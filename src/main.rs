@@ -1,12 +1,14 @@
+mod config;
 mod tools;
 
 use anyhow::Result;
 use rig::completion::message::Message;
 use rig::completion::Prompt;
 use rig::prelude::*;
-use rig::providers::anthropic;
+use rig::providers::openrouter;
 use std::io::{self, BufRead, Write};
 
+use config::Config;
 use tools::{BashTool, FileEditTool, FileReadTool, ListDirectoryTool};
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
@@ -18,12 +20,29 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let client = anthropic::Client::from_env();
+    // Load configuration from environment variables
+    let config = Config::load().unwrap_or_default();
+
+    // Get API key from config
+    let api_key = config.openrouter_api_key.unwrap_or_default();
+    if api_key.is_empty() {
+        anyhow::bail!("OpenRouter API key not configured. Set OPENROUTER_API_KEY env var");
+    }
+
+    use rig::providers::openrouter::Client;
+    
+    let client: Client = openrouter::Client::builder()
+        .api_key(&api_key)
+        .build()
+        .expect("Failed to create OpenRouter client");
+
+    // Create completion model with configured model name
+    let model_name = config.openrouter_model.clone();
 
     let agent = client
-        .agent(anthropic::completion::CLAUDE_4_SONNET)
+        .agent(model_name)
         .preamble(SYSTEM_PROMPT)
-        .max_tokens(4096)
+        .max_tokens(config.openrouter_max_tokens as u64)
         .tool(FileEditTool::default())
         .tool(FileReadTool)
         .tool(BashTool)
@@ -32,6 +51,7 @@ async fn main() -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     println!("PeakBot coding agent ready.");
+    println!("Model: {}", config.openrouter_model);
     println!("Working directory: {}", cwd.display());
     println!("Type your message (or 'exit' to quit).\n");
 
@@ -58,7 +78,7 @@ async fn main() -> Result<()> {
         match agent
             .prompt(input)
             .with_history(&mut chat_history)
-            .max_turns(15)
+            .max_turns(config.agent_max_turns as usize)
             .await
         {
             Ok(response) => {
