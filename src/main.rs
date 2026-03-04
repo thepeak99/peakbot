@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     // Build the agent with all tools
     let agent = client
         .agent(model_name)
-        .preamble(&system_prompt)
+        .preamble(system_prompt)
         .max_tokens(config.openrouter_max_tokens as u64)
         .tool(FileEditTool::default())
         .tool(FileReadTool)

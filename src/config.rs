@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use directories_next::ProjectDirs;
 use serde::Deserialize;
 use std::collections::HashMap;

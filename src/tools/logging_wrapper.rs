@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use rig::completion::ToolDefinition;
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
