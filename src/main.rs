@@ -2,22 +2,18 @@ mod config;
 mod tools;
 
 use anyhow::Result;
-use tracing_subscriber::EnvFilter;
-use rig::completion::message::Message;
 use rig::completion::Prompt;
+use rig::completion::message::Message;
 use rig::prelude::*;
 use rig::providers::openrouter;
 use std::io::{self, BufRead, Write};
+use tracing_subscriber::EnvFilter;
 
 use peakbot::{
-    load_mcp_servers,
-    Config,
-    BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool
+    BashTool, Config, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, load_mcp_servers,
 };
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
-
-
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,7 +32,7 @@ async fn main() -> Result<()> {
     }
 
     use rig::providers::openrouter::Client;
-    
+
     let client: Client = openrouter::Client::builder()
         .api_key(&api_key)
         .build()

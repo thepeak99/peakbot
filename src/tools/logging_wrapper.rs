@@ -30,7 +30,7 @@ impl ToolDyn for LoggingToolDyn {
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
         let tool_name = self.name();
         let server = self.server_name.clone();
-        
+
         // Log BEFORE the call
         tracing::info!(
             target: "peakbot",
@@ -40,12 +40,12 @@ impl ToolDyn for LoggingToolDyn {
             args = %args,
             "Starting MCP tool execution"
         );
-        
+
         let start_time = std::time::Instant::now();
-        
+
         Box::pin(async move {
             let result = self.inner.call(args).await;
-            
+
             // Log AFTER the call
             match &result {
                 Ok(output) => {
@@ -70,7 +70,7 @@ impl ToolDyn for LoggingToolDyn {
                     );
                 }
             }
-            
+
             result
         })
     }

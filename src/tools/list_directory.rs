@@ -115,9 +115,7 @@ fn collect_entries(
         return Ok(());
     }
 
-    let mut dir_entries: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .collect();
+    let mut dir_entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
 
     dir_entries.sort_by_key(|e| e.file_name());
 

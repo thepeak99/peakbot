@@ -8,8 +8,7 @@ use std::sync::Mutex;
 
 const SNIPPET_CONTEXT_LINES: usize = 4;
 const MAX_OUTPUT_CHARS: usize = 10_000;
-const TRUNCATION_NOTICE: &str =
-    "\n... [output truncated] Use file_read with start_line/end_line or bash with `grep -n` to find specific content.";
+const TRUNCATION_NOTICE: &str = "\n... [output truncated] Use file_read with start_line/end_line or bash with `grep -n` to find specific content.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum FileEditError {
@@ -205,13 +204,13 @@ impl FileEditTool {
             )));
         }
 
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| FileEditError::Io {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| FileEditError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
         }
 
         self.write_file(path, file_text)?;
@@ -270,7 +269,12 @@ impl FileEditTool {
         self.write_file(path, &new_content)?;
 
         // Build context snippet
-        let replacement_line = content.split(old_str).next().unwrap_or("").matches('\n').count();
+        let replacement_line = content
+            .split(old_str)
+            .next()
+            .unwrap_or("")
+            .matches('\n')
+            .count();
         let new_lines: Vec<&str> = new_content.lines().collect();
         let start = replacement_line.saturating_sub(SNIPPET_CONTEXT_LINES);
         let end = (replacement_line + SNIPPET_CONTEXT_LINES + new_str.matches('\n').count() + 1)
