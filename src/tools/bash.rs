@@ -82,11 +82,8 @@ impl Tool for BashTool {
             .spawn()
             .map_err(|e| BashError::Execution(format!("Failed to spawn shell: {}", e)))?;
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
 
         match result {
             Ok(Ok(output)) => {
