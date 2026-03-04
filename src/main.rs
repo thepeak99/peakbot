@@ -2,6 +2,7 @@ mod config;
 mod tools;
 
 use anyhow::Result;
+use chrono::Local;
 use rig::completion::message::Message;
 use rig::completion::Prompt;
 use rig::prelude::*;
@@ -11,6 +12,7 @@ use rig::tool::ToolDyn;
 use rmcp::service::ServiceExt;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use tracing_subscriber::EnvFilter;
 
 use config::{Config, McpServerConfig};
 use tools::{BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool};
@@ -134,6 +136,20 @@ fn load_agents_md() -> Option<String> {
 fn build_system_prompt() -> String {
     let mut prompt = load_base_system_prompt();
     
+    // Get current date and working directory
+    let current_date = Local::now().format("%Y-%m-%d").to_string();
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    
+    // Insert dynamic info after the first line (the initial description)
+    let dynamic_info = format!(
+        "\n\n**Current Date:** {}\n**Current Working Directory:** {}",
+        current_date, cwd
+    );
+    
+    prompt.push_str(&dynamic_info);
+    
     if let Some(agents_content) = load_agents_md() {
         prompt.push_str("\n\n---\n\n");
         prompt.push_str("## Additional Agent Configuration (from agents.md)\n\n");
@@ -147,7 +163,7 @@ fn build_system_prompt() -> String {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
-        .with_target(false)
+        .with_env_filter(EnvFilter::new("peakbot=info"))
         .init();
 
     // Load configuration from environment variables
