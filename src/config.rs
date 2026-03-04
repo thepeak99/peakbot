@@ -16,9 +16,9 @@ pub struct Config {
     /// Maximum tool turns per message
     #[serde(default = "default_max_turns")]
     pub agent_max_turns: u32,
-    /// MCP servers configuration (JSON array)
+    /// MCP servers configuration (YAML array)
     #[serde(default)]
-    pub mcp_servers: Option<String>,
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -70,12 +70,16 @@ fn load_yaml_config() -> Option<Config> {
     let config_dir = get_config_dir()?;
     let config_path = config_dir.join("config.yaml");
     
+    tracing::debug!("Looking for config at: {}", config_path.display());
+    
     if !config_path.exists() {
         tracing::debug!("No YAML config found at {}", config_path.display());
         return None;
     }
     
     let content = std::fs::read_to_string(&config_path).ok()?;
+    tracing::debug!("Config file content: {}", content);
+    
     let config: Config = serde_yaml::from_str(&content).ok()?;
     
     tracing::info!("Loaded YAML config from {}", config_path.display());
@@ -85,29 +89,49 @@ fn load_yaml_config() -> Option<Config> {
 impl Config {
     /// Load configuration from YAML file first, then environment variables.
     /// Environment variables take precedence over YAML config.
-    pub fn load() -> Result<Self, envy::Error> {
+    pub fn load() -> anyhow::Result<Self> {
         // Start with YAML config if present, otherwise use defaults
         let mut config = load_yaml_config().unwrap_or_default();
         
-        // Load environment variables and merge (env vars override YAML/defaults)
-        let env_config = envy::from_env::<Config>()?;
+        tracing::debug!("Config after YAML load: {:?}", config.openrouter_api_key);
         
-        // Override with env vars if they are set
-        if let Some(api_key) = env_config.openrouter_api_key {
-            config.openrouter_api_key = Some(api_key);
+        // Load environment variables and merge (env vars override YAML/defaults)
+        // Use a simple approach: try to get each env var manually to avoid issues
+        if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") {
+            if !api_key.is_empty() {
+                config.openrouter_api_key = Some(api_key);
+            }
         }
-        if !env_config.openrouter_model.is_empty() {
-            config.openrouter_model = env_config.openrouter_model;
+        
+        if let Ok(model) = std::env::var("OPENROUTER_MODEL") {
+            if !model.is_empty() {
+                config.openrouter_model = model;
+            }
         }
-        if env_config.openrouter_max_tokens != default_max_tokens() {
-            config.openrouter_max_tokens = env_config.openrouter_max_tokens;
+        
+        if let Ok(tokens) = std::env::var("OPENROUTER_MAX_TOKENS") {
+            if let Ok(tokens) = tokens.parse() {
+                config.openrouter_max_tokens = tokens;
+            }
         }
-        if env_config.agent_max_turns != default_max_turns() {
-            config.agent_max_turns = env_config.agent_max_turns;
+        
+        if let Ok(turns) = std::env::var("AGENT_MAX_TURNS") {
+            if let Ok(turns) = turns.parse() {
+                config.agent_max_turns = turns;
+            }
         }
-        if env_config.mcp_servers.is_some() {
-            config.mcp_servers = env_config.mcp_servers;
+        
+        if let Ok(mcp) = std::env::var("MCP_SERVERS") {
+            if !mcp.is_empty() {
+                // Parse JSON string into Vec<McpServerConfig>
+                match serde_json::from_str::<Vec<McpServerConfig>>(&mcp) {
+                    Ok(servers) => config.mcp_servers = Some(servers),
+                    Err(e) => tracing::warn!("Failed to parse MCP_SERVERS JSON: {}", e),
+                }
+            }
         }
+        
+        tracing::debug!("Final config: {:?}", config.openrouter_api_key);
         
         Ok(config)
     }
