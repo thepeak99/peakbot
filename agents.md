@@ -55,15 +55,17 @@ There is one agent. It is constructed in `src/main.rs`:
 
 ```rust
 let agent = client
-    .agent(anthropic::completion::CLAUDE_4_SONNET)  // claude-sonnet-4-0
+    .agent(model_name)  // configurable via config.yaml
     .preamble(SYSTEM_PROMPT)                        // loaded from src/system_prompt.txt
-    .max_tokens(4096)
+    .max_tokens(config.openrouter.max_tokens)       // configurable via config.yaml
     .tool(FileEditTool::default())
     .tool(FileReadTool)
     .tool(BashTool)
     .tool(ListDirectoryTool)
     .build();
 ```
+
+The agent uses **OpenRouter** as the provider (migrated from Anthropic). All settings are configurable via `config.yaml` or environment variables.
 
 The agent is stateless between tool turns -- all state lives in `chat_history` (conversation memory) and `FileEditTool.file_history` (undo stack). Rig owns the agentic loop: it automatically dispatches tool calls, collects results, and loops until the model produces a text response or hits the 15-turn limit.
 
@@ -172,14 +174,14 @@ Environment: set `ANTHROPIC_API_KEY` before running.
 
 ### Switching models
 
-Change the model constant in `src/main.rs:24`. Available Anthropic constants from Rig:
-- `CLAUDE_4_OPUS` (`claude-opus-4-0`)
-- `CLAUDE_4_SONNET` (`claude-sonnet-4-0`)
-- `CLAUDE_3_7_SONNET` (`claude-3-7-sonnet-latest`)
-- `CLAUDE_3_5_SONNET` (`claude-3-5-sonnet-latest`)
-- `CLAUDE_3_5_HAIKU` (`claude-3-5-haiku-latest`)
+Change the model in `config.yaml` or set the `PEAKBOT_OPENROUTER_MODEL` environment variable. Find models at https://openrouter.ai/models.
 
-Or pass any model string directly: `.agent("claude-sonnet-4-5-20250514")`.
+Example models:
+- `anthropic/claude-3.7-sonnet` (default)
+- `anthropic/claude-3.5-sonnet`
+- `google/gemini-2.0-flash-001`
+- `openai/gpt-4o`
+- `qwen/qwq-32b`
 
 ### Multi-agent patterns
 
@@ -206,6 +208,7 @@ let main_agent = client
 ```
 src/
 ├── main.rs                 # Agent construction, REPL loop, entry point
+├── config.rs               # Configuration loading from config.yaml
 ├── system_prompt.txt       # System prompt (included at compile time)
 └── tools/
     ├── mod.rs              # Re-exports: BashTool, FileEditTool, FileReadTool, ListDirectoryTool
@@ -214,3 +217,14 @@ src/
     ├── bash.rs             # BashTool -- shell execution with timeout (120 lines)
     └── list_directory.rs   # ListDirectoryTool -- dir listing with recursion (127 lines)
 ```
+
+## Configuration
+
+All settings are managed via environment variables:
+
+| Environment Variable | Default |
+|---------------------|---------|
+| `OPENROUTER_API_KEY` | (required) |
+| `OPENROUTER_MODEL` | `anthropic/claude-3.7-sonnet` |
+| `OPENROUTER_MAX_TOKENS` | `4096` |
+| `AGENT_MAX_TURNS` | `15` |
