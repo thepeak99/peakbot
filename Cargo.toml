@@ -13,3 +13,4 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 envy = "0.4"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }

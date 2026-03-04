@@ -9,7 +9,7 @@ use rig::providers::openrouter;
 use std::io::{self, BufRead, Write};
 
 use config::Config;
-use tools::{BashTool, FileEditTool, FileReadTool, ListDirectoryTool};
+use tools::{BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool};
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
         .tool(FileReadTool)
         .tool(BashTool)
         .tool(ListDirectoryTool)
+        .tool(FetchUrlTool)
         .build();
 
     let cwd = std::env::current_dir()?;
