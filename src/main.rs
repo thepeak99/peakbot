@@ -7,85 +7,15 @@ use rig::completion::message::Message;
 use rig::completion::Prompt;
 use rig::prelude::*;
 use rig::providers::openrouter;
-use rig::tool::rmcp::McpTool;
-use rig::tool::ToolDyn;
-use rmcp::service::ServiceExt;
 use std::io::{self, BufRead, Write};
 
-use config::{Config, McpServerConfig};
-use tools::{BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn};
+use peakbot::{
+    load_mcp_servers,
+    Config,
+    BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool
+};
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
-
-/// Connect to an MCP server and return its tools (wrapped with LoggingToolDyn)
-async fn connect_mcp_server(config: &McpServerConfig) -> Result<Vec<Box<dyn ToolDyn>>> {
-    // Only stdio transport is supported for now
-    let command = &config.command;
-    
-    let mut cmd = tokio::process::Command::new(command);
-    if let Some(args) = &config.args {
-        cmd.args(args);
-    }
-    if let Some(env) = &config.env {
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-    }
-    
-    // Use TokioChildProcess transport
-    let transport = rmcp::transport::TokioChildProcess::new(cmd)
-        .map_err(|e| anyhow::anyhow!("Failed to create child process: {}", e))?;
-    
-    // Connect to the MCP server
-    let service = ().serve(transport).await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?;
-    
-    // Get server info
-    let server_info = service.peer_info();
-    tracing::info!("Connected to MCP server '{}': {:?}", config.name, server_info);
-    
-    // List available tools (use None for paginated request)
-    let tools = service.list_tools(None).await
-        .map_err(|e| anyhow::anyhow!("Failed to list tools: {}", e))?;
-    
-    tracing::info!("MCP server '{}' has {} tools", config.name, tools.tools.len());
-    
-    // Create wrapped McpTool for each tool with logging
-    let mcp_tools: Vec<Box<dyn ToolDyn>> = tools.tools.into_iter().map(|tool| {
-        let inner = Box::new(McpTool::from_mcp_server(tool, service.clone())) as Box<dyn ToolDyn>;
-        Box::new(LoggingToolDyn::new(inner, &config.name)) as Box<dyn ToolDyn>
-    }).collect();
-    
-    Ok(mcp_tools)
-}
-
-/// Load and connect to all configured MCP servers
-async fn load_mcp_servers(config: &Config) -> Result<Vec<Box<dyn ToolDyn>>> {
-    let mut all_tools = Vec::new();
-    
-    let servers = match &config.mcp_servers {
-        Some(servers) => servers,
-        None => {
-            tracing::info!("No MCP servers configured");
-            return Ok(all_tools);
-        }
-    };
-    
-    for server_config in servers {
-        tracing::info!("Connecting to MCP server: {}", server_config.name);
-        match connect_mcp_server(server_config).await {
-            Ok(tools) => {
-                tracing::info!("Loaded {} tools from MCP server '{}'", tools.len(), server_config.name);
-                all_tools.extend(tools);
-            }
-            Err(e) => {
-                tracing::error!("Failed to connect to MCP server '{}': {}", server_config.name, e);
-            }
-        }
-    }
-    
-    Ok(all_tools)
-}
 
 
 

@@ -3,6 +3,14 @@ name = "peakbot"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "peakbot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "peakbot"
+path = "src/main.rs"
+
 [dependencies]
 rig-core = { version = "0.31", features = ["rmcp"] }
 rmcp = { version = "0.13", features = ["client", "transport-child-process"] }
