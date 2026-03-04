@@ -63,20 +63,17 @@ async fn connect_mcp_server(config: &McpServerConfig) -> Result<Vec<Box<dyn Tool
 async fn load_mcp_servers(config: &Config) -> Result<Vec<Box<dyn ToolDyn>>> {
     let mut all_tools = Vec::new();
     
-    let mcp_servers_json = match &config.mcp_servers {
-        Some(json) => json,
+    let servers = match &config.mcp_servers {
+        Some(servers) => servers,
         None => {
             tracing::info!("No MCP servers configured");
             return Ok(all_tools);
         }
     };
     
-    let servers: Vec<McpServerConfig> = serde_json::from_str(mcp_servers_json)
-        .map_err(|e| anyhow::anyhow!("Failed to parse MCP_SERVERS JSON: {}", e))?;
-    
     for server_config in servers {
         tracing::info!("Connecting to MCP server: {}", server_config.name);
-        match connect_mcp_server(&server_config).await {
+        match connect_mcp_server(server_config).await {
             Ok(tools) => {
                 tracing::info!("Loaded {} tools from MCP server '{}'", tools.len(), server_config.name);
                 all_tools.extend(tools);
@@ -95,8 +92,8 @@ async fn load_mcp_servers(config: &Config) -> Result<Vec<Box<dyn ToolDyn>>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_env_filter(EnvFilter::new("peakbot=info"))
+        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(EnvFilter::new("peakbot=debug,envy=debug"))
         .init();
 
     // Load configuration from environment variables
