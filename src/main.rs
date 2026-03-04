@@ -6,10 +6,13 @@ use rig::completion::message::Message;
 use rig::completion::Prompt;
 use rig::prelude::*;
 use rig::providers::openrouter;
+use rig::tool::rmcp::McpTool;
+use rig::tool::ToolDyn;
+use rmcp::service::ServiceExt;
 use std::fs;
 use std::io::{self, BufRead, Write};
 
-use config::Config;
+use config::{Config, McpServerConfig};
 use tools::{BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool};
 
 /// Load the base system prompt from system_prompt.txt
@@ -18,6 +21,78 @@ fn load_base_system_prompt() -> String {
         eprintln!("Warning: Could not read system_prompt.txt: {}", e);
         "You are PeakBot, a coding agent.".to_string()
     })
+}
+
+/// Connect to an MCP server and return its tools
+async fn connect_mcp_server(config: &McpServerConfig) -> Result<Vec<McpTool>> {
+    // Only stdio transport is supported for now
+    let command = &config.command;
+    
+    let mut cmd = tokio::process::Command::new(command);
+    if let Some(args) = &config.args {
+        cmd.args(args);
+    }
+    if let Some(env) = &config.env {
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+    }
+    
+    // Use TokioChildProcess transport
+    let transport = rmcp::transport::TokioChildProcess::new(cmd)
+        .map_err(|e| anyhow::anyhow!("Failed to create child process: {}", e))?;
+    
+    // Connect to the MCP server
+    let service = ().serve(transport).await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?;
+    
+    // Get server info
+    let server_info = service.peer_info();
+    tracing::info!("Connected to MCP server '{}': {:?}", config.name, server_info);
+    
+    // List available tools (use None for paginated request)
+    let tools = service.list_tools(None).await
+        .map_err(|e| anyhow::anyhow!("Failed to list tools: {}", e))?;
+    
+    tracing::info!("MCP server '{}' has {} tools", config.name, tools.tools.len());
+    
+    // Create McpTool for each tool
+    let mcp_tools: Vec<McpTool> = tools.tools.into_iter().map(|tool| {
+        McpTool::from_mcp_server(tool, service.clone())
+    }).collect();
+    
+    Ok(mcp_tools)
+}
+
+/// Load and connect to all configured MCP servers
+async fn load_mcp_servers(config: &Config) -> Result<Vec<McpTool>> {
+    let mut all_tools = Vec::new();
+    
+    let mcp_servers_json = match &config.mcp_servers {
+        Some(json) => json,
+        None => {
+            tracing::info!("No MCP servers configured");
+            return Ok(all_tools);
+        }
+    };
+    
+    let servers: Vec<McpServerConfig> = serde_json::from_str(mcp_servers_json)
+        .map_err(|e| anyhow::anyhow!("Failed to parse MCP_SERVERS JSON: {}", e))?;
+    
+    for server_config in servers {
+        tracing::info!("Connecting to MCP server: {}", server_config.name);
+        match connect_mcp_server(&server_config).await {
+            Ok(tools) => {
+                tracing::info!("Loaded {} tools from MCP server '{}'", tools.len(), server_config.name);
+                all_tools.extend(tools);
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect to MCP server '{}': {}", server_config.name, e);
+            }
+        }
+    }
+    
+    Ok(all_tools)
 }
 
 /// Check for agents.md in the current directory (case insensitive) and load its contents
@@ -79,7 +154,7 @@ async fn main() -> Result<()> {
     let config = Config::load().unwrap_or_default();
 
     // Get API key from config
-    let api_key = config.openrouter_api_key.unwrap_or_default();
+    let api_key = config.openrouter_api_key.clone().unwrap_or_default();
     if api_key.is_empty() {
         anyhow::bail!("OpenRouter API key not configured. Set OPENROUTER_API_KEY env var");
     }
@@ -97,6 +172,18 @@ async fn main() -> Result<()> {
     // Build system prompt (combines base prompt with agents.md if present in current directory)
     let system_prompt = build_system_prompt();
 
+    // Load MCP servers and get their tools
+    let mcp_tools = load_mcp_servers(&config).await?;
+    let mcp_tool_count = mcp_tools.len();
+    tracing::info!("Loaded {} total MCP tools", mcp_tool_count);
+
+    // Convert MCP tools to boxed dyn ToolDyn
+    let mcp_tools_boxed: Vec<Box<dyn ToolDyn>> = mcp_tools
+        .into_iter()
+        .map(|t| Box::new(t) as Box<dyn ToolDyn>)
+        .collect();
+
+    // Build the agent with all tools
     let agent = client
         .agent(model_name)
         .preamble(&system_prompt)
@@ -106,11 +193,15 @@ async fn main() -> Result<()> {
         .tool(BashTool)
         .tool(ListDirectoryTool)
         .tool(FetchUrlTool)
+        .tools(mcp_tools_boxed)
         .build();
 
     let cwd = std::env::current_dir()?;
     println!("PeakBot coding agent ready.");
     println!("Model: {}", config.openrouter_model);
+    if mcp_tool_count > 0 {
+        println!("MCP tools: {}", mcp_tool_count);
+    }
     println!("Working directory: {}", cwd.display());
     println!("Type your message (or 'exit' to quit).\n");
 
