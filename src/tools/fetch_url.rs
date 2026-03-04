@@ -47,6 +47,16 @@ impl Tool for FetchUrlTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Log before execution
+        tracing::info!(
+            target: "peakbot",
+            tool_type = "fetch_url",
+            url = %args.url,
+            "Starting fetch_url tool execution"
+        );
+
+        let start_time = std::time::Instant::now();
+
         // Validate URL
         if args.url.is_empty() {
             return Err(FetchUrlError::InvalidUrl("URL cannot be empty".to_string()));
@@ -75,6 +85,16 @@ impl Tool for FetchUrlTool {
         } else {
             body
         };
+
+        tracing::info!(
+            target: "peakbot",
+            tool_type = "fetch_url",
+            url = %args.url,
+            status_code = status.as_u16(),
+            response_len = body.len(),
+            duration_ms = start_time.elapsed().as_millis(),
+            "Fetch URL completed successfully"
+        );
 
         Ok(format!(
             "HTTP {} {}\n\n{}",

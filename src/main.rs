@@ -2,7 +2,7 @@ mod config;
 mod tools;
 
 use anyhow::Result;
-use chrono::Local;
+use tracing_subscriber::EnvFilter;
 use rig::completion::message::Message;
 use rig::completion::Prompt;
 use rig::prelude::*;
@@ -10,23 +10,15 @@ use rig::providers::openrouter;
 use rig::tool::rmcp::McpTool;
 use rig::tool::ToolDyn;
 use rmcp::service::ServiceExt;
-use std::fs;
 use std::io::{self, BufRead, Write};
-use tracing_subscriber::EnvFilter;
 
 use config::{Config, McpServerConfig};
-use tools::{BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool};
+use tools::{BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn};
 
-/// Load the base system prompt from system_prompt.txt
-fn load_base_system_prompt() -> String {
-    fs::read_to_string("system_prompt.txt").unwrap_or_else(|e| {
-        eprintln!("Warning: Could not read system_prompt.txt: {}", e);
-        "You are PeakBot, a coding agent.".to_string()
-    })
-}
+const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
-/// Connect to an MCP server and return its tools
-async fn connect_mcp_server(config: &McpServerConfig) -> Result<Vec<McpTool>> {
+/// Connect to an MCP server and return its tools (wrapped with LoggingToolDyn)
+async fn connect_mcp_server(config: &McpServerConfig) -> Result<Vec<Box<dyn ToolDyn>>> {
     // Only stdio transport is supported for now
     let command = &config.command;
     
@@ -58,16 +50,17 @@ async fn connect_mcp_server(config: &McpServerConfig) -> Result<Vec<McpTool>> {
     
     tracing::info!("MCP server '{}' has {} tools", config.name, tools.tools.len());
     
-    // Create McpTool for each tool
-    let mcp_tools: Vec<McpTool> = tools.tools.into_iter().map(|tool| {
-        McpTool::from_mcp_server(tool, service.clone())
+    // Create wrapped McpTool for each tool with logging
+    let mcp_tools: Vec<Box<dyn ToolDyn>> = tools.tools.into_iter().map(|tool| {
+        let inner = Box::new(McpTool::from_mcp_server(tool, service.clone())) as Box<dyn ToolDyn>;
+        Box::new(LoggingToolDyn::new(inner, &config.name)) as Box<dyn ToolDyn>
     }).collect();
     
     Ok(mcp_tools)
 }
 
 /// Load and connect to all configured MCP servers
-async fn load_mcp_servers(config: &Config) -> Result<Vec<McpTool>> {
+async fn load_mcp_servers(config: &Config) -> Result<Vec<Box<dyn ToolDyn>>> {
     let mut all_tools = Vec::new();
     
     let mcp_servers_json = match &config.mcp_servers {
@@ -97,67 +90,7 @@ async fn load_mcp_servers(config: &Config) -> Result<Vec<McpTool>> {
     Ok(all_tools)
 }
 
-/// Check for agents.md in the current directory (case insensitive) and load its contents
-fn load_agents_md() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    
-    // List all entries in current directory and find one that matches "agents.md" (case insensitive)
-    let entries = match std::fs::read_dir(&cwd) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("Warning: Could not read current directory: {}", e);
-            return None;
-        }
-    };
-    
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                if file_name.to_lowercase() == "agents.md" {
-                    match std::fs::read_to_string(&path) {
-                        Ok(contents) => {
-                            println!("Loaded agents.md from: {}", path.display());
-                            return Some(contents);
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Could not read {}: {}", path.display(), e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    None
-}
 
-/// Build the full system prompt by combining the base prompt with agents.md if present
-fn build_system_prompt() -> String {
-    let mut prompt = load_base_system_prompt();
-    
-    // Get current date and working directory
-    let current_date = Local::now().format("%Y-%m-%d").to_string();
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-    
-    // Insert dynamic info after the first line (the initial description)
-    let dynamic_info = format!(
-        "\n\n**Current Date:** {}\n**Current Working Directory:** {}",
-        current_date, cwd
-    );
-    
-    prompt.push_str(&dynamic_info);
-    
-    if let Some(agents_content) = load_agents_md() {
-        prompt.push_str("\n\n---\n\n");
-        prompt.push_str("## Additional Agent Configuration (from agents.md)\n\n");
-        prompt.push_str(&agents_content);
-    }
-    
-    prompt
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -185,19 +118,13 @@ async fn main() -> Result<()> {
     // Create completion model with configured model name
     let model_name = config.openrouter_model.clone();
 
-    // Build system prompt (combines base prompt with agents.md if present in current directory)
-    let system_prompt = build_system_prompt();
+    // Use embedded system prompt
+    let system_prompt = SYSTEM_PROMPT;
 
-    // Load MCP servers and get their tools
+    // Load MCP servers and get their tools (already wrapped with LoggingToolDyn)
     let mcp_tools = load_mcp_servers(&config).await?;
     let mcp_tool_count = mcp_tools.len();
     tracing::info!("Loaded {} total MCP tools", mcp_tool_count);
-
-    // Convert MCP tools to boxed dyn ToolDyn
-    let mcp_tools_boxed: Vec<Box<dyn ToolDyn>> = mcp_tools
-        .into_iter()
-        .map(|t| Box::new(t) as Box<dyn ToolDyn>)
-        .collect();
 
     // Build the agent with all tools
     let agent = client
@@ -209,7 +136,7 @@ async fn main() -> Result<()> {
         .tool(BashTool)
         .tool(ListDirectoryTool)
         .tool(FetchUrlTool)
-        .tools(mcp_tools_boxed)
+        .tools(mcp_tools)
         .build();
 
     let cwd = std::env::current_dir()?;

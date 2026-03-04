@@ -107,7 +107,17 @@ impl Tool for FileEditTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        match args.command.as_str() {
+        // Log before execution
+        tracing::info!(
+            target: "peakbot",
+            tool_type = "file_edit",
+            command = %args.command,
+            path = %args.path,
+            "Starting file_edit tool execution"
+        );
+
+        let start_time = std::time::Instant::now();
+        let result = match args.command.as_str() {
             "view" => self.cmd_view(&args),
             "create" => self.cmd_create(&args),
             "str_replace" => self.cmd_str_replace(&args),
@@ -116,7 +126,34 @@ impl Tool for FileEditTool {
                 "Unknown command '{}'. Valid commands: view, create, str_replace, insert",
                 other
             ))),
+        };
+
+        // Log after execution
+        match &result {
+            Ok(output) => {
+                tracing::info!(
+                    target: "peakbot",
+                    tool_type = "file_edit",
+                    command = %args.command,
+                    path = %args.path,
+                    output_len = output.len(),
+                    duration_ms = start_time.elapsed().as_millis(),
+                    "File edit completed successfully"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "peakbot",
+                    tool_type = "file_edit",
+                    command = %args.command,
+                    path = %args.path,
+                    error = %e,
+                    "File edit failed"
+                );
+            }
         }
+
+        result
     }
 }
 

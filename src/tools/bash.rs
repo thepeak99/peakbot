@@ -62,6 +62,17 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
+        // Log before execution
+        tracing::info!(
+            target: "peakbot",
+            tool_type = "bash",
+            command = %args.command,
+            timeout_secs = timeout_secs,
+            "Starting bash tool execution"
+        );
+
+        let start_time = std::time::Instant::now();
+
         let child = Command::new("/bin/sh")
             .arg("-c")
             .arg(&args.command)
@@ -93,15 +104,41 @@ impl Tool for BashTool {
                 if !stderr.is_empty() {
                     result.push_str(&format!("\nSTDERR:\n{}\n", stderr));
                 }
+
+                // Log successful completion
+                tracing::info!(
+                    target: "peakbot",
+                    tool_type = "bash",
+                    exit_code = exit_code,
+                    duration_ms = start_time.elapsed().as_millis(),
+                    "Bash tool completed successfully"
+                );
+
                 Ok(result)
             }
-            Ok(Err(e)) => Err(BashError::Execution(format!("Command failed: {}", e))),
+            Ok(Err(e)) => {
+                let error = format!("Command failed: {}", e);
+                tracing::warn!(
+                    target: "peakbot",
+                    tool_type = "bash",
+                    error = %error,
+                    "Bash tool execution failed"
+                );
+                Err(BashError::Execution(error))
+            }
             Err(_) => {
                 // child is dropped here -> killed automatically due to kill_on_drop
-                Err(BashError::Execution(format!(
+                let error = format!(
                     "Command timed out after {} seconds. Consider increasing timeout_seconds.",
                     timeout_secs
-                )))
+                );
+                tracing::warn!(
+                    target: "peakbot",
+                    tool_type = "bash",
+                    timeout_secs = timeout_secs,
+                    "Bash tool timed out"
+                );
+                Err(BashError::Execution(error))
             }
         }
     }

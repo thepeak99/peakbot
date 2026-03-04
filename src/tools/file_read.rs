@@ -59,6 +59,17 @@ impl Tool for FileReadTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Log before execution
+        tracing::info!(
+            target: "peakbot",
+            tool_type = "file_read",
+            path = %args.path,
+            start_line = args.start_line,
+            end_line = args.end_line,
+            "Starting file_read tool execution"
+        );
+
+        let start_time = std::time::Instant::now();
         let path = Path::new(&args.path);
 
         if !path.is_absolute() {
@@ -109,7 +120,19 @@ impl Tool for FileReadTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        Ok(maybe_truncate(&output))
+        let output = maybe_truncate(&output);
+
+        tracing::info!(
+            target: "peakbot",
+            tool_type = "file_read",
+            path = %args.path,
+            total_lines = total,
+            lines_read = end - start,
+            duration_ms = start_time.elapsed().as_millis(),
+            "File read completed successfully"
+        );
+
+        Ok(output)
     }
 }
 

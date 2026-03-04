@@ -52,6 +52,16 @@ impl Tool for ListDirectoryTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Log before execution
+        tracing::info!(
+            target: "peakbot",
+            tool_type = "list_directory",
+            path = %args.path,
+            recursive = args.recursive.unwrap_or(false),
+            "Starting list_directory tool execution"
+        );
+
+        let start_time = std::time::Instant::now();
         let path = Path::new(&args.path);
 
         if !path.is_absolute() {
@@ -79,6 +89,16 @@ impl Tool for ListDirectoryTool {
         let mut entries = Vec::new();
         collect_entries(path, path, 0, max_depth, &mut entries)?;
         entries.sort();
+
+        let entry_count = entries.len();
+        tracing::info!(
+            target: "peakbot",
+            tool_type = "list_directory",
+            path = %args.path,
+            entry_count = entry_count,
+            duration_ms = start_time.elapsed().as_millis(),
+            "List directory completed successfully"
+        );
 
         Ok(entries.join("\n"))
     }
