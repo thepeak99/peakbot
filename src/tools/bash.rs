@@ -1,0 +1,120 @@
+use rig::completion::ToolDefinition;
+use rig::tool::Tool;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::time::Duration;
+use tokio::process::Command;
+
+const MAX_OUTPUT_CHARS: usize = 10_000;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const MAX_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BashError {
+    #[error("{0}")]
+    Execution(String),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Deserialize)]
+pub struct BashArgs {
+    command: String,
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct BashTool;
+
+impl Tool for BashTool {
+    const NAME: &'static str = "bash";
+    type Error = BashError;
+    type Args = BashArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: "bash".to_string(),
+            description: "Run a shell command and return stdout and stderr. \
+                Use for running builds, tests, git operations, grep, and other CLI tools. \
+                Commands run in /bin/sh. Default timeout is 30 seconds."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Optional timeout in seconds (default: 30, max: 120)"
+                    }
+                },
+                "required": ["command"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let timeout_secs = args
+            .timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, MAX_TIMEOUT_SECS);
+
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&args.command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| BashError::Execution(format!("Failed to spawn shell: {}", e)))?;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            child.wait_with_output(),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(output)) => {
+                let exit_code = output.status.code().unwrap_or(-1);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                let stdout = maybe_truncate(&stdout);
+                let stderr = maybe_truncate(&stderr);
+
+                let mut result = format!("Exit code: {}\n", exit_code);
+                if !stdout.is_empty() {
+                    result.push_str(&format!("\nSTDOUT:\n{}\n", stdout));
+                }
+                if !stderr.is_empty() {
+                    result.push_str(&format!("\nSTDERR:\n{}\n", stderr));
+                }
+                Ok(result)
+            }
+            Ok(Err(e)) => Err(BashError::Execution(format!("Command failed: {}", e))),
+            Err(_) => {
+                // child is dropped here -> killed automatically due to kill_on_drop
+                Err(BashError::Execution(format!(
+                    "Command timed out after {} seconds. Consider increasing timeout_seconds.",
+                    timeout_secs
+                )))
+            }
+        }
+    }
+}
+
+fn maybe_truncate(s: &str) -> String {
+    if s.len() > MAX_OUTPUT_CHARS {
+        format!(
+            "{}... [truncated, {} total chars]",
+            &s[..MAX_OUTPUT_CHARS],
+            s.len()
+        )
+    } else {
+        s.to_string()
+    }
+}
