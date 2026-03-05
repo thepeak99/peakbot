@@ -1,5 +1,3 @@
-#![allow(unused_imports)]
-
 mod bash;
 mod fetch_url;
 mod file_edit;

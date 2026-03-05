@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
