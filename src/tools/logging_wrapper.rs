@@ -1,18 +1,22 @@
-#![allow(dead_code)]
-
 use rig::completion::ToolDefinition;
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 
 /// Wrapper around any ToolDyn that adds structured logging for tool execution.
 /// This is useful for MCP tools where we can't modify the internal implementation.
-pub struct LoggingToolDyn {
-    inner: Box<dyn ToolDyn>,
+pub struct LoggingToolDyn<T>
+where
+    T: ToolDyn,
+{
+    inner: T,
     server_name: String,
 }
 
-impl LoggingToolDyn {
-    pub fn new(inner: Box<dyn ToolDyn>, server_name: &str) -> Self {
+impl<T> LoggingToolDyn<T>
+where
+    T: ToolDyn,
+{
+    pub fn new(inner: T, server_name: &str) -> Self {
         Self {
             inner,
             server_name: server_name.to_string(),
@@ -20,7 +24,10 @@ impl LoggingToolDyn {
     }
 }
 
-impl ToolDyn for LoggingToolDyn {
+impl<T> ToolDyn for LoggingToolDyn<T>
+where
+    T: ToolDyn,
+{
     fn name(&self) -> String {
         self.inner.name()
     }

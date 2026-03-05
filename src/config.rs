@@ -14,10 +14,10 @@ pub struct Config {
     pub openrouter_model: String,
     /// Maximum tokens for responses
     #[serde(default = "default_max_tokens")]
-    pub openrouter_max_tokens: u32,
+    pub openrouter_max_tokens: u64,
     /// Maximum tool turns per message
     #[serde(default = "default_max_turns")]
-    pub agent_max_turns: u32,
+    pub agent_max_turns: usize,
     /// MCP servers configuration (YAML array)
     #[serde(default)]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
@@ -41,11 +41,11 @@ fn default_model() -> String {
     "anthropic/claude-3.7-sonnet".to_string()
 }
 
-fn default_max_tokens() -> u32 {
+fn default_max_tokens() -> u64 {
     4096
 }
 
-fn default_max_turns() -> u32 {
+fn default_max_turns() -> usize {
     50
 }
 
