@@ -1,6 +1,7 @@
 //! PeakBot library - Core functionality for connecting to MCP servers and managing tools.
 
 mod config;
+mod skills;
 mod tools;
 
 pub use config::{Config, McpServerConfig};
@@ -10,6 +11,7 @@ use rig::completion::{CompletionModel, Prompt};
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
 use rmcp::transport::TokioChildProcess;
+pub use skills::{SkillRegistry, load_default_skills};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
 };
@@ -20,11 +22,12 @@ use rig::{agent::Agent, completion::message::Message};
 use rmcp::service::ServiceExt;
 use std::io::{self, BufRead, Write};
 use std::process::Stdio;
+use tracing::debug;
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
 /// Build the system prompt dynamically with environment information
-fn build_system_prompt() -> String {
+fn build_system_prompt(skills: &SkillRegistry) -> String {
     let mut prompt = SYSTEM_PROMPT.to_string();
 
     // Get current working directory
@@ -42,13 +45,19 @@ fn build_system_prompt() -> String {
         .map(|content| format!("\n## Agents.md Content\n\n{}\n", content.trim()))
         .unwrap_or_else(|_| String::new());
 
+    // Add skills section if skills are loaded
+    let skills_section = skills.to_system_prompt_section();
+
     // Build the environment information section
     let env_info = format!(
-        "\n## Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n{}\n",
-        cwd, current_time, agents_md_content
+        "\n## Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n{}\n{}",
+        cwd, current_time, agents_md_content, skills_section
     );
 
     prompt.push_str(&env_info);
+
+    debug!("System prompt:\n {}", prompt);
+
     prompt
 }
 
@@ -73,6 +82,7 @@ pub async fn build_agent<M, Ext>(
     client: &Client<Ext>,
     config: &Config,
     mcp_server_handles: &[McpServerHandle],
+    skills: &SkillRegistry,
 ) -> Agent<M>
 where
     M: CompletionModel<Client = Client<Ext>>, //Type bending
@@ -81,8 +91,8 @@ where
     // Create completion model with configured model name
     let model_name = config.openrouter_model.clone();
 
-    // Build the system prompt dynamically with environment info
-    let system_prompt = build_system_prompt();
+    // Build the system prompt dynamically with environment info and skills
+    let system_prompt = build_system_prompt(skills);
 
     let mcp_tools = mcp_server_handles
         .iter()
@@ -109,12 +119,17 @@ where
 pub struct AgentRunner<M: CompletionModel, P: PromptHook<M>> {
     agent: Agent<M, P>,
     config: Config,
+    skills: SkillRegistry,
 }
 
 impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
     /// Create a new AgentRunner
-    pub fn new(agent: Agent<M, P>, config: Config) -> Self {
-        Self { agent, config }
+    pub fn new(agent: Agent<M, P>, config: Config, skills: SkillRegistry) -> Self {
+        Self {
+            agent,
+            config,
+            skills,
+        }
     }
 
     /// Run the interactive REPL loop
@@ -127,6 +142,12 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
                 "MCP servers: {}",
                 self.config.mcp_servers.as_ref().map_or(0, |s| s.len())
             );
+        }
+        if !self.skills.is_empty() {
+            println!("Skills: {}", self.skills.len());
+            for skill in self.skills.all() {
+                println!("  - {}: {}", skill.name, skill.description);
+            }
         }
         println!("Working directory: {}", cwd.display());
         println!("Type your message (or 'exit' to quit).\n");
