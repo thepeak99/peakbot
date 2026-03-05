@@ -147,6 +147,7 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
 pub struct McpServerHandle {
     /// The service - kept alive to maintain the connection
     /// Using type alias for the running service
+    #[allow(unused)]
     service: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
     tools: Vec<McpTool>,
     name: String,
