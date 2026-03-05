@@ -16,4 +16,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }
 chrono = "0.4"
 directories-next = "2"
+dirs = "5"
 serde_yaml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
