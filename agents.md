@@ -2,7 +2,7 @@
 
 ## Overview
 
-PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.31). It runs as a terminal REPL, backed by Anthropic's Claude Sonnet 4, equipped with filesystem and shell tools to read, write, and execute code on the user's machine.
+PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.31). It runs as a terminal REPL, backed by OpenRouter (default: Anthropic Claude 3.7 Sonnet), equipped with filesystem, shell, and web fetch tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers.
 
 ## Architecture
 
@@ -19,10 +19,10 @@ User (stdin)
                ▼
 ┌──────────────────────────────────────────────┐
 │  Rig Agent                                   │
-│  Model: claude-sonnet-4-0                    │
+│  Model: anthropic/claude-3.7-sonnet (default)│
 │  System prompt: src/system_prompt.txt        │
 │  Max tokens: 4096                            │
-│  Max tool turns per message: 15              │
+│  Max tool turns per message: 50              │
 │                                              │
 │  Agentic loop (managed by Rig):              │
 │  1. Send prompt + tool defs to Claude        │
@@ -46,28 +46,35 @@ User (stdin)
 │  │ bash        │  │ list_directory │        │
 │  │ /bin/sh -c  │  │ recursive opt  │        │
 │  └─────────────┘  └────────────────┘        │
+│  ┌─────────────┐  ┌──────────────────┐     │
+│  │ fetch_url   │  │ MCP tools        │     │
+│  │ HTTP GET    │  │ (dynamic)        │     │
+│  └─────────────┘  └──────────────────┘     │
 └──────────────────────────────────────────────┘
 ```
 
 ## Agent
 
-There is one agent. It is constructed in `src/main.rs`:
+There is one agent. It is constructed in `src/lib.rs` via the `build_agent()` function:
 
 ```rust
 let agent = client
     .agent(model_name)  // configurable via config.yaml
-    .preamble(SYSTEM_PROMPT)                        // loaded from src/system_prompt.txt
-    .max_tokens(config.openrouter.max_tokens)       // configurable via config.yaml
+    .preamble(&system_prompt)                        // built dynamically with env info
+    .max_tokens(config.openrouter_max_tokens)       // configurable via config.yaml
+    .default_max_turns(config.agent_max_turns)       // configurable via config.yaml
     .tool(FileEditTool::default())
     .tool(FileReadTool)
     .tool(BashTool)
     .tool(ListDirectoryTool)
+    .tool(FetchUrlTool)
+    .tools(mcp_tools)           // dynamically loaded from MCP servers
     .build();
 ```
 
-The agent uses **OpenRouter** as the provider (migrated from Anthropic). All settings are configurable via `config.yaml` or environment variables.
+The agent uses **OpenRouter** as the provider. All settings are configurable via `config.yaml` (in platform config directory) or environment variables (which take precedence).
 
-The agent is stateless between tool turns -- all state lives in `chat_history` (conversation memory) and `FileEditTool.file_history` (undo stack). Rig owns the agentic loop: it automatically dispatches tool calls, collects results, and loops until the model produces a text response or hits the 15-turn limit.
+The agent is stateless between tool turns -- all state lives in `chat_history` (conversation memory) and `FileEditTool.file_history` (undo stack). Rig owns the agentic loop: it automatically dispatches tool calls, collects results, and loops until the model produces a text response or hits the 50-turn limit.
 
 ## Tools
 
@@ -127,41 +134,63 @@ Lists directory contents with optional recursion.
 
 Entries are sorted alphabetically. Directories get a trailing `/`. Hidden files (`.` prefix) are skipped.
 
+### fetch_url (`src/tools/fetch_url.rs`)
+
+Fetches the content of a URL via HTTP GET request.
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `url` | required | any valid HTTP/HTTPS URL |
+
+Implementation details:
+- Uses `reqwest` for HTTP requests with a 30-second timeout.
+- Returns the HTTP status code, reason phrase, and response body.
+- Response body is truncated at 50,000 characters.
+- Sets `User-Agent: PeakBot/1.0` header.
+
 ## Data Flow
 
 1. **User types a message** in the terminal.
-2. `agent.prompt(input).with_history(&mut chat_history).max_turns(15).await` enters Rig's agentic loop.
-3. Rig builds a `CompletionRequest` with the system prompt, chat history, user message, and all 4 tool definitions (JSON Schemas).
-4. Rig sends it to Claude via the Anthropic API.
-5. Claude responds with either text (done) or tool calls.
+2. `agent.prompt(input).with_history(&mut chat_history).await` enters Rig's agentic loop (uses `default_max_turns(50)`).
+3. Rig builds a `CompletionRequest` with the system prompt, chat history, user message, and all 5 built-in tool definitions (JSON Schemas), plus any MCP tools.
+4. Rig sends it to the configured LLM via OpenRouter API.
+5. The model responds with either text (done) or tool calls.
 6. For each tool call, Rig deserializes `Args` from the JSON the model produced, calls `tool.call(args)`, and serializes `Output` back to JSON.
 7. Tool results are appended to the conversation as `ToolResult` messages.
-8. Rig sends the updated conversation back to Claude (goto step 4).
-9. When Claude produces a text response, Rig returns it to the REPL.
+8. Rig sends the updated conversation back to the model (goto step 4).
+9. When the model produces a text response, Rig returns it to the REPL.
 10. The REPL prints the response and `chat_history` now contains the full exchange for the next turn.
 
 ## Error Handling
 
 - **Tool errors** (bad path, non-unique match, timeout) are returned to the model as tool results. The model sees the error message and self-corrects. These do not crash the agent.
 - **API errors** (auth failure, network) surface as `PromptError` and are printed in the REPL. The loop continues.
-- **Max turns exceeded** means the model used all 15 tool rounds without producing a final answer. Printed as an error; the user can retry or rephrase.
+- **Max turns exceeded** means the model used all 50 tool rounds without producing a final answer. Printed as an error; the user can retry or rephrase.
 
 ## Configuration
 
 | Setting | Value | Where |
 |---------|-------|-------|
-| Model | `claude-sonnet-4-0` | `src/main.rs:24` |
-| Max tokens | 4096 | `src/main.rs:26` |
-| Max tool turns | 15 | `src/main.rs:59` |
-| Output truncation | 10,000 chars | each tool file |
-| Bash timeout | 30s default, 120s max | `src/tools/bash.rs:9-10` |
-| Recursive dir depth | 3 | `src/tools/list_directory.rs:77` |
+| Model | `anthropic/claude-3.7-sonnet` | `src/config.rs:41` (default) |
+| Max tokens | 4096 | `src/config.rs:45` (default) |
+| Max tool turns | 50 | `src/config.rs:49` (default) |
+| Output truncation (file tools) | 10,000 chars | each tool file |
+| Output truncation (fetch_url) | 50,000 chars | `src/tools/fetch_url.rs:5` |
+| Bash timeout | 30s default, 120s max | `src/tools/bash.rs` |
 
-Environment: set `ANTHROPIC_API_KEY` before running.
+Configuration is loaded from `config.yaml` in the platform config directory, with environment variables taking precedence.
+
+| Environment Variable | Default |
+|---------------------|---------|
+| `OPENROUTER_API_KEY` | (required) |
+| `OPENROUTER_MODEL` | `anthropic/claude-3.7-sonnet` |
+| `OPENROUTER_MAX_TOKENS` | `4096` |
+| `AGENT_MAX_TURNS` | `50` |
+| `MCP_SERVERS` | (none) |
 
 ## Extending
 
-### Adding a new tool
+### Adding a new built-in tool
 
 1. Create `src/tools/my_tool.rs`
 2. Define `MyToolArgs` (derive `Deserialize`), `MyToolError` (derive `thiserror::Error`), and `MyTool` (derive `Serialize, Deserialize`)
@@ -170,11 +199,30 @@ Environment: set `ANTHROPIC_API_KEY` before running.
    - Return a `ToolDefinition` with JSON Schema in `definition()`
    - Implement logic in `call()`
 4. Add `mod my_tool;` and `pub use my_tool::MyTool;` in `src/tools/mod.rs`
-5. Add `.tool(MyTool)` to the agent builder in `src/main.rs`
+5. Add `.tool(MyTool)` to the agent builder in `src/lib.rs:build_agent()`
+
+### Adding MCP tools
+
+Instead of building tools into the binary, you can configure external MCP (Model Context Protocol) servers. Tools from MCP servers are dynamically loaded at runtime:
+
+```yaml
+# config.yaml
+mcp_servers:
+  - name: filesystem
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+```
+
+Or via environment variable (JSON format):
+```bash
+export MCP_SERVERS='[{"name":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/path/to/dir"]}]'
+```
+
+MCP tools are automatically wrapped with `LoggingToolDyn` for tracing.
 
 ### Switching models
 
-Change the model in `config.yaml` or set the `PEAKBOT_OPENROUTER_MODEL` environment variable. Find models at https://openrouter.ai/models.
+Change the model in `config.yaml` or set the `OPENROUTER_MODEL` environment variable. Find models at https://openrouter.ai/models.
 
 Example models:
 - `anthropic/claude-3.7-sonnet` (default)
@@ -207,24 +255,17 @@ let main_agent = client
 
 ```
 src/
-├── main.rs                 # Agent construction, REPL loop, entry point
-├── config.rs               # Configuration loading from config.yaml
+├── main.rs                 # Entry point, creates AgentRunner
+├── lib.rs                  # Agent construction, REPL loop, MCP server handling
+├── config.rs               # Configuration loading from config.yaml + env vars
 ├── system_prompt.txt       # System prompt (included at compile time)
 └── tools/
-    ├── mod.rs              # Re-exports: BashTool, FileEditTool, FileReadTool, ListDirectoryTool
-    ├── file_edit.rs        # FileEditTool -- view/create/str_replace/insert (437 lines)
-    ├── file_read.rs        # FileReadTool -- read with line ranges (122 lines)
-    ├── bash.rs             # BashTool -- shell execution with timeout (120 lines)
-    └── list_directory.rs   # ListDirectoryTool -- dir listing with recursion (127 lines)
+    ├── mod.rs              # Re-exports: BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn
+    ├── bash.rs             # BashTool -- shell execution with timeout
+    ├── fetch_url.rs        # FetchUrlTool -- HTTP GET requests
+    ├── file_edit.rs        # FileEditTool -- view/create/str_replace/insert
+    ├── file_read.rs        # FileReadTool -- read with line ranges
+    ├── list_directory.rs   # ListDirectoryTool -- dir listing with recursion
+    └── logging_wrapper.rs  # LoggingToolDyn -- wrapper for MCP tool tracing
 ```
 
-## Configuration
-
-All settings are managed via environment variables:
-
-| Environment Variable | Default |
-|---------------------|---------|
-| `OPENROUTER_API_KEY` | (required) |
-| `OPENROUTER_MODEL` | `anthropic/claude-3.7-sonnet` |
-| `OPENROUTER_MAX_TOKENS` | `4096` |
-| `AGENT_MAX_TURNS` | `15` |
