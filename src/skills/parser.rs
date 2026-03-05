@@ -128,12 +128,13 @@ pub fn parse_skill_file(skill_dir: &Path) -> Result<Skill> {
     }
 
     let content = fs::read_to_string(&skill_md_path)?;
-    parse_skill_content(skill_dir, &content)
+    parse_skill_content(skill_dir, &content, &skill_md_path)
 }
 
 /// Parse SKILL.md content and return a Skill struct
-pub fn parse_skill_content(skill_dir: &Path, content: &str) -> Result<Skill> {
-    let (yaml_str, body) = parse_frontmatter(content)?;
+/// Note: This does NOT load the body - the body will be loaded by the model when required
+pub fn parse_skill_content(skill_dir: &Path, content: &str, skill_md_path: &Path) -> Result<Skill> {
+    let (yaml_str, _body) = parse_frontmatter(content)?;
 
     let frontmatter: SkillFrontmatter = serde_yaml::from_str(&yaml_str)
         .map_err(|e| anyhow!("Failed to parse YAML frontmatter: {}", e))?;
@@ -153,7 +154,7 @@ pub fn parse_skill_content(skill_dir: &Path, content: &str) -> Result<Skill> {
         license: frontmatter.license,
         compatibility: frontmatter.compatibility,
         allowed_tools: frontmatter.allowed_tools,
-        body: body.to_string(),
+        skill_md: skill_md_path.to_path_buf(),
         scripts,
         references,
         assets,
@@ -254,6 +255,11 @@ This is the body content.
         assert_eq!(skill.name, "my-skill");
         assert_eq!(skill.description, "A test skill for unit testing");
         assert_eq!(skill.license, Some("MIT".to_string()));
-        assert!(skill.body.contains("My Skill"));
+        assert!(
+            skill
+                .skill_md
+                .to_string_lossy()
+                .contains("my-skill/SKILL.md")
+        );
     }
 }

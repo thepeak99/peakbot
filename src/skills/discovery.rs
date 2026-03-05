@@ -8,11 +8,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const PROMPT: &str = r#"
+# Skills
 You can use skills.
 
 Skills are organized in folders. Each folder contains a `SKILL.md` file describing the capability, when to use it, required inputs, and usage instructions. **You do not load skill documentation by default** — only read a `SKILL.md` when you've determined a skill is likely relevant.
 
-## Workflow
+# Workflow
 
 1. Read the user's request and identify what kind of task it is.
 2. Scan the available skill list and check if any skill plausibly applies.
@@ -21,12 +22,14 @@ Skills are organized in folders. Each folder contains a `SKILL.md` file describi
 5. If multiple skills seem relevant, load all candidates before starting the task.
 6. If no skill applies, complete the task using permanently available tools (e.g. MCPs, built-in functions) or your own reasoning.
 
-## Guidelines
+# Guidelines
 
 - Never assume how a skill works — always read its `SKILL.md` first.
 - When in doubt whether a skill applies, load it. Reading is cheap; doing the wrong thing isn't.
 - Follow `SKILL.md` instructions exactly — they encode hard-won best practices.
 - If a task could chain multiple skills together, plan the full sequence before starting.
+
+# Available skills
 "#;
 
 /// Registry of loaded skills
@@ -108,11 +111,15 @@ impl SkillRegistry {
             return String::new();
         }
 
-        let mut section = String::from("\n## Available Skills\n\n");
-        section.push_str(PROMPT);
+        let mut section = PROMPT.to_owned();
 
         for skill in self.skills.values() {
-            section.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
+            section.push_str(&format!(
+                "- {}: `{}` - {}\n",
+                skill.name,
+                skill.skill_md.to_string_lossy(),
+                skill.description,
+            ));
             if let Some(tools) = &skill.allowed_tools {
                 section.push_str(&format!("  - Allowed tools: `{}`\n", tools));
             }

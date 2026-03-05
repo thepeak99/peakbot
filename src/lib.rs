@@ -17,6 +17,7 @@ pub use tools::{
 };
 
 use anyhow::{Result, anyhow};
+use core::prelude;
 use rig::providers::openrouter;
 use rig::{agent::Agent, completion::message::Message};
 use rmcp::service::ServiceExt;
@@ -42,7 +43,7 @@ fn build_system_prompt(skills: &SkillRegistry) -> String {
 
     // Try to read agents.md if it exists
     let agents_md_content = std::fs::read_to_string("agents.md")
-        .map(|content| format!("\n## Agents.md Content\n\n{}\n", content.trim()))
+        .map(|content| format!("\n# Agents.md Content\n\n--------------------------------------------------------\n{}\n", content.trim()))
         .unwrap_or_else(|_| String::new());
 
     // Add skills section if skills are loaded
@@ -50,11 +51,13 @@ fn build_system_prompt(skills: &SkillRegistry) -> String {
 
     // Build the environment information section
     let env_info = format!(
-        "\n## Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n{}\n{}",
-        cwd, current_time, agents_md_content, skills_section
+        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n",
+        cwd, current_time
     );
 
+    prompt.push_str(&skills_section);
     prompt.push_str(&env_info);
+    prompt.push_str(&agents_md_content);
 
     debug!("System prompt:\n {}", prompt);
 
