@@ -154,6 +154,11 @@ pub struct McpServerHandle {
 }
 
 impl McpServerHandle {
+    /// Get the tools from this MCP server handle
+    pub fn tools(&self) -> &[McpTool] {
+        &self.tools
+    }
+
     fn dyn_tools(&self) -> Vec<Box<dyn ToolDyn>> {
         self.tools
             .iter()
@@ -248,118 +253,118 @@ pub async fn load_mcp_servers(config: &Config) -> Result<Vec<McpServerHandle>> {
     Ok(handles)
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use std::collections::HashMap;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
 
-//     /// Test that connect_mcp_server handles an invalid command gracefully
-//     #[tokio::test]
-//     async fn test_connect_mcp_server_invalid_command() {
-//         let mut env = HashMap::new();
-//         env.insert("TEST_VAR".to_string(), "test_value".to_string());
+    /// Test that connect_mcp_server handles an invalid command gracefully
+    #[tokio::test]
+    async fn test_connect_mcp_server_invalid_command() {
+        let mut env = HashMap::new();
+        env.insert("TEST_VAR".to_string(), "test_value".to_string());
 
-//         let config = McpServerConfig {
-//             name: "test_invalid".to_string(),
-//             command: "nonexistent_command_xyz123".to_string(),
-//             args: None,
-//             env: Some(env),
-//         };
+        let config = McpServerConfig {
+            name: "test_invalid".to_string(),
+            command: "nonexistent_command_xyz123".to_string(),
+            args: None,
+            env: Some(env),
+        };
 
-//         let result = connect_mcp_server(&config).await;
-//         assert!(result.is_err(), "Expected error for invalid command");
-//     }
+        let result = connect_mcp_server(&config).await;
+        assert!(result.is_err(), "Expected error for invalid command");
+    }
 
-//     /// Test that connect_mcp_server works with a real MCP server
-//     #[tokio::test]
-//     async fn test_connect_mcp_server_hello() {
-//         let config = McpServerConfig {
-//             name: "hello-mcp-server".to_string(),
-//             command: "uvx".to_string(),
-//             args: Some(vec![
-//                 "--from".to_string(),
-//                 "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
-//                 "hello-mcp-server".to_string(),
-//             ]),
-//             env: None,
-//         };
+    /// Test that connect_mcp_server works with a real MCP server
+    #[tokio::test]
+    async fn test_connect_mcp_server_hello() {
+        let config = McpServerConfig {
+            name: "hello-mcp-server".to_string(),
+            command: "uvx".to_string(),
+            args: Some(vec![
+                "--from".to_string(),
+                "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
+                "hello-mcp-server".to_string(),
+            ]),
+            env: None,
+        };
 
-//         let result = connect_mcp_server(&config).await;
+        let result = connect_mcp_server(&config).await;
 
-//         // This should succeed and return a handle with tools
-//         let handle = result.expect("Failed to connect to hello-mcp-server");
-//         let tools = handle.tools();
-//         assert!(!tools.is_empty(), "Expected at least one tool");
+        // This should succeed and return a handle with tools
+        let handle = result.expect("Failed to connect to hello-mcp-server");
+        let tools = handle.tools();
+        assert!(!tools.is_empty(), "Expected at least one tool");
 
-//         println!("Connected to hello-mcp-server with {} tools", tools.len());
-//     }
+        println!("Connected to hello-mcp-server with {} tools", tools.len());
+    }
 
-//     /// Test that connect_mcp_server works with environment variables
-//     #[tokio::test]
-//     async fn test_connect_mcp_server_with_env() {
-//         let mut env = HashMap::new();
-//         env.insert("TEST_ENV_VAR".to_string(), "test_value".to_string());
+    /// Test that connect_mcp_server works with environment variables
+    #[tokio::test]
+    async fn test_connect_mcp_server_with_env() {
+        let mut env = HashMap::new();
+        env.insert("TEST_ENV_VAR".to_string(), "test_value".to_string());
 
-//         let config = McpServerConfig {
-//             name: "hello-mcp-server-with-env".to_string(),
-//             command: "uvx".to_string(),
-//             args: Some(vec![
-//                 "--from".to_string(),
-//                 "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
-//                 "hello-mcp-server".to_string(),
-//             ]),
-//             env: Some(env),
-//         };
+        let config = McpServerConfig {
+            name: "hello-mcp-server-with-env".to_string(),
+            command: "uvx".to_string(),
+            args: Some(vec![
+                "--from".to_string(),
+                "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
+                "hello-mcp-server".to_string(),
+            ]),
+            env: Some(env),
+        };
 
-//         let result = connect_mcp_server(&config).await;
-//         let handle = result.expect("Failed to connect to hello-mcp-server with env vars");
-//         let tools = handle.tools();
+        let result = connect_mcp_server(&config).await;
+        let handle = result.expect("Failed to connect to hello-mcp-server with env vars");
+        let tools = handle.tools();
 
-//         assert!(
-//             !tools.is_empty(),
-//             "Expected at least one tool with custom env"
-//         );
-//     }
+        assert!(
+            !tools.is_empty(),
+            "Expected at least one tool with custom env"
+        );
+    }
 
-//     /// Test that we can actually call a tool on the MCP server
-//     /// This is the key test - keeping the service alive while calling tools
-//     #[tokio::test]
-//     async fn test_connect_mcp_server_call_tool() {
-//         let config = McpServerConfig {
-//             name: "hello-mcp-server".to_string(),
-//             command: "uvx".to_string(),
-//             args: Some(vec![
-//                 "--from".to_string(),
-//                 "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
-//                 "hello-mcp-server".to_string(),
-//             ]),
-//             env: None,
-//         };
+    /// Test that we can actually call a tool on the MCP server
+    /// This is the key test - keeping the service alive while calling tools
+    #[tokio::test]
+    async fn test_connect_mcp_server_call_tool() {
+        let config = McpServerConfig {
+            name: "hello-mcp-server".to_string(),
+            command: "uvx".to_string(),
+            args: Some(vec![
+                "--from".to_string(),
+                "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
+                "hello-mcp-server".to_string(),
+            ]),
+            env: None,
+        };
 
-//         // Connect and get the handle (which keeps the service alive)
-//         let handle = connect_mcp_server(&config)
-//             .await
-//             .expect("Failed to connect to hello-mcp-server");
+        // Connect and get the handle (which keeps the service alive)
+        let handle = connect_mcp_server(&config)
+            .await
+            .expect("Failed to connect to hello-mcp-server");
 
-//         // Get tools from the handle - the service is kept alive by the handle
-//         let tools = handle.tools();
-//         assert!(!tools.is_empty(), "Expected at least one tool");
+        // Get tools from the handle - the service is kept alive by the handle
+        let tools = handle.tools();
+        assert!(!tools.is_empty(), "Expected at least one tool");
 
-//         // Call the first tool
-//         let first_tool = &tools[0];
-//         println!("Calling tool: {}", first_tool.name());
+        // Call the first tool
+        let first_tool = &tools[0];
+        println!("Calling tool: {}", first_tool.name());
 
-//         let result = first_tool
-//             .call("{}".to_string())
-//             .await
-//             .expect("Failed to call tool");
+        let result = first_tool
+            .call("{}".to_string())
+            .await
+            .expect("Failed to call tool");
 
-//         println!("Tool call result: {:?}", result);
+        println!("Tool call result: {:?}", result);
 
-//         // Verify we got a response
-//         assert!(
-//             !result.is_empty(),
-//             "Expected non-empty result from tool call"
-//         );
-//     }
-// }
+        // Verify we got a response
+        assert!(
+            !result.is_empty(),
+            "Expected non-empty result from tool call"
+        );
+    }
+}
