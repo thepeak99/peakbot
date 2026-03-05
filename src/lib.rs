@@ -17,7 +17,6 @@ pub use tools::{
 };
 
 use anyhow::{Result, anyhow};
-use core::prelude;
 use rig::providers::openrouter;
 use rig::{agent::Agent, completion::message::Message};
 use rmcp::service::ServiceExt;
@@ -99,8 +98,7 @@ where
 
     let mcp_tools = mcp_server_handles
         .iter()
-        .map(|handle| handle.dyn_tools())
-        .flatten()
+        .flat_map(|handle| handle.dyn_tools())
         .collect();
 
     // Build the agent with all tools

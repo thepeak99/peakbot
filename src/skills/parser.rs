@@ -10,11 +10,13 @@ use thiserror::Error;
 
 /// Validation errors for skill fields
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum ValidationError {
     #[error("Invalid skill name '{name}': {reason}")]
     InvalidName { name: String, reason: String },
     #[error("Invalid description: {0}")]
     InvalidDescription(String),
+    // MissingField is reserved for future use
     #[error("Missing required field: {0}")]
     MissingField(String),
 }
@@ -173,10 +175,10 @@ fn index_directory(skill_dir: &Path, subdir: &str) -> HashMap<String, PathBuf> {
 
     if let Ok(entries) = fs::read_dir(&subdir_path) {
         for entry in entries.flatten() {
-            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                if let Some(name) = entry.file_name().to_str() {
-                    result.insert(name.to_string(), entry.path());
-                }
+            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                && let Some(name) = entry.file_name().to_str()
+            {
+                result.insert(name.to_string(), entry.path());
             }
         }
     }
