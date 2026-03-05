@@ -23,6 +23,35 @@ use std::process::Stdio;
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
+/// Build the system prompt dynamically with environment information
+fn build_system_prompt() -> String {
+    let mut prompt = SYSTEM_PROMPT.to_string();
+
+    // Get current working directory
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
+
+    // Get current time
+    let current_time = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string();
+
+    // Try to read agents.md if it exists
+    let agents_md_content = std::fs::read_to_string("agents.md")
+        .map(|content| format!("\n## Agents.md Content\n\n{}\n", content.trim()))
+        .unwrap_or_else(|_| String::new());
+
+    // Build the environment information section
+    let env_info = format!(
+        "\n## Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n{}\n",
+        cwd, current_time, agents_md_content
+    );
+
+    prompt.push_str(&env_info);
+    prompt
+}
+
 /// Create the OpenRouter client from config
 pub fn create_openrouter_client(config: &Config) -> Result<openrouter::Client> {
     let api_key = config.openrouter_api_key.clone().unwrap_or_default();
@@ -52,8 +81,8 @@ where
     // Create completion model with configured model name
     let model_name = config.openrouter_model.clone();
 
-    // Use embedded system prompt
-    let system_prompt = SYSTEM_PROMPT;
+    // Build the system prompt dynamically with environment info
+    let system_prompt = build_system_prompt();
 
     let mcp_tools = mcp_server_handles
         .iter()
@@ -64,7 +93,7 @@ where
     // Build the agent with all tools
     client
         .agent(model_name)
-        .preamble(system_prompt)
+        .preamble(&system_prompt)
         .max_tokens(config.openrouter_max_tokens)
         .default_max_turns(config.agent_max_turns)
         .tool(FileEditTool::default())
