@@ -1,8 +1,7 @@
 // Use the library crate (defined in lib.rs)
 use anyhow::Result;
 use peakbot::{
-    AgentRunner, BashTool, Config, FetchUrlTool, FileEditTool, FileReadTool,
-    ListDirectoryTool, build_agent, create_openrouter_client, load_mcp_servers,
+    AgentRunner, Config, build_agent, create_openrouter_client, load_mcp_servers,
 };
 use tracing_subscriber::EnvFilter;
 
