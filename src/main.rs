@@ -22,11 +22,6 @@ async fn main() -> Result<()> {
     // Load skills from default locations (~/.agents/skills and ./.agents/skills)
     let skills = load_default_skills()?;
 
-    // Report loaded skills
-    if !skills.is_empty() {
-        tracing::info!("Loaded {} skill(s)", skills.len());
-    }
-
     // Load MCP servers (handles kept alive by McpServers)
     let mcp_servers = load_mcp_servers(&config).await?;
 
