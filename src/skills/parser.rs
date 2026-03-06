@@ -10,15 +10,11 @@ use thiserror::Error;
 
 /// Validation errors for skill fields
 #[derive(Error, Debug)]
-#[allow(dead_code)]
 pub enum ValidationError {
     #[error("Invalid skill name '{name}': {reason}")]
     InvalidName { name: String, reason: String },
     #[error("Invalid description: {0}")]
     InvalidDescription(String),
-    // MissingField is reserved for future use
-    #[error("Missing required field: {0}")]
-    MissingField(String),
 }
 
 /// YAML frontmatter structure matching the Agent Skills spec

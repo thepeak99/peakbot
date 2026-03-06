@@ -143,9 +143,22 @@ impl Tool for BashTool {
 
 fn maybe_truncate(s: &str) -> String {
     if s.len() > MAX_OUTPUT_CHARS {
+        // Safely truncate at the nearest character boundary to avoid
+        // panicking on multi-byte UTF-8 characters (e.g., '─' = 3 bytes)
+        let truncate_at = s
+            .get(..MAX_OUTPUT_CHARS)
+            .map(|sub| sub.len())
+            .unwrap_or_else(|| {
+                // Byte index wasn't a char boundary, find the nearest one below
+                let mut boundary = MAX_OUTPUT_CHARS;
+                while !s.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                boundary
+            });
         format!(
             "{}... [truncated, {} total chars]",
-            &s[..MAX_OUTPUT_CHARS],
+            &s[..truncate_at],
             s.len()
         )
     } else {
