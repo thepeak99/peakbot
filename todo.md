@@ -140,10 +140,6 @@ As a model, I want a "think" tool that allows me to:
   - Mistakes are costly and you want to verify your approach
   ```
 
-#### 2.4 Optional: Extended Prompt for Specific Domains
-- [ ] Consider adding domain-specific thinking examples to system prompt
-- [ ] This follows Anthropic's recommendation for complex domains
-
 #### 2.5 Testing
 - [x] Test tool is callable and returns thought
 - [x] Verify it appears in tool definitions sent to model
@@ -558,6 +554,49 @@ Some tasks have dependencies on others:
 5. Task 7 (Context Compaction) - Uses token counting from 3
 6. Task 1 (Dynamic MCP) - Independent but uses similar patterns
 7. Task 5 (Ollama) - Independent, can be done anytime
+
+---
+
+## Task 8: Domain-Specific Thinking Prompts
+
+### Overview
+Add domain-specific thinking examples to the system prompt to help the model use the think tool more effectively in complex domains. This follows Anthropic's recommendation for complex domains where structured thinking examples can significantly improve reasoning quality.
+
+### User Story
+As a model, I want domain-specific guidance and examples for using the think tool so that I can:
+- Apply appropriate reasoning frameworks for different task types
+- Know what to look for when analyzing domain-specific problems
+- Follow best practices for complex decision-making in specialized areas
+
+### Implementation Details
+
+#### 8.1 Analyze Common Task Domains
+- [ ] Identify key domains where PeakBot operates (e.g., code review, bug fixing, refactoring, documentation)
+- [ ] For each domain, determine the typical reasoning patterns needed
+
+#### 8.2 Create Domain-Specific Thinking Guides
+- [ ] Add thinking templates/examples for code review:
+  - What to look for in security, performance, readability
+  - How to prioritize issues found
+  - When to suggest vs. mandate changes
+- [ ] Add thinking templates/examples for bug fixing:
+  - Reproducing the issue
+  - Identifying root cause vs. symptoms
+  - Evaluating fix approaches
+- [ ] Add thinking templates/examples for refactoring:
+  - Understanding the current design
+  - Identifying code smells
+  - Planning incremental changes
+
+#### 8.3 Update System Prompt
+- [ ] Add "Domain-Specific Thinking Guides" section to system prompt
+- [ ] Include examples for each identified domain
+- [ ] Make it clear these are optional frameworks to consider
+
+#### 8.4 Testing
+- [ ] Verify the thinking guides don't overwhelm the prompt
+- [ ] Test that the model appropriately uses domain-specific frameworks
+- [ ] Gather feedback on reasoning quality improvements
 
 ---
 
