@@ -14,6 +14,7 @@ use rmcp::transport::TokioChildProcess;
 pub use skills::{SkillRegistry, load_default_skills};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
+    ThinkTool,
 };
 
 use anyhow::{Result, anyhow};
@@ -112,6 +113,7 @@ where
         .tool(BashTool)
         .tool(ListDirectoryTool)
         .tool(FetchUrlTool)
+        .tool(ThinkTool)
         .tools(mcp_tools)
         .build()
 }

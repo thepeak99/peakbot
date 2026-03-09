@@ -7,7 +7,7 @@ use tokio::process::Command;
 
 const MAX_OUTPUT_CHARS: usize = 10_000;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const MAX_TIMEOUT_SECS: u64 = 120;
+const MAX_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BashError {
