@@ -530,32 +530,7 @@ As a user, I want to have long conversations without hitting context window limi
 - [ ] Test edge cases (empty history, very long messages)
 - [ ] Test with various model context sizes
 
----
-
-## Dependencies and Ordering
-
-Some tasks have dependencies on others:
-
-| Task | Depends On |
-|------|------------|
-| 1 (Dynamic MCP) | - |
-| 2 (Think Tool) | - |
-| 3 (Token Hook) | - |
-| 4 (Logging Hooks) | 3 (uses PromptHook) |
-| 5 (Ollama) | - |
-| 6 (Debug ApiResponse) | - |
-| 7 (Context Compaction) | 3 (token counting) |
-
-**Recommended implementation order:**
-1. Task 6 (Debug ApiResponse) - Fix existing bug
-2. Task 2 (Think Tool) - Simple, good warm-up
-3. Task 3 (Token Counting) - Foundation for 4 and 7
-4. Task 4 (Logging Refactor) - Benefits from 3
-5. Task 7 (Context Compaction) - Uses token counting from 3
-6. Task 1 (Dynamic MCP) - Independent but uses similar patterns
-7. Task 5 (Ollama) - Independent, can be done anytime
-
----
+--- 
 
 ## Task 8: Domain-Specific Thinking Prompts
 
@@ -598,6 +573,465 @@ As a model, I want domain-specific guidance and examples for using the think too
 - [ ] Test that the model appropriately uses domain-specific frameworks
 - [ ] Gather feedback on reasoning quality improvements
 
+---
+
+## Task 9: Web Search Tool with SearXNG
+
+### Overview
+Implement a web search tool that uses a user-configured SearXNG instance. SearXNG is a self-hosted metasearch engine that provides privacy-respecting web search without sending data to commercial search providers.
+
+### User Story
+As a user, I want to search the web through my own SearXNG instance so that:
+1. I can get search results while maintaining privacy
+2. I avoid rate limits or costs from commercial search APIs
+3. I have control over the search engine configuration
+
+### Implementation Details
+
+#### 9.1 Add SearXNG Configuration
+- [ ] Add new config section in `Config`:
+  ```rust
+  #[serde(default)]
+  pub searxng: Option<SearXngConfig>,
+  
+  #[derive(Debug, Deserialize, Clone, Default)]
+  pub struct SearXngConfig {
+      /// Base URL of the SearXNG instance (e.g., "https://searx.example.com")
+      pub base_url: String,
+      /// Enable/disable search (default: true)
+      #[serde(default = "default_true")]
+      pub enabled: bool,
+  }
+  
+  fn default_true() -> bool {
+      true
+  }
+  ```
+- [ ] Add environment variables:
+  - `SEARXNG_BASE_URL`
+  - `SEARXNG_ENABLED`
+
+#### 9.2 Create Search Tool
+- [ ] Create new tool `src/tools/search.rs` implementing `rig::tool::Tool`
+- [ ] Tool name: `search`
+- [ ] Input schema:
+  ```json
+  {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "The search query to send to SearXNG"
+      },
+      "num_results": {
+        "type": "integer",
+        "description": "Maximum number of results to return",
+        "default": 10
+      }
+    },
+    "required": ["query"]
+  }
+  ```
+- [ ] Behavior:
+  1. Send GET request to `{base_url}/search?q={query}&format=json`
+  2. Parse JSON response
+  3. Return formatted results with title, url, and snippet
+
+#### 9.3 Error Handling
+- [ ] Handle connection errors (instance unreachable)
+- [ ] Handle SearXNG-specific errors (blocked, rate limited)
+- [ ] Add timeout (default 30 seconds)
+- [ ] Return helpful error messages
+
+#### 9.4 Add Search Tool to Agent
+- [ ] Import and add `SearchTool` to agent in `build_agent()`
+- [ ] Only add if SearXNG is configured
+
+#### 9.5 Update System Prompt
+- [ ] Add section explaining when to use the search tool:
+  ```
+  ## Using the search tool
+  
+  Use the search tool to:
+  - Find up-to-date information on topics
+  - Look up documentation or references
+  - Research solutions to problems
+  - Get current information the model might not have
+  
+  Results come from your configured SearXNG instance.
+  ```
+
+#### 9.6 Testing
+- [ ] Test connection to a SearXNG instance
+- [ ] Test search query returns results
+- [ ] Test error handling when instance is unreachable
+- [ ] Test with various query types
+
+---
+
+## Task 10: LLM Timeout and Retry Handling
+
+### Overview
+Implement configurable timeout and automatic retry with exponential backoff for LLM API requests. Currently, if an API call times out or fails transiently, the user receives an error with no automatic recovery. Adding timeout and retry logic will improve reliability and user experience.
+
+### Investigation Results
+
+#### Existing rig-core functionality:
+- rig-core has a retry module (`http_client/retry.rs`) with `ExponentialBackoff`, `Constant`, and `Never` policies
+- These are primarily designed for SSE/event source reconnection, not completion request retries
+- No built-in timeout configuration for LLM API requests in rig-core
+
+#### Recommended approach:
+Since rig-core doesn't expose retry logic for completion requests, implement timeout and retry at the application level in the REPL loop where `agent.prompt()` is called.
+
+### Implementation Details
+
+#### 10.1 Add LLM Configuration to Config
+- [ ] Add new `llm` config section in `src/config.rs`:
+  ```rust
+  #[serde(default)]
+  pub llm: Option<LlmConfig>,
+
+  #[derive(Debug, Deserialize, Clone, Default)]
+  pub struct LlmConfig {
+      /// Request timeout in seconds (default: 120)
+      #[serde(default = "default_llm_timeout")]
+      pub timeout_seconds: u64,
+      /// Maximum number of retries (default: 3)
+      #[serde(default = "default_max_retries")]
+      pub max_retries: u32,
+      /// Initial retry delay in seconds (default: 1)
+      #[serde(default = "default_retry_delay")]
+      pub retry_delay_seconds: u64,
+      /// Maximum retry delay in seconds (default: 30)
+      #[serde(default = "default_max_retry_delay")]
+      pub max_retry_delay_seconds: u64,
+  }
+  ```
+- [ ] Add environment variables:
+  - `LLM_TIMEOUT_SECONDS`
+  - `LLM_MAX_RETRIES`
+  - `LLM_RETRY_DELAY_SECONDS`
+  - `LLM_MAX_RETRY_DELAY_SECONDS`
+
+#### 10.2 Create Retry Logic Module
+- [ ] Create `src/retry.rs` with:
+  ```rust
+  pub struct RetryConfig {
+      pub max_retries: u32,
+      pub initial_delay: Duration,
+      pub max_delay: Duration,
+      pub multiplier: f64,
+  }
+
+  impl RetryConfig {
+      pub fn calculate_delay(&self, attempt: u32) -> Duration {
+          // exponential backoff: initial_delay * (multiplier ^ attempt)
+      }
+  }
+
+  /// Errors that should trigger a retry
+  fn is_retryable_error(error: &rig::completion::CompletionError) -> bool {
+      match error {
+          // Network errors, timeouts, 5xx errors, rate limits (429), etc.
+          CompletionError::Request(_) => true,  // Network issues
+          CompletionError::ApiError(status, _) if status.as_u16() >= 500 => true,
+          CompletionError::ApiError(status, _) if status.as_u16() == 429 => true,
+          _ => false,
+      }
+  }
+  ```
+
+#### 10.3 Update AgentRunner to Use Retry Logic
+- [ ] Modify `run()` method in `src/lib.rs` to:
+  1. Wrap `agent.prompt()` call with retry logic
+  2. Apply timeout using `tokio::time::timeout`
+  3. On timeout: return user-friendly error, don't retry (user can increase timeout)
+  4. On retryable error: wait with exponential backoff, then retry
+  5. On non-retryable error: return immediately
+  6. After max retries exhausted: return final error with retry count info
+
+- [ ] Example flow:
+  ```
+  User input
+      │
+      ▼
+  Attempt 1 ──► API call with timeout
+      │
+      ├─► Success ──► Return response
+      │
+      ├─► Timeout ──► Error (don't retry)
+      │
+      ├─► Retryable error ──► Wait (backoff) ──► Attempt 2
+      │                                                  │
+      │                                                  ├─► Success
+      │                                                  │
+      │                                                  ├─► Retryable ──► Wait ──► Attempt 3
+      │                                                  │
+      │                                                  └─► Max retries ──► Error
+      │
+      └─► Non-retryable error ──► Error
+  ```
+
+#### 10.4 Add User Feedback
+- [ ] Show retry attempts in output:
+  ```
+  [Request failed, retrying in 2s... (attempt 2/3)]
+  [Request failed, retrying in 4s... (attempt 3/3)]
+  ```
+- [ ] Add `/retry` command to manually retry last failed request
+- [ ] Log retry attempts at debug/info level
+
+#### 10.5 Configure Default Behavior
+- [ ] Set sensible defaults:
+  - Timeout: 120 seconds (LLM requests can be slow)
+  - Max retries: 3
+  - Initial delay: 1 second
+  - Max delay: 30 seconds
+  - Multiplier: 2x (exponential)
+
+#### 10.6 Testing
+- [ ] Test timeout triggers correctly
+- [ ] Test retry on network errors
+- [ ] Test no retry on non-retryable errors (auth failures, invalid requests)
+- [ ] Test exponential backoff timing
+- [ ] Test max retries limit
+- [ ] Test with various error types from OpenRouter
+
+#### 10.7 Documentation
+- [ ] Update `agents.md` with LLM retry configuration
+- [ ] Document which errors trigger retries
+
+---
+
+## Task 11: Fetch Markdown Tool
+
+### Overview
+Implement a tool to fetch web pages and convert them to Markdown format for efficient parsing and reading. Unlike the existing `fetch_url` tool that returns HTML, this tool uses a Markdown conversion library to provide clean, readable content.
+
+### User Story
+As a model, I want to fetch web pages as Markdown so that:
+1. I can parse and extract information more efficiently
+2. The content is cleaner without HTML noise
+3. I can better understand document structure (headings, lists, etc.)
+
+### Implementation Details
+
+#### 11.1 Create FetchMarkdown Tool
+- [ ] Create new tool `src/tools/fetch_markdown.rs` implementing `rig::tool::Tool`
+- [ ] Tool name: `fetch_markdown`
+- [ ] Input schema:
+  ```json
+  {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "The URL to fetch and convert to Markdown"
+      }
+    },
+    "required": ["url"]
+  }
+  ```
+
+#### 11.2 Implement Markdown Conversion
+- [ ] Use a crate like `html2md` or `pulldown-cmark` for conversion
+- [ ] Add dependency to `Cargo.toml`:
+  ```toml
+  html2md = "0.3"
+  ```
+- [ ] Implement conversion:
+  1. Fetch HTML via reqwest (like fetch_url)
+  2. Convert HTML to Markdown using conversion library
+  3. Return clean Markdown content
+
+#### 11.3 Content Processing
+- [ ] Remove scripts and styles
+- [ ] Preserve headings (h1-h6)
+- [ ] Preserve links and images (as Markdown syntax)
+- [ ] Preserve code blocks with language hints
+- [ ] Handle tables (convert to Markdown tables if possible)
+- [ ] Truncate at 50,000 characters (like fetch_url)
+
+#### 11.4 Add FetchMarkdown Tool to Agent
+- [ ] Import and add `FetchMarkdownTool` to agent in `build_agent()`
+
+#### 11.5 Update System Prompt
+- [ ] Add section explaining when to use fetch_markdown:
+  ```
+  ## Using the fetch_markdown tool
+  
+  Use fetch_markdown instead of fetch_url when you need to:
+  - Parse and extract information from web pages
+  - Read documentation or articles
+  - Analyze content structure
+  
+  Fetch_markdown returns clean Markdown that's easier to process than HTML.
+  ```
+
+#### 11.6 Testing
+- [ ] Test fetching various HTML pages
+- [ ] Verify Markdown conversion quality
+- [ ] Test error handling for invalid URLs
+- [ ] Test with pages that have complex HTML structures
+
+---
+
+## Task 12: Todo List Tool
+
+### Overview
+Implement a todo list tool that allows the model to track its own progress on multi-step tasks. The model can create tasks, update their status, and view the current state of its work plan.
+
+### User Story
+As a model, I want a todo list tool so that I can:
+- Share my plan with the user before executing complex tasks
+- Track progress as I work through multi-step problems
+- Show what I've completed and what's remaining
+- Keep the user informed about my work progress
+
+### Implementation Details
+
+#### 12.1 Create Todo Tool
+- [ ] Create new tool `src/tools/todo.rs` implementing `rig::tool::Tool`
+- [ ] Tool name: `todo`
+- [ ] Input schema:
+  ```json
+  {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["add", "update", "remove", "list", "clear"],
+        "description": "The action to perform on the todo list"
+      },
+      "task": {
+        "type": "string",
+        "description": "Task description (for add/update)"
+      },
+      "status": {
+        "type": "string",
+        "enum": ["pending", "in_progress", "completed", "cancelled"],
+        "description": "Task status (for update)"
+      },
+      "task_id": {
+        "type": "integer",
+        "description": "Task ID (for update/remove)"
+      }
+    },
+    "required": ["action"]
+  }
+  ```
+
+#### 12.2 Implement Todo State Management
+- [ ] Create `TodoList` struct to manage tasks:
+  ```rust
+  #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+  pub struct TodoList {
+      tasks: Vec<TodoItem>,
+      next_id: usize,
+  }
+  
+  #[derive(Debug, Clone, Serialize, Deserialize)]
+  pub struct TodoItem {
+      pub id: usize,
+      pub task: String,
+      pub status: TodoStatus,
+      pub created_at: DateTime<Utc>,
+      pub updated_at: DateTime<Utc>,
+  }
+  
+  #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+  #[serde(rename_all = "snake_case")]
+  pub enum TodoStatus {
+      Pending,
+      InProgress,
+      Completed,
+      Cancelled,
+  }
+  ```
+- [ ] Use a `Mutex<TodoList>` to maintain state across tool calls
+
+#### 12.3 Implement Tool Actions
+- [ ] **add**: Add a new task with "pending" status
+  - Returns: "Added task #{id}: {task}"
+- [ ] **update**: Change status of existing task
+  - Validates task_id exists
+  - Returns: "Updated task #{id} to {status}"
+- [ ] **remove**: Delete a task by ID
+  - Returns: "Removed task #{id}"
+- [ ] **list**: Show all tasks with their status
+  - Returns formatted list with completion summary
+- [ ] **clear**: Remove all completed tasks
+  - Returns: "Cleared {n} completed tasks"
+
+#### 12.4 Add Todo Tool to Agent
+- [ ] Import and add `TodoTool` to agent in `build_agent()`
+- [ ] Ensure the todo state persists across the session
+
+#### 12.5 Update System Prompt
+- [ ] Add section explaining when to use the todo tool:
+  ```
+  ## Using the todo tool
+  
+  For multi-step tasks, use the todo tool to:
+  - Plan your approach by adding tasks
+  - Show the user what you intend to do
+  - Track progress as you complete each step
+  - Keep both yourself and the user informed
+  
+  Best practices:
+  - Add tasks at the start of complex operations
+  - Update status as you make progress
+  - Use "in_progress" when starting work on a task
+  - Use "completed" when finished, "cancelled" if abandoned
+  
+  Example workflow:
+  1. Use todo add to create your plan
+  2. Use todo list to show the user your plan
+  3. As you work, update task statuses
+  4. Use todo list to show progress
+  ```
+
+#### 12.6 Testing
+- [ ] Test adding tasks
+- [ ] Test updating task status
+- [ ] Test removing tasks
+- [ ] Test listing tasks with various statuses
+- [ ] Test clearing completed tasks
+- [ ] Test error cases (invalid task_id, etc.)
+
+---
+
+## Dependencies and Ordering
+
+Some tasks have dependencies on others:
+
+| Task | Depends On |
+|------|------------|
+| 1 (Dynamic MCP) | - |
+| 2 (Think Tool) | - |
+| 3 (Token Hook) | - |
+| 4 (Logging Hooks) | 3 (uses PromptHook) |
+| 5 (Ollama) | - |
+| 6 (Debug ApiResponse) | - |
+| 7 (Context Compaction) | 3 (token counting) |
+| 8 (Domain Thinking) | 2 (think tool) |
+| 9 (SearXNG Search) | - |
+| 10 (Fetch Markdown) | - |
+| 11 (Todo Tool) | - |
+
+**Recommended implementation order:**
+1. Task 6 (Debug ApiResponse) - Fix existing bug
+2. Task 2 (Think Tool) - Simple, good warm-up
+3. Task 3 (Token Counting) - Foundation for 4 and 7
+4. Task 4 (Logging Refactor) - Benefits from 3
+5. Task 7 (Context Compaction) - Uses token counting from 3
+6. Task 1 (Dynamic MCP) - Independent but uses similar patterns
+7. Task 5 (Ollama) - Independent, can be done anytime
+8. Task 8 (Domain-specific thinking) - Independent
+9. Task 9 (SearXNG Search) - Independent, uses existing HTTP patterns
+10. Task 10 (Fetch Markdown) - Independent, uses existing HTTP patterns
+11. Task 11 (Todo Tool) - Independent, simple tool
 ---
 
 ## Future Considerations
