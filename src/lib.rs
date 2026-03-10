@@ -4,7 +4,7 @@ mod config;
 mod skills;
 mod tools;
 
-pub use config::{Config, McpServerConfig};
+pub use config::{Config, McpServerConfig, SearXngConfig};
 use rig::agent::PromptHook;
 use rig::client::{Capabilities, Capable, Client};
 use rig::completion::{CompletionModel, Prompt};
@@ -14,7 +14,7 @@ use rmcp::transport::TokioChildProcess;
 pub use skills::{SkillRegistry, load_default_skills};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
-    ThinkTool,
+    ThinkTool, SearchTool,
 };
 
 use anyhow::{Result, anyhow};
@@ -103,7 +103,7 @@ where
         .collect();
 
     // Build the agent with all tools
-    client
+    let mut agent_builder = client
         .agent(model_name)
         .preamble(&system_prompt)
         .max_tokens(config.openrouter_max_tokens)
@@ -113,7 +113,17 @@ where
         .tool(BashTool)
         .tool(ListDirectoryTool)
         .tool(FetchUrlTool)
-        .tool(ThinkTool)
+        .tool(ThinkTool);
+
+    // Conditionally add search tool if SearXNG is configured
+    if config.searxng_enabled() {
+        if let Some(searxng_config) = &config.searxng {
+            agent_builder = agent_builder.tool(SearchTool::new(searxng_config));
+            tracing::info!("SearXNG search enabled: {}", searxng_config.base_url);
+        }
+    }
+
+    agent_builder
         .tools(mcp_tools)
         .build()
 }
@@ -151,6 +161,13 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
             for skill in self.skills.all() {
                 println!("  - {}: {}", skill.name, skill.description);
             }
+        }
+        if self.config.searxng_enabled() {
+            if let Some(ref searxng) = self.config.searxng {
+                println!("SearXNG: {} (enabled)", searxng.base_url);
+            }
+        } else {
+            println!("SearXNG: not configured");
         }
         println!("Working directory: {}", cwd.display());
         println!("Type your message (or 'exit' to quit).\n");

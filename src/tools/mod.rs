@@ -4,6 +4,7 @@ mod file_edit;
 mod file_read;
 mod list_directory;
 mod logging_wrapper;
+mod search;
 mod think;
 
 pub use bash::BashTool;
@@ -12,4 +13,5 @@ pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use list_directory::ListDirectoryTool;
 pub use logging_wrapper::LoggingToolDyn;
+pub use search::SearchTool;
 pub use think::ThinkTool;

@@ -21,6 +21,9 @@ pub struct Config {
     /// MCP servers configuration (YAML array)
     #[serde(default)]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
+    /// SearXNG search configuration
+    #[serde(default)]
+    pub searxng: Option<SearXngConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -36,6 +39,25 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SearXngConfig {
+    /// Base URL of the SearXNG instance (e.g., "https://searx.example.com")
+    pub base_url: String,
+    /// Enable/disable search (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+    /// Default maximum number of results to return (default: 10)
+    #[serde(default = "default_max_results")]
+    pub max_results: u32,
+}
+
+fn default_true() -> bool { true }
+fn default_timeout() -> u64 { 30 }
+fn default_max_results() -> u32 { 10 }
 
 fn default_model() -> String {
     "anthropic/claude-3.7-sonnet".to_string()
@@ -57,6 +79,7 @@ impl Default for Config {
             openrouter_max_tokens: default_max_tokens(),
             agent_max_turns: default_max_turns(),
             mcp_servers: None,
+            searxng: None,
         }
     }
 }
@@ -134,6 +157,63 @@ impl Config {
 
         tracing::debug!("Final config: {:?}", config.openrouter_api_key);
 
+        // SEARXNG_BASE_URL
+        if let Ok(url) = std::env::var("SEARXNG_BASE_URL") {
+            if !url.is_empty() {
+                let searxng = config.searxng.get_or_insert_with(|| SearXngConfig {
+                    base_url: String::new(),
+                    enabled: true,
+                    timeout_seconds: 30,
+                    max_results: 10,
+                });
+                searxng.base_url = url;
+            }
+        }
+
+        // SEARXNG_ENABLED
+        if let Ok(enabled) = std::env::var("SEARXNG_ENABLED") {
+            if let Ok(enabled) = enabled.parse() {
+                let searxng = config.searxng.get_or_insert_with(|| SearXngConfig {
+                    base_url: String::new(),
+                    enabled: true,
+                    timeout_seconds: 30,
+                    max_results: 10,
+                });
+                searxng.enabled = enabled;
+            }
+        }
+
+        // SEARXNG_TIMEOUT
+        if let Ok(timeout) = std::env::var("SEARXNG_TIMEOUT") {
+            if let Ok(timeout) = timeout.parse() {
+                if let Some(searxng) = config.searxng.as_mut() {
+                    searxng.timeout_seconds = timeout;
+                }
+            }
+        }
+
+        // SEARXNG_MAX_RESULTS
+        if let Ok(max) = std::env::var("SEARXNG_MAX_RESULTS") {
+            if let Ok(max) = max.parse() {
+                if let Some(searxng) = config.searxng.as_mut() {
+                    searxng.max_results = max;
+                }
+            }
+        }
+
         Ok(config)
+    }
+
+    /// Check if SearXNG is configured and enabled
+    pub fn searxng_enabled(&self) -> bool {
+        self.searxng
+            .as_ref()
+            .map(|c| c.enabled && !c.base_url.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Get the SearXNG base URL
+    pub fn searxng_base_url(&self) -> Option<String> {
+        self.searxng.as_ref().map(|c| c.base_url.clone())
     }
 }
