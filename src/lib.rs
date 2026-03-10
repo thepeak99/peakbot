@@ -1,10 +1,14 @@
 //! PeakBot library - Core functionality for connecting to MCP servers and managing tools.
 
 mod config;
+mod hooks;
 mod skills;
 mod tools;
 
 pub use config::{Config, McpServerConfig, SearXngConfig};
+pub use hooks::{
+    CostTrackingStats, ModelPricing, SessionStats, TokenCostHook, fetch_model_pricing,
+};
 use rig::agent::PromptHook;
 use rig::client::{Capabilities, Capable, Client};
 use rig::completion::{CompletionModel, Prompt};
@@ -14,7 +18,7 @@ use rmcp::transport::TokioChildProcess;
 pub use skills::{SkillRegistry, load_default_skills};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
-    ThinkTool, SearchTool,
+    SearchTool, ThinkTool,
 };
 
 use anyhow::{Result, anyhow};
@@ -23,6 +27,7 @@ use rig::{agent::Agent, completion::message::Message};
 use rmcp::service::ServiceExt;
 use std::io::{self, BufRead, Write};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
@@ -81,12 +86,13 @@ pub fn create_openrouter_client(config: &Config) -> Result<openrouter::Client> {
 
 use rig::client::completion::CompletionClient;
 /// Build the agent with all tools (built-in and MCP)
+/// Returns the agent and a reference to the session stats
 pub async fn build_agent<M, Ext>(
     client: &Client<Ext>,
     config: &Config,
     mcp_server_handles: &[McpServerHandle],
     skills: &SkillRegistry,
-) -> Agent<M>
+) -> Result<(Agent<M, TokenCostHook>, Arc<Mutex<SessionStats>>)>
 where
     M: CompletionModel<Client = Client<Ext>>, //Type bending
     Ext: Capabilities<Completion = Capable<M>>,
@@ -102,12 +108,37 @@ where
         .flat_map(|handle| handle.dyn_tools())
         .collect();
 
-    // Build the agent with all tools
+    // Create the token cost hook if enabled
+    let hook = if config.cost_tracking {
+        TokenCostHook::new(
+            model_name.clone(),
+            fetch_model_pricing(
+                config.openrouter_api_key.as_deref().unwrap_or(""),
+                &model_name,
+            )
+            .await?,
+        )
+    } else {
+        // Create a no-op hook with zero pricing
+        TokenCostHook::new(
+            model_name.clone(),
+            ModelPricing {
+                input_per_token: 0.0,
+                output_per_token: 0.0,
+            },
+        )
+    };
+
+    // Get the stats reference before moving the hook into the agent
+    let stats = hook.get_stats();
+
+    // Build the agent with all tools and the hook
     let mut agent_builder = client
         .agent(model_name)
         .preamble(&system_prompt)
         .max_tokens(config.openrouter_max_tokens)
         .default_max_turns(config.agent_max_turns)
+        .hook(hook)
         .tool(FileEditTool::default())
         .tool(FileReadTool)
         .tool(BashTool)
@@ -123,9 +154,9 @@ where
         }
     }
 
-    agent_builder
-        .tools(mcp_tools)
-        .build()
+    let agent = agent_builder.tools(mcp_tools).build();
+
+    Ok((agent, stats))
 }
 
 /// A type that can handle agent prompts with history support
@@ -133,15 +164,50 @@ pub struct AgentRunner<M: CompletionModel, P: PromptHook<M>> {
     agent: Agent<M, P>,
     config: Config,
     skills: SkillRegistry,
+    stats: Arc<Mutex<SessionStats>>,
 }
 
 impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
     /// Create a new AgentRunner
-    pub fn new(agent: Agent<M, P>, config: Config, skills: SkillRegistry) -> Self {
+    pub fn new(
+        agent: Agent<M, P>,
+        config: Config,
+        skills: SkillRegistry,
+        stats: Arc<Mutex<SessionStats>>,
+    ) -> Self {
         Self {
             agent,
             config,
             skills,
+            stats,
+        }
+    }
+
+    /// Print stats for the last request
+    fn print_last_request_stats(&self) {
+        if let Ok(stats) = self.stats.lock() {
+            if let Some(last) = stats.last_request() {
+                println!(
+                    "{}",
+                    stats.format_per_request(last.input_tokens, last.output_tokens, last.cost)
+                );
+            }
+        }
+    }
+
+    /// Print session summary
+    fn print_stats(&self) {
+        if let Ok(stats) = self.stats.lock() {
+            println!("\n=== Session Statistics ===\n");
+            println!("{}", stats.summary());
+            println!();
+        }
+    }
+
+    /// Reset session stats
+    fn reset_stats(&self) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.reset();
         }
     }
 
@@ -169,8 +235,16 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
         } else {
             println!("SearXNG: not configured");
         }
+        println!(
+            "Cost tracking: {}",
+            if self.config.cost_tracking {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
         println!("Working directory: {}", cwd.display());
-        println!("Type your message (or 'exit' to quit).\n");
+        println!("Type /stats to see session stats, or 'exit' to quit.\n");
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
@@ -188,8 +262,23 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
                 continue;
             }
             if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
+                // Show final stats before exiting
+                self.print_stats();
                 println!("Goodbye!");
                 break;
+            }
+
+            // Handle /stats command
+            if input.eq_ignore_ascii_case("/stats") {
+                self.print_stats();
+                continue;
+            }
+
+            // Handle /reset command
+            if input.eq_ignore_ascii_case("/reset") {
+                self.reset_stats();
+                println!("Stats reset.\n");
+                continue;
             }
 
             // Clone history since chat() takes ownership
@@ -200,7 +289,9 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
                 .await
             {
                 Ok(response) => {
-                    println!("\n{}\n", response);
+                    println!("\n{}", response);
+                    // Display token stats after each response
+                    self.print_last_request_stats();
                 }
                 Err(e) => {
                     eprintln!("\nError: {}\n", e);
