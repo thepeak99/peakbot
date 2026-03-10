@@ -160,9 +160,9 @@ As a user, I want to see token usage and API costs for my sessions so that I can
 ### Implementation Details
 
 #### 3.1 Create Token/Cost Tracking Hook
-- [ ] Create new module `src/hooks/mod.rs`
-- [ ] Create `TokenCostHook` struct implementing `PromptHook<M>`
-- [ ] Define model pricing (can be expanded later):
+- [x] Create new module `src/hooks/mod.rs`
+- [x] Create `TokenCostHook` struct implementing `PromptHook<M>`
+- [x] Define model pricing (can be expanded later):
   ```rust
   pub struct ModelPricing {
       pub input_per_million: f64,
@@ -186,15 +186,15 @@ As a user, I want to see token usage and API costs for my sessions so that I can
   ```
 
 #### 3.2 Implement PromptHook Methods
-- [ ] Implement `on_completion_call` to log/track request start
-- [ ] Implement `on_completion_response` to:
+- [x] Implement `on_completion_call` to log/track request start
+- [x] Implement `on_completion_response` to:
   - Extract token usage from response
   - Calculate costs
   - Log/display metrics
-- [ ] Implement `on_tool_call` and `on_tool_result` for detailed tool logging
+- [x] Implement `on_tool_call` and `on_tool_result` for detailed tool logging
 
 #### 3.3 Create Statistics Struct
-- [ ] Create `SessionStats` to track:
+- [x] Create `SessionStats` to track:
   - Total input tokens
   - Total output tokens
   - Total API calls
@@ -207,21 +207,21 @@ As a user, I want to see token usage and API costs for my sessions so that I can
   - `reset()` - clear stats
 
 #### 3.4 Display Stats in REPL
-- [ ] After each model response, display:
+- [x] After each model response, display:
   ```
   [Tokens: {input} in / {output} out | Cost: ${cost} | Total: ${total}]
   ```
-- [ ] Add command to show cumulative stats (e.g., `/stats`)
+- [x] Add command to show cumulative stats (e.g., `/stats`)
 
 #### 3.5 Make Hook Pluggable
-- [ ] Design `TokenCostHook` to be optional
-- [ ] Add config option to enable/disable cost tracking
-- [ ] Allow custom pricing via config file
+- [x] Design `TokenCostHook` to be optional
+- [x] Add config option to enable/disable cost tracking
+- [x] Allow custom pricing via config file
 
 #### 3.6 Testing
-- [ ] Test hook is called on each request
-- [ ] Test token calculation accuracy
-- [ ] Test cost calculation with known prices
+- [x] Test hook is called on each request
+- [x] Test token calculation accuracy
+- [x] Test cost calculation with known prices
 
 ---
 

@@ -24,6 +24,9 @@ pub struct Config {
     /// SearXNG search configuration
     #[serde(default)]
     pub searxng: Option<SearXngConfig>,
+    /// Enable token cost tracking (default: true)
+    #[serde(default = "default_cost_tracking")]
+    pub cost_tracking: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -71,6 +74,10 @@ fn default_max_turns() -> usize {
     50
 }
 
+fn default_cost_tracking() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -80,6 +87,7 @@ impl Default for Config {
             agent_max_turns: default_max_turns(),
             mcp_servers: None,
             searxng: None,
+            cost_tracking: default_cost_tracking(),
         }
     }
 }
@@ -198,6 +206,13 @@ impl Config {
                 if let Some(searxng) = config.searxng.as_mut() {
                     searxng.max_results = max;
                 }
+            }
+        }
+
+        // COST_TRACKING
+        if let Ok(enabled) = std::env::var("COST_TRACKING") {
+            if let Ok(enabled) = enabled.parse() {
+                config.cost_tracking = enabled;
             }
         }
 

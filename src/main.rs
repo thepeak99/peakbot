@@ -26,10 +26,11 @@ async fn main() -> Result<()> {
     let mcp_servers = load_mcp_servers(&config).await?;
 
     // Build the agent with all tools and skills
-    let agent = build_agent(&client, &config, &mcp_servers, &skills).await;
+    // Returns agent and stats reference
+    let (agent, stats) = build_agent(&client, &config, &mcp_servers, &skills).await?;
 
     // Run the interactive REPL
-    let mut runner = AgentRunner::new(agent, config.clone(), skills);
+    let mut runner = AgentRunner::new(agent, config.clone(), skills, stats);
     runner.run().await?;
 
     Ok(())
