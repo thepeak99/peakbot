@@ -106,6 +106,28 @@ impl SessionStats {
     pub fn last_request(&self) -> Option<RequestStats> {
         self.requests.last().cloned()
     }
+
+    /// Get total input tokens used so far (approximates context size)
+    /// This is the sum of all input tokens from all requests
+    pub fn total_input_tokens(&self) -> u64 {
+        self.total_input_tokens
+    }
+
+    /// Get total output tokens used so far
+    pub fn total_output_tokens(&self) -> u64 {
+        self.total_output_tokens
+    }
+
+    /// Get total tokens (input + output)
+    pub fn total_tokens(&self) -> u64 {
+        self.total_input_tokens + self.total_output_tokens
+    }
+
+    /// Get the input tokens from the most recent request
+    /// This approximates the current context size (history + new message)
+    pub fn last_input_tokens(&self) -> Option<u64> {
+        self.requests.last().map(|r| r.input_tokens)
+    }
 }
 
 // Manual implementation of Send + Sync for SessionStats since Mutex guards are not Send

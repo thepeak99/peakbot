@@ -4,7 +4,6 @@ mod config;
 mod context_manager;
 mod hooks;
 mod skills;
-mod token_estimator;
 mod tools;
 
 pub use config::{Config, ContextConfig, McpServerConfig, SearXngConfig};
@@ -19,7 +18,6 @@ use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
 use rmcp::transport::TokioChildProcess;
 pub use skills::{SkillRegistry, load_default_skills};
-pub use token_estimator::{get_default_estimator, get_model_context_window, SimpleEstimator, TiktokenEstimator, TokenEstimator};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
     SearchTool, ThinkTool,
@@ -184,8 +182,17 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
         // Build system prompt for context manager
         let system_prompt = build_system_prompt(&skills);
         
+        // Estimate system prompt tokens (rough approximation: ~4 chars per token)
+        let system_prompt_tokens = system_prompt.len() / 4;
+        
         // Create context manager (always created, enabled flag controls actual usage)
-        let context_manager = Some(ContextManager::new(config.context.clone(), &config.openrouter_model));
+        // Pass stats reference so it can read actual token counts from the provider
+        let context_manager = Some(ContextManager::new(
+            config.context.clone(), 
+            &config.openrouter_model,
+            stats.clone(),
+            system_prompt_tokens,
+        ));
         
         Self {
             agent,
@@ -226,10 +233,11 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
     }
 
     /// Print context status
-    fn print_context_status(&self, chat_history: &[Message]) {
+    fn print_context_status(&self, _chat_history: &[Message]) {
         if let Some(ref cm) = self.context_manager {
             println!("\n=== Context Status ===\n");
-            println!("{}", cm.format_status(chat_history, &self.system_prompt));
+            // Uses actual token counts from provider - no need for chat_history
+            println!("{}", cm.format_status());
             println!();
         } else {
             println!("\nContext compaction is not enabled.\n");
