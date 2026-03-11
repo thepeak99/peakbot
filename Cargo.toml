@@ -18,7 +18,6 @@ chrono = "0.4"
 directories-next = "2"
 dirs = "5"
 serde_yaml = "0.9"
-tiktoken-rs = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
