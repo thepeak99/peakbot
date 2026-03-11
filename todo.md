@@ -442,7 +442,7 @@ Potential solutions:
 ## Task 7: Context Compaction
 
 ### Overview
-Implement automatic context management to handle conversations that grow too large. When the conversation context (chat history) approaches the model's context window limit, the system should compact or summarize older messages to make room for new ones.
+Implement automatic context management to handle conversations that grow too large. When the conversation context (chat history) approaches the model's context window limit, the system should compact older messages while preserving recent context.
 
 ### User Story
 As a user, I want to have long conversations without hitting context window limits, so that:
@@ -450,85 +450,207 @@ As a user, I want to have long conversations without hitting context window limi
 2. The agent maintains context across extended sessions
 3. I don't lose access to important parts of the conversation history
 
-### Implementation Details
+### Hybrid Approach: Summarize + Keep Recent
+The compaction uses a hybrid strategy:
+1. **Summarize older messages**: Everything except the last N messages is summarized by the model
+2. **Keep recent messages**: Last N messages (configurable) are kept verbatim for immediate context
+3. **Final truncation if needed**: If the summary is still too large, truncate from the summary
 
-#### 7.1 Design Context Management Strategy
-- [ ] Define context window threshold (e.g., 80% of max tokens)
-- [ ] Decide on compaction strategy:
-  - **Summarization**: Use the model to summarize older messages
-  - **Truncation**: Simply remove oldest messages
-  - **Hybrid**: Summarize some, truncate some
-- [ ] Determine what to preserve (system prompt, tool definitions, etc.)
+Example:
+```
+Before (100 messages, keep_recent=5):
+[Msg 1] → ... → [Msg 95] → [Msg 96] → [Msg 97] → [Msg 98] → [Msg 99] → [Msg 100]
 
-#### 7.2 Create Context Manager Struct
-- [ ] Create `src/context_manager.rs`
-- [ ] Implement `ContextManager` with:
+After compaction:
+[Summary of msgs 1-95] → [Msg 96] → [Msg 97] → [Msg 98] → [Msg 99] → [Msg 100]
+```
+
+### Implementation Plan
+
+#### Phase 1: Core Infrastructure
+
+**Step 1.1: Add Configuration Support**
+- Update `src/config.rs` to add:
+  ```rust
+  #[derive(Debug, Deserialize, Clone, Default)]
+  pub struct ContextConfig {
+      /// Compaction threshold (0.0-1.0), default 0.8
+      #[serde(default = "default_threshold")]
+      pub threshold: f64,
+      /// Compaction strategy: "truncate" or "summarize"
+      #[serde(default = "default_strategy")]
+      pub strategy: String,
+      /// Keep last N messages always
+      #[serde(default = "default_keep_recent")]
+      pub keep_recent: usize,
+      /// Enable/disable compaction
+      #[serde(default = "default_enabled")]
+      pub enabled: bool,
+      /// Model context window size (0 = auto-detect from API)
+      #[serde(default)]
+      pub context_window: Option<usize>,
+  }
+  
+  fn default_threshold() -> f64 { 0.8 }
+  fn default_strategy() -> String { "truncate".to_string() }
+  fn default_keep_recent() -> usize { 5 }
+  fn default_enabled() -> bool { true }
+  ```
+- Add to Config struct: `pub context: Option<ContextConfig>`
+- Add environment variables: `CONTEXT_THRESHOLD`, `CONTEXT_STRATEGY`, `CONTEXT_ENABLED`, etc.
+
+**Step 1.2: Create Token Estimator**
+- Create `src/token_estimator.rs`:
+  ```rust
+  use rig::completion::message::Message;
+  
+  /// Trait for estimating token counts
+  pub trait TokenEstimator {
+      fn estimate(&self, text: &str) -> usize;
+      fn estimate_message(&self, msg: &Message) -> usize;
+      fn estimate_messages(&self, msgs: &[Message]) -> usize;
+  }
+  
+  /// Simple char-based estimator (4 chars ≈ 1 token)
+  pub struct SimpleEstimator;
+  
+  /// Tiktoken-based estimator (more accurate)
+  pub struct TiktokenEstimator { ... }
+  ```
+- Implement both SimpleEstimator (fallback) and TiktokenEstimator (if available)
+- Use OpenRouter API to get model context_window if not configured
+
+**Step 1.3: Create Context Manager**
+- Create `src/context_manager.rs`:
   ```rust
   pub struct ContextManager {
-      max_tokens: usize,
-      threshold_percent: f64,
-      system_prompt_tokens: usize,
+      config: ContextConfig,
+      estimator: Box<dyn TokenEstimator>,
+      context_window: usize,
+      current_token_count: usize,
+  }
+  
+  impl ContextManager {
+      pub fn new(config: ContextConfig, context_window: usize) -> Self;
+      pub fn needs_compaction(&self, messages: &[Message]) -> bool;
+      pub fn compact(&mut self, messages: &mut [Message]) -> CompactionResult;
+      pub fn estimate_total_tokens(&self, messages: &[Message], system_prompt: &str) -> usize;
+  }
+  
+  #[derive(Debug, Clone)]
+  pub struct CompactionResult {
+      pub original_count: usize,
+      pub compacted_count: usize,
+      pub tokens_saved: usize,
+      pub strategy: String,
   }
   ```
-- [ ] Implement methods:
-  - `new(max_tokens, system_prompt_tokens)` - create manager
-  - `needs_compaction(messages)` - check if compaction needed
-  - `compact(messages, model)` - perform compaction
-  - `estimate_tokens(messages)` - estimate token count
 
-#### 7.3 Implement Token Estimation
-- [ ] Create simple token counter (can use tiktoken or approximation)
-- [ ] Count tokens for messages, system prompt, tool definitions
-- [ ] Account for overhead in API request (formatting, tool schemas)
+#### Phase 2: Compaction Logic
 
-#### 7.4 Implement Compaction Logic
-- [ ] **Truncation approach** (simpler):
-  - Calculate how many tokens need to be freed
-  - Remove oldest messages until under threshold
-  - Keep at least last N messages for context
-  
-- [ ] **Summarization approach** (better):
-  - Identify messages to summarize (e.g., older than X turns)
-  - Use model to generate summary
-  - Replace original messages with summary + key info
-  - Preserve user tool outputs if important
+**Step 2.1: Implement Truncation Strategy**
+- Calculate tokens needed: context_window * threshold
+- Separate messages into:
+  - **Preserve always**: System prompt, tool definitions (passed separately)
+  - **Never compact**: Last N messages (keep_recent config)
+  - **Compaction candidates**: Everything in between
+- Remove oldest messages from candidates until under threshold
+- Return CompactionResult with details
 
-#### 7.5 Integrate with AgentRunner
-- [ ] Modify REPL loop to check context size before each request
-- [ ] Call compaction when needed, before sending to model
-- [ ] Inform user when compaction occurs:
+**Step 2.2: Implement Summarization Strategy (Future)**
+- Identify messages to summarize (older than X turns)
+- Create a summarization prompt
+- Call model to generate summary
+- Replace original messages with summary + key metadata
+- Note: This requires an extra API call, so make it optional
+
+**Step 2.3: Handle Edge Cases**
+- Empty history: No compaction needed
+- Single message: Check if it's too large, truncate if needed
+- All messages are "keep_recent": No compaction
+- Message too large alone: Truncate the message itself
+
+#### Phase 3: Integration
+
+**Step 3.1: Update AgentRunner**
+- Add ContextManager to AgentRunner struct:
+  ```rust
+  pub struct AgentRunner<M: CompletionModel, P: PromptHook<M>> {
+      agent: Agent<M, P>,
+      config: Config,
+      skills: SkillRegistry,
+      stats: Arc<Mutex<SessionStats>>,
+      context_manager: Option<ContextManager>,  // NEW
+  }
   ```
-  [Context compacted: summarized 15 messages into 3]
+- In the run() loop, before agent.prompt():
+  ```rust
+  // Check and compact if needed
+  if let Some(ref mut cm) = self.context_manager {
+      if cm.needs_compaction(&chat_history) {
+          let result = cm.compact(&mut chat_history);
+          println!("[Context compacted: {} → {} messages]", 
+              result.original_count, result.compacted_count);
+      }
+  }
   ```
 
-#### 7.6 Preserve Important Context
-- [ ] Never remove system prompt
-- [ ] Keep recent tool definitions (if dynamically added)
-- [ ] Preserve last N user/assistant exchanges
-- [ ] Handle special messages (enable_mcp results, etc.)
-
-#### 7.7 Add User Controls
-- [ ] Add config options:
-  ```yaml
-  context:
-    # Compaction threshold (0.0-1.0), default 0.8
-    threshold: 0.8
-    # Compaction strategy: "truncate" or "summarize"
-    strategy: "truncate"
-    # Keep last N messages always
-    keep_recent: 5
-    # Enable/disable compaction
-    enabled: true
+**Step 3.2: Update Token Tracking**
+- After each successful response, update token count in context manager:
+  ```rust
+  if let Some(ref mut cm) = self.context_manager {
+      cm.update_token_count(response.usage.input_tokens);
+  }
   ```
-- [ ] Add `/compact` command for manual compaction
-- [ ] Add `/context` command to show context usage
 
-#### 7.8 Testing
-- [ ] Test token estimation accuracy
-- [ ] Test truncation preserves recent messages
-- [ ] Test summarization maintains key information
-- [ ] Test edge cases (empty history, very long messages)
-- [ ] Test with various model context sizes
+**Step 3.3: Add REPL Commands**
+- `/compact` - Force compaction now
+- `/context` - Show context usage:
+  ```
+  Context: 45,000 / 200,000 tokens (22.5%)
+  150 messages
+  Compaction threshold: 80%
+  Strategy: truncate
+  ```
+
+#### Phase 4: Testing
+
+**Step 4.1: Unit Tests**
+- Test token estimation accuracy (compare to tiktoken)
+- Test truncation preserves recent messages
+- Test needs_compaction returns correct result
+
+**Step 4.2: Integration Tests**
+- Test full compaction flow in REPL
+- Test edge cases (empty, very long messages)
+- Test with various model context sizes
+
+**Step 4.3: Manual Testing**
+- Test with long conversation
+- Verify context compaction happens correctly
+- Verify key information preserved
+
+### File Changes Summary
+
+| File | Changes |
+|------|---------|
+| `src/config.rs` | Add ContextConfig struct, add to Config, add env var parsing |
+| `src/token_estimator.rs` | NEW - TokenEstimator trait and implementations |
+| `src/context_manager.rs` | NEW - ContextManager, CompactionResult |
+| `src/lib.rs` | Add context_manager field to AgentRunner, integrate into run() loop |
+
+### Dependencies on Other Tasks
+- **Task 3 (Token Counting)**: Uses token tracking for the actual API usage, but we need our own estimator for pre-request estimation
+
+### Open Questions
+1. Should we include tool definitions in token count? (They're passed separately in rig)
+2. How to handle different model context windows?
+3. Should we cache token counts instead of recalculating each time?
+
+### Estimated Complexity
+- **Time**: ~3-4 days (requires model API call for summarization)
+- **Risk**: Medium - impacts core REPL loop
+- **Testing**: Requires manual testing with long conversations
 
 --- 
 
@@ -1002,6 +1124,149 @@ As a model, I want a todo list tool so that I can:
 
 ---
 
+## Task 13: Conversation Persistence
+
+### Overview
+Implement the ability to save and restore conversation history, storing at every step so that if the program crashes or is interrupted, the conversation can be resumed with minimal loss. This includes automatic saving after each user input and each tool result.
+
+### User Story
+As a user, I want my conversation to be automatically saved so that:
+1. I can resume my session after a crash or restart
+2. I don't lose progress if the program is killed unexpectedly
+3. I can manually save/load conversations for later review
+4. I can list and manage previous conversations
+
+### Implementation Details
+
+#### 13.1 Define Conversation Storage Format
+- [ ] Create `Conversation` struct in a new module `src/conversation.rs`:
+  ```rust
+  #[derive(Debug, Clone, Serialize, Deserialize)]
+  pub struct Conversation {
+      pub id: Uuid,
+      pub name: String,
+      pub created_at: DateTime<Utc>,
+      pub updated_at: DateTime<Utc>,
+      pub messages: Vec<Message>,
+      pub model: String,
+      pub metadata: ConversationMetadata,
+  }
+
+  #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+  pub struct ConversationMetadata {
+      pub total_tokens: Option<u64>,
+      pub total_cost: Option<f64>,
+      pub message_count: usize,
+  }
+
+  #[derive(Debug, Clone, Serialize, Deserialize)]
+  #[serde(tag = "role")]
+  pub enum Message {
+      User { content: String, timestamp: DateTime<Utc> },
+      Assistant { content: String, timestamp: DateTime<Utc> },
+      ToolResult { tool_name: String, result: String, timestamp: DateTime<Utc> },
+  }
+  ```
+- [ ] Use JSON format for storage (human-readable, easy to debug)
+- [ ] Store in platform data directory (e.g., `~/.local/share/peakbot/conversations/`)
+
+#### 13.2 Create Conversation Manager
+- [ ] Implement `ConversationManager` struct:
+  ```rust
+  pub struct ConversationManager {
+      storage_dir: PathBuf,
+      current_conversation: Option<Conversation>,
+      auto_save: bool,
+  }
+  ```
+- [ ] Implement methods:
+  - `new(storage_dir, auto_save)` - create manager
+  - `create_new(name, model)` - start a new conversation
+  - `save()` - save current conversation to disk
+  - `load(id)` - load a conversation by ID
+  - `list()` - list all saved conversations
+  - `delete(id)` - delete a conversation
+  - `add_user_message(content)` - add user message and auto-save
+  - `add_assistant_message(content)` - add assistant message and auto-save
+  - `add_tool_result(tool_name, result)` - add tool result and auto-save
+
+#### 13.3 Implement Auto-Save
+- [ ] Modify REPL loop to save after every significant event:
+  - After receiving user input (before sending to model)
+  - After receiving assistant response
+  - After each tool result
+- [ ] Use write-ahead logging or atomic writes to prevent corruption:
+  ```rust
+  fn save_atomic(&self, conversation: &Conversation) -> Result<()> {
+      let temp_path = self.storage_dir.join(".tmp.json");
+      let final_path = self.storage_dir.join(format!("{}.json", conversation.id));
+      
+      let json = serde_json::to_string_pretty(conversation)?;
+      std::fs::write(&temp_path, json)?;
+      std::fs::rename(&temp_path, &final_path)?;
+      Ok(())
+  }
+  ```
+- [ ] Add crash recovery: on startup, check for incomplete saves and recover
+
+#### 13.4 Add Resume Functionality
+- [ ] On startup, check for the most recent conversation
+- [ ] Prompt user to resume or start new:
+  ```
+  Found saved conversation: "My Project"
+  Last activity: 2 hours ago
+  15 messages
+  
+  Resume [r], Start new [n], List all [l]? 
+  ```
+- [ ] Implement `/resume` command in REPL to manually resume a conversation
+- [ ] Implement `/new` command to start a fresh conversation
+
+#### 13.5 Add Conversation Management Commands
+- [ ] Add REPL commands:
+  - `/save [name]` - save current conversation with optional name
+  - `/load <id>` - load a conversation by ID
+  - `/conversations` or `/history` - list all saved conversations
+  - `/delete <id>` - delete a conversation
+  - `/export <id> <format>` - export conversation (json, markdown)
+  - `/rename <name>` - rename current conversation
+- [ ] Add tab completion for conversation IDs
+
+#### 13.6 Add Configuration Options
+- [ ] Add to config:
+  ```yaml
+  conversation:
+    # Enable auto-save (default: true)
+    auto_save: true
+    # Storage directory (default: platform data dir)
+    storage_dir: ~/.local/share/peakbot/conversations
+    # Maximum conversations to keep (default: 50, 0 = unlimited)
+    max_conversations: 50
+    # Auto-load last conversation on startup (default: true)
+    auto_resume: true
+  ```
+- [ ] Add environment variables:
+  - `CONVERSATION_AUTO_SAVE`
+  - `CONVERSATION_STORAGE_DIR`
+  - `CONVERSATION_AUTO_RESUME`
+
+#### 13.7 Update AgentRunner for Persistence
+- [ ] Modify `AgentRunner` to hold a `ConversationManager`
+- [ ] After each agent.prompt() cycle, add messages to conversation and save
+- [ ] On startup, initialize conversation manager and optionally resume
+
+#### 13.8 Testing
+- [ ] Test auto-save after user input
+- [ ] Test auto-save after assistant response
+- [ ] Test auto-save after tool result
+- [ ] Test resume after crash simulation
+- [ ] Test conversation listing
+- [ ] Test export to different formats
+- [ ] Test concurrent write safety
+- [ ] Test recovery from partial writes
+
+---
+
 ## Dependencies and Ordering
 
 Some tasks have dependencies on others:
@@ -1019,6 +1284,7 @@ Some tasks have dependencies on others:
 | 9 (SearXNG Search) | - |
 | 10 (Fetch Markdown) | - |
 | 11 (Todo Tool) | - |
+| 13 (Conversation Persistence) | - |
 
 **Recommended implementation order:**
 1. Task 6 (Debug ApiResponse) - Fix existing bug
@@ -1032,6 +1298,8 @@ Some tasks have dependencies on others:
 9. Task 9 (SearXNG Search) - Independent, uses existing HTTP patterns
 10. Task 10 (Fetch Markdown) - Independent, uses existing HTTP patterns
 11. Task 11 (Todo Tool) - Independent, simple tool
+12. Task 13 (Conversation Persistence) - Independent, valuable for UX
+
 ---
 
 ## Future Considerations

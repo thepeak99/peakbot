@@ -167,7 +167,6 @@ pub async fn fetch_model_pricing(api_key: &str, model: &str) -> Result<ModelPric
     get_model_pricing(models.data, model)
 }
 
-//AI: Make a test for this function, use this ref value, parse it and construct a vec<openroutermodel> and check the outputs:[{"id":"minimax/minimax-m2.5","canonical_slug":"minimax/minimax-m2.5-20260211","hugging_face_id":"MiniMaxAI/MiniMax-M2.5","name":"MiniMax: MiniMax M2.5","created":1770908502,"description":"MiniMax-M2.5 is a SOTA large language model designed for real-world productivity. Trained in a diverse range of complex real-world digital working environments, M2.5 builds upon the coding expertise of M2.1 to extend into general office work, reaching fluency in generating and operating Word, Excel, and Powerpoint files, context switching between diverse software environments, and working across different agent and human teams. Scoring 80.2% on SWE-Bench Verified, 51.3% on Multi-SWE-Bench, and 76.3% on BrowseComp, M2.5 is also more token efficient than previous generations, having been trained to optimize its actions and output through planning.","context_length":196608,"architecture":{"modality":"text->text","input_modalities":["text"],"output_modalities":["text"],"tokenizer":"Other","instruct_type":null},"pricing":{"prompt":"0.000000295","completion":"0.0000012","input_cache_read":"0.00000003"},"top_provider":{"context_length":196608,"max_completion_tokens":196608,"is_moderated":false},"per_request_limits":null,"supported_parameters":["frequency_penalty","include_reasoning","logit_bias","logprobs","max_tokens","min_p","parallel_tool_calls","presence_penalty","reasoning","reasoning_effort","repetition_penalty","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_logprobs","top_p"],"default_parameters":{"temperature":1,"top_p":0.95,"frequency_penalty":null},"expiration_date":null}]
 fn get_model_pricing(models: Vec<OpenRouterModel>, model: &str) -> Result<ModelPricing> {
     // Find our model (API returns average price already per model)
     if let Some(model_info) = models.iter().find(|m| m.id == model) {
@@ -196,6 +195,82 @@ fn get_model_pricing(models: Vec<OpenRouterModel>, model: &str) -> Result<ModelP
             model
         );
         Ok(ModelPricing::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_model_pricing_minimax() {
+        // JSON data from OpenRouter API for MiniMax M2.5 model
+        let json_data = r#"[
+            {
+                "id": "minimax/minimax-m2.5",
+                "canonical_slug": "minimax/minimax-m2.5-20260211",
+                "hugging_face_id": "MiniMaxAI/MiniMax-M2.5",
+                "name": "MiniMax: MiniMax M2.5",
+                "created": 1770908502,
+                "description": "MiniMax-M2.5 is a SOTA large language model",
+                "context_length": 196608,
+                "architecture": {
+                    "modality": "text->text",
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"],
+                    "tokenizer": "Other",
+                    "instruct_type": null
+                },
+                "pricing": {
+                    "prompt": "0.000000295",
+                    "completion": "0.0000012",
+                    "input_cache_read": "0.00000003"
+                },
+                "top_provider": {
+                    "context_length": 196608,
+                    "max_completion_tokens": 196608,
+                    "is_moderated": false
+                },
+                "per_request_limits": null,
+                "supported_parameters": ["frequency_penalty", "include_reasoning"],
+                "default_parameters": {
+                    "temperature": 1,
+                    "top_p": 0.95,
+                    "frequency_penalty": null
+                },
+                "expiration_date": null
+            }
+        ]"#;
+
+        // Parse JSON into Vec<OpenRouterModel>
+        let models: Vec<OpenRouterModel> = serde_json::from_str(json_data)
+            .expect("Failed to parse JSON test data");
+
+        // Verify we parsed one model
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "minimax/minimax-m2.5");
+
+        // Call get_model_pricing
+        let pricing = get_model_pricing(models, "minimax/minimax-m2.5")
+            .expect("get_model_pricing should succeed");
+
+        // Verify output pricing values
+        assert_eq!(pricing.input_per_token, 0.000000295);
+        assert_eq!(pricing.output_per_token, 0.0000012);
+    }
+
+    #[test]
+    fn test_get_model_pricing_not_found() {
+        // Empty models list - model not found
+        let models: Vec<OpenRouterModel> = vec![];
+
+        // Call get_model_pricing with non-existent model
+        let pricing = get_model_pricing(models, "nonexistent/model")
+            .expect("get_model_pricing should succeed even when model not found");
+
+        // Should return default pricing
+        assert_eq!(pricing.input_per_token, 0.000003);
+        assert_eq!(pricing.output_per_token, 0.000015);
     }
 }
 
