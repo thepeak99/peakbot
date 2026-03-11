@@ -27,6 +27,9 @@ pub struct Config {
     /// Enable token cost tracking (default: true)
     #[serde(default = "default_cost_tracking")]
     pub cost_tracking: bool,
+    /// Context compaction configuration (enabled by default when not specified)
+    #[serde(default)]
+    pub context: ContextConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -58,9 +61,44 @@ pub struct SearXngConfig {
     pub max_results: u32,
 }
 
-fn default_true() -> bool { true }
-fn default_timeout() -> u64 { 30 }
-fn default_max_results() -> u32 { 10 }
+/// Configuration for context compaction
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContextConfig {
+    /// Compaction threshold (0.0-1.0), default 0.8
+    /// When context usage exceeds this threshold, compaction is triggered
+    #[serde(default = "default_threshold")]
+    pub threshold: f64,
+    /// Keep last N messages always (default: 5)
+    #[serde(default = "default_keep_recent")]
+    pub keep_recent: usize,
+    /// Enable/disable compaction (default: true)
+    #[serde(default = "default_context_enabled")]
+    pub enabled: bool,
+    /// Model context window size (0 or None = auto-detect from API)
+    /// Common values: 128k, 200k, etc.
+    #[serde(default)]
+    pub context_window: Option<usize>,
+}
+
+fn default_threshold() -> f64 {
+    0.8
+}
+fn default_keep_recent() -> usize {
+    5
+}
+fn default_context_enabled() -> bool {
+    true
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_timeout() -> u64 {
+    30
+}
+fn default_max_results() -> u32 {
+    10
+}
 
 fn default_model() -> String {
     "anthropic/claude-3.7-sonnet".to_string()
@@ -88,6 +126,12 @@ impl Default for Config {
             mcp_servers: None,
             searxng: None,
             cost_tracking: default_cost_tracking(),
+            context: ContextConfig {
+                threshold: default_threshold(),
+                keep_recent: default_keep_recent(),
+                enabled: default_context_enabled(),
+                context_window: None,
+            },
         }
     }
 }
@@ -213,6 +257,37 @@ impl Config {
         if let Ok(enabled) = std::env::var("COST_TRACKING") {
             if let Ok(enabled) = enabled.parse() {
                 config.cost_tracking = enabled;
+            }
+        }
+
+        // Context compaction config via environment variables
+        // CONTEXT_ENABLED
+        if let Ok(enabled) = std::env::var("CONTEXT_ENABLED") {
+            if let Ok(enabled) = enabled.parse() {
+                config.context.enabled = enabled;
+            }
+        }
+
+        // CONTEXT_THRESHOLD
+        if let Ok(threshold) = std::env::var("CONTEXT_THRESHOLD") {
+            if let Ok(threshold) = threshold.parse::<f64>() {
+                if threshold >= 0.0 && threshold <= 1.0 {
+                    config.context.threshold = threshold;
+                }
+            }
+        }
+
+        // CONTEXT_KEEP_RECENT
+        if let Ok(keep_recent) = std::env::var("CONTEXT_KEEP_RECENT") {
+            if let Ok(keep_recent) = keep_recent.parse() {
+                config.context.keep_recent = keep_recent;
+            }
+        }
+
+        // CONTEXT_WINDOW
+        if let Ok(window) = std::env::var("CONTEXT_WINDOW") {
+            if let Ok(window) = window.parse() {
+                config.context.context_window = Some(window);
             }
         }
 

@@ -1,11 +1,14 @@
 //! PeakBot library - Core functionality for connecting to MCP servers and managing tools.
 
 mod config;
+mod context_manager;
 mod hooks;
 mod skills;
+mod token_estimator;
 mod tools;
 
-pub use config::{Config, McpServerConfig, SearXngConfig};
+pub use config::{Config, ContextConfig, McpServerConfig, SearXngConfig};
+pub use context_manager::{CompactionResult, ContextManager};
 pub use hooks::{
     CostTrackingStats, ModelPricing, SessionStats, TokenCostHook, fetch_model_pricing,
 };
@@ -16,6 +19,7 @@ use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
 use rmcp::transport::TokioChildProcess;
 pub use skills::{SkillRegistry, load_default_skills};
+pub use token_estimator::{get_default_estimator, get_model_context_window, SimpleEstimator, TiktokenEstimator, TokenEstimator};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
     SearchTool, ThinkTool,
@@ -165,6 +169,8 @@ pub struct AgentRunner<M: CompletionModel, P: PromptHook<M>> {
     config: Config,
     skills: SkillRegistry,
     stats: Arc<Mutex<SessionStats>>,
+    context_manager: Option<ContextManager>,
+    system_prompt: String,
 }
 
 impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
@@ -175,11 +181,19 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
         skills: SkillRegistry,
         stats: Arc<Mutex<SessionStats>>,
     ) -> Self {
+        // Build system prompt for context manager
+        let system_prompt = build_system_prompt(&skills);
+        
+        // Create context manager (always created, enabled flag controls actual usage)
+        let context_manager = Some(ContextManager::new(config.context.clone(), &config.openrouter_model));
+        
         Self {
             agent,
             config,
             skills,
             stats,
+            context_manager,
+            system_prompt,
         }
     }
 
@@ -208,6 +222,38 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
     fn reset_stats(&self) {
         if let Ok(mut stats) = self.stats.lock() {
             stats.reset();
+        }
+    }
+
+    /// Print context status
+    fn print_context_status(&self, chat_history: &[Message]) {
+        if let Some(ref cm) = self.context_manager {
+            println!("\n=== Context Status ===\n");
+            println!("{}", cm.format_status(chat_history, &self.system_prompt));
+            println!();
+        } else {
+            println!("\nContext compaction is not enabled.\n");
+        }
+    }
+
+    /// Force context compaction
+    fn force_compact(&mut self, chat_history: &mut Vec<Message>) {
+        if let Some(ref mut cm) = self.context_manager {
+            match cm.compact(chat_history, &self.system_prompt) {
+                Ok(result) => {
+                    println!(
+                        "\n[Context compacted: {} → {} messages, {} messages summarized]\n",
+                        result.original_count,
+                        result.compacted_count,
+                        result.num_summarized
+                    );
+                }
+                Err(e) => {
+                    eprintln!("\nError compacting context: {}\n", e);
+                }
+            }
+        } else {
+            println!("\nContext compaction is not enabled.\n");
         }
     }
 
@@ -243,8 +289,18 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
                 "disabled"
             }
         );
+        // Context compaction status - check the enabled flag
+        if self.config.context.enabled {
+            println!(
+                "Context compaction: enabled (threshold: {:.0}%, keep_recent: {})",
+                self.config.context.threshold * 100.0,
+                self.config.context.keep_recent
+            );
+        } else {
+            println!("Context compaction: disabled");
+        }
         println!("Working directory: {}", cwd.display());
-        println!("Type /stats to see session stats, or 'exit' to quit.\n");
+        println!("Type /stats to see session stats, /context for context status, /compact to force compaction, or 'exit' to quit.\n");
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
@@ -279,6 +335,37 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
                 self.reset_stats();
                 println!("Stats reset.\n");
                 continue;
+            }
+
+            // Handle /context command
+            if input.eq_ignore_ascii_case("/context") {
+                self.print_context_status(&chat_history);
+                continue;
+            }
+
+            // Handle /compact command
+            if input.eq_ignore_ascii_case("/compact") {
+                self.force_compact(&mut chat_history);
+                continue;
+            }
+
+            // Check if context compaction is needed before prompting
+            if let Some(ref mut cm) = self.context_manager {
+                if cm.needs_compaction(&chat_history) {
+                    println!("[Context approaching limit, compacting before prompt...]");
+                    cm.compact(&mut chat_history, &self.system_prompt)
+                        .map(|result| {
+                            println!(
+                                "[Compacted: {} → {} messages, {} summarized]\n",
+                                result.original_count,
+                                result.compacted_count,
+                                result.num_summarized
+                            );
+                        })
+                        .unwrap_or_else(|e| {
+                            eprintln!("[Warning: compaction failed: {}]", e);
+                        });
+                }
             }
 
             // Clone history since chat() takes ownership
