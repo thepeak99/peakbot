@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
         searxng_config,
         config.agent_max_turns,
         Some(todo_tool),
+        &config.bash,
     )?;
     tracing::info!(
         "Using provider: {} with model: {}",

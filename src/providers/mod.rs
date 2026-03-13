@@ -3,7 +3,7 @@
 //! This module provides a unified interface for different LLM providers
 //! (OpenRouter, Ollama, etc.) to make the codebase provider-independent.
 
-use crate::config::{OllamaConfig, OpenRouterConfig, ProviderConfig, SearXngConfig};
+use crate::config::{BashConfig, OllamaConfig, OpenRouterConfig, ProviderConfig, SearXngConfig};
 use crate::hooks::TokenCostHook;
 use crate::tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
@@ -70,6 +70,26 @@ impl CostTracker {
     pub fn get_session_stats(&self) -> Option<Arc<Mutex<crate::hooks::SessionStats>>> {
         self.hook.as_ref().map(|h| h.get_stats())
     }
+
+    /// Get total tokens used in this session
+    pub fn get_total_tokens(&self) -> u64 {
+        if let Some(ref hook) = self.hook {
+            if let Ok(stats) = hook.get_stats().lock() {
+                return stats.total_tokens();
+            }
+        }
+        0
+    }
+
+    /// Get total cost for this session
+    pub fn get_total_cost(&self) -> f64 {
+        if let Some(ref hook) = self.hook {
+            if let Ok(stats) = hook.get_stats().lock() {
+                return stats.total_cost;
+            }
+        }
+        0.0
+    }
 }
 
 /// A dynamic agent type that can work with any provider
@@ -117,11 +137,12 @@ pub fn create_provider(
     searxng_config: Option<&SearXngConfig>,
     max_turns: usize,
     todo_tool: Option<TodoTool>,
+    bash_config: &BashConfig,
 ) -> Result<(DynAgent, ProviderInfo, CostTracker, Arc<Mutex<TodoList>>)> {
     match config {
         ProviderConfig::OpenRouter(c) => {
             let (agent, info, hook, todo_state) =
-                create_openrouter_agent(c, mcp_tools, system_prompt, searxng_config, max_turns, todo_tool)?;
+                create_openrouter_agent(c, mcp_tools, system_prompt, searxng_config, max_turns, todo_tool, bash_config)?;
             Ok((
                 DynAgent::OpenRouter(agent),
                 info,
@@ -130,7 +151,7 @@ pub fn create_provider(
             ))
         }
         ProviderConfig::Ollama(c) => {
-            let (agent, info, todo_state) = create_ollama_agent(c, mcp_tools, system_prompt, searxng_config, max_turns, todo_tool)?;
+            let (agent, info, todo_state) = create_ollama_agent(c, mcp_tools, system_prompt, searxng_config, max_turns, todo_tool, bash_config)?;
             Ok((DynAgent::Ollama(agent), info, CostTracker::none(), todo_state))
         }
     }
@@ -142,6 +163,7 @@ fn add_builtin_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P, rig::agent::NoToolConfig>,
     searxng_config: Option<&SearXngConfig>,
     todo_tool: Option<TodoTool>,
+    bash_config: &BashConfig,
 ) -> (rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>, Arc<Mutex<TodoList>>)
 where
     M: rig::completion::CompletionModel,
@@ -151,10 +173,13 @@ where
     let todo = todo_tool.unwrap_or_default();
     let todo_state = todo.get_state();
 
+    // Create BashTool with configured environment variables
+    let bash_tool = BashTool::new(bash_config.env.clone());
+
     let mut builder = builder
         .tool(FileEditTool::default())
         .tool(FileReadTool)
-        .tool(BashTool)
+        .tool(bash_tool)
         .tool(ListDirectoryTool)
         .tool(FetchUrlTool)
         .tool(ThinkTool)
@@ -176,6 +201,7 @@ fn create_openrouter_agent(
     searxng_config: Option<&SearXngConfig>,
     max_turns: usize,
     todo_tool: Option<TodoTool>,
+    bash_config: &BashConfig,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, TokenCostHook>,
     ProviderInfo,
@@ -214,7 +240,7 @@ fn create_openrouter_agent(
         .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) = add_builtin_tools(agent_builder, searxng_config, todo_tool);
+    let (agent_builder, todo_state) = add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config);
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -240,6 +266,7 @@ fn create_ollama_agent(
     searxng_config: Option<&SearXngConfig>,
     max_turns: usize,
     todo_tool: Option<TodoTool>,
+    bash_config: &BashConfig,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -279,7 +306,7 @@ fn create_ollama_agent(
     }
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) = add_builtin_tools(agent_builder, searxng_config, todo_tool);
+    let (agent_builder, todo_state) = add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config);
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {

@@ -2,6 +2,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -23,8 +24,25 @@ pub struct BashArgs {
     timeout_seconds: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct BashTool;
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BashTool {
+    /// Optional environment variables to set for the command
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self { env: None }
+    }
+}
+
+impl BashTool {
+    /// Create a new BashTool with the given environment variables
+    pub fn new(env: Option<HashMap<String, String>>) -> Self {
+        Self { env }
+    }
+}
 
 impl Tool for BashTool {
     const NAME: &'static str = "bash";
@@ -68,17 +86,28 @@ impl Tool for BashTool {
             tool_type = "bash",
             command = %args.command,
             timeout_secs = timeout_secs,
+            env_vars = ?self.env.as_ref().map(|e| e.keys().collect::<Vec<_>>()),
             "Starting bash tool execution"
         );
 
         let start_time = std::time::Instant::now();
 
-        let child = Command::new("/bin/sh")
-            .arg("-c")
+        // Build the command with optional environment variables
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
             .arg(&args.command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        // Add configured environment variables if any
+        if let Some(ref env_vars) = self.env {
+            for (key, value) in env_vars {
+                cmd.env(key, value);
+            }
+        }
+
+        let child = cmd
             .spawn()
             .map_err(|e| BashError::Execution(format!("Failed to spawn shell: {}", e)))?;
 

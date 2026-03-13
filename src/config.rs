@@ -95,6 +95,12 @@ pub struct Config {
     /// Context compaction configuration (enabled by default when not specified)
     #[serde(default)]
     pub context: ContextConfig,
+    /// Conversation persistence configuration
+    #[serde(default)]
+    pub conversation: Option<ConversationConfig>,
+    /// Bash tool configuration (env vars, etc.)
+    #[serde(default)]
+    pub bash: BashConfig,
 
     // === DEPRECATED: Legacy config fields for backward compatibility ===
     /// Legacy: OpenRouter API key (use provider.config.api_key instead)
@@ -157,6 +163,45 @@ impl Config {
             .as_ref()
             .map(|c| c.enabled && !c.base_url.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Check if conversation persistence is enabled
+    pub fn conversation_enabled(&self) -> bool {
+        self.conversation.as_ref().map(|c| c.auto_save).unwrap_or(true)
+    }
+
+    /// Get the conversation storage directory
+    pub fn conversation_storage_dir(&self) -> std::path::PathBuf {
+        self.conversation
+            .as_ref()
+            .and_then(|c| c.storage_dir.clone())
+            .unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("peakbot")
+                    .join("conversations")
+            })
+    }
+
+    /// Get max conversations setting
+    pub fn conversation_max(&self) -> usize {
+        self.conversation
+            .as_ref()
+            .map(|c| c.max_conversations)
+            .unwrap_or(50)
+    }
+
+    /// Check if auto-resume is enabled
+    pub fn conversation_auto_resume(&self) -> bool {
+        self.conversation
+            .as_ref()
+            .map(|c| c.auto_resume)
+            .unwrap_or(true)
+    }
+
+    /// Get the bash tool environment variables
+    pub fn bash_env(&self) -> Option<&HashMap<String, String>> {
+        self.bash.env.as_ref()
     }
 }
 
@@ -244,6 +289,35 @@ fn default_cost_tracking() -> bool {
     true
 }
 
+/// Configuration for conversation persistence
+#[derive(Debug, Deserialize, Clone)]
+pub struct ConversationConfig {
+    /// Enable auto-save (default: true)
+    #[serde(default = "default_true")]
+    pub auto_save: bool,
+    /// Storage directory (default: platform data dir)
+    #[serde(default)]
+    pub storage_dir: Option<std::path::PathBuf>,
+    /// Maximum conversations to keep (default: 50, 0 = unlimited)
+    #[serde(default = "default_max_conversations")]
+    pub max_conversations: usize,
+    /// Auto-load last conversation on startup (default: true)
+    #[serde(default = "default_true")]
+    pub auto_resume: bool,
+}
+
+/// Configuration for the bash tool
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct BashConfig {
+    /// Environment variables to set when running bash commands
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+}
+
+fn default_max_conversations() -> usize {
+    50
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -258,6 +332,8 @@ impl Default for Config {
                 enabled: default_context_enabled(),
                 context_window: None,
             },
+            conversation: None,
+            bash: BashConfig::default(),
             // Legacy fields default to None
             openrouter_api_key: None,
             openrouter_model: None,
@@ -481,6 +557,59 @@ impl Config {
         if let Ok(window) = std::env::var("CONTEXT_WINDOW") {
             if let Ok(window) = window.parse() {
                 config.context.context_window = Some(window);
+            }
+        }
+
+        // Conversation persistence config via environment variables
+        // CONVERSATION_AUTO_SAVE
+        if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_SAVE") {
+            if let Ok(enabled) = enabled.parse() {
+                let conv = config.conversation.get_or_insert_with(|| ConversationConfig {
+                    auto_save: true,
+                    storage_dir: None,
+                    max_conversations: 50,
+                    auto_resume: true,
+                });
+                conv.auto_save = enabled;
+            }
+        }
+
+        // CONVERSATION_STORAGE_DIR
+        if let Ok(dir) = std::env::var("CONVERSATION_STORAGE_DIR") {
+            if !dir.is_empty() {
+                let conv = config.conversation.get_or_insert_with(|| ConversationConfig {
+                    auto_save: true,
+                    storage_dir: None,
+                    max_conversations: 50,
+                    auto_resume: true,
+                });
+                conv.storage_dir = Some(std::path::PathBuf::from(dir));
+            }
+        }
+
+        // CONVERSATION_MAX_CONVERSATIONS
+        if let Ok(max) = std::env::var("CONVERSATION_MAX_CONVERSATIONS") {
+            if let Ok(max) = max.parse() {
+                let conv = config.conversation.get_or_insert_with(|| ConversationConfig {
+                    auto_save: true,
+                    storage_dir: None,
+                    max_conversations: 50,
+                    auto_resume: true,
+                });
+                conv.max_conversations = max;
+            }
+        }
+
+        // CONVERSATION_AUTO_RESUME
+        if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_RESUME") {
+            if let Ok(enabled) = enabled.parse() {
+                let conv = config.conversation.get_or_insert_with(|| ConversationConfig {
+                    auto_save: true,
+                    storage_dir: None,
+                    max_conversations: 50,
+                    auto_resume: true,
+                });
+                conv.auto_resume = enabled;
             }
         }
 

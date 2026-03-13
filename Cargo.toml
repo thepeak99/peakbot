@@ -18,6 +18,7 @@ chrono = "0.4"
 directories-next = "2"
 dirs = "5"
 serde_yaml = "0.9"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"
