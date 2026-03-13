@@ -7,6 +7,7 @@ use crate::config::{OllamaConfig, OpenRouterConfig, ProviderConfig, SearXngConfi
 use crate::hooks::TokenCostHook;
 use crate::tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
+    TodoList, TodoTool,
 };
 use anyhow::{Context, Result};
 use rig::agent::Agent;
@@ -107,53 +108,64 @@ impl DynAgent {
 /// If mcp_tools is provided, they will be added to the agent along with built-in tools.
 /// The system_prompt is used as the agent's preamble.
 /// For OpenRouter, cost tracking is enabled automatically.
+/// If todo_tool is provided, it will be used (otherwise a default one is created).
+/// Returns the todo state Arc for user visibility.
 pub fn create_provider(
     config: &ProviderConfig,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
     max_turns: usize,
-) -> Result<(DynAgent, ProviderInfo, CostTracker)> {
+    todo_tool: Option<TodoTool>,
+) -> Result<(DynAgent, ProviderInfo, CostTracker, Arc<Mutex<TodoList>>)> {
     match config {
         ProviderConfig::OpenRouter(c) => {
-            let (agent, info, hook) =
-                create_openrouter_agent(c, mcp_tools, system_prompt, searxng_config, max_turns)?;
+            let (agent, info, hook, todo_state) =
+                create_openrouter_agent(c, mcp_tools, system_prompt, searxng_config, max_turns, todo_tool)?;
             Ok((
                 DynAgent::OpenRouter(agent),
                 info,
                 CostTracker::new(Some(hook)),
+                todo_state,
             ))
         }
         ProviderConfig::Ollama(c) => {
-            let (agent, info) = create_ollama_agent(c, mcp_tools, system_prompt, searxng_config, max_turns)?;
-            Ok((DynAgent::Ollama(agent), info, CostTracker::none()))
+            let (agent, info, todo_state) = create_ollama_agent(c, mcp_tools, system_prompt, searxng_config, max_turns, todo_tool)?;
+            Ok((DynAgent::Ollama(agent), info, CostTracker::none(), todo_state))
         }
     }
 }
 
 /// Get built-in tools for PeakBot (excluding SearchTool which requires config)
+/// If todo_tool is provided, uses it; otherwise creates a new one
 fn add_builtin_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P, rig::agent::NoToolConfig>,
     searxng_config: Option<&SearXngConfig>,
-) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
+    todo_tool: Option<TodoTool>,
+) -> (rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>, Arc<Mutex<TodoList>>)
 where
     M: rig::completion::CompletionModel,
     P: rig::agent::PromptHook<M>,
 {
-    let builder = builder
+    // Use provided tool or create a new one
+    let todo = todo_tool.unwrap_or_default();
+    let todo_state = todo.get_state();
+
+    let mut builder = builder
         .tool(FileEditTool::default())
         .tool(FileReadTool)
         .tool(BashTool)
         .tool(ListDirectoryTool)
         .tool(FetchUrlTool)
-        .tool(ThinkTool);
+        .tool(ThinkTool)
+        .tool(todo);
 
     // Conditionally add search tool if SearXNG is configured
     if let Some(config) = searxng_config {
-        builder.tool(SearchTool::new(config))
-    } else {
-        builder
+        builder = builder.tool(SearchTool::new(config));
     }
+
+    (builder, todo_state)
 }
 
 /// Create OpenRouter agent and info with cost tracking
@@ -163,10 +175,12 @@ fn create_openrouter_agent(
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
     max_turns: usize,
+    todo_tool: Option<TodoTool>,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, TokenCostHook>,
     ProviderInfo,
     TokenCostHook,
+    Arc<Mutex<TodoList>>,
 )> {
     let api_key = config
         .api_key
@@ -199,8 +213,8 @@ fn create_openrouter_agent(
         .default_max_turns(max_turns)
         .hook(hook.clone());
 
-    // Add built-in tools (including optional SearchTool)
-    let agent_builder = add_builtin_tools(agent_builder, searxng_config);
+    // Add built-in tools (including optional SearchTool and TodoTool)
+    let (agent_builder, todo_state) = add_builtin_tools(agent_builder, searxng_config, todo_tool);
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -215,7 +229,7 @@ fn create_openrouter_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, hook))
+    Ok((agent, info, hook, todo_state))
 }
 
 /// Create Ollama agent and info (no cost tracking for local models)
@@ -225,9 +239,11 @@ fn create_ollama_agent(
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
     max_turns: usize,
+    todo_tool: Option<TodoTool>,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
+    Arc<Mutex<TodoList>>,
 )> {
     if config.model.is_empty() {
         anyhow::bail!("Ollama model not specified");
@@ -262,8 +278,8 @@ fn create_ollama_agent(
         agent_builder = agent_builder.additional_params(params);
     }
 
-    // Add built-in tools (including optional SearchTool)
-    let agent_builder = add_builtin_tools(agent_builder, searxng_config);
+    // Add built-in tools (including optional SearchTool and TodoTool)
+    let (agent_builder, todo_state) = add_builtin_tools(agent_builder, searxng_config, todo_tool);
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -278,5 +294,5 @@ fn create_ollama_agent(
         supports_pricing: false,
     };
 
-    Ok((agent, info))
+    Ok((agent, info, todo_state))
 }

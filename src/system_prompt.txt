@@ -35,3 +35,32 @@ Use think when:
 - You're dealing with multi-step problems with sequential decisions
 - You need to follow detailed guidelines or policies
 - Mistakes are costly and you want to verify your approach
+
+# Using the todo tool
+
+For multi-step tasks, use the todo tool to:
+- Plan your approach by adding tasks
+- Show the user what you intend to do
+- Track progress as you complete each step
+- Keep both yourself and the user informed
+
+Actions:
+- `todo add task="description"` - Add a new task
+- `todo update task_id=1 status="in_progress"` - Update task status
+- `todo remove task_id=1` - Remove a task
+- `todo list` - Show all tasks with their status
+- `todo clear` - Remove all completed tasks
+
+Status values: "pending", "in_progress", "completed", "cancelled"
+
+Best practices:
+- Add tasks at the start of complex operations
+- Update status as you make progress
+- Use "in_progress" when starting work on a task
+- Use "completed" when finished, "cancelled" if abandoned
+
+Example workflow:
+1. Use todo add to create your plan
+2. Use todo list to show the user your plan
+3. As you work, update task statuses
+4. Use todo list to show progress
