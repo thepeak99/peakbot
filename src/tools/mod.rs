@@ -6,6 +6,7 @@ mod list_directory;
 mod logging_wrapper;
 mod search;
 mod think;
+mod todo;
 
 pub use bash::BashTool;
 pub use fetch_url::FetchUrlTool;
@@ -15,3 +16,4 @@ pub use list_directory::ListDirectoryTool;
 pub use logging_wrapper::LoggingToolDyn;
 pub use search::SearchTool;
 pub use think::ThinkTool;
+pub use todo::{TodoList, TodoStatus, TodoTool};

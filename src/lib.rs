@@ -20,7 +20,7 @@ use rmcp::transport::TokioChildProcess;
 pub use skills::{SkillRegistry, load_default_skills};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
-    SearchTool, ThinkTool,
+    SearchTool, ThinkTool, TodoList, TodoStatus, TodoTool,
 };
 
 use anyhow::{Result, anyhow};
@@ -78,6 +78,7 @@ pub struct AgentRunner {
     context_manager: Option<ContextManager>,
     system_prompt: String,
     cost_tracker: CostTracker,
+    todo_state: Option<Arc<Mutex<TodoList>>>,
 }
 
 impl AgentRunner {
@@ -88,6 +89,7 @@ impl AgentRunner {
         provider_info: ProviderInfo,
         skills: SkillRegistry,
         cost_tracker: CostTracker,
+        todo_state: Option<Arc<Mutex<TodoList>>>,
     ) -> Self {
         // Wrap agent in Arc so we can share it with ContextManager for summarization
         let agent = Arc::new(agent);
@@ -116,6 +118,7 @@ impl AgentRunner {
             context_manager,
             system_prompt,
             cost_tracker,
+            todo_state,
         }
     }
 
@@ -146,6 +149,22 @@ impl AgentRunner {
     fn reset_stats(&self) {
         self.cost_tracker.reset_stats();
         println!("Stats reset.\n");
+    }
+
+    /// Print todo list summary
+    fn print_todo_summary(&self) {
+        if let Some(ref state) = self.todo_state {
+            if let Ok(list) = state.lock() {
+                let tasks = list.list();
+                if !tasks.is_empty() {
+                    let (pending, in_progress, completed, cancelled) = list.count_by_status();
+                    println!(
+                        "\n[Todo: {} pending, {} in-progress, {} completed, {} cancelled]\n",
+                        pending, in_progress, completed, cancelled
+                    );
+                }
+            }
+        }
     }
 
     /// Print context status
@@ -306,6 +325,8 @@ impl AgentRunner {
                     println!("\n{}", response);
                     // Display token stats after each response
                     self.print_last_request_stats();
+                    // Display todo summary after each response
+                    self.print_todo_summary();
                 }
                 Err(e) => {
                     eprintln!("\nError: {}\n", e);

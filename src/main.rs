@@ -1,7 +1,7 @@
 // Use the library crate (defined in lib.rs)
 use anyhow::Result;
 use peakbot::{
-    AgentRunner, Config, build_system_prompt, create_provider, load_default_skills,
+    AgentRunner, Config, TodoTool, build_system_prompt, create_provider, load_default_skills,
     load_mcp_servers,
 };
 use tracing_subscriber::EnvFilter;
@@ -46,13 +46,17 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Create the todo tool - we'll pass it to the provider and store its state
+    let todo_tool = TodoTool::new();
+
     // Create provider (agent) with all tools (built-in + MCP) and system prompt
-    let (agent, provider_info, cost_tracker) = create_provider(
+    let (agent, provider_info, cost_tracker, todo_state) = create_provider(
         &config.provider,
         mcp_tools,
         &system_prompt,
         searxng_config,
         config.agent_max_turns,
+        Some(todo_tool),
     )?;
     tracing::info!(
         "Using provider: {} with model: {}",
@@ -61,7 +65,7 @@ async fn main() -> Result<()> {
     );
 
     // Run the interactive REPL - the agent includes both built-in and MCP tools
-    let mut runner = AgentRunner::new(agent, config.clone(), provider_info, skills, cost_tracker);
+    let mut runner = AgentRunner::new(agent, config.clone(), provider_info, skills, cost_tracker, Some(todo_state));
     runner.run().await?;
 
     Ok(())
