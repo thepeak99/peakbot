@@ -2,18 +2,22 @@
 
 mod config;
 mod context_manager;
+mod conversation;
+mod conversation_manager;
 mod hooks;
 mod providers;
 mod skills;
 mod tools;
 
-pub use config::{Config, ContextConfig, McpServerConfig, OllamaConfig, OpenRouterConfig, ProviderConfig, ProviderType, SearXngConfig};
+pub use config::{BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig, OllamaConfig, OpenRouterConfig, ProviderConfig, ProviderType, SearXngConfig};
 pub use context_manager::{CompactionResult, ContextManager};
+pub use conversation::{Conversation, ConversationMetadata, ConversationSummary, Message as ConversationMessage};
+pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
     CostTrackingStats, ModelPricing, SessionStats, TokenCostHook, fetch_model_pricing,
 };
 pub use providers::{create_provider, CostTracker, DynAgent, ProviderInfo};
-use rig::completion::message::Message;
+use rig::completion::Message;
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
 use rmcp::transport::TokioChildProcess;
@@ -69,6 +73,67 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
     prompt
 }
 
+/// Convert stored conversation messages to rig Messages for LLM chat history
+/// This is used when loading a conversation to restore the chat history
+pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message> {
+    use crate::conversation::Message as StoredMessage;
+    
+    let mut messages = Vec::new();
+    
+    for msg in &conv.messages {
+        match msg {
+            StoredMessage::User { content, .. } => {
+                messages.push(Message::user(content.clone()));
+            }
+            StoredMessage::Assistant { content, .. } => {
+                messages.push(Message::assistant(content.clone()));
+            }
+            // Skip tool results - they're already embedded in assistant responses
+            // and including them would be redundant
+            StoredMessage::ToolResult { .. } => {}
+        }
+    }
+    
+    messages
+}
+
+/// Print the last N messages from a conversation to the console
+/// This is used when resuming an old conversation to show context
+pub fn print_recent_messages(conv: &Conversation, count: usize) {
+    use crate::conversation::Message as StoredMessage;
+    
+    let messages: Vec<_> = conv.messages.iter().rev().take(count).collect();
+    
+    if messages.is_empty() {
+        println!("  (no messages in this conversation)");
+        return;
+    }
+    
+    // Print in reverse order (oldest first)
+    for msg in messages.iter().rev() {
+        match msg {
+            StoredMessage::User { content, timestamp } => {
+                println!("  [{}] User: {}", timestamp.format("%H:%M"), truncate(content, 100));
+            }
+            StoredMessage::Assistant { content, timestamp } => {
+                println!("  [{}] Assistant: {}", timestamp.format("%H:%M"), truncate(content, 100));
+            }
+            StoredMessage::ToolResult { tool_name, result, timestamp } => {
+                println!("  [{}] Tool: {} - {}", timestamp.format("%H:%M"), tool_name, truncate(result, 60));
+            }
+        }
+    }
+}
+
+/// Truncate a string to a maximum length, adding "..." if truncated
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
 /// A type that can handle agent prompts with history support
 pub struct AgentRunner {
     agent: Arc<DynAgent>,
@@ -76,6 +141,7 @@ pub struct AgentRunner {
     provider_info: ProviderInfo,
     skills: SkillRegistry,
     context_manager: Option<ContextManager>,
+    conversation_manager: Option<ConversationManager>,
     system_prompt: String,
     cost_tracker: CostTracker,
     todo_state: Option<Arc<Mutex<TodoList>>>,
@@ -110,12 +176,31 @@ impl AgentRunner {
             Some(agent.clone()),
         ));
         
+        // Create conversation manager if persistence is enabled
+        let conversation_manager = if config.conversation_enabled() {
+            match ConversationManager::new(ConversationManagerConfig {
+                auto_save: true,
+                storage_dir: config.conversation_storage_dir(),
+                max_conversations: config.conversation_max(),
+                auto_resume: config.conversation_auto_resume(),
+            }) {
+                Ok(cm) => Some(cm),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize conversation manager: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
         Self {
             agent,
             config,
             provider_info,
             skills,
             context_manager,
+            conversation_manager,
             system_prompt,
             cost_tracker,
             todo_state,
@@ -200,6 +285,35 @@ impl AgentRunner {
         }
     }
 
+    /// List all saved conversations
+    fn list_conversations(&self) {
+        if let Some(ref cm) = self.conversation_manager {
+            match cm.list() {
+                Ok(conversations) => {
+                    if conversations.is_empty() {
+                        println!("\nNo saved conversations.\n");
+                    } else {
+                        println!("\n=== Saved Conversations ===\n");
+                        for conv in &conversations {
+                            println!("ID: {}", conv.id);
+                            println!("  Name: {}", conv.name);
+                            println!("  Model: {}", conv.model);
+                            println!("  Messages: {}", conv.message_count);
+                            println!("  Created: {}", conv.created_at.format("%Y-%m-%d %H:%M"));
+                            println!("  Updated: {}", conv.updated_at.format("%Y-%m-%d %H:%M"));
+                            println!();
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to list conversations: {}\n", e);
+                }
+            }
+        } else {
+            println!("\nConversation persistence is not enabled.\n");
+        }
+    }
+
     /// Run the interactive REPL loop
     pub async fn run(&mut self) -> Result<()> {
         let cwd = std::env::current_dir()?;
@@ -244,12 +358,70 @@ impl AgentRunner {
         } else {
             println!("Context compaction: disabled");
         }
+        
+        // Print conversation persistence status
+        if let Some(ref cm) = self.conversation_manager {
+            println!(
+                "Conversation persistence: enabled (auto-save, {} stored)",
+                cm.storage_dir().display()
+            );
+        } else {
+            println!("Conversation persistence: disabled");
+        }
+        
         println!("Working directory: {}", cwd.display());
-        println!("Type /stats to see session stats, /context for context status, /compact to force compaction, or 'exit' to quit.\n");
+        println!("Type /stats to see session stats, /context for context status, /compact to force compaction, /conversations to list saved, or 'exit' to quit.\n");
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
         let mut chat_history: Vec<Message> = Vec::new();
+        
+        // Check for auto-resume before starting the main loop
+        let mut resumed = false;
+        if let Some(ref mut cm) = self.conversation_manager {
+            if self.config.conversation_auto_resume() {
+                if let Ok(Some(latest)) = cm.get_latest() {
+                    // Skip resuming if the conversation has 0 messages
+                    if latest.messages.is_empty() {
+                        tracing::debug!("Skipping auto-resume: latest conversation has 0 messages");
+                    } else {
+                        println!(
+                            "\n[Found previous conversation: '{}' ({} messages)]",
+                            latest.name,
+                            latest.messages.len()
+                        );
+                        print!("Resume this conversation? (y/n): ");
+                        stdout.flush().ok();
+                        
+                        let mut confirm = String::new();
+                        if stdin.lock().read_line(&mut confirm).is_ok() {
+                            if confirm.trim().eq_ignore_ascii_case("y") || confirm.trim().is_empty() {
+                                // Load the conversation
+                                if let Err(e) = cm.load_and_set_current(latest.id) {
+                                    eprintln!("Failed to load conversation: {}", e);
+                                } else {
+                                    // Convert stored messages to rig messages and populate chat history
+                                    chat_history = convert_conversation_to_rig_messages(&latest);
+                                    resumed = true;
+                                    println!("\n--- Resumed conversation: '{}' ---", latest.name);
+                                    println!("Last {} messages:\n", 10.min(latest.messages.len()));
+                                    print_recent_messages(&latest, 10);
+                                    println!("\n");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If not resumed, create a new conversation
+        if !resumed {
+            if let Some(ref mut cm) = self.conversation_manager {
+                let name = format!("Conversation {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+                let _ = cm.create_new(name, self.config.model().to_string());
+            }
+        }
 
         loop {
             print!("> ");
@@ -294,6 +466,147 @@ impl AgentRunner {
                 continue;
             }
 
+            // Handle /conversations or /history command
+            if input.eq_ignore_ascii_case("/conversations") || input.eq_ignore_ascii_case("/history") {
+                self.list_conversations();
+                continue;
+            }
+
+            // Handle /new command - start a fresh conversation
+            if input.eq_ignore_ascii_case("/new") {
+                if let Some(ref mut cm) = self.conversation_manager {
+                    let name = format!("Conversation {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+                    let _ = cm.create_new(name, self.config.model().to_string());
+                    chat_history.clear();
+                    println!("Started a new conversation.\n");
+                } else {
+                    println!("Conversation persistence is not enabled.\n");
+                }
+                continue;
+            }
+
+            // Handle /save command - save current conversation
+            if input.eq_ignore_ascii_case("/save") {
+                if let Some(ref mut cm) = self.conversation_manager {
+                    if let Some(ref conv) = cm.get_current() {
+                        let _ = cm.save();
+                        println!("Conversation saved: {}\n", conv.name);
+                    }
+                } else {
+                    println!("Conversation persistence is not enabled.\n");
+                }
+                continue;
+            }
+
+            // Handle /load <id> command
+            if let Some(id_str) = input.strip_prefix("/load ") {
+                if let Some(ref mut cm) = self.conversation_manager {
+                    match uuid::Uuid::parse_str(id_str) {
+                        Ok(id) => {
+                            match cm.load(id) {
+                                Ok(conv) => {
+                                    // Load the conversation and populate chat history
+                                    let _ = cm.load_and_set_current(id);
+                                    chat_history = convert_conversation_to_rig_messages(&conv);
+                                    println!("\n--- Loaded conversation: '{}' ---", conv.name);
+                                    println!("Last {} messages:\n", 10.min(conv.messages.len()));
+                                    print_recent_messages(&conv, 10);
+                                    println!("\n");
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to load conversation: {}\n", e);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("Invalid conversation ID. Use /conversations to see available IDs.\n");
+                        }
+                    }
+                } else {
+                    println!("Conversation persistence is not enabled.\n");
+                }
+                continue;
+            }
+
+            // Handle /delete <id> command
+            if let Some(id_str) = input.strip_prefix("/delete ") {
+                if let Some(ref cm) = self.conversation_manager {
+                    match uuid::Uuid::parse_str(id_str) {
+                        Ok(id) => {
+                            match cm.delete(id) {
+                                Ok(_) => println!("Conversation deleted.\n"),
+                                Err(e) => eprintln!("Failed to delete: {}\n", e),
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("Invalid conversation ID.\n");
+                        }
+                    }
+                } else {
+                    println!("Conversation persistence is not enabled.\n");
+                }
+                continue;
+            }
+
+            // Handle /export <id> <format> command
+            if let Some(args) = input.strip_prefix("/export ") {
+                let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    if let Some(ref cm) = self.conversation_manager {
+                        let id_str = parts[0];
+                        let format = parts[1].to_lowercase();
+                        match uuid::Uuid::parse_str(id_str) {
+                            Ok(id) => {
+                                match cm.load(id) {
+                                    Ok(conv) => {
+                                        let output = match format.as_str() {
+                                            "markdown" | "md" => cm.export_markdown(&conv),
+                                            "json" => cm.export_json(&conv),
+                                            _ => {
+                                                eprintln!("Unknown format '{}'. Use 'json' or 'markdown'.\n", format);
+                                                continue;
+                                            }
+                                        };
+                                        match output {
+                                            Ok(s) => {
+                                                println!("\n--- Export ---\n{}\n--- End ---\n", s);
+                                            }
+                                            Err(e) => eprintln!("Export failed: {}\n", e),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Failed to load conversation: {}\n", e),
+                                }
+                            }
+                            Err(_) => eprintln!("Invalid conversation ID.\n"),
+                        }
+                    } else {
+                        println!("Conversation persistence is not enabled.\n");
+                    }
+                } else {
+                    println!("Usage: /export <id> <json|markdown>\n");
+                }
+                continue;
+            }
+
+            // Handle /rename <name> command
+            if let Some(name) = input.strip_prefix("/rename ") {
+                if let Some(ref mut cm) = self.conversation_manager {
+                    if let Err(e) = cm.rename(name.to_string()) {
+                        eprintln!("Failed to rename: {}\n", e);
+                    } else {
+                        println!("Conversation renamed to: {}\n", name);
+                    }
+                } else {
+                    println!("Conversation persistence is not enabled.\n");
+                }
+                continue;
+            }
+
+            // Auto-save user message before sending to model
+            if let Some(ref mut cm) = self.conversation_manager {
+                let _ = cm.add_user_message(input.to_string());
+            }
+
             // Check if context compaction is needed before prompting
             if let Some(ref mut cm) = self.context_manager {
                 if cm.needs_compaction(&chat_history) {
@@ -323,6 +636,14 @@ impl AgentRunner {
             {
                 Ok(response) => {
                     println!("\n{}", response);
+                    // Auto-save assistant message after response
+                    if let Some(ref mut cm) = self.conversation_manager {
+                        let _ = cm.add_assistant_message(response.clone());
+                        // Update token statistics in the conversation
+                        let tokens = self.cost_tracker.get_total_tokens();
+                        let cost = self.cost_tracker.get_total_cost();
+                        let _ = cm.update_tokens(tokens, cost);
+                    }
                     // Display token stats after each response
                     self.print_last_request_stats();
                     // Display todo summary after each response

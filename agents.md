@@ -299,6 +299,13 @@ provider:
 ### Additional Configuration Options
 
 ```yaml
+# Bash tool configuration (environment variables for shell commands)
+bash:
+  env:
+    MY_API_KEY: "secret-key-123"
+    MY_CUSTOM_PATH: "/opt/custom/bin"
+    # These env vars will be available in all bash command executions
+
 # SearXNG web search configuration
 searxng:
   base_url: https://searx.example.com
