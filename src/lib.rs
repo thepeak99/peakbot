@@ -3,17 +3,17 @@
 mod config;
 mod context_manager;
 mod hooks;
+mod providers;
 mod skills;
 mod tools;
 
-pub use config::{Config, ContextConfig, McpServerConfig, SearXngConfig};
+pub use config::{Config, ContextConfig, McpServerConfig, OllamaConfig, OpenRouterConfig, ProviderConfig, ProviderType, SearXngConfig};
 pub use context_manager::{CompactionResult, ContextManager};
 pub use hooks::{
     CostTrackingStats, ModelPricing, SessionStats, TokenCostHook, fetch_model_pricing,
 };
-use rig::agent::PromptHook;
-use rig::client::{Capabilities, Capable, Client};
-use rig::completion::{CompletionModel, Prompt};
+pub use providers::{create_provider, CostTracker, DynAgent, ProviderInfo};
+use rig::completion::message::Message;
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
 use rmcp::transport::TokioChildProcess;
@@ -24,8 +24,6 @@ pub use tools::{
 };
 
 use anyhow::{Result, anyhow};
-use rig::providers::openrouter;
-use rig::{agent::Agent, completion::message::Message};
 use rmcp::service::ServiceExt;
 use std::io::{self, BufRead, Write};
 use std::process::Stdio;
@@ -35,7 +33,7 @@ use tracing::debug;
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
 /// Build the system prompt dynamically with environment information
-fn build_system_prompt(skills: &SkillRegistry) -> String {
+pub fn build_system_prompt(skills: &SkillRegistry) -> String {
     let mut prompt = SYSTEM_PROMPT.to_string();
 
     // Get current working directory
@@ -71,114 +69,29 @@ fn build_system_prompt(skills: &SkillRegistry) -> String {
     prompt
 }
 
-/// Create the OpenRouter client from config
-pub fn create_openrouter_client(config: &Config) -> Result<openrouter::Client> {
-    let api_key = config.openrouter_api_key.clone().unwrap_or_default();
-    if api_key.is_empty() {
-        anyhow::bail!("OpenRouter API key not configured. Set OPENROUTER_API_KEY env var");
-    }
-
-    let client = openrouter::Client::builder()
-        .api_key(&api_key)
-        .build()
-        .expect("Failed to create OpenRouter client");
-
-    Ok(client)
-}
-
-use rig::client::completion::CompletionClient;
-/// Build the agent with all tools (built-in and MCP)
-/// Returns the agent and a reference to the session stats
-pub async fn build_agent<M, Ext>(
-    client: &Client<Ext>,
-    config: &Config,
-    mcp_server_handles: &[McpServerHandle],
-    skills: &SkillRegistry,
-) -> Result<(Agent<M, TokenCostHook>, Arc<Mutex<SessionStats>>)>
-where
-    M: CompletionModel<Client = Client<Ext>>, //Type bending
-    Ext: Capabilities<Completion = Capable<M>>,
-{
-    // Create completion model with configured model name
-    let model_name = config.openrouter_model.clone();
-
-    // Build the system prompt dynamically with environment info and skills
-    let system_prompt = build_system_prompt(skills);
-
-    let mcp_tools = mcp_server_handles
-        .iter()
-        .flat_map(|handle| handle.dyn_tools())
-        .collect();
-
-    // Create the token cost hook if enabled
-    let hook = if config.cost_tracking {
-        TokenCostHook::new(
-            model_name.clone(),
-            fetch_model_pricing(
-                config.openrouter_api_key.as_deref().unwrap_or(""),
-                &model_name,
-            )
-            .await?,
-        )
-    } else {
-        // Create a no-op hook with zero pricing
-        TokenCostHook::new(
-            model_name.clone(),
-            ModelPricing {
-                input_per_token: 0.0,
-                output_per_token: 0.0,
-            },
-        )
-    };
-
-    // Get the stats reference before moving the hook into the agent
-    let stats = hook.get_stats();
-
-    // Build the agent with all tools and the hook
-    let mut agent_builder = client
-        .agent(model_name)
-        .preamble(&system_prompt)
-        .max_tokens(config.openrouter_max_tokens)
-        .default_max_turns(config.agent_max_turns)
-        .hook(hook)
-        .tool(FileEditTool::default())
-        .tool(FileReadTool)
-        .tool(BashTool)
-        .tool(ListDirectoryTool)
-        .tool(FetchUrlTool)
-        .tool(ThinkTool);
-
-    // Conditionally add search tool if SearXNG is configured
-    if config.searxng_enabled() {
-        if let Some(searxng_config) = &config.searxng {
-            agent_builder = agent_builder.tool(SearchTool::new(searxng_config));
-            tracing::info!("SearXNG search enabled: {}", searxng_config.base_url);
-        }
-    }
-
-    let agent = agent_builder.tools(mcp_tools).build();
-
-    Ok((agent, stats))
-}
-
 /// A type that can handle agent prompts with history support
-pub struct AgentRunner<M: CompletionModel, P: PromptHook<M>> {
-    agent: Agent<M, P>,
+pub struct AgentRunner {
+    agent: Arc<DynAgent>,
     config: Config,
+    provider_info: ProviderInfo,
     skills: SkillRegistry,
-    stats: Arc<Mutex<SessionStats>>,
     context_manager: Option<ContextManager>,
     system_prompt: String,
+    cost_tracker: CostTracker,
 }
 
-impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
+impl AgentRunner {
     /// Create a new AgentRunner
     pub fn new(
-        agent: Agent<M, P>,
+        agent: DynAgent,
         config: Config,
+        provider_info: ProviderInfo,
         skills: SkillRegistry,
-        stats: Arc<Mutex<SessionStats>>,
+        cost_tracker: CostTracker,
     ) -> Self {
+        // Wrap agent in Arc so we can share it with ContextManager for summarization
+        let agent = Arc::new(agent);
+        
         // Build system prompt for context manager
         let system_prompt = build_system_prompt(&skills);
         
@@ -186,50 +99,53 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
         let system_prompt_tokens = system_prompt.len() / 4;
         
         // Create context manager (always created, enabled flag controls actual usage)
-        // Pass stats reference so it can read actual token counts from the provider
+        // Pass a clone of the agent Arc for summarization
         let context_manager = Some(ContextManager::new(
             config.context.clone(), 
-            &config.openrouter_model,
-            stats.clone(),
+            provider_info.model.as_str(),
+            cost_tracker.get_session_stats().unwrap_or_else(|| Arc::new(Mutex::new(SessionStats::new()))),
             system_prompt_tokens,
+            Some(agent.clone()),
         ));
         
         Self {
             agent,
             config,
+            provider_info,
             skills,
-            stats,
             context_manager,
             system_prompt,
+            cost_tracker,
         }
     }
 
     /// Print stats for the last request
     fn print_last_request_stats(&self) {
-        if let Ok(stats) = self.stats.lock() {
-            if let Some(last) = stats.last_request() {
-                println!(
-                    "{}",
-                    stats.format_per_request(last.input_tokens, last.output_tokens, last.cost)
-                );
-            }
+        if let Some(stats) = self.cost_tracker.get_last_request_stats() {
+            println!("{}", stats);
+        } else {
+            // For providers without cost tracking (e.g., Ollama)
+            println!("[Token tracking not available for this provider]");
         }
     }
 
     /// Print session summary
     fn print_stats(&self) {
-        if let Ok(stats) = self.stats.lock() {
-            println!("\n=== Session Statistics ===\n");
-            println!("{}", stats.summary());
-            println!();
+        println!("\n=== Session Statistics ===\n");
+        println!("Provider: {}", self.provider_info.name);
+        println!("Model: {}", self.provider_info.model);
+        if let Some(summary) = self.cost_tracker.get_session_summary() {
+            println!("{}", summary);
+        } else {
+            println!("Token tracking not available for this provider.");
         }
+        println!();
     }
 
     /// Reset session stats
     fn reset_stats(&self) {
-        if let Ok(mut stats) = self.stats.lock() {
-            stats.reset();
-        }
+        self.cost_tracker.reset_stats();
+        println!("Stats reset.\n");
     }
 
     /// Print context status
@@ -245,15 +161,15 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
     }
 
     /// Force context compaction
-    fn force_compact(&mut self, chat_history: &mut Vec<Message>) {
+    async fn force_compact(&mut self, chat_history: &mut Vec<Message>) {
         if let Some(ref mut cm) = self.context_manager {
-            match cm.compact(chat_history, &self.system_prompt) {
+            match cm.compact(chat_history, &self.system_prompt).await {
                 Ok(result) => {
                     println!(
-                        "\n[Context compacted: {} → {} messages, {} messages summarized]\n",
+                        "\n[Context compacted: {} → {} messages, {} messages discarded]\n",
                         result.original_count,
                         result.compacted_count,
-                        result.num_summarized
+                        result.num_discarded
                     );
                 }
                 Err(e) => {
@@ -269,7 +185,7 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
     pub async fn run(&mut self) -> Result<()> {
         let cwd = std::env::current_dir()?;
         println!("PeakBot coding agent ready.");
-        println!("Model: {}", self.config.openrouter_model);
+        println!("Provider: {} | Model: {}", self.config.provider_name(), self.config.model());
         if self.config.mcp_servers.as_ref().map_or(0, |s| s.len()) > 0 {
             println!(
                 "MCP servers: {}",
@@ -291,7 +207,9 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
         }
         println!(
             "Cost tracking: {}",
-            if self.config.cost_tracking {
+            if !self.config.supports_pricing() {
+                "not supported by provider"
+            } else if self.config.cost_tracking {
                 "enabled"
             } else {
                 "disabled"
@@ -353,7 +271,7 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
 
             // Handle /compact command
             if input.eq_ignore_ascii_case("/compact") {
-                self.force_compact(&mut chat_history);
+                self.force_compact(&mut chat_history).await;
                 continue;
             }
 
@@ -362,12 +280,13 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
                 if cm.needs_compaction(&chat_history) {
                     println!("[Context approaching limit, compacting before prompt...]");
                     cm.compact(&mut chat_history, &self.system_prompt)
+                        .await
                         .map(|result| {
                             println!(
-                                "[Compacted: {} → {} messages, {} summarized]\n",
+                                "[Compacted: {} → {} messages, {} discarded]\n",
                                 result.original_count,
                                 result.compacted_count,
-                                result.num_summarized
+                                result.num_discarded
                             );
                         })
                         .unwrap_or_else(|e| {
@@ -376,11 +295,11 @@ impl<M: CompletionModel, P: PromptHook<M> + 'static> AgentRunner<M, P> {
                 }
             }
 
-            // Clone history since chat() takes ownership
+            // Use the agent to prompt with history
             match self
                 .agent
-                .prompt(input)
-                .with_history(&mut chat_history)
+                .as_ref()
+                .prompt_with_history(input, &mut chat_history)
                 .await
             {
                 Ok(response) => {
@@ -415,10 +334,11 @@ impl McpServerHandle {
         &self.tools
     }
 
-    fn dyn_tools(&self) -> Vec<Box<dyn ToolDyn>> {
+    /// Take ownership of the tools, converting them to dynamic tool trait objects
+    pub fn take_tools(self) -> Vec<Box<dyn ToolDyn>> {
         self.tools
-            .iter()
-            .map(|tool| LoggingToolDyn::new(tool.to_owned(), &self.name))
+            .into_iter()
+            .map(|tool| LoggingToolDyn::new(tool, &self.name))
             .map(|tool| Box::new(tool) as Box<dyn ToolDyn>)
             .collect()
     }

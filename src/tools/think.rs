@@ -46,6 +46,7 @@ impl Tool for ThinkTool {
             target: "peakbot",
             tool_type = "think",
             thought_length = args.thought.len(),
+            thoughts = args.thought,
             "Think tool executed"
         );
 
