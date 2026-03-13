@@ -1,7 +1,7 @@
 // Use the library crate (defined in lib.rs)
 use anyhow::Result;
 use peakbot::{
-    AgentRunner, Config, build_agent, create_openrouter_client, load_default_skills,
+    AgentRunner, Config, build_system_prompt, create_provider, load_default_skills,
     load_mcp_servers,
 };
 use tracing_subscriber::EnvFilter;
@@ -10,27 +10,58 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     // Setup logging
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("peakbot=debug"))
+        .with_env_filter(EnvFilter::new("peakbot=info"))
         .init();
 
     // Load configuration from environment variables
-    let config = Config::load().unwrap_or_default();
-
-    // Create OpenRouter client
-    let client = create_openrouter_client(&config)?;
+    let config = Config::load()?;
 
     // Load skills from default locations (~/.agents/skills and ./.agents/skills)
     let skills = load_default_skills()?;
 
-    // Load MCP servers (handles kept alive by McpServers)
-    let mcp_servers = load_mcp_servers(&config).await?;
+    // Build the system prompt dynamically with environment info and skills
+    // This must be done before creating the provider so the agent can use it as preamble
+    let system_prompt = build_system_prompt(&skills);
 
-    // Build the agent with all tools and skills
-    // Returns agent and stats reference
-    let (agent, stats) = build_agent(&client, &config, &mcp_servers, &skills).await?;
+    // Load MCP servers first (async operation) - this gives us MCP tools
+    let mcp_handles = load_mcp_servers(&config).await?;
 
-    // Run the interactive REPL
-    let mut runner = AgentRunner::new(agent, config.clone(), skills, stats);
+    // Extract MCP tools from the handles (if any)
+    let mcp_tools = if mcp_handles.is_empty() {
+        None
+    } else {
+        let mut all_tools = Vec::new();
+        for handle in mcp_handles {
+            use rig::tool::ToolDyn;
+            let tools: Vec<Box<dyn ToolDyn>> = handle.take_tools();
+            all_tools.extend(tools);
+        }
+        Some(all_tools)
+    };
+
+    // Get SearXNG config if enabled
+    let searxng_config = if config.searxng_enabled() {
+        config.searxng.as_ref()
+    } else {
+        None
+    };
+
+    // Create provider (agent) with all tools (built-in + MCP) and system prompt
+    let (agent, provider_info, cost_tracker) = create_provider(
+        &config.provider,
+        mcp_tools,
+        &system_prompt,
+        searxng_config,
+        config.agent_max_turns,
+    )?;
+    tracing::info!(
+        "Using provider: {} with model: {}",
+        provider_info.name,
+        provider_info.model
+    );
+
+    // Run the interactive REPL - the agent includes both built-in and MCP tools
+    let mut runner = AgentRunner::new(agent, config.clone(), provider_info, skills, cost_tracker);
     runner.run().await?;
 
     Ok(())

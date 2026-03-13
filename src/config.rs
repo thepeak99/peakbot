@@ -4,17 +4,82 @@ use directories_next::ProjectDirs;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+/// Provider type enum - identifies which LLM provider to use
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderType {
+    #[default]
+    OpenRouter,
+    Ollama,
+}
+
+/// Configuration for OpenRouter provider
 #[derive(Debug, Deserialize, Clone)]
-pub struct Config {
+pub struct OpenRouterConfig {
     /// OpenRouter API key
     #[serde(default)]
-    pub openrouter_api_key: Option<String>,
+    pub api_key: Option<String>,
     /// Model to use (default: anthropic/claude-3.7-sonnet)
     #[serde(default = "default_model")]
-    pub openrouter_model: String,
+    pub model: String,
     /// Maximum tokens for responses
     #[serde(default = "default_max_tokens")]
-    pub openrouter_max_tokens: u64,
+    pub max_tokens: u64,
+}
+
+/// Configuration for Ollama provider (local models)
+#[derive(Debug, Deserialize, Clone)]
+pub struct OllamaConfig {
+    /// Base URL (default: http://localhost:11434)
+    #[serde(default = "default_ollama_url")]
+    pub base_url: String,
+    /// Model name (e.g., "llama3", "qwen2.5:14b", "mistral")
+    pub model: String,
+    /// Temperature setting (optional)
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Number of context tokens (optional, defaults to 2048 for most models)
+    #[serde(default)]
+    pub num_ctx: Option<usize>,
+}
+
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+/// Provider configuration - specifies which provider and its specific config
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", content = "config")]
+pub enum ProviderConfig {
+    #[serde(rename = "openrouter")]
+    OpenRouter(OpenRouterConfig),
+    #[serde(rename = "ollama")]
+    Ollama(OllamaConfig),
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        ProviderConfig::OpenRouter(OpenRouterConfig::default())
+    }
+}
+
+impl Default for OpenRouterConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model: default_model(),
+            max_tokens: default_max_tokens(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Config {
+    /// LLM Provider configuration (OpenRouter or Ollama)
+    #[serde(default)]
+    pub provider: ProviderConfig,
+
+    /// DEPRECATED: Use provider.config.model instead
     /// Maximum tool turns per message
     #[serde(default = "default_max_turns")]
     pub agent_max_turns: usize,
@@ -30,6 +95,69 @@ pub struct Config {
     /// Context compaction configuration (enabled by default when not specified)
     #[serde(default)]
     pub context: ContextConfig,
+
+    // === DEPRECATED: Legacy config fields for backward compatibility ===
+    /// Legacy: OpenRouter API key (use provider.config.api_key instead)
+    #[serde(default)]
+    pub openrouter_api_key: Option<String>,
+    /// Legacy: OpenRouter model (use provider.config.model instead)
+    #[serde(default)]
+    pub openrouter_model: Option<String>,
+    /// Legacy: Max tokens (use provider.config.max_tokens instead)
+    #[serde(default)]
+    pub openrouter_max_tokens: Option<u64>,
+}
+
+impl Config {
+    /// Get the model name from the provider config
+    pub fn model(&self) -> &str {
+        match &self.provider {
+            ProviderConfig::OpenRouter(c) => &c.model,
+            ProviderConfig::Ollama(c) => &c.model,
+        }
+    }
+
+    /// Get the max tokens from the provider config
+    pub fn max_tokens(&self) -> u64 {
+        match &self.provider {
+            ProviderConfig::OpenRouter(c) => c.max_tokens,
+            ProviderConfig::Ollama(_) => 4096, // Ollama doesn't have this setting in the same way
+        }
+    }
+
+    /// Get the API key for OpenRouter (if applicable)
+    pub fn openrouter_api_key(&self) -> Option<&str> {
+        match &self.provider {
+            ProviderConfig::OpenRouter(c) => c.api_key.as_deref(),
+            ProviderConfig::Ollama(_) => None,
+        }
+    }
+
+    /// Check if cost tracking is supported (only for OpenRouter)
+    pub fn supports_pricing(&self) -> bool {
+        matches!(self.provider, ProviderConfig::OpenRouter(_))
+    }
+
+    /// Get the provider name as a string
+    pub fn provider_name(&self) -> &str {
+        match &self.provider {
+            ProviderConfig::OpenRouter(_) => "openrouter",
+            ProviderConfig::Ollama(_) => "ollama",
+        }
+    }
+
+    /// Get the SearXNG base URL
+    pub fn searxng_base_url(&self) -> Option<String> {
+        self.searxng.as_ref().map(|c| c.base_url.clone())
+    }
+
+    /// Check if SearXNG is configured and enabled
+    pub fn searxng_enabled(&self) -> bool {
+        self.searxng
+            .as_ref()
+            .map(|c| c.enabled && !c.base_url.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -119,9 +247,7 @@ fn default_cost_tracking() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            openrouter_api_key: None,
-            openrouter_model: default_model(),
-            openrouter_max_tokens: default_max_tokens(),
+            provider: ProviderConfig::default(),
             agent_max_turns: default_max_turns(),
             mcp_servers: None,
             searxng: None,
@@ -132,6 +258,10 @@ impl Default for Config {
                 enabled: default_context_enabled(),
                 context_window: None,
             },
+            // Legacy fields default to None
+            openrouter_api_key: None,
+            openrouter_model: None,
+            openrouter_max_tokens: None,
         }
     }
 }
@@ -169,26 +299,89 @@ impl Config {
         // Start with YAML config if present, otherwise use defaults
         let mut config = load_yaml_config().unwrap_or_default();
 
-        tracing::debug!("Config after YAML load: {:?}", config.openrouter_api_key);
+        tracing::debug!("Config after YAML load: provider = {:?}", config.provider);
+
+        // === Backward Compatibility: Migrate legacy YAML config to new provider format ===
+        // If provider is still default (OpenRouter with defaults) but legacy fields exist,
+        // migrate them to the new provider format
+        if let ProviderConfig::OpenRouter(ref mut provider_cfg) = config.provider {
+            // Check for legacy OpenRouter config fields in YAML
+            if let Some(ref api_key) = config.openrouter_api_key {
+                if provider_cfg.api_key.is_none() && !api_key.is_empty() {
+                    provider_cfg.api_key = Some(api_key.clone());
+                }
+            }
+            if let Some(ref model) = config.openrouter_model {
+                if !model.is_empty() {
+                    provider_cfg.model = model.clone();
+                }
+            }
+            if let Some(tokens) = config.openrouter_max_tokens {
+                provider_cfg.max_tokens = tokens;
+            }
+        }
 
         // Load environment variables and merge (env vars override YAML/defaults)
-        // Use a simple approach: try to get each env var manually to avoid issues
-        if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY")
-            && !api_key.is_empty()
+        
+        // Check for new PROVIDER JSON config first
+        if let Ok(provider_json) = std::env::var("PROVIDER")
+            && !provider_json.is_empty()
         {
-            config.openrouter_api_key = Some(api_key);
-        }
+            // Parse JSON provider config
+            match serde_json::from_str::<ProviderConfig>(&provider_json) {
+                Ok(provider_config) => config.provider = provider_config,
+                Err(e) => tracing::warn!("Failed to parse PROVIDER JSON: {}", e),
+            }
+        } else {
+            // Fall back to legacy OpenRouter environment variables
+            // This maintains backward compatibility
+            
+            // Check if OLLAMA_MODEL is set to switch to Ollama
+            if let Ok(model) = std::env::var("OLLAMA_MODEL")
+                && !model.is_empty()
+            {
+                // Using Ollama via legacy env var
+                let base_url = std::env::var("OLLAMA_BASE_URL")
+                    .unwrap_or_else(|_| "http://localhost:11434".to_string());
+                let temperature = std::env::var("OLLAMA_TEMPERATURE")
+                    .ok()
+                    .and_then(|t| t.parse().ok());
+                let num_ctx = std::env::var("OLLAMA_NUM_CTX")
+                    .ok()
+                    .and_then(|c| c.parse().ok());
+                
+                config.provider = ProviderConfig::Ollama(OllamaConfig {
+                    base_url,
+                    model,
+                    temperature,
+                    num_ctx,
+                });
+            } else {
+                // OpenRouter config via legacy env vars
+                if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY")
+                    && !api_key.is_empty()
+                {
+                    if let ProviderConfig::OpenRouter(ref mut c) = config.provider {
+                        c.api_key = Some(api_key);
+                    }
+                }
 
-        if let Ok(model) = std::env::var("OPENROUTER_MODEL")
-            && !model.is_empty()
-        {
-            config.openrouter_model = model;
-        }
+                if let Ok(model) = std::env::var("OPENROUTER_MODEL")
+                    && !model.is_empty()
+                {
+                    if let ProviderConfig::OpenRouter(ref mut c) = config.provider {
+                        c.model = model;
+                    }
+                }
 
-        if let Ok(tokens) = std::env::var("OPENROUTER_MAX_TOKENS")
-            && let Ok(tokens) = tokens.parse()
-        {
-            config.openrouter_max_tokens = tokens;
+                if let Ok(tokens) = std::env::var("OPENROUTER_MAX_TOKENS")
+                    && let Ok(tokens) = tokens.parse()
+                {
+                    if let ProviderConfig::OpenRouter(ref mut c) = config.provider {
+                        c.max_tokens = tokens;
+                    }
+                }
+            }
         }
 
         if let Ok(turns) = std::env::var("AGENT_MAX_TURNS")
@@ -207,7 +400,7 @@ impl Config {
             }
         }
 
-        tracing::debug!("Final config: {:?}", config.openrouter_api_key);
+        tracing::debug!("Final config: provider = {:?}", config.provider);
 
         // SEARXNG_BASE_URL
         if let Ok(url) = std::env::var("SEARXNG_BASE_URL") {
@@ -292,18 +485,5 @@ impl Config {
         }
 
         Ok(config)
-    }
-
-    /// Check if SearXNG is configured and enabled
-    pub fn searxng_enabled(&self) -> bool {
-        self.searxng
-            .as_ref()
-            .map(|c| c.enabled && !c.base_url.is_empty())
-            .unwrap_or(false)
-    }
-
-    /// Get the SearXNG base URL
-    pub fn searxng_base_url(&self) -> Option<String> {
-        self.searxng.as_ref().map(|c| c.base_url.clone())
     }
 }

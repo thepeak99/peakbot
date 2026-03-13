@@ -1270,21 +1270,20 @@ As a user, I want my conversation to be automatically saved so that:
 ## Dependencies and Ordering
 
 Some tasks have dependencies on others:
-
-| Task | Depends On |
-|------|------------|
-| 1 (Dynamic MCP) | - |
-| 2 (Think Tool) | - |
-| 3 (Token Hook) | - |
-| 4 (Logging Hooks) | 3 (uses PromptHook) |
-| 5 (Ollama) | - |
-| 6 (Debug ApiResponse) | - |
-| 7 (Context Compaction) | 3 (token counting) |
-| 8 (Domain Thinking) | 2 (think tool) |
-| 9 (SearXNG Search) | - |
-| 10 (Fetch Markdown) | - |
-| 11 (Todo Tool) | - |
-| 13 (Conversation Persistence) | - |
+| Status | Task | Depends On |
+|--------|------|------------|
+| [ ] | 1 (Dynamic MCP) | - |
+| [x] | 2 (Think Tool) | - |
+| [x] | 3 (Token Hook) | - |
+| [ ] | 4 (Logging Hooks) | 3 (uses PromptHook) |
+| [x] | 5 (Ollama) | - |
+| [ ] | 6 (Debug ApiResponse) | - |
+| [x] | 7 (Context Compaction) | 3 (token counting) |
+| [ ] | 8 (Domain Thinking) | 2 (think tool) |
+| [x] | 9 (SearXNG Search) | - |
+| [ ] | 10 (Fetch Markdown) | - |
+| [ ] | 11 (Todo Tool) | - |
+| [ ] | 13 (Conversation Persistence) | - |
 
 **Recommended implementation order:**
 1. Task 6 (Debug ApiResponse) - Fix existing bug
