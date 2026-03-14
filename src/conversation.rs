@@ -45,10 +45,21 @@ pub enum Message {
         /// Timestamp when message was generated
         timestamp: DateTime<Utc>,
     },
+    /// Tool invocation (captures what the model asked the tool to do)
+    ToolCall {
+        /// Name of the tool being called
+        tool_name: String,
+        /// Arguments passed to the tool (JSON string)
+        arguments: String,
+        /// Timestamp when tool was called
+        timestamp: DateTime<Utc>,
+    },
     /// Tool execution result
     ToolResult {
         /// Name of the tool that was executed
         tool_name: String,
+        /// Arguments that were passed to the tool
+        arguments: String,
         /// Tool execution result (or error message)
         result: String,
         /// Timestamp when tool was executed
@@ -73,10 +84,20 @@ impl Message {
         }
     }
 
+    /// Create a new tool call message
+    pub fn tool_call(tool_name: String, arguments: String) -> Self {
+        Message::ToolCall {
+            tool_name,
+            arguments,
+            timestamp: Utc::now(),
+        }
+    }
+
     /// Create a new tool result message
-    pub fn tool_result(tool_name: String, result: String) -> Self {
+    pub fn tool_result(tool_name: String, arguments: String, result: String) -> Self {
         Message::ToolResult {
             tool_name,
+            arguments,
             result,
             timestamp: Utc::now(),
         }
@@ -88,6 +109,7 @@ impl Message {
             Message::User { content, .. } => content,
             Message::Assistant { content, .. } => content,
             Message::ToolResult { result, .. } => result,
+            Message::ToolCall { .. } => "",
         }
     }
 }
@@ -140,9 +162,16 @@ impl Conversation {
         self.updated_at = Utc::now();
     }
 
+    /// Add a tool call to the conversation
+    pub fn add_tool_call(&mut self, tool_name: String, arguments: String) {
+        self.messages.push(Message::tool_call(tool_name, arguments));
+        self.metadata.message_count = self.messages.len();
+        self.updated_at = Utc::now();
+    }
+
     /// Add a tool result to the conversation
-    pub fn add_tool_result(&mut self, tool_name: String, result: String) {
-        self.messages.push(Message::tool_result(tool_name, result));
+    pub fn add_tool_result(&mut self, tool_name: String, arguments: String, result: String) {
+        self.messages.push(Message::tool_result(tool_name, arguments, result));
         self.metadata.message_count = self.messages.len();
         self.updated_at = Utc::now();
     }
@@ -213,9 +242,13 @@ mod tests {
         conv.add_assistant_message("Hi there!".to_string());
         assert_eq!(conv.messages.len(), 2);
         
-        conv.add_tool_result("bash".to_string(), "output".to_string());
+        conv.add_tool_result("bash".to_string(), r#"{"command": "ls"}"#.to_string(), "output".to_string());
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.metadata.message_count, 3);
+        
+        // Test adding a tool call
+        conv.add_tool_call("file_read".to_string(), r#"{"path": "/test/file.txt"}"#.to_string());
+        assert_eq!(conv.messages.len(), 4);
     }
 
     #[test]

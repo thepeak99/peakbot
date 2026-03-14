@@ -73,6 +73,7 @@ PeakBot supports multiple LLM providers through a unified provider abstraction:
 | Provider | Features | Cost Tracking |
 |----------|----------|---------------|
 | **OpenRouter** | Access to 100+ models via API | ✅ Full support |
+| **OpenAI** | Direct access to GPT models, configurable endpoint | ✅ Full support |
 | **Ollama** | Local models (llama3, qwen, mistral, etc.) | ❌ Not supported |
 
 The provider system provides:
@@ -271,7 +272,7 @@ Implementation details:
 
 ## Configuration
 
-PeakBot supports multiple LLM providers (OpenRouter, Ollama). Configuration is loaded from `config.yaml` in the platform config directory, with environment variables taking precedence.
+PeakBot supports multiple LLM providers (OpenRouter, OpenAI, Ollama). Configuration is loaded from `config.yaml` in the platform config directory, with environment variables taking precedence.
 
 ### Provider Configuration
 
@@ -284,6 +285,15 @@ provider:
   config:
     api_key: sk-or-v1-xxx
     model: anthropic/claude-3.7-sonnet
+    max_tokens: 4096
+
+# OpenAI example (direct API access with configurable endpoint)
+provider:
+  type: openai
+  config:
+    api_key: sk-xxx
+    base_url: https://api.openai.com/v1  # Default - can be overridden for compatible endpoints
+    model: gpt-4o
     max_tokens: 4096
 
 # Ollama example (local models)
@@ -349,6 +359,7 @@ openrouter_max_tokens: 4096
 | `OPENROUTER_API_KEY` | OpenRouter API key (legacy) |
 | `OPENROUTER_MODEL` | OpenRouter model (legacy) |
 | `OPENROUTER_MAX_TOKENS` | Max tokens for OpenRouter (legacy) |
+| `OPENAI_API_KEY` | OpenAI API key |
 | `OLLAMA_MODEL` | Ollama model name (legacy) |
 | `OLLAMA_BASE_URL` | Ollama base URL (legacy) |
 | `OLLAMA_TEMPERATURE` | Ollama temperature (legacy) |
