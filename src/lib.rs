@@ -9,12 +9,13 @@ mod providers;
 mod skills;
 mod tools;
 
-pub use config::{BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig, OllamaConfig, OpenRouterConfig, ProviderConfig, ProviderType, SearXngConfig};
+pub use config::{BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig, OllamaConfig, OpenRouterConfig, ProviderConfig, ProviderType, RetryConfig, SearXngConfig};
 pub use context_manager::{CompactionResult, ContextManager};
 pub use conversation::{Conversation, ConversationMetadata, ConversationSummary, Message as ConversationMessage};
 pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
-    CostTrackingStats, ModelPricing, SessionStats, TokenCostHook, fetch_model_pricing,
+    CostTrackingStats, ModelPricing, SessionStats, TokenCostHook, ToolEvent, ToolEventBuffer,
+    fetch_model_pricing, create_tool_event_buffer,
 };
 pub use providers::{create_provider, CostTracker, DynAgent, ProviderInfo};
 use rig::completion::Message;
@@ -27,11 +28,12 @@ pub use tools::{
     SearchTool, ThinkTool, TodoList, TodoStatus, TodoTool,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use rmcp::service::ServiceExt;
 use std::io::{self, BufRead, Write};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use tokio::time::{sleep, Duration};
 use tracing::debug;
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
@@ -88,8 +90,9 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
             StoredMessage::Assistant { content, .. } => {
                 messages.push(Message::assistant(content.clone()));
             }
-            // Skip tool results - they're already embedded in assistant responses
+            // Skip tool calls and tool results - they're already embedded in assistant responses
             // and including them would be redundant
+            StoredMessage::ToolCall { .. } => {}
             StoredMessage::ToolResult { .. } => {}
         }
     }
@@ -118,7 +121,10 @@ pub fn print_recent_messages(conv: &Conversation, count: usize) {
             StoredMessage::Assistant { content, timestamp } => {
                 println!("  [{}] Assistant: {}", timestamp.format("%H:%M"), truncate(content, 100));
             }
-            StoredMessage::ToolResult { tool_name, result, timestamp } => {
+            StoredMessage::ToolCall { tool_name, arguments, timestamp } => {
+                println!("  [{}] Tool Call: {} - {}", timestamp.format("%H:%M"), tool_name, truncate(arguments, 60));
+            }
+            StoredMessage::ToolResult { tool_name, result, timestamp, .. } => {
                 println!("  [{}] Tool: {} - {}", timestamp.format("%H:%M"), tool_name, truncate(result, 60));
             }
         }
@@ -145,6 +151,7 @@ pub struct AgentRunner {
     system_prompt: String,
     cost_tracker: CostTracker,
     todo_state: Option<Arc<Mutex<TodoList>>>,
+    tool_buffer: Option<ToolEventBuffer>,
 }
 
 impl AgentRunner {
@@ -156,6 +163,7 @@ impl AgentRunner {
         skills: SkillRegistry,
         cost_tracker: CostTracker,
         todo_state: Option<Arc<Mutex<TodoList>>>,
+        tool_buffer: Option<ToolEventBuffer>,
     ) -> Self {
         // Wrap agent in Arc so we can share it with ContextManager for summarization
         let agent = Arc::new(agent);
@@ -204,6 +212,7 @@ impl AgentRunner {
             system_prompt,
             cost_tracker,
             todo_state,
+            tool_buffer,
         }
     }
 
@@ -636,10 +645,31 @@ impl AgentRunner {
             {
                 Ok(response) => {
                     println!("\n{}", response);
-                    // Auto-save assistant message after response
+                    
+                    // Drain tool events and persist them
                     if let Some(ref mut cm) = self.conversation_manager {
+                        if let Some(ref buffer) = self.tool_buffer {
+                            let events = {
+                                let mut events = buffer.lock().unwrap();
+                                std::mem::take(&mut *events)
+                            };
+                            
+                            for event in events {
+                                match event {
+                                    ToolEvent::Call { tool_name, arguments, .. } => {
+                                        let _ = cm.add_tool_call(tool_name, arguments);
+                                    }
+                                    ToolEvent::Result { tool_name, arguments, result, .. } => {
+                                        let _ = cm.add_tool_result(tool_name, arguments, result);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Save assistant message
                         let _ = cm.add_assistant_message(response.clone());
-                        // Update token statistics in the conversation
+                        
+                        // Update tokens
                         let tokens = self.cost_tracker.get_total_tokens();
                         let cost = self.cost_tracker.get_total_cost();
                         let _ = cm.update_tokens(tokens, cost);
@@ -650,7 +680,82 @@ impl AgentRunner {
                     self.print_todo_summary();
                 }
                 Err(e) => {
-                    eprintln!("\nError: {}\n", e);
+                    // Retry with exponential backoff
+                    let retry_config = self.config.retry();
+                    let mut attempt = 0u32;
+                    let mut last_error = e;
+
+                    loop {
+                        // Check if we should retry
+                        if attempt >= retry_config.max_retries {
+                            // Max retries exceeded, print the final error
+                            eprintln!("\nError (after {} retries): {}\n", attempt, last_error);
+                            break;
+                        }
+
+                        // Calculate delay with exponential backoff
+                        let delay_ms = ((retry_config.initial_delay_ms as f64)
+                            * (retry_config.backoff_factor.powi(attempt as i32)))
+                            .min(retry_config.max_delay_ms as f64) as u64;
+
+                        if attempt > 0 {
+                            eprintln!("\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
+                                last_error, delay_ms, attempt + 1, retry_config.max_retries);
+                        }
+
+                        // Wait before retrying
+                        sleep(Duration::from_millis(delay_ms)).await;
+
+                        // Attempt the request again
+                        match self
+                            .agent
+                            .as_ref()
+                            .prompt_with_history(input, &mut chat_history)
+                            .await
+                        {
+                            Ok(response) => {
+                                println!("\n{}", response);
+
+                                // Drain tool events and persist them
+                                if let Some(ref mut cm) = self.conversation_manager {
+                                    if let Some(ref buffer) = self.tool_buffer {
+                                        let events = {
+                                            let mut events = buffer.lock().unwrap();
+                                            std::mem::take(&mut *events)
+                                        };
+
+                                        for event in events {
+                                            match event {
+                                                ToolEvent::Call { tool_name, arguments, .. } => {
+                                                    let _ = cm.add_tool_call(tool_name, arguments);
+                                                }
+                                                ToolEvent::Result { tool_name, arguments, result, .. } => {
+                                                    let _ = cm.add_tool_result(tool_name, arguments, result);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Save assistant message
+                                    let _ = cm.add_assistant_message(response.clone());
+
+                                    // Update tokens
+                                    let tokens = self.cost_tracker.get_total_tokens();
+                                    let cost = self.cost_tracker.get_total_cost();
+                                    let _ = cm.update_tokens(tokens, cost);
+                                }
+                                // Display token stats after each response
+                                self.print_last_request_stats();
+                                // Display todo summary after each response
+                                self.print_todo_summary();
+                                break;
+                            }
+                            Err(e) => {
+                                last_error = e;
+                                attempt += 1;
+                            }
+                        }
+                    }
                 }
             }
         }

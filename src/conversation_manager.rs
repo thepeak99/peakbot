@@ -261,10 +261,22 @@ impl ConversationManager {
         Ok(())
     }
 
-    /// Add a tool result to the current conversation
-    pub fn add_tool_result(&mut self, tool_name: String, result: String) -> Result<()> {
+    /// Add a tool call to the current conversation
+    pub fn add_tool_call(&mut self, tool_name: String, arguments: String) -> Result<()> {
         if let Some(ref mut conv) = self.current_conversation {
-            conv.add_tool_result(tool_name, result);
+            conv.add_tool_call(tool_name, arguments);
+
+            if self.config.auto_save {
+                self.save()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a tool result to the current conversation
+    pub fn add_tool_result(&mut self, tool_name: String, arguments: String, result: String) -> Result<()> {
+        if let Some(ref mut conv) = self.current_conversation {
+            conv.add_tool_result(tool_name, arguments, result);
 
             if self.config.auto_save {
                 self.save()?;
@@ -344,15 +356,29 @@ impl ConversationManager {
                         content
                     ));
                 }
+                Message::ToolCall {
+                    tool_name,
+                    arguments,
+                    timestamp,
+                } => {
+                    md.push_str(&format!(
+                        "### Tool Call: {} ({})\n\n```json\n{}\n```\n\n",
+                        tool_name,
+                        timestamp.format("%Y-%m-%d %H:%M"),
+                        arguments
+                    ));
+                }
                 Message::ToolResult {
                     tool_name,
+                    arguments,
                     result,
                     timestamp,
                 } => {
                     md.push_str(&format!(
-                        "### Tool: {} ({})\n\n```\n{}\n```\n\n",
+                        "### Tool Result: {} ({})\n\n**Arguments:**\n```json\n{}\n```\n\n**Output:**\n```\n{}\n```\n\n",
                         tool_name,
                         timestamp.format("%Y-%m-%d %H:%M"),
+                        arguments,
                         result
                     ));
                 }

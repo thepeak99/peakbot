@@ -3,11 +3,45 @@
 //! This module provides a PromptHook that tracks token usage and calculates costs
 //! based on model pricing fetched from OpenRouter's API.
 
-use anyhow::{Result, anyhow};
-use rig::agent::{HookAction, PromptHook};
-use rig::completion::{CompletionModel, CompletionResponse, message::Message};
-use serde::Deserialize;
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
+use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
+use rig::completion::{message::Message, CompletionModel, CompletionResponse};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+
+/// An event representing a tool call or result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ToolEvent {
+    /// Tool was invoked
+    Call {
+        /// Name of the tool being called
+        tool_name: String,
+        /// Arguments passed to the tool (JSON string)
+        arguments: String,
+        /// Timestamp when tool was called
+        timestamp: DateTime<Utc>,
+    },
+    /// Tool completed
+    Result {
+        /// Name of the tool that was executed
+        tool_name: String,
+        /// Arguments that were passed to the tool
+        arguments: String,
+        /// Tool execution result (or error message)
+        result: String,
+        /// Timestamp when tool was executed
+        timestamp: DateTime<Utc>,
+    },
+}
+
+/// Thread-safe buffer for tracking tool events during agent execution
+pub type ToolEventBuffer = Arc<Mutex<Vec<ToolEvent>>>;
+
+/// Create a new tool event buffer
+pub fn create_tool_event_buffer() -> ToolEventBuffer {
+    Arc::new(Mutex::new(Vec::new()))
+}
 
 /// Pricing information for a model (cost per token)
 #[derive(Clone, Debug)]
@@ -309,20 +343,23 @@ pub struct TokenCostHook {
     stats: Arc<Mutex<SessionStats>>,
     /// Model pricing (fetched from API or default)
     pricing: Arc<ModelPricing>,
+    /// Buffer for tool events (optional - only if persistence enabled)
+    tool_buffer: Option<ToolEventBuffer>,
 }
 
 impl TokenCostHook {
-    /// Create a new hook with pre-configured pricing
-    pub fn new(model_name: String, pricing: ModelPricing) -> Self {
+    /// Create a new hook with pre-configured pricing and optional tool buffer
+    pub fn new(model_name: String, pricing: ModelPricing, tool_buffer: Option<ToolEventBuffer>) -> Self {
         Self {
             model_name,
             stats: Arc::new(Mutex::new(SessionStats::new())),
             pricing: Arc::new(pricing),
+            tool_buffer,
         }
     }
 
     /// Create a new hook and fetch pricing from OpenRouter API
-    pub async fn with_api_pricing(model_name: String, api_key: &str) -> Self {
+    pub async fn with_api_pricing(model_name: String, api_key: &str, tool_buffer: Option<ToolEventBuffer>) -> Self {
         let pricing = fetch_model_pricing(api_key, &model_name)
             .await
             .unwrap_or_else(|e| {
@@ -334,6 +371,7 @@ impl TokenCostHook {
             model_name,
             stats: Arc::new(Mutex::new(SessionStats::new())),
             pricing: Arc::new(pricing),
+            tool_buffer,
         }
     }
 
@@ -347,6 +385,11 @@ impl TokenCostHook {
     /// Get a reference to the stats
     pub fn get_stats(&self) -> Arc<Mutex<SessionStats>> {
         self.stats.clone()
+    }
+
+    /// Get the tool buffer (if present)
+    pub fn get_tool_buffer(&self) -> Option<ToolEventBuffer> {
+        self.tool_buffer.clone()
     }
 
     /// Get a formatted string for the last request
@@ -402,6 +445,54 @@ impl<M: CompletionModel> PromptHook<M> for TokenCostHook {
                 cost,
                 stats.total_cost
             );
+        }
+
+        HookAction::Continue
+    }
+
+    /// Called before a tool is invoked
+    async fn on_tool_call(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        _internal_call_id: &str,
+        args: &str,
+    ) -> ToolCallHookAction {
+        if let Some(ref buffer) = self.tool_buffer {
+            let event = ToolEvent::Call {
+                tool_name: tool_name.to_string(),
+                arguments: args.to_string(),
+                timestamp: Utc::now(),
+            };
+
+            if let Ok(mut events) = buffer.lock() {
+                events.push(event);
+            }
+        }
+
+        ToolCallHookAction::Continue
+    }
+
+    /// Called after a tool is invoked (and a result has been returned)
+    async fn on_tool_result(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        _internal_call_id: &str,
+        args: &str,
+        result: &str,
+    ) -> HookAction {
+        if let Some(ref buffer) = self.tool_buffer {
+            let event = ToolEvent::Result {
+                tool_name: tool_name.to_string(),
+                arguments: args.to_string(),
+                result: result.to_string(),
+                timestamp: Utc::now(),
+            };
+
+            if let Ok(mut events) = buffer.lock() {
+                events.push(event);
+            }
         }
 
         HookAction::Continue

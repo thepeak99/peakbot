@@ -10,6 +10,7 @@ use std::collections::HashMap;
 pub enum ProviderType {
     #[default]
     OpenRouter,
+    OpenAI,
     Ollama,
 }
 
@@ -43,8 +44,29 @@ pub struct OllamaConfig {
     pub num_ctx: Option<usize>,
 }
 
+/// Configuration for OpenAI provider
+#[derive(Debug, Deserialize, Clone)]
+pub struct OpenAIConfig {
+    /// OpenAI API key
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Base URL for the OpenAI API (default: https://api.openai.com/v1)
+    /// Can be overridden to use compatible endpoints (e.g., Azure OpenAI, local proxies)
+    #[serde(default = "default_openai_url")]
+    pub base_url: String,
+    /// Model to use (e.g., "gpt-4o", "gpt-4o-mini", "o1-preview")
+    pub model: String,
+    /// Maximum tokens for responses
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u64,
+}
+
 fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
+}
+
+fn default_openai_url() -> String {
+    "https://api.openai.com/v1".to_string()
 }
 
 /// Provider configuration - specifies which provider and its specific config
@@ -53,6 +75,8 @@ fn default_ollama_url() -> String {
 pub enum ProviderConfig {
     #[serde(rename = "openrouter")]
     OpenRouter(OpenRouterConfig),
+    #[serde(rename = "openai")]
+    OpenAI(OpenAIConfig),
     #[serde(rename = "ollama")]
     Ollama(OllamaConfig),
 }
@@ -68,6 +92,17 @@ impl Default for OpenRouterConfig {
         Self {
             api_key: None,
             model: default_model(),
+            max_tokens: default_max_tokens(),
+        }
+    }
+}
+
+impl Default for OpenAIConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            base_url: default_openai_url(),
+            model: "gpt-4o".to_string(),
             max_tokens: default_max_tokens(),
         }
     }
@@ -101,7 +136,11 @@ pub struct Config {
     /// Bash tool configuration (env vars, etc.)
     #[serde(default)]
     pub bash: BashConfig,
+    /// Retry configuration for API errors
+    #[serde(default)]
+    pub retry: RetryConfig,
 
+    //AI: delete this, we dont need backwards compatibility
     // === DEPRECATED: Legacy config fields for backward compatibility ===
     /// Legacy: OpenRouter API key (use provider.config.api_key instead)
     #[serde(default)]
@@ -119,6 +158,7 @@ impl Config {
     pub fn model(&self) -> &str {
         match &self.provider {
             ProviderConfig::OpenRouter(c) => &c.model,
+            ProviderConfig::OpenAI(c) => &c.model,
             ProviderConfig::Ollama(c) => &c.model,
         }
     }
@@ -127,6 +167,7 @@ impl Config {
     pub fn max_tokens(&self) -> u64 {
         match &self.provider {
             ProviderConfig::OpenRouter(c) => c.max_tokens,
+            ProviderConfig::OpenAI(c) => c.max_tokens,
             ProviderConfig::Ollama(_) => 4096, // Ollama doesn't have this setting in the same way
         }
     }
@@ -135,6 +176,7 @@ impl Config {
     pub fn openrouter_api_key(&self) -> Option<&str> {
         match &self.provider {
             ProviderConfig::OpenRouter(c) => c.api_key.as_deref(),
+            ProviderConfig::OpenAI(c) => c.api_key.as_deref(),
             ProviderConfig::Ollama(_) => None,
         }
     }
@@ -148,6 +190,7 @@ impl Config {
     pub fn provider_name(&self) -> &str {
         match &self.provider {
             ProviderConfig::OpenRouter(_) => "openrouter",
+            ProviderConfig::OpenAI(_) => "openai",
             ProviderConfig::Ollama(_) => "ollama",
         }
     }
@@ -167,7 +210,10 @@ impl Config {
 
     /// Check if conversation persistence is enabled
     pub fn conversation_enabled(&self) -> bool {
-        self.conversation.as_ref().map(|c| c.auto_save).unwrap_or(true)
+        self.conversation
+            .as_ref()
+            .map(|c| c.auto_save)
+            .unwrap_or(true)
     }
 
     /// Get the conversation storage directory
@@ -202,6 +248,11 @@ impl Config {
     /// Get the bash tool environment variables
     pub fn bash_env(&self) -> Option<&HashMap<String, String>> {
         self.bash.env.as_ref()
+    }
+
+    /// Get the retry configuration
+    pub fn retry(&self) -> &RetryConfig {
+        &self.retry
     }
 }
 
@@ -314,6 +365,50 @@ pub struct BashConfig {
     pub env: Option<HashMap<String, String>>,
 }
 
+/// Configuration for retry logic with exponential backoff
+#[derive(Debug, Deserialize, Clone)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts (default: 3)
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Initial delay in milliseconds (default: 1000)
+    #[serde(default = "default_initial_delay")]
+    pub initial_delay_ms: u64,
+    /// Maximum delay in milliseconds (default: 30000)
+    #[serde(default = "default_max_delay")]
+    pub max_delay_ms: u64,
+    /// Backoff multiplier (default: 2.0)
+    #[serde(default = "default_backoff_factor")]
+    pub backoff_factor: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            initial_delay_ms: default_initial_delay(),
+            max_delay_ms: default_max_delay(),
+            backoff_factor: default_backoff_factor(),
+        }
+    }
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+
+fn default_initial_delay() -> u64 {
+    1000
+}
+
+fn default_max_delay() -> u64 {
+    30000
+}
+
+fn default_backoff_factor() -> f64 {
+    2.0
+}
+
 fn default_max_conversations() -> usize {
     50
 }
@@ -334,7 +429,9 @@ impl Default for Config {
             },
             conversation: None,
             bash: BashConfig::default(),
+            retry: RetryConfig::default(),
             // Legacy fields default to None
+            //AI: remove these
             openrouter_api_key: None,
             openrouter_model: None,
             openrouter_max_tokens: None,
@@ -398,7 +495,7 @@ impl Config {
         }
 
         // Load environment variables and merge (env vars override YAML/defaults)
-        
+
         // Check for new PROVIDER JSON config first
         if let Ok(provider_json) = std::env::var("PROVIDER")
             && !provider_json.is_empty()
@@ -411,7 +508,7 @@ impl Config {
         } else {
             // Fall back to legacy OpenRouter environment variables
             // This maintains backward compatibility
-            
+
             // Check if OLLAMA_MODEL is set to switch to Ollama
             if let Ok(model) = std::env::var("OLLAMA_MODEL")
                 && !model.is_empty()
@@ -425,7 +522,7 @@ impl Config {
                 let num_ctx = std::env::var("OLLAMA_NUM_CTX")
                     .ok()
                     .and_then(|c| c.parse().ok());
-                
+
                 config.provider = ProviderConfig::Ollama(OllamaConfig {
                     base_url,
                     model,
@@ -564,12 +661,14 @@ impl Config {
         // CONVERSATION_AUTO_SAVE
         if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_SAVE") {
             if let Ok(enabled) = enabled.parse() {
-                let conv = config.conversation.get_or_insert_with(|| ConversationConfig {
-                    auto_save: true,
-                    storage_dir: None,
-                    max_conversations: 50,
-                    auto_resume: true,
-                });
+                let conv = config
+                    .conversation
+                    .get_or_insert_with(|| ConversationConfig {
+                        auto_save: true,
+                        storage_dir: None,
+                        max_conversations: 50,
+                        auto_resume: true,
+                    });
                 conv.auto_save = enabled;
             }
         }
@@ -577,12 +676,14 @@ impl Config {
         // CONVERSATION_STORAGE_DIR
         if let Ok(dir) = std::env::var("CONVERSATION_STORAGE_DIR") {
             if !dir.is_empty() {
-                let conv = config.conversation.get_or_insert_with(|| ConversationConfig {
-                    auto_save: true,
-                    storage_dir: None,
-                    max_conversations: 50,
-                    auto_resume: true,
-                });
+                let conv = config
+                    .conversation
+                    .get_or_insert_with(|| ConversationConfig {
+                        auto_save: true,
+                        storage_dir: None,
+                        max_conversations: 50,
+                        auto_resume: true,
+                    });
                 conv.storage_dir = Some(std::path::PathBuf::from(dir));
             }
         }
@@ -590,12 +691,14 @@ impl Config {
         // CONVERSATION_MAX_CONVERSATIONS
         if let Ok(max) = std::env::var("CONVERSATION_MAX_CONVERSATIONS") {
             if let Ok(max) = max.parse() {
-                let conv = config.conversation.get_or_insert_with(|| ConversationConfig {
-                    auto_save: true,
-                    storage_dir: None,
-                    max_conversations: 50,
-                    auto_resume: true,
-                });
+                let conv = config
+                    .conversation
+                    .get_or_insert_with(|| ConversationConfig {
+                        auto_save: true,
+                        storage_dir: None,
+                        max_conversations: 50,
+                        auto_resume: true,
+                    });
                 conv.max_conversations = max;
             }
         }
@@ -603,12 +706,14 @@ impl Config {
         // CONVERSATION_AUTO_RESUME
         if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_RESUME") {
             if let Ok(enabled) = enabled.parse() {
-                let conv = config.conversation.get_or_insert_with(|| ConversationConfig {
-                    auto_save: true,
-                    storage_dir: None,
-                    max_conversations: 50,
-                    auto_resume: true,
-                });
+                let conv = config
+                    .conversation
+                    .get_or_insert_with(|| ConversationConfig {
+                        auto_save: true,
+                        storage_dir: None,
+                        max_conversations: 50,
+                        auto_resume: true,
+                    });
                 conv.auto_resume = enabled;
             }
         }

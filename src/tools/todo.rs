@@ -6,6 +6,7 @@ use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
+use tracing::debug;
 
 /// Status of a todo item
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,10 +114,26 @@ impl TodoList {
 
     /// Count tasks by status
     pub fn count_by_status(&self) -> (usize, usize, usize, usize) {
-        let pending = self.tasks.iter().filter(|t| t.status == TodoStatus::Pending).count();
-        let in_progress = self.tasks.iter().filter(|t| t.status == TodoStatus::InProgress).count();
-        let completed = self.tasks.iter().filter(|t| t.status == TodoStatus::Completed).count();
-        let cancelled = self.tasks.iter().filter(|t| t.status == TodoStatus::Cancelled).count();
+        let pending = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TodoStatus::Pending)
+            .count();
+        let in_progress = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TodoStatus::InProgress)
+            .count();
+        let completed = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TodoStatus::Completed)
+            .count();
+        let cancelled = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TodoStatus::Cancelled)
+            .count();
         (pending, in_progress, completed, cancelled)
     }
 }
@@ -135,7 +152,7 @@ pub enum TodoError {
 }
 
 /// Arguments for the todo tool
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct TodoArgs {
     /// The action to perform: add, update, remove, list, clear
     action: String,
@@ -222,13 +239,20 @@ impl Tool for TodoTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let mut list = self.todo_list.lock()
+        let mut list = self
+            .todo_list
+            .lock()
             .map_err(|e| TodoError::LockError(e.to_string()))?;
+
+        debug!("Todo: {:?}", args);
+        debug!("Todo state: {:?}", list);
 
         match args.action.as_str() {
             "add" => {
                 let task = args.task.ok_or_else(|| {
-                    TodoError::InvalidAction("Task description required for 'add' action".to_string())
+                    TodoError::InvalidAction(
+                        "Task description required for 'add' action".to_string(),
+                    )
                 })?;
                 let item = list.add(task);
                 Ok(format!("Added task #{}: {}", item.id, item.task))
@@ -247,7 +271,12 @@ impl Tool for TodoTool {
                     "in_progress" => TodoStatus::InProgress,
                     "completed" => TodoStatus::Completed,
                     "cancelled" => TodoStatus::Cancelled,
-                    _ => return Err(TodoError::InvalidAction(format!("Invalid status: {}", status_str))),
+                    _ => {
+                        return Err(TodoError::InvalidAction(format!(
+                            "Invalid status: {}",
+                            status_str
+                        )));
+                    }
                 };
 
                 match list.update_status(task_id, status) {
@@ -288,10 +317,7 @@ impl Tool for TodoTool {
                     };
                     output.push_str(&format!(
                         "{} #{} [{}] {}\n",
-                        status_icon,
-                        item.id,
-                        item.status,
-                        item.task
+                        status_icon, item.id, item.status, item.task
                     ));
                 }
 

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rig-core = { version = "0.31", features = ["rmcp"] }
-rmcp = { version = "0.13", features = ["client", "transport-child-process"] }
+rig-core = { path = "../rig/rig/rig-core", features = ["rmcp"] }
+rmcp = { version = "0.16", features = ["client", "transport-child-process"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,9 +16,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }
 chrono = "0.4"
 directories-next = "2"
-dirs = "5"
+dirs = "6"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27"
