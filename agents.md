@@ -158,11 +158,10 @@ PeakBot includes **7 built-in tools** (6 always available, 1 conditional):
 
 ### file_edit (`src/tools/file_edit.rs`)
 
-The primary editing tool, modeled after Anthropic's `text_editor_20250728`. A single tool with a `command` discriminator selecting between four operations.
+The primary editing tool, modeled after Anthropic's `text_editor_20250728`. A single tool with a `command` discriminator selecting between three operations.
 
 | Command | Required Params | Behavior |
 |---------|----------------|----------|
-| `view` | `path` | Read file with line numbers. Optional `view_range: [start, end]` (1-indexed, -1 = EOF). On directories, lists contents. |
 | `create` | `path`, `file_text` | Write a new file. Fails if file already exists. Creates parent dirs if needed. |
 | `str_replace` | `path`, `old_str` | Find `old_str` (must be unique in file), replace with `new_str` (omit to delete). Returns context snippet around edit. |
 | `insert` | `path`, `insert_line`, `insert_text` | Insert text after line N (0 = beginning). Returns context snippet. |
@@ -170,14 +169,13 @@ The primary editing tool, modeled after Anthropic's `text_editor_20250728`. A si
 Design decisions:
 - **Uniqueness enforcement** on `str_replace`: if `old_str` matches 0 or >1 times, the tool returns an error with line numbers to help the model refine.
 - **Undo history**: `file_history: Mutex<HashMap<PathBuf, Vec<String>>>` stores previous file contents on each edit. Not exposed as a command yet but the stack is there.
-- **Truncation**: outputs > 10,000 chars are clipped with a notice suggesting `grep -n` or line ranges.
 - All paths must be absolute.
 
 ### file_read (`src/tools/file_read.rs`)
 
 Simple read-only tool. Takes `path` with optional `start_line`/`end_line` (1-indexed, inclusive). Returns content with `cat -n` style line numbering. Truncates at 10,000 chars.
 
-Exists separately from `file_edit view` to give the model a simpler, single-purpose tool for the common "just read this file" case.
+Provides read-only access to files, complementing the edit capabilities of file_edit.
 
 ### bash (`src/tools/bash.rs`)
 
@@ -484,7 +482,7 @@ src/
     ├── mod.rs              # Re-exports: all built-in tools
     ├── bash.rs             # BashTool -- shell execution with timeout
     ├── fetch_url.rs        # FetchUrlTool -- HTTP GET requests
-    ├── file_edit.rs        # FileEditTool -- view/create/str_replace/insert
+    ├── file_edit.rs        # FileEditTool -- create/str_replace/insert
     ├── file_read.rs        # FileReadTool -- read with line ranges
     ├── list_directory.rs   # ListDirectoryTool -- dir listing with recursion
     ├── search.rs           # SearchTool -- SearXNG web search

@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const SNIPPET_CONTEXT_LINES: usize = 4;
-const MAX_OUTPUT_CHARS: usize = 10_000;
-const TRUNCATION_NOTICE: &str = "\n... [output truncated] Use file_read with start_line/end_line or bash with `grep -n` to find specific content.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum FileEditError {
@@ -26,7 +24,6 @@ pub struct FileEditArgs {
     command: String,
     path: String,
     file_text: Option<String>,
-    view_range: Option<Vec<i64>>,
     old_str: Option<String>,
     new_str: Option<String>,
     insert_line: Option<usize>,
@@ -56,8 +53,7 @@ impl Tool for FileEditTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "file_edit".to_string(),
-            description: "A filesystem editor tool. Supports four commands:\n\
-                - `view`: View file contents or list directory (with optional line range)\n\
+            description: "A filesystem editor tool. Supports three commands:\n\
                 - `create`: Create a new file (fails if file already exists)\n\
                 - `str_replace`: Replace an exact unique string in a file\n\
                 - `insert`: Insert text at a specific line number"
@@ -67,21 +63,16 @@ impl Tool for FileEditTool {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "enum": ["view", "create", "str_replace", "insert"],
+                        "enum": ["create", "str_replace", "insert"],
                         "description": "The editing command to execute"
                     },
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to the file or directory"
+                        "description": "Absolute path to the file"
                     },
                     "file_text": {
                         "type": "string",
                         "description": "Required for 'create': the full content of the new file"
-                    },
-                    "view_range": {
-                        "type": "array",
-                        "items": { "type": "integer" },
-                        "description": "Optional for 'view': [start_line, end_line] (1-indexed). Use -1 for end_line to mean EOF."
                     },
                     "old_str": {
                         "type": "string",
@@ -117,12 +108,11 @@ impl Tool for FileEditTool {
 
         let start_time = std::time::Instant::now();
         let result = match args.command.as_str() {
-            "view" => self.cmd_view(&args),
             "create" => self.cmd_create(&args),
             "str_replace" => self.cmd_str_replace(&args),
             "insert" => self.cmd_insert(&args),
             other => Err(FileEditError::Validation(format!(
-                "Unknown command '{}'. Valid commands: view, create, str_replace, insert",
+                "Unknown command '{}'. Valid commands: create, str_replace, insert",
                 other
             ))),
         };
@@ -157,32 +147,6 @@ impl Tool for FileEditTool {
 }
 
 impl FileEditTool {
-    fn cmd_view(&self, args: &FileEditArgs) -> Result<String, FileEditError> {
-        let path = Path::new(&args.path);
-        self.validate_path_exists(path)?;
-
-        if path.is_dir() {
-            if args.view_range.is_some() {
-                return Err(FileEditError::Validation(
-                    "view_range is not allowed for directories".into(),
-                ));
-            }
-            return self.list_dir_contents(path);
-        }
-
-        let content = self.read_file(path)?;
-        let lines: Vec<&str> = content.lines().collect();
-        let total = lines.len();
-
-        let (start, end) = match &args.view_range {
-            Some(range) => self.parse_view_range(range, total)?,
-            None => (0, total),
-        };
-
-        let output = format_lines_numbered(&lines[start..end], start + 1);
-        Ok(maybe_truncate(&output))
-    }
-
     fn cmd_create(&self, args: &FileEditArgs) -> Result<String, FileEditError> {
         let path = Path::new(&args.path);
 
@@ -387,77 +351,6 @@ impl FileEditTool {
             .or_default()
             .push(content.to_string());
     }
-
-    fn parse_view_range(
-        &self,
-        range: &[i64],
-        total: usize,
-    ) -> Result<(usize, usize), FileEditError> {
-        if range.len() != 2 {
-            return Err(FileEditError::Validation(
-                "view_range must be exactly [start_line, end_line]".into(),
-            ));
-        }
-        let start = range[0];
-        let end = range[1];
-
-        if start < 1 || start as usize > total {
-            return Err(FileEditError::Validation(format!(
-                "view_range start {} is out of range [1, {}]",
-                start, total
-            )));
-        }
-        let start_idx = (start - 1) as usize;
-
-        let end_idx = if end == -1 {
-            total
-        } else {
-            if (end as usize) > total {
-                return Err(FileEditError::Validation(format!(
-                    "view_range end {} exceeds file length {}",
-                    end, total
-                )));
-            }
-            if end < start {
-                return Err(FileEditError::Validation(format!(
-                    "view_range end {} is less than start {}",
-                    end, start
-                )));
-            }
-            end as usize
-        };
-
-        Ok((start_idx, end_idx))
-    }
-
-    fn list_dir_contents(&self, path: &Path) -> Result<String, FileEditError> {
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(path).map_err(|e| FileEditError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })? {
-            let entry = entry.map_err(|e| FileEditError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-            let suffix = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                "/"
-            } else {
-                ""
-            };
-            entries.push(format!("{}{}", name, suffix));
-        }
-        entries.sort();
-        Ok(format!(
-            "Directory listing of {}:\n{}",
-            path.display(),
-            entries.join("\n")
-        ))
-    }
 }
 
 fn format_lines_numbered(lines: &[&str], start_num: usize) -> String {
@@ -467,12 +360,4 @@ fn format_lines_numbered(lines: &[&str], start_num: usize) -> String {
         .map(|(i, line)| format!("{:>6}\t{}", start_num + i, line))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn maybe_truncate(s: &str) -> String {
-    if s.len() > MAX_OUTPUT_CHARS {
-        format!("{}{}", &s[..MAX_OUTPUT_CHARS], TRUNCATION_NOTICE)
-    } else {
-        s.to_string()
-    }
 }
