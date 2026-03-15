@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rig-core = { path = "../rig/rig/rig-core", features = ["rmcp"] }
+rig-core = { version = "0.32", features = ["rmcp"] }
 rmcp = { version = "0.16", features = ["client", "transport-child-process"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
