@@ -244,8 +244,14 @@ impl Tool for TodoTool {
             .lock()
             .map_err(|e| TodoError::LockError(e.to_string()))?;
 
+        // TODO: REMOVE!!!
         debug!("Todo: {:?}", args);
         debug!("Todo state: {:?}", list);
+        let tasks = list.list();
+        for i in tasks.iter() {
+            println!("{}. {}: {}", i.id, i.task, i.status.to_string())
+        }
+        //END REMOVE
 
         match args.action.as_str() {
             "add" => {

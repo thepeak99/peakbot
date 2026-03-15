@@ -3,7 +3,7 @@
 //! Uses actual token counts from the provider (via token_cost hook) instead of estimates.
 
 use crate::config::ContextConfig;
-use crate::hooks::token_cost::SessionStats;
+use crate::hooks::session_hook::SessionStats;
 use crate::providers::DynAgent;
 use anyhow::{Context as AnyhowContext, Result};
 use rig::completion::message::Message;

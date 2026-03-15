@@ -11,6 +11,7 @@ pub enum ProviderType {
     #[default]
     OpenRouter,
     OpenAI,
+    LlamaCpp,
     Ollama,
 }
 
@@ -61,12 +62,33 @@ pub struct OpenAIConfig {
     pub max_tokens: u64,
 }
 
+/// Configuration for LlamaCpp provider (uses OpenAI-compatible completions API)
+/// This is compatible with llama.cpp's server mode which provides an OpenAI-compatible API
+#[derive(Debug, Deserialize, Clone)]
+pub struct LlamaCppConfig {
+    /// API key (optional for local llama.cpp instances)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Base URL for the llama.cpp API (default: http://localhost:8080)
+    #[serde(default = "default_llamacpp_url")]
+    pub base_url: String,
+    /// Model to use (e.g., "llama3", "qwen2.5:14b", any model running in llama.cpp)
+    pub model: String,
+    /// Maximum tokens for responses
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u64,
+}
+
 fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
 }
 
 fn default_openai_url() -> String {
     "https://api.openai.com/v1".to_string()
+}
+
+fn default_llamacpp_url() -> String {
+    "http://localhost:8080".to_string()
 }
 
 /// Provider configuration - specifies which provider and its specific config
@@ -77,6 +99,8 @@ pub enum ProviderConfig {
     OpenRouter(OpenRouterConfig),
     #[serde(rename = "openai")]
     OpenAI(OpenAIConfig),
+    #[serde(rename = "llamacpp")]
+    LlamaCpp(LlamaCppConfig),
     #[serde(rename = "ollama")]
     Ollama(OllamaConfig),
 }
@@ -103,6 +127,17 @@ impl Default for OpenAIConfig {
             api_key: None,
             base_url: default_openai_url(),
             model: "gpt-4o".to_string(),
+            max_tokens: default_max_tokens(),
+        }
+    }
+}
+
+impl Default for LlamaCppConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            base_url: default_llamacpp_url(),
+            model: "llama3".to_string(),
             max_tokens: default_max_tokens(),
         }
     }
@@ -140,17 +175,6 @@ pub struct Config {
     #[serde(default)]
     pub retry: RetryConfig,
 
-    //AI: delete this, we dont need backwards compatibility
-    // === DEPRECATED: Legacy config fields for backward compatibility ===
-    /// Legacy: OpenRouter API key (use provider.config.api_key instead)
-    #[serde(default)]
-    pub openrouter_api_key: Option<String>,
-    /// Legacy: OpenRouter model (use provider.config.model instead)
-    #[serde(default)]
-    pub openrouter_model: Option<String>,
-    /// Legacy: Max tokens (use provider.config.max_tokens instead)
-    #[serde(default)]
-    pub openrouter_max_tokens: Option<u64>,
 }
 
 impl Config {
@@ -159,6 +183,7 @@ impl Config {
         match &self.provider {
             ProviderConfig::OpenRouter(c) => &c.model,
             ProviderConfig::OpenAI(c) => &c.model,
+            ProviderConfig::LlamaCpp(c) => &c.model,
             ProviderConfig::Ollama(c) => &c.model,
         }
     }
@@ -168,6 +193,7 @@ impl Config {
         match &self.provider {
             ProviderConfig::OpenRouter(c) => c.max_tokens,
             ProviderConfig::OpenAI(c) => c.max_tokens,
+            ProviderConfig::LlamaCpp(c) => c.max_tokens,
             ProviderConfig::Ollama(_) => 4096, // Ollama doesn't have this setting in the same way
         }
     }
@@ -177,6 +203,7 @@ impl Config {
         match &self.provider {
             ProviderConfig::OpenRouter(c) => c.api_key.as_deref(),
             ProviderConfig::OpenAI(c) => c.api_key.as_deref(),
+            ProviderConfig::LlamaCpp(c) => c.api_key.as_deref(),
             ProviderConfig::Ollama(_) => None,
         }
     }
@@ -191,6 +218,7 @@ impl Config {
         match &self.provider {
             ProviderConfig::OpenRouter(_) => "openrouter",
             ProviderConfig::OpenAI(_) => "openai",
+            ProviderConfig::LlamaCpp(_) => "llamacpp",
             ProviderConfig::Ollama(_) => "ollama",
         }
     }
@@ -430,11 +458,6 @@ impl Default for Config {
             conversation: None,
             bash: BashConfig::default(),
             retry: RetryConfig::default(),
-            // Legacy fields default to None
-            //AI: remove these
-            openrouter_api_key: None,
-            openrouter_model: None,
-            openrouter_max_tokens: None,
         }
     }
 }
@@ -473,26 +496,6 @@ impl Config {
         let mut config = load_yaml_config().unwrap_or_default();
 
         tracing::debug!("Config after YAML load: provider = {:?}", config.provider);
-
-        // === Backward Compatibility: Migrate legacy YAML config to new provider format ===
-        // If provider is still default (OpenRouter with defaults) but legacy fields exist,
-        // migrate them to the new provider format
-        if let ProviderConfig::OpenRouter(ref mut provider_cfg) = config.provider {
-            // Check for legacy OpenRouter config fields in YAML
-            if let Some(ref api_key) = config.openrouter_api_key {
-                if provider_cfg.api_key.is_none() && !api_key.is_empty() {
-                    provider_cfg.api_key = Some(api_key.clone());
-                }
-            }
-            if let Some(ref model) = config.openrouter_model {
-                if !model.is_empty() {
-                    provider_cfg.model = model.clone();
-                }
-            }
-            if let Some(tokens) = config.openrouter_max_tokens {
-                provider_cfg.max_tokens = tokens;
-            }
-        }
 
         // Load environment variables and merge (env vars override YAML/defaults)
 

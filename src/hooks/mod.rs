@@ -1,5 +1,21 @@
-pub mod token_cost;
-pub use token_cost::{
-    CostTrackingStats, ModelPricing, SessionStats, TokenCostHook, ToolEvent, ToolEventBuffer,
-    fetch_model_pricing, create_tool_event_buffer,
+//! Hooks module for PeakBot.
+//!
+//! Provides event-driven hook system for tracking agent activity:
+//! - SessionHook: Emits events for LLM calls, responses, and tool usage
+//! - EventChannel: Async channel for streaming events
+//! - EventProcessor: Processes events with configurable handlers
+
+pub mod channel;
+pub mod events;
+pub mod session_hook;
+
+// Re-exports
+pub use channel::create_event_channel;
+pub use channel::{EventChannel, EventProcessor};
+pub use events::{AgentEvent, TokenUsage};
+pub use session_hook::{
+    ModelPricing,
+    SessionHook,
+    SessionStats,
+    fetch_model_pricing,
 };
