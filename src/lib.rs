@@ -437,7 +437,7 @@ impl AgentRunner {
         if let Some(receiver) = self.event_receiver.take() {
             let stats = self.cost_tracker.get_session_stats();
             let pricing = self.cost_tracker.get_pricing().clone();
-            
+
             tokio::spawn(async move {
                 let mut receiver = receiver;
                 while let Some(event) = receiver.recv().await {
@@ -914,6 +914,10 @@ pub async fn load_mcp_servers(config: &Config) -> Result<Vec<McpServerHandle>> {
     };
 
     for server_config in servers {
+        if !server_config.enabled {
+            continue;
+        }
+
         tracing::info!("Connecting to MCP server: {}", server_config.name);
         match connect_mcp_server(server_config).await {
             Ok(handle) => {
@@ -948,6 +952,7 @@ mod tests {
             command: "nonexistent_command_xyz123".to_string(),
             args: None,
             env: Some(env),
+            enabled: true,
         };
 
         let result = connect_mcp_server(&config).await;
@@ -966,6 +971,7 @@ mod tests {
                 "hello-mcp-server".to_string(),
             ]),
             env: None,
+            enabled: true,
         };
 
         let result = connect_mcp_server(&config).await;
@@ -993,6 +999,7 @@ mod tests {
                 "hello-mcp-server".to_string(),
             ]),
             env: Some(env),
+            enabled: true,
         };
 
         let result = connect_mcp_server(&config).await;
@@ -1018,6 +1025,7 @@ mod tests {
                 "hello-mcp-server".to_string(),
             ]),
             env: None,
+            enabled: true,
         };
 
         // Connect and get the handle (which keeps the service alive)

@@ -174,7 +174,6 @@ pub struct Config {
     /// Retry configuration for API errors
     #[serde(default)]
     pub retry: RetryConfig,
-
 }
 
 impl Config {
@@ -296,6 +295,8 @@ pub struct McpServerConfig {
     /// Environment variables
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

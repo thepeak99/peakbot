@@ -2,7 +2,7 @@
 
 ## Overview
 
-PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.31). It runs as a terminal REPL, equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills.
+PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.31). It runs as a terminal REPL, equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills. Additional features include conversation persistence, todo list management, and an event-driven hooks system for cost tracking.
 
 ## Architecture
 
@@ -11,20 +11,31 @@ User (stdin)
   │
   ▼
 ┌──────────────────────────────────────────────┐
-│  REPL Loop  (src/main.rs)                    │
+│  REPL Loop  (src/main.rs / src/lib.rs)      │
 │  Reads input, passes to agent, prints output │
-│  Maintains chat_history: Vec<Message>        │
-│  Commands: /stats, /context, /compact        │
+│  Commands: /stats, /context, /compact,       │
+│           /conversations                     │
+│  Maintains:                                  │
+│  - chat_history: Vec<Message>                │
+│  - todo_state: Arc<Mutex<TodoList>>          │
 └──────────────┬───────────────────────────────┘
                │
                ▼
 ┌──────────────────────────────────────────────┐
 │  Provider Abstraction (src/providers/)       │
-│  ┌──────────────────┐ ┌──────────────────┐   │
-│  │ OpenRouter       │ │ Ollama           │   │
-│  │ (with cost hook) │ │ (local models)   │   │
-│  └──────────────────┘ └──────────────────┘   │
-│  CostTracker: Token cost tracking for API    │
+│  ┌────────────────────────────────────────┐  │
+│  │  DynAgent (enum for runtime switching) │  │
+│  │  ┌──────────────────────────────────┐  │  │
+│  │  │ OpenRouter  │  OpenAI   │ LlamaCpp│  │  │
+│  │  │ (100+ models) │ (GPT APIs) │(local) │  │  │
+│  │  └──────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────┐  │  │
+│  │  │   Ollama (local models)          │  │  │
+│  │  └──────────────────────────────────┘  │  │
+│  │                                        │  │
+│  │  CostTracker: Unified cost tracking    │  │
+│  │  SessionHook: Event emission           │  │
+│  └────────────────────────────────────────┘  │
 └──────────────┬───────────────────────────────┘
                │
                ▼
@@ -32,6 +43,8 @@ User (stdin)
 │  Context Manager (src/context_manager.rs)    │
 │  Auto-compacts context when threshold reached│
 │  Uses actual token counts from provider      │
+│  Passes system_prompt to agent for           │
+│  summarization-based compaction              │
 └──────────────┬───────────────────────────────┘
                │
                ▼
@@ -40,27 +53,32 @@ User (stdin)
 │  System prompt: built from + skills + env    │
 │  Max tokens: configurable                    │
 │  Max tool turns per message: configurable    │
+│  Tools: built-in (8) + MCP + todo tool       │
 └──────────────┬───────────────────────────────┘
                │
                ▼
 ┌──────────────────────────────────────────────┐
-│  Tool Set                                    │
-│                                              │
-│  ┌─────────────┐  ┌─────────────┐            │
-│  │ file_edit   │  │ file_read   │            │
-│  │ 4 commands  │  │ line ranges │            │
-│  └─────────────┘  └─────────────┘            │
-│  ┌─────────────┐  ┌────────────────┐         │
-│  │ bash        │  │ list_directory │         │
-│  │ /bin/sh -c  │  │ recursive opt  │         │
-│  └─────────────┘  └────────────────┘         │
-│  ┌─────────────┐  ┌────────────────┐  ┌────┐ │
-│  │ fetch_url   │  │ web_search     │  │thnk│ │
-│  │ HTTP GET    │  │ (SearXNG)      │  │    │ │
-│  └─────────────┘  └────────────────┘  └────┘ │
-│  ┌─────────────────────────────────────────┐ │
-│  │ MCP tools (dynamic)                     │ │
-│  └─────────────────────────────────────────┘ │
+│  Event Channel (async)                       │
+│  ┌────────────────────────────────────────┐  │
+│  │ SessionHook emits: AgentEvent          │  │
+│  │  - CompletionResponse (tokens, cost)   │  │
+│  │  - ToolCall, ToolResult                │  │
+│  └────────────────┬───────────────────────┘  │
+│                   │                           │
+│                   ▼                           │
+│  ┌────────────────────────────────────────┐  │
+│  │ AgentRunner processes events →         │  │
+│  │ updates CostTracker (external)         │  │
+│  └────────────────────────────────────────┘  │
+└──────────────────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────────┐
+│  Conversation Manager (src/conversation_     │
+│  manager.rs)                                 │
+│  Auto-saves conversations to JSON files      │
+│  Supports auto-resume, listing, metadata     │
+│  Stores: User, Assistant, ToolCall, ToolResult│
 └──────────────────────────────────────────────┘
 ```
 
@@ -70,16 +88,23 @@ User (stdin)
 
 PeakBot supports multiple LLM providers through a unified provider abstraction:
 
-| Provider | Features | Cost Tracking |
-|----------|----------|---------------|
-| **OpenRouter** | Access to 100+ models via API | ✅ Full support |
-| **OpenAI** | Direct access to GPT models, configurable endpoint | ✅ Full support |
-| **Ollama** | Local models (llama3, qwen, mistral, etc.) | ❌ Not supported |
+| Provider | Features | Cost Tracking | API Type |
+|----------|----------|---------------|----------|
+| **OpenRouter** | Access to 100+ models via API | ✅ Full support | Completion API |
+| **OpenAI** | Direct access to GPT models, configurable endpoint | ✅ Full support | Responses API |
+| **LlamaCpp** | llama.cpp compatible endpoints | ✅ Supported | Completion API |
+| **Ollama** | Local models (llama3, qwen, mistral, etc.) | ❌ Not supported | Completion API |
 
 The provider system provides:
 - `DynAgent` - Dynamic enum for runtime provider switching
 - `CostTracker` - Unified interface for session statistics
 - `ProviderInfo` - Metadata (name, model, pricing support)
+
+**DynAgent Variants**:
+- `OpenRouter(Agent<CompletionModel, SessionHook>)` - Full cost tracking
+- `OpenAI(Agent<ResponsesCompletionModel, SessionHook>)` - Uses OpenAI's responses API
+- `LlamaCpp(Agent<CompletionModel, SessionHook>)` - llama.cpp compatible
+- `Ollama(Agent<CompletionModel, ()>)` - No hook for local models
 
 ### Context Manager (`src/context_manager.rs`)
 
@@ -98,11 +123,31 @@ Supported context windows (auto-detected):
 
 ### Hooks System (`src/hooks/`)
 
-Extends the agent with post-processing capabilities:
+Extends the agent with event-driven post-processing capabilities:
 
-- **TokenCostHook** (`src/hooks/token_cost.rs`): Tracks token usage and calculates API costs for OpenRouter
-- **SessionStats**: Accumulates total tokens, requests, and estimated cost
-- **ModelPricing**: Per-model pricing data (input/output per 1M tokens)
+**Module Structure**:
+- `session_hook.rs` - Main hook implementation
+  - `SessionHook` - Implements `PromptHook` for emitting events
+  - `SessionStats` - Accumulates total tokens, requests, and cost
+  - `ModelPricing` - Per-model pricing data (input/output per token)
+  - `fetch_model_pricing()` - Fetches pricing from OpenRouter API
+- `channel.rs` - Async event channel
+  - `EventChannel` - Creates event channel and processor
+  - `EventProcessor` - Processes events with handlers
+- `events.rs` - Event types
+  - `AgentEvent` - Enum for LLM events (CompletionResponse, ToolCall, ToolResult)
+  - `TokenUsage` - Token usage data structure
+
+**Cost Tracking Flow**:
+1. `SessionHook` emits `AgentEvent` for each LLM call
+2. Events are sent via async channel to `AgentRunner`
+3. `CostTracker` processes events and calculates costs
+4. Session stats are updated and accessible via REPL commands
+
+**Key Types**:
+- `CostTracker` - External cost tracking handle (not a hook itself)
+- `SessionStats` - Thread-safe statistics with `Arc<Mutex<>>`
+- `ModelPricing` - Fetched from OpenRouter API or uses defaults
 
 ### Skills System (`src/skills/`)
 
@@ -133,16 +178,36 @@ pub fn create_provider(
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
     max_turns: usize,
-) -> Result<(DynAgent, ProviderInfo, CostTracker)>
+    todo_tool: Option<TodoTool>,
+    bash_config: &BashConfig,
+) -> Result<(DynAgent, ProviderInfo, CostTracker, Arc<Mutex<TodoList>>, Option<mpsc::UnboundedReceiver<AgentEvent>>)>
 ```
 
-The agent uses:
-- The configured LLM provider (OpenRouter or Ollama)
-- Built-in tools (7 tools + optional search)
-- Any MCP tools from configuration
-- Skills loaded from the skills directories
+**Return Values**:
+- `DynAgent` - The configured agent for the selected provider
+- `ProviderInfo` - Metadata about the provider (name, model, pricing support)
+- `CostTracker` - Handle for accessing session statistics and costs
+- `Arc<Mutex<TodoList>>` - Shared state for the todo tool
+- `Option<mpsc::UnboundedReceiver<AgentEvent>>` - Event channel for external processing
 
-The agent is stateless between tool turns -- all state lives in `chat_history` (conversation memory) and `FileEditTool.file_history` (undo stack). Rig owns the agentic loop: it automatically dispatches tool calls, collects results, and loops until the model produces a text response or hits the 50-turn limit.
+**Agent Initialization Flow** (`src/main.rs`):
+1. Load configuration from environment variables and `config.yaml`
+2. Load skills from `~/.agents/skills` and `./.agents/skills`
+3. Build system prompt dynamically (includes skills, cwd, time, agents.md content)
+4. Load MCP servers (async) and extract their tools
+5. Create `TodoTool` instance
+6. Call `create_provider()` with all components
+7. Create `AgentRunner` with agent, config, and shared state
+8. Run the REPL loop
+
+**State Management**:
+- **Conversation memory**: `chat_history` in `AgentRunner` (Vec<Message>)
+- **Todo state**: Shared `Arc<Mutex<TodoList>>` accessible by the agent
+- **File edit history**: `FileEditTool.file_history` (undo stack, not yet exposed)
+- **Session stats**: `CostTracker` with `SessionStats` (Arc<Mutex<>>)
+- **Events**: Processed externally by `AgentRunner` from the channel
+
+The agent is stateless between tool turns -- Rig owns the agentic loop: it automatically dispatches tool calls, collects results, and loops until the model produces a text response or hits the 50-turn limit.
 
 ## Tools
 
@@ -154,99 +219,24 @@ All tools live in `src/tools/` and implement `rig::tool::Tool`. Each tool define
 - `definition()` -- returns the JSON Schema the model uses to know what to send
 - `call()` -- executes the tool logic
 
-PeakBot includes **7 built-in tools** (6 always available, 1 conditional):
+PeakBot includes **8 built-in tools**:
 
-### file_edit (`src/tools/file_edit.rs`)
+### Tools Overview
 
-The primary editing tool, modeled after Anthropic's `text_editor_20250728`. A single tool with a `command` discriminator selecting between three operations.
+PeakBot includes **8 built-in tools** (all always available):
 
-| Command | Required Params | Behavior |
-|---------|----------------|----------|
-| `create` | `path`, `file_text` | Write a new file. Fails if file already exists. Creates parent dirs if needed. |
-| `str_replace` | `path`, `old_str` | Find `old_str` (must be unique in file), replace with `new_str` (omit to delete). Returns context snippet around edit. |
-| `insert` | `path`, `insert_line`, `insert_text` | Insert text after line N (0 = beginning). Returns context snippet. |
+| Tool | File | Description |
+|------|------|-------------|
+| `file_edit` | `file_edit.rs` | Create, replace, insert text in files |
+| `file_read` | `file_read.rs` | Read files with line ranges |
+| `list_directory` | `list_directory.rs` | List directory contents with recursion |
+| `bash` | `bash.rs` | Execute shell commands with timeout |
+| `fetch_url` | `fetch_url.rs` | HTTP GET requests to URLs |
+| `web_search` | `search.rs` | SearXNG-based web search |
+| `think` | `think.rs` | Reasoning tool for complex thinking |
+| `todo` | `todo.rs` | Todo list management |
 
-Design decisions:
-- **Uniqueness enforcement** on `str_replace`: if `old_str` matches 0 or >1 times, the tool returns an error with line numbers to help the model refine.
-- **Undo history**: `file_history: Mutex<HashMap<PathBuf, Vec<String>>>` stores previous file contents on each edit. Not exposed as a command yet but the stack is there.
-- All paths must be absolute.
-
-### file_read (`src/tools/file_read.rs`)
-
-Simple read-only tool. Takes `path` with optional `start_line`/`end_line` (1-indexed, inclusive). Returns content with `cat -n` style line numbering. Truncates at 10,000 chars.
-
-Provides read-only access to files, complementing the edit capabilities of file_edit.
-
-### bash (`src/tools/bash.rs`)
-
-Runs shell commands via `/bin/sh -c`. Returns exit code, stdout, and stderr.
-
-| Param | Default | Range |
-|-------|---------|-------|
-| `command` | required | any string |
-| `timeout_seconds` | 30 | 1-120 |
-
-Implementation details:
-- Uses `tokio::process::Command` with `.kill_on_drop(true)` so timed-out processes are cleaned up automatically.
-- Timeout is enforced with `tokio::time::timeout` wrapping `wait_with_output()`.
-- stdout/stderr each truncated independently at 10,000 chars.
-
-### list_directory (`src/tools/list_directory.rs`)
-
-Lists directory contents with optional recursion.
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `path` | required | absolute path to directory |
-| `recursive` | false | if true, recurse up to depth 3 |
-
-Entries are sorted alphabetically. Directories get a trailing `/`. Hidden files (`.` prefix) are skipped.
-
-### fetch_url (`src/tools/fetch_url.rs`)
-
-Fetches the content of a URL via HTTP GET request.
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `url` | required | any valid HTTP/HTTPS URL |
-
-Implementation details:
-- Uses `reqwest` for HTTP requests with a 30-second timeout.
-- Returns the HTTP status code, reason phrase, and response body.
-- Response body is truncated at 50,000 characters.
-- Sets `User-Agent: PeakBot/1.0` header.
-
-### web_search (`src/tools/search.rs`)
-
-Web search tool using SearXNG instances. Requires SearXNG to be configured in `config.yaml`.
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `query` | required | The search query |
-| `category` | optional | "images", "videos", "news", "maps", "music", "science" |
-| `site` | optional | Filter to specific site (e.g., "github.com") |
-| `num_results` | 10 | Max results (1-20) |
-| `time_range` | optional | "day", "month", "year" |
-
-Implementation details:
-- Connects to a SearXNG instance configured via `searxng.base_url`
-- Uses JSON format for API responses
-- Returns title, URL, and snippet for each result
-- Requires JSON format to be enabled on the SearXNG instance
-- Configurable timeout (default: 30s) and max results (default: 10)
-
-### think (`src/tools/think.rs`)
-
-Reasoning tool for complex thinking and brainstorming. Allows the model to pause and think through problems before taking action.
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `thought` | required | The thought process to execute |
-
-Implementation details:
-- Useful for multi-step reasoning, bug analysis, and planning
-- Logs thoughts to tracing for debugging
-- Returns a confirmation with the thought content
+Plus optional **MCP tools** from configured servers.
 
 ## Data Flow
 
@@ -259,8 +249,10 @@ Implementation details:
    - Calls `tool.call(args)`
    - Serializes `Output` back to JSON
 6. Tool results are appended to the conversation as `ToolResult` messages
-7. When the model produces a text response, TokenCostHook tracks token usage
-8. Results are printed and session stats are updated
+7. `SessionHook` emits `AgentEvent` for each LLM call (tokens, cost)
+8. Events are sent via channel to `AgentRunner`
+9. `CostTracker` processes events and updates session statistics
+10. Results are printed and session stats are updated
 
 ## Error Handling
 
@@ -270,14 +262,14 @@ Implementation details:
 
 ## Configuration
 
-PeakBot supports multiple LLM providers (OpenRouter, OpenAI, Ollama). Configuration is loaded from `config.yaml` in the platform config directory, with environment variables taking precedence.
+PeakBot supports multiple LLM providers (OpenRouter, OpenAI, LlamaCpp, Ollama). Configuration is loaded from `config.yaml` in the platform config directory, with environment variables taking precedence.
 
 ### Provider Configuration
 
 The recommended config format uses the `provider` key:
 
 ```yaml
-# OpenRouter example
+# OpenRouter example (100+ models)
 provider:
   type: openrouter
   config:
@@ -290,8 +282,17 @@ provider:
   type: openai
   config:
     api_key: sk-xxx
-    base_url: https://api.openai.com/v1  # Default - can be overridden for compatible endpoints
+    base_url: https://api.openai.com/v1  # Default - can be overridden for Azure, local proxies
     model: gpt-4o
+    max_tokens: 4096
+
+# LlamaCpp example (llama.cpp server with OpenAI-compatible API)
+provider:
+  type: llamacpp
+  config:
+    api_key: optional  # Optional for local instances
+    base_url: http://localhost:8080
+    model: llama3
     max_tokens: 4096
 
 # Ollama example (local models)
@@ -358,12 +359,17 @@ openrouter_max_tokens: 4096
 | `OPENROUTER_MODEL` | OpenRouter model (legacy) |
 | `OPENROUTER_MAX_TOKENS` | Max tokens for OpenRouter (legacy) |
 | `OPENAI_API_KEY` | OpenAI API key |
+| `OPENAI_BASE_URL` | OpenAI base URL (legacy) |
+| `LLAMACPP_API_KEY` | LlamaCpp API key (legacy) |
+| `LLAMACPP_BASE_URL` | LlamaCpp base URL (legacy) |
+| `LLAMACPP_MODEL` | LlamaCpp model name (legacy) |
 | `OLLAMA_MODEL` | Ollama model name (legacy) |
 | `OLLAMA_BASE_URL` | Ollama base URL (legacy) |
 | `OLLAMA_TEMPERATURE` | Ollama temperature (legacy) |
 | `OLLAMA_NUM_CTX` | Ollama context size (legacy) |
 | `AGENT_MAX_TURNS` | Max tool turns per message |
 | `MCP_SERVERS` | JSON array of MCP server configs |
+| `SEARXNG_BASE_URL` | SearXNG base URL |
 
 ### REPL Commands
 
@@ -464,15 +470,19 @@ let main_agent = client
 ```
 src/
 ├── main.rs                 # Entry point, creates AgentRunner
-├── lib.rs                  # AgentRunner, system prompt building
+├── lib.rs                  # AgentRunner, system prompt building, conversation conversion
 ├── config.rs               # Configuration loading from config.yaml + env vars
 ├── context_manager.rs      # Context compaction for long conversations
+├── conversation.rs         # Conversation data structures
+├── conversation_manager.rs # Conversation persistence manager
 ├── system_prompt.txt       # Base system prompt (included at compile time)
 ├── providers/
-│   └── mod.rs              # Provider abstraction (OpenRouter, Ollama), DynAgent
+│   └── mod.rs              # Provider abstraction (OpenRouter, OpenAI, LlamaCpp, Ollama), DynAgent, CostTracker
 ├── hooks/
 │   ├── mod.rs              # Hook exports
-│   └── token_cost.rs       # TokenCostHook for API cost tracking
+│   ├── session_hook.rs     # SessionHook, SessionStats, ModelPricing, fetch_model_pricing
+│   ├── channel.rs          # EventChannel, EventProcessor
+│   └── events.rs           # AgentEvent, TokenUsage
 ├── skills/
 │   ├── mod.rs              # Skills module exports
 │   ├── discovery.rs        # Skill discovery and SkillRegistry
@@ -487,6 +497,7 @@ src/
     ├── list_directory.rs   # ListDirectoryTool -- dir listing with recursion
     ├── search.rs           # SearchTool -- SearXNG web search
     ├── think.rs            # ThinkTool -- reasoning tool
+    ├── todo.rs             # TodoTool -- todo list management
     └── logging_wrapper.rs  # LoggingToolDyn -- wrapper for MCP tool tracing
 ```
 
