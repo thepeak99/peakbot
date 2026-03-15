@@ -9,15 +9,28 @@ mod providers;
 mod skills;
 mod tools;
 
-pub use config::{BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig, OllamaConfig, OpenRouterConfig, ProviderConfig, ProviderType, RetryConfig, SearXngConfig};
+pub use config::{
+    BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig, OllamaConfig,
+    OpenRouterConfig, ProviderConfig, ProviderType, RetryConfig, SearXngConfig,
+};
 pub use context_manager::{CompactionResult, ContextManager};
-pub use conversation::{Conversation, ConversationMetadata, ConversationSummary, Message as ConversationMessage};
+pub use conversation::{
+    Conversation, ConversationMetadata, ConversationSummary, Message as ConversationMessage,
+};
 pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
-    CostTrackingStats, ModelPricing, SessionStats, TokenCostHook, ToolEvent, ToolEventBuffer,
-    fetch_model_pricing, create_tool_event_buffer,
+    // Event types
+    AgentEvent,
+    EventChannel,
+    EventProcessor,
+    ModelPricing,
+    SessionHook,
+    SessionStats,
+    TokenUsage,
+    create_event_channel,
+    fetch_model_pricing,
 };
-pub use providers::{create_provider, CostTracker, DynAgent, ProviderInfo};
+pub use providers::{CostTracker, DynAgent, ProviderInfo, create_provider};
 use rig::completion::Message;
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
@@ -28,12 +41,13 @@ pub use tools::{
     SearchTool, ThinkTool, TodoList, TodoStatus, TodoTool,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rmcp::service::ServiceExt;
 use std::io::{self, BufRead, Write};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::sync::mpsc;
+use tokio::time::{Duration, sleep};
 use tracing::debug;
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
@@ -79,9 +93,9 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
 /// This is used when loading a conversation to restore the chat history
 pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message> {
     use crate::conversation::Message as StoredMessage;
-    
+
     let mut messages = Vec::new();
-    
+
     for msg in &conv.messages {
         match msg {
             StoredMessage::User { content, .. } => {
@@ -96,7 +110,7 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
             StoredMessage::ToolResult { .. } => {}
         }
     }
-    
+
     messages
 }
 
@@ -104,28 +118,55 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
 /// This is used when resuming an old conversation to show context
 pub fn print_recent_messages(conv: &Conversation, count: usize) {
     use crate::conversation::Message as StoredMessage;
-    
+
     let messages: Vec<_> = conv.messages.iter().rev().take(count).collect();
-    
+
     if messages.is_empty() {
         println!("  (no messages in this conversation)");
         return;
     }
-    
+
     // Print in reverse order (oldest first)
     for msg in messages.iter().rev() {
         match msg {
             StoredMessage::User { content, timestamp } => {
-                println!("  [{}] User: {}", timestamp.format("%H:%M"), truncate(content, 100));
+                println!(
+                    "  [{}] User: {}",
+                    timestamp.format("%H:%M"),
+                    truncate(content, 100)
+                );
             }
             StoredMessage::Assistant { content, timestamp } => {
-                println!("  [{}] Assistant: {}", timestamp.format("%H:%M"), truncate(content, 100));
+                println!(
+                    "  [{}] Assistant: {}",
+                    timestamp.format("%H:%M"),
+                    truncate(content, 100)
+                );
             }
-            StoredMessage::ToolCall { tool_name, arguments, timestamp } => {
-                println!("  [{}] Tool Call: {} - {}", timestamp.format("%H:%M"), tool_name, truncate(arguments, 60));
+            StoredMessage::ToolCall {
+                tool_name,
+                arguments,
+                timestamp,
+            } => {
+                println!(
+                    "  [{}] Tool Call: {} - {}",
+                    timestamp.format("%H:%M"),
+                    tool_name,
+                    truncate(arguments, 60)
+                );
             }
-            StoredMessage::ToolResult { tool_name, result, timestamp, .. } => {
-                println!("  [{}] Tool: {} - {}", timestamp.format("%H:%M"), tool_name, truncate(result, 60));
+            StoredMessage::ToolResult {
+                tool_name,
+                result,
+                timestamp,
+                ..
+            } => {
+                println!(
+                    "  [{}] Tool: {} - {}",
+                    timestamp.format("%H:%M"),
+                    tool_name,
+                    truncate(result, 60)
+                );
             }
         }
     }
@@ -151,7 +192,7 @@ pub struct AgentRunner {
     system_prompt: String,
     cost_tracker: CostTracker,
     todo_state: Option<Arc<Mutex<TodoList>>>,
-    tool_buffer: Option<ToolEventBuffer>,
+    event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
 }
 
 impl AgentRunner {
@@ -163,27 +204,27 @@ impl AgentRunner {
         skills: SkillRegistry,
         cost_tracker: CostTracker,
         todo_state: Option<Arc<Mutex<TodoList>>>,
-        tool_buffer: Option<ToolEventBuffer>,
+        event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
     ) -> Self {
         // Wrap agent in Arc so we can share it with ContextManager for summarization
         let agent = Arc::new(agent);
-        
+
         // Build system prompt for context manager
         let system_prompt = build_system_prompt(&skills);
-        
+
         // Estimate system prompt tokens (rough approximation: ~4 chars per token)
         let system_prompt_tokens = system_prompt.len() / 4;
-        
+
         // Create context manager (always created, enabled flag controls actual usage)
         // Pass a clone of the agent Arc for summarization
         let context_manager = Some(ContextManager::new(
-            config.context.clone(), 
+            config.context.clone(),
             provider_info.model.as_str(),
-            cost_tracker.get_session_stats().unwrap_or_else(|| Arc::new(Mutex::new(SessionStats::new()))),
+            cost_tracker.get_session_stats(),
             system_prompt_tokens,
             Some(agent.clone()),
         ));
-        
+
         // Create conversation manager if persistence is enabled
         let conversation_manager = if config.conversation_enabled() {
             match ConversationManager::new(ConversationManagerConfig {
@@ -201,7 +242,7 @@ impl AgentRunner {
         } else {
             None
         };
-        
+
         Self {
             agent,
             config,
@@ -212,7 +253,7 @@ impl AgentRunner {
             system_prompt,
             cost_tracker,
             todo_state,
-            tool_buffer,
+            event_receiver,
         }
     }
 
@@ -280,9 +321,7 @@ impl AgentRunner {
                 Ok(result) => {
                     println!(
                         "\n[Context compacted: {} → {} messages, {} messages discarded]\n",
-                        result.original_count,
-                        result.compacted_count,
-                        result.num_discarded
+                        result.original_count, result.compacted_count, result.num_discarded
                     );
                 }
                 Err(e) => {
@@ -327,7 +366,12 @@ impl AgentRunner {
     pub async fn run(&mut self) -> Result<()> {
         let cwd = std::env::current_dir()?;
         println!("PeakBot coding agent ready.");
-        println!("Provider: {} | Model: {}", self.config.provider_name(), self.config.model());
+        println!(
+            "Provider: {} | Model: {} | Max-tokens: {}",
+            self.config.provider_name(),
+            self.config.model(),
+            self.config.max_tokens()
+        );
         if self.config.mcp_servers.as_ref().map_or(0, |s| s.len()) > 0 {
             println!(
                 "MCP servers: {}",
@@ -367,7 +411,7 @@ impl AgentRunner {
         } else {
             println!("Context compaction: disabled");
         }
-        
+
         // Print conversation persistence status
         if let Some(ref cm) = self.conversation_manager {
             println!(
@@ -377,14 +421,48 @@ impl AgentRunner {
         } else {
             println!("Conversation persistence: disabled");
         }
-        
+
         println!("Working directory: {}", cwd.display());
-        println!("Type /stats to see session stats, /context for context status, /compact to force compaction, /conversations to list saved, or 'exit' to quit.\n");
+        println!(
+            "Type /stats to see session stats, /context for context status, /compact to force compaction, /conversations to list saved, or 'exit' to quit.\n"
+        );
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
         let mut chat_history: Vec<Message> = Vec::new();
-        
+
+        // Spawn event processing task if we have an event receiver
+        // This handles cost tracking via events from SessionHook
+        // We clone the necessary data from CostTracker to pass to the task
+        if let Some(receiver) = self.event_receiver.take() {
+            let stats = self.cost_tracker.get_session_stats();
+            let pricing = self.cost_tracker.get_pricing().clone();
+            
+            tokio::spawn(async move {
+                let mut receiver = receiver;
+                while let Some(event) = receiver.recv().await {
+                    // Track cost for completion events
+                    if let AgentEvent::CompletionResponse { usage, .. } = event {
+                        let cost = (usage.input_tokens as f64 * pricing.input_per_token)
+                            + (usage.output_tokens as f64 * pricing.output_per_token);
+
+                        if let Ok(mut stats) = stats.lock() {
+                            stats.add_request(usage.input_tokens, usage.output_tokens, cost);
+
+                            tracing::info!(
+                                "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                cost,
+                                stats.total_cost
+                            );
+                        }
+                    }
+                }
+                tracing::debug!("Event processor finished");
+            });
+        }
+
         // Check for auto-resume before starting the main loop
         let mut resumed = false;
         if let Some(ref mut cm) = self.conversation_manager {
@@ -401,10 +479,11 @@ impl AgentRunner {
                         );
                         print!("Resume this conversation? (y/n): ");
                         stdout.flush().ok();
-                        
+
                         let mut confirm = String::new();
                         if stdin.lock().read_line(&mut confirm).is_ok() {
-                            if confirm.trim().eq_ignore_ascii_case("y") || confirm.trim().is_empty() {
+                            if confirm.trim().eq_ignore_ascii_case("y") || confirm.trim().is_empty()
+                            {
                                 // Load the conversation
                                 if let Err(e) = cm.load_and_set_current(latest.id) {
                                     eprintln!("Failed to load conversation: {}", e);
@@ -423,11 +502,14 @@ impl AgentRunner {
                 }
             }
         }
-        
+
         // If not resumed, create a new conversation
         if !resumed {
             if let Some(ref mut cm) = self.conversation_manager {
-                let name = format!("Conversation {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+                let name = format!(
+                    "Conversation {}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M")
+                );
                 let _ = cm.create_new(name, self.config.model().to_string());
             }
         }
@@ -476,7 +558,9 @@ impl AgentRunner {
             }
 
             // Handle /conversations or /history command
-            if input.eq_ignore_ascii_case("/conversations") || input.eq_ignore_ascii_case("/history") {
+            if input.eq_ignore_ascii_case("/conversations")
+                || input.eq_ignore_ascii_case("/history")
+            {
                 self.list_conversations();
                 continue;
             }
@@ -484,7 +568,10 @@ impl AgentRunner {
             // Handle /new command - start a fresh conversation
             if input.eq_ignore_ascii_case("/new") {
                 if let Some(ref mut cm) = self.conversation_manager {
-                    let name = format!("Conversation {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+                    let name = format!(
+                        "Conversation {}",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M")
+                    );
                     let _ = cm.create_new(name, self.config.model().to_string());
                     chat_history.clear();
                     println!("Started a new conversation.\n");
@@ -528,7 +615,9 @@ impl AgentRunner {
                             }
                         }
                         Err(_) => {
-                            eprintln!("Invalid conversation ID. Use /conversations to see available IDs.\n");
+                            eprintln!(
+                                "Invalid conversation ID. Use /conversations to see available IDs.\n"
+                            );
                         }
                     }
                 } else {
@@ -541,12 +630,10 @@ impl AgentRunner {
             if let Some(id_str) = input.strip_prefix("/delete ") {
                 if let Some(ref cm) = self.conversation_manager {
                     match uuid::Uuid::parse_str(id_str) {
-                        Ok(id) => {
-                            match cm.delete(id) {
-                                Ok(_) => println!("Conversation deleted.\n"),
-                                Err(e) => eprintln!("Failed to delete: {}\n", e),
-                            }
-                        }
+                        Ok(id) => match cm.delete(id) {
+                            Ok(_) => println!("Conversation deleted.\n"),
+                            Err(e) => eprintln!("Failed to delete: {}\n", e),
+                        },
                         Err(_) => {
                             eprintln!("Invalid conversation ID.\n");
                         }
@@ -565,27 +652,28 @@ impl AgentRunner {
                         let id_str = parts[0];
                         let format = parts[1].to_lowercase();
                         match uuid::Uuid::parse_str(id_str) {
-                            Ok(id) => {
-                                match cm.load(id) {
-                                    Ok(conv) => {
-                                        let output = match format.as_str() {
-                                            "markdown" | "md" => cm.export_markdown(&conv),
-                                            "json" => cm.export_json(&conv),
-                                            _ => {
-                                                eprintln!("Unknown format '{}'. Use 'json' or 'markdown'.\n", format);
-                                                continue;
-                                            }
-                                        };
-                                        match output {
-                                            Ok(s) => {
-                                                println!("\n--- Export ---\n{}\n--- End ---\n", s);
-                                            }
-                                            Err(e) => eprintln!("Export failed: {}\n", e),
+                            Ok(id) => match cm.load(id) {
+                                Ok(conv) => {
+                                    let output = match format.as_str() {
+                                        "markdown" | "md" => cm.export_markdown(&conv),
+                                        "json" => cm.export_json(&conv),
+                                        _ => {
+                                            eprintln!(
+                                                "Unknown format '{}'. Use 'json' or 'markdown'.\n",
+                                                format
+                                            );
+                                            continue;
                                         }
+                                    };
+                                    match output {
+                                        Ok(s) => {
+                                            println!("\n--- Export ---\n{}\n--- End ---\n", s);
+                                        }
+                                        Err(e) => eprintln!("Export failed: {}\n", e),
                                     }
-                                    Err(e) => eprintln!("Failed to load conversation: {}\n", e),
                                 }
-                            }
+                                Err(e) => eprintln!("Failed to load conversation: {}\n", e),
+                            },
                             Err(_) => eprintln!("Invalid conversation ID.\n"),
                         }
                     } else {
@@ -625,9 +713,7 @@ impl AgentRunner {
                         .map(|result| {
                             println!(
                                 "[Compacted: {} → {} messages, {} discarded]\n",
-                                result.original_count,
-                                result.compacted_count,
-                                result.num_discarded
+                                result.original_count, result.compacted_count, result.num_discarded
                             );
                         })
                         .unwrap_or_else(|e| {
@@ -645,30 +731,12 @@ impl AgentRunner {
             {
                 Ok(response) => {
                     println!("\n{}", response);
-                    
-                    // Drain tool events and persist them
+
+                    // Save conversation to persistence if enabled
                     if let Some(ref mut cm) = self.conversation_manager {
-                        if let Some(ref buffer) = self.tool_buffer {
-                            let events = {
-                                let mut events = buffer.lock().unwrap();
-                                std::mem::take(&mut *events)
-                            };
-                            
-                            for event in events {
-                                match event {
-                                    ToolEvent::Call { tool_name, arguments, .. } => {
-                                        let _ = cm.add_tool_call(tool_name, arguments);
-                                    }
-                                    ToolEvent::Result { tool_name, arguments, result, .. } => {
-                                        let _ = cm.add_tool_result(tool_name, arguments, result);
-                                    }
-                                }
-                            }
-                        }
-                        
                         // Save assistant message
                         let _ = cm.add_assistant_message(response.clone());
-                        
+
                         // Update tokens
                         let tokens = self.cost_tracker.get_total_tokens();
                         let cost = self.cost_tracker.get_total_cost();
@@ -696,11 +764,17 @@ impl AgentRunner {
                         // Calculate delay with exponential backoff
                         let delay_ms = ((retry_config.initial_delay_ms as f64)
                             * (retry_config.backoff_factor.powi(attempt as i32)))
-                            .min(retry_config.max_delay_ms as f64) as u64;
+                        .min(retry_config.max_delay_ms as f64)
+                            as u64;
 
                         if attempt > 0 {
-                            eprintln!("\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
-                                last_error, delay_ms, attempt + 1, retry_config.max_retries);
+                            eprintln!(
+                                "\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
+                                last_error,
+                                delay_ms,
+                                attempt + 1,
+                                retry_config.max_retries
+                            );
                         }
 
                         // Wait before retrying
@@ -716,26 +790,8 @@ impl AgentRunner {
                             Ok(response) => {
                                 println!("\n{}", response);
 
-                                // Drain tool events and persist them
+                                // Save conversation to persistence if enabled
                                 if let Some(ref mut cm) = self.conversation_manager {
-                                    if let Some(ref buffer) = self.tool_buffer {
-                                        let events = {
-                                            let mut events = buffer.lock().unwrap();
-                                            std::mem::take(&mut *events)
-                                        };
-
-                                        for event in events {
-                                            match event {
-                                                ToolEvent::Call { tool_name, arguments, .. } => {
-                                                    let _ = cm.add_tool_call(tool_name, arguments);
-                                                }
-                                                ToolEvent::Result { tool_name, arguments, result, .. } => {
-                                                    let _ = cm.add_tool_result(tool_name, arguments, result);
-                                                }
-                                            }
-                                        }
-                                    }
-
                                     // Save assistant message
                                     let _ = cm.add_assistant_message(response.clone());
 

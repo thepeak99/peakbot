@@ -3,8 +3,13 @@
 //! This module provides a unified interface for different LLM providers
 //! (OpenRouter, Ollama, etc.) to make the codebase provider-independent.
 
-use crate::config::{BashConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig, SearXngConfig};
-use crate::hooks::{TokenCostHook, ToolEventBuffer};
+use crate::config::{
+    BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig,
+    SearXngConfig,
+};
+use crate::hooks::{SessionHook, SessionStats};
+use crate::hooks::events::AgentEvent;
+use tokio::sync::mpsc;
 use crate::tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
     TodoList, TodoTool,
@@ -33,61 +38,113 @@ pub struct ProviderInfo {
 }
 
 /// Cost tracking handle that provides access to session statistics
-#[derive(Clone)]
 pub struct CostTracker {
-    /// The hook that tracks token costs (only for OpenRouter)
-    hook: Option<TokenCostHook>,
+    /// Session statistics for tracking tokens and costs
+    stats: Arc<Mutex<SessionStats>>,
+    /// Model pricing for cost calculation
+    pricing: crate::hooks::ModelPricing,
 }
 
 impl CostTracker {
-    /// Create a new cost tracker
-    fn new(hook: Option<TokenCostHook>) -> Self {
-        Self { hook }
+    /// Create a new cost tracker with the given pricing
+    /// Note: Event processing is handled externally by the caller (e.g., AgentRunner)
+    /// Use track_event() to process events for cost tracking
+    pub fn new(pricing: crate::hooks::ModelPricing) -> Self {
+        Self {
+            stats: Arc::new(Mutex::new(SessionStats::new())),
+            pricing,
+        }
+    }
+
+    /// Process an event for cost tracking
+    /// This should be called by the external event processor
+    pub fn track_event(&self, event: &AgentEvent) {
+        if let AgentEvent::CompletionResponse { usage, .. } = event {
+            let cost = (usage.input_tokens as f64 * self.pricing.input_per_token)
+                + (usage.output_tokens as f64 * self.pricing.output_per_token);
+
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.add_request(usage.input_tokens, usage.output_tokens, cost);
+
+                tracing::info!(
+                    "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    cost,
+                    stats.total_cost
+                );
+            }
+        }
     }
 
     /// Create a cost tracker with no tracking (for providers that don't support it)
     pub fn none() -> Self {
-        Self { hook: None }
+        Self {
+            stats: Arc::new(Mutex::new(SessionStats::new())),
+            pricing: crate::hooks::ModelPricing::default(),
+        }
+    }
+
+    /// Update stats with token usage from a completion response
+    pub fn track_completion(&self, input_tokens: u64, output_tokens: u64) {
+        let cost = (input_tokens as f64 * self.pricing.input_per_token)
+            + (output_tokens as f64 * self.pricing.output_per_token);
+        
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.add_request(input_tokens, output_tokens, cost);
+            
+            tracing::info!(
+                "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
+                input_tokens,
+                output_tokens,
+                cost,
+                stats.total_cost
+            );
+        }
     }
 
     /// Get stats for the last request
     pub fn get_last_request_stats(&self) -> Option<String> {
-        self.hook.as_ref()?.get_last_request_stats()
+        let stats = self.stats.lock().ok()?;
+        let last = stats.last_request()?;
+        Some(stats.format_per_request(last.input_tokens, last.output_tokens, last.cost))
     }
 
     /// Get session summary
     pub fn get_session_summary(&self) -> Option<String> {
-        self.hook.as_ref()?.get_session_summary()
+        let stats = self.stats.lock().ok()?;
+        Some(stats.summary())
     }
 
     /// Reset session stats
     pub fn reset_stats(&self) {
-        if let Some(ref hook) = self.hook {
-            hook.reset_stats();
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.reset();
         }
     }
 
     /// Get the underlying SessionStats for context tracking
-    pub fn get_session_stats(&self) -> Option<Arc<Mutex<crate::hooks::SessionStats>>> {
-        self.hook.as_ref().map(|h| h.get_stats())
+    pub fn get_session_stats(&self) -> Arc<Mutex<SessionStats>> {
+        self.stats.clone()
+    }
+
+    /// Get the pricing model
+    pub fn get_pricing(&self) -> &crate::hooks::ModelPricing {
+        &self.pricing
     }
 
     /// Get total tokens used in this session
     pub fn get_total_tokens(&self) -> u64 {
-        if let Some(ref hook) = self.hook {
-            if let Ok(stats) = hook.get_stats().lock() {
-                return stats.total_tokens();
-            }
+        if let Ok(stats) = self.stats.lock() {
+            return stats.total_tokens();
         }
         0
     }
 
     /// Get total cost for this session
     pub fn get_total_cost(&self) -> f64 {
-        if let Some(ref hook) = self.hook {
-            if let Ok(stats) = hook.get_stats().lock() {
-                return stats.total_cost;
-            }
+        if let Ok(stats) = self.stats.lock() {
+            return stats.total_cost;
         }
         0.0
     }
@@ -96,11 +153,13 @@ impl CostTracker {
 /// A dynamic agent type that can work with any provider
 /// This allows us to abstract over different provider agent types at runtime
 pub enum DynAgent {
-    /// OpenRouter agent with cost tracking hook
-    OpenRouter(Agent<<openrouter::Client as CompletionClient>::CompletionModel, TokenCostHook>),
-    /// OpenAI agent (no cost tracking by default, but supports it)
-    OpenAI(Agent<<openai::Client as CompletionClient>::CompletionModel, TokenCostHook>),
-    /// Ollama agent (no cost tracking for local models)
+    /// OpenRouter agent with session hook
+    OpenRouter(Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>),
+    /// OpenAI agent (uses modern responses API)
+    OpenAI(Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>),
+    /// LlamaCpp agent (uses completions API for compatibility with llama.cpp)
+    LlamaCpp(Agent<rig::providers::openai::completion::CompletionModel, SessionHook>),
+    /// Ollama agent (no hook for local models)
     Ollama(Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>),
 }
 
@@ -110,6 +169,7 @@ impl DynAgent {
         match self {
             DynAgent::OpenRouter(agent) => agent.prompt(prompt).await,
             DynAgent::OpenAI(agent) => agent.prompt(prompt).await,
+            DynAgent::LlamaCpp(agent) => agent.prompt(prompt).await,
             DynAgent::Ollama(agent) => agent.prompt(prompt).await,
         }
     }
@@ -123,6 +183,7 @@ impl DynAgent {
         match self {
             DynAgent::OpenRouter(agent) => agent.prompt(prompt).with_history(history).await,
             DynAgent::OpenAI(agent) => agent.prompt(prompt).with_history(history).await,
+            DynAgent::LlamaCpp(agent) => agent.prompt(prompt).with_history(history).await,
             DynAgent::Ollama(agent) => agent.prompt(prompt).with_history(history).await,
         }
     }
@@ -134,8 +195,7 @@ impl DynAgent {
 /// The system_prompt is used as the agent's preamble.
 /// For OpenRouter, cost tracking is enabled automatically.
 /// If todo_tool is provided, it will be used (otherwise a default one is created).
-/// If tool_buffer is provided, tool calls will be tracked for persistence.
-/// Returns the todo state Arc for user visibility.
+/// Returns the todo state Arc for user visibility and an event receiver for external processing.
 pub fn create_provider(
     config: &ProviderConfig,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
@@ -144,11 +204,10 @@ pub fn create_provider(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tool_buffer: Option<ToolEventBuffer>,
-) -> Result<(DynAgent, ProviderInfo, CostTracker, Arc<Mutex<TodoList>>)> {
+) -> Result<(DynAgent, ProviderInfo, CostTracker, Arc<Mutex<TodoList>>, Option<mpsc::UnboundedReceiver<AgentEvent>>)> {
     match config {
         ProviderConfig::OpenRouter(c) => {
-            let (agent, info, hook, todo_state) = create_openrouter_agent(
+            let (agent, info, cost_tracker, todo_state, receiver) = create_openrouter_agent(
                 c,
                 mcp_tools,
                 system_prompt,
@@ -156,17 +215,17 @@ pub fn create_provider(
                 max_turns,
                 todo_tool,
                 bash_config,
-                tool_buffer,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
                 info,
-                CostTracker::new(Some(hook)),
+                cost_tracker,
                 todo_state,
+                Some(receiver),
             ))
         }
         ProviderConfig::OpenAI(c) => {
-            let (agent, info, hook, todo_state) = create_openai_agent(
+            let (agent, info, cost_tracker, todo_state, receiver) = create_openai_agent(
                 c,
                 mcp_tools,
                 system_prompt,
@@ -174,13 +233,31 @@ pub fn create_provider(
                 max_turns,
                 todo_tool,
                 bash_config,
-                tool_buffer,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
                 info,
-                CostTracker::new(Some(hook)),
+                cost_tracker,
                 todo_state,
+                Some(receiver),
+            ))
+        }
+        ProviderConfig::LlamaCpp(c) => {
+            let (agent, info, cost_tracker, todo_state, receiver) = create_llamacpp_agent(
+                c,
+                mcp_tools,
+                system_prompt,
+                searxng_config,
+                max_turns,
+                todo_tool,
+                bash_config,
+            )?;
+            Ok((
+                DynAgent::LlamaCpp(agent),
+                info,
+                cost_tracker,
+                todo_state,
+                Some(receiver),
             ))
         }
         ProviderConfig::Ollama(c) => {
@@ -198,6 +275,7 @@ pub fn create_provider(
                 info,
                 CostTracker::none(),
                 todo_state,
+                None, // No event channel for Ollama
             ))
         }
     }
@@ -251,12 +329,12 @@ fn create_openrouter_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tool_buffer: Option<ToolEventBuffer>,
 ) -> Result<(
-    Agent<<openrouter::Client as CompletionClient>::CompletionModel, TokenCostHook>,
+    Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
-    TokenCostHook,
+    CostTracker,
     Arc<Mutex<TodoList>>,
+    mpsc::UnboundedReceiver<AgentEvent>,
 )> {
     let api_key = config
         .api_key
@@ -278,12 +356,9 @@ fn create_openrouter_agent(
 
     let model = config.model.clone();
 
-    // Create the cost tracking hook with optional tool buffer
-    let hook = TokenCostHook::new(
-        model.clone(),
-        crate::hooks::ModelPricing::default(),
-        tool_buffer,
-    );
+    // Create the session hook for event streaming
+    // This creates an unbounded channel so events are not dropped
+    let (hook, receiver) = SessionHook::with_channel();
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -291,7 +366,7 @@ fn create_openrouter_agent(
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)
-        .hook(hook.clone());
+        .hook(hook);
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
@@ -310,7 +385,9 @@ fn create_openrouter_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, hook, todo_state))
+    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
+
+    Ok((agent, info, cost_tracker, todo_state, receiver))
 }
 
 /// Create Ollama agent and info (no cost tracking for local models)
@@ -389,12 +466,12 @@ fn create_openai_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tool_buffer: Option<ToolEventBuffer>,
 ) -> Result<(
-    Agent<<openai::Client as CompletionClient>::CompletionModel, TokenCostHook>,
+    Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
-    TokenCostHook,
+    CostTracker,
     Arc<Mutex<TodoList>>,
+    mpsc::UnboundedReceiver<AgentEvent>,
 )> {
     let api_key = config
         .api_key
@@ -410,6 +487,7 @@ fn create_openai_agent(
     }
 
     // Build the OpenAI client with configurable base URL
+    // Note: Using default responses API (not completions_api) for modern OpenAI compatibility
     let client = openai::Client::builder()
         .api_key(&api_key)
         .base_url(&config.base_url)
@@ -418,12 +496,9 @@ fn create_openai_agent(
 
     let model = config.model.clone();
 
-    // Create the cost tracking hook with optional tool buffer
-    let hook = TokenCostHook::new(
-        model.clone(),
-        crate::hooks::ModelPricing::default(),
-        tool_buffer,
-    );
+    // Create the session hook for event streaming
+    // This creates an unbounded channel so events are not dropped
+    let (hook, receiver) = SessionHook::with_channel();
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -431,7 +506,7 @@ fn create_openai_agent(
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)
-        .hook(hook.clone());
+        .hook(hook);
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
@@ -450,5 +525,78 @@ fn create_openai_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, hook, todo_state))
+    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
+
+    Ok((agent, info, cost_tracker, todo_state, receiver))
+}
+
+/// Create LlamaCpp agent and info (uses completions API for compatibility)
+fn create_llamacpp_agent(
+    config: &LlamaCppConfig,
+    mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
+    system_prompt: &str,
+    searxng_config: Option<&SearXngConfig>,
+    max_turns: usize,
+    todo_tool: Option<TodoTool>,
+    bash_config: &BashConfig,
+) -> Result<(
+    Agent<rig::providers::openai::completion::CompletionModel, SessionHook>,
+    ProviderInfo,
+    CostTracker,
+    Arc<Mutex<TodoList>>,
+    mpsc::UnboundedReceiver<AgentEvent>,
+)> {
+    // API key is optional for local llama.cpp instances
+    let api_key = config
+        .api_key
+        .clone()
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .unwrap_or_default();
+
+    if config.model.is_empty() {
+        anyhow::bail!("LlamaCpp model not specified");
+    }
+
+    // Build the OpenAI client with completions API for llama.cpp compatibility
+    let client = openai::Client::builder()
+        .api_key(&api_key)
+        .base_url(&config.base_url)
+        .build()
+        .context("Failed to create LlamaCpp client")?
+        .completions_api();
+
+    let model = config.model.clone();
+
+    // Create the session hook for event streaming
+    // This creates an unbounded channel so events are not dropped
+    let (hook, receiver) = SessionHook::with_channel();
+
+    // Build agent with system prompt, hook, and built-in tools
+    let agent_builder = client
+        .agent(&model)
+        .preamble(system_prompt)
+        .max_tokens(config.max_tokens)
+        .default_max_turns(max_turns)
+        .hook(hook);
+
+    // Add built-in tools (including optional SearchTool and TodoTool)
+    let (agent_builder, todo_state) =
+        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config);
+
+    // Add MCP tools and build
+    let agent = if let Some(tools) = mcp_tools {
+        agent_builder.tools(tools).build()
+    } else {
+        agent_builder.build()
+    };
+
+    let info = ProviderInfo {
+        name: "llamacpp".to_string(),
+        model,
+        supports_pricing: true,
+    };
+
+    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
+
+    Ok((agent, info, cost_tracker, todo_state, receiver))
 }

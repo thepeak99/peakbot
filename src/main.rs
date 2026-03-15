@@ -1,8 +1,8 @@
 // Use the library crate (defined in lib.rs)
 use anyhow::Result;
 use peakbot::{
-    AgentRunner, Config, TodoTool, build_system_prompt, create_provider, create_tool_event_buffer,
-    load_default_skills, load_mcp_servers,
+    AgentRunner, Config, TodoTool, build_system_prompt, create_provider, load_default_skills,
+    load_mcp_servers,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     // Setup logging
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("peakbot=debug"))
+        .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     // Load configuration from environment variables
@@ -49,15 +49,9 @@ async fn main() -> Result<()> {
     // Create the todo tool - we'll pass it to the provider and store its state
     let todo_tool = TodoTool::new();
 
-    // Create tool event buffer if conversation persistence is enabled
-    let tool_buffer = if config.conversation_enabled() {
-        Some(create_tool_event_buffer())
-    } else {
-        None
-    };
-
     // Create provider (agent) with all tools (built-in + MCP) and system prompt
-    let (agent, provider_info, cost_tracker, todo_state) = create_provider(
+    // The event_receiver is returned for external processing by AgentRunner
+    let (agent, provider_info, cost_tracker, todo_state, event_receiver) = create_provider(
         &config.provider,
         mcp_tools,
         &system_prompt,
@@ -65,7 +59,6 @@ async fn main() -> Result<()> {
         config.agent_max_turns,
         Some(todo_tool),
         &config.bash,
-        tool_buffer.clone(),
     )?;
     tracing::info!(
         "Using provider: {} with model: {}",
@@ -81,7 +74,7 @@ async fn main() -> Result<()> {
         skills,
         cost_tracker,
         Some(todo_state),
-        tool_buffer,
+        event_receiver,
     );
     runner.run().await?;
 

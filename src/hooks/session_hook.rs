@@ -1,47 +1,13 @@
-//! Token cost tracking hook for PeakBot.
+//! Session hook for PeakBot.
 //!
-//! This module provides a PromptHook that tracks token usage and calculates costs
-//! based on model pricing fetched from OpenRouter's API.
+//! This module provides a PromptHook that emits events for tracking agent activity.
+//! Events are streamed to handlers via async channels.
 
-use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use anyhow::{Result, anyhow};
+use chrono::Utc;
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
-use rig::completion::{message::Message, CompletionModel, CompletionResponse};
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-
-/// An event representing a tool call or result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ToolEvent {
-    /// Tool was invoked
-    Call {
-        /// Name of the tool being called
-        tool_name: String,
-        /// Arguments passed to the tool (JSON string)
-        arguments: String,
-        /// Timestamp when tool was called
-        timestamp: DateTime<Utc>,
-    },
-    /// Tool completed
-    Result {
-        /// Name of the tool that was executed
-        tool_name: String,
-        /// Arguments that were passed to the tool
-        arguments: String,
-        /// Tool execution result (or error message)
-        result: String,
-        /// Timestamp when tool was executed
-        timestamp: DateTime<Utc>,
-    },
-}
-
-/// Thread-safe buffer for tracking tool events during agent execution
-pub type ToolEventBuffer = Arc<Mutex<Vec<ToolEvent>>>;
-
-/// Create a new tool event buffer
-pub fn create_tool_event_buffer() -> ToolEventBuffer {
-    Arc::new(Mutex::new(Vec::new()))
-}
+use rig::completion::{CompletionModel, CompletionResponse, message::Message};
+use serde::Deserialize;
 
 /// Pricing information for a model (cost per token)
 #[derive(Clone, Debug)]
@@ -299,8 +265,8 @@ mod tests {
         ]"#;
 
         // Parse JSON into Vec<OpenRouterModel>
-        let models: Vec<OpenRouterModel> = serde_json::from_str(json_data)
-            .expect("Failed to parse JSON test data");
+        let models: Vec<OpenRouterModel> =
+            serde_json::from_str(json_data).expect("Failed to parse JSON test data");
 
         // Verify we parsed one model
         assert_eq!(models.len(), 1);
@@ -330,200 +296,176 @@ mod tests {
     }
 }
 
-/// Token cost tracking hook
-///
-/// This hook intercepts completion responses to track token usage
-/// and calculate costs based on model pricing.
+use crate::hooks::events::AgentEvent;
+use crate::hooks::events::TokenUsage as EventTokenUsage;
+use rig::completion::message::AssistantContent;
+use rig::one_or_many::OneOrMany;
+use tokio::sync::mpsc;
+
 #[derive(Clone)]
-pub struct TokenCostHook {
-    /// Name of the model being used
-    #[allow(dead_code)]
-    model_name: String,
-    /// Shared session statistics (using Arc<Mutex> for interior mutability)
-    stats: Arc<Mutex<SessionStats>>,
-    /// Model pricing (fetched from API or default)
-    pricing: Arc<ModelPricing>,
-    /// Buffer for tool events (optional - only if persistence enabled)
-    tool_buffer: Option<ToolEventBuffer>,
+pub struct SessionHook {
+    /// Channel sender for streaming events
+    event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
 }
 
-impl TokenCostHook {
-    /// Create a new hook with pre-configured pricing and optional tool buffer
-    pub fn new(model_name: String, pricing: ModelPricing, tool_buffer: Option<ToolEventBuffer>) -> Self {
-        Self {
-            model_name,
-            stats: Arc::new(Mutex::new(SessionStats::new())),
-            pricing: Arc::new(pricing),
-            tool_buffer,
-        }
+impl SessionHook {
+    /// Create a new minimal session hook
+    pub fn new(event_sender: Option<mpsc::UnboundedSender<AgentEvent>>) -> Self {
+        Self { event_sender }
     }
 
-    /// Create a new hook and fetch pricing from OpenRouter API
-    pub async fn with_api_pricing(model_name: String, api_key: &str, tool_buffer: Option<ToolEventBuffer>) -> Self {
-        let pricing = fetch_model_pricing(api_key, &model_name)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to fetch model pricing: {}, using defaults", e);
-                ModelPricing::default()
-            });
-
-        Self {
-            model_name,
-            stats: Arc::new(Mutex::new(SessionStats::new())),
-            pricing: Arc::new(pricing),
-            tool_buffer,
-        }
-    }
-
-    /// Calculate cost based on token usage and pricing
-    /// Prices are already per-token from OpenRouter API
-    fn calculate_cost(&self, input: u64, output: u64) -> f64 {
-        let pricing = &self.pricing;
-        (input as f64 * pricing.input_per_token) + (output as f64 * pricing.output_per_token)
-    }
-
-    /// Get a reference to the stats
-    pub fn get_stats(&self) -> Arc<Mutex<SessionStats>> {
-        self.stats.clone()
-    }
-
-    /// Get the tool buffer (if present)
-    pub fn get_tool_buffer(&self) -> Option<ToolEventBuffer> {
-        self.tool_buffer.clone()
-    }
-
-    /// Get a formatted string for the last request
-    pub fn get_last_request_stats(&self) -> Option<String> {
-        let stats = self.stats.lock().ok()?;
-        let last = stats.last_request()?;
-        Some(stats.format_per_request(last.input_tokens, last.output_tokens, last.cost))
-    }
-
-    /// Get session summary
-    pub fn get_session_summary(&self) -> Option<String> {
-        let stats = self.stats.lock().ok()?;
-        Some(stats.summary())
-    }
-
-    /// Reset the session stats
-    pub fn reset_stats(&self) {
-        if let Ok(mut stats) = self.stats.lock() {
-            stats.reset();
-        }
+    /// Create a new session hook with a new event channel
+    pub fn with_channel() -> (Self, mpsc::UnboundedReceiver<AgentEvent>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                event_sender: Some(sender),
+            },
+            receiver,
+        )
     }
 }
 
-impl<M: CompletionModel> PromptHook<M> for TokenCostHook {
-    /// Called before the prompt is sent to the model
-    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
-        tracing::debug!("TokenCostHook: Starting completion call");
+/// Extract text and reasoning from the response choice
+/// Simplified extraction - just gets basic info without worrying about all edge cases
+fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (String, Option<String>) {
+    let mut text = String::new();
+    let mut reasoning = None;
+
+    // Try to iterate over the contents
+    for item in choice.iter() {
+        match item {
+            AssistantContent::Text(t) => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&t.to_string());
+            }
+            AssistantContent::Reasoning(r) => {
+                // Extract reasoning text from the Reasoning struct
+                let mut reasonings = String::new();
+                for rc in &r.content {
+                    match rc {
+                        rig::completion::message::ReasoningContent::Text { text: t, .. } => {
+                            if !reasonings.is_empty() {
+                                reasonings.push('\n');
+                            }
+                            reasonings.push_str(t);
+                        }
+                        rig::completion::message::ReasoningContent::Summary(s) => {
+                            if !reasonings.is_empty() {
+                                reasonings.push('\n');
+                            }
+                            reasonings.push_str(s);
+                        }
+                        _ => {}
+                    }
+                }
+                if !reasonings.is_empty() {
+                    reasoning = Some(reasonings);
+                }
+            }
+            AssistantContent::ToolCall(_tc) => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str("[tool call]");
+            }
+            AssistantContent::Image(_) => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str("[image]");
+            }
+        }
+    }
+
+    (text, reasoning)
+}
+
+impl<M: CompletionModel> PromptHook<M> for SessionHook {
+    /// Called before the prompt is sent - just emit an event
+    async fn on_completion_call(&self, _prompt: &Message, history: &[Message]) -> HookAction {
+        if let Some(ref sender) = self.event_sender {
+            let event = AgentEvent::CompletionRequest {
+                message_count: history.len() + 1,
+                estimated_tokens: None,
+                timestamp: Utc::now(),
+            };
+            let _ = sender.send(event);
+        }
         HookAction::Continue
     }
 
-    /// Called after the response is received - extract token usage here
+    /// Called after response - emit event with raw token data (no calculation)
     async fn on_completion_response(
         &self,
         _prompt: &Message,
         response: &CompletionResponse<M::Response>,
     ) -> HookAction {
-        let usage = &response.usage;
-        let input = usage.input_tokens;
-        let output = usage.output_tokens;
+        if let Some(ref sender) = self.event_sender {
+            let usage = &response.usage;
 
-        // Calculate cost using our pricing
-        let cost = self.calculate_cost(input, output);
+            // Extract content and reasoning from response using rig's API
+            let (content, reasoning) = extract_content_from_response(&response.choice);
 
-        // Update stats
-        if let Ok(mut stats) = self.stats.lock() {
-            stats.add_request(input, output, cost);
-
-            // Log the stats
-            tracing::info!(
-                "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
-                input,
-                output,
-                cost,
-                stats.total_cost
-            );
+            // Emit event with RAW token counts - cost calculation happens in CostHandler
+            let event = AgentEvent::CompletionResponse {
+                content,
+                reasoning,
+                usage: EventTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    total_tokens: usage.input_tokens + usage.output_tokens,
+                    cost: 0.0, // Cost = 0 here, calculated by CostHandler
+                },
+                timestamp: Utc::now(),
+            };
+            let _ = sender.send(event);
         }
-
         HookAction::Continue
     }
 
-    /// Called before a tool is invoked
+    /// Called before tool invocation - emit event
     async fn on_tool_call(
         &self,
         tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
+        tool_call_id: Option<String>,
+        internal_call_id: &str,
         args: &str,
     ) -> ToolCallHookAction {
-        if let Some(ref buffer) = self.tool_buffer {
-            let event = ToolEvent::Call {
+        if let Some(ref sender) = self.event_sender {
+            let event = AgentEvent::ToolCall {
                 tool_name: tool_name.to_string(),
                 arguments: args.to_string(),
+                call_id: tool_call_id.or(Some(internal_call_id.to_string())),
                 timestamp: Utc::now(),
             };
-
-            if let Ok(mut events) = buffer.lock() {
-                events.push(event);
-            }
+            let _ = sender.send(event);
         }
-
         ToolCallHookAction::Continue
     }
 
-    /// Called after a tool is invoked (and a result has been returned)
+    /// Called after tool result - emit event
     async fn on_tool_result(
         &self,
         tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
+        tool_call_id: Option<String>,
+        internal_call_id: &str,
         args: &str,
         result: &str,
     ) -> HookAction {
-        if let Some(ref buffer) = self.tool_buffer {
-            let event = ToolEvent::Result {
+        if let Some(ref sender) = self.event_sender {
+            let event = AgentEvent::ToolResult {
                 tool_name: tool_name.to_string(),
                 arguments: args.to_string(),
                 result: result.to_string(),
+                success: !result.starts_with("Error:"),
+                call_id: tool_call_id.or(Some(internal_call_id.to_string())),
                 timestamp: Utc::now(),
             };
-
-            if let Ok(mut events) = buffer.lock() {
-                events.push(event);
-            }
+            let _ = sender.send(event);
         }
-
         HookAction::Continue
-    }
-}
-
-/// Trait for accessing cost statistics from a hook
-pub trait CostTrackingStats {
-    /// Get formatted stats for the last request
-    fn get_last_request_stats(&self) -> Option<String>;
-    /// Get session summary
-    fn get_session_summary(&self) -> Option<String>;
-    /// Reset the session stats
-    fn reset_stats(&self);
-}
-
-impl CostTrackingStats for TokenCostHook {
-    fn get_last_request_stats(&self) -> Option<String> {
-        let stats = self.stats.lock().ok()?;
-        let last = stats.last_request()?;
-        Some(stats.format_per_request(last.input_tokens, last.output_tokens, last.cost))
-    }
-
-    fn get_session_summary(&self) -> Option<String> {
-        let stats = self.stats.lock().ok()?;
-        Some(stats.summary())
-    }
-
-    fn reset_stats(&self) {
-        if let Ok(mut stats) = self.stats.lock() {
-            stats.reset();
-        }
     }
 }
