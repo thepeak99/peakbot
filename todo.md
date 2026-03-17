@@ -1282,8 +1282,8 @@ Some tasks have dependencies on others:
 | [ ] | 8 (Domain Thinking) | 2 (think tool) |
 | [x] | 9 (SearXNG Search) | - |
 | [ ] | 10 (Fetch Markdown) | - |
-| [ ] | 11 (Todo Tool) | - |
-| [ ] | 13 (Conversation Persistence) | - |
+| [x] | 11 (Todo Tool) | - |
+| [x] | 13 (Conversation Persistence) | - |
 
 **Recommended implementation order:**
 1. Task 6 (Debug ApiResponse) - Fix existing bug
