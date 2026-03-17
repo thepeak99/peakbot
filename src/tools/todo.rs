@@ -76,6 +76,11 @@ impl TodoList {
         item
     }
 
+    /// Add multiple tasks at once
+    pub fn add_many(&mut self, tasks: Vec<String>) -> Vec<TodoItem> {
+        tasks.into_iter().map(|task| self.add(task)).collect()
+    }
+
     /// Update task status
     pub fn update_status(&mut self, id: usize, status: TodoStatus) -> Option<TodoItem> {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
@@ -156,9 +161,9 @@ pub enum TodoError {
 pub struct TodoArgs {
     /// The action to perform: add, update, remove, list, clear
     action: String,
-    /// Task description (for add/update)
+    /// Task descriptions (for add) - ALWAYS use array, even for single task
     #[serde(default)]
-    task: Option<String>,
+    tasks: Option<Vec<String>>,
     /// Task status (for update): pending, in_progress, completed, cancelled
     #[serde(default)]
     status: Option<String>,
@@ -210,7 +215,7 @@ impl Tool for TodoTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "todo".to_string(),
-            description: "Manage a todo list to track progress on multi-step tasks. Use this to plan your approach, track progress, and keep the user informed about your work.".to_string(),
+            description: "Manage a todo list to track progress on multi-step tasks. Use this to plan your approach, track progress, and keep the user informed about your work. For the 'add' action, always use the 'tasks' array parameter (even for a single task, use an array with one element).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -219,9 +224,10 @@ impl Tool for TodoTool {
                         "enum": ["add", "update", "remove", "list", "clear"],
                         "description": "The action to perform on the todo list"
                     },
-                    "task": {
-                        "type": "string",
-                        "description": "Task description (required for add, optional for update)"
+                    "tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Array of task descriptions (required for 'add' action, use array even for single task)"
                     },
                     "status": {
                         "type": "string",
@@ -255,13 +261,34 @@ impl Tool for TodoTool {
 
         match args.action.as_str() {
             "add" => {
-                let task = args.task.ok_or_else(|| {
+                let tasks = args.tasks.ok_or_else(|| {
                     TodoError::InvalidAction(
-                        "Task description required for 'add' action".to_string(),
+                        "Tasks array required for 'add' action".to_string(),
                     )
                 })?;
-                let item = list.add(task);
-                Ok(format!("Added task #{}: {}", item.id, item.task))
+                
+                if tasks.is_empty() {
+                    return Err(TodoError::InvalidAction(
+                        "Tasks array is empty for 'add' action".to_string(),
+                    ));
+                }
+                
+                let items = list.add_many(tasks);
+                
+                // Format response based on count
+                if items.len() == 1 {
+                    Ok(format!("Added task #{}: {}", items[0].id, items[0].task))
+                } else {
+                    let task_list: Vec<String> = items
+                        .iter()
+                        .map(|i| format!("#{}: {}", i.id, i.task))
+                        .collect();
+                    Ok(format!(
+                        "Added {} tasks: {}",
+                        items.len(),
+                        task_list.join(", ")
+                    ))
+                }
             }
 
             "update" => {
@@ -419,5 +446,34 @@ mod tests {
         assert_eq!(in_progress, 1);
         assert_eq!(completed, 1);
         assert_eq!(cancelled, 0);
+    }
+
+    #[test]
+    fn test_add_many_tasks() {
+        let mut list = TodoList::new();
+        let items = list.add_many(vec![
+            "Task 1".to_string(),
+            "Task 2".to_string(),
+            "Task 3".to_string(),
+        ]);
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, 1);
+        assert_eq!(items[1].id, 2);
+        assert_eq!(items[2].id, 3);
+        assert_eq!(items[0].task, "Task 1");
+        assert_eq!(items[1].task, "Task 2");
+        assert_eq!(items[2].task, "Task 3");
+        assert_eq!(list.list().len(), 3);
+    }
+
+    #[test]
+    fn test_add_many_single_task() {
+        let mut list = TodoList::new();
+        let items = list.add_many(vec!["Single task".to_string()]);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, 1);
+        assert_eq!(items[0].task, "Single task");
     }
 }

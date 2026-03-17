@@ -21,12 +21,17 @@ pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
     // Event types
     AgentEvent,
+    CostHandler,
+    ConversationHandler,
     EventChannel,
     EventProcessor,
+    EventHandler,
     ModelPricing,
     SessionHook,
     SessionStats,
+    StreamingOutputHandler,
     TokenUsage,
+    VerbosityLevel,
     create_event_channel,
     fetch_model_pricing,
 };
@@ -188,7 +193,7 @@ pub struct AgentRunner {
     provider_info: ProviderInfo,
     skills: SkillRegistry,
     context_manager: Option<ContextManager>,
-    conversation_manager: Option<ConversationManager>,
+    conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
     system_prompt: String,
     cost_tracker: CostTracker,
     todo_state: Option<Arc<Mutex<TodoList>>>,
@@ -233,7 +238,7 @@ impl AgentRunner {
                 max_conversations: config.conversation_max(),
                 auto_resume: config.conversation_auto_resume(),
             }) {
-                Ok(cm) => Some(cm),
+                Ok(cm) => Some(Arc::new(Mutex::new(cm))),
                 Err(e) => {
                     tracing::warn!("Failed to initialize conversation manager: {}", e);
                     None
@@ -336,7 +341,7 @@ impl AgentRunner {
     /// List all saved conversations
     fn list_conversations(&self) {
         if let Some(ref cm) = self.conversation_manager {
-            match cm.list() {
+            match cm.lock().unwrap().list() {
                 Ok(conversations) => {
                     if conversations.is_empty() {
                         println!("\nNo saved conversations.\n");
@@ -416,7 +421,7 @@ impl AgentRunner {
         if let Some(ref cm) = self.conversation_manager {
             println!(
                 "Conversation persistence: enabled (auto-save, {} stored)",
-                cm.storage_dir().display()
+                cm.lock().unwrap().storage_dir().display()
             );
         } else {
             println!("Conversation persistence: disabled");
@@ -432,42 +437,34 @@ impl AgentRunner {
         let mut chat_history: Vec<Message> = Vec::new();
 
         // Spawn event processing task if we have an event receiver
-        // This handles cost tracking via events from SessionHook
-        // We clone the necessary data from CostTracker to pass to the task
+        // This handles cost tracking and conversation persistence via events from SessionHook
         if let Some(receiver) = self.event_receiver.take() {
+            let mut handlers: Vec<Arc<dyn EventHandler>> = Vec::new();
+            
+            // Add cost handler
             let stats = self.cost_tracker.get_session_stats();
             let pricing = self.cost_tracker.get_pricing().clone();
-
+            handlers.push(Arc::new(CostHandler::new(pricing, stats)));
+            
+            // Add conversation handler if enabled
+            if let Some(ref cm) = self.conversation_manager {
+                handlers.push(Arc::new(hooks::ConversationHandler::new(cm.clone())));
+            }
+            
+            // Add streaming output handler for real-time agent output
+            handlers.push(Arc::new(StreamingOutputHandler::new()));
+            
             tokio::spawn(async move {
-                let mut receiver = receiver;
-                while let Some(event) = receiver.recv().await {
-                    // Track cost for completion events
-                    if let AgentEvent::CompletionResponse { usage, .. } = event {
-                        let cost = (usage.input_tokens as f64 * pricing.input_per_token)
-                            + (usage.output_tokens as f64 * pricing.output_per_token);
-
-                        if let Ok(mut stats) = stats.lock() {
-                            stats.add_request(usage.input_tokens, usage.output_tokens, cost);
-
-                            tracing::info!(
-                                "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
-                                usage.input_tokens,
-                                usage.output_tokens,
-                                cost,
-                                stats.total_cost
-                            );
-                        }
-                    }
-                }
-                tracing::debug!("Event processor finished");
+                let mut processor = EventProcessor::new(receiver, handlers);
+                processor.run().await;
             });
         }
 
         // Check for auto-resume before starting the main loop
         let mut resumed = false;
-        if let Some(ref mut cm) = self.conversation_manager {
+        if let Some(ref cm) = self.conversation_manager {
             if self.config.conversation_auto_resume() {
-                if let Ok(Some(latest)) = cm.get_latest() {
+                if let Ok(Some(latest)) = cm.lock().unwrap().get_latest() {
                     // Skip resuming if the conversation has 0 messages
                     if latest.messages.is_empty() {
                         tracing::debug!("Skipping auto-resume: latest conversation has 0 messages");
@@ -485,7 +482,7 @@ impl AgentRunner {
                             if confirm.trim().eq_ignore_ascii_case("y") || confirm.trim().is_empty()
                             {
                                 // Load the conversation
-                                if let Err(e) = cm.load_and_set_current(latest.id) {
+                                if let Err(e) = cm.lock().unwrap().load_and_set_current(latest.id) {
                                     eprintln!("Failed to load conversation: {}", e);
                                 } else {
                                     // Convert stored messages to rig messages and populate chat history
@@ -505,12 +502,12 @@ impl AgentRunner {
 
         // If not resumed, create a new conversation
         if !resumed {
-            if let Some(ref mut cm) = self.conversation_manager {
+            if let Some(ref cm) = self.conversation_manager {
                 let name = format!(
                     "Conversation {}",
                     chrono::Local::now().format("%Y-%m-%d %H:%M")
                 );
-                let _ = cm.create_new(name, self.config.model().to_string());
+                let _ = cm.lock().unwrap().create_new(name, self.config.model().to_string());
             }
         }
 
@@ -567,12 +564,12 @@ impl AgentRunner {
 
             // Handle /new command - start a fresh conversation
             if input.eq_ignore_ascii_case("/new") {
-                if let Some(ref mut cm) = self.conversation_manager {
+                if let Some(ref cm) = self.conversation_manager {
                     let name = format!(
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")
                     );
-                    let _ = cm.create_new(name, self.config.model().to_string());
+                    let _ = cm.lock().unwrap().create_new(name, self.config.model().to_string());
                     chat_history.clear();
                     println!("Started a new conversation.\n");
                 } else {
@@ -583,9 +580,9 @@ impl AgentRunner {
 
             // Handle /save command - save current conversation
             if input.eq_ignore_ascii_case("/save") {
-                if let Some(ref mut cm) = self.conversation_manager {
-                    if let Some(ref conv) = cm.get_current() {
-                        let _ = cm.save();
+                if let Some(ref cm) = self.conversation_manager {
+                    if let Some(ref conv) = cm.lock().unwrap().get_current() {
+                        let _ = cm.lock().unwrap().save();
                         println!("Conversation saved: {}\n", conv.name);
                     }
                 } else {
@@ -596,13 +593,13 @@ impl AgentRunner {
 
             // Handle /load <id> command
             if let Some(id_str) = input.strip_prefix("/load ") {
-                if let Some(ref mut cm) = self.conversation_manager {
+                if let Some(ref cm) = self.conversation_manager {
                     match uuid::Uuid::parse_str(id_str) {
                         Ok(id) => {
-                            match cm.load(id) {
+                            match cm.lock().unwrap().load(id) {
                                 Ok(conv) => {
                                     // Load the conversation and populate chat history
-                                    let _ = cm.load_and_set_current(id);
+                                    let _ = cm.lock().unwrap().load_and_set_current(id);
                                     chat_history = convert_conversation_to_rig_messages(&conv);
                                     println!("\n--- Loaded conversation: '{}' ---", conv.name);
                                     println!("Last {} messages:\n", 10.min(conv.messages.len()));
@@ -626,11 +623,11 @@ impl AgentRunner {
                 continue;
             }
 
-            // Handle /delete <id> command
+           // Handle /delete <id> command
             if let Some(id_str) = input.strip_prefix("/delete ") {
                 if let Some(ref cm) = self.conversation_manager {
                     match uuid::Uuid::parse_str(id_str) {
-                        Ok(id) => match cm.delete(id) {
+                        Ok(id) => match cm.lock().unwrap().delete(id) {
                             Ok(_) => println!("Conversation deleted.\n"),
                             Err(e) => eprintln!("Failed to delete: {}\n", e),
                         },
@@ -644,7 +641,7 @@ impl AgentRunner {
                 continue;
             }
 
-            // Handle /export <id> <format> command
+           // Handle /export <id> <format> command
             if let Some(args) = input.strip_prefix("/export ") {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if parts.len() == 2 {
@@ -652,11 +649,11 @@ impl AgentRunner {
                         let id_str = parts[0];
                         let format = parts[1].to_lowercase();
                         match uuid::Uuid::parse_str(id_str) {
-                            Ok(id) => match cm.load(id) {
+                            Ok(id) => match cm.lock().unwrap().load(id) {
                                 Ok(conv) => {
                                     let output = match format.as_str() {
-                                        "markdown" | "md" => cm.export_markdown(&conv),
-                                        "json" => cm.export_json(&conv),
+                                        "markdown" | "md" => cm.lock().unwrap().export_markdown(&conv),
+                                        "json" => cm.lock().unwrap().export_json(&conv),
                                         _ => {
                                             eprintln!(
                                                 "Unknown format '{}'. Use 'json' or 'markdown'.\n",
@@ -687,8 +684,8 @@ impl AgentRunner {
 
             // Handle /rename <name> command
             if let Some(name) = input.strip_prefix("/rename ") {
-                if let Some(ref mut cm) = self.conversation_manager {
-                    if let Err(e) = cm.rename(name.to_string()) {
+                if let Some(ref cm) = self.conversation_manager {
+                    if let Err(e) = cm.lock().unwrap().rename(name.to_string()) {
                         eprintln!("Failed to rename: {}\n", e);
                     } else {
                         println!("Conversation renamed to: {}\n", name);
@@ -700,8 +697,8 @@ impl AgentRunner {
             }
 
             // Auto-save user message before sending to model
-            if let Some(ref mut cm) = self.conversation_manager {
-                let _ = cm.add_user_message(input.to_string());
+            if let Some(ref cm) = self.conversation_manager {
+                let _ = cm.lock().unwrap().add_user_message(input.to_string());
             }
 
             // Check if context compaction is needed before prompting
@@ -731,17 +728,6 @@ impl AgentRunner {
             {
                 Ok(response) => {
                     println!("\n{}", response);
-
-                    // Save conversation to persistence if enabled
-                    if let Some(ref mut cm) = self.conversation_manager {
-                        // Save assistant message
-                        let _ = cm.add_assistant_message(response.clone());
-
-                        // Update tokens
-                        let tokens = self.cost_tracker.get_total_tokens();
-                        let cost = self.cost_tracker.get_total_cost();
-                        let _ = cm.update_tokens(tokens, cost);
-                    }
                     // Display token stats after each response
                     self.print_last_request_stats();
                     // Display todo summary after each response
@@ -789,17 +775,6 @@ impl AgentRunner {
                         {
                             Ok(response) => {
                                 println!("\n{}", response);
-
-                                // Save conversation to persistence if enabled
-                                if let Some(ref mut cm) = self.conversation_manager {
-                                    // Save assistant message
-                                    let _ = cm.add_assistant_message(response.clone());
-
-                                    // Update tokens
-                                    let tokens = self.cost_tracker.get_total_tokens();
-                                    let cost = self.cost_tracker.get_total_cost();
-                                    let _ = cm.update_tokens(tokens, cost);
-                                }
                                 // Display token stats after each response
                                 self.print_last_request_stats();
                                 // Display todo summary after each response

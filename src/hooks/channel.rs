@@ -107,22 +107,14 @@ use crate::hooks::{ModelPricing, SessionStats};
 
 /// Cost tracking handler that calculates and logs token usage costs
 pub struct CostHandler {
-    stats: Arc<tokio::sync::Mutex<SessionStats>>,
+    stats: Arc<std::sync::Mutex<SessionStats>>,
     pricing: Arc<ModelPricing>,
 }
 
 impl CostHandler {
-    /// Create a new cost handler with the given pricing
-    pub fn new(pricing: ModelPricing) -> Self {
-        Self {
-            stats: Arc::new(tokio::sync::Mutex::new(SessionStats::new())),
-            pricing: Arc::new(pricing),
-        }
-    }
-
-    /// Get a clone of the stats Arc for external access
-    pub fn get_stats(&self) -> Arc<tokio::sync::Mutex<SessionStats>> {
-        self.stats.clone()
+    /// Create a new cost handler with the given pricing and stats
+    pub fn new(pricing: ModelPricing, stats: Arc<std::sync::Mutex<SessionStats>>) -> Self {
+        Self { stats, pricing: Arc::new(pricing) }
     }
 }
 
@@ -133,9 +125,9 @@ impl EventHandler for CostHandler {
             let cost = (usage.input_tokens as f64 * self.pricing.input_per_token)
                 + (usage.output_tokens as f64 * self.pricing.output_per_token);
 
-            // Use blocking lock since handle_event is sync (can't be async in trait)
+            // Use lock since handle_event is sync (can't be async in trait)
             // For async handling, users should spawn a task
-            let mut stats = self.stats.blocking_lock();
+            let mut stats = self.stats.lock().unwrap();
             stats.add_request(usage.input_tokens, usage.output_tokens, cost);
 
             tracing::info!(
@@ -153,37 +145,3 @@ impl EventHandler for CostHandler {
     }
 }
 
-/// Persistence handler that logs tool calls and results for debugging
-pub struct PersistenceHandler;
-
-impl EventHandler for PersistenceHandler {
-    fn handle_event(&self, event: &AgentEvent) {
-        match event {
-            AgentEvent::ToolCall {
-                tool_name,
-                arguments,
-                ..
-            } => {
-                tracing::debug!(
-                    "Tool call: {} - {}",
-                    tool_name,
-                    &arguments[..arguments.len().min(100)]
-                );
-            }
-            AgentEvent::ToolResult {
-                tool_name, result, ..
-            } => {
-                tracing::debug!(
-                    "Tool result: {} - {}",
-                    tool_name,
-                    &result[..result.len().min(100)]
-                );
-            }
-            _ => {}
-        }
-    }
-
-    fn name(&self) -> &str {
-        "PersistenceHandler"
-    }
-}
