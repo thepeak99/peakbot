@@ -250,18 +250,28 @@ impl EventHandler for StreamingOutputHandler {
 
             AgentEvent::ToolResult {
                 tool_name,
+                result,
                 success,
                 ..
             } => {
                 if self.show_tool_results || self.verbosity == VerbosityLevel::Verbose {
                     print_tool_complete(tool_name, *success, &self.config);
+                    
+                    // Show summarized result in verbose mode
+                    if self.verbosity == VerbosityLevel::Verbose {
+                        let summary = summarize_result(tool_name, result);
+                        let indented_summary = indent_text(&summary, 4);
+                        let ts = format_timestamp_with_color(&self.config);
+                        println!("{}    {}↪ {}{}", ts, COLOR_WHITE, indented_summary, COLOR_RESET);
+                    }
                 }
             }
 
             AgentEvent::SessionStart { model, .. } => {
+                let ts = format_timestamp_with_color(&self.config);
                 println!(
                     "\n{}{}🚀 Session started with model:{} {}{}",
-                    format_timestamp(&self.config),
+                    ts,
                     if self.config.use_color { COLOR_BRIGHT_GREEN } else { "" },
                     if self.config.use_color { COLOR_RESET } else { "" },
                     model,
@@ -274,9 +284,10 @@ impl EventHandler for StreamingOutputHandler {
                 total_cost,
                 ..
             } => {
+                let ts = format_timestamp_with_color(&self.config);
                 println!(
                     "\n{}{}🏁 Session ended:{} {} tokens, ${:.4}{}",
-                    format_timestamp(&self.config),
+                    ts,
                     if self.config.use_color { COLOR_BRIGHT_GREEN } else { "" },
                     if self.config.use_color { COLOR_RESET } else { "" },
                     total_tokens,
@@ -320,10 +331,14 @@ fn timestamp() -> String {
     format!("[{}:{}:{}]", hours, mins, secs)
 }
 
-/// Format timestamp based on config
-fn format_timestamp(config: &StreamingConfig) -> String {
+/// Format timestamp with cyan color based on config
+fn format_timestamp_with_color(config: &StreamingConfig) -> String {
     if config.show_timestamps {
-        timestamp()
+        if config.use_color {
+            format!("{}{}{}", COLOR_BRIGHT_CYAN, timestamp(), COLOR_RESET)
+        } else {
+            timestamp()
+        }
     } else {
         String::new()
     }
@@ -336,7 +351,7 @@ fn print_thinking_header() {
 
 /// Print a line of thinking content
 fn print_thinking_line(line: &str, config: &StreamingConfig) {
-    let ts = format_timestamp(config);
+    let ts = format_timestamp_with_color(config);
     let text_color = if config.use_color { config.text_color.ansi_code() } else { "" };
     let reset = if config.use_color { COLOR_RESET } else { "" };
     println!("{} {}{}{}", ts, text_color, line, reset);
@@ -349,7 +364,7 @@ fn print_talking_header() {
 
 /// Print a line of talking content
 fn print_talking_line(line: &str, config: &StreamingConfig) {
-    let ts = format_timestamp(config);
+    let ts = format_timestamp_with_color(config);
     let text_color = if config.use_color { config.text_color.ansi_code() } else { "" };
     let reset = if config.use_color { COLOR_RESET } else { "" };
     println!("{} {}{}{}", ts, text_color, line, reset);
@@ -357,19 +372,19 @@ fn print_talking_line(line: &str, config: &StreamingConfig) {
 
 /// Print tool call header
 fn print_tool_header(tool_name: &str, config: &StreamingConfig) {
-    let ts = format_timestamp(config);
+    let ts = format_timestamp_with_color(config);
     println!("\n{}{} 🔧 TOOL: {}{}", ts, COLOR_BRIGHT_BLUE, tool_name, COLOR_RESET);
 }
 
 /// Print tool argument line
 fn print_tool_arg_line(args: &str, config: &StreamingConfig) {
-    let ts = format_timestamp(config);
+    let ts = format_timestamp_with_color(config);
     println!("{}    {}↪ {}{}", ts, COLOR_WHITE, args, COLOR_RESET);
 }
 
 /// Print tool complete message
 fn print_tool_complete(tool_name: &str, is_error: bool, config: &StreamingConfig) {
-    let ts = format_timestamp(config);
+    let ts = format_timestamp_with_color(config);
     if is_error {
         println!("{}{} ❌ TOOL ERROR: {}{}", ts, COLOR_BRIGHT_RED, tool_name, COLOR_RESET);
     } else {
