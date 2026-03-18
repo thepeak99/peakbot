@@ -8,6 +8,40 @@ use std::sync::Mutex;
 
 const SNIPPET_CONTEXT_LINES: usize = 4;
 
+/// Level of matching that was used to find the text
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchLevel {
+    Exact,
+    WhitespaceNormalized,
+    FlexibleWhitespace,
+}
+
+impl MatchLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MatchLevel::Exact => "exact",
+            MatchLevel::WhitespaceNormalized => "whitespace_normalized",
+            MatchLevel::FlexibleWhitespace => "flexible_whitespace",
+        }
+    }
+}
+
+/// Result of a matching operation
+#[derive(Debug, Clone)]
+pub enum MatchResult {
+    NoMatch,
+    MultipleMatches {
+        count: usize,
+        positions: Vec<usize>,
+    },
+    UniqueMatch {
+        position: usize,
+        end_position: usize,
+        match_level: MatchLevel,
+        confidence: f32,
+    },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FileEditError {
     #[error("{0}")]
@@ -28,6 +62,7 @@ pub struct FileEditArgs {
     new_str: Option<String>,
     insert_line: Option<usize>,
     insert_text: Option<String>,
+    replace_all: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,10 +88,21 @@ impl Tool for FileEditTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "file_edit".to_string(),
-            description: "A filesystem editor tool. Supports three commands:\n\
-                - `create`: Create a new file (fails if file already exists)\n\
-                - `str_replace`: Replace an exact unique string in a file\n\
-                - `insert`: Insert text at a specific line number"
+            description: "Edit files safely with automatic formatting detection.\n\n\
+PREFER THIS TOOL OVER BASH/SED for all file modifications because:\n\
+- Provides clear diffs for review\n\
+- Automatically handles whitespace differences\n\
+- Safer: won't accidentally modify wrong files\n\
+- Works across all platforms (sed syntax varies)\n\
+\n\
+Use bash ONLY for: file operations (mv/cp/rm), permissions, bulk operations on many files.\n\
+\n\
+Commands:\n\
+- `create`: Create a new file (fails if file already exists)\n\
+- `str_replace`: Replace text in a file (use replace_all:true for global replacement)\n\
+- `insert`: Insert text at a specific line number\n\
+\n\
+If editing fails, read the file first to get exact content, then retry."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -89,6 +135,10 @@ impl Tool for FileEditTool {
                     "insert_text": {
                         "type": "string",
                         "description": "Required for 'insert': the text to insert"
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Optional for 'str_replace': if true, replace all occurrences instead of just the first one. Default: false (single match only)."
                     }
                 },
                 "required": ["command", "path"]
@@ -199,56 +249,113 @@ impl FileEditTool {
             FileEditError::Validation("'old_str' is required for str_replace command".into())
         })?;
         let new_str = args.new_str.as_deref().unwrap_or("");
+        let replace_all = args.replace_all.unwrap_or(false);
 
         let content = self.read_file(path)?;
 
-        // Count occurrences
-        let count = content.matches(old_str).count();
-        if count == 0 {
-            return Err(FileEditError::Validation(format!(
-                "old_str not found verbatim in {}. Ensure you're matching the exact text including whitespace and indentation.",
-                path.display()
-            )));
-        }
-        if count > 1 {
-            let line_nums: Vec<usize> = content
-                .lines()
-                .enumerate()
-                .filter(|(_, line)| line.contains(old_str))
-                .map(|(i, _)| i + 1)
-                .collect();
-            return Err(FileEditError::Validation(format!(
-                "old_str appears {} times in {} at lines {:?}. Include more surrounding context to make the match unique.",
-                count,
-                path.display(),
-                line_nums
-            )));
-        }
+        // Use progressive matching
+        let match_result = self.progressive_match(&content, old_str);
+
+        // Handle match results
+        let (count, position, match_level, confidence) = match match_result {
+            MatchResult::NoMatch => {
+                return Err(FileEditError::Validation(format!(
+                    "String not found in file '{}'\n\n\
+Searched for:\n  {}\n\n\
+Suggestions:\n\
+1. The text might have different whitespace or indentation\n   Try: file_read with line ranges to see exact formatting\n   \n\
+2. If you need to replace all occurrences of a pattern, use replace_all: true\n\
+3. Always read the file first for precise edits to get exact content.\n\n\
+Tip: Include 2-3 lines of surrounding context in old_str for better matching.",
+                    path.display(),
+                    old_str.lines().take(5).collect::<Vec<_>>().join("\n  ")
+                )));
+            }
+            MatchResult::MultipleMatches { count, positions } => {
+                if replace_all {
+                    (count, positions[0], MatchLevel::Exact, 1.0)
+                } else {
+                    let line_nums: Vec<usize> = positions
+                        .iter()
+                        .map(|&pos| content[..pos].lines().count() + 1)
+                        .collect();
+                    return Err(FileEditError::Validation(format!(
+                        "String appears {} times in '{}' at lines {:?}.\n\n\
+To replace all occurrences, use: replace_all: true\n\
+To replace a specific occurrence, include more surrounding context in old_str to make it unique.\n\n\
+Tip: Read the file first with file_read to see exact formatting.",
+                        count,
+                        path.display(),
+                        line_nums
+                    )));
+                }
+            }
+            MatchResult::UniqueMatch {
+                position,
+                end_position: _,
+                match_level,
+                confidence,
+            } => (1, position, match_level, confidence),
+        };
 
         // Save undo history
         self.push_history(path, &content);
 
         // Perform replacement
-        let new_content = content.replacen(old_str, new_str, 1);
+        let new_content = if replace_all && count > 1 {
+            content.replace(old_str, new_str)
+        } else {
+            content.replacen(old_str, new_str, 1)
+        };
         self.write_file(path, &new_content)?;
 
+        // Build success message
+        let replacement_msg = if replace_all && count > 1 {
+            format!("Replaced all {} occurrences", count)
+        } else {
+            "Replaced 1 occurrence".to_string()
+        };
+
         // Build context snippet
-        let replacement_line = content
-            .split(old_str)
-            .next()
-            .unwrap_or("")
-            .matches('\n')
-            .count();
+        let replacement_line = content[..position].lines().count();
         let new_lines: Vec<&str> = new_content.lines().collect();
         let start = replacement_line.saturating_sub(SNIPPET_CONTEXT_LINES);
         let end = (replacement_line + SNIPPET_CONTEXT_LINES + new_str.matches('\n').count() + 1)
             .min(new_lines.len());
         let snippet = format_lines_numbered(&new_lines[start..end], start + 1);
 
+        // Build warnings
+        let mut warnings = Vec::new();
+
+        if replace_all && count > 1 {
+            warnings.push(format!(
+                "⚠️  Global replacement: {} occurrences changed. Review carefully.",
+                count
+            ));
+        }
+
+        if match_level != MatchLevel::Exact {
+            warnings.push(format!(
+                "ℹ️  Match required {} (confidence: {:.0}%). Consider reading file first for exact match.",
+                match_level.as_str(),
+                confidence * 100.0
+            ));
+        }
+
+        let warning = if warnings.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", warnings.join("\n"))
+        };
+
         Ok(format!(
-            "File {} has been edited. Here's the result around the edit:\n{}\nReview the changes and edit again if necessary.",
+            "✅ Successfully edited {}\n\n{}\n\n{}\n{}\n\
+Review the changes and edit again if necessary.\n\
+Tip: For global replacements, use replace_all: true",
             path.display(),
-            snippet
+            replacement_msg,
+            snippet,
+            warning
         ))
     }
 
@@ -310,6 +417,196 @@ impl FileEditTool {
             path.display(),
             snippet
         ))
+    }
+
+    // ── Matching Functions ────────────────────────────────────────
+
+    /// Level 1: Exact match (current implementation)
+    fn exact_match(&self, content: &str, old_str: &str) -> MatchResult {
+        let count = content.matches(old_str).count();
+
+        if count == 0 {
+            MatchResult::NoMatch
+        } else if count > 1 {
+            let positions: Vec<usize> =
+                content.match_indices(old_str).map(|(pos, _)| pos).collect();
+            MatchResult::MultipleMatches { count, positions }
+        } else {
+            if let Some((pos, _)) = content.match_indices(old_str).next() {
+                MatchResult::UniqueMatch {
+                    position: pos,
+                    end_position: pos + old_str.len(),
+                    match_level: MatchLevel::Exact,
+                    confidence: 1.0,
+                }
+            } else {
+                MatchResult::NoMatch
+            }
+        }
+    }
+
+    /// Level 2: Whitespace-normalized match
+    /// Normalizes whitespace per line while preserving line structure
+    fn whitespace_normalized_match(&self, content: &str, old_str: &str) -> MatchResult {
+        let normalize_line = |line: &str| -> String {
+            // Preserve leading indentation but normalize trailing whitespace
+            let trimmed = line.trim_end();
+            trimmed.to_string()
+        };
+
+        let normalize =
+            |s: &str| -> String { s.lines().map(normalize_line).collect::<Vec<_>>().join("\n") };
+
+        let norm_content = normalize(content);
+        let norm_old = normalize(old_str);
+
+        // Try to find in normalized content
+        let count = norm_content.matches(&norm_old).count();
+
+        if count == 0 {
+            MatchResult::NoMatch
+        } else if count > 1 {
+            // Map positions back to original content
+            let positions: Vec<usize> = norm_content
+                .match_indices(&norm_old)
+                .map(|(pos, _)| pos)
+                .collect();
+            MatchResult::MultipleMatches { count, positions }
+        } else {
+            if let Some((norm_pos, _)) = norm_content.match_indices(&norm_old).next() {
+                // Map normalized position back to original content
+                // We need to find the corresponding line in original content
+                let norm_lines: Vec<&str> = norm_content.lines().collect();
+                let orig_lines: Vec<&str> = content.lines().collect();
+
+                // Find which line the match starts on
+                let match_start_line = norm_lines
+                    .iter()
+                    .take_while(|&&line| {
+                        norm_pos >= line.len() + 1 // +1 for newline
+                    })
+                    .count();
+
+                // Find the position in original content
+                let orig_pos: usize = orig_lines
+                    .iter()
+                    .take(match_start_line)
+                    .map(|l| l.len() + 1) // +1 for newline
+                    .sum();
+
+                let match_len = old_str.len();
+
+                MatchResult::UniqueMatch {
+                    position: orig_pos,
+                    end_position: orig_pos + match_len,
+                    match_level: MatchLevel::WhitespaceNormalized,
+                    confidence: 0.95,
+                }
+            } else {
+                MatchResult::NoMatch
+            }
+        }
+    }
+
+    /// Level 3: Flexible whitespace regex
+    /// Allows variable whitespace between tokens
+    fn flexible_whitespace_match(&self, content: &str, old_str: &str) -> MatchResult {
+        // Tokenize old_str on whitespace, but preserve the tokens
+        let tokens: Vec<&str> = old_str
+            .split(|c: char| c.is_whitespace() && c != '\n')
+            .collect();
+
+        if tokens.is_empty() || tokens.iter().all(|t| t.is_empty()) {
+            return MatchResult::NoMatch;
+        }
+
+        // Build regex pattern with \s* between tokens
+        // Escape regex special characters in each token
+        let pattern: String = tokens
+            .iter()
+            .map(|token| regex::escape(token))
+            .collect::<Vec<_>>()
+            .join(r"\s*");
+
+        // Add optional whitespace at start and end
+        let pattern = format!(r"^\s*{}\s*$", pattern);
+
+        // Try to match line by line first (for multi-line, we'll do a simpler approach)
+        if old_str.contains('\n') {
+            // For multi-line, use a simpler approach: normalize all whitespace to single space
+            let flat_old = old_str.split_whitespace().collect::<Vec<_>>().join(" ");
+            let flat_pattern = regex::escape(&flat_old);
+
+            // Search in content with flexible whitespace
+            let re = match regex::Regex::new(&format!(r"\s*{}\s*", flat_pattern)) {
+                Ok(re) => re,
+                Err(_) => return MatchResult::NoMatch,
+            };
+
+            let count = re.find_iter(content).count();
+
+            if count == 0 {
+                MatchResult::NoMatch
+            } else if count > 1 {
+                let positions: Vec<usize> = re.find_iter(content).map(|m| m.start()).collect();
+                MatchResult::MultipleMatches { count, positions }
+            } else {
+                if let Some(m) = re.find(content) {
+                    MatchResult::UniqueMatch {
+                        position: m.start(),
+                        end_position: m.end(),
+                        match_level: MatchLevel::FlexibleWhitespace,
+                        confidence: 0.85,
+                    }
+                } else {
+                    MatchResult::NoMatch
+                }
+            }
+        } else {
+            // Single line: use the token-based pattern
+            let re = match regex::Regex::new(&pattern) {
+                Ok(re) => re,
+                Err(_) => return MatchResult::NoMatch,
+            };
+
+            let count = re.find_iter(content).count();
+
+            if count == 0 {
+                MatchResult::NoMatch
+            } else if count > 1 {
+                let positions: Vec<usize> = re.find_iter(content).map(|m| m.start()).collect();
+                MatchResult::MultipleMatches { count, positions }
+            } else {
+                if let Some(m) = re.find(content) {
+                    MatchResult::UniqueMatch {
+                        position: m.start(),
+                        end_position: m.end(),
+                        match_level: MatchLevel::FlexibleWhitespace,
+                        confidence: 0.85,
+                    }
+                } else {
+                    MatchResult::NoMatch
+                }
+            }
+        }
+    }
+
+    /// Progressive fallback matching: tries Level 1, then 2, then 3
+    fn progressive_match(&self, content: &str, old_str: &str) -> MatchResult {
+        // Level 1: Exact match
+        let result = self.exact_match(content, old_str);
+        if matches!(result, MatchResult::UniqueMatch { .. }) {
+            return result;
+        }
+
+        // Level 2: Whitespace normalized
+        let result = self.whitespace_normalized_match(content, old_str);
+        if matches!(result, MatchResult::UniqueMatch { .. }) {
+            return result;
+        }
+
+        // Level 3: Flexible whitespace
+        self.flexible_whitespace_match(content, old_str)
     }
 
     // ── Helpers ────────────────────────────────────────
