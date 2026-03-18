@@ -21,4 +21,5 @@ pub use session_hook::{
     SessionStats,
     fetch_model_pricing,
 };
-pub use streaming_output_handler::{StreamingOutputHandler, VerbosityLevel};
+
+pub use streaming_output_handler::{StreamingConfig, StreamingOutputHandler, TextColor, VerbosityLevel};
