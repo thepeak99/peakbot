@@ -406,26 +406,70 @@ impl BashTool {
 
 ## 📋 Implementation Priority
 
-### Phase 1: Quick Wins (1-2 days)
-- [ ] Add `replace_all` parameter to str_replace
-- [ ] Enhance error messages with suggestions
-- [ ] Update tool description to discourage bash
-- [ ] Add system prompt guidance section
+### Phase 1: Quick Wins (1-2 days) ✅ COMPLETED
+- [x] Add `replace_all` parameter to str_replace
+- [x] Enhance error messages with suggestions
+- [x] Update tool description to discourage bash
+- [x] Add system prompt guidance section
 
-### Phase 2: Flexible Matching (3-5 days)
-- [ ] Implement MatchResult enum
-- [ ] Add whitespace_normalized_match()
-- [ ] Add flexible_whitespace_match()
-- [ ] Implement progressive fallback logic
-- [ ] Add match_level to success responses
-- [ ] Add warnings for non-exact matches
+**Implementation Notes:**
+- ✅ Added `replace_all: Option<bool>` to `FileEditArgs` (default: false)
+- ✅ Enhanced error messages with actionable suggestions and context
+- ✅ Updated tool description with strong bash/sed discouragement
+- ✅ Added comprehensive "File Editing Best Practices" section to system prompt
+- ✅ Success messages now show replacement count and warnings for global replacements
+- ✅ Code compiles successfully, ready for use
+
+**Files Modified:**
+- `src/tools/file_edit.rs` - Added replace_all support and enhanced errors
+- `src/system_prompt.txt` - Added file editing best practices section
+
+### Phase 2: Flexible Matching (3-5 days) ✅ COMPLETED
+- [x] Implement MatchResult enum
+- [x] Add whitespace_normalized_match()
+- [x] Add flexible_whitespace_match()
+- [x] Implement progressive fallback logic
+- [x] Add match_level to success responses
+- [x] Add warnings for non-exact matches
+
+**Implementation Notes:**
+- ✅ Added `MatchLevel` enum (Exact, WhitespaceNormalized, FlexibleWhitespace)
+- ✅ Added `MatchResult` enum (NoMatch, MultipleMatches, UniqueMatch with metadata)
+- ✅ Implemented `exact_match()` - Level 1 matching (refactored from existing code)
+- ✅ Implemented `whitespace_normalized_match()` - Level 2 matching (trims trailing whitespace per line)
+- ✅ Implemented `flexible_whitespace_match()` - Level 3 matching (regex-based token matching)
+- ✅ Implemented `progressive_match()` - Falls back through levels 1→2→3 automatically
+- ✅ Updated `cmd_str_replace()` to use progressive matching
+- ✅ Success responses now include match_level and confidence warnings
+- ✅ Added `regex` dependency to Cargo.toml
+- ✅ Code compiles successfully with only minor warning (unused end_position field)
+
+**Files Modified:**
+- `src/tools/file_edit.rs` - Added matching enums and functions, updated str_replace
+- `Cargo.toml` - Added regex dependency
+
+**How It Works:**
+1. **Level 1 (Exact)**: Direct string comparison - fast, zero false positives
+2. **Level 2 (Whitespace Normalized)**: Trims trailing whitespace per line - catches formatting differences
+3. **Level 3 (Flexible Whitespace)**: Regex-based token matching with `\s*` between tokens - handles variable spacing
+4. **Progressive Fallback**: Automatically tries Level 1 → 2 → 3 until a unique match is found
+5. **Warnings**: Non-exact matches show confidence level and suggest reading file first
 
 ### Phase 3: Advanced Features (Optional)
 - [ ] Fuzzy matching with line number suggestions
-- [ ] Bash tool guardrails (warnings)
+- [x] Bash tool guardrails (warnings) ✅ COMPLETED
 - [ ] Undo history in file_edit
 - [ ] "view" command in file_edit for undo support
 - [ ] Evaluation suite to measure improvement
+
+**Bash Guardrails Implementation Notes:**
+- ✅ Added `check_file_edit_patterns()` method to detect common file-editing bash commands
+- ✅ Added `file_edit_warning()` helper to generate standardized warning messages
+- ✅ Integrated guardrails into bash tool's `call()` method
+- ✅ Warnings are appended to successful command output (non-intrusive)
+- ✅ Commands still execute normally (advisory only)
+- ✅ Detects: `sed -i`, `awk ... >`, `perl -pi`, `ex + ... %`, `vi -c`
+- ✅ Warning message educates users on file_edit benefits and bash appropriate uses
 
 ### Phase 4: Optimization
 - [ ] Performance benchmarking
@@ -523,13 +567,56 @@ Create benchmark tasks:
 
 ## 📅 Timeline
 
-- **Week 1**: Phase 1 (quick wins) - Immediate bash reduction
-- **Week 2-3**: Phase 2 (flexible matching) - Major reliability improvement  
+- **Week 1**: Phase 1 (quick wins) - Immediate bash reduction ✅ **COMPLETED**
+- **Week 2-3**: Phase 2 (flexible matching) - Major reliability improvement
 - **Week 4**: Testing and evaluation
 - **Week 5+**: Phase 3 (advanced features) - Optional enhancements
 
 ---
 
+## 🎉 Current Status
+
+**Phase 1: COMPLETED** ✅ (2026-03-18)
+All quick wins have been implemented and are ready for use. The file_edit tool now supports:
+- Global replacements with `replace_all: true`
+- Enhanced error messages with actionable suggestions
+- Strong bash/sed discouragement in tool description
+- Comprehensive file editing best practices in system prompt
+
+**Phase 2: COMPLETED** ✅ (2026-03-18)
+Flexible matching has been fully implemented. The file_edit tool now:
+- Automatically falls back through 3 levels of matching (exact → whitespace normalized → flexible)
+- Shows match level and confidence in success messages
+- Warns when non-exact matching is used
+- Handles whitespace differences gracefully without manual file reading
+
+**Phase 3: Bash Guardrails COMPLETED** ✅ (2026-03-18)
+Bash tool guardrails have been implemented to discourage file-editing bash commands:
+- Detects common file-editing patterns: `sed -i`, `awk ... >`, `perl -pi`, `ex +`, `vi -c`
+- Shows advisory warnings suggesting file_edit tool instead
+- Commands still execute normally (non-blocking)
+- Educates users on file_edit benefits and appropriate bash uses
+
+**Combined Features:**
+The file_edit tool now supports:
+1. **Global replacements** with `replace_all: true`
+2. **Flexible matching** with automatic fallback through 3 levels
+3. **Enhanced error messages** with actionable suggestions
+4. **Match level warnings** to inform users when exact matching wasn't possible
+5. **Strong bash/sed discouragement** in tool description
+6. **Comprehensive file editing best practices** in system prompt
+7. **Bash guardrails** that warn when file-editing bash commands are used
+
+**Next Steps:**
+- Monitor usage to measure bash/sed reduction
+- Gather user feedback on flexible matching effectiveness
+- Gather user feedback on bash guardrails effectiveness
+- Consider implementing remaining Phase 3 features (fuzzy matching, undo)
+- Add unit tests for matching functions and bash guardrails
+
+---
+
 *Created: 2026-03-18*
+*Updated: 2026-03-18 (Phase 1, 2 & Bash Guardrails completed)*
 *Author: PeakBot (with research from industry best practices)*
-*Status: Draft - Ready for Implementation*
+*Status: Phase 1, 2 & Bash Guardrails Complete - Ready for Testing*

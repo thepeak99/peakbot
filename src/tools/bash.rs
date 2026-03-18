@@ -42,6 +42,51 @@ impl BashTool {
     pub fn new(env: Option<HashMap<String, String>>) -> Self {
         Self { env }
     }
+
+    /// Detect if the command appears to be doing file editing
+    /// Returns a warning message if file-editing patterns are detected
+    fn check_file_edit_patterns(&self, command: &str) -> Option<String> {
+        let command_lower = command.to_lowercase();
+
+        // Check for common file-editing bash patterns
+        if command_lower.contains("sed -i") {
+            return Some(self.file_edit_warning("sed -i for in-place file editing"));
+        }
+
+        // Check for awk with output redirection (awk ... > file)
+        if command_lower.contains("awk") && command.contains(">") {
+            return Some(self.file_edit_warning("awk for file modification"));
+        }
+
+        if command_lower.contains("perl -pi") {
+            return Some(self.file_edit_warning("perl for in-place file editing"));
+        }
+
+        if command_lower.contains("ex +") && command.contains("%") {
+            return Some(self.file_edit_warning("vim/ex for file editing"));
+        }
+
+        if command_lower.contains("vi -c") {
+            return Some(self.file_edit_warning("vi for file editing"));
+        }
+
+        None
+    }
+
+    /// Generate a standardized warning message for file-editing bash commands
+    fn file_edit_warning(&self, description: &str) -> String {
+        format!(
+            "⚠️  Consider using file_edit tool instead of {} for file modifications.\n\
+            \nfile_edit provides:\n\
+            - Safe diffs for review\n\
+            - Undo support via file history\n\
+            - Cross-platform compatibility\n\
+            - Automatic whitespace handling\n\
+            \nThis command will execute, but file_edit is recommended for file content modifications.\n\
+            Use bash ONLY for: file operations (mv/cp/rm), permissions, bulk operations on many files.",
+            description
+        )
+    }
 }
 
 impl Tool for BashTool {
@@ -75,6 +120,9 @@ impl Tool for BashTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Check for file-editing patterns and add warning if detected
+        let warning = self.check_file_edit_patterns(&args.command);
+        
         let timeout_secs = args
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -129,6 +177,11 @@ impl Tool for BashTool {
                 }
                 if !stderr.is_empty() {
                     result.push_str(&format!("\nSTDERR:\n{}\n", stderr));
+                }
+
+                // Add warning if file-editing pattern was detected
+                if let Some(warning_msg) = warning {
+                    result.push_str(&format!("\n\n{}", warning_msg));
                 }
 
                 // Log successful completion

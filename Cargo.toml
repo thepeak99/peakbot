@@ -19,6 +19,7 @@ directories-next = "2"
 dirs = "6"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3.27"
