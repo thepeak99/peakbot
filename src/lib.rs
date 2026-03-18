@@ -321,6 +321,12 @@ impl AgentRunner {
         }
     }
 
+    /// Handle successful agent response by printing stats and todo summary
+    fn handle_success(&self) {
+        self.print_last_request_stats();
+        self.print_todo_summary();
+    }
+
     /// Force context compaction
     async fn force_compact(&mut self, chat_history: &mut Vec<Message>) {
         if let Some(ref mut cm) = self.context_manager {
@@ -730,73 +736,56 @@ impl AgentRunner {
             }
 
             // Use the agent to prompt with history
-            match self
+            let retry_config = self.config.retry();
+            let mut last_error = self
                 .agent
                 .as_ref()
                 .prompt_with_history(input, &mut chat_history)
                 .await
-            {
-                Ok(response) => {
-                    println!("\n{}", response);
-                    // Display token stats after each response
-                    self.print_last_request_stats();
-                    // Display todo summary after each response
-                    self.print_todo_summary();
+                .err();
+
+            let mut attempt = 0u32;
+            while let Some(ref error) = last_error {
+                // Check if we should retry
+                if attempt >= retry_config.max_retries {
+                    // Max retries exceeded, print the final error
+                    eprintln!("\nError (after {} retries): {}\n", attempt, error);
+                    last_error = None;
+                    break;
                 }
-                Err(e) => {
-                    // Retry with exponential backoff
-                    let retry_config = self.config.retry();
-                    let mut attempt = 0u32;
-                    let mut last_error = e;
 
-                    loop {
-                        // Check if we should retry
-                        if attempt >= retry_config.max_retries {
-                            // Max retries exceeded, print the final error
-                            eprintln!("\nError (after {} retries): {}\n", attempt, last_error);
-                            break;
-                        }
+                // Calculate delay with exponential backoff
+                let delay_ms = ((retry_config.initial_delay_ms as f64)
+                    * (retry_config.backoff_factor.powi(attempt as i32)))
+                .min(retry_config.max_delay_ms as f64)
+                    as u64;
 
-                        // Calculate delay with exponential backoff
-                        let delay_ms = ((retry_config.initial_delay_ms as f64)
-                            * (retry_config.backoff_factor.powi(attempt as i32)))
-                        .min(retry_config.max_delay_ms as f64)
-                            as u64;
-
-                        if attempt > 0 {
-                            eprintln!(
-                                "\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
-                                last_error,
-                                delay_ms,
-                                attempt + 1,
-                                retry_config.max_retries
-                            );
-                        }
-
-                        // Wait before retrying
-                        sleep(Duration::from_millis(delay_ms)).await;
-
-                        // Attempt the request again
-                        match self
-                            .agent
-                            .as_ref()
-                            .prompt_with_history(input, &mut chat_history)
-                            .await
-                        {
-                            Ok(_r) => {
-                                // Display token stats after each response
-                                self.print_last_request_stats();
-                                // Display todo summary after each response
-                                self.print_todo_summary();
-                                break;
-                            }
-                            Err(e) => {
-                                last_error = e;
-                                attempt += 1;
-                            }
-                        }
-                    }
+                if attempt > 0 {
+                    eprintln!(
+                        "\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
+                        error,
+                        delay_ms,
+                        attempt + 1,
+                        retry_config.max_retries
+                    );
                 }
+
+                // Wait before retrying
+                sleep(Duration::from_millis(delay_ms)).await;
+
+                // Attempt the request again
+                last_error = self
+                    .agent
+                    .as_ref()
+                    .prompt_with_history(input, &mut chat_history)
+                    .await
+                    .err();
+                attempt += 1;
+            }
+
+            // Handle success (no error)
+            if last_error.is_none() {
+                self.handle_success();
             }
         }
 
