@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
 
-const MAX_OUTPUT_CHARS: usize = 10_000;
+const MAX_OUTPUT_CHARS: usize = 50_000;
 const TRUNCATION_NOTICE: &str =
     "\n... [output truncated] Use start_line/end_line to read specific sections.";
 

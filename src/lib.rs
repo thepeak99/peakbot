@@ -21,15 +21,17 @@ pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
     // Event types
     AgentEvent,
-    CostHandler,
     ConversationHandler,
+    CostHandler,
     EventChannel,
-    EventProcessor,
     EventHandler,
+    EventProcessor,
     ModelPricing,
     SessionHook,
     SessionStats,
+    StreamingConfig,
     StreamingOutputHandler,
+    TextColor,
     TokenUsage,
     VerbosityLevel,
     create_event_channel,
@@ -440,20 +442,20 @@ impl AgentRunner {
         // This handles cost tracking and conversation persistence via events from SessionHook
         if let Some(receiver) = self.event_receiver.take() {
             let mut handlers: Vec<Arc<dyn EventHandler>> = Vec::new();
-            
+
             // Add cost handler
             let stats = self.cost_tracker.get_session_stats();
             let pricing = self.cost_tracker.get_pricing().clone();
             handlers.push(Arc::new(CostHandler::new(pricing, stats)));
-            
+
             // Add conversation handler if enabled
             if let Some(ref cm) = self.conversation_manager {
                 handlers.push(Arc::new(hooks::ConversationHandler::new(cm.clone())));
             }
-            
+
             // Add streaming output handler for real-time agent output
             handlers.push(Arc::new(StreamingOutputHandler::new()));
-            
+
             tokio::spawn(async move {
                 let mut processor = EventProcessor::new(receiver, handlers);
                 processor.run().await;
@@ -507,7 +509,10 @@ impl AgentRunner {
                     "Conversation {}",
                     chrono::Local::now().format("%Y-%m-%d %H:%M")
                 );
-                let _ = cm.lock().unwrap().create_new(name, self.config.model().to_string());
+                let _ = cm
+                    .lock()
+                    .unwrap()
+                    .create_new(name, self.config.model().to_string());
             }
         }
 
@@ -569,7 +574,10 @@ impl AgentRunner {
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")
                     );
-                    let _ = cm.lock().unwrap().create_new(name, self.config.model().to_string());
+                    let _ = cm
+                        .lock()
+                        .unwrap()
+                        .create_new(name, self.config.model().to_string());
                     chat_history.clear();
                     println!("Started a new conversation.\n");
                 } else {
@@ -623,7 +631,7 @@ impl AgentRunner {
                 continue;
             }
 
-           // Handle /delete <id> command
+            // Handle /delete <id> command
             if let Some(id_str) = input.strip_prefix("/delete ") {
                 if let Some(ref cm) = self.conversation_manager {
                     match uuid::Uuid::parse_str(id_str) {
@@ -641,7 +649,7 @@ impl AgentRunner {
                 continue;
             }
 
-           // Handle /export <id> <format> command
+            // Handle /export <id> <format> command
             if let Some(args) = input.strip_prefix("/export ") {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if parts.len() == 2 {
@@ -652,7 +660,9 @@ impl AgentRunner {
                             Ok(id) => match cm.lock().unwrap().load(id) {
                                 Ok(conv) => {
                                     let output = match format.as_str() {
-                                        "markdown" | "md" => cm.lock().unwrap().export_markdown(&conv),
+                                        "markdown" | "md" => {
+                                            cm.lock().unwrap().export_markdown(&conv)
+                                        }
                                         "json" => cm.lock().unwrap().export_json(&conv),
                                         _ => {
                                             eprintln!(
@@ -773,8 +783,7 @@ impl AgentRunner {
                             .prompt_with_history(input, &mut chat_history)
                             .await
                         {
-                            Ok(response) => {
-                                println!("\n{}", response);
+                            Ok(_r) => {
                                 // Display token stats after each response
                                 self.print_last_request_stats();
                                 // Display todo summary after each response
