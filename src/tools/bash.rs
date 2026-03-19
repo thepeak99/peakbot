@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::process::Command;
 
-const MAX_OUTPUT_CHARS: usize = 10_000;
+const MAX_OUTPUT_CHARS: usize = 50_000;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 600;
 
@@ -122,7 +122,7 @@ impl Tool for BashTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         // Check for file-editing patterns and add warning if detected
         let warning = self.check_file_edit_patterns(&args.command);
-        
+
         let timeout_secs = args
             .timeout_seconds
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
