@@ -36,7 +36,6 @@ pub enum MatchResult {
     },
     UniqueMatch {
         position: usize,
-        end_position: usize,
         match_level: MatchLevel,
         confidence: f32,
     },
@@ -292,7 +291,6 @@ Tip: Read the file first with file_read to see exact formatting.",
             }
             MatchResult::UniqueMatch {
                 position,
-                end_position: _,
                 match_level,
                 confidence,
             } => (1, position, match_level, confidence),
@@ -435,7 +433,6 @@ Tip: For global replacements, use replace_all: true",
             if let Some((pos, _)) = content.match_indices(old_str).next() {
                 MatchResult::UniqueMatch {
                     position: pos,
-                    end_position: pos + old_str.len(),
                     match_level: MatchLevel::Exact,
                     confidence: 1.0,
                 }
@@ -494,11 +491,8 @@ Tip: For global replacements, use replace_all: true",
                     .map(|l| l.len() + 1) // +1 for newline
                     .sum();
 
-                let match_len = old_str.len();
-
                 MatchResult::UniqueMatch {
                     position: orig_pos,
-                    end_position: orig_pos + match_len,
                     match_level: MatchLevel::WhitespaceNormalized,
                     confidence: 0.95,
                 }
@@ -554,7 +548,6 @@ Tip: For global replacements, use replace_all: true",
                 if let Some(m) = re.find(content) {
                     MatchResult::UniqueMatch {
                         position: m.start(),
-                        end_position: m.end(),
                         match_level: MatchLevel::FlexibleWhitespace,
                         confidence: 0.85,
                     }
@@ -580,7 +573,6 @@ Tip: For global replacements, use replace_all: true",
                 if let Some(m) = re.find(content) {
                     MatchResult::UniqueMatch {
                         position: m.start(),
-                        end_position: m.end(),
                         match_level: MatchLevel::FlexibleWhitespace,
                         confidence: 0.85,
                     }
