@@ -1,10 +1,55 @@
 // Use the library crate (defined in lib.rs)
 use anyhow::Result;
+use clap::Parser;
 use peakbot::{
     AgentRunner, Config, TodoTool, build_system_prompt, create_provider, load_default_skills,
     load_mcp_servers,
 };
+#[cfg(feature = "tui")]
+use peakbot::ui::{Tui, Ui, UiAction};
+use peakbot::ui::StateManager;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
+
+/// CLI arguments for PeakBot
+#[derive(Parser, Debug)]
+#[command(name = "peakbot")]
+#[command(about = "PeakBot coding agent with TUI and REPL modes")]
+struct Args {
+    /// Choose the UI mode: 'tui' for rich terminal UI, 'repl' for simple REPL
+    #[arg(short, long, default_value = "repl")]
+    ui: UiMode,
+}
+
+/// UI mode selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiMode {
+    /// Rich terminal UI using ratatui (requires tui feature)
+    Tui,
+    /// Simple REPL interface (always available)
+    Repl,
+}
+
+impl std::str::FromStr for UiMode {
+    type Err = String;
+    
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "tui" => Ok(UiMode::Tui),
+            "repl" => Ok(UiMode::Repl),
+            _ => Err(format!("Invalid UI mode '{}'. Use 'tui' or 'repl'", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for UiMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UiMode::Tui => write!(f, "tui"),
+            UiMode::Repl => write!(f, "repl"),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,6 +58,18 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // Parse CLI arguments
+    let args = Args::parse();
+    
+    // Validate TUI mode availability
+    #[cfg(not(feature = "tui"))]
+    if args.ui == UiMode::Tui {
+        eprintln!("Error: TUI mode requires the 'tui' feature to be enabled.");
+        eprintln!("Run with: cargo run --features tui -- --ui tui");
+        eprintln!("Or use REPL mode: peakbot --ui repl");
+        std::process::exit(1);
+    }
+
     // Load configuration from environment variables
     let config = Config::load()?;
 
@@ -20,7 +77,6 @@ async fn main() -> Result<()> {
     let skills = load_default_skills()?;
 
     // Build the system prompt dynamically with environment info and skills
-    // This must be done before creating the provider so the agent can use it as preamble
     let system_prompt = build_system_prompt(&skills);
 
     // Load MCP servers first (async operation) - this gives us MCP tools
@@ -46,11 +102,10 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Create the todo tool - we'll pass it to the provider and store its state
+    // Create the todo tool
     let todo_tool = TodoTool::new();
 
-    // Create provider (agent) with all tools (built-in + MCP) and system prompt
-    // The event_receiver is returned for external processing by AgentRunner
+    // Create provider (agent) with all tools
     let (agent, provider_info, cost_tracker, todo_state, event_receiver) = create_provider(
         &config.provider,
         mcp_tools,
@@ -66,17 +121,79 @@ async fn main() -> Result<()> {
         provider_info.model
     );
 
-    // Run the interactive REPL - the agent includes both built-in and MCP tools
-    let mut runner = AgentRunner::new(
+    // Create StateManager for UI state
+    let state_manager = Arc::new(StateManager::new());
+    
+    // Initialize state with current data
+    if let Ok(list) = todo_state.lock() {
+        state_manager.update_todo(&list);
+    }
+    let stats = cost_tracker.get_session_stats();
+    state_manager.update_stats(&stats);
+
+    // Create AgentRunner with state_manager
+    let mut agent_runner = AgentRunner::new(
         agent,
-        config.clone(),
+        config,
         provider_info,
         skills,
         cost_tracker,
         Some(todo_state),
         event_receiver,
+        Some(state_manager.clone()),
     );
-    runner.run().await?;
+
+    // Run the appropriate UI based on CLI argument
+    match args.ui {
+        UiMode::Tui => {
+            #[cfg(feature = "tui")]
+            {
+                use tokio::sync::mpsc;
+                
+                // Run TUI - takes over the terminal
+                
+                // Create channel for TUI -> Agent communication
+                let (action_sender, mut action_receiver) = mpsc::unbounded_channel::<UiAction>();
+                
+                let mut tui = Tui::new(state_manager.clone(), Some(action_sender));
+                tui.init()?;
+                
+                // Spawn the agent runner in a separate task that processes UI actions
+                let agent_handle = tokio::spawn(async move {
+                    // Agent runner expects to process UiActions
+                    // For now, we run a simple message loop
+                    // TODO: Full integration with AgentRunner would require UI-aware changes
+                    while let Some(action) = action_receiver.recv().await {
+                        match action {
+                            UiAction::Exit => break,
+                            _ => {
+                                // Other actions handled by agent runner in full implementation
+                            }
+                        }
+                    }
+                });
+                
+                // Run TUI loop (blocking)
+                tui.run()?;
+                tui.shutdown()?;
+                
+                // Signal agent to exit
+                let _ = action_sender.send(UiAction::Exit);
+                
+                // Wait for agent to finish
+                let _ = agent_handle.await;
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                // This case is handled above with the error exit
+                unreachable!();
+            }
+        }
+        UiMode::Repl => {
+            // Run REPL - simple stdin/stdout interface
+            agent_runner.run().await?;
+        }
+    }
 
     Ok(())
 }

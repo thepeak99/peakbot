@@ -63,17 +63,21 @@ impl CostTracker {
             let cost = (usage.input_tokens as f64 * self.pricing.input_per_token)
                 + (usage.output_tokens as f64 * self.pricing.output_per_token);
 
-            if let Ok(mut stats) = self.stats.lock() {
+            let total_cost = if let Ok(mut stats) = self.stats.lock() {
                 stats.add_request(usage.input_tokens, usage.output_tokens, cost);
+                stats.total_cost
+            } else {
+                return;
+            };
 
-                tracing::info!(
-                    "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    cost,
-                    stats.total_cost
-                );
-            }
+            // Log outside the lock to avoid holding the mutex during I/O
+            tracing::info!(
+                "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
+                usage.input_tokens,
+                usage.output_tokens,
+                cost,
+                total_cost
+            );
         }
     }
 

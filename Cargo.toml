@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rig-core = { version = "0.32", features = ["rmcp"] }
+rig-core = { version = "0.33", features = ["rmcp"] }
 rmcp = { version = "0.16", features = ["client", "transport-child-process"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,6 +20,17 @@ dirs = "6"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Optional TUI support (feature-gated)
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
+
+[features]
+default = []
+tui = ["dep:ratatui", "dep:crossterm"]
 
 [dev-dependencies]
 tempfile = "3.27"

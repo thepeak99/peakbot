@@ -6,7 +6,7 @@ mod list_directory;
 mod logging_wrapper;
 mod search;
 mod think;
-mod todo;
+pub mod todo;
 
 pub use bash::BashTool;
 pub use fetch_url::FetchUrlTool;
