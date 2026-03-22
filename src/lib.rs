@@ -8,6 +8,7 @@ mod hooks;
 mod providers;
 mod skills;
 mod tools;
+pub mod ui;
 
 pub use config::{
     BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig, OllamaConfig,
@@ -47,6 +48,7 @@ pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
     SearchTool, ThinkTool, TodoList, TodoStatus, TodoTool,
 };
+pub use ui::{UiAction, ui_trait::Ui};
 
 use anyhow::{Result, anyhow};
 use rmcp::service::ServiceExt;
@@ -200,6 +202,7 @@ pub struct AgentRunner {
     cost_tracker: CostTracker,
     todo_state: Option<Arc<Mutex<TodoList>>>,
     event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    state_manager: Option<Arc<ui::StateManager>>,
 }
 
 impl AgentRunner {
@@ -212,6 +215,7 @@ impl AgentRunner {
         cost_tracker: CostTracker,
         todo_state: Option<Arc<Mutex<TodoList>>>,
         event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+        state_manager: Option<Arc<ui::StateManager>>,
     ) -> Self {
         // Wrap agent in Arc so we can share it with ContextManager for summarization
         let agent = Arc::new(agent);
@@ -261,6 +265,7 @@ impl AgentRunner {
             cost_tracker,
             todo_state,
             event_receiver,
+            state_manager,
         }
     }
 
@@ -325,6 +330,22 @@ impl AgentRunner {
     fn handle_success(&self) {
         self.print_last_request_stats();
         self.print_todo_summary();
+    }
+
+    /// Sync state to StateManager if present
+    fn sync_state_to_manager(&self) {
+        if let Some(ref sm) = self.state_manager {
+            // Update stats
+            let stats = self.cost_tracker.get_session_stats();
+            sm.update_stats(&stats);
+            
+            // Update todo list
+            if let Some(ref todo) = self.todo_state {
+                if let Ok(list) = todo.lock() {
+                    sm.update_todo(&list);
+                }
+            }
+        }
     }
 
     /// Force context compaction
@@ -770,6 +791,7 @@ impl AgentRunner {
                     );
                 }
 
+                self.sync_state_to_manager();
                 // Wait before retrying
                 sleep(Duration::from_millis(delay_ms)).await;
 

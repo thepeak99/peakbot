@@ -9,6 +9,13 @@ use anyhow::{Context as AnyhowContext, Result};
 use rig::completion::message::Message;
 use std::sync::{Arc, Mutex};
 
+/// Default context window size (128k tokens)
+const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+/// Estimated tokens per message for fallback calculations
+const TOKENS_PER_MESSAGE: usize = 50;
+/// Estimated tokens for a conversation summary
+const SUMMARY_TOKENS: usize = 75;
+
 /// Result of a context compaction operation
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
@@ -61,7 +68,7 @@ impl ContextManager {
                 m if m.contains("gemini-2.0") => 1_000_000,
                 m if m.contains("gemini-1.5-pro") => 2_000_000,
                 m if m.contains("gemini-1.5-flash") => 1_000_000,
-                _ => 128_000, // Default fallback
+                _ => DEFAULT_CONTEXT_WINDOW, // Default fallback
             }
         });
 
@@ -300,13 +307,12 @@ impl ContextManager {
         let compacted_count = messages.len();
 
         // Estimate tokens saved - summarization is much more efficient than truncation
-        // A summary is typically ~50-100 tokens vs thousands for the original messages
         let tokens_saved = if summary_created {
-            // Estimate: original had ~50 tokens per message, summary is ~75 tokens
-            (num_to_discard * 50).saturating_sub(75)
+            // Estimate: original had TOKENS_PER_MESSAGE tokens per message, summary is SUMMARY_TOKENS
+            (num_to_discard * TOKENS_PER_MESSAGE).saturating_sub(SUMMARY_TOKENS)
         } else {
             // Fallback to truncation calculation
-            tokens_before.saturating_sub(self.config.keep_recent * 50)
+            tokens_before.saturating_sub(self.config.keep_recent * TOKENS_PER_MESSAGE)
         };
 
         Ok(CompactionResult {

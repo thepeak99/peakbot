@@ -7,7 +7,13 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
 use rig::completion::{CompletionModel, CompletionResponse, message::Message};
+use rig::completion::message::AssistantContent;
+use rig::one_or_many::OneOrMany;
 use serde::Deserialize;
+use tokio::sync::mpsc;
+
+use crate::hooks::events::AgentEvent;
+use crate::hooks::events::TokenUsage as EventTokenUsage;
 
 /// Pricing information for a model (cost per token)
 #[derive(Clone, Debug)]
@@ -295,12 +301,6 @@ mod tests {
         assert_eq!(pricing.output_per_token, 0.000015);
     }
 }
-
-use crate::hooks::events::AgentEvent;
-use crate::hooks::events::TokenUsage as EventTokenUsage;
-use rig::completion::message::AssistantContent;
-use rig::one_or_many::OneOrMany;
-use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct SessionHook {

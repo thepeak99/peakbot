@@ -79,7 +79,6 @@ impl BashTool {
             "⚠️  Consider using file_edit tool instead of {} for file modifications.\n\
             \nfile_edit provides:\n\
             - Safe diffs for review\n\
-            - Undo support via file history\n\
             - Cross-platform compatibility\n\
             - Automatic whitespace handling\n\
             \nThis command will execute, but file_edit is recommended for file content modifications.\n\
