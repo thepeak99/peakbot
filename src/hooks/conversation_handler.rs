@@ -31,6 +31,10 @@ impl EventHandler for ConversationHandler {
                 ..
             } => {
                 if let Err(e) = manager.add_tool_call(tool_name.clone(), arguments.clone()) {
+                    tracing::error!("Failed to add tool call: {}", e);
+                }
+                // Save after modification to avoid nested lock deadlock
+                if let Err(e) = manager.save() {
                     tracing::error!("Failed to save tool call: {}", e);
                 }
             }
@@ -43,6 +47,10 @@ impl EventHandler for ConversationHandler {
                 if let Err(e) =
                     manager.add_tool_result(tool_name.clone(), arguments.clone(), result.clone())
                 {
+                    tracing::error!("Failed to add tool result: {}", e);
+                }
+                // Save after modification to avoid nested lock deadlock
+                if let Err(e) = manager.save() {
                     tracing::error!("Failed to save tool result: {}", e);
                 }
             }
@@ -59,6 +67,10 @@ impl EventHandler for ConversationHandler {
                 }
                 if let Err(e) = manager.update_tokens(usage.total_tokens, usage.cost) {
                     tracing::error!("Failed to update tokens: {}", e);
+                }
+                // Save after modification to avoid nested lock deadlock
+                if let Err(e) = manager.save() {
+                    tracing::error!("Failed to save completion: {}", e);
                 }
             }
             _ => {} // Ignore other events

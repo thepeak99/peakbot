@@ -131,43 +131,70 @@ async fn main() -> Result<()> {
     let stats = cost_tracker.get_session_stats();
     state_manager.update_stats(&stats);
 
-    // Create AgentRunner with state_manager
-    let mut agent_runner = AgentRunner::new(
-        agent,
-        config,
-        provider_info,
-        skills,
-        cost_tracker,
-        Some(todo_state),
-        event_receiver,
-        Some(state_manager.clone()),
-    );
-
     // Run the appropriate UI based on CLI argument
     match args.ui {
         UiMode::Tui => {
             #[cfg(feature = "tui")]
             {
                 use tokio::sync::mpsc;
-                
-                // Run TUI - takes over the terminal
+                use peakbot::ui::tui::{TuiAgentRunner, RunnerEvent};
                 
                 // Create channel for TUI -> Agent communication
                 let (action_sender, mut action_receiver) = mpsc::unbounded_channel::<UiAction>();
                 
-                let mut tui = Tui::new(state_manager.clone(), Some(action_sender));
+                // Create channel for Runner -> TUI events
+                let (event_sender, mut event_receiver) = mpsc::unbounded_channel::<RunnerEvent>();
+                
+                let mut tui = Tui::new(state_manager.clone(), Some(action_sender.clone()));
                 tui.init()?;
+                
+                // Create TuiAgentRunner (takes ownership of components)
+                let mut runner = TuiAgentRunner::new(
+                    agent,
+                    config.clone(),
+                    provider_info.clone(),
+                    skills,
+                    cost_tracker,
+                    state_manager.clone(),
+                    Some(event_sender),
+                );
                 
                 // Spawn the agent runner in a separate task that processes UI actions
                 let agent_handle = tokio::spawn(async move {
-                    // Agent runner expects to process UiActions
-                    // For now, we run a simple message loop
-                    // TODO: Full integration with AgentRunner would require UI-aware changes
-                    while let Some(action) = action_receiver.recv().await {
-                        match action {
-                            UiAction::Exit => break,
-                            _ => {
-                                // Other actions handled by agent runner in full implementation
+                    loop {
+                        tokio::select! {
+                            Some(action) = action_receiver.recv() => {
+                                match action {
+                                    UiAction::Exit => {
+                                        break;
+                                    }
+                                    _ => {
+                                        // Process action through runner
+                                        if let Err(e) = runner.process_action(action).await {
+                                            eprintln!("Error processing action: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            Some(event) = event_receiver.recv() => {
+                                match event {
+                                    RunnerEvent::Exit => {
+                                        // Signal TUI to exit
+                                        break;
+                                    }
+                                    RunnerEvent::AgentBusy => {
+                                        tracing::debug!("Agent is processing a request");
+                                    }
+                                    RunnerEvent::AgentIdle => {
+                                        tracing::debug!("Agent is ready for next input");
+                                    }
+                                    RunnerEvent::Error(e) => {
+                                        eprintln!("Agent error: {}", e);
+                                    }
+                                    RunnerEvent::StatsUpdated => {
+                                        // Stats updated in UI
+                                    }
+                                }
                             }
                         }
                     }
@@ -185,11 +212,23 @@ async fn main() -> Result<()> {
             }
             #[cfg(not(feature = "tui"))]
             {
-                // This case is handled above with the error exit
-                unreachable!();
+                // TUI mode is not available - this branch should never be reached
+                // since we check and exit earlier if TUI is requested without the feature
             }
         }
         UiMode::Repl => {
+            // Create AgentRunner for REPL mode
+            let mut agent_runner = AgentRunner::new(
+                agent,
+                config,
+                provider_info,
+                skills,
+                cost_tracker,
+                Some(todo_state),
+                event_receiver,
+                Some(state_manager),
+            );
+            
             // Run REPL - simple stdin/stdout interface
             agent_runner.run().await?;
         }

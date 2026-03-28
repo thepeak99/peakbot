@@ -6,8 +6,8 @@
 use anyhow::{Result, anyhow};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::ui::app_state::{AppState, ChatMessage};
 use crate::ui::tui::input_handler::{InputHandler, TerminalSetup};
@@ -30,7 +30,7 @@ pub struct Tui {
     state_manager: Arc<StateManager>,
     
     /// Channel to send actions to the agent
-    action_sender: Option<Sender<UiAction>>,
+    action_sender: Option<UnboundedSender<UiAction>>,
     
     /// Current input buffer
     input_buffer: String,
@@ -44,7 +44,7 @@ pub struct Tui {
 
 impl Tui {
     /// Create a new TUI instance
-    pub fn new(state_manager: Arc<StateManager>, action_sender: Option<Sender<UiAction>>) -> Self {
+    pub fn new(state_manager: Arc<StateManager>, action_sender: Option<UnboundedSender<UiAction>>) -> Self {
         Self {
             terminal: None,
             input_handler: InputHandler::new(),

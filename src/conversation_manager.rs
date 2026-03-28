@@ -261,50 +261,38 @@ impl ConversationManager {
         Ok(())
     }
 
-    /// Add a tool call to the current conversation
+    /// Add a tool call to the current conversation (without auto-save)
     pub fn add_tool_call(&mut self, tool_name: String, arguments: String) -> Result<()> {
         if let Some(ref mut conv) = self.current_conversation {
             conv.add_tool_call(tool_name, arguments);
-
-            if self.config.auto_save {
-                self.save()?;
-            }
+            // Auto-save is handled by the caller (ConversationHandler) to avoid nested locks
         }
         Ok(())
     }
 
-    /// Add a tool result to the current conversation
+    /// Add a tool result to the current conversation (without auto-save)
     pub fn add_tool_result(&mut self, tool_name: String, arguments: String, result: String) -> Result<()> {
         if let Some(ref mut conv) = self.current_conversation {
             conv.add_tool_result(tool_name, arguments, result);
-
-            if self.config.auto_save {
-                self.save()?;
-            }
+            // Auto-save is handled by the caller (ConversationHandler) to avoid nested locks
         }
         Ok(())
     }
 
-    /// Update token statistics for the current conversation
+    /// Update token statistics for the current conversation (without auto-save)
     pub fn update_tokens(&mut self, tokens: u64, cost: f64) -> Result<()> {
         if let Some(ref mut conv) = self.current_conversation {
             conv.update_tokens(tokens, cost);
-
-            if self.config.auto_save {
-                self.save()?;
-            }
+            // Auto-save is handled by the caller (ConversationHandler) to avoid nested locks
         }
         Ok(())
     }
 
-    /// Rename the current conversation
+    /// Rename the current conversation (without auto-save)
     pub fn rename(&mut self, name: String) -> Result<()> {
         if let Some(ref mut conv) = self.current_conversation {
             conv.rename(name);
-
-            if self.config.auto_save {
-                self.save()?;
-            }
+            // Auto-save is handled by the caller (ConversationHandler) to avoid nested locks
         }
         Ok(())
     }
