@@ -3,12 +3,18 @@ use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 
 const MAX_OUTPUT_CHARS: usize = 50_000;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 600;
+const TEMP_DIR_NAME: &str = "peakbot";
+
+/// Session-unique counter for generating output filenames
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum BashError {
@@ -88,6 +94,63 @@ impl BashTool {
     }
 }
 
+/// Save full output to temp files and return the paths
+fn save_full_output(stdout: &str, stderr: &str) -> std::io::Result<(PathBuf, PathBuf)> {
+    let temp_dir = std::env::temp_dir().join(TEMP_DIR_NAME);
+    std::fs::create_dir_all(&temp_dir)?;
+
+    let counter = SESSION_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let session_id = format!("{}_{}", timestamp, counter);
+    let base = temp_dir.join(format!("bash_{}", session_id));
+
+    let stdout_path = base.with_extension("stdout.txt");
+    let stderr_path = base.with_extension("stderr.txt");
+
+    std::fs::write(&stdout_path, stdout)?;
+    std::fs::write(&stderr_path, stderr)?;
+
+    Ok((stdout_path, stderr_path))
+}
+
+/// Truncate string from the beginning, keeping the end (like `tail -c N`)
+/// Returns (truncated_string, was_truncated)
+fn truncate_from_beginning(s: &str, max_chars: usize) -> (String, bool) {
+    if s.len() <= max_chars {
+        return (s.to_string(), false);
+    }
+
+    // Calculate the starting position for the last max_chars
+    let start_byte = s.len() - max_chars;
+
+    // Find the nearest char boundary from the end
+    let mut end_byte = s.len();
+    while !s.is_char_boundary(end_byte) {
+        end_byte -= 1;
+    }
+
+    // Find the nearest char boundary from the start
+    let mut start_byte = start_byte;
+    while !s.is_char_boundary(start_byte) {
+        start_byte += 1;
+    }
+
+    let truncated = &s[start_byte..end_byte];
+    let chars_truncated = s.len() - truncated.len();
+
+    (
+        format!(
+            "[... {} chars truncated from beginning ...]\n{}",
+            chars_truncated, truncated
+        ),
+        true,
+    )
+}
+
 impl Tool for BashTool {
     const NAME: &'static str = "bash";
     type Error = BashError;
@@ -98,7 +161,8 @@ impl Tool for BashTool {
         ToolDefinition {
             name: "bash".to_string(),
             description: "Run a shell command and return stdout and stderr. \
-                Use for running builds, tests, git operations, grep, and other CLI tools. \
+                Output is truncated to ~50k chars (keeping the end, like `tail`). \
+                Full output is saved to /tmp/peakbot/ and can be accessed via file_read. \
                 Commands run in /bin/sh. Default timeout is 30 seconds."
                 .to_string(),
             parameters: json!({
@@ -164,18 +228,48 @@ impl Tool for BashTool {
         match result {
             Ok(Ok(output)) => {
                 let exit_code = output.status.code().unwrap_or(-1);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout_raw = String::from_utf8_lossy(&output.stdout);
+                let stderr_raw = String::from_utf8_lossy(&output.stderr);
 
-                let stdout = maybe_truncate(&stdout);
-                let stderr = maybe_truncate(&stderr);
+                // Save full output to temp files
+                let (stdout_path, stderr_path) = match save_full_output(&stdout_raw, &stderr_raw) {
+                    Ok(paths) => paths,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "peakbot",
+                            tool_type = "bash",
+                            error = %e,
+                            "Failed to save full output to temp file"
+                        );
+                        (PathBuf::new(), PathBuf::new())
+                    }
+                };
+
+                // Truncate from beginning, keeping the end (like `tail`)
+                let (stdout, stdout_truncated) = truncate_from_beginning(&stdout_raw, MAX_OUTPUT_CHARS);
+                let (stderr, stderr_truncated) = truncate_from_beginning(&stderr_raw, MAX_OUTPUT_CHARS);
 
                 let mut result = format!("Exit code: {}\n", exit_code);
-                if !stdout.is_empty() {
+                if !stdout_raw.is_empty() {
                     result.push_str(&format!("\nSTDOUT:\n{}\n", stdout));
                 }
-                if !stderr.is_empty() {
+                if !stderr_raw.is_empty() {
                     result.push_str(&format!("\nSTDERR:\n{}\n", stderr));
+                }
+
+                // Add full output location if anything was truncated
+                if stdout_truncated || stderr_truncated {
+                    let divider = "\n─────────────────────────────────────────────────\n";
+                    result.push_str(divider);
+                    result.push_str("Full output saved to:\n");
+                    if stdout_truncated {
+                        result.push_str(&format!("  {}\n", stdout_path.display()));
+                    }
+                    if stderr_truncated {
+                        result.push_str(&format!("  {}\n", stderr_path.display()));
+                    }
+                    result.push_str("\nUse file_read tool to access the complete output.\n");
+                    result.push_str(divider);
                 }
 
                 // Add warning if file-editing pattern was detected
@@ -189,6 +283,10 @@ impl Tool for BashTool {
                     tool_type = "bash",
                     exit_code = exit_code,
                     duration_ms = start_time.elapsed().as_millis(),
+                    stdout_truncated = stdout_truncated,
+                    stderr_truncated = stderr_truncated,
+                    stdout_path = %stdout_path.display(),
+                    stderr_path = %stderr_path.display(),
                     "Bash tool completed successfully"
                 );
 
@@ -219,30 +317,5 @@ impl Tool for BashTool {
                 Err(BashError::Execution(error))
             }
         }
-    }
-}
-
-fn maybe_truncate(s: &str) -> String {
-    if s.len() > MAX_OUTPUT_CHARS {
-        // Safely truncate at the nearest character boundary to avoid
-        // panicking on multi-byte UTF-8 characters (e.g., '─' = 3 bytes)
-        let truncate_at = s
-            .get(..MAX_OUTPUT_CHARS)
-            .map(|sub| sub.len())
-            .unwrap_or_else(|| {
-                // Byte index wasn't a char boundary, find the nearest one below
-                let mut boundary = MAX_OUTPUT_CHARS;
-                while !s.is_char_boundary(boundary) {
-                    boundary -= 1;
-                }
-                boundary
-            });
-        format!(
-            "{}... [truncated, {} total chars]",
-            &s[..truncate_at],
-            s.len()
-        )
-    } else {
-        s.to_string()
     }
 }

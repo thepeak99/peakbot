@@ -1,3 +1,5 @@
+// Allow dead_code for provider-specific config structs - not all providers may be used
+// depending on build configuration. The enum variants are accessed via deserialization.
 #![allow(dead_code)]
 
 use directories_next::ProjectDirs;

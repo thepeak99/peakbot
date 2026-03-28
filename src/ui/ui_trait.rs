@@ -114,7 +114,10 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("context", "Show context usage status", false),
         SlashCommand::new("compact", "Force context compaction", false),
         SlashCommand::new("conversations", "List saved conversations", false),
-        SlashCommand::new("help", "Show help message", false),
+        SlashCommand::new("help", "Show available commands", false),
+        SlashCommand::new("clear", "Clear chat history", false),
+        SlashCommand::new("exit", "Exit the application", false),
+        SlashCommand::new("quit", "Exit the application", false),
     ]
 }
 

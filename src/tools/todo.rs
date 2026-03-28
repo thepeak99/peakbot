@@ -6,7 +6,6 @@ use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use tracing::debug;
 
 /// Status of a todo item
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -249,15 +248,6 @@ impl Tool for TodoTool {
             .todo_list
             .lock()
             .map_err(|e| TodoError::LockError(e.to_string()))?;
-
-        // TODO: REMOVE!!!
-        debug!("Todo: {:?}", args);
-        debug!("Todo state: {:?}", list);
-        let tasks = list.list();
-        for i in tasks.iter() {
-            println!("{}. {}: {}", i.id, i.task, i.status.to_string())
-        }
-        //END REMOVE
 
         match args.action.as_str() {
             "add" => {

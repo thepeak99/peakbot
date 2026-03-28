@@ -39,14 +39,11 @@ impl StateManager {
         let state_clone = state.clone();
         std::thread::spawn(move || {
             let receivers = vec![update_receiver];
-            loop {
-                // Select on receivers would be ideal, but for simplicity
-                // we just poll the update channel
-                if let Ok(update) = receivers[0].try_recv() {
-                    let mut state = state_clone.write().unwrap();
-                    *state = update;
-                }
+            while let Ok(update) = receivers[0].recv() {
+                let mut state = state_clone.write().unwrap();
+                *state = update;
             }
+            tracing::debug!("StateManager update thread exiting");
         });
 
         Self {
@@ -95,6 +92,20 @@ impl StateManager {
     pub fn update_chat(&self, message: ChatMessage) {
         let mut state = self.state.write().unwrap();
         state.chat.add_message(message);
+        self.notify_update(&state);
+    }
+
+    /// Clear all chat messages
+    pub fn clear_chat(&self) {
+        let mut state = self.state.write().unwrap();
+        state.chat.clear();
+        self.notify_update(&state);
+    }
+
+    /// Set loading state
+    pub fn set_loading(&self, loading: bool) {
+        let mut state = self.state.write().unwrap();
+        state.is_loading = loading;
         self.notify_update(&state);
     }
 

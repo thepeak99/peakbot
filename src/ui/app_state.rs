@@ -40,6 +40,10 @@ pub struct AppState {
     
     /// UI preferences
     pub preferences: UiPreferences,
+    
+    /// Whether the agent is currently processing
+    #[serde(default)]
+    pub is_loading: bool,
 }
 
 impl AppState {
@@ -72,6 +76,12 @@ impl ChatState {
     pub fn add_message(&mut self, message: ChatMessage) {
         self.messages.push(message);
         // Auto-scroll when new messages are added
+        self.auto_scroll = true;
+    }
+    
+    /// Clear all messages
+    pub fn clear(&mut self) {
+        self.messages.clear();
         self.auto_scroll = true;
     }
     
@@ -137,6 +147,20 @@ impl ChatMessage {
         let content = format!("📋 {} result: {}", tool_name, result);
         Self {
             role: MessageRole::ToolResult,
+            content,
+            timestamp: Local::now(),
+        }
+    }
+    
+    /// Create a new assistant message (alias for agent)
+    pub fn assistant(content: String) -> Self {
+        Self::agent(content)
+    }
+    
+    /// Create a new error message
+    pub fn error(content: String) -> Self {
+        Self {
+            role: MessageRole::System,
             content,
             timestamp: Local::now(),
         }

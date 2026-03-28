@@ -230,7 +230,7 @@ PeakBot includes **8 built-in tools** (all always available):
 | `file_edit` | `file_edit.rs` | Create, replace, insert text in files |
 | `file_read` | `file_read.rs` | Read files with line ranges |
 | `list_directory` | `list_directory.rs` | List directory contents with recursion |
-| `bash` | `bash.rs` | Execute shell commands with timeout |
+| `bash` | `bash.rs` | Execute shell commands with timeout, truncate to last 50k chars, save full output to temp |
 | `fetch_url` | `fetch_url.rs` | HTTP GET requests to URLs |
 | `web_search` | `search.rs` | SearXNG-based web search |
 | `think` | `think.rs` | Reasoning tool for complex thinking |
@@ -309,6 +309,8 @@ provider:
 
 ```yaml
 # Bash tool configuration (environment variables for shell commands)
+# Note: bash output is truncated to ~50k chars (keeping the end like `tail`).
+# Full output is saved to /tmp/peakbot/ and can be accessed via file_read.
 bash:
   env:
     MY_API_KEY: "secret-key-123"
