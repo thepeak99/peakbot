@@ -6,14 +6,12 @@
 //! - EventProcessor: Processes events with configurable handlers
 
 pub mod channel;
-pub mod conversation_handler;
 pub mod events;
 pub mod session_hook;
 pub mod streaming_output_handler;
 
 // Re-exports
 pub use channel::{CostHandler, create_event_channel, EventChannel, EventProcessor, EventHandler};
-pub use conversation_handler::ConversationHandler;
 pub use events::{AgentEvent, TokenUsage};
 pub use session_hook::{
     ModelPricing,

@@ -208,6 +208,7 @@ pub fn create_provider(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
+    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
 ) -> Result<(DynAgent, ProviderInfo, CostTracker, Arc<Mutex<TodoList>>, Option<mpsc::UnboundedReceiver<AgentEvent>>)> {
     match config {
         ProviderConfig::OpenRouter(c) => {
@@ -219,6 +220,7 @@ pub fn create_provider(
                 max_turns,
                 todo_tool,
                 bash_config,
+                pipeline_registry,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -237,6 +239,7 @@ pub fn create_provider(
                 max_turns,
                 todo_tool,
                 bash_config,
+                pipeline_registry,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -255,6 +258,7 @@ pub fn create_provider(
                 max_turns,
                 todo_tool,
                 bash_config,
+                pipeline_registry,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -273,6 +277,7 @@ pub fn create_provider(
                 max_turns,
                 todo_tool,
                 bash_config,
+                pipeline_registry,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -292,6 +297,8 @@ fn add_builtin_tools<M, P>(
     searxng_config: Option<&SearXngConfig>,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
+    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
+    cost_tracker: Arc<Mutex<crate::hooks::SessionStats>>,
 ) -> (
     rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
     Arc<Mutex<TodoList>>,
@@ -321,6 +328,15 @@ where
         builder = builder.tool(SearchTool::new(config));
     }
 
+    // Add DelegateTool if pipeline is enabled
+    if let Some(registry) = pipeline_registry {
+        let delegate_tool = crate::pipeline::DelegateTool::new(
+            Arc::new(registry.clone()),
+            cost_tracker,
+        );
+        builder = builder.tool(delegate_tool);
+    }
+
     (builder, todo_state)
 }
 
@@ -333,6 +349,7 @@ fn create_openrouter_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
+    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -372,9 +389,13 @@ fn create_openrouter_agent(
         .default_max_turns(max_turns)
         .hook(hook);
 
+    // Create cost tracker for this agent
+    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
+    let cost_tracker_stats = cost_tracker.get_session_stats();
+
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
-        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config);
+        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config, pipeline_registry, cost_tracker_stats);
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -389,8 +410,6 @@ fn create_openrouter_agent(
         supports_pricing: true,
     };
 
-    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
-
     Ok((agent, info, cost_tracker, todo_state, receiver))
 }
 
@@ -403,6 +422,7 @@ fn create_ollama_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
+    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -441,9 +461,12 @@ fn create_ollama_agent(
         agent_builder = agent_builder.additional_params(params);
     }
 
+    // Ollama doesn't have cost tracking, so use a dummy stats tracker
+    let dummy_stats = Arc::new(Mutex::new(crate::hooks::SessionStats::new()));
+    
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
-        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config);
+        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config, pipeline_registry, dummy_stats);
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -470,6 +493,7 @@ fn create_openai_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
+    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
 ) -> Result<(
     Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -512,9 +536,13 @@ fn create_openai_agent(
         .default_max_turns(max_turns)
         .hook(hook);
 
+    // Create cost tracker for this agent
+    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
+    let cost_tracker_stats = cost_tracker.get_session_stats();
+
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
-        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config);
+        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config, pipeline_registry, cost_tracker_stats);
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -529,8 +557,6 @@ fn create_openai_agent(
         supports_pricing: true,
     };
 
-    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
-
     Ok((agent, info, cost_tracker, todo_state, receiver))
 }
 
@@ -543,6 +569,7 @@ fn create_llamacpp_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
+    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
 ) -> Result<(
     Agent<rig::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -583,9 +610,13 @@ fn create_llamacpp_agent(
         .default_max_turns(max_turns)
         .hook(hook);
 
+    // Create cost tracker for this agent
+    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
+    let cost_tracker_stats = cost_tracker.get_session_stats();
+
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
-        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config);
+        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config, pipeline_registry, cost_tracker_stats);
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -599,8 +630,6 @@ fn create_llamacpp_agent(
         model,
         supports_pricing: true,
     };
-
-    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
 
     Ok((agent, info, cost_tracker, todo_state, receiver))
 }

@@ -7,12 +7,6 @@ use uuid::Uuid;
 /// Metadata about a conversation (stats, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationMetadata {
-    /// Total tokens used in this conversation (from Task 3 - Token Counting)
-    #[serde(default)]
-    pub total_tokens: u64,
-    /// Total API cost for this conversation (from Task 3 - Token Counting)
-    #[serde(default)]
-    pub total_cost: f64,
     /// Number of messages in the conversation
     pub message_count: usize,
 }
@@ -20,8 +14,6 @@ pub struct ConversationMetadata {
 impl Default for ConversationMetadata {
     fn default() -> Self {
         Self {
-            total_tokens: 0,
-            total_cost: 0.0,
             message_count: 0,
         }
     }
@@ -173,13 +165,6 @@ impl Conversation {
     pub fn add_tool_result(&mut self, tool_name: String, arguments: String, result: String) {
         self.messages.push(Message::tool_result(tool_name, arguments, result));
         self.metadata.message_count = self.messages.len();
-        self.updated_at = Utc::now();
-    }
-
-    /// Update token statistics
-    pub fn update_tokens(&mut self, tokens: u64, cost: f64) {
-        self.metadata.total_tokens = tokens;
-        self.metadata.total_cost = cost;
         self.updated_at = Utc::now();
     }
 

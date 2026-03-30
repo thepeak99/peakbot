@@ -2,8 +2,8 @@
 use anyhow::Result;
 use clap::Parser;
 use peakbot::{
-    AgentRunner, Config, TodoTool, build_system_prompt, create_provider, load_default_skills,
-    load_mcp_servers,
+    AgentRunner, Config, SubAgentRegistry, TodoTool, build_system_prompt, create_provider,
+    load_default_skills, load_mcp_servers,
 };
 #[cfg(feature = "tui")]
 use peakbot::ui::{Tui, Ui, UiAction};
@@ -105,6 +105,47 @@ async fn main() -> Result<()> {
     // Create the todo tool
     let todo_tool = TodoTool::new();
 
+    // Check if pipeline is enabled (we need this info before creating the provider)
+    let pipeline_enabled = config.pipeline_enabled();
+    
+    // Prepare sub-agent registry for pipeline if enabled
+    let pipeline_registry = if pipeline_enabled {
+        let pipeline_config = config.pipeline().unwrap();
+        
+        // Create API keys map from config
+        let openrouter_key = match &config.provider {
+            peakbot::ProviderConfig::OpenRouter(c) => c.api_key.clone(),
+            _ => std::env::var("OPENROUTER_API_KEY").ok(),
+        };
+        let openai_key = match &config.provider {
+            peakbot::ProviderConfig::OpenAI(c) => c.api_key.clone(),
+            _ => std::env::var("OPENAI_API_KEY").ok(),
+        };
+        let llamacpp_key = std::env::var("LLAMACPP_API_KEY").ok();
+        let llamacpp_url = std::env::var("LLAMACPP_BASE_URL").ok();
+        let ollama_url = std::env::var("OLLAMA_BASE_URL").ok();
+
+        // Create sub-agent registry
+        let registry = SubAgentRegistry::new(
+            pipeline_config,
+            openrouter_key,
+            openai_key,
+            llamacpp_key,
+            llamacpp_url,
+            ollama_url,
+        );
+
+        tracing::info!(
+            "Pipeline enabled with {} agents: {:?}",
+            config.pipeline().unwrap().agent_names().len(),
+            config.pipeline().unwrap().agent_names()
+        );
+        
+        Some(registry)
+    } else {
+        None
+    };
+
     // Create provider (agent) with all tools
     let (agent, provider_info, cost_tracker, todo_state, event_receiver) = create_provider(
         &config.provider,
@@ -114,6 +155,7 @@ async fn main() -> Result<()> {
         config.agent_max_turns,
         Some(todo_tool),
         &config.bash,
+        pipeline_registry.as_ref(),
     )?;
     tracing::info!(
         "Using provider: {} with model: {}",

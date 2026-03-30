@@ -5,14 +5,16 @@ mod context_manager;
 mod conversation;
 mod conversation_manager;
 mod hooks;
+mod pipeline;
 mod providers;
 mod skills;
 mod tools;
 pub mod ui;
 
 pub use config::{
-    BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig, OllamaConfig,
-    OpenRouterConfig, ProviderConfig, ProviderType, RetryConfig, SearXngConfig,
+    AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig,
+    OllamaConfig, OpenRouterConfig, PipelineConfig, ProviderConfig, ProviderType, RetryConfig,
+    SearXngConfig,
 };
 pub use context_manager::{CompactionResult, ContextManager};
 pub use conversation::{
@@ -22,7 +24,6 @@ pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
     // Event types
     AgentEvent,
-    ConversationHandler,
     CostHandler,
     EventChannel,
     EventHandler,
@@ -38,6 +39,7 @@ pub use hooks::{
     create_event_channel,
     fetch_model_pricing,
 };
+pub use pipeline::{DelegateTool, SubAgentRegistry};
 pub use providers::{CostTracker, DynAgent, ProviderInfo, create_provider};
 use rig::completion::Message;
 use rig::tool::ToolDyn;
@@ -326,10 +328,17 @@ impl AgentRunner {
         }
     }
 
-    /// Handle successful agent response by printing stats and todo summary
+    /// Handle successful agent response by printing stats and saving conversation
     fn handle_success(&self) {
         self.print_last_request_stats();
         self.print_todo_summary();
+        
+        // Save conversation after successful prompt
+        if let Some(ref cm) = self.conversation_manager {
+            if let Err(e) = cm.lock().unwrap().save() {
+                tracing::warn!("Failed to save conversation: {}", e);
+            }
+        }
     }
 
     /// Sync state to StateManager if present
@@ -466,19 +475,15 @@ impl AgentRunner {
         let mut chat_history: Vec<Message> = Vec::new();
 
         // Spawn event processing task if we have an event receiver
-        // This handles cost tracking and conversation persistence via events from SessionHook
+        // This handles cost tracking and streaming output via events from SessionHook
+        // Note: Conversation persistence is handled directly by AgentRunner after each prompt
         if let Some(receiver) = self.event_receiver.take() {
             let mut handlers: Vec<Arc<dyn EventHandler>> = Vec::new();
 
-            // Add cost handler
+            // Add cost handler for tracking token usage
             let stats = self.cost_tracker.get_session_stats();
             let pricing = self.cost_tracker.get_pricing().clone();
             handlers.push(Arc::new(CostHandler::new(pricing, stats)));
-
-            // Add conversation handler if enabled
-            if let Some(ref cm) = self.conversation_manager {
-                handlers.push(Arc::new(hooks::ConversationHandler::new(cm.clone())));
-            }
 
             // Add streaming output handler for real-time agent output
             handlers.push(Arc::new(StreamingOutputHandler::new()));
