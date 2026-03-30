@@ -30,7 +30,7 @@ impl fmt::Display for ProviderType {
 }
 
 /// Configuration for OpenRouter provider
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct OpenRouterConfig {
     /// OpenRouter API key
     #[serde(default)]
@@ -44,7 +44,7 @@ pub struct OpenRouterConfig {
 }
 
 /// Configuration for Ollama provider (local models)
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct OllamaConfig {
     /// Base URL (default: http://localhost:11434)
     #[serde(default = "default_ollama_url")]
@@ -60,7 +60,7 @@ pub struct OllamaConfig {
 }
 
 /// Configuration for OpenAI provider
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct OpenAIConfig {
     /// OpenAI API key
     #[serde(default)]
@@ -78,7 +78,7 @@ pub struct OpenAIConfig {
 
 /// Configuration for LlamaCpp provider (uses OpenAI-compatible completions API)
 /// This is compatible with llama.cpp's server mode which provides an OpenAI-compatible API
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct LlamaCppConfig {
     /// API key (optional for local llama.cpp instances)
     #[serde(default)]
@@ -106,7 +106,7 @@ fn default_llamacpp_url() -> String {
 }
 
 /// Provider configuration - specifies which provider and its specific config
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "config")]
 pub enum ProviderConfig {
     #[serde(rename = "openrouter")]
@@ -157,7 +157,7 @@ impl Default for LlamaCppConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct Config {
     /// LLM Provider configuration (OpenRouter or Ollama)
     #[serde(default)]
@@ -194,7 +194,7 @@ pub struct Config {
 }
 
 /// Multi-agent pipeline configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct PipelineConfig {
     /// Whether multi-agent pipelines are enabled (default: false)
     #[serde(default)]
@@ -215,7 +215,7 @@ impl Default for PipelineConfig {
 }
 
 /// Definition of a sub-agent that can be delegated to
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct AgentDefinition {
     /// Agent type (must match a provider type)
     #[serde(rename = "type")]
@@ -375,7 +375,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct McpServerConfig {
     /// Unique name for this MCP server
     pub name: String,
@@ -391,7 +391,7 @@ pub struct McpServerConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct SearXngConfig {
     /// Base URL of the SearXNG instance (e.g., "https://searx.example.com")
     pub base_url: String,
@@ -407,7 +407,7 @@ pub struct SearXngConfig {
 }
 
 /// Configuration for context compaction
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct ContextConfig {
     /// Compaction threshold (0.0-1.0), default 0.8
     /// When context usage exceeds this threshold, compaction is triggered
@@ -462,7 +462,7 @@ fn default_cost_tracking() -> bool {
 }
 
 /// Configuration for conversation persistence
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct ConversationConfig {
     /// Enable auto-save (default: true)
     #[serde(default = "default_true")]
@@ -479,7 +479,7 @@ pub struct ConversationConfig {
 }
 
 /// Configuration for the bash tool
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
 pub struct BashConfig {
     /// Environment variables to set when running bash commands
     #[serde(default)]
@@ -487,7 +487,7 @@ pub struct BashConfig {
 }
 
 /// Configuration for retry logic with exponential backoff
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts (default: 3)
     #[serde(default = "default_max_retries")]
@@ -533,6 +533,66 @@ fn default_backoff_factor() -> f64 {
 fn default_max_conversations() -> usize {
     50
 }
+impl Config {
+    /// Merge another config into this one (top-level key override).
+    /// Fields present in `other` replace the corresponding fields in `self`.
+    /// Fields absent in `other` (or left as defaults) are left unchanged.
+    ///
+    /// This implements shallow merge - if a top-level key is specified
+    /// in `other`, the entire corresponding field in `self` is replaced.
+    pub fn merge_with(&mut self, other: Config) {
+        // Only override if other has non-default provider
+        if other.provider != ProviderConfig::default() {
+            self.provider = other.provider;
+        }
+
+        // agent_max_turns - only override if explicitly set to non-default
+        if other.agent_max_turns != default_max_turns() {
+            self.agent_max_turns = other.agent_max_turns;
+        }
+
+        // mcp_servers - only override if explicitly set
+        if other.mcp_servers != None {
+            self.mcp_servers = other.mcp_servers;
+        }
+
+        // searxng - override if set
+        if other.searxng != None {
+            self.searxng = other.searxng;
+        }
+
+        // cost_tracking - only override if explicitly set to non-default
+        if other.cost_tracking != default_cost_tracking() {
+            self.cost_tracking = other.cost_tracking;
+        }
+
+        // context - always override if other has non-default
+        if other.context != ContextConfig::default() {
+            self.context = other.context;
+        }
+
+        // conversation - override if set
+        if other.conversation != None {
+            self.conversation = other.conversation;
+        }
+
+        // bash - only override if explicitly set
+        if other.bash != BashConfig::default() {
+            self.bash = other.bash;
+        }
+
+        // retry - always override if other has non-default
+        if other.retry != RetryConfig::default() {
+            self.retry = other.retry;
+        }
+
+        // pipeline - override if set
+        if other.pipeline != None {
+            self.pipeline = other.pipeline;
+        }
+    }
+}
+
 
 impl Default for Config {
     fn default() -> Self {
@@ -582,17 +642,64 @@ fn load_yaml_config() -> Option<Config> {
     Some(config)
 }
 
-impl Config {
-    /// Load configuration from YAML file first, then environment variables.
-    /// Environment variables take precedence over YAML config.
-    pub fn load() -> anyhow::Result<Self> {
-        // Start with YAML config if present, otherwise use defaults
-        let mut config = load_yaml_config().unwrap_or_default();
+/// Load per-repository configuration from `.peakbot/config.yaml` in the current working directory.
+/// If the file exists and is valid, returns the parsed config.
+/// If the file doesn't exist, returns None silently.
+/// If the file is malformed, logs a warning and returns None.
+fn load_per_repo_config() -> Option<Config> {
+    // Look for .peakbot/config.yaml in the current working directory
+    let per_repo_path = std::env::current_dir()
+        .ok()?
+        .join(".peakbot/config.yaml");
 
-        tracing::debug!("Config after YAML load: provider = {:?}", config.provider);
+    if !per_repo_path.exists() {
+        tracing::debug!("No per-repo config found at {}", per_repo_path.display());
+        return None;
+    }
+
+    let content = match std::fs::read_to_string(&per_repo_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to read .peakbot/config.yaml: {}. Ignoring.", e);
+            return None;
+        }
+    };
+
+    match serde_yaml::from_str::<Config>(&content) {
+        Ok(config) => {
+            tracing::info!("Loaded per-repo config from {}", per_repo_path.display());
+            Some(config)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to parse .peakbot/config.yaml: {}. Ignoring.", e);
+            None
+        }
+    }
+}
+
+impl Config {
+    /// Load configuration from multiple sources in priority order:
+    /// 1. Defaults (lowest priority)
+    /// 2. Master config (~/.config/peakbot/peakbot/config.yaml)
+    /// 3. Per-repo config (.peakbot/config.yaml in cwd) - top-level key override
+    /// 4. Environment variables (highest priority)
+    pub fn load() -> anyhow::Result<Self> {
+        // Step 1: Start with defaults
+        let mut config = Config::default();
+
+        // Step 2: Load and apply master config if present
+        if let Some(master) = load_yaml_config() {
+            config = master;
+            tracing::debug!("Config after master load: provider = {:?}", config.provider);
+        }
+
+        // Step 3: Load and merge per-repo config if present (top-level key override)
+        if let Some(repo_config) = load_per_repo_config() {
+            config.merge_with(repo_config);
+            tracing::debug!("Config after per-repo merge: provider = {:?}", config.provider);
+        }
 
         // Load environment variables and merge (env vars override YAML/defaults)
-
         // Check for new PROVIDER JSON config first
         if let Ok(provider_json) = std::env::var("PROVIDER")
             && !provider_json.is_empty()
@@ -816,5 +923,128 @@ impl Config {
         }
 
         Ok(config)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_with_partial_provider_override() {
+        // Master config with full OpenRouter settings
+        let mut master = Config::default();
+        if let ProviderConfig::OpenRouter(ref mut c) = master.provider {
+            c.api_key = Some("master-key".to_string());
+            c.model = "anthropic/claude-3.7-sonnet".to_string();
+            c.max_tokens = 4096;
+        }
+
+        // Per-repo config specifying a different model
+        // NOTE: With shallow merge, the entire provider object is replaced
+        let repo_config = Config {
+            provider: ProviderConfig::OpenRouter(OpenRouterConfig {
+                api_key: Some("repo-key".to_string()),
+                model: "google/gemini-2.0-flash-001".to_string(),
+                max_tokens: 8192,
+            }),
+            ..Config::default()
+        };
+
+        // Merge
+        master.merge_with(repo_config);
+
+        // With shallow merge, entire provider is replaced
+        if let ProviderConfig::OpenRouter(c) = master.provider {
+            assert_eq!(c.model, "google/gemini-2.0-flash-001");
+            assert_eq!(c.api_key, Some("repo-key".to_string()));
+            assert_eq!(c.max_tokens, 8192);
+        } else {
+            panic!("Expected OpenRouter provider");
+        }
+    }
+
+    #[test]
+    fn test_merge_preserves_master_when_repo_doesnt_override() {
+        // Master has provider configured
+        let mut master = Config::default();
+        if let ProviderConfig::OpenRouter(ref mut c) = master.provider {
+            c.api_key = Some("master-key".to_string());
+            c.model = "anthropic/claude-3.7-sonnet".to_string();
+        }
+
+        // Repo only specifies cost_tracking, not provider
+        let repo_config = Config {
+            cost_tracking: false,
+            ..Config::default()
+        };
+
+        master.merge_with(repo_config);
+
+        // Provider should be preserved from master
+        if let ProviderConfig::OpenRouter(c) = master.provider {
+            assert_eq!(c.model, "anthropic/claude-3.7-sonnet");
+            assert_eq!(c.api_key, Some("master-key".to_string()));
+        }
+        assert!(!master.cost_tracking);
+    }
+
+    #[test]
+    fn test_merge_mcp_servers_replacement() {
+        let mut master = Config::default();
+        master.mcp_servers = Some(vec![
+            McpServerConfig {
+                name: "master-server".to_string(),
+                command: "npx".to_string(),
+                args: None,
+                env: None,
+                enabled: true,
+            }
+        ]);
+
+        let repo_config = Config {
+            mcp_servers: Some(vec![
+                McpServerConfig {
+                    name: "repo-server".to_string(),
+                    command: "npx".to_string(),
+                    args: None,
+                    env: None,
+                    enabled: true,
+                }
+            ]),
+            ..Config::default()
+        };
+
+        master.merge_with(repo_config);
+
+        // Should be completely replaced by repo's servers
+        assert!(master.mcp_servers.is_some());
+        let servers = master.mcp_servers.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "repo-server");
+    }
+
+    #[test]
+    fn test_merge_context_config() {
+        let master = Config::default();
+        
+        // Repo overrides context settings
+        let repo_config = Config {
+            context: ContextConfig {
+                threshold: 0.5,
+                keep_recent: 10,
+                enabled: true,
+                context_window: Some(128000),
+            },
+            ..Config::default()
+        };
+
+        let mut merged = master;
+        merged.merge_with(repo_config);
+
+        assert_eq!(merged.context.threshold, 0.5);
+        assert_eq!(merged.context.keep_recent, 10);
+        assert_eq!(merged.context.context_window, Some(128000));
     }
 }
