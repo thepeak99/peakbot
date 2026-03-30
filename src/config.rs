@@ -5,6 +5,7 @@
 use directories_next::ProjectDirs;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 
 /// Provider type enum - identifies which LLM provider to use
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -15,6 +16,17 @@ pub enum ProviderType {
     OpenAI,
     LlamaCpp,
     Ollama,
+}
+
+impl fmt::Display for ProviderType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProviderType::OpenRouter => write!(f, "openrouter"),
+            ProviderType::OpenAI => write!(f, "openai"),
+            ProviderType::LlamaCpp => write!(f, "llamacpp"),
+            ProviderType::Ollama => write!(f, "ollama"),
+        }
+    }
 }
 
 /// Configuration for OpenRouter provider
@@ -176,6 +188,71 @@ pub struct Config {
     /// Retry configuration for API errors
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Multi-agent pipeline configuration
+    #[serde(default)]
+    pub pipeline: Option<PipelineConfig>,
+}
+
+/// Multi-agent pipeline configuration
+#[derive(Debug, Deserialize, Clone)]
+pub struct PipelineConfig {
+    /// Whether multi-agent pipelines are enabled (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Sub-agent definitions keyed by agent name
+    #[serde(default)]
+    pub agents: HashMap<String, AgentDefinition>,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            agents: HashMap::new(),
+        }
+    }
+}
+
+/// Definition of a sub-agent that can be delegated to
+#[derive(Debug, Deserialize, Clone)]
+pub struct AgentDefinition {
+    /// Agent type (must match a provider type)
+    #[serde(rename = "type")]
+    pub agent_type: ProviderType,
+
+    /// Model to use for this agent
+    /// If not specified, uses the default model for the provider type
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// System prompt / preamble for this agent
+    pub prompt: String,
+
+    /// Optional: max tokens override (uses provider default if not specified)
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+
+    /// Optional: temperature override (uses provider default if not specified)
+    #[serde(default)]
+    pub temperature: Option<f32>,
+}
+
+impl PipelineConfig {
+    /// Check if the pipeline has any agents defined
+    pub fn has_agents(&self) -> bool {
+        !self.agents.is_empty()
+    }
+
+    /// Get the names of all defined agents
+    pub fn agent_names(&self) -> Vec<&str> {
+        self.agents.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Get an agent definition by name
+    pub fn get_agent(&self, name: &str) -> Option<&AgentDefinition> {
+        self.agents.get(name)
+    }
 }
 
 impl Config {
@@ -282,6 +359,19 @@ impl Config {
     /// Get the retry configuration
     pub fn retry(&self) -> &RetryConfig {
         &self.retry
+    }
+
+    /// Get pipeline configuration if present
+    pub fn pipeline(&self) -> Option<&PipelineConfig> {
+        self.pipeline.as_ref()
+    }
+
+    /// Check if multi-agent pipelines are enabled
+    pub fn pipeline_enabled(&self) -> bool {
+        self.pipeline
+            .as_ref()
+            .map(|p| p.enabled && !p.agents.is_empty())
+            .unwrap_or(false)
     }
 }
 
@@ -461,6 +551,7 @@ impl Default for Config {
             conversation: None,
             bash: BashConfig::default(),
             retry: RetryConfig::default(),
+            pipeline: None,
         }
     }
 }

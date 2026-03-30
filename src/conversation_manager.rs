@@ -274,16 +274,6 @@ impl ConversationManager {
     pub fn add_tool_result(&mut self, tool_name: String, arguments: String, result: String) -> Result<()> {
         if let Some(ref mut conv) = self.current_conversation {
             conv.add_tool_result(tool_name, arguments, result);
-            // Auto-save is handled by the caller (ConversationHandler) to avoid nested locks
-        }
-        Ok(())
-    }
-
-    /// Update token statistics for the current conversation (without auto-save)
-    pub fn update_tokens(&mut self, tokens: u64, cost: f64) -> Result<()> {
-        if let Some(ref mut conv) = self.current_conversation {
-            conv.update_tokens(tokens, cost);
-            // Auto-save is handled by the caller (ConversationHandler) to avoid nested locks
         }
         Ok(())
     }
@@ -318,13 +308,6 @@ impl ConversationManager {
             "**Messages**: {}\n\n",
             conversation.metadata.message_count
         ));
-
-        if conversation.metadata.total_tokens > 0 {
-            md.push_str(&format!("**Total Tokens**: {}\n", conversation.metadata.total_tokens));
-        }
-        if conversation.metadata.total_cost > 0.0 {
-            md.push_str(&format!("**Total Cost**: ${:.4}\n", conversation.metadata.total_cost));
-        }
 
         md.push_str("\n---\n\n");
 
