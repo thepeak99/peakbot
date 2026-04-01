@@ -91,18 +91,8 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
         cwd, current_time
     );
 
-    // Bash tool usage guidance
-    let bash_guidance = r#"
-# Bash Tool Usage
-
-- Do NOT use `| head` or `| tail` in commands — use the head/tail parameters instead
-- The full output is always saved to /tmp/peakbot/ regardless of head/tail settings
-- Default tail is 100 lines; set tail: 0 to see all output (or use file_read on the saved file)
-"#;
-
     prompt.push_str(&skills_section);
     prompt.push_str(&env_info);
-    prompt.push_str(&bash_guidance);
     prompt.push_str(&agents_md_content);
 
     debug!("System prompt:\n {}", prompt);
@@ -342,7 +332,7 @@ impl AgentRunner {
     fn handle_success(&self) {
         self.print_last_request_stats();
         self.print_todo_summary();
-        
+
         // Save conversation after successful prompt
         if let Some(ref cm) = self.conversation_manager {
             if let Err(e) = cm.lock().unwrap().save() {
@@ -357,7 +347,7 @@ impl AgentRunner {
             // Update stats
             let stats = self.cost_tracker.get_session_stats();
             sm.update_stats(&stats);
-            
+
             // Update todo list
             if let Some(ref todo) = self.todo_state {
                 if let Ok(list) = todo.lock() {
@@ -793,8 +783,7 @@ impl AgentRunner {
                 // Calculate delay with exponential backoff
                 let delay_ms = ((retry_config.initial_delay_ms as f64)
                     * (retry_config.backoff_factor.powi(attempt as i32)))
-                .min(retry_config.max_delay_ms as f64)
-                    as u64;
+                .min(retry_config.max_delay_ms as f64) as u64;
 
                 if attempt > 0 {
                     eprintln!(
