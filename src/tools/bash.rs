@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 
-const MAX_OUTPUT_CHARS: usize = 50_000;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 600;
 const TEMP_DIR_NAME: &str = "peakbot";
@@ -28,6 +27,10 @@ pub enum BashError {
 pub struct BashArgs {
     command: String,
     timeout_seconds: Option<u64>,
+    /// Show first N lines of output (optional)
+    head: Option<usize>,
+    /// Show last N lines of output (default: 100, use 0 for all)
+    tail: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -117,35 +120,56 @@ fn save_full_output(stdout: &str, stderr: &str) -> std::io::Result<(PathBuf, Pat
     Ok((stdout_path, stderr_path))
 }
 
-/// Truncate string from the beginning, keeping the end (like `tail -c N`)
-/// Returns (truncated_string, was_truncated)
-fn truncate_from_beginning(s: &str, max_chars: usize) -> (String, bool) {
-    if s.len() <= max_chars {
+/// Apply head/tail line truncation to output
+/// Returns (displayed_output, was_modified)
+fn apply_head_tail(s: &str, head: Option<usize>, tail: Option<usize>) -> (String, bool) {
+    let lines: Vec<&str> = s.lines().collect();
+    let total_lines = lines.len();
+
+    // No truncation needed
+    if head.is_none() && tail.is_none() {
         return (s.to_string(), false);
     }
 
-    // Calculate the starting position for the last max_chars
-    let start_byte = s.len() - max_chars;
-
-    // Find the nearest char boundary from the end
-    let mut end_byte = s.len();
-    while !s.is_char_boundary(end_byte) {
-        end_byte -= 1;
+    // Only head specified
+    if let Some(h) = head {
+        if tail.is_none() {
+            if total_lines <= h {
+                return (s.to_string(), false);
+            }
+            return (lines[..h].join("\n"), true);
+        }
     }
 
-    // Find the nearest char boundary from the start
-    let mut start_byte = start_byte;
-    while !s.is_char_boundary(start_byte) {
-        start_byte += 1;
+    // Only tail specified (default 100)
+    if head.is_none() {
+        let t = tail.unwrap_or(100);
+        if t == 0 || total_lines <= t {
+            return (s.to_string(), false);
+        }
+        return (lines[total_lines - t..].join("\n"), true);
     }
 
-    let truncated = &s[start_byte..end_byte];
-    let chars_truncated = s.len() - truncated.len();
+    // Both head and tail specified
+    let h = head.unwrap_or(usize::MAX);
+    let t = tail.unwrap_or(100);
+
+    // If lines fit in head + tail, show all
+    if total_lines <= h + t {
+        return (s.to_string(), false);
+    }
+
+    // Need to truncate: head at top, tail at bottom
+    let head_lines = &lines[..h];
+    let tail_lines = &lines[total_lines - t..];
+    let middle_count = total_lines - h - t;
 
     (
         format!(
-            "[... {} chars truncated from beginning ...]\n{}",
-            chars_truncated, truncated
+            "{}\n... {} lines in between ...\n{}",
+            head_lines.join("\n"),
+            middle_count,
+            tail_lines.join("\n")
         ),
         true,
     )
@@ -161,8 +185,8 @@ impl Tool for BashTool {
         ToolDefinition {
             name: "bash".to_string(),
             description: "Run a shell command and return stdout and stderr. \
-                Output is truncated to ~50k chars (keeping the end, like `tail`). \
-                Full output is saved to /tmp/peakbot/ and can be accessed via file_read. \
+                Use `head` to show first N lines, `tail` to show last N lines (default: 100). \
+                Full output is always saved to /tmp/peakbot/ and accessible via file_read. \
                 Commands run in /bin/sh. Default timeout is 30 seconds."
                 .to_string(),
             parameters: json!({
@@ -175,6 +199,14 @@ impl Tool for BashTool {
                     "timeout_seconds": {
                         "type": "integer",
                         "description": "Optional timeout in seconds (default: 30, max: 120)"
+                    },
+                    "head": {
+                        "type": "integer",
+                        "description": "Show first N lines of output (optional)"
+                    },
+                    "tail": {
+                        "type": "integer",
+                        "description": "Show last N lines of output (default: 100, use 0 for all)"
                     }
                 },
                 "required": ["command"]
@@ -231,7 +263,7 @@ impl Tool for BashTool {
                 let stdout_raw = String::from_utf8_lossy(&output.stdout);
                 let stderr_raw = String::from_utf8_lossy(&output.stderr);
 
-                // Save full output to temp files
+                // Save full output to temp files (always saved)
                 let (stdout_path, stderr_path) = match save_full_output(&stdout_raw, &stderr_raw) {
                     Ok(paths) => paths,
                     Err(e) => {
@@ -245,9 +277,18 @@ impl Tool for BashTool {
                     }
                 };
 
-                // Truncate from beginning, keeping the end (like `tail`)
-                let (stdout, stdout_truncated) = truncate_from_beginning(&stdout_raw, MAX_OUTPUT_CHARS);
-                let (stderr, stderr_truncated) = truncate_from_beginning(&stderr_raw, MAX_OUTPUT_CHARS);
+                // Apply head/tail truncation (defaults to tail: 100)
+                let default_tail = Some(100);
+                let (stdout, stdout_modified) = apply_head_tail(
+                    &stdout_raw,
+                    args.head,
+                    args.tail.or(default_tail),
+                );
+                let (stderr, stderr_modified) = apply_head_tail(
+                    &stderr_raw,
+                    args.head,
+                    args.tail.or(default_tail),
+                );
 
                 let mut result = format!("Exit code: {}\n", exit_code);
                 if !stdout_raw.is_empty() {
@@ -257,18 +298,22 @@ impl Tool for BashTool {
                     result.push_str(&format!("\nSTDERR:\n{}\n", stderr));
                 }
 
-                // Add full output location if anything was truncated
-                if stdout_truncated || stderr_truncated {
+                // Always show full output location (it's always saved)
+                if !stdout_path.as_os_str().is_empty() || !stderr_path.as_os_str().is_empty() {
                     let divider = "\n─────────────────────────────────────────────────\n";
                     result.push_str(divider);
                     result.push_str("Full output saved to:\n");
-                    if stdout_truncated {
+                    if !stdout_path.as_os_str().is_empty() {
                         result.push_str(&format!("  {}\n", stdout_path.display()));
                     }
-                    if stderr_truncated {
+                    if !stderr_path.as_os_str().is_empty() {
                         result.push_str(&format!("  {}\n", stderr_path.display()));
                     }
-                    result.push_str("\nUse file_read tool to access the complete output.\n");
+                    if !stdout_modified && !stderr_modified {
+                        result.push_str("(output was not truncated)\n");
+                    } else {
+                        result.push_str("Use file_read tool to access the complete output.\n");
+                    }
                     result.push_str(divider);
                 }
 
@@ -283,8 +328,8 @@ impl Tool for BashTool {
                     tool_type = "bash",
                     exit_code = exit_code,
                     duration_ms = start_time.elapsed().as_millis(),
-                    stdout_truncated = stdout_truncated,
-                    stderr_truncated = stderr_truncated,
+                    stdout_modified = stdout_modified,
+                    stderr_modified = stderr_modified,
                     stdout_path = %stdout_path.display(),
                     stderr_path = %stderr_path.display(),
                     "Bash tool completed successfully"

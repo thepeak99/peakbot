@@ -263,7 +263,7 @@ impl Ui for Tui {
                 } else if key.code == crossterm::event::KeyCode::Backspace {
                     self.handle_backspace();
                 } else if key.code == crossterm::event::KeyCode::Enter {
-                    // Enter - send message or execute command
+                    // Send message or execute command
                     if !self.input_buffer.is_empty() {
                         if self.in_command_mode {
                             let _ = self.action_sender.as_ref().map(|s| s.send(UiAction::ExecuteCommand(self.input_buffer.clone())));

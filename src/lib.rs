@@ -91,8 +91,18 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
         cwd, current_time
     );
 
+    // Bash tool usage guidance
+    let bash_guidance = r#"
+# Bash Tool Usage
+
+- Do NOT use `| head` or `| tail` in commands — use the head/tail parameters instead
+- The full output is always saved to /tmp/peakbot/ regardless of head/tail settings
+- Default tail is 100 lines; set tail: 0 to see all output (or use file_read on the saved file)
+"#;
+
     prompt.push_str(&skills_section);
     prompt.push_str(&env_info);
+    prompt.push_str(&bash_guidance);
     prompt.push_str(&agents_md_content);
 
     debug!("System prompt:\n {}", prompt);
