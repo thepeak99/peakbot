@@ -338,26 +338,34 @@ pub fn render_command_popup(f: &mut Frame, app: &AppState) {
 
     let area = f.area();
     let popup_y = area.height.saturating_sub(10);
-    let popup_height = (popup_y - 3).min(8); // Max 8 items
+    let visible_height = (popup_y - 3).min(8) as usize;
     let popup_width = 50;
 
     let popup_area = Rect::new(
         2,
         popup_y,
         popup_width.min(area.width.saturating_sub(4)),
-        popup_height,
+        visible_height as u16 + 2, // +2 for border
     );
 
-    // Get the selected index from popup state
+    // Get the selected and scroll offset from popup state
     let selected_index = popup.selected_index;
+    let scroll_offset = popup.scroll_offset;
+
+    // Get visible slice of commands
+    let visible_slice: Vec<_> = commands
+        .iter()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .collect();
 
     // Build list items with selection highlighting
-    let mut items: Vec<ListItem> = commands
-        .into_iter()
-        .take(MAX_POPUP_ITEMS)
+    let mut items: Vec<ListItem> = visible_slice
+        .iter()
         .enumerate()
         .map(|(i, cmd)| {
-            let style = if i == selected_index {
+            let actual_index = scroll_offset + i;
+            let style = if actual_index == selected_index {
                 Style::default().fg(Color::White).bg(Color::Blue)
             } else {
                 Style::default().fg(Color::White).bg(Color::Black)

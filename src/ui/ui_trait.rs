@@ -129,6 +129,9 @@ pub struct CommandPopupState {
     
     /// Currently selected index in the filtered list
     pub selected_index: usize,
+    
+    /// Scroll offset for visible items
+    pub scroll_offset: usize,
 }
 
 impl CommandPopupState {
@@ -137,6 +140,7 @@ impl CommandPopupState {
         Self {
             prefix,
             selected_index: 0,
+            scroll_offset: 0,
         }
     }
     
@@ -154,22 +158,33 @@ impl CommandPopupState {
     
     /// Get the currently selected command
     pub fn selected_command(&self) -> Option<SlashCommand> {
-        self.filtered_commands().get(self.selected_index).cloned()
+        let filtered = self.filtered_commands();
+        filtered.get(self.selected_index.min(filtered.len().saturating_sub(1))).cloned()
     }
     
     /// Navigate up in the list
     pub fn navigate_up(&mut self) {
         let count = self.filtered_commands().len();
         if count > 0 {
-            self.selected_index = (self.selected_index.saturating_sub(1)) % count;
+            self.selected_index = self.selected_index.saturating_sub(1);
+            // Adjust scroll if selection moved above visible area
+            if self.selected_index < self.scroll_offset {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
         }
     }
     
     /// Navigate down in the list
     pub fn navigate_down(&mut self) {
-        let count = self.filtered_commands().len();
+        let filtered = self.filtered_commands();
+        let count = filtered.len();
         if count > 0 {
             self.selected_index = (self.selected_index + 1) % count;
+            // Adjust scroll if selection moved below visible area
+            let visible_height = 8;
+            if self.selected_index >= self.scroll_offset + visible_height {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+            }
         }
     }
 }

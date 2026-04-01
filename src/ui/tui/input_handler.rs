@@ -90,7 +90,7 @@ impl InputHandler {
     /// Check if a key event should be captured (not passed through)
     pub fn should_capture(&self, key: &KeyEvent) -> bool {
         match key.code {
-            KeyCode::Enter | KeyCode::Esc | KeyCode::Tab | KeyCode::Up | KeyCode::Down => true,
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Up | KeyCode::Down => true,
             KeyCode::Char(c) if c == 't' && key.modifiers.contains(KeyModifiers::CONTROL) => true,
             KeyCode::Char(c) if c == 'q' && key.modifiers.contains(KeyModifiers::CONTROL) => true,
             _ => false,
