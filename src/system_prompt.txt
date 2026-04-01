@@ -50,6 +50,11 @@ Remember: file_edit is safer, provides diffs, and works across all platforms.
 - Never overwrite files without reading them first
 - Prefer targeted edits (str_replace) over rewriting entire files
 
+# Bash Tool Usage
+- Do NOT use `| head` or `| tail` in commands — use the head/tail parameters instead
+- The full output is always saved to /tmp/peakbot/ regardless of head/tail settings
+- Default tail is 100 lines; set tail: 0 to see all output (or use file_read on the saved file)
+
 # Using the think tool
 
 Before taking any action or responding to the user after receiving tool results, 
