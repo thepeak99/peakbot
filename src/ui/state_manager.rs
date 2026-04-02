@@ -1,55 +1,36 @@
 //! State Manager
 //!
 //! This module provides centralized state management for all UI implementations.
-//! It keeps `AppState` in sync with the core PeakBot state (TodoList, SessionStats, etc.)
-//! and distributes updates to subscribed UIs.
+//! It serves as the single source of truth for UI-renderable state.
+//!
+//! ## MVC Model
+//!
+//! StateManager is the Model. It holds `AppState` and broadcasts changes to
+//! all subscribed Views. Controller writes to it, Views read from it.
 
 use crate::hooks::events::AgentEvent;
 use crate::hooks::session_hook::SessionStats;
 use crate::TodoList;
 use crate::ui::app_state::{
     AppState, ChatMessage, ChatState, ContextState, SessionState, TodoItem, TodoState,
+    WelcomeState,
 };
-use crate::ui::ui_trait::UiAction;
-use anyhow::Result;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 
-/// Manages AppState and distributes updates to UI
-///
-/// The StateManager serves as the single source of truth for all UI-renderable state.
-/// It synchronizes with core PeakBot components (TodoList, SessionStats, AgentRunner)
-/// and notifies UIs of state changes via channels.
+/// Manages AppState and distributes updates to subscribed Views
 pub struct StateManager {
     state: Arc<RwLock<AppState>>,
-    update_sender: Sender<AppState>,
-    action_receiver: Arc<Mutex<Receiver<UiAction>>>,
+    /// Persistent subscribers that receive every state update
+    subscribers: Arc<RwLock<Vec<Sender<AppState>>>>,
 }
 
 impl StateManager {
     /// Create a new StateManager
     pub fn new() -> Self {
-        let (update_sender, update_receiver) = mpsc::channel();
-        let (_action_sender, action_receiver) = mpsc::channel();
-
-        let state = Arc::new(RwLock::new(AppState::new()));
-
-        // Spawn a thread to process state updates
-        // This ensures updates don't block the sender
-        let state_clone = state.clone();
-        std::thread::spawn(move || {
-            let receivers = vec![update_receiver];
-            while let Ok(update) = receivers[0].recv() {
-                let mut state = state_clone.write().unwrap();
-                *state = update;
-            }
-            tracing::debug!("StateManager update thread exiting");
-        });
-
         Self {
-            state,
-            update_sender,
-            action_receiver: Arc::new(Mutex::new(action_receiver)),
+            state: Arc::new(RwLock::new(AppState::new())),
+            subscribers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -58,37 +39,31 @@ impl StateManager {
         self.state.read().unwrap().clone()
     }
 
-    /// Get state update channel for UI to subscribe
+    /// Set the welcome banner state (called once at startup by main.rs)
+    pub fn set_welcome(&self, welcome: WelcomeState) {
+        let mut state = self.state.write().unwrap();
+        state.welcome = Some(welcome);
+        // Don't broadcast — welcome is set once before the View subscribes
+    }
+
+    /// Mark the next broadcast as final (called before final agent response)
+    pub fn set_final_broadcast(&self, final_flag: bool) {
+        let mut state = self.state.write().unwrap();
+        state.is_final = final_flag;
+    }
+
+    /// Subscribe to state updates. Returns a channel that receives AppState on every change.
+    /// The sender is automatically removed when the receiver is dropped.
     pub fn subscribe(&self) -> Receiver<AppState> {
-        // For now, return a receiver that gets notified on state changes
-        // In a more sophisticated implementation, we'd use a publish-subscribe pattern
-        let state = self.state.clone();
         let (sender, receiver) = mpsc::channel();
-        
-        // Send current state immediately
-        let _ = sender.send(state.read().unwrap().clone());
-        
-        // TODO: Implement proper subscription with update notifications
+        // Send current state immediately so subscriber is up-to-date
+        let current = self.state.read().unwrap().clone();
+        let _ = sender.send(current);
+        self.subscribers.write().unwrap().push(sender);
         receiver
     }
 
-    /// Send action to be processed
-    ///
-    /// Returns a sender that can be used to send actions to this StateManager
-    pub fn action_sender(&self) -> Sender<UiAction> {
-        // We need to store this somewhere - for now, return a dummy
-        // The actual implementation would store the sender in StateManager
-        unimplemented!("Action sender not yet implemented - use action_receiver directly")
-    }
-
-     /// Receive an action from the UI
-    pub fn receive_action(&self) -> Result<UiAction> {
-        self.action_receiver.lock().unwrap().recv().map_err(|e| e.into())
-    }
-
-    /// Update chat messages
-    ///
-    /// Called by AgentRunner when new messages are added
+    /// Update chat messages — called by Controller after agent response
     pub fn update_chat(&self, message: ChatMessage) {
         let mut state = self.state.write().unwrap();
         state.chat.add_message(message);
@@ -116,12 +91,12 @@ impl StateManager {
         self.notify_update(&state);
     }
 
-    /// Update TODO state (syncs with core TodoList)
+    /// Update TODO state — syncs with core TodoList
     pub fn update_todo(&self, todo_list: &TodoList) {
         let items: Vec<TodoItem> = todo_list
             .list()
             .iter()
-            .map(|item| TodoItem::from(item))
+            .map(TodoItem::from)
             .collect();
 
         let mut state = self.state.write().unwrap();
@@ -136,16 +111,14 @@ impl StateManager {
         self.notify_update(&state);
     }
 
-    /// Update session stats (syncs with CostTracker/SessionStats)
-    pub fn update_stats(&self, stats: &Arc<std::sync::Mutex<SessionStats>>) {
+    /// Update session stats — syncs with CostTracker/SessionStats
+    pub fn update_stats(&self, stats: &Arc<Mutex<SessionStats>>) {
         let stats_lock = stats.lock().unwrap();
-        
         let mut state = self.state.write().unwrap();
         state.stats.total_input_tokens = stats_lock.total_input_tokens;
         state.stats.total_output_tokens = stats_lock.total_output_tokens;
         state.stats.total_api_calls = stats_lock.total_api_calls;
         state.stats.total_cost = stats_lock.total_cost;
-        
         self.notify_update(&state);
     }
 
@@ -163,13 +136,6 @@ impl StateManager {
         self.notify_update(&state);
     }
 
-    /// Update UI preferences
-    pub fn update_preferences(&self, preferences: crate::ui::UiPreferences) {
-        let mut state = self.state.write().unwrap();
-        state.preferences = preferences;
-        self.notify_update(&state);
-    }
-
     /// Set command popup state
     pub fn set_command_popup(&self, popup: Option<crate::ui::ui_trait::CommandPopupState>) {
         let mut state = self.state.write().unwrap();
@@ -181,59 +147,58 @@ impl StateManager {
     pub fn process_agent_event(&self, event: AgentEvent) {
         match event {
             AgentEvent::CompletionResponse { content, usage, .. } => {
-                // Update stats from token usage
                 let mut state = self.state.write().unwrap();
                 state.stats.total_input_tokens += usage.input_tokens;
                 state.stats.total_output_tokens += usage.output_tokens;
                 state.stats.total_api_calls += 1;
-                
-                // Add agent message
                 state.chat.add_message(ChatMessage::agent(content));
-                
                 self.notify_update(&state);
             }
-            AgentEvent::ToolCall { tool_name, arguments, .. } => {
-                // Add tool call message
+            AgentEvent::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
                 let mut state = self.state.write().unwrap();
-                state.chat.add_message(ChatMessage::tool_call(
-                    &tool_name,
-                    &arguments,
-                    "",
-                ));
+                state.chat.add_message(ChatMessage::tool_call(&tool_name, &arguments, ""));
                 self.notify_update(&state);
             }
-            AgentEvent::ToolResult { tool_name, result, .. } => {
-                // Add tool result message
+            AgentEvent::ToolResult {
+                tool_name, result, ..
+            } => {
                 let mut state = self.state.write().unwrap();
-                state.chat.add_message(ChatMessage::tool_result(
-                    &tool_name,
-                    &result,
-                ));
+                state.chat.add_message(ChatMessage::tool_result(&tool_name, &result));
                 self.notify_update(&state);
             }
-            // Ignore other events
-            AgentEvent::CompletionRequest { .. } |
-            AgentEvent::SessionStart { .. } |
-            AgentEvent::SessionEnd { .. } => {}
+            AgentEvent::CompletionRequest { .. }
+            | AgentEvent::SessionStart { .. }
+            | AgentEvent::SessionEnd { .. } => {}
         }
     }
 
-    /// Notify subscribers of state update
+    /// Broadcast current state to all subscribers.
+    /// Removes dead subscribers (receivers that have been dropped).
     fn notify_update(&self, state: &AppState) {
-        // Send update to all subscribers
-        let _ = self.update_sender.send(state.clone());
+        let state = state.clone();
+        let mut dead = Vec::new();
+        let mut subs = self.subscribers.write().unwrap();
+        for (i, sender) in subs.iter().enumerate() {
+            if sender.send(state.clone()).is_err() {
+                dead.push(i);
+            }
+        }
+        // Remove dead subscribers in reverse order
+        for i in dead.into_iter().rev() {
+            subs.remove(i);
+        }
     }
 
     /// Get a clone of the internal state Arc
-    ///
-    /// This allows UIs to read state without going through the StateManager
     pub fn state_arc(&self) -> Arc<RwLock<AppState>> {
         self.state.clone()
     }
 
-    /// Update the entire state
-    ///
-    /// This is used when multiple state fields have been modified
+    /// Update the entire state — used when multiple fields have been modified
     pub fn update_state(&self, new_state: AppState) {
         let mut state = self.state.write().unwrap();
         *state = new_state;
@@ -264,7 +229,6 @@ mod tests {
         let sm = StateManager::new();
         let message = ChatMessage::user("Hello".to_string());
         sm.update_chat(message);
-        
         let state = sm.get_state();
         assert_eq!(state.chat.messages.len(), 1);
         assert_eq!(state.chat.messages[0].content, "Hello");
@@ -279,13 +243,20 @@ mod tests {
         stats_lock.total_output_tokens = 50;
         stats_lock.total_api_calls = 5;
         stats_lock.total_cost = 0.123;
-        
+        drop(stats_lock);
         sm.update_stats(&stats);
-        
         let state = sm.get_state();
         assert_eq!(state.stats.total_input_tokens, 100);
         assert_eq!(state.stats.total_output_tokens, 50);
         assert_eq!(state.stats.total_api_calls, 5);
         assert!((state.stats.total_cost - 0.123).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_subscribe() {
+        let sm = StateManager::new();
+        let receiver = sm.subscribe();
+        // Should receive initial state
+        assert!(receiver.recv().is_ok());
     }
 }

@@ -8,6 +8,7 @@
 pub mod channel;
 pub mod events;
 pub mod session_hook;
+pub mod state_manager_handler;
 pub mod streaming_output_handler;
 
 // Re-exports
@@ -19,5 +20,5 @@ pub use session_hook::{
     SessionStats,
     fetch_model_pricing,
 };
-
+pub use state_manager_handler::StateManagerHandler;
 pub use streaming_output_handler::{StreamingConfig, StreamingOutputHandler, TextColor, VerbosityLevel};

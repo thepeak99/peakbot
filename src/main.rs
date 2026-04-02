@@ -1,14 +1,13 @@
-// Use the library crate (defined in lib.rs)
+//! PeakBot entry point
+
 use anyhow::Result;
 use clap::Parser;
 use peakbot::{
-    AgentRunner, Config, SubAgentRegistry, TodoTool, build_system_prompt, create_provider,
-    load_default_skills, load_mcp_servers,
+    AgentRunner, Config, SubAgentRegistry, TodoTool, UiAction, Ui, build_system_prompt,
+    create_provider, load_default_skills, load_mcp_servers,
 };
-#[cfg(feature = "tui")]
-use peakbot::ui::{Tui, Ui, UiAction};
-use peakbot::ui::StateManager;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 /// CLI arguments for PeakBot
@@ -32,7 +31,7 @@ pub enum UiMode {
 
 impl std::str::FromStr for UiMode {
     type Err = String;
-    
+
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "tui" => Ok(UiMode::Tui),
@@ -53,15 +52,12 @@ impl std::fmt::Display for UiMode {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Setup logging
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // Parse CLI arguments
     let args = Args::parse();
-    
-    // Validate TUI mode availability
+
     #[cfg(not(feature = "tui"))]
     if args.ui == UiMode::Tui {
         eprintln!("Error: TUI mode requires the 'tui' feature to be enabled.");
@@ -70,19 +66,15 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Load configuration from environment variables
+    // ── Shared setup ──────────────────────────────────────────────
     let config = Config::load()?;
-
-    // Load skills from default locations (~/.agents/skills and ./.agents/skills)
     let skills = load_default_skills()?;
-
-    // Build the system prompt dynamically with environment info and skills
+    let skills_count = skills.len(); // Keep count before moving skills
     let system_prompt = build_system_prompt(&skills);
 
-    // Load MCP servers first (async operation) - this gives us MCP tools
+    // Load MCP servers
     let mcp_handles = load_mcp_servers(&config).await?;
-
-    // Extract MCP tools from the handles (if any)
+    let mcp_tools_count = mcp_handles.len(); // Keep count before moving handles
     let mcp_tools = if mcp_handles.is_empty() {
         None
     } else {
@@ -95,24 +87,13 @@ async fn main() -> Result<()> {
         Some(all_tools)
     };
 
-    // Get SearXNG config if enabled
-    let searxng_config = if config.searxng_enabled() {
-        config.searxng.as_ref()
-    } else {
-        None
-    };
+    let searxng_config = config.searxng_enabled().then(|| config.searxng.as_ref()).flatten();
 
-    // Create the todo tool
     let todo_tool = TodoTool::new();
 
-    // Check if pipeline is enabled (we need this info before creating the provider)
-    let pipeline_enabled = config.pipeline_enabled();
-    
-    // Prepare sub-agent registry for pipeline if enabled
-    let pipeline_registry = if pipeline_enabled {
+    // Pipeline
+    let pipeline_registry = if config.pipeline_enabled() {
         let pipeline_config = config.pipeline().unwrap();
-        
-        // Create API keys map from config
         let openrouter_key = match &config.provider {
             peakbot::ProviderConfig::OpenRouter(c) => c.api_key.clone(),
             _ => std::env::var("OPENROUTER_API_KEY").ok(),
@@ -125,28 +106,19 @@ async fn main() -> Result<()> {
         let llamacpp_url = std::env::var("LLAMACPP_BASE_URL").ok();
         let ollama_url = std::env::var("OLLAMA_BASE_URL").ok();
 
-        // Create sub-agent registry
-        let registry = SubAgentRegistry::new(
+        Some(SubAgentRegistry::new(
             pipeline_config,
             openrouter_key,
             openai_key,
             llamacpp_key,
             llamacpp_url,
             ollama_url,
-        );
-
-        tracing::info!(
-            "Pipeline enabled with {} agents: {:?}",
-            config.pipeline().unwrap().agent_names().len(),
-            config.pipeline().unwrap().agent_names()
-        );
-        
-        Some(registry)
+        ))
     } else {
         None
     };
 
-    // Create provider (agent) with all tools
+    // Create provider
     let (agent, provider_info, cost_tracker, todo_state, event_receiver) = create_provider(
         &config.provider,
         mcp_tools,
@@ -157,122 +129,96 @@ async fn main() -> Result<()> {
         &config.bash,
         pipeline_registry.as_ref(),
     )?;
+
     tracing::info!(
         "Using provider: {} with model: {}",
         provider_info.name,
         provider_info.model
     );
 
-    // Create StateManager for UI state
-    let state_manager = Arc::new(StateManager::new());
-    
-    // Initialize state with current data
+    // StateManager (Model) — shared by all
+    let state_manager = Arc::new(peakbot::ui::StateManager::new());
     if let Ok(list) = todo_state.lock() {
         state_manager.update_todo(&list);
     }
-    let stats = cost_tracker.get_session_stats();
-    state_manager.update_stats(&stats);
+    state_manager.update_stats(&cost_tracker.get_session_stats());
 
-    // Run the appropriate UI based on CLI argument
+    // Channel: View → Controller
+    let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
+
+    // Create AgentRunner (Controller)
+    let mut runner = AgentRunner::new(
+        agent,
+        config.clone(),
+        provider_info.clone(),
+        skills,
+        cost_tracker,
+        Some(todo_state),
+        event_receiver,
+        Some(state_manager.clone()),
+    );
+
+    // Set up welcome banner state
+    state_manager.set_welcome(peakbot::ui::app_state::WelcomeState {
+        provider_name: provider_info.name.clone(),
+        model: provider_info.model.clone(),
+        max_tokens: config.max_tokens() as usize,
+        builtin_tools_count: 8, // file_edit, file_read, bash, list_directory, fetch_url, think, todo, search
+        mcp_tools_count,
+        skills_count,
+        searxng_enabled: config.searxng_enabled(),
+        searxng_url: config.searxng.as_ref().map(|s| s.base_url.clone()),
+        cost_tracking_enabled: config.supports_pricing() && config.cost_tracking,
+        compaction_enabled: config.context.enabled,
+        compaction_threshold: config.context.threshold,
+        compaction_keep_recent: config.context.keep_recent,
+        conversation_persistence_enabled: config.conversation_enabled(),
+        cwd: std::env::current_dir().unwrap_or_default(),
+    });
+
+    // ── Run UI ──────────────────────────────────────────────────────
     match args.ui {
         UiMode::Tui => {
             #[cfg(feature = "tui")]
             {
-                use tokio::sync::mpsc;
-                use peakbot::ui::tui::{TuiAgentRunner, RunnerEvent};
-                
-                // Create channel for TUI -> Agent communication
-                let (action_sender, mut action_receiver) = mpsc::unbounded_channel::<UiAction>();
-                
-                // Create channel for Runner -> TUI events
-                let (event_sender, mut event_receiver) = mpsc::unbounded_channel::<RunnerEvent>();
-                
-                let mut tui = Tui::new(state_manager.clone(), Some(action_sender.clone()));
-                tui.init()?;
-                
-                // Create TuiAgentRunner (takes ownership of components)
-                let mut runner = TuiAgentRunner::new(
-                    agent,
-                    config.clone(),
-                    provider_info.clone(),
-                    skills,
-                    cost_tracker,
-                    state_manager.clone(),
-                    Some(event_sender),
-                );
-                
-                // Spawn the agent runner in a separate task that processes UI actions
-                let agent_handle = tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            Some(action) = action_receiver.recv() => {
-                                match action {
-                                    UiAction::Exit => {
-                                        break;
-                                    }
-                                    _ => {
-                                        // Process action through runner
-                                        if let Err(e) = runner.process_action(action).await {
-                                            eprintln!("Error processing action: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                            Some(event) = event_receiver.recv() => {
-                                match event {
-                                    RunnerEvent::Exit => {
-                                        // Signal TUI to exit
-                                        break;
-                                    }
-                                    RunnerEvent::AgentBusy => {
-                                        tracing::debug!("Agent is processing a request");
-                                    }
-                                    RunnerEvent::AgentIdle => {
-                                        tracing::debug!("Agent is ready for next input");
-                                    }
-                                    RunnerEvent::Error(e) => {
-                                        eprintln!("Agent error: {}", e);
-                                    }
-                                    RunnerEvent::StatsUpdated => {
-                                        // Stats updated in UI
-                                    }
-                                }
-                            }
-                        }
-                    }
+                use peakbot::ui::Tui;
+
+                // Spawn controller task
+                let runner_handle = tokio::spawn(async move {
+                    runner.run_loop(action_receiver).await;
                 });
-                
-                // Run TUI loop (blocking)
+
+                // Run TUI (blocking)
+                let mut tui = Tui::new(state_manager.clone(), action_sender);
+                tui.init()?;
                 tui.run()?;
                 tui.shutdown()?;
-                
-                // Signal agent to exit
-                let _ = action_sender.send(UiAction::Exit);
-                
-                // Wait for agent to finish
-                let _ = agent_handle.await;
+
+                // Signal controller to exit
+                let _ = runner_handle.abort();
+                let _ = runner_handle.await;
             }
             #[cfg(not(feature = "tui"))]
             {
-                // TUI mode is not available - this branch should never be reached
-                // since we check and exit earlier if TUI is requested without the feature
+                unreachable!();
             }
         }
         UiMode::Repl => {
-            // Create AgentRunner for REPL mode
-            let mut agent_runner = AgentRunner::new(
-                agent,
-                config,
-                provider_info,
-                skills,
-                cost_tracker,
-                Some(todo_state),
-                event_receiver,
-                Some(state_manager),
-            );
-            
-            // Run REPL - simple stdin/stdout interface
-            agent_runner.run().await?;
+            use peakbot::ui::ReplUi;
+
+            // Spawn controller task
+            let runner_handle = tokio::spawn(async move {
+                runner.run_loop(action_receiver).await;
+            });
+
+            // Run REPL View (blocking)
+            let mut ui = ReplUi::new(state_manager.clone(), action_sender);
+            ui.init()?;
+            ui.run()?;
+            ui.shutdown()?;
+
+            let _ = runner_handle.abort();
+            let _ = runner_handle.await;
         }
     }
 
