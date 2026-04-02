@@ -62,9 +62,23 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
 
-    let agents_md_content = std::fs::read_to_string("agents.md")
+    // Load agents.md with case-insensitive filename matching
+    let agents_md_content = std::fs::read_dir(".")
+        .ok()
+        .and_then(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .find(|e| {
+                    e.path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|name| name.to_lowercase() == "agents.md")
+                        .unwrap_or(false)
+                })
+        })
+        .and_then(|entry| std::fs::read_to_string(entry.path()).ok())
         .map(|content| format!("\n# Agents.md Content\n\n--------------------------------------------------------\n{}\n", content.trim()))
-        .unwrap_or_else(|_| String::new());
+        .unwrap_or_default();
 
     let skills_section = skills.to_system_prompt_section();
 
