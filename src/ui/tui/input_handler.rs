@@ -4,7 +4,7 @@
 //! It translates raw key events into UiActions that can be processed by the UI.
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crate::ui::ui_trait::UiAction;
+use crate::ui::ui_trait::TuiAction;
 
 /// Input handler for the TUI
 ///
@@ -33,38 +33,32 @@ impl InputHandler {
         }
     }
 
-    /// Translate a key event into a UiAction
+    /// Translate a key event into a TuiAction
     ///
     /// Returns None if the key should be ignored
-    pub fn translate_key(&self, key: KeyEvent, _in_command_mode: bool, _todo_visible: bool) -> Option<UiAction> {
+    pub fn translate_key(&self, key: KeyEvent, _in_command_mode: bool, _todo_visible: bool) -> Option<TuiAction> {
         match key.code {
             KeyCode::Enter => {
-                // Send message or execute command
-                Some(UiAction::ExecuteCommand(String::new())) // Will be filled by caller
+                Some(TuiAction::SelectPopupItem)
             }
             KeyCode::Esc => {
-                // Cancel popup or exit
-                Some(UiAction::CancelPopup)
+                Some(TuiAction::CancelPopup)
             }
             KeyCode::Tab => {
-                // Select popup item
-                Some(UiAction::SelectPopupItem)
+                Some(TuiAction::SelectPopupItem)
             }
             KeyCode::Up | KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Navigate up in popup
-                Some(UiAction::NavigatePopup(-1))
+                Some(TuiAction::NavigatePopup(-1))
             }
             KeyCode::Down | KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Navigate down in popup
-                Some(UiAction::NavigatePopup(1))
+                Some(TuiAction::NavigatePopup(1))
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Toggle TODO panel
-                Some(UiAction::ToggleTodoPanel)
+                Some(TuiAction::ToggleTodoPanel)
             }
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Quit
-                Some(UiAction::Exit)
+                // Exit is handled by UiAction, not here
+                return None;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Interrupt/Cancel
@@ -160,7 +154,7 @@ mod tests {
         let handler = InputHandler::new();
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
         let action = handler.translate_key(key, false, false);
-        assert_eq!(action, Some(UiAction::CancelPopup));
+        assert_eq!(action, Some(TuiAction::CancelPopup));
     }
 
     #[test]
@@ -168,7 +162,7 @@ mod tests {
         let handler = InputHandler::new();
         let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
         let action = handler.translate_key(key, false, false);
-        assert_eq!(action, Some(UiAction::ToggleTodoPanel));
+        assert_eq!(action, Some(TuiAction::ToggleTodoPanel));
     }
 
     #[test]
@@ -176,7 +170,8 @@ mod tests {
         let handler = InputHandler::new();
         let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
         let action = handler.translate_key(key, false, false);
-        assert_eq!(action, Some(UiAction::Exit));
+        // Ctrl+Q returns None — exit is handled by the main TUI loop via key.code check
+        assert!(action.is_none());
     }
 
     #[test]

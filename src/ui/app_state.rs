@@ -4,7 +4,7 @@
 //! It mirrors the patterns from ui-example.rs while being compatible
 //! with existing PeakBot types (TodoList, SessionStats, etc.).
 
-use crate::ui::ui_trait::CommandPopupState;
+use crate::ui::ui_trait::{CommandPopupState, TodoItemAction};
 use crate::tools::todo::TodoItem as CoreTodoItem;
 use crate::TodoStatus;
 use chrono::{DateTime, Local};
@@ -44,6 +44,13 @@ pub struct AppState {
     /// Whether the agent is currently processing
     #[serde(default)]
     pub is_loading: bool,
+
+    /// Welcome banner — populated once at startup, never changes
+    pub welcome: Option<WelcomeState>,
+
+    /// Whether this state update is the final broadcast after a prompt completed
+    #[serde(default)]
+    pub is_final: bool,
 }
 
 impl AppState {
@@ -228,10 +235,10 @@ impl TodoState {
     }
     
     /// Update a TODO item by index
-    pub fn update_item(&mut self, index: usize, action: super::ui_trait::TodoItemAction) -> Option<TodoItem> {
+    pub fn update_item(&mut self, index: usize, action: TodoItemAction) -> Option<TodoItem> {
         if let Some(item) = self.items.get_mut(index) {
             match action {
-                super::ui_trait::TodoItemAction::ToggleComplete => {
+                TodoItemAction::ToggleComplete => {
                     item.completed = !item.completed;
                     if item.completed {
                         item.status = TodoStatus::Completed;
@@ -239,11 +246,11 @@ impl TodoState {
                         item.status = TodoStatus::Pending;
                     }
                 }
-                super::ui_trait::TodoItemAction::UpdateStatus(status) => {
+                TodoItemAction::UpdateStatus(status) => {
                     item.status = status.clone();
                     item.completed = matches!(status, TodoStatus::Completed);
                 }
-                super::ui_trait::TodoItemAction::Delete => {
+                TodoItemAction::Delete => {
                     return Some(self.items.remove(index));
                 }
             }
@@ -348,6 +355,10 @@ pub struct InputState {
     /// Whether the input is in command mode (after typing /)
     #[serde(default)]
     pub in_command_mode: bool,
+    
+    /// Number of wrapped lines in the input (for dynamic height)
+    #[serde(default)]
+    pub wrapped_lines: usize,
 }
 
 impl InputState {
@@ -361,6 +372,7 @@ impl InputState {
         self.buffer.clear();
         self.cursor_pos = 0;
         self.in_command_mode = false;
+        self.wrapped_lines = 0;
     }
     
     /// Check if the buffer is empty
@@ -376,6 +388,11 @@ impl InputState {
     /// Set the cursor position
     pub fn set_cursor(&mut self, pos: usize) {
         self.cursor_pos = pos.min(self.buffer.len());
+    }
+    
+    /// Set the wrapped line count
+    pub fn set_wrapped_lines(&mut self, lines: usize) {
+        self.wrapped_lines = lines;
     }
 }
 
@@ -530,4 +547,23 @@ fn default_font_size() -> u8 {
 
 fn default_true() -> bool {
     true
+}
+
+/// Welcome banner state — populated once at startup
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WelcomeState {
+    pub provider_name: String,
+    pub model: String,
+    pub max_tokens: usize,
+    pub builtin_tools_count: usize,
+    pub mcp_tools_count: usize,
+    pub skills_count: usize,
+    pub searxng_enabled: bool,
+    pub searxng_url: Option<String>,
+    pub cost_tracking_enabled: bool,
+    pub compaction_enabled: bool,
+    pub compaction_threshold: f64,
+    pub compaction_keep_recent: usize,
+    pub conversation_persistence_enabled: bool,
+    pub cwd: std::path::PathBuf,
 }

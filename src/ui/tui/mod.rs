@@ -6,8 +6,6 @@
 
 pub mod input_handler;
 pub mod renderer;
-pub mod runner;
 pub mod tui_impl;
 
-pub use runner::{TuiAgentRunner, RunnerEvent};
 pub use tui_impl::Tui;

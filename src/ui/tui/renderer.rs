@@ -6,7 +6,8 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    text::{Line, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -120,7 +121,7 @@ pub fn render_chat_area(f: &mut Frame, area: Rect, chat: &ChatState) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(1), // Left border
-            Constraint::Fill(1),   // Chat content
+            Constraint::Fill(1),  // Chat content
             Constraint::Length(1), // Right border
         ])
         .split(area);
@@ -132,11 +133,11 @@ pub fn render_chat_area(f: &mut Frame, area: Rect, chat: &ChatState) {
 
     let chat_area = chunks[1];
 
-    // Build message text from state
-    let mut message_text = String::new();
+    // Build message text with proper word wrapping
+    let mut message_lines: Vec<Line> = Vec::new();
 
     if chat.messages.is_empty() {
-        message_text.push_str("Welcome to PeakBot! Start a conversation or use /help for commands.");
+        message_lines.push(Line::from("Welcome to PeakBot! Start a conversation or use /help for commands."));
     } else {
         for msg in &chat.messages {
             let (prefix, _color) = match msg.role {
@@ -148,45 +149,138 @@ pub fn render_chat_area(f: &mut Frame, area: Rect, chat: &ChatState) {
             };
             
             let timestamp = msg.timestamp.format("%H:%M:%S").to_string();
-            message_text.push_str(&format!(
-                "\n[{}] {}:\n{}\n",
-                timestamp, prefix, msg.content
-            ));
+            
+            // Add header line
+            message_lines.push(Line::from(format!("[{}] {}:", timestamp, prefix)));
+            
+            // Add content with word wrapping (respecting terminal width)
+            // We'll wrap at the available width minus some padding
+            let wrap_width = (chat_area.width.saturating_sub(4)) as usize;
+            let content = wrap_text(&msg.content, wrap_width);
+            message_lines.extend(content);
+            
+            // Add empty line between messages
+            message_lines.push(Line::from(""));
         }
     }
 
-    // Calculate the scroll offset
-    let content_lines = message_text.lines().count();
+    // Count actual rendered lines (after wrapping)
+    let content_lines = message_lines.len();
     let view_height = chat_area.height.saturating_sub(2) as usize; // Account for borders
 
-    // Calculate auto-scroll: if content exceeds view and auto_scroll is enabled
+    // Calculate scroll offset
     let scroll_offset = if chat.auto_scroll && content_lines > view_height {
-        // Scroll to show the latest messages
+        // Auto-scroll to bottom
         content_lines.saturating_sub(view_height)
-    } else if !chat.auto_scroll {
-        // Manual scroll offset (already tracked in state)
-        chat.scroll_offset
     } else {
-        // No scroll needed
-        0
+        // Clamp manual scroll offset
+        chat.scroll_offset.min(content_lines.saturating_sub(view_height).saturating_sub(1))
     };
 
-    let mut paragraph = Paragraph::new(message_text)
+    // Get visible lines
+    let visible_lines: Vec<Line> = message_lines
+        .into_iter()
+        .skip(scroll_offset)
+        .take(view_height)
+        .collect();
+
+    let paragraph = Paragraph::new(Text::from(visible_lines))
         .style(Style::default().fg(Color::LightCyan))
         .block(
             Block::default()
                 .title(" Chat Messages ")
                 .borders(Borders::ALL),
         );
-
-    // Apply scroll offset
-    paragraph = paragraph.scroll((scroll_offset as u16, 0));
     f.render_widget(paragraph, chat_area);
+
+    // Render scrollbar if content exceeds view
+    if content_lines > view_height {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(Color::DarkGray));
+        let mut scroll_state = ScrollbarState::new(content_lines)
+            .position(scroll_offset);
+        f.render_stateful_widget(scrollbar, chat_area, &mut scroll_state);
+    }
 
     let right_border = Paragraph::new("│")
         .style(Style::default().fg(Color::DarkGray))
         .block(Block::default().borders(Borders::NONE));
     f.render_widget(right_border, chunks[2]);
+}
+
+/// Wrap text to fit within a maximum width, breaking on word boundaries
+fn wrap_text(text: &str, max_width: usize) -> Vec<Line> {
+    if max_width == 0 {
+        return vec![Line::from(text)];
+    }
+
+    let mut lines = Vec::new();
+    
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+
+        let mut current_line = String::new();
+        
+        for word in paragraph.split_whitespace() {
+            let word_len = word.chars().count();
+            
+            if current_line.is_empty() {
+                if word_len > max_width {
+                    // Word is longer than max width, need to break it
+                    let mut chars_remaining = word_len;
+                    let mut chars_on_line = 0;
+                    for c in word.chars() {
+                        if chars_on_line >= max_width {
+                            lines.push(Line::from(current_line.clone()));
+                            current_line.clear();
+                            chars_on_line = 0;
+                        }
+                        current_line.push(c);
+                        chars_on_line += 1;
+                        chars_remaining -= 1;
+                    }
+                } else {
+                    current_line.push_str(word);
+                }
+            } else if current_line.chars().count() + 1 + word_len <= max_width {
+                // Word fits on current line
+                current_line.push(' ');
+                current_line.push_str(word);
+            } else {
+                // Word doesn't fit, start new line
+                lines.push(Line::from(current_line.clone()));
+                if word_len > max_width {
+                    // Word is longer than max width, need to break it
+                    let mut chars_on_line = 0;
+                    for c in word.chars() {
+                        if chars_on_line >= max_width {
+                            lines.push(Line::from(current_line.clone()));
+                            current_line.clear();
+                            chars_on_line = 0;
+                        }
+                        current_line.push(c);
+                        chars_on_line += 1;
+                    }
+                } else {
+                    current_line.clear();
+                    current_line.push_str(word);
+                }
+            }
+        }
+        
+        if !current_line.is_empty() {
+            lines.push(Line::from(current_line));
+        }
+    }
+    
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    
+    lines
 }
 
 /// Render the TODO panel
@@ -286,7 +380,24 @@ pub fn render_input_area(f: &mut Frame, area: Rect, input: &InputState) {
         " Message "
     };
 
-    let input_paragraph = Paragraph::new(input_text)
+    // Calculate wrap width for input (accounting for block borders and padding)
+    let wrap_width = (chunks[0].width.saturating_sub(2)) as usize;
+    
+    // Wrap input text to fit in the available width
+    let wrapped_lines = wrap_text(input_text, wrap_width);
+    
+    // Take only the first few lines that fit in the input area
+    let max_input_lines = area.height.saturating_sub(2) as usize;
+    let visible_lines: Vec<Line> = wrapped_lines
+        .into_iter()
+        .take(max_input_lines)
+        .collect();
+    
+    let input_paragraph = if visible_lines.is_empty() {
+        Paragraph::new("")
+    } else {
+        Paragraph::new(Text::from(visible_lines))
+    }
         .style(input_style)
         .block(Block::default().title(input_title).borders(Borders::ALL));
     f.render_widget(input_paragraph, chunks[0]);

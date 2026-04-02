@@ -3,24 +3,14 @@
 //! This module provides a clean abstraction between the core PeakBot logic
 //! and various UI implementations (TUI, Web, Mobile, REPL).
 //!
-//! Architecture:
-//! ```
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                         UI Layer                                │
-//! ├─────────────────┬─────────────────┬─────────────────────────────┤
-//! │   TUI           │   Web UI        │   Mobile UI                 │
-//! │   (ratatui)     │   (Axum/WS)     │   (Flutter/RN)              │
-//! ├─────────────────┴─────────────────┴─────────────────────────────┤
-//! │                    UI Abstraction Layer                        │
-//! │              (ui_trait.rs, app_state.rs)                       │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │                      State Layer                                │
-//! │         (AppState, state updates via channels)                 │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │                     Core Logic Layer                           │
-//! │   AgentRunner, Tools, Providers, ContextManager, etc.          │
-//! └─────────────────────────────────────────────────────────────────┘
-//! ```
+//! ## MVC Architecture
+//!
+//! - **Model** (`StateManager`): single source of truth for UI state. Broadcasts to subscribers.
+//! - **View** (`Ui` impls): read state from Model, render to screen, send user input to Controller.
+//! - **Controller** (`AgentRunner`): receive input from View, call agent, write to Model.
+//!
+//! Data flows one way only:
+//!   View ──UiAction──► Controller ──writes──► Model ──broadcasts──► View
 
 pub mod app_state;
 pub mod state_manager;
