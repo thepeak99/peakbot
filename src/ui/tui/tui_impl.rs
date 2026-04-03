@@ -247,7 +247,11 @@ impl Ui for Tui {
                 } else if key.code == crossterm::event::KeyCode::Backspace {
                     self.handle_backspace();
                 } else if key.code == crossterm::event::KeyCode::Enter {
-                    if !self.input_buffer.is_empty() {
+                    if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                        // Shift+Enter inserts a newline
+                        self.input_buffer.push('\n');
+                        self.update_input_state();
+                    } else if !self.input_buffer.is_empty() {
                         if self.in_command_mode {
                             self.send_action(UiAction::ExecuteCommand(
                                 self.input_buffer.clone(),

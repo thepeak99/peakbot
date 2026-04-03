@@ -19,6 +19,9 @@ const MAX_TODO_ITEMS_DISPLAY: usize = 7;
 /// Maximum number of commands to show in popup
 const MAX_POPUP_ITEMS: usize = 8;
 
+/// Maximum input height in lines (input will grow up to this)
+const MAX_INPUT_LINES: usize = 6;
+
 /// Calculate the TODO panel height based on number of items
 fn calculate_todo_panel_height(todo: &TodoState) -> usize {
     if !todo.visible {
@@ -27,6 +30,26 @@ fn calculate_todo_panel_height(todo: &TodoState) -> usize {
     let item_count = todo.items.len().min(MAX_TODO_ITEMS_DISPLAY);
     // Panel height = items + top border + bottom border
     item_count + 2
+}
+
+/// Calculate the input area height based on content
+fn calculate_input_height(input: &InputState, width: u16) -> usize {
+    if input.buffer.is_empty() {
+        return 3; // Minimum height
+    }
+    // The available width inside the message box is width - 2 for borders
+    let available_width = width.saturating_sub(2) as usize;
+    if available_width == 0 {
+        return 3;
+    }
+    // Count actual newlines + estimate wrapped lines
+    let newline_count = input.buffer.chars().filter(|&c| c == '\n').count();
+    let char_count = input.buffer.len();
+    let estimated_wrapped_lines = (char_count / available_width) + 1;
+    // Add 1 for the line the cursor is on, +1 extra buffer so text isn't cramped
+    let total_lines = newline_count + estimated_wrapped_lines + 2;
+    // Clamp between min (3) and max (6)
+    total_lines.min(MAX_INPUT_LINES).max(3)
 }
 
 /// Render any active popup
@@ -52,13 +75,16 @@ pub fn ui(f: &mut Frame, app: &AppState) {
         Constraint::Length(0)
     };
 
+    // Calculate dynamic input height based on content and terminal width
+    let input_height = calculate_input_height(&app.input, size.width) as u16;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Title bar
             Constraint::Fill(1),   // Chat area
-            todo_constraint,       // TODO panel (dynamic height)
-            Constraint::Length(3), // Input area
+            todo_constraint,        // TODO panel (dynamic height)
+            Constraint::Length(input_height), // Input area (dynamic height)
             Constraint::Length(1), // Status bar
         ])
         .split(size);
@@ -352,16 +378,8 @@ pub fn render_todo_panel(f: &mut Frame, area: Rect, todo: &TodoState) {
 ///
 /// Takes only InputState - doesn't need or want access to todo or chat state
 pub fn render_input_area(f: &mut Frame, area: Rect, input: &InputState) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Fill(1),    // Input field
-            Constraint::Length(30), // Send button
-        ])
-        .split(area);
-
     let input_text = if input.buffer.is_empty() {
-        "💬 Type your message... (use / for commands)"
+        "💬 Message..."
     } else {
         &input.buffer
     };
@@ -380,32 +398,11 @@ pub fn render_input_area(f: &mut Frame, area: Rect, input: &InputState) {
         " Message "
     };
 
-    // Calculate wrap width for input (accounting for block borders and padding)
-    let wrap_width = (chunks[0].width.saturating_sub(2)) as usize;
-    
-    // Wrap input text to fit in the available width
-    let wrapped_lines = wrap_text(input_text, wrap_width);
-    
-    // Take only the first few lines that fit in the input area
-    let max_input_lines = area.height.saturating_sub(2) as usize;
-    let visible_lines: Vec<Line> = wrapped_lines
-        .into_iter()
-        .take(max_input_lines)
-        .collect();
-    
-    let input_paragraph = if visible_lines.is_empty() {
-        Paragraph::new("")
-    } else {
-        Paragraph::new(Text::from(visible_lines))
-    }
+    let input_paragraph = Paragraph::new(input_text)
         .style(input_style)
+        .wrap(ratatui::widgets::Wrap { trim: false })
         .block(Block::default().title(input_title).borders(Borders::ALL));
-    f.render_widget(input_paragraph, chunks[0]);
-
-    let send_button = Paragraph::new("↵ Send")
-        .style(Style::default().fg(Color::LightGreen))
-        .block(Block::default().title(" Actions ").borders(Borders::ALL));
-    f.render_widget(send_button, chunks[1]);
+    f.render_widget(input_paragraph, area);
 }
 
 /// Render the status bar
