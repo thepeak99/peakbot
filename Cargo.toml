@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 rig-core = { version = "0.33", features = ["rmcp"] }
-rmcp = { version = "0.16", features = ["client", "transport-child-process"] }
+rmcp = { version = "0.16", features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

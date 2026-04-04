@@ -375,20 +375,83 @@ impl Config {
     }
 }
 
+/// MCP transport type (matches Claude/Continue SDK format)
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransportType {
+    /// Standard I/O transport (spawns a local process)
+    #[default]
+    Stdio,
+    /// Server-Sent Events over HTTP
+    Sse,
+    /// Streamable HTTP transport (recommended for remote servers)
+    StreamableHttp,
+}
+
+impl fmt::Display for McpTransportType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            McpTransportType::Stdio => write!(f, "stdio"),
+            McpTransportType::Sse => write!(f, "sse"),
+            McpTransportType::StreamableHttp => write!(f, "streamable-http"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct McpServerConfig {
     /// Unique name for this MCP server
     pub name: String,
-    /// Command to run
-    pub command: String,
-    /// Arguments for the command
+    /// Transport type: "stdio" (default), "sse", or "streamable-http"
+    /// For "stdio": command/args/env are required
+    /// For "sse"/"streamable-http": url is required
+    #[serde(default)]
+    #[serde(rename = "type")]
+    pub transport_type: McpTransportType,
+    /// Command to run (required for stdio transport)
+    pub command: Option<String>,
+    /// Arguments for the command (optional)
     #[serde(default)]
     pub args: Option<Vec<String>>,
-    /// Environment variables
+    /// Environment variables (optional)
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+    /// URL for remote transports (sse, streamable-http)
+    pub url: Option<String>,
+    /// Enable/disable this server (default: true)
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl McpServerConfig {
+    /// Returns the transport type for this config
+    pub fn transport_type(&self) -> McpTransportType {
+        self.transport_type.clone()
+    }
+
+    /// Validates the configuration based on transport type.
+    /// Returns Ok(()) if valid, or Err with an error message.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.transport_type {
+            McpTransportType::Stdio => {
+                if self.command.is_none() || self.command.as_ref().unwrap().is_empty() {
+                    return Err(format!(
+                        "MCP server '{}': 'command' is required for stdio transport",
+                        self.name
+                    ));
+                }
+            }
+            McpTransportType::Sse | McpTransportType::StreamableHttp => {
+                if self.url.is_none() || self.url.as_ref().unwrap().is_empty() {
+                    return Err(format!(
+                        "MCP server '{}': 'url' is required for {} transport",
+                        self.name, self.transport_type
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -996,9 +1059,11 @@ mod tests {
         master.mcp_servers = Some(vec![
             McpServerConfig {
                 name: "master-server".to_string(),
-                command: "npx".to_string(),
+                transport_type: McpTransportType::Stdio,
+                command: Some("npx".to_string()),
                 args: None,
                 env: None,
+                url: None,
                 enabled: true,
             }
         ]);
@@ -1007,9 +1072,11 @@ mod tests {
             mcp_servers: Some(vec![
                 McpServerConfig {
                     name: "repo-server".to_string(),
-                    command: "npx".to_string(),
+                    transport_type: McpTransportType::Stdio,
+                    command: Some("npx".to_string()),
                     args: None,
                     env: None,
+                    url: None,
                     enabled: true,
                 }
             ]),
