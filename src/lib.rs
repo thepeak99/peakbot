@@ -13,8 +13,8 @@ pub mod ui;
 
 pub use config::{
     AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig,
-    OllamaConfig, OpenRouterConfig, PipelineConfig, ProviderConfig, ProviderType, RetryConfig,
-    SearXngConfig,
+    McpTransportType, OllamaConfig, OpenRouterConfig, PipelineConfig, ProviderConfig,
+    ProviderType, RetryConfig, SearXngConfig,
 };
 pub use context_manager::{CompactionResult, ContextManager};
 pub use conversation::{
@@ -31,7 +31,7 @@ pub use providers::{CostTracker, DynAgent, ProviderInfo, create_provider};
 use rig::completion::Message;
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
-use rmcp::transport::TokioChildProcess;
+use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpClientTransport};
 pub use skills::{SkillRegistry, load_default_skills};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
@@ -1059,9 +1059,10 @@ impl AgentRunner {
 /// A handle to an MCP server connection that keeps the service alive
 pub struct McpServerHandle {
     #[allow(unused)]
-    service: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-    tools: Vec<McpTool>,
     name: String,
+    tools: Vec<McpTool>,
+    // Box for type erasure - allows stdio and HTTP transports to coexist
+    service: Box<dyn std::any::Any + Send + Sync>,
 }
 
 impl McpServerHandle {
@@ -1079,7 +1080,25 @@ impl McpServerHandle {
 }
 
 pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpServerHandle> {
-    let command = &config.command;
+    // Validate configuration
+    if let Err(e) = config.validate() {
+        return Err(anyhow::anyhow!("Invalid MCP server config: {}", e));
+    }
+
+    match config.transport_type() {
+        McpTransportType::Stdio => connect_mcp_stdio(config).await,
+        McpTransportType::Sse | McpTransportType::StreamableHttp => {
+            connect_mcp_http(config).await
+        }
+    }
+}
+
+/// Connect to an MCP server using stdio transport (spawns a local process)
+async fn connect_mcp_stdio(config: &McpServerConfig) -> Result<McpServerHandle> {
+    let command = config
+        .command
+        .as_ref()
+        .ok_or_else(|| anyhow!("stdio transport requires 'command'"))?;
 
     let mut cmd = tokio::process::Command::new(command);
     if let Some(args) = &config.args {
@@ -1121,9 +1140,56 @@ pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpServerHan
     tracing::info!("MCP server '{}' has {} tools", config.name, tools.len());
 
     Ok(McpServerHandle {
-        service,
-        tools,
         name: config.name.clone(),
+        tools,
+        service: Box::new(service),
+    })
+}
+
+/// Connect to an MCP server using HTTP transport (remote server)
+async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
+    let url = config
+        .url
+        .as_ref()
+        .ok_or_else(|| anyhow!("HTTP transport requires 'url'"))?;
+
+    tracing::info!(
+        "Connecting to MCP server '{}' at {}",
+        config.name,
+        url
+    );
+
+    // Create the HTTP transport using reqwest
+    let transport = StreamableHttpClientTransport::from_uri(url.clone());
+
+    let service = ()
+        .serve(transport)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?;
+
+    let server_info = service
+        .peer_info()
+        .ok_or_else(|| anyhow!("Can't get MCP info"))?;
+    tracing::info!(
+        "Connected to MCP server '{}': ({}:{})",
+        config.name,
+        server_info.server_info.name,
+        server_info.server_info.version
+    );
+
+    let tools = service
+        .list_all_tools()
+        .await?
+        .into_iter()
+        .map(|tool| McpTool::from_mcp_server(tool, service.clone()))
+        .collect::<Vec<_>>();
+
+    tracing::info!("MCP server '{}' has {} tools", config.name, tools.len());
+
+    Ok(McpServerHandle {
+        name: config.name.clone(),
+        tools,
+        service: Box::new(service),
     })
 }
 
@@ -1173,9 +1239,11 @@ mod tests {
 
         let config = McpServerConfig {
             name: "test_invalid".to_string(),
-            command: "nonexistent_command_xyz123".to_string(),
+            transport_type: McpTransportType::Stdio,
+            command: Some("nonexistent_command_xyz123".to_string()),
             args: None,
             env: Some(env),
+            url: None,
             enabled: true,
         };
 
@@ -1187,13 +1255,15 @@ mod tests {
     async fn test_connect_mcp_server_hello() {
         let config = McpServerConfig {
             name: "hello-mcp-server".to_string(),
-            command: "uvx".to_string(),
+            transport_type: McpTransportType::Stdio,
+            command: Some("uvx".to_string()),
             args: Some(vec![
                 "--from".to_string(),
                 "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
                 "hello-mcp-server".to_string(),
             ]),
             env: None,
+            url: None,
             enabled: true,
         };
 
@@ -1212,13 +1282,15 @@ mod tests {
 
         let config = McpServerConfig {
             name: "hello-mcp-server-with-env".to_string(),
-            command: "uvx".to_string(),
+            transport_type: McpTransportType::Stdio,
+            command: Some("uvx".to_string()),
             args: Some(vec![
                 "--from".to_string(),
                 "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
                 "hello-mcp-server".to_string(),
             ]),
             env: Some(env),
+            url: None,
             enabled: true,
         };
 
@@ -1236,13 +1308,15 @@ mod tests {
     async fn test_connect_mcp_server_call_tool() {
         let config = McpServerConfig {
             name: "hello-mcp-server".to_string(),
-            command: "uvx".to_string(),
+            transport_type: McpTransportType::Stdio,
+            command: Some("uvx".to_string()),
             args: Some(vec![
                 "--from".to_string(),
                 "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
                 "hello-mcp-server".to_string(),
             ]),
             env: None,
+            url: None,
             enabled: true,
         };
 
@@ -1267,5 +1341,100 @@ mod tests {
             !result.is_empty(),
             "Expected non-empty result from tool call"
         );
+    }
+
+    #[test]
+    fn test_mcp_transport_type_deserialization() {
+        // Test stdio (default)
+        let yaml = r#"
+name: test-stdio
+command: npx
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.transport_type, McpTransportType::Stdio);
+        assert_eq!(config.command.as_ref().unwrap(), "npx");
+        assert!(config.url.is_none());
+
+        // Test explicit stdio
+        let yaml = r#"
+name: test-explicit-stdio
+type: stdio
+command: npx
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.transport_type, McpTransportType::Stdio);
+
+        // Test SSE
+        let yaml = r#"
+name: test-sse
+type: sse
+url: https://example.com/mcp
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.transport_type, McpTransportType::Sse);
+        assert!(config.command.is_none());
+        assert_eq!(config.url.as_ref().unwrap(), "https://example.com/mcp");
+
+        // Test streamable-http (hyphens are removed in lowercase serde)
+        let yaml = r#"
+name: test-http
+type: streamablehttp
+url: https://example.com/mcp
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.transport_type, McpTransportType::StreamableHttp);
+        assert!(config.command.is_none());
+        assert_eq!(config.url.as_ref().unwrap(), "https://example.com/mcp");
+    }
+
+    #[test]
+    fn test_mcp_config_validation() {
+        // Valid stdio config
+        let config = McpServerConfig {
+            name: "test".to_string(),
+            transport_type: McpTransportType::Stdio,
+            command: Some("npx".to_string()),
+            args: None,
+            env: None,
+            url: None,
+            enabled: true,
+        };
+        assert!(config.validate().is_ok());
+
+        // Invalid stdio (missing command)
+        let config = McpServerConfig {
+            name: "test".to_string(),
+            transport_type: McpTransportType::Stdio,
+            command: None,
+            args: None,
+            env: None,
+            url: None,
+            enabled: true,
+        };
+        assert!(config.validate().is_err());
+
+        // Valid HTTP config
+        let config = McpServerConfig {
+            name: "test".to_string(),
+            transport_type: McpTransportType::Sse,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("https://example.com/mcp".to_string()),
+            enabled: true,
+        };
+        assert!(config.validate().is_ok());
+
+        // Invalid HTTP (missing url)
+        let config = McpServerConfig {
+            name: "test".to_string(),
+            transport_type: McpTransportType::Sse,
+            command: None,
+            args: None,
+            env: None,
+            url: None,
+            enabled: true,
+        };
+        assert!(config.validate().is_err());
     }
 }
