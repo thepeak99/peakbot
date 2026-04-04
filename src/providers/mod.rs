@@ -202,6 +202,8 @@ impl DynAgent {
 /// Returns the todo state Arc for user visibility and an event receiver for external processing.
 pub fn create_provider(
     config: &ProviderConfig,
+    context_config: &crate::config::ContextConfig,
+    context_window: usize,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
@@ -214,6 +216,8 @@ pub fn create_provider(
         ProviderConfig::OpenRouter(c) => {
             let (agent, info, cost_tracker, todo_state, receiver) = create_openrouter_agent(
                 c,
+                context_config,
+                context_window,
                 mcp_tools,
                 system_prompt,
                 searxng_config,
@@ -233,6 +237,8 @@ pub fn create_provider(
         ProviderConfig::OpenAI(c) => {
             let (agent, info, cost_tracker, todo_state, receiver) = create_openai_agent(
                 c,
+                context_config,
+                context_window,
                 mcp_tools,
                 system_prompt,
                 searxng_config,
@@ -252,6 +258,8 @@ pub fn create_provider(
         ProviderConfig::LlamaCpp(c) => {
             let (agent, info, cost_tracker, todo_state, receiver) = create_llamacpp_agent(
                 c,
+                context_config,
+                context_window,
                 mcp_tools,
                 system_prompt,
                 searxng_config,
@@ -343,6 +351,8 @@ where
 /// Create OpenRouter agent and info with cost tracking
 fn create_openrouter_agent(
     config: &OpenRouterConfig,
+    context_config: &crate::config::ContextConfig,
+    context_window: usize,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
@@ -377,9 +387,18 @@ fn create_openrouter_agent(
 
     let model = config.model.clone();
 
-    // Create the session hook for event streaming
-    // This creates an unbounded channel so events are not dropped
-    let (hook, receiver) = SessionHook::with_channel();
+    // Create cost tracker first (needed for session hook stats)
+    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
+    let cost_tracker_stats = cost_tracker.get_session_stats();
+
+    // Create session hook with context tracking
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let hook = SessionHook::with_context_tracking(
+        Some(sender),
+        cost_tracker_stats.clone(),
+        context_window as u64,
+        context_config.threshold,
+    );
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -388,10 +407,6 @@ fn create_openrouter_agent(
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)
         .hook(hook);
-
-    // Create cost tracker for this agent
-    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
-    let cost_tracker_stats = cost_tracker.get_session_stats();
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
@@ -487,6 +502,8 @@ fn create_ollama_agent(
 /// Create OpenAI agent and info with cost tracking
 fn create_openai_agent(
     config: &OpenAIConfig,
+    context_config: &crate::config::ContextConfig,
+    context_window: usize,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
@@ -524,9 +541,18 @@ fn create_openai_agent(
 
     let model = config.model.clone();
 
-    // Create the session hook for event streaming
-    // This creates an unbounded channel so events are not dropped
-    let (hook, receiver) = SessionHook::with_channel();
+    // Create cost tracker first (needed for session hook stats)
+    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
+    let cost_tracker_stats = cost_tracker.get_session_stats();
+
+    // Create session hook with context tracking
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let hook = SessionHook::with_context_tracking(
+        Some(sender),
+        cost_tracker_stats.clone(),
+        context_window as u64,
+        context_config.threshold,
+    );
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -535,10 +561,6 @@ fn create_openai_agent(
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)
         .hook(hook);
-
-    // Create cost tracker for this agent
-    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
-    let cost_tracker_stats = cost_tracker.get_session_stats();
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
@@ -563,6 +585,8 @@ fn create_openai_agent(
 /// Create LlamaCpp agent and info (uses completions API for compatibility)
 fn create_llamacpp_agent(
     config: &LlamaCppConfig,
+    context_config: &crate::config::ContextConfig,
+    context_window: usize,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
@@ -598,9 +622,18 @@ fn create_llamacpp_agent(
 
     let model = config.model.clone();
 
-    // Create the session hook for event streaming
-    // This creates an unbounded channel so events are not dropped
-    let (hook, receiver) = SessionHook::with_channel();
+    // Create cost tracker first (needed for session hook stats)
+    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
+    let cost_tracker_stats = cost_tracker.get_session_stats();
+
+    // Create session hook with context tracking
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let hook = SessionHook::with_context_tracking(
+        Some(sender),
+        cost_tracker_stats.clone(),
+        context_window as u64,
+        context_config.threshold,
+    );
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -609,10 +642,6 @@ fn create_llamacpp_agent(
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)
         .hook(hook);
-
-    // Create cost tracker for this agent
-    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
-    let cost_tracker_stats = cost_tracker.get_session_stats();
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =

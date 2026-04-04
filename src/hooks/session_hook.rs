@@ -11,6 +11,7 @@ use rig::completion::message::AssistantContent;
 use rig::one_or_many::OneOrMany;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use crate::hooks::events::AgentEvent;
 use crate::hooks::events::TokenUsage as EventTokenUsage;
@@ -306,20 +307,49 @@ mod tests {
 pub struct SessionHook {
     /// Channel sender for streaming events
     event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+    /// Reference to session stats for token tracking
+    stats: Arc<Mutex<SessionStats>>,
+    /// Context window size in tokens
+    context_window: u64,
+    /// Compaction threshold (0.0-1.0)
+    threshold: f64,
 }
 
 impl SessionHook {
-    /// Create a new minimal session hook
+    /// Create a new minimal session hook (no context checking)
     pub fn new(event_sender: Option<mpsc::UnboundedSender<AgentEvent>>) -> Self {
-        Self { event_sender }
+        Self {
+            event_sender,
+            stats: Arc::new(Mutex::new(SessionStats::new())),
+            context_window: 128_000,
+            threshold: 0.8,
+        }
     }
 
-    /// Create a new session hook with a new event channel
+    /// Create a new session hook with full context checking
+    pub fn with_context_tracking(
+        event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+        stats: Arc<Mutex<SessionStats>>,
+        context_window: u64,
+        threshold: f64,
+    ) -> Self {
+        Self {
+            event_sender,
+            stats,
+            context_window,
+            threshold,
+        }
+    }
+
+    /// Create a new session hook with a new event channel (backward compatible)
     pub fn with_channel() -> (Self, mpsc::UnboundedReceiver<AgentEvent>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         (
             Self {
                 event_sender: Some(sender),
+                stats: Arc::new(Mutex::new(SessionStats::new())),
+                context_window: 128_000,
+                threshold: 0.8,
             },
             receiver,
         )
@@ -446,7 +476,7 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         ToolCallHookAction::Continue
     }
 
-    /// Called after tool result - emit event
+    /// Called after tool result - emit event and check for context overflow
     async fn on_tool_result(
         &self,
         tool_name: &str,
@@ -466,6 +496,22 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             };
             let _ = sender.send(event);
         }
+
+        // Check context usage and terminate if needed
+        if let Ok(stats) = self.stats.lock() {
+            if let Some(current_tokens) = stats.last_input_tokens() {
+                let threshold_tokens = (self.context_window as f64 * self.threshold) as u64;
+                if current_tokens > threshold_tokens {
+                    tracing::info!(
+                        "Context at {}% ({} tokens), triggering compact and resume",
+                        (current_tokens as f64 / self.context_window as f64) * 100.0,
+                        current_tokens
+                    );
+                    return HookAction::terminate("Context limit reached, compacting");
+                }
+            }
+        }
+
         HookAction::Continue
     }
 }

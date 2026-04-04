@@ -28,7 +28,7 @@ pub use hooks::{
 };
 pub use pipeline::{DelegateTool, SubAgentRegistry};
 pub use providers::{CostTracker, DynAgent, ProviderInfo, create_provider};
-use rig::completion::Message;
+use rig::completion::{Message, PromptError};
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
 use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpClientTransport};
@@ -366,65 +366,106 @@ impl AgentRunner {
     /// Handle a message — call the agent and process the response
     /// Returns the agent's response text on success, or the final error on failure
     async fn process_message(&mut self, msg: &str, chat_history: &mut Vec<Message>) -> Result<String, String> {
-        // Check if context compaction is needed
-        if let Some(ref mut cm) = self.context_manager {
-            if cm.needs_compaction(chat_history) {
-                println!("[Context approaching limit, compacting before prompt...]");
-                cm.compact(chat_history, &self.system_prompt)
-                    .await
-                    .map(|result| {
-                        println!(
-                            "[Compacted: {} → {} messages, {} discarded]\n",
-                            result.original_count, result.compacted_count, result.num_discarded
-                        );
-                    })
-                    .unwrap_or_else(|e| {
-                        eprintln!("[Warning: compaction failed: {}]", e);
-                    });
+        let mut retry_count = 0;
+        const MAX_COMPACT_RETRIES: usize = 3;
+
+        loop {
+            // Check if context compaction is needed before starting
+            if let Some(ref mut cm) = self.context_manager {
+                if cm.needs_compaction(chat_history) {
+                    println!("[Context approaching limit, compacting before prompt...]");
+                    cm.compact(chat_history, &self.system_prompt)
+                        .await
+                        .map(|result| {
+                            println!(
+                                "[Compacted: {} → {} messages, {} discarded]\n",
+                                result.original_count, result.compacted_count, result.num_discarded
+                            );
+                        })
+                        .unwrap_or_else(|e| {
+                            eprintln!("[Warning: compaction failed: {}]", e);
+                        });
+                }
+            }
+
+            // Call the agent - may be interrupted by hook if context is exceeded
+            let result = self.agent.as_ref().prompt_with_history(msg, chat_history).await;
+
+            match result {
+                Ok(response) => return Ok(response),
+                
+                Err(PromptError::PromptCancelled { chat_history: terminated_history, .. }) => {
+                    // Agent was terminated by hook - history was returned
+                    chat_history.clear();
+                    chat_history.extend(terminated_history.iter().cloned());
+                    retry_count += 1;
+
+                    if retry_count > MAX_COMPACT_RETRIES {
+                        return Err("Max compaction retries exceeded".to_string());
+                    }
+
+                    tracing::info!(
+                        "Agent terminated due to context limit. Compacting (attempt {}/{})",
+                        retry_count, MAX_COMPACT_RETRIES
+                    );
+                    println!("[Context limit reached, compacting...]");
+
+                    // Compact the history
+                    if let Some(ref mut cm) = self.context_manager {
+                        if let Err(e) = cm.compact(chat_history, &self.system_prompt).await {
+                            return Err(format!("Compaction failed: {}", e));
+                        }
+                        println!("[Compaction complete, resuming...]");
+                    } else {
+                        return Err("Context limit reached but compaction not available".to_string());
+                    }
+
+                    continue; // Retry with same user message
+                }
+                
+                Err(e) => {
+                    // Non-cancellation error - handle with retry logic
+                    let retry_config = self.config.retry();
+                    
+                    if retry_count > 0 {
+                        // We've already retried after a cancellation, don't retry again
+                        return Err(e.to_string());
+                    }
+
+                    let mut attempt = 0u32;
+                    let mut last_error = Err(e);
+                    
+                    while last_error.is_err() {
+                        if attempt >= retry_config.max_retries {
+                            let error = last_error.err().unwrap();
+                            eprintln!("\nError (after {} retries): {}\n", attempt, error);
+                            return Err(error.to_string());
+                        }
+
+                        let delay_ms = ((retry_config.initial_delay_ms as f64)
+                            * (retry_config.backoff_factor.powi(attempt as i32)))
+                        .min(retry_config.max_delay_ms as f64) as u64;
+
+                        if attempt > 0 {
+                            eprintln!(
+                                "\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
+                                last_error.as_ref().err().unwrap(),
+                                delay_ms,
+                                attempt + 1,
+                                retry_config.max_retries
+                            );
+                        }
+
+                        sleep(Duration::from_millis(delay_ms)).await;
+
+                        last_error = self.agent.as_ref().prompt_with_history(msg, chat_history).await;
+                        attempt += 1;
+                    }
+
+                    return Ok(last_error.unwrap());
+                }
             }
         }
-
-        // Call the agent
-        let retry_config = self.config.retry();
-        let mut last_result = self
-            .agent
-            .as_ref()
-            .prompt_with_history(msg, chat_history)
-            .await;
-
-        let mut attempt = 0u32;
-        while last_result.is_err() {
-            if attempt >= retry_config.max_retries {
-                let error = last_result.err().unwrap();
-                eprintln!("\nError (after {} retries): {}\n", attempt, error);
-                return Err(error.to_string());
-            }
-
-            let delay_ms = ((retry_config.initial_delay_ms as f64)
-                * (retry_config.backoff_factor.powi(attempt as i32)))
-            .min(retry_config.max_delay_ms as f64) as u64;
-
-            if attempt > 0 {
-                eprintln!(
-                    "\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
-                    last_result.as_ref().err().unwrap(),
-                    delay_ms,
-                    attempt + 1,
-                    retry_config.max_retries
-                );
-            }
-
-            sleep(Duration::from_millis(delay_ms)).await;
-
-            last_result = self
-                .agent
-                .as_ref()
-                .prompt_with_history(msg, chat_history)
-                .await;
-            attempt += 1;
-        }
-
-        Ok(last_result.unwrap())
     }
 
     /// Handle a slash command
@@ -1004,51 +1045,82 @@ impl AgentRunner {
                 }
             }
 
-            // Call agent
-            let retry_config = self.config.retry();
-            let mut last_error = self
-                .agent
-                .as_ref()
-                .prompt_with_history(input, &mut chat_history)
-                .await
-                .err();
+            // Call agent - may be interrupted by hook
+            let mut retry_count = 0;
+            const MAX_COMPACT_RETRIES: usize = 3;
+            
+            loop {
+                match self.agent.as_ref().prompt_with_history(input, &mut chat_history).await {
+                    Ok(_) => {
+                        self.handle_success(None);
+                        break;
+                    }
+                    Err(PromptError::PromptCancelled { chat_history: terminated_history, .. }) => {
+                        // Agent was terminated by hook - history was returned
+                        chat_history.clear();
+                        chat_history.extend(terminated_history.iter().cloned());
+                        retry_count += 1;
 
-            let mut attempt = 0u32;
-            while let Some(ref error) = last_error {
-                if attempt >= retry_config.max_retries {
-                    eprintln!("\nError (after {} retries): {}\n", attempt, error);
-                    last_error = None;
-                    break;
+                        if retry_count > MAX_COMPACT_RETRIES {
+                            eprintln!("\nMax compaction retries exceeded\n");
+                            break;
+                        }
+
+                        println!("[Context limit reached, compacting...]");
+                        if let Some(ref mut cm) = self.context_manager {
+                            if let Err(e) = cm.compact(&mut chat_history, &self.system_prompt).await {
+                                eprintln!("\nCompaction failed: {}\n", e);
+                                break;
+                            }
+                            println!("[Compaction complete, resuming...]");
+                        } else {
+                            eprintln!("\nContext limit reached but compaction not available\n");
+                            break;
+                        }
+                        // Continue to retry
+                    }
+                    Err(mut e) => {
+                        // Handle with retry logic
+                        let retry_config = self.config.retry();
+                        let mut attempt = 0u32;
+                        
+                        loop {
+                            if attempt >= retry_config.max_retries {
+                                eprintln!("\nError (after {} retries): {}\n", attempt, e);
+                                break;
+                            }
+
+                            let delay_ms = ((retry_config.initial_delay_ms as f64)
+                                * (retry_config.backoff_factor.powi(attempt as i32)))
+                            .min(retry_config.max_delay_ms as f64) as u64;
+
+                            if attempt > 0 {
+                                eprintln!(
+                                    "\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
+                                    e,
+                                    delay_ms,
+                                    attempt + 1,
+                                    retry_config.max_retries
+                                );
+                            }
+
+                            self.sync_state_to_manager();
+                            sleep(Duration::from_millis(delay_ms)).await;
+
+                            match self.agent.as_ref().prompt_with_history(input, &mut chat_history).await {
+                                Ok(_) => {
+                                    self.handle_success(None);
+                                    break;
+                                }
+                                Err(new_e) => {
+                                    e = new_e;
+                                    attempt += 1;
+                                }
+                            }
+                        }
+                        break;
+                    }
                 }
-
-                let delay_ms = ((retry_config.initial_delay_ms as f64)
-                    * (retry_config.backoff_factor.powi(attempt as i32)))
-                .min(retry_config.max_delay_ms as f64) as u64;
-
-                if attempt > 0 {
-                    eprintln!(
-                        "\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
-                        error,
-                        delay_ms,
-                        attempt + 1,
-                        retry_config.max_retries
-                    );
-                }
-
-                self.sync_state_to_manager();
-                sleep(Duration::from_millis(delay_ms)).await;
-
-                last_error = self
-                    .agent
-                    .as_ref()
-                    .prompt_with_history(input, &mut chat_history)
-                    .await
-                    .err();
-                attempt += 1;
-            }
-
-            if last_error.is_none() {
-                self.handle_success(None);
             }
         }
 
