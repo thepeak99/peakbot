@@ -77,11 +77,16 @@ impl StateManager {
         self.notify_update(&state);
     }
 
-    /// Set loading state
-    pub fn set_loading(&self, loading: bool) {
+    /// Set whether the agent is currently running (processing a message)
+    pub fn set_running(&self, running: bool) {
         let mut state = self.state.write().unwrap();
-        state.is_loading = loading;
+        state.is_running = running;
         self.notify_update(&state);
+    }
+
+    /// Check if the agent is currently running
+    pub fn is_running(&self) -> bool {
+        self.state.read().unwrap().is_running
     }
 
     /// Update chat state entirely

@@ -33,6 +33,9 @@ pub enum UiAction {
     /// Execute a slash command (e.g., /stats, /context)
     ExecuteCommand(String),
 
+    /// Request the agent to stop
+    RequestStop,
+
     /// Exit the application
     Exit,
 }
@@ -87,6 +90,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("conversations", "List saved conversations", false),
         SlashCommand::new("help", "Show available commands", false),
         SlashCommand::new("clear", "Clear chat history", false),
+        SlashCommand::new("stop", "Stop the agent (interrupt current task)", false),
         SlashCommand::new("exit", "Exit the application", false),
         SlashCommand::new("quit", "Exit the application", false),
     ]
