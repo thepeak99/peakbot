@@ -43,6 +43,11 @@ pub struct AppState {
     
     /// Whether the agent is currently processing
     #[serde(default)]
+    pub is_running: bool,
+
+    /// Whether the agent is currently loading (alias for is_running, kept for compatibility)
+    #[serde(default)]
+    #[doc(hidden)]
     pub is_loading: bool,
 
     /// Welcome banner — populated once at startup, never changes

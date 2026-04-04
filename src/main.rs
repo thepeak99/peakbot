@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
         _ => 128_000, // default
     };
 
-    let (agent, provider_info, cost_tracker, todo_state, event_receiver) = create_provider(
+    let (agent, provider_info, cost_tracker, todo_state, event_receiver, session_hook) = create_provider(
         &config.provider,
         &config.context,
         context_window,
@@ -176,6 +176,7 @@ async fn main() -> Result<()> {
         Some(todo_state),
         event_receiver,
         Some(state_manager.clone()),
+        session_hook,
     );
 
     // Set up welcome banner state

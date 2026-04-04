@@ -197,9 +197,8 @@ impl DynAgent {
 ///
 /// If mcp_tools is provided, they will be added to the agent along with built-in tools.
 /// The system_prompt is used as the agent's preamble.
-/// For OpenRouter, cost tracking is enabled automatically.
-/// If todo_tool is provided, it will be used (otherwise a default one is created).
-/// Returns the todo state Arc for user visibility and an event receiver for external processing.
+/// Create the provider agent with all tools and hooks.
+/// Returns the agent, provider info, cost tracker, todo state, event receiver, and shared session hook.
 pub fn create_provider(
     config: &ProviderConfig,
     context_config: &crate::config::ContextConfig,
@@ -211,10 +210,10 @@ pub fn create_provider(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
-) -> Result<(DynAgent, ProviderInfo, CostTracker, Arc<Mutex<TodoList>>, Option<mpsc::UnboundedReceiver<AgentEvent>>)> {
+) -> Result<(DynAgent, ProviderInfo, CostTracker, Arc<Mutex<TodoList>>, Option<mpsc::UnboundedReceiver<AgentEvent>>, Arc<SessionHook>)> {
     match config {
         ProviderConfig::OpenRouter(c) => {
-            let (agent, info, cost_tracker, todo_state, receiver) = create_openrouter_agent(
+            let (agent, info, cost_tracker, todo_state, receiver, hook) = create_openrouter_agent(
                 c,
                 context_config,
                 context_window,
@@ -232,10 +231,11 @@ pub fn create_provider(
                 cost_tracker,
                 todo_state,
                 Some(receiver),
+                Arc::new(hook),
             ))
         }
         ProviderConfig::OpenAI(c) => {
-            let (agent, info, cost_tracker, todo_state, receiver) = create_openai_agent(
+            let (agent, info, cost_tracker, todo_state, receiver, hook) = create_openai_agent(
                 c,
                 context_config,
                 context_window,
@@ -253,10 +253,11 @@ pub fn create_provider(
                 cost_tracker,
                 todo_state,
                 Some(receiver),
+                Arc::new(hook),
             ))
         }
         ProviderConfig::LlamaCpp(c) => {
-            let (agent, info, cost_tracker, todo_state, receiver) = create_llamacpp_agent(
+            let (agent, info, cost_tracker, todo_state, receiver, hook) = create_llamacpp_agent(
                 c,
                 context_config,
                 context_window,
@@ -274,6 +275,7 @@ pub fn create_provider(
                 cost_tracker,
                 todo_state,
                 Some(receiver),
+                Arc::new(hook),
             ))
         }
         ProviderConfig::Ollama(c) => {
@@ -293,6 +295,7 @@ pub fn create_provider(
                 CostTracker::none(),
                 todo_state,
                 None, // No event channel for Ollama
+                Arc::new(SessionHook::new(None)), // Empty hook for Ollama (no injection support)
             ))
         }
     }
@@ -366,6 +369,7 @@ fn create_openrouter_agent(
     CostTracker,
     Arc<Mutex<TodoList>>,
     mpsc::UnboundedReceiver<AgentEvent>,
+    SessionHook,
 )> {
     let api_key = config
         .api_key
@@ -406,7 +410,7 @@ fn create_openrouter_agent(
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)
-        .hook(hook);
+        .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
@@ -425,7 +429,7 @@ fn create_openrouter_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, cost_tracker, todo_state, receiver))
+    Ok((agent, info, cost_tracker, todo_state, receiver, hook))
 }
 
 /// Create Ollama agent and info (no cost tracking for local models)
@@ -517,6 +521,7 @@ fn create_openai_agent(
     CostTracker,
     Arc<Mutex<TodoList>>,
     mpsc::UnboundedReceiver<AgentEvent>,
+    SessionHook,
 )> {
     let api_key = config
         .api_key
@@ -560,7 +565,7 @@ fn create_openai_agent(
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)
-        .hook(hook);
+        .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
@@ -579,7 +584,7 @@ fn create_openai_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, cost_tracker, todo_state, receiver))
+    Ok((agent, info, cost_tracker, todo_state, receiver, hook))
 }
 
 /// Create LlamaCpp agent and info (uses completions API for compatibility)
@@ -600,6 +605,7 @@ fn create_llamacpp_agent(
     CostTracker,
     Arc<Mutex<TodoList>>,
     mpsc::UnboundedReceiver<AgentEvent>,
+    SessionHook,
 )> {
     // API key is optional for local llama.cpp instances
     let api_key = config
@@ -641,7 +647,7 @@ fn create_llamacpp_agent(
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)
-        .hook(hook);
+        .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let (agent_builder, todo_state) =
@@ -660,5 +666,5 @@ fn create_llamacpp_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, cost_tracker, todo_state, receiver))
+    Ok((agent, info, cost_tracker, todo_state, receiver, hook))
 }

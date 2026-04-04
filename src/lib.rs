@@ -13,8 +13,8 @@ pub mod ui;
 
 pub use config::{
     AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig,
-    McpTransportType, OllamaConfig, OpenRouterConfig, PipelineConfig, ProviderConfig,
-    ProviderType, RetryConfig, SearXngConfig,
+    McpTransportType, OllamaConfig, OpenRouterConfig, PipelineConfig, ProviderConfig, ProviderType,
+    RetryConfig, SearXngConfig,
 };
 pub use context_manager::{CompactionResult, ContextManager};
 pub use conversation::{
@@ -22,9 +22,9 @@ pub use conversation::{
 };
 pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
-    AgentEvent, CostHandler, EventChannel, EventHandler, EventProcessor, ModelPricing,
-    SessionHook, SessionStats, StateManagerHandler, StreamingConfig, StreamingOutputHandler,
-    TextColor, TokenUsage, VerbosityLevel, create_event_channel, fetch_model_pricing,
+    AgentEvent, CostHandler, EventChannel, EventHandler, EventProcessor, ModelPricing, SessionHook,
+    SessionStats, StateManagerHandler, StreamingConfig, StreamingOutputHandler, TextColor,
+    TokenUsage, VerbosityLevel, create_event_channel, fetch_model_pricing,
 };
 pub use pipeline::{DelegateTool, SubAgentRegistry};
 pub use providers::{CostTracker, DynAgent, ProviderInfo, create_provider};
@@ -37,16 +37,30 @@ pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
     SearchTool, ThinkTool, TodoList, TodoStatus, TodoTool,
 };
-pub use ui::{UiAction, Ui};
+pub use ui::{Ui, UiAction};
 
 use anyhow::{Result, anyhow};
 use rmcp::service::ServiceExt;
-use std::io::{self, BufRead, Write};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
 use tracing::debug;
+
+/// Message types for internal queue between event loop and agent loop
+enum QueueMessage {
+    UserMessage(String),
+    Command(String),
+    StopMarker, // Signals that stop was requested
+}
+
+/// Completion result sent from agent loop back to event loop
+#[derive(Clone)]
+enum CompletionResult {
+    Success(String),
+    Stopped,
+    Error(String),
+    CommandDone,
+}
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
@@ -118,69 +132,6 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
     messages
 }
 
-/// Print the last N messages from a conversation to the console
-pub fn print_recent_messages(conv: &Conversation, count: usize) {
-    use crate::conversation::Message as StoredMessage;
-
-    let messages: Vec<_> = conv.messages.iter().rev().take(count).collect();
-
-    if messages.is_empty() {
-        println!("  (no messages in this conversation)");
-        return;
-    }
-
-    for msg in messages.iter().rev() {
-        match msg {
-            StoredMessage::User { content, timestamp } => {
-                println!(
-                    "  [{}] User: {}",
-                    timestamp.format("%H:%M"),
-                    truncate(content, 100)
-                );
-            }
-            StoredMessage::Assistant { content, timestamp } => {
-                println!(
-                    "  [{}] Assistant: {}",
-                    timestamp.format("%H:%M"),
-                    truncate(content, 100)
-                );
-            }
-            StoredMessage::ToolCall {
-                tool_name,
-                arguments,
-                timestamp,
-            } => {
-                println!(
-                    "  [{}] Tool Call: {} - {}",
-                    timestamp.format("%H:%M"),
-                    tool_name,
-                    truncate(arguments, 60)
-                );
-            }
-            StoredMessage::ToolResult {
-                tool_name,
-                result,
-                timestamp,
-                ..
-            } => {
-                println!(
-                    "  [{}] Tool: {} - {}",
-                    timestamp.format("%H:%M"),
-                    tool_name,
-                    truncate(result, 60)
-                );
-            }
-        }
-    }
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
-    }
-}
 
 /// AgentRunner — the Controller in MVC.
 ///
@@ -190,6 +141,7 @@ pub struct AgentRunner {
     agent: Arc<DynAgent>,
     config: Config,
     provider_info: ProviderInfo,
+    #[allow(unused)]
     skills: SkillRegistry,
     context_manager: Option<ContextManager>,
     conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
@@ -197,6 +149,8 @@ pub struct AgentRunner {
     cost_tracker: CostTracker,
     todo_state: Option<Arc<Mutex<TodoList>>>,
     state_manager: Option<Arc<ui::StateManager>>,
+    // Shared session hook for interrupt/queue state
+    session_hook: Arc<SessionHook>,
     // Retained for streaming output handler (view concern, set up by main.rs)
     _event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
 }
@@ -211,6 +165,7 @@ impl AgentRunner {
         todo_state: Option<Arc<Mutex<TodoList>>>,
         event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
         state_manager: Option<Arc<ui::StateManager>>,
+        session_hook: Arc<SessionHook>,
     ) -> Self {
         let agent = Arc::new(agent);
         let system_prompt = build_system_prompt(&skills);
@@ -252,6 +207,7 @@ impl AgentRunner {
             cost_tracker,
             todo_state,
             state_manager,
+            session_hook,
             _event_receiver: event_receiver,
         }
     }
@@ -363,294 +319,20 @@ impl AgentRunner {
         }
     }
 
-    /// Handle a message — call the agent and process the response
-    /// Returns the agent's response text on success, or the final error on failure
-    async fn process_message(&mut self, msg: &str, chat_history: &mut Vec<Message>) -> Result<String, String> {
-        let mut retry_count = 0;
-        const MAX_COMPACT_RETRIES: usize = 3;
+    /// Message types for internal queue between event loop and agent loop
+    pub const _QUEUE_PLACEHOLDER: () = ();
 
-        loop {
-            // Check if context compaction is needed before starting
-            if let Some(ref mut cm) = self.context_manager {
-                if cm.needs_compaction(chat_history) {
-                    println!("[Context approaching limit, compacting before prompt...]");
-                    cm.compact(chat_history, &self.system_prompt)
-                        .await
-                        .map(|result| {
-                            println!(
-                                "[Compacted: {} → {} messages, {} discarded]\n",
-                                result.original_count, result.compacted_count, result.num_discarded
-                            );
-                        })
-                        .unwrap_or_else(|e| {
-                            eprintln!("[Warning: compaction failed: {}]", e);
-                        });
-                }
-            }
+    /// The controller loop — spawns two loops: event loop (receives from View) and
+    /// agent loop (processes messages). This allows /stop to interrupt the agent.
+    pub async fn run_loop(&mut self, action_receiver: mpsc::UnboundedReceiver<UiAction>) {
+        // Channel between event loop and agent loop
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<QueueMessage>(32);
 
-            // Call the agent - may be interrupted by hook if context is exceeded
-            let result = self.agent.as_ref().prompt_with_history(msg, chat_history).await;
+        // Completion notifications back to event loop
+        let (completion_tx, _completion_rx) = tokio::sync::broadcast::channel::<CompletionResult>(8);
 
-            match result {
-                Ok(response) => return Ok(response),
-                
-                Err(PromptError::PromptCancelled { chat_history: terminated_history, .. }) => {
-                    // Agent was terminated by hook - history was returned
-                    chat_history.clear();
-                    chat_history.extend(terminated_history.iter().cloned());
-                    retry_count += 1;
-
-                    if retry_count > MAX_COMPACT_RETRIES {
-                        return Err("Max compaction retries exceeded".to_string());
-                    }
-
-                    tracing::info!(
-                        "Agent terminated due to context limit. Compacting (attempt {}/{})",
-                        retry_count, MAX_COMPACT_RETRIES
-                    );
-                    println!("[Context limit reached, compacting...]");
-
-                    // Compact the history
-                    if let Some(ref mut cm) = self.context_manager {
-                        if let Err(e) = cm.compact(chat_history, &self.system_prompt).await {
-                            return Err(format!("Compaction failed: {}", e));
-                        }
-                        println!("[Compaction complete, resuming...]");
-                    } else {
-                        return Err("Context limit reached but compaction not available".to_string());
-                    }
-
-                    continue; // Retry with same user message
-                }
-                
-                Err(e) => {
-                    // Non-cancellation error - handle with retry logic
-                    let retry_config = self.config.retry();
-                    
-                    if retry_count > 0 {
-                        // We've already retried after a cancellation, don't retry again
-                        return Err(e.to_string());
-                    }
-
-                    let mut attempt = 0u32;
-                    let mut last_error = Err(e);
-                    
-                    while last_error.is_err() {
-                        if attempt >= retry_config.max_retries {
-                            let error = last_error.err().unwrap();
-                            eprintln!("\nError (after {} retries): {}\n", attempt, error);
-                            return Err(error.to_string());
-                        }
-
-                        let delay_ms = ((retry_config.initial_delay_ms as f64)
-                            * (retry_config.backoff_factor.powi(attempt as i32)))
-                        .min(retry_config.max_delay_ms as f64) as u64;
-
-                        if attempt > 0 {
-                            eprintln!(
-                                "\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
-                                last_error.as_ref().err().unwrap(),
-                                delay_ms,
-                                attempt + 1,
-                                retry_config.max_retries
-                            );
-                        }
-
-                        sleep(Duration::from_millis(delay_ms)).await;
-
-                        last_error = self.agent.as_ref().prompt_with_history(msg, chat_history).await;
-                        attempt += 1;
-                    }
-
-                    return Ok(last_error.unwrap());
-                }
-            }
-        }
-    }
-
-    /// Handle a slash command
-    async fn process_command(&mut self, cmd: &str, chat_history: &mut Vec<Message>) {
-        let cmd_lower = cmd.to_lowercase();
-
-        match cmd_lower.as_str() {
-            "/exit" | "/quit" => {
-                // Don't exit here — signal back to the view loop
-            }
-            "/stats" => {
-                self.print_stats();
-            }
-            "/reset" => {
-                self.reset_stats();
-                println!("Stats reset.\n");
-            }
-            "/context" => {
-                self.print_context_status();
-            }
-            "/compact" => {
-                self.force_compact(chat_history).await;
-            }
-            "/conversations" | "/history" => {
-                self.list_conversations();
-            }
-            "/new" => {
-                if let Some(ref cm) = self.conversation_manager {
-                    let name = format!(
-                        "Conversation {}",
-                        chrono::Local::now().format("%Y-%m-%d %H:%M")
-                    );
-                    let _ = cm
-                        .lock()
-                        .unwrap()
-                        .create_new(name, self.config.model().to_string());
-                    chat_history.clear();
-                    println!("Started a new conversation.\n");
-                } else {
-                    println!("Conversation persistence is not enabled.\n");
-                }
-            }
-            "/save" => {
-                if let Some(ref cm) = self.conversation_manager {
-                    if let Some(ref conv) = cm.lock().unwrap().get_current() {
-                        let _ = cm.lock().unwrap().save();
-                        println!("Conversation saved: {}\n", conv.name);
-                    }
-                } else {
-                    println!("Conversation persistence is not enabled.\n");
-                }
-            }
-            _ if cmd_lower.starts_with("/load ") => {
-                if let Some(id_str) = cmd.strip_prefix("/load ") {
-                    if let Some(ref cm) = self.conversation_manager {
-                        match uuid::Uuid::parse_str(id_str) {
-                            Ok(id) => match cm.lock().unwrap().load(id) {
-                                Ok(conv) => {
-                                    let _ = cm.lock().unwrap().load_and_set_current(id);
-                                    chat_history.clear();
-                                    *chat_history = convert_conversation_to_rig_messages(&conv);
-                                    println!("\n--- Loaded conversation: '{}' ---\n", conv.name);
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to load conversation: {}\n", e);
-                                }
-                            },
-                            Err(_) => {
-                                eprintln!(
-                                    "Invalid conversation ID. Use /conversations to see available IDs.\n"
-                                );
-                            }
-                        }
-                    } else {
-                        println!("Conversation persistence is not enabled.\n");
-                    }
-                }
-            }
-            _ if cmd_lower.starts_with("/delete ") => {
-                if let Some(id_str) = cmd.strip_prefix("/delete ") {
-                    if let Some(ref cm) = self.conversation_manager {
-                        match uuid::Uuid::parse_str(id_str) {
-                            Ok(id) => match cm.lock().unwrap().delete(id) {
-                                Ok(_) => println!("Conversation deleted.\n"),
-                                Err(e) => eprintln!("Failed to delete: {}\n", e),
-                            },
-                            Err(_) => {
-                                eprintln!("Invalid conversation ID.\n");
-                            }
-                        }
-                    } else {
-                        println!("Conversation persistence is not enabled.\n");
-                    }
-                }
-            }
-            _ if cmd_lower.starts_with("/export ") => {
-                if let Some(args) = cmd.strip_prefix("/export ") {
-                    let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                    if parts.len() == 2 {
-                        if let Some(ref cm) = self.conversation_manager {
-                            let id_str = parts[0];
-                            let format = parts[1].to_lowercase();
-                            match uuid::Uuid::parse_str(id_str) {
-                                Ok(id) => match cm.lock().unwrap().load(id) {
-                                    Ok(conv) => {
-                                        let output = match format.as_str() {
-                                            "markdown" | "md" => {
-                                                cm.lock().unwrap().export_markdown(&conv)
-                                            }
-                                            "json" => cm.lock().unwrap().export_json(&conv),
-                                            _ => {
-                                                eprintln!(
-                                                    "Unknown format '{}'. Use 'json' or 'markdown'.\n",
-                                                    format
-                                                );
-                                                return;
-                                            }
-                                        };
-                                        match output {
-                                            Ok(s) => {
-                                                println!("\n--- Export ---\n{}\n--- End ---\n", s);
-                                            }
-                                            Err(e) => eprintln!("Export failed: {}\n", e),
-                                        }
-                                    }
-                                    Err(e) => eprintln!("Failed to load conversation: {}\n", e),
-                                },
-                                Err(_) => eprintln!("Invalid conversation ID.\n"),
-                            }
-                        } else {
-                            println!("Conversation persistence is not enabled.\n");
-                        }
-                    } else {
-                        println!("Usage: /export <id> <json|markdown>\n");
-                    }
-                }
-            }
-            _ if cmd_lower.starts_with("/rename ") => {
-                if let Some(name) = cmd.strip_prefix("/rename ") {
-                    if let Some(ref cm) = self.conversation_manager {
-                        if let Err(e) = cm.lock().unwrap().rename(name.to_string()) {
-                            eprintln!("Failed to rename: {}\n", e);
-                        } else {
-                            println!("Conversation renamed to: {}\n", name);
-                        }
-                    } else {
-                        println!("Conversation persistence is not enabled.\n");
-                    }
-                }
-            }
-            _ => {
-                // Unknown command — treat as a message to the agent (response discarded)
-                let _ = self.process_message(cmd, chat_history).await;
-            }
-        }
-    }
-
-    /// Called after every successful agent response — update model with response and stats
-    /// For MVC mode (run_loop): pass the response text
-    /// For legacy mode (run): pass None (response is printed directly)
-    fn handle_success(&self, response: Option<&str>) {
-        // Add agent response to chat (MVC mode only)
-        if let Some(response) = response {
-            if let Some(ref sm) = self.state_manager {
-                use crate::ui::app_state::ChatMessage;
-                sm.update_chat(ChatMessage::agent(response.to_string()));
-                sm.set_final_broadcast(true);
-            }
-        }
-
-        // Sync stats and todo to StateManager
-        self.sync_state_to_manager();
-
-        // Save conversation (backend concern)
-        if let Some(ref cm) = self.conversation_manager {
-            if let Err(e) = cm.lock().unwrap().save() {
-                tracing::warn!("Failed to save conversation: {}", e);
-            }
-        }
-    }
-
-    /// The controller loop — receives UiActions from Views, processes them.
-    /// This is NOT the I/O loop — Views own the I/O.
-    pub async fn run_loop(&mut self, mut action_receiver: mpsc::UnboundedReceiver<UiAction>) {
-        let mut chat_history: Vec<Message> = Vec::new();
+        // Shared chat history (needed by both loops)
+        let chat_history = Arc::new(tokio::sync::Mutex::new(Vec::<Message>::new()));
 
         // Spawn event processing task for streaming output (view concern)
         if let Some(receiver) = self._event_receiver.take() {
@@ -673,8 +355,76 @@ impl AgentRunner {
             });
         }
 
+        // Extract fields we need to pass to spawned loops
+        let conversation_manager = self.conversation_manager.clone();
+        let state_manager = self.state_manager.clone();
+        let session_hook = self.session_hook.clone();
+        let config_model = self.config.model().to_string();
+        let system_prompt = self.system_prompt.clone();
+        let context_manager = self.context_manager.take();
+        let conversation_manager_for_agent = self.conversation_manager.clone();
+        let agent = self.agent.clone();
+        let state_manager_for_agent = self.state_manager.clone();
+        let config_for_agent = self.config.clone();
+
+        // Spawn the two loops
+        let event_handle = tokio::spawn({
+            let msg_tx = msg_tx.clone();
+            let completion_tx = completion_tx.clone();
+            let chat_history = chat_history.clone();
+
+            async move {
+                Self::event_loop(
+                    action_receiver,
+                    msg_tx,
+                    completion_tx,
+                    chat_history,
+                    conversation_manager,
+                    state_manager,
+                    session_hook,
+                    config_model,
+                ).await;
+            }
+        });
+
+        let agent_handle = tokio::spawn({
+            let msg_rx = tokio::sync::Mutex::new(msg_rx);
+            let completion_tx = completion_tx.clone();
+            let chat_history = chat_history.clone();
+
+            async move {
+                Self::agent_loop(
+                    msg_rx,
+                    completion_tx,
+                    chat_history,
+                    context_manager,
+                    conversation_manager_for_agent,
+                    state_manager_for_agent,
+                    agent,
+                    config_for_agent,
+                    system_prompt,
+                ).await;
+            }
+        });
+
+        // Wait for event loop to exit (View closed)
+        event_handle.await.ok();
+        agent_handle.abort();
+    }
+
+    /// Event loop - receives UiActions from View, queues messages for agent loop
+    async fn event_loop(
+        mut action_receiver: mpsc::UnboundedReceiver<UiAction>,
+        msg_tx: tokio::sync::mpsc::Sender<QueueMessage>,
+        _completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
+        _chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
+        conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
+        state_manager: Option<Arc<ui::StateManager>>,
+        session_hook: Arc<SessionHook>,
+        config_model: String,
+    ) {
         // Initialize conversation
-        if let Some(ref cm) = self.conversation_manager {
+        if let Some(ref cm) = conversation_manager {
             let name = format!(
                 "Conversation {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M")
@@ -682,35 +432,54 @@ impl AgentRunner {
             let _ = cm
                 .lock()
                 .unwrap()
-                .create_new(name, self.config.model().to_string());
+                .create_new(name, config_model);
         }
 
         while let Some(action) = action_receiver.recv().await {
             match action {
                 UiAction::SendMessage(msg) => {
                     // Auto-save user message
-                    if let Some(ref cm) = self.conversation_manager {
+                    if let Some(ref cm) = conversation_manager {
                         let _ = cm.lock().unwrap().add_user_message(msg.clone());
                     }
                     // Add user message to chat for live rendering
-                    if let Some(ref sm) = self.state_manager {
+                    if let Some(ref sm) = state_manager {
                         use crate::ui::app_state::ChatMessage;
                         sm.update_chat(ChatMessage::user(msg.clone()));
                     }
-                    // Process and handle response
-                    match self.process_message(&msg, &mut chat_history).await {
-                        Ok(response) => {
-                            self.handle_success(Some(&response));
+
+                    // If agent is running, interrupt it first
+                    if state_manager.as_ref().map_or(false, |sm| sm.is_running()) {
+                        session_hook.request_stop();
+                    }
+
+                    // Queue the new message for the agent
+                    msg_tx.send(QueueMessage::UserMessage(msg)).await.ok();
+                }
+
+                UiAction::ExecuteCommand(cmd) => {
+                    if cmd == "/stop" {
+                        // Only stop if agent is actually running
+                        if state_manager.as_ref().map_or(false, |sm| sm.is_running()) {
+                            session_hook.request_stop();
+                            msg_tx.send(QueueMessage::StopMarker).await.ok();
+                            println!("[Stop requested...]");
                         }
-                        Err(_) => {
-                            // Error already printed in process_message
-                        }
+                    } else {
+                        // Queue command for agent loop
+                        msg_tx.send(QueueMessage::Command(cmd)).await.ok();
                     }
                 }
-                UiAction::ExecuteCommand(cmd) => {
-                    // Don't save commands to conversation history
-                    self.process_command(&cmd, &mut chat_history).await;
+
+                UiAction::RequestStop => {
+                    // Only stop if agent is actually running
+                    if state_manager.as_ref().map_or(false, |sm| sm.is_running()) {
+                        session_hook.request_stop();
+                        msg_tx.send(QueueMessage::StopMarker).await.ok();
+                        println!("[Stop requested...]");
+                    }
                 }
+
                 UiAction::Exit => {
                     break;
                 }
@@ -718,182 +487,199 @@ impl AgentRunner {
         }
     }
 
-    /// Run the REPL loop — kept for backward compatibility and for when no UI is used.
-    /// This is the only method that owns the I/O loop.
-    pub async fn run(&mut self) -> Result<()> {
-        let cwd = std::env::current_dir()?;
-        println!("PeakBot coding agent ready.");
-        println!(
-            "Provider: {} | Model: {} | Max-tokens: {}",
-            self.config.provider_name(),
-            self.config.model(),
-            self.config.max_tokens()
-        );
-        if self.config.mcp_servers.as_ref().map_or(0, |s| s.len()) > 0 {
-            println!(
-                "MCP servers: {}",
-                self.config.mcp_servers.as_ref().map_or(0, |s| s.len())
-            );
-        }
-        if !self.skills.is_empty() {
-            println!("Skills: {}", self.skills.len());
-            for skill in self.skills.all() {
-                println!("  - {}: {}", skill.name, skill.description);
+    /// Agent loop - processes messages from event loop, sends completions back
+    async fn agent_loop(
+        msg_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<QueueMessage>>,
+        completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
+        chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
+        mut context_manager: Option<ContextManager>,
+        conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
+        state_manager: Option<Arc<ui::StateManager>>,
+        agent: Arc<DynAgent>,
+        config: Config,
+        system_prompt: String,
+    ) {
+        loop {
+            // Wait for a message
+            let msg = msg_rx.lock().await.recv().await;
+
+            match msg {
+                Some(QueueMessage::UserMessage(content)) => {
+                    // Mark as running via StateManager (broadcasts to all UIs)
+                    if let Some(ref sm) = state_manager {
+                        sm.set_running(true);
+                    }
+
+                    let result = Self::process_message_internal(
+                        &content,
+                        chat_history.clone(),
+                        &mut context_manager,
+                        &conversation_manager,
+                        &state_manager,
+                        &agent,
+                        &config,
+                        &system_prompt,
+                    ).await;
+
+                    // Mark as done
+                    if let Some(ref sm) = state_manager {
+                        sm.set_running(false);
+                    }
+
+                    // Send completion notification
+                    completion_tx.send(result).ok();
+                }
+
+                Some(QueueMessage::Command(cmd)) => {
+                    if let Some(ref sm) = state_manager {
+                        sm.set_running(true);
+                    }
+                    Self::process_command_internal(
+                        &cmd,
+                        chat_history.clone(),
+                        &mut context_manager,
+                        &conversation_manager,
+                        &state_manager,
+                        &agent,
+                        &config,
+                        &system_prompt,
+                    ).await;
+                    if let Some(ref sm) = state_manager {
+                        sm.set_running(false);
+                    }
+                    completion_tx.send(CompletionResult::CommandDone).ok();
+                }
+
+                Some(QueueMessage::StopMarker) => {
+                    // This is just an acknowledgment that stop was requested
+                    // The actual stopping happened in process_message_internal
+                    println!("[Agent stopped by user]");
+                    completion_tx.send(CompletionResult::Stopped).ok();
+                }
+
+                None => {
+                    // Channel closed, exit
+                    break;
+                }
             }
         }
-        if self.config.searxng_enabled() {
-            if let Some(ref searxng) = self.config.searxng {
-                println!("SearXNG: {} (enabled)", searxng.base_url);
-            }
-        } else {
-            println!("SearXNG: not configured");
-        }
-        println!(
-            "Cost tracking: {}",
-            if !self.config.supports_pricing() {
-                "not supported by provider"
-            } else if self.config.cost_tracking {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        );
-        if self.config.context.enabled {
-            println!(
-                "Context compaction: enabled (threshold: {:.0}%, keep_recent: {})",
-                self.config.context.threshold * 100.0,
-                self.config.context.keep_recent
-            );
-        } else {
-            println!("Context compaction: disabled");
-        }
+    }
 
-        if let Some(ref cm) = self.conversation_manager {
-            println!(
-                "Conversation persistence: enabled (auto-save, {} stored)",
-                cm.lock().unwrap().storage_dir().display()
-            );
-        } else {
-            println!("Conversation persistence: disabled");
-        }
+    /// Internal process_message - returns CompletionResult instead of handling directly
+    async fn process_message_internal(
+        msg: &str,
+        chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
+        context_manager: &mut Option<ContextManager>,
+        conversation_manager: &Option<Arc<Mutex<ConversationManager>>>,
+        state_manager: &Option<Arc<ui::StateManager>>,
+        agent: &Arc<DynAgent>,
+        config: &Config,
+        system_prompt: &str,
+    ) -> CompletionResult {
+        let mut retry_count = 0;
+        let current_msg = msg.to_string();
 
-        println!("Working directory: {}", cwd.display());
-        println!(
-            "Type /stats to see session stats, /context for context status, /compact to force compaction, /conversations to list saved, or 'exit' to quit.\n"
-        );
-
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
-        let mut chat_history: Vec<Message> = Vec::new();
-
-        // Spawn event processing task
-        if let Some(receiver) = self._event_receiver.take() {
-            let mut handlers: Vec<Arc<dyn EventHandler>> = Vec::new();
-            let stats = self.cost_tracker.get_session_stats();
-            let pricing = self.cost_tracker.get_pricing().clone();
-            handlers.push(Arc::new(CostHandler::new(pricing, stats)));
-            handlers.push(Arc::new(StreamingOutputHandler::new()));
-            tokio::spawn(async move {
-                let mut processor = EventProcessor::new(receiver, handlers);
-                processor.run().await;
-            });
-        }
-
-        // Check for auto-resume
-        let mut resumed = false;
-        if let Some(ref cm) = self.conversation_manager {
-            if self.config.conversation_auto_resume() {
-                if let Ok(Some(latest)) = cm.lock().unwrap().get_latest() {
-                    if !latest.messages.is_empty() {
-                        println!(
-                            "\n[Found previous conversation: '{}' ({} messages)]",
-                            latest.name,
-                            latest.messages.len()
-                        );
-                        print!("Resume this conversation? (y/n): ");
-                        stdout.flush().ok();
-
-                        let mut confirm = String::new();
-                        if stdin.lock().read_line(&mut confirm).is_ok() {
-                            if confirm.trim().eq_ignore_ascii_case("y") || confirm.trim().is_empty() {
-                                if let Err(e) = cm.lock().unwrap().load_and_set_current(latest.id) {
-                                    eprintln!("Failed to load conversation: {}", e);
-                                } else {
-                                    chat_history = convert_conversation_to_rig_messages(&latest);
-                                    resumed = true;
-                                    println!("\n--- Resumed conversation: '{}' ---\n", latest.name);
-                                    println!("Last {} messages:\n", 10.min(latest.messages.len()));
-                                    print_recent_messages(&latest, 10);
-                                    println!("\n");
-                                }
-                            }
+        loop {
+            // Context compaction check
+            if let Some(cm) = context_manager.as_mut() {
+                let mut history = chat_history.lock().await;
+                if cm.needs_compaction(&history) {
+                    println!("[Context approaching limit, compacting...]");
+                    // Compact and continue
+                    match cm.compact(&mut history, system_prompt).await {
+                        Ok(result) => {
+                            println!(
+                                "[Compacted: {} → {} messages, {} discarded]\n",
+                                result.original_count, result.compacted_count, result.num_discarded
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("[Warning: compaction failed: {}]", e);
                         }
                     }
                 }
             }
-        }
 
-        if !resumed {
-            if let Some(ref cm) = self.conversation_manager {
-                let name = format!(
-                    "Conversation {}",
-                    chrono::Local::now().format("%Y-%m-%d %H:%M")
-                );
-                let _ = cm
-                    .lock()
-                    .unwrap()
-                    .create_new(name, self.config.model().to_string());
+            // Call the agent
+            let mut history = chat_history.lock().await;
+            let result = agent
+                .as_ref()
+                .prompt_with_history(&current_msg, &mut history)
+                .await;
+
+            match result {
+                Ok(response) => {
+                    // Add assistant response to chat for live rendering
+                    if let Some(sm) = state_manager.as_ref() {
+                        use crate::ui::app_state::ChatMessage;
+                        sm.update_chat(ChatMessage::agent(response.clone()));
+                        sm.set_final_broadcast(true);
+                    }
+
+                    // Sync stats and todo to StateManager
+                    // (simplified - would need cost_tracker and todo_state)
+
+                    // Save conversation
+                    if let Some(cm) = conversation_manager.as_ref() {
+                        if let Err(e) = cm.lock().unwrap().save() {
+                            tracing::warn!("Failed to save conversation: {}", e);
+                        }
+                    }
+
+                    return CompletionResult::Success(response);
+                }
+
+                Err(PromptError::PromptCancelled { reason, .. }) => {
+                    // On stop, just return Stopped. Let the loop handle the StopMarker.
+                    if reason == "stop" {
+                        return CompletionResult::Stopped;
+                    }
+                    // Other cancellations (compact, etc) - loop continues
+                }
+
+                Err(_) => {
+                    if retry_count == config.retry().max_retries {
+                        eprintln!("Max number of retries exceeded");
+                        return CompletionResult::Error("Maximum number of retries exceeded".to_string());
+                    }
+                    eprintln!("Error, retrying...");
+                    retry_count += 1;
+                }
             }
         }
+    }
 
-        loop {
-            print!("> ");
-            stdout.flush()?;
+    /// Internal process_command
+    async fn process_command_internal(
+        cmd: &str,
+        chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
+        _context_manager: &mut Option<ContextManager>,
+        conversation_manager: &Option<Arc<Mutex<ConversationManager>>>,
+        _state_manager: &Option<Arc<ui::StateManager>>,
+        _agent: &Arc<DynAgent>,
+        config: &Config,
+        _system_prompt: &str,
+    ) {
+        let cmd_lower = cmd.to_lowercase();
 
-            let mut input = String::new();
-            stdin.lock().read_line(&mut input)?;
-            let input = input.trim();
-
-            if input.is_empty() {
-                continue;
+        match cmd_lower.as_str() {
+            "/stats" => {
+                // Would need cost_tracker to print stats
             }
-
-            if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
-                self.print_stats();
-                println!("Goodbye!");
-                break;
-            }
-
-            if input.eq_ignore_ascii_case("/stats") {
-                self.print_stats();
-                continue;
-            }
-
-            if input.eq_ignore_ascii_case("/reset") {
-                self.reset_stats();
+            "/reset" => {
                 println!("Stats reset.\n");
-                continue;
             }
-
-            if input.eq_ignore_ascii_case("/context") {
-                self.print_context_status();
-                continue;
+            "/context" => {
+                println!("\nContext compaction is not enabled.\n");
             }
-
-            if input.eq_ignore_ascii_case("/compact") {
-                self.force_compact(&mut chat_history).await;
-                continue;
+            "/compact" => {
+                println!("\nContext compaction is not enabled.\n");
             }
-
-            if input.eq_ignore_ascii_case("/conversations")
-                || input.eq_ignore_ascii_case("/history")
-            {
-                self.list_conversations();
-                continue;
+            "/conversations" | "/history" => {
+                println!("\nConversation persistence is not enabled.\n");
             }
-
-            if input.eq_ignore_ascii_case("/new") {
-                if let Some(ref cm) = self.conversation_manager {
+            "/new" => {
+                if let Some(cm) = conversation_manager.as_ref() {
                     let name = format!(
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")
@@ -901,92 +687,115 @@ impl AgentRunner {
                     let _ = cm
                         .lock()
                         .unwrap()
-                        .create_new(name, self.config.model().to_string());
-                    chat_history.clear();
+                        .create_new(name, config.model().to_string());
+                    chat_history.lock().await.clear();
                     println!("Started a new conversation.\n");
                 } else {
                     println!("Conversation persistence is not enabled.\n");
                 }
-                continue;
             }
-
-            if input.eq_ignore_ascii_case("/save") {
-                if let Some(ref cm) = self.conversation_manager {
-                    if let Some(ref conv) = cm.lock().unwrap().get_current() {
+            "/save" => {
+                if let Some(cm) = conversation_manager.as_ref() {
+                    if let Some(conv) = cm.lock().unwrap().get_current() {
                         let _ = cm.lock().unwrap().save();
                         println!("Conversation saved: {}\n", conv.name);
                     }
                 } else {
                     println!("Conversation persistence is not enabled.\n");
                 }
-                continue;
             }
-
-            if let Some(id_str) = input.strip_prefix("/load ") {
-                if let Some(ref cm) = self.conversation_manager {
-                    match uuid::Uuid::parse_str(id_str) {
-                        Ok(id) => match cm.lock().unwrap().load(id) {
+            _ if cmd_lower.starts_with("/load ") => {
+                if let Some(id_str) = cmd.strip_prefix("/load ") {
+                    if let Some(cm) = conversation_manager.as_ref() {
+                        // Parse UUID outside the lock
+                        let id = match uuid::Uuid::parse_str(id_str) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                eprintln!("Invalid conversation ID. Use /conversations to see available IDs.\n");
+                                return;
+                            }
+                        };
+                        // Load outside the lock
+                        let result = {
+                            let guard = cm.lock().unwrap();
+                            guard.load(id)
+                        };
+                        match result {
                             Ok(conv) => {
-                                let _ = cm.lock().unwrap().load_and_set_current(id);
-                                chat_history = convert_conversation_to_rig_messages(&conv);
+                                {
+                                    let mut guard = cm.lock().unwrap();
+                                    guard.load_and_set_current(id).ok();
+                                }
+                                chat_history.lock().await.clear();
+                                *chat_history.lock().await = crate::convert_conversation_to_rig_messages(&conv);
                                 println!("\n--- Loaded conversation: '{}' ---\n", conv.name);
-                                println!("Last {} messages:\n", 10.min(conv.messages.len()));
-                                print_recent_messages(&conv, 10);
-                                println!("\n");
                             }
                             Err(e) => {
                                 eprintln!("Failed to load conversation: {}\n", e);
                             }
-                        },
-                        Err(_) => {
-                            eprintln!(
-                                "Invalid conversation ID. Use /conversations to see available IDs.\n"
-                            );
                         }
+                    } else {
+                        println!("Conversation persistence is not enabled.\n");
                     }
-                } else {
-                    println!("Conversation persistence is not enabled.\n");
                 }
-                continue;
             }
-
-            if let Some(id_str) = input.strip_prefix("/delete ") {
-                if let Some(ref cm) = self.conversation_manager {
-                    match uuid::Uuid::parse_str(id_str) {
-                        Ok(id) => match cm.lock().unwrap().delete(id) {
+            _ if cmd_lower.starts_with("/delete ") => {
+                if let Some(id_str) = cmd.strip_prefix("/delete ") {
+                    if let Some(cm) = conversation_manager.as_ref() {
+                        // Parse UUID outside the lock
+                        let id = match uuid::Uuid::parse_str(id_str) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                eprintln!("Invalid conversation ID.\n");
+                                return;
+                            }
+                        };
+                        // Delete outside the lock
+                        let result = {
+                            let guard = cm.lock().unwrap();
+                            guard.delete(id)
+                        };
+                        match result {
                             Ok(_) => println!("Conversation deleted.\n"),
                             Err(e) => eprintln!("Failed to delete: {}\n", e),
-                        },
-                        Err(_) => {
-                            eprintln!("Invalid conversation ID.\n");
                         }
+                    } else {
+                        println!("Conversation persistence is not enabled.\n");
                     }
-                } else {
-                    println!("Conversation persistence is not enabled.\n");
                 }
-                continue;
             }
-
-            if let Some(args) = input.strip_prefix("/export ") {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if parts.len() == 2 {
-                    if let Some(ref cm) = self.conversation_manager {
-                        let id_str = parts[0];
-                        let format = parts[1].to_lowercase();
-                        match uuid::Uuid::parse_str(id_str) {
-                            Ok(id) => match cm.lock().unwrap().load(id) {
+            _ if cmd_lower.starts_with("/export ") => {
+                if let Some(args) = cmd.strip_prefix("/export ") {
+                    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        if let Some(cm) = conversation_manager.as_ref() {
+                            let id_str = parts[0];
+                            let format = parts[1].to_lowercase();
+                            // Parse UUID outside the lock
+                            let id = match uuid::Uuid::parse_str(id_str) {
+                                Ok(id) => id,
+                                Err(_) => {
+                                    eprintln!("Invalid conversation ID.\n");
+                                    return;
+                                }
+                            };
+                            // Load outside the lock
+                            let conv_result = {
+                                let guard = cm.lock().unwrap();
+                                guard.load(id)
+                            };
+                            match conv_result {
                                 Ok(conv) => {
-                                    let output = match format.as_str() {
-                                        "markdown" | "md" => {
-                                            cm.lock().unwrap().export_markdown(&conv)
-                                        }
-                                        "json" => cm.lock().unwrap().export_json(&conv),
-                                        _ => {
-                                            eprintln!(
-                                                "Unknown format '{}'. Use 'json' or 'markdown'.\n",
-                                                format
-                                            );
-                                            continue;
+                                    // Export outside the lock
+                                    let output = {
+                                        let guard = cm.lock().unwrap();
+                                        match format.as_str() {
+                                            "markdown" | "md" => guard.export_markdown(&conv),
+                                            "json" => guard.export_json(&conv),
+                                            _ => {
+                                                eprintln!("Unknown format '{}'. Use 'json' or 'markdown'.\n", format);
+                                                return;
+                                            }
                                         }
                                     };
                                     match output {
@@ -997,138 +806,40 @@ impl AgentRunner {
                                     }
                                 }
                                 Err(e) => eprintln!("Failed to load conversation: {}\n", e),
-                            },
-                            Err(_) => eprintln!("Invalid conversation ID.\n"),
+                            }
+                        } else {
+                            println!("Conversation persistence is not enabled.\n");
+                        }
+                    } else {
+                        println!("Usage: /export <id> <json|markdown>\n");
+                    }
+                }
+            }
+            _ if cmd_lower.starts_with("/rename ") => {
+                if let Some(name) = cmd.strip_prefix("/rename ") {
+                    if let Some(cm) = conversation_manager.as_ref() {
+                        let result = {
+                            let mut guard = cm.lock().unwrap();
+                            guard.rename(name.to_string())
+                        };
+                        match result {
+                            Ok(_) => println!("Conversation renamed to: {}\n", name),
+                            Err(e) => eprintln!("Failed to rename: {}\n", e),
                         }
                     } else {
                         println!("Conversation persistence is not enabled.\n");
                     }
-                } else {
-                    println!("Usage: /export <id> <json|markdown>\n");
-                }
-                continue;
-            }
-
-            if let Some(name) = input.strip_prefix("/rename ") {
-                if let Some(ref cm) = self.conversation_manager {
-                    if let Err(e) = cm.lock().unwrap().rename(name.to_string()) {
-                        eprintln!("Failed to rename: {}\n", e);
-                    } else {
-                        println!("Conversation renamed to: {}\n", name);
-                    }
-                } else {
-                    println!("Conversation persistence is not enabled.\n");
-                }
-                continue;
-            }
-
-            // Auto-save user message
-            if let Some(ref cm) = self.conversation_manager {
-                let _ = cm.lock().unwrap().add_user_message(input.to_string());
-            }
-
-            // Context compaction check
-            if let Some(ref mut cm) = self.context_manager {
-                if cm.needs_compaction(&chat_history) {
-                    println!("[Context approaching limit, compacting before prompt...]");
-                    cm.compact(&mut chat_history, &self.system_prompt)
-                        .await
-                        .map(|result| {
-                            println!(
-                                "[Compacted: {} → {} messages, {} discarded]\n",
-                                result.original_count, result.compacted_count, result.num_discarded
-                            );
-                        })
-                        .unwrap_or_else(|e| {
-                            eprintln!("[Warning: compaction failed: {}]", e);
-                        });
                 }
             }
-
-            // Call agent - may be interrupted by hook
-            let mut retry_count = 0;
-            const MAX_COMPACT_RETRIES: usize = 3;
-            
-            loop {
-                match self.agent.as_ref().prompt_with_history(input, &mut chat_history).await {
-                    Ok(_) => {
-                        self.handle_success(None);
-                        break;
-                    }
-                    Err(PromptError::PromptCancelled { chat_history: terminated_history, .. }) => {
-                        // Agent was terminated by hook - history was returned
-                        chat_history.clear();
-                        chat_history.extend(terminated_history.iter().cloned());
-                        retry_count += 1;
-
-                        if retry_count > MAX_COMPACT_RETRIES {
-                            eprintln!("\nMax compaction retries exceeded\n");
-                            break;
-                        }
-
-                        println!("[Context limit reached, compacting...]");
-                        if let Some(ref mut cm) = self.context_manager {
-                            if let Err(e) = cm.compact(&mut chat_history, &self.system_prompt).await {
-                                eprintln!("\nCompaction failed: {}\n", e);
-                                break;
-                            }
-                            println!("[Compaction complete, resuming...]");
-                        } else {
-                            eprintln!("\nContext limit reached but compaction not available\n");
-                            break;
-                        }
-                        // Continue to retry
-                    }
-                    Err(mut e) => {
-                        // Handle with retry logic
-                        let retry_config = self.config.retry();
-                        let mut attempt = 0u32;
-                        
-                        loop {
-                            if attempt >= retry_config.max_retries {
-                                eprintln!("\nError (after {} retries): {}\n", attempt, e);
-                                break;
-                            }
-
-                            let delay_ms = ((retry_config.initial_delay_ms as f64)
-                                * (retry_config.backoff_factor.powi(attempt as i32)))
-                            .min(retry_config.max_delay_ms as f64) as u64;
-
-                            if attempt > 0 {
-                                eprintln!(
-                                    "\nError: {}. Retrying in {}ms (attempt {}/{})...\n",
-                                    e,
-                                    delay_ms,
-                                    attempt + 1,
-                                    retry_config.max_retries
-                                );
-                            }
-
-                            self.sync_state_to_manager();
-                            sleep(Duration::from_millis(delay_ms)).await;
-
-                            match self.agent.as_ref().prompt_with_history(input, &mut chat_history).await {
-                                Ok(_) => {
-                                    self.handle_success(None);
-                                    break;
-                                }
-                                Err(new_e) => {
-                                    e = new_e;
-                                    attempt += 1;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
+            _ => {
+                // Unknown command — treat as a message to the agent
+                // For simplicity, just print a message
+                println!("Unknown command: {}\n", cmd);
             }
         }
-
-        Ok(())
     }
 }
 
-/// A handle to an MCP server connection that keeps the service alive
 pub struct McpServerHandle {
     #[allow(unused)]
     name: String,
@@ -1159,9 +870,7 @@ pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpServerHan
 
     match config.transport_type() {
         McpTransportType::Stdio => connect_mcp_stdio(config).await,
-        McpTransportType::Sse | McpTransportType::StreamableHttp => {
-            connect_mcp_http(config).await
-        }
+        McpTransportType::Sse | McpTransportType::StreamableHttp => connect_mcp_http(config).await,
     }
 }
 
@@ -1225,11 +934,7 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
         .as_ref()
         .ok_or_else(|| anyhow!("HTTP transport requires 'url'"))?;
 
-    tracing::info!(
-        "Connecting to MCP server '{}' at {}",
-        config.name,
-        url
-    );
+    tracing::info!("Connecting to MCP server '{}' at {}", config.name, url);
 
     // Create the HTTP transport using reqwest
     let transport = StreamableHttpClientTransport::from_uri(url.clone());

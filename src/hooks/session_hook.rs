@@ -11,6 +11,7 @@ use rig::completion::message::AssistantContent;
 use rig::one_or_many::OneOrMany;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::hooks::events::AgentEvent;
@@ -303,7 +304,7 @@ mod tests {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone)] // NOTE: Clone only shallow-copies the Arc handles
 pub struct SessionHook {
     /// Channel sender for streaming events
     event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
@@ -313,6 +314,8 @@ pub struct SessionHook {
     context_window: u64,
     /// Compaction threshold (0.0-1.0)
     threshold: f64,
+    /// User requested stop
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl SessionHook {
@@ -323,6 +326,7 @@ impl SessionHook {
             stats: Arc::new(Mutex::new(SessionStats::new())),
             context_window: 128_000,
             threshold: 0.8,
+            stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -338,7 +342,13 @@ impl SessionHook {
             stats,
             context_window,
             threshold,
+            stop_requested: Arc::new(AtomicBool::new(false)),
         }
+    }
+    
+    /// Request the agent to stop
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::SeqCst);
     }
 
     /// Create a new session hook with a new event channel (backward compatible)
@@ -350,6 +360,7 @@ impl SessionHook {
                 stats: Arc::new(Mutex::new(SessionStats::new())),
                 context_window: 128_000,
                 threshold: 0.8,
+                stop_requested: Arc::new(AtomicBool::new(false)),
             },
             receiver,
         )
@@ -427,7 +438,9 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         HookAction::Continue
     }
 
-    /// Called after response - emit event with raw token data (no calculation)
+    /// Called after response - emit event and check for interruptions.
+    /// This is the right place for interruption checks because we have usage data here
+    /// and it fires at LLM boundaries (before tool execution).
     async fn on_completion_response(
         &self,
         _prompt: &Message,
@@ -453,6 +466,27 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             };
             let _ = sender.send(event);
         }
+        
+        // Check for interruptions at LLM boundary (before tool execution)
+        
+        // 1. Stop flag takes priority over everything
+        if self.stop_requested.load(Ordering::SeqCst) {
+            self.stop_requested.store(false, Ordering::SeqCst);
+            tracing::info!("Stop requested, terminating");
+            return HookAction::terminate("stop");
+        }
+        
+        // 2. Context limit check - we have usage data directly here
+        let threshold_tokens = (self.context_window as f64 * self.threshold) as u64;
+        if response.usage.input_tokens > threshold_tokens {
+            tracing::info!(
+                "Context at {:.1}% ({} tokens), triggering compact",
+                (response.usage.input_tokens as f64 / self.context_window as f64) * 100.0,
+                response.usage.input_tokens
+            );
+            return HookAction::terminate("compact");
+        }
+        
         HookAction::Continue
     }
 
@@ -476,7 +510,8 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         ToolCallHookAction::Continue
     }
 
-    /// Called after tool result - emit event and check for context overflow
+    /// Called after tool result - just emit event, no interruption logic here.
+    /// All interruption checks happen in on_completion_response.
     async fn on_tool_result(
         &self,
         tool_name: &str,
@@ -496,22 +531,6 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             };
             let _ = sender.send(event);
         }
-
-        // Check context usage and terminate if needed
-        if let Ok(stats) = self.stats.lock() {
-            if let Some(current_tokens) = stats.last_input_tokens() {
-                let threshold_tokens = (self.context_window as f64 * self.threshold) as u64;
-                if current_tokens > threshold_tokens {
-                    tracing::info!(
-                        "Context at {}% ({} tokens), triggering compact and resume",
-                        (current_tokens as f64 / self.context_window as f64) * 100.0,
-                        current_tokens
-                    );
-                    return HookAction::terminate("Context limit reached, compacting");
-                }
-            }
-        }
-
         HookAction::Continue
     }
 }
