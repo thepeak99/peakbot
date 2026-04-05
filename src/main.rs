@@ -1,7 +1,6 @@
 //! PeakBot entry point
 
 use anyhow::Result;
-use clap::Parser;
 use peakbot::{
     AgentRunner, Config, SubAgentRegistry, TodoTool, UiAction, Ui, build_system_prompt,
     create_provider, load_default_skills, load_mcp_servers,
@@ -10,53 +9,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-/// CLI arguments for PeakBot
-#[derive(Parser, Debug)]
-#[command(name = "peakbot")]
-#[command(about = "PeakBot coding agent with TUI and REPL modes")]
-struct Args {
-    /// Choose the UI mode: 'tui' for rich terminal UI, 'repl' for simple REPL
-    #[arg(short, long, default_value = "repl")]
-    ui: UiMode,
-}
-
-/// UI mode selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UiMode {
-    /// Rich terminal UI using ratatui (requires tui feature)
-    Tui,
-    /// Simple REPL interface (always available)
-    Repl,
-}
-
-impl std::str::FromStr for UiMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "tui" => Ok(UiMode::Tui),
-            "repl" => Ok(UiMode::Repl),
-            _ => Err(format!("Invalid UI mode '{}'. Use 'tui' or 'repl'", s)),
-        }
-    }
-}
-
-impl std::fmt::Display for UiMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UiMode::Tui => write!(f, "tui"),
-            UiMode::Repl => write!(f, "repl"),
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-
-    let args = Args::parse();
 
     // ── Shared setup ──────────────────────────────────────────────
     let config = Config::load()?;
@@ -189,44 +146,22 @@ async fn main() -> Result<()> {
         cwd: std::env::current_dir().unwrap_or_default(),
     });
 
-    // ── Run UI ──────────────────────────────────────────────────────
-    match args.ui {
-        UiMode::Tui => {
-            use peakbot::ui::Tui;
+    // ── Run REPL ──────────────────────────────────────────────────────
+    use peakbot::ui::ReplUi;
 
-            // Spawn controller task
-            let runner_handle = tokio::spawn(async move {
-                runner.run_loop(action_receiver).await;
-            });
+    // Spawn controller task
+    let runner_handle = tokio::spawn(async move {
+        runner.run_loop(action_receiver).await;
+    });
 
-            // Run TUI (blocking)
-            let mut tui = Tui::new(state_manager.clone(), action_sender);
-            tui.init().await?;
-            tui.run().await?;
-            tui.shutdown().await?;
+    // Run REPL View (blocking)
+    let mut ui = ReplUi::new(state_manager.clone(), action_sender);
+    ui.init().await?;
+    ui.run().await?;
+    ui.shutdown().await?;
 
-            // Signal controller to exit
-            let _ = runner_handle.abort();
-            let _ = runner_handle.await;
-        }
-        UiMode::Repl => {
-            use peakbot::ui::ReplUi;
-
-            // Spawn controller task
-            let runner_handle = tokio::spawn(async move {
-                runner.run_loop(action_receiver).await;
-            });
-
-            // Run REPL View (blocking)
-            let mut ui = ReplUi::new(state_manager.clone(), action_sender);
-            ui.init().await?;
-            ui.run().await?;
-            ui.shutdown().await?;
-
-            let _ = runner_handle.abort();
-            let _ = runner_handle.await;
-        }
-    }
+    let _ = runner_handle.abort();
+    let _ = runner_handle.await;
 
     Ok(())
 }
