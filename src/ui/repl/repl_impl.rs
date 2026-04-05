@@ -71,7 +71,7 @@ impl ReplUi {
     }
 
     /// Render the chat history area
-    fn render_chat_history(f: &mut ratatui::Frame, area: Rect, scroll: u16, chat: &ChatState) {
+    pub fn render_chat_history(f: &mut ratatui::Frame, area: Rect, scroll: u16, chat: &ChatState) {
         let mut message_lines: Vec<Line> = Vec::new();
 
         if chat.messages.is_empty() {
@@ -118,8 +118,8 @@ impl ReplUi {
         f.render_widget(paragraph, area);
     }
 
-    /// Render the input area with cursor
-    fn get_input_area<'a>(input: &str, cursor_pos: usize) -> Paragraph<'a> {
+    /// Render the input area with cursor (returns Paragraph for testing)
+    pub fn get_input_area<'a>(input: &str, cursor_pos: usize) -> Paragraph<'a> {
         let (prompt_text, prompt_color) = if input.is_empty() {
             ("💬 Message...", Color::DarkGray)
         } else {
@@ -144,7 +144,7 @@ impl ReplUi {
     }
 
     /// Render the status bar
-    fn render_status_bar(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    pub fn render_status_bar(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         let stats = &state.stats;
         let context = &state.context;
 

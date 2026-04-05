@@ -184,6 +184,19 @@ impl ChatMessage {
             timestamp: Local::now(),
         }
     }
+
+    /// Create a message with a fixed timestamp (for testing)
+    pub fn with_timestamp(role: MessageRole, content: String, timestamp_str: &str) -> Self {
+        use chrono::NaiveDateTime;
+        Self {
+            role,
+            content,
+            timestamp: NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_local_timezone(Local)
+                .unwrap(),
+        }
+    }
 }
 
 /// Role of a message sender
