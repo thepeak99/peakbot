@@ -9,6 +9,7 @@ use crate::tools::todo::TodoItem as CoreTodoItem;
 use crate::TodoStatus;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::fmt;
 
 /// Centralized state that all UIs observe
@@ -56,6 +57,13 @@ pub struct AppState {
     /// Whether this state update is the final broadcast after a prompt completed
     #[serde(default)]
     pub is_final: bool,
+
+    /// Pending notifications for the UI to display
+    #[serde(default)]
+    pub notifications: Vec<Notification>,
+    
+    /// Agent status message (e.g., "Compacting...", "Stopped")
+    pub status_message: Option<String>,
 }
 
 impl AppState {
@@ -144,19 +152,21 @@ impl ChatMessage {
         }
     }
     
-    /// Create a new tool call message
+    /// Create a new tool call message with structured display:
+    /// - Shows thought intent first
+    /// - Shows key params (2-3 lines max)
     pub fn tool_call(tool_name: &str, args: &str, _result: &str) -> Self {
-        let content = format!("🔧 {}({})", tool_name, args);
+        let content = format_tool_call(tool_name, args);
         Self {
             role: MessageRole::ToolCall,
             content,
             timestamp: Local::now(),
         }
     }
-    
-    /// Create a new tool result message
+
+    /// Create a new tool result message with truncation to top 2-3 lines
     pub fn tool_result(tool_name: &str, result: &str) -> Self {
-        let content = format!("📋 {} result: {}", tool_name, result);
+        let content = format_tool_result(tool_name, result);
         Self {
             role: MessageRole::ToolResult,
             content,
@@ -177,6 +187,241 @@ impl ChatMessage {
             timestamp: Local::now(),
         }
     }
+
+    /// Create a message with a fixed timestamp (for testing)
+    pub fn with_timestamp(role: MessageRole, content: String, timestamp_str: &str) -> Self {
+        use chrono::NaiveDateTime;
+        Self {
+            role,
+            content,
+            timestamp: NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_local_timezone(Local)
+                .unwrap(),
+        }
+    }
+}
+
+/// Format tool call with structured output: thought intent first, then params
+fn format_tool_call(tool_name: &str, args: &str) -> String {
+    // Try to parse JSON args to extract thought and key params
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+        let mut lines = Vec::new();
+
+        // Line 1: Thought intent (always first if present)
+        if let Some(thought) = parsed.get("thought").and_then(|v| v.as_str()) {
+            if !thought.is_empty() {
+                lines.push(format!("💭 {}", truncate_str(thought, 100)));
+            }
+        }
+
+        // Line 2: Tool name with key params
+        let mut params = Vec::new();
+        for (key, value) in parsed.as_object().unwrap_or(&serde_json::Map::new()) {
+            if key == "thought" {
+                continue; // Already shown
+            }
+            let value_str = match value {
+                serde_json::Value::String(s) => truncate_str(s, 60),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => "null".to_string(),
+                _ => truncate_str(&value.to_string(), 40),
+            };
+            params.push(format!("{}={}", key, value_str));
+        }
+
+        let params_str = params.join(", ");
+        lines.push(format!("🔧 {}({})", tool_name, params_str));
+
+        // Limit to 2-3 lines total
+        if lines.len() > 3 {
+            lines.truncate(3);
+        }
+
+        lines.join("\n")
+    } else {
+        // Fallback: just show tool name with raw args
+        format!("🔧 {}({})", tool_name, truncate_str(args, 150))
+    }
+}
+
+/// Format tool result with truncation to top 2-3 lines
+fn format_tool_result(tool_name: &str, result: &str) -> String {
+    // Special handling per tool type
+    match tool_name {
+        "bash" => format_bash_result(result),
+        "file_read" => format_file_read_result(result),
+        "list_directory" => format_list_directory_result(result),
+        "web_search" => format_search_result(result),
+        _ => format_generic_result(result),
+    }
+}
+
+/// Truncate a string to max_len, adding "..." if truncated
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+/// Truncate a single line to max chars, adding "..." if truncated
+fn truncate_line(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+/// Truncate each line to max chars, then truncate to top N lines
+fn truncate_lines(s: &str, max_lines: usize, max_chars: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let total = lines.len();
+    
+    // First truncate each line
+    let truncated: Vec<String> = lines.iter()
+        .map(|l| truncate_line(l, max_chars))
+        .collect();
+    
+    if total <= max_lines {
+        truncated.join("\n")
+    } else {
+        let preview: Vec<&str> = truncated.iter().take(max_lines).map(|s| s.as_str()).collect();
+        format!("{}\n... [{} lines truncated]", preview.join("\n"), total - max_lines)
+    }
+}
+
+/// Truncate result to top N lines
+fn truncate_to_lines(s: &str, max_lines: usize) -> String {
+    truncate_lines(s, max_lines, 60)
+}
+
+fn format_bash_result(result: &str) -> String {
+    // Parse bash output format: "Exit code: X\nSTDOUT:\n...\nSTDERR:\n..."
+    let lines: Vec<&str> = result.lines().collect();
+
+    // Extract exit code
+    let exit_code = lines.iter()
+        .find(|l| l.starts_with("Exit code:"))
+        .map(|l| l.split_whitespace().last().unwrap_or("0"))
+        .unwrap_or("0");
+
+    // Find stdout/stderr sections
+    let mut stdout_lines = Vec::new();
+    let mut stderr_lines = Vec::new();
+    let mut in_stdout = false;
+    let mut in_stderr = false;
+
+    for line in &lines {
+        if line.starts_with("STDOUT:") {
+            in_stdout = true;
+            in_stderr = false;
+        } else if line.starts_with("STDERR:") {
+            in_stdout = false;
+            in_stderr = true;
+        } else if line.starts_with("Exit code:") || line.starts_with("Full output saved") {
+            in_stdout = false;
+            in_stderr = false;
+        } else if in_stdout {
+            stdout_lines.push(*line);
+        } else if in_stderr {
+            stderr_lines.push(*line);
+        }
+    }
+
+    let exit_icon = if exit_code == "0" { "✅" } else { "❌" };
+    let mut output = format!("{} Exit {}", exit_icon, exit_code);
+
+    // Show first 2-3 lines of stdout (truncated to 60 chars each)
+    let stdout_preview: Vec<String> = stdout_lines.iter()
+        .take(2)
+        .map(|l| truncate_line(l, 60))
+        .collect();
+    if !stdout_preview.is_empty() {
+        output.push_str(&format!(" | {}", stdout_preview.join(" | ")));
+    }
+
+    // Show stderr if present (1 line max)
+    if !stderr_lines.is_empty() {
+        output.push_str(&format!(" | ⚠️ {}", truncate_str(stderr_lines[0], 50)));
+    }
+
+    // Add truncation notice if there was more
+    let total_lines = stdout_lines.len() + stderr_lines.len();
+    if total_lines > 3 {
+        output.push_str(&format!(" ... [{} more lines]", total_lines - 3));
+    }
+
+    output
+}
+
+fn format_file_read_result(result: &str) -> String {
+    // Parse: "     1\tcontent\n     2\tcontent2\n..."
+    let lines: Vec<&str> = result.lines().collect();
+
+    // Extract total lines from last line format or count
+    let total_lines = lines.len();
+
+    // Truncate lines and show first 3 only
+    let truncated: Vec<String> = lines.iter()
+        .take(3)
+        .map(|l| truncate_line(l, 60))
+        .collect();
+    let preview_str = truncated.join("\n");
+
+    let mut output = format!("📄 {} lines\n{}", total_lines, preview_str);
+
+    if lines.len() > 3 {
+        output.push_str(&format!("\n... [{} more lines]", lines.len() - 3));
+    }
+
+    output
+}
+
+fn format_list_directory_result(result: &str) -> String {
+    let lines: Vec<&str> = result.lines().collect();
+    let total = lines.len();
+
+    // Truncate each entry and show first 3
+    let preview: Vec<String> = lines.iter()
+        .take(3)
+        .map(|l| truncate_line(l, 60))
+        .collect();
+    let preview_str = preview.join(", ");
+
+    let mut output = format!("📁 {} entries\n{}", total, preview_str);
+
+    if lines.len() > 3 {
+        output.push_str(&format!("\n... [{} more]", lines.len() - 3));
+    }
+
+    output
+}
+
+fn format_search_result(result: &str) -> String {
+    // Truncate each line and show first 3 results
+    let lines: Vec<&str> = result.lines().collect();
+    let preview: Vec<String> = lines.iter()
+        .take(3)
+        .map(|l| truncate_line(l, 60))
+        .collect();
+    let preview_str = preview.join("\n");
+
+    let mut output = preview_str;
+
+    if lines.len() > 3 {
+        output.push_str(&format!("\n... [{} more results]", lines.len() - 3));
+    }
+
+    output
+}
+
+fn format_generic_result(result: &str) -> String {
+    // Generic truncation to 2-3 lines
+    truncate_to_lines(result, 3)
 }
 
 /// Role of a message sender
@@ -571,4 +816,44 @@ pub struct WelcomeState {
     pub compaction_keep_recent: usize,
     pub conversation_persistence_enabled: bool,
     pub cwd: std::path::PathBuf,
+}
+
+/// Notification for user-facing messages (confirmations, status updates)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub id: String,
+    pub message: String,
+    pub kind: NotificationKind,
+    pub timestamp: DateTime<Local>,
+}
+
+impl Notification {
+    pub fn new(message: String, kind: NotificationKind) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            message,
+            kind,
+            timestamp: Local::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl NotificationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NotificationKind::Info => "info",
+            NotificationKind::Success => "success",
+            NotificationKind::Warning => "warning",
+            NotificationKind::Error => "error",
+        }
+    }
 }
