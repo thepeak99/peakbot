@@ -129,7 +129,7 @@ impl Tui {
 }
 
 impl Ui for Tui {
-    fn init(&mut self) -> Result<()> {
+    async fn init(&mut self) -> Result<()> {
         TerminalSetup::enable_raw_mode()?;
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend)?;
@@ -137,7 +137,7 @@ impl Ui for Tui {
         Ok(())
     }
 
-    fn run(&mut self) -> Result<()> {
+    async fn run(&mut self) -> Result<()> {
         if self.terminal.is_none() {
             return Err(anyhow!("TUI not initialized. Call init() first."));
         }
@@ -270,7 +270,7 @@ impl Ui for Tui {
         Ok(())
     }
 
-    fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&mut self) -> Result<()> {
         TerminalSetup::disable_raw_mode()?;
         self.terminal = None;
         self.running = false;

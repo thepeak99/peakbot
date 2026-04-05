@@ -19,9 +19,9 @@ use crate::TodoStatus;
 
 /// Trait that all UI implementations must implement — View in MVC
 pub trait Ui: Send + 'static {
-    fn init(&mut self) -> Result<()>;
-    fn run(&mut self) -> Result<()>;
-    fn shutdown(&mut self) -> Result<()>;
+    async fn init(&mut self) -> Result<()>;
+    async fn run(&mut self) -> Result<()>;
+    async fn shutdown(&mut self) -> Result<()>;
 }
 
 /// User input actions — flow from View to Controller
