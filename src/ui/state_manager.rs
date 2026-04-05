@@ -12,8 +12,8 @@ use crate::hooks::events::AgentEvent;
 use crate::hooks::session_hook::SessionStats;
 use crate::TodoList;
 use crate::ui::app_state::{
-    AppState, ChatMessage, ChatState, ContextState, SessionState, TodoItem, TodoState,
-    WelcomeState,
+    AppState, ChatMessage, ChatState, ContextState, Notification, NotificationKind, SessionState,
+    TodoItem, TodoState, WelcomeState,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -146,6 +146,34 @@ impl StateManager {
         let mut state = self.state.write().unwrap();
         state.command_popup = popup;
         self.notify_update(&state);
+    }
+
+    /// Push a notification to be displayed by UI
+    pub fn push_notification(&self, message: String, kind: NotificationKind) {
+        let notification = Notification::new(message, kind);
+        let mut state = self.state.write().unwrap();
+        state.notifications.push(notification);
+        self.notify_update(&state);
+    }
+
+    /// Clear all notifications
+    pub fn clear_notifications(&self) {
+        let mut state = self.state.write().unwrap();
+        state.notifications.clear();
+        self.notify_update(&state);
+    }
+
+    /// Set agent status message (e.g., "Compacting...", "Stopped")
+    pub fn set_status(&self, message: Option<String>) {
+        let mut state = self.state.write().unwrap();
+        state.status_message = message;
+        self.notify_update(&state);
+    }
+
+    /// Add a system message to the chat
+    pub fn add_system_message(&self, content: String) {
+        let msg = ChatMessage::system(content);
+        self.update_chat(msg);
     }
 
     /// Process an AgentEvent and update state accordingly

@@ -283,7 +283,7 @@ impl ContextManager {
                 }
                 Err(e) => {
                     // If summarization fails, log and fall back to truncation
-                    eprintln!("Warning: Failed to summarize messages: {}. Falling back to truncation.", e);
+                    tracing::warn!("Failed to summarize messages: {}. Falling back to truncation.", e);
                     None
                 }
             }
