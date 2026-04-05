@@ -96,7 +96,8 @@ impl ReplUi {
                     Span::styled(timestamp_str, Style::default().fg(Color::DarkGray)),
                     Span::raw("] "),
                     Span::styled(prefix, Style::default().fg(color)),
-                    Span::raw(":"),
+                    Span::raw(": "),
+                    Span::raw(&msg.content),
                 ]));
             }
         }
