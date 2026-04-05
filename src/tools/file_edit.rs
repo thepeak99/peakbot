@@ -54,6 +54,7 @@ pub enum FileEditError {
 
 #[derive(Deserialize)]
 pub struct FileEditArgs {
+    thought: String,
     command: String,
     path: String,
     file_text: Option<String>,
@@ -106,6 +107,10 @@ If editing fails, read the file first to get exact content, then retry."
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "thought": {
+                        "type": "string",
+                        "description": "Briefly explain what you're about to do and why, before acting."
+                    },
                     "command": {
                         "type": "string",
                         "enum": ["create", "str_replace", "insert"],
@@ -140,7 +145,7 @@ If editing fails, read the file first to get exact content, then retry."
                         "description": "Optional for 'str_replace': if true, replace all occurrences instead of just the first one. Default: false (single match only)."
                     }
                 },
-                "required": ["command", "path"]
+                "required": ["thought", "command", "path"]
             }),
         }
     }

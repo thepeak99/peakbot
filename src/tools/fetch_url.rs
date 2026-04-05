@@ -14,6 +14,7 @@ pub enum FetchUrlError {
 
 #[derive(Deserialize)]
 pub struct FetchUrlArgs {
+    thought: String,
     url: String,
 }
 
@@ -36,12 +37,16 @@ impl Tool for FetchUrlTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "thought": {
+                        "type": "string",
+                        "description": "Briefly explain what you're about to do and why, before acting."
+                    },
                     "url": {
                         "type": "string",
                         "description": "The URL to fetch"
                     }
                 },
-                "required": ["url"]
+                "required": ["thought", "url"]
             }),
         }
     }
