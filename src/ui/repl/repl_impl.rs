@@ -76,8 +76,8 @@ impl ReplUi {
         }
     }
 
-    /// Render the chat history area
-    pub fn render_chat_history(f: &mut ratatui::Frame, area: Rect, scroll: u16, chat: &ChatState) {
+    /// Build the chat history paragraph (returns Paragraph, caller handles rendering)
+    pub fn build_chat_history_paragraph<'a>(chat: &'a ChatState) -> Paragraph<'a> {
         let mut message_lines: Vec<Line> = Vec::new();
 
         if chat.messages.is_empty() {
@@ -108,6 +108,25 @@ impl ReplUi {
             }
         }
 
+        Paragraph::new(Text::from(message_lines))
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" Chat Messages ")
+                    .borders(Borders::ALL),
+            )
+    }
+
+    /// Render the chat history area with scrollbar
+    pub fn render_chat_history(
+        f: &mut ratatui::Frame,
+        area: Rect,
+        scroll: u16,
+        paragraph: Paragraph,
+    ) {
+        let content_height = paragraph.line_count(area.width.saturating_sub(2)) as u16;
+
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -115,23 +134,15 @@ impl ReplUi {
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
-        let mut scroll_state = ScrollbarState::new(message_lines.len()).position(scroll as usize);
+        let mut scroll_state =
+            ScrollbarState::new(content_height as usize).position(scroll as usize);
         f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state);
 
-        let paragraph = Paragraph::new(Text::from(message_lines))
-            .style(Style::default().fg(Color::White))
-            .wrap(Wrap { trim: true })
-            .scroll((scroll, 0))
-            .block(
-                Block::default()
-                    .title(" Chat Messages ")
-                    .borders(Borders::ALL),
-            );
         f.render_widget(paragraph, chunks[0]);
     }
 
-    /// Render the input area with cursor (returns Paragraph for testing)
-    pub fn get_input_area<'a>(input: &str, cursor_pos: usize) -> Paragraph<'a> {
+    /// Build the input area paragraph (returns Paragraph for rendering)
+    pub fn build_input_paragraph<'a>(input: &str, cursor_pos: usize) -> Paragraph<'a> {
         let (prompt_text, prompt_color) = if input.is_empty() {
             ("💬 Message...", Color::DarkGray)
         } else {
@@ -153,6 +164,11 @@ impl ReplUi {
             .wrap(Wrap { trim: true })
             .block(Block::default().title(" Input ").borders(Borders::ALL));
         paragraph
+    }
+
+    /// Render the input area (takes built paragraph and renders it)
+    pub fn render_input_area<'a>(f: &mut ratatui::Frame, area: Rect, paragraph: Paragraph<'a>) {
+        f.render_widget(paragraph, area);
     }
 
     /// Render the status bar
@@ -183,7 +199,6 @@ impl ReplUi {
         let current_scroll_position = self.scroll_position;
         let current_auto_scroll = self.auto_scroll;
         let state_auto_scroll = state.chat.auto_scroll;
-        let current_content_height = self.content_height;
 
         if let Some(ref mut terminal) = self.terminal {
             terminal.draw(|f| {
@@ -195,7 +210,7 @@ impl ReplUi {
                     return;
                 }
 
-                let input = Self::get_input_area(&self.input_buffer, self.cursor_pos);
+                let input = Self::build_input_paragraph(&self.input_buffer, self.cursor_pos);
 
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -206,10 +221,12 @@ impl ReplUi {
                     ])
                     .split(size);
 
+                let chat_history = Self::build_chat_history_paragraph(&state.chat);
                 let viewport_height = chunks[0].height;
+                self.content_height = chat_history.line_count(size.width.saturating_sub(2)) as u16;
 
                 // Calculate scroll based on auto_scroll setting
-                let max_scroll = current_content_height.saturating_sub(viewport_height);
+                let max_scroll = self.content_height.saturating_sub(viewport_height);
                 let scroll = if current_auto_scroll || state_auto_scroll {
                     // Scroll to bottom
                     max_scroll
@@ -218,9 +235,9 @@ impl ReplUi {
                     current_scroll_position.min(max_scroll)
                 };
 
-                Self::render_chat_history(f, chunks[0], scroll, &state.chat);
+                Self::render_chat_history(f, chunks[0], scroll, chat_history);
+                Self::render_input_area(f, chunks[1], input);
                 Self::render_status_bar(f, chunks[2], state);
-                f.render_widget(input, chunks[1]);
             })?;
         }
         Ok(())
