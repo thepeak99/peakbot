@@ -56,6 +56,13 @@ pub struct AppState {
     /// Whether this state update is the final broadcast after a prompt completed
     #[serde(default)]
     pub is_final: bool,
+
+    /// Pending notifications for the UI to display
+    #[serde(default)]
+    pub notifications: Vec<Notification>,
+    
+    /// Agent status message (e.g., "Compacting...", "Stopped")
+    pub status_message: Option<String>,
 }
 
 impl AppState {
@@ -571,4 +578,44 @@ pub struct WelcomeState {
     pub compaction_keep_recent: usize,
     pub conversation_persistence_enabled: bool,
     pub cwd: std::path::PathBuf,
+}
+
+/// Notification for user-facing messages (confirmations, status updates)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub id: String,
+    pub message: String,
+    pub kind: NotificationKind,
+    pub timestamp: DateTime<Local>,
+}
+
+impl Notification {
+    pub fn new(message: String, kind: NotificationKind) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            message,
+            kind,
+            timestamp: Local::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl NotificationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NotificationKind::Info => "info",
+            NotificationKind::Success => "success",
+            NotificationKind::Warning => "warning",
+            NotificationKind::Error => "error",
+        }
+    }
 }
