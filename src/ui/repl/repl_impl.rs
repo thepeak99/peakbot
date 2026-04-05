@@ -24,10 +24,10 @@ use ratatui::{
         Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
+use std::future::pending;
 use std::io;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use std::future::pending;
 
 use crate::ui::app_state::{AppState, ChatState, MessageRole};
 use crate::ui::state_manager::StateManager;
@@ -73,16 +73,6 @@ impl ReplUi {
             welcome_printed: false,
             event_receiver: None,
         }
-    }
-
-    /// Get current state from the StateManager
-    fn get_state(&self) -> AppState {
-        self.state_manager.get_state()
-    }
-
-    /// Send an action to the controller
-    fn send_action(&self, action: UiAction) {
-        let _ = self.action_sender.send(action);
     }
 
     /// Render the chat history area
@@ -246,7 +236,6 @@ impl ReplUi {
     }
 
     /// Calculate the height needed for the input area based on content.
-    /// This uses the same wrapping logic as the message rendering.
     fn calculate_input_height(text: &str, width: u16) -> usize {
         let available_width = (width.saturating_sub(4)) as usize;
         if available_width == 0 {
@@ -324,7 +313,7 @@ impl ReplUi {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Fill(1),
-                        Constraint::Length(input_height),
+                        Constraint::Length(input_height + 4),
                         Constraint::Length(1),
                     ])
                     .split(size);
@@ -372,12 +361,8 @@ impl ReplUi {
             KeyCode::Enter => {
                 let msg = self.input_buffer.clone();
                 if !msg.trim().is_empty() {
-                    self.send_action(UiAction::SendMessage(msg));
+                    let _ = self.action_sender.send(UiAction::SendMessage(msg));
                 }
-                self.input_buffer.clear();
-                self.cursor_pos = 0;
-            }
-            KeyCode::Esc => {
                 self.input_buffer.clear();
                 self.cursor_pos = 0;
             }
@@ -434,13 +419,13 @@ impl Ui for ReplUi {
                 } => {
                     if let Some(key) = key {
                         self.handle_input(key);
-                        let state = self.get_state();
+                        let state = self.state_manager.get_state();
                         self.render(&state)?;
                     }
                 }
                 // Periodic render to keep UI responsive to state changes
                 _ = render_interval.tick() => {
-                    let state = self.get_state();
+                    let state = self.state_manager.get_state();
                     self.render(&state)?;
                 }
             }
