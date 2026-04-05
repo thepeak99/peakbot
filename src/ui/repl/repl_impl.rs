@@ -27,7 +27,9 @@ use ratatui::{
 };
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::time;
 
 use crate::ui::app_state::{AppState, ChatState, MessageRole};
 use crate::ui::state_manager::StateManager;
@@ -99,13 +101,16 @@ impl ReplUi {
 
                 // Split content by newlines to handle multiline messages
                 let content_lines: Vec<&str> = msg.content.split('\n').collect();
-                
+
                 for (i, content_line) in content_lines.iter().enumerate() {
                     // First line gets the full header (timestamp + role), subsequent lines get indentation
                     let line_content = if i == 0 {
                         vec![
                             Span::raw("["),
-                            Span::styled(format!("{}", msg.timestamp.format("%H:%M:%S")), Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!("{}", msg.timestamp.format("%H:%M:%S")),
+                                Style::default().fg(Color::DarkGray),
+                            ),
                             Span::raw("] "),
                             Span::styled(prefix, Style::default().fg(color)),
                             Span::raw(": "),
@@ -113,7 +118,7 @@ impl ReplUi {
                         ]
                     } else {
                         vec![
-                            Span::raw("         "),  // Align with role label
+                            Span::raw("         "), // Align with role label
                             Span::raw(*content_line),
                         ]
                     };
@@ -345,25 +350,18 @@ impl Ui for ReplUi {
 
     async fn run(&mut self) -> Result<()> {
         let mut events = EventStream::new();
-        let mut state_rx = self.state_manager.subscribe();
+        let mut ticks = time::interval(Duration::from_millis(50));
         while self.running {
             tokio::select! {
                 // Handle keyboard events via tokio::select!
                 e = events.next() => {
                     if let Some(Ok(e)) = e {
                         self.handle_input(e);
-                        let state = self.state_manager.get_state();
-                        self.render(&state)?;
                     }
                 }
-                // Async stream subscription — receive state updates
-                state = state_rx.recv() => {
-                    if let Some(state) = state {
-                        self.render(&state)?;
-                    } else {
-                        // Channel closed, subscriber was dropped
-                        break;
-                    }
+                _ = ticks.tick() => {
+                    let state = self.state_manager.get_state();
+                    self.render(&state)?;
                 }
             }
         }
