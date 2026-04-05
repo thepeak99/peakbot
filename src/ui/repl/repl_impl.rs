@@ -52,14 +52,14 @@ impl ReplUi {
 }
 
 impl Ui for ReplUi {
-    fn init(&mut self) -> Result<()> {
+    async fn init(&mut self) -> Result<()> {
         Ok(())
     }
 
     /// Run the REPL view loop:
     /// 1. Spawn a thread to read stdin and send UiActions to Controller
     /// 2. Subscribe to StateManager and render on every state update
-    fn run(&mut self) -> Result<()> {
+    async fn run(&mut self) -> Result<()> {
         // Spawn stdin reader thread
         let action_sender = self.action_sender.clone();
         thread::spawn(move || {
@@ -116,7 +116,7 @@ impl Ui for ReplUi {
         Ok(())
     }
 
-    fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&mut self) -> Result<()> {
         self.running = false;
         Ok(())
     }

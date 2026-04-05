@@ -211,9 +211,9 @@ async fn main() -> Result<()> {
 
                 // Run TUI (blocking)
                 let mut tui = Tui::new(state_manager.clone(), action_sender);
-                tui.init()?;
-                tui.run()?;
-                tui.shutdown()?;
+                tui.init().await?;
+                tui.run().await?;
+                tui.shutdown().await?;
 
                 // Signal controller to exit
                 let _ = runner_handle.abort();
@@ -234,9 +234,9 @@ async fn main() -> Result<()> {
 
             // Run REPL View (blocking)
             let mut ui = ReplUi::new(state_manager.clone(), action_sender);
-            ui.init()?;
-            ui.run()?;
-            ui.shutdown()?;
+            ui.init().await?;
+            ui.run().await?;
+            ui.shutdown().await?;
 
             let _ = runner_handle.abort();
             let _ = runner_handle.await;
