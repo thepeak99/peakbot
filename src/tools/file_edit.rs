@@ -54,6 +54,7 @@ pub enum FileEditError {
 
 #[derive(Deserialize)]
 pub struct FileEditArgs {
+    #[allow(dead_code)]
     thought: String,
     command: String,
     path: String,

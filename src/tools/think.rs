@@ -11,6 +11,7 @@ pub enum ThinkError {
 
 #[derive(Deserialize)]
 pub struct ThinkArgs {
+    #[allow(dead_code)]
     thought: String,
 }
 

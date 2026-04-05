@@ -18,6 +18,7 @@ pub enum FileReadError {
 
 #[derive(Deserialize)]
 pub struct FileReadArgs {
+    #[allow(dead_code)]
     thought: String,
     path: String,
     start_line: Option<usize>,

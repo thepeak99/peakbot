@@ -24,8 +24,10 @@ pub struct DelegateTool {
     /// Registry of available sub-agents
     registry: Arc<SubAgentRegistry>,
     /// Cost tracker for aggregating costs
+    #[allow(unused)]
     cost_tracker: Arc<Mutex<crate::hooks::SessionStats>>,
     /// Default timeout for agent execution
+    #[allow(unused)]
     default_timeout: Duration,
 }
 
@@ -125,6 +127,7 @@ impl DelegateTool {
     }
 
     /// Execute agents in series (one after another, passing results)
+    #[allow(dead_code)]
     async fn execute_series(
         &self,
         agents: &[String],
@@ -215,6 +218,7 @@ impl DelegateTool {
     }
 
     /// Format results from series execution
+    #[allow(dead_code)]
     fn format_series_results_static(results: &[AgentExecutionResult]) -> String {
         let mut output = String::new();
         output.push_str("# Series Execution Results\n\n");
@@ -257,7 +261,9 @@ struct AgentExecutionResult {
     agent_name: String,
     response: String,
     duration_secs: f64,
+    #[allow(dead_code)]
     tokens_used: Option<u64>,
+    #[allow(dead_code)]
     cost: Option<f64>,
     timed_out: bool,
 }

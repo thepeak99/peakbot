@@ -14,6 +14,7 @@ pub enum FetchUrlError {
 
 #[derive(Deserialize)]
 pub struct FetchUrlArgs {
+    #[allow(dead_code)]
     thought: String,
     url: String,
 }

@@ -309,6 +309,7 @@ pub struct SessionHook {
     /// Channel sender for streaming events
     event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
     /// Reference to session stats for token tracking
+    #[allow(dead_code)]
     stats: Arc<Mutex<SessionStats>>,
     /// Context window size in tokens
     context_window: u64,

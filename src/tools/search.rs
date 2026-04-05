@@ -92,6 +92,7 @@ struct SearXngResult {
 /// Arguments for the search tool
 #[derive(Debug, Deserialize)]
 pub struct SearchArgs {
+    #[allow(dead_code)]
     thought: String,
     /// The search query (plain text, no special syntax required)
     query: String,

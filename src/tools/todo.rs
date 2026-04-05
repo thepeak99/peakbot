@@ -158,6 +158,7 @@ pub enum TodoError {
 /// Arguments for the todo tool
 #[derive(Deserialize, Debug)]
 pub struct TodoArgs {
+    #[allow(dead_code)]
     thought: String,
     /// The action to perform: add, update, remove, list, clear
     action: String,

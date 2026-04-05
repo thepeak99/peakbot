@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::TodoStatus;
 
 /// Trait that all UI implementations must implement — View in MVC
+#[allow(async_fn_in_trait)]
 pub trait Ui: Send + 'static {
     async fn init(&mut self) -> Result<()>;
     async fn run(&mut self) -> Result<()>;
