@@ -58,14 +58,6 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    #[cfg(not(feature = "tui"))]
-    if args.ui == UiMode::Tui {
-        eprintln!("Error: TUI mode requires the 'tui' feature to be enabled.");
-        eprintln!("Run with: cargo run --features tui -- --ui tui");
-        eprintln!("Or use REPL mode: peakbot --ui repl");
-        std::process::exit(1);
-    }
-
     // ── Shared setup ──────────────────────────────────────────────
     let config = Config::load()?;
     let skills = load_default_skills()?;
@@ -200,29 +192,22 @@ async fn main() -> Result<()> {
     // ── Run UI ──────────────────────────────────────────────────────
     match args.ui {
         UiMode::Tui => {
-            #[cfg(feature = "tui")]
-            {
-                use peakbot::ui::Tui;
+            use peakbot::ui::Tui;
 
-                // Spawn controller task
-                let runner_handle = tokio::spawn(async move {
-                    runner.run_loop(action_receiver).await;
-                });
+            // Spawn controller task
+            let runner_handle = tokio::spawn(async move {
+                runner.run_loop(action_receiver).await;
+            });
 
-                // Run TUI (blocking)
-                let mut tui = Tui::new(state_manager.clone(), action_sender);
-                tui.init().await?;
-                tui.run().await?;
-                tui.shutdown().await?;
+            // Run TUI (blocking)
+            let mut tui = Tui::new(state_manager.clone(), action_sender);
+            tui.init().await?;
+            tui.run().await?;
+            tui.shutdown().await?;
 
-                // Signal controller to exit
-                let _ = runner_handle.abort();
-                let _ = runner_handle.await;
-            }
-            #[cfg(not(feature = "tui"))]
-            {
-                unreachable!();
-            }
+            // Signal controller to exit
+            let _ = runner_handle.abort();
+            let _ = runner_handle.await;
         }
         UiMode::Repl => {
             use peakbot::ui::ReplUi;
