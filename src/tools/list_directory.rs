@@ -14,6 +14,7 @@ pub enum ListDirectoryError {
 
 #[derive(Deserialize)]
 pub struct ListDirectoryArgs {
+    thought: String,
     path: String,
     recursive: Option<bool>,
 }
@@ -37,6 +38,10 @@ impl Tool for ListDirectoryTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "thought": {
+                        "type": "string",
+                        "description": "Briefly explain what you're about to do and why, before acting."
+                    },
                     "path": {
                         "type": "string",
                         "description": "Absolute path to the directory to list"
@@ -46,7 +51,7 @@ impl Tool for ListDirectoryTool {
                         "description": "If true, recurse into subdirectories (max depth 3). Default: false."
                     }
                 },
-                "required": ["path"]
+                "required": ["thought", "path"]
             }),
         }
     }
