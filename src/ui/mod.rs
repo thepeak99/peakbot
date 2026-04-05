@@ -16,11 +16,10 @@ pub mod app_state;
 pub mod state_manager;
 pub mod ui_trait;
 
-// REPL UI (always available for backward compatibility)
+// REPL UI (ratatui-based)
 pub mod repl;
 
-// TUI (feature-gated)
-#[cfg(feature = "tui")]
+// TUI module
 pub mod tui;
 
 // Re-export commonly used types
@@ -30,6 +29,4 @@ pub use ui_trait::*;
 
 // Re-export UI implementations
 pub use repl::*;
-
-#[cfg(feature = "tui")]
 pub use tui::*;
