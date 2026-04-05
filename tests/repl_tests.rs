@@ -139,6 +139,60 @@ mod tests {
         assert_snapshot!("chat_single_agent_message", lines.join("\n"));
     }
 
+    #[test]
+    fn chat_single_user_message_multiline() {
+        let mut chat = ChatState::new();
+        chat.add_message(ChatMessage::with_timestamp(
+            MessageRole::User,
+            "This is a message\nwith a newline\nin it.".to_string(),
+            "2024-01-01 12:00:00",
+        ));
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(100),
+                    Constraint::Length(1),
+                ])
+                .split(f.area());
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("chat_single_user_message_multiline", lines.join("\n"));
+    }
+
+    #[test]
+    fn chat_single_agent_message_multiline() {
+        let mut chat = ChatState::new();
+        chat.add_message(ChatMessage::with_timestamp(
+            MessageRole::Agent,
+            "Line one\nLine two\nLine three".to_string(),
+            "2024-01-01 12:00:00",
+        ));
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(100),
+                    Constraint::Length(1),
+                ])
+                .split(f.area());
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("chat_single_agent_message_multiline", lines.join("\n"));
+    }
+
     // === Status Bar Tests ===
 
     #[test]
