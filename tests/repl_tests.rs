@@ -23,7 +23,7 @@ mod tests {
 
     #[test]
     fn input_area_empty() {
-        let paragraph = ReplUi::get_input_area("", 0);
+        let paragraph = ReplUi::build_input_paragraph("", 0);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_empty", lines.join("\n"));
@@ -31,7 +31,7 @@ mod tests {
 
     #[test]
     fn input_area_cursor_start() {
-        let paragraph = ReplUi::get_input_area("Hello", 0);
+        let paragraph = ReplUi::build_input_paragraph("Hello", 0);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_cursor_start", lines.join("\n"));
@@ -39,7 +39,7 @@ mod tests {
 
     #[test]
     fn input_area_cursor_middle() {
-        let paragraph = ReplUi::get_input_area("Hello", 2);
+        let paragraph = ReplUi::build_input_paragraph("Hello", 2);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_cursor_middle", lines.join("\n"));
@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn input_area_cursor_end() {
-        let paragraph = ReplUi::get_input_area("Hello", 5);
+        let paragraph = ReplUi::build_input_paragraph("Hello", 5);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_cursor_end", lines.join("\n"));
@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn input_area_long_text() {
-        let paragraph = ReplUi::get_input_area("This is a very long input that will wrap to multiple lines", 0);
+        let paragraph = ReplUi::build_input_paragraph("This is a very long input that will wrap to multiple lines", 0);
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_long_text", lines.join("\n"));
@@ -66,6 +66,7 @@ mod tests {
     #[test]
     fn chat_welcome() {
         let chat = ChatState::new();
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -77,7 +78,7 @@ mod tests {
                     Constraint::Length(1),
                 ])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, &chat);
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -92,6 +93,7 @@ mod tests {
             "Hello".to_string(),
             "2024-01-01 12:00:00",
         ));
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -103,7 +105,7 @@ mod tests {
                     Constraint::Length(1),
                 ])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, &chat);
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -118,6 +120,7 @@ mod tests {
             "Hi there!".to_string(),
             "2024-01-01 12:00:00",
         ));
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -129,7 +132,7 @@ mod tests {
                     Constraint::Length(1),
                 ])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, &chat);
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -235,6 +238,7 @@ mod tests {
                 "2024-01-01 12:00:00",
             ));
         }
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -247,7 +251,7 @@ mod tests {
                 ])
                 .split(f.area());
             // Scroll position 0 = showing top of content
-            ReplUi::render_chat_history(f, chunks[0], 0, &chat);
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -265,6 +269,7 @@ mod tests {
                 "2024-01-01 12:00:00",
             ));
         }
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -277,7 +282,7 @@ mod tests {
                 ])
                 .split(f.area());
             // Scroll position 5 = showing middle of content
-            ReplUi::render_chat_history(f, chunks[0], 5, &chat);
+            ReplUi::render_chat_history(f, chunks[0], 5, paragraph);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -295,6 +300,7 @@ mod tests {
                 "2024-01-01 12:00:00",
             ));
         }
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -307,7 +313,7 @@ mod tests {
                 ])
                 .split(f.area());
             // Max scroll = 15 messages - 8 visible = 7 (show last messages)
-            ReplUi::render_chat_history(f, chunks[0], 7, &chat);
+            ReplUi::render_chat_history(f, chunks[0], 7, paragraph);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -348,6 +354,7 @@ mod tests {
             "I found some files in the directory.".to_string(),
             "2024-01-01 12:00:05",
         ));
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
         let backend = TestBackend::new(70, 12);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -359,7 +366,7 @@ mod tests {
                     Constraint::Length(1),
                 ])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, &chat);
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -385,6 +392,7 @@ mod tests {
             "Short".to_string(),
             "2024-01-01 12:00:02",
         ));
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -396,7 +404,7 @@ mod tests {
                     Constraint::Length(1),
                 ])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, &chat);
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
 
         let lines = buffer_to_lines(terminal.backend());

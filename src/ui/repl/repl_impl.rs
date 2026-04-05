@@ -9,7 +9,9 @@
 //!   User input → UiAction → Controller → Model (StateManager) → broadcast → View (render)
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, MouseEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use futures::StreamExt;
@@ -138,7 +140,8 @@ impl ReplUi {
             ScrollbarState::new(content_height as usize).position(scroll as usize);
         f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state);
 
-        f.render_widget(paragraph, chunks[0]);
+        let scrolled = paragraph.scroll((scroll, 0));
+        f.render_widget(scrolled, chunks[0]);
     }
 
     /// Build the input area paragraph (returns Paragraph for rendering)
@@ -196,10 +199,6 @@ impl ReplUi {
     /// Main render function
     fn render(&mut self, state: &AppState) -> Result<()> {
         // Calculate content height and extract scroll state before borrowing terminal
-        let current_scroll_position = self.scroll_position;
-        let current_auto_scroll = self.auto_scroll;
-        let state_auto_scroll = state.chat.auto_scroll;
-
         if let Some(ref mut terminal) = self.terminal {
             terminal.draw(|f| {
                 let size = f.area();
@@ -222,17 +221,17 @@ impl ReplUi {
                     .split(size);
 
                 let chat_history = Self::build_chat_history_paragraph(&state.chat);
-                let viewport_height = chunks[0].height;
+                self.viewport_height = chunks[0].height;
                 self.content_height = chat_history.line_count(size.width.saturating_sub(2)) as u16;
 
                 // Calculate scroll based on auto_scroll setting
-                let max_scroll = self.content_height.saturating_sub(viewport_height);
-                let scroll = if current_auto_scroll || state_auto_scroll {
+                let max_scroll = self.content_height.saturating_sub(self.viewport_height);
+                let scroll = if self.auto_scroll {
                     // Scroll to bottom
                     max_scroll
                 } else {
                     // Use stored position (clamped to valid range)
-                    current_scroll_position.min(max_scroll)
+                    self.scroll_position.min(max_scroll)
                 };
 
                 Self::render_chat_history(f, chunks[0], scroll, chat_history);
@@ -295,7 +294,7 @@ impl ReplUi {
                 self.auto_scroll = false;
             }
             KeyCode::Esc => {
-                panic!("At the disco");
+                self.running = false;
             }
             _ => {}
         }
@@ -327,6 +326,7 @@ impl ReplUi {
 impl Ui for ReplUi {
     async fn init(&mut self) -> Result<()> {
         self.terminal = Some(ratatui::init());
+        execute!(std::io::stdout(), EnableMouseCapture)?;
 
         Ok(())
     }
@@ -369,6 +369,7 @@ impl Ui for ReplUi {
         }
         disable_raw_mode()?;
         execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(std::io::stdout(), DisableMouseCapture)?;
         self.terminal = None;
         self.running = false;
         Ok(())
