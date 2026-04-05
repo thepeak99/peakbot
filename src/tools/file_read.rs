@@ -18,6 +18,7 @@ pub enum FileReadError {
 
 #[derive(Deserialize)]
 pub struct FileReadArgs {
+    thought: String,
     path: String,
     start_line: Option<usize>,
     end_line: Option<usize>,
@@ -40,6 +41,10 @@ impl Tool for FileReadTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "thought": {
+                        "type": "string",
+                        "description": "Briefly explain what you're about to do and why, before acting."
+                    },
                     "path": {
                         "type": "string",
                         "description": "Absolute path to the file to read"
@@ -53,7 +58,7 @@ impl Tool for FileReadTool {
                         "description": "Optional: stop reading at this line (1-indexed, inclusive)"
                     }
                 },
-                "required": ["path"]
+                "required": ["thought", "path"]
             }),
         }
     }

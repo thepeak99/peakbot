@@ -1,0 +1,9 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+┌ Input ───────────────────────────────────────────────────┐
+│> █This is a very long input that will wrap to multiple   │
+│lines                                                     │
+│                                                          │
+└──────────────────────────────────────────────────────────┘

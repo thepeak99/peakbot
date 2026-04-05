@@ -1,0 +1,5 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+Tokens: 1.5k │ Calls: 10 │ Cost: $0.0250 │ Context: 0.0% │ Model: claude-3.7-son

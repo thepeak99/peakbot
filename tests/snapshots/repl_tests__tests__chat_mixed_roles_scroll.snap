@@ -1,0 +1,15 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+┌ Chat Messages ────────────────────────────────────────────────────┐▲
+│[12:00:00] 👤  User: Hello, how are you?                            │█
+│[12:00:01] 🤖  Agent: I'm doing well, thank you!                    │█
+│[12:00:02] 👤  User: Can you help me with coding?                   │█
+│[12:00:03] 🔧  Tool: bash("ls -la")                                 │█
+│[12:00:04] 📋  Result: file1.txt file2.txt                          │█
+│[12:00:05] 🤖  Agent: I found some files in the directory.          │█
+│                                                                   │║
+│                                                                   │║
+│                                                                   │║
+└───────────────────────────────────────────────────────────────────┘▼

@@ -23,8 +23,7 @@ pub use conversation::{
 pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
     AgentEvent, CostHandler, EventChannel, EventHandler, EventProcessor, ModelPricing, SessionHook,
-    SessionStats, StateManagerHandler, StreamingConfig, StreamingOutputHandler, TextColor,
-    TokenUsage, VerbosityLevel, create_event_channel, fetch_model_pricing,
+    SessionStats, StateManagerHandler, TokenUsage, create_event_channel, fetch_model_pricing,
 };
 pub use pipeline::{DelegateTool, SubAgentRegistry};
 pub use providers::{CostTracker, DynAgent, ProviderInfo, create_provider};
@@ -34,8 +33,8 @@ use rig::tool::rmcp::McpTool;
 use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpClientTransport};
 pub use skills::{SkillRegistry, load_default_skills};
 pub use tools::{
-    BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, LoggingToolDyn,
-    SearchTool, ThinkTool, TodoList, TodoStatus, TodoTool,
+    BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
+    TodoList, TodoStatus, TodoTool,
 };
 pub use ui::{Ui, UiAction};
 
@@ -132,7 +131,6 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
     messages
 }
 
-
 /// AgentRunner — the Controller in MVC.
 ///
 /// Receives input (UiAction) from Views, calls the agent, writes results to
@@ -212,75 +210,6 @@ impl AgentRunner {
         }
     }
 
-    /// Print session stats — used by REPL View
-    pub fn print_stats(&self) {
-        println!("\n=== Session Statistics ===\n");
-        println!("Provider: {}", self.provider_info.name);
-        println!("Model: {}", self.provider_info.model);
-        if let Some(summary) = self.cost_tracker.get_session_summary() {
-            println!("{}", summary);
-        } else {
-            println!("Token tracking not available for this provider.");
-        }
-        println!();
-    }
-
-    /// Print context status — used by REPL View
-    pub fn print_context_status(&self) {
-        if let Some(ref cm) = self.context_manager {
-            println!("\n=== Context Status ===\n");
-            println!("{}", cm.format_status());
-            println!();
-        } else {
-            println!("\nContext compaction is not enabled.\n");
-        }
-    }
-
-    /// Print todo list summary — used by REPL View
-    pub fn print_todo_summary(&self) {
-        if let Some(ref state) = self.todo_state {
-            if let Ok(list) = state.lock() {
-                let tasks = list.list();
-                if !tasks.is_empty() {
-                    let (pending, in_progress, completed, cancelled) = list.count_by_status();
-                    println!(
-                        "\n[Todo: {} pending, {} in-progress, {} completed, {} cancelled]\n",
-                        pending, in_progress, completed, cancelled
-                    );
-                }
-            }
-        }
-    }
-
-    /// List saved conversations — used by REPL View
-    pub fn list_conversations(&self) {
-        if let Some(ref cm) = self.conversation_manager {
-            match cm.lock().unwrap().list() {
-                Ok(conversations) => {
-                    if conversations.is_empty() {
-                        println!("\nNo saved conversations.\n");
-                    } else {
-                        println!("\n=== Saved Conversations ===\n");
-                        for conv in &conversations {
-                            println!("ID: {}", conv.id);
-                            println!("  Name: {}", conv.name);
-                            println!("  Model: {}", conv.model);
-                            println!("  Messages: {}", conv.message_count);
-                            println!("  Created: {}", conv.created_at.format("%Y-%m-%d %H:%M"));
-                            println!("  Updated: {}", conv.updated_at.format("%Y-%m-%d %H:%M"));
-                            println!();
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to list conversations: {}\n", e);
-                }
-            }
-        } else {
-            println!("\nConversation persistence is not enabled.\n");
-        }
-    }
-
     /// Reset session stats — backend concern
     pub fn reset_stats(&self) {
         self.cost_tracker.reset_stats();
@@ -302,20 +231,35 @@ impl AgentRunner {
 
     /// Force context compaction
     pub async fn force_compact(&mut self, chat_history: &mut Vec<Message>) {
+        use crate::ui::app_state::NotificationKind;
+
         if let Some(ref mut cm) = self.context_manager {
             match cm.compact(chat_history, &self.system_prompt).await {
                 Ok(result) => {
-                    println!(
-                        "\n[Context compacted: {} → {} messages, {} messages discarded]\n",
-                        result.original_count, result.compacted_count, result.num_discarded
-                    );
+                    if let Some(ref sm) = self.state_manager {
+                        sm.push_notification(
+                            format!(
+                                "Context compacted: {} → {} messages, {} discarded",
+                                result.original_count, result.compacted_count, result.num_discarded
+                            ),
+                            NotificationKind::Info,
+                        );
+                    }
                 }
                 Err(e) => {
-                    eprintln!("\nError compacting context: {}\n", e);
+                    if let Some(ref sm) = self.state_manager {
+                        sm.push_notification(
+                            format!("Error compacting context: {}", e),
+                            NotificationKind::Error,
+                        );
+                    }
                 }
             }
-        } else {
-            println!("\nContext compaction is not enabled.\n");
+        } else if let Some(ref sm) = self.state_manager {
+            sm.push_notification(
+                "Context compaction is not enabled.".to_string(),
+                NotificationKind::Warning,
+            );
         }
     }
 
@@ -329,12 +273,13 @@ impl AgentRunner {
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<QueueMessage>(32);
 
         // Completion notifications back to event loop
-        let (completion_tx, _completion_rx) = tokio::sync::broadcast::channel::<CompletionResult>(8);
+        let (completion_tx, _completion_rx) =
+            tokio::sync::broadcast::channel::<CompletionResult>(8);
 
         // Shared chat history (needed by both loops)
         let chat_history = Arc::new(tokio::sync::Mutex::new(Vec::<Message>::new()));
 
-        // Spawn event processing task for streaming output (view concern)
+        // Spawn event processing task for live state updates
         if let Some(receiver) = self._event_receiver.take() {
             let mut handlers: Vec<Arc<dyn EventHandler>> = Vec::new();
 
@@ -346,8 +291,6 @@ impl AgentRunner {
             if let Some(ref sm) = self.state_manager {
                 handlers.push(Arc::new(StateManagerHandler::new(sm.clone())));
             }
-
-            handlers.push(Arc::new(StreamingOutputHandler::new()));
 
             tokio::spawn(async move {
                 let mut processor = EventProcessor::new(receiver, handlers);
@@ -383,7 +326,8 @@ impl AgentRunner {
                     state_manager,
                     session_hook,
                     config_model,
-                ).await;
+                )
+                .await;
             }
         });
 
@@ -403,7 +347,8 @@ impl AgentRunner {
                     agent,
                     config_for_agent,
                     system_prompt,
-                ).await;
+                )
+                .await;
             }
         });
 
@@ -429,10 +374,7 @@ impl AgentRunner {
                 "Conversation {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M")
             );
-            let _ = cm
-                .lock()
-                .unwrap()
-                .create_new(name, config_model);
+            let _ = cm.lock().unwrap().create_new(name, config_model);
         }
 
         while let Some(action) = action_receiver.recv().await {
@@ -463,7 +405,12 @@ impl AgentRunner {
                         if state_manager.as_ref().map_or(false, |sm| sm.is_running()) {
                             session_hook.request_stop();
                             msg_tx.send(QueueMessage::StopMarker).await.ok();
-                            println!("[Stop requested...]");
+                            if let Some(ref sm) = state_manager {
+                                sm.push_notification(
+                                    "Stop requested...".to_string(),
+                                    crate::ui::app_state::NotificationKind::Info,
+                                );
+                            }
                         }
                     } else {
                         // Queue command for agent loop
@@ -476,7 +423,12 @@ impl AgentRunner {
                     if state_manager.as_ref().map_or(false, |sm| sm.is_running()) {
                         session_hook.request_stop();
                         msg_tx.send(QueueMessage::StopMarker).await.ok();
-                        println!("[Stop requested...]");
+                        if let Some(ref sm) = state_manager {
+                            sm.push_notification(
+                                "Stop requested...".to_string(),
+                                crate::ui::app_state::NotificationKind::Info,
+                            );
+                        }
                     }
                 }
 
@@ -519,7 +471,8 @@ impl AgentRunner {
                         &agent,
                         &config,
                         &system_prompt,
-                    ).await;
+                    )
+                    .await;
 
                     // Mark as done
                     if let Some(ref sm) = state_manager {
@@ -543,7 +496,8 @@ impl AgentRunner {
                         &agent,
                         &config,
                         &system_prompt,
-                    ).await;
+                    )
+                    .await;
                     if let Some(ref sm) = state_manager {
                         sm.set_running(false);
                     }
@@ -553,7 +507,12 @@ impl AgentRunner {
                 Some(QueueMessage::StopMarker) => {
                     // This is just an acknowledgment that stop was requested
                     // The actual stopping happened in process_message_internal
-                    println!("[Agent stopped by user]");
+                    if let Some(ref sm) = state_manager {
+                        sm.push_notification(
+                            "Agent stopped by user".to_string(),
+                            crate::ui::app_state::NotificationKind::Info,
+                        );
+                    }
                     completion_tx.send(CompletionResult::Stopped).ok();
                 }
 
@@ -584,27 +543,44 @@ impl AgentRunner {
             if let Some(cm) = context_manager.as_mut() {
                 let mut history = chat_history.lock().await;
                 if cm.needs_compaction(&history) {
-                    println!("[Context approaching limit, compacting...]");
+                    // Set status message for UI
+                    if let Some(sm) = state_manager {
+                        sm.set_status(Some("Compacting context...".to_string()));
+                    }
                     // Compact and continue
                     match cm.compact(&mut history, system_prompt).await {
                         Ok(result) => {
-                            println!(
-                                "[Compacted: {} → {} messages, {} discarded]\n",
-                                result.original_count, result.compacted_count, result.num_discarded
-                            );
+                            if let Some(sm) = state_manager {
+                                sm.push_notification(
+                                    format!(
+                                        "Context compacted: {} → {} messages, {} discarded",
+                                        result.original_count,
+                                        result.compacted_count,
+                                        result.num_discarded
+                                    ),
+                                    crate::ui::app_state::NotificationKind::Info,
+                                );
+                                sm.set_status(None);
+                            }
                         }
                         Err(e) => {
-                            eprintln!("[Warning: compaction failed: {}]", e);
+                            if let Some(sm) = state_manager {
+                                sm.push_notification(
+                                    format!("Context compaction failed: {}", e),
+                                    crate::ui::app_state::NotificationKind::Warning,
+                                );
+                                sm.set_status(None);
+                            }
                         }
                     }
                 }
             }
 
             // Call the agent
-            let mut history = chat_history.lock().await;
+            let history = chat_history.lock().await;
             let result = agent
                 .as_ref()
-                .prompt_with_history(&current_msg, &mut history)
+                .prompt_with_history(&current_msg, &history)
                 .await;
 
             match result {
@@ -639,10 +615,22 @@ impl AgentRunner {
 
                 Err(_) => {
                     if retry_count == config.retry().max_retries {
-                        eprintln!("Max number of retries exceeded");
-                        return CompletionResult::Error("Maximum number of retries exceeded".to_string());
+                        if let Some(sm) = state_manager {
+                            sm.push_notification(
+                                "Max number of retries exceeded".to_string(),
+                                crate::ui::app_state::NotificationKind::Error,
+                            );
+                        }
+                        return CompletionResult::Error(
+                            "Maximum number of retries exceeded".to_string(),
+                        );
                     }
-                    eprintln!("Error, retrying...");
+                    if let Some(sm) = state_manager {
+                        sm.push_notification(
+                            "Retrying...".to_string(),
+                            crate::ui::app_state::NotificationKind::Warning,
+                        );
+                    }
                     retry_count += 1;
                 }
             }
@@ -655,28 +643,19 @@ impl AgentRunner {
         chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
         _context_manager: &mut Option<ContextManager>,
         conversation_manager: &Option<Arc<Mutex<ConversationManager>>>,
-        _state_manager: &Option<Arc<ui::StateManager>>,
+        state_manager: &Option<Arc<ui::StateManager>>,
         _agent: &Arc<DynAgent>,
         config: &Config,
         _system_prompt: &str,
     ) {
+        use crate::ui::app_state::NotificationKind;
+
         let cmd_lower = cmd.to_lowercase();
 
         match cmd_lower.as_str() {
-            "/stats" => {
-                // Would need cost_tracker to print stats
-            }
-            "/reset" => {
-                println!("Stats reset.\n");
-            }
-            "/context" => {
-                println!("\nContext compaction is not enabled.\n");
-            }
-            "/compact" => {
-                println!("\nContext compaction is not enabled.\n");
-            }
-            "/conversations" | "/history" => {
-                println!("\nConversation persistence is not enabled.\n");
+            "/stats" | "/reset" | "/context" | "/compact" | "/conversations" | "/history" => {
+                // These commands return data that UI can access via StateManager
+                // No notification needed - UI pulls this data
             }
             "/new" => {
                 if let Some(cm) = conversation_manager.as_ref() {
@@ -689,33 +668,46 @@ impl AgentRunner {
                         .unwrap()
                         .create_new(name, config.model().to_string());
                     chat_history.lock().await.clear();
-                    println!("Started a new conversation.\n");
-                } else {
-                    println!("Conversation persistence is not enabled.\n");
+                    if let Some(sm) = state_manager {
+                        sm.add_system_message("Started a new conversation.".to_string());
+                    }
+                } else if let Some(sm) = state_manager {
+                    sm.push_notification(
+                        "Conversation persistence is not enabled.".to_string(),
+                        NotificationKind::Warning,
+                    );
                 }
             }
             "/save" => {
                 if let Some(cm) = conversation_manager.as_ref() {
                     if let Some(conv) = cm.lock().unwrap().get_current() {
                         let _ = cm.lock().unwrap().save();
-                        println!("Conversation saved: {}\n", conv.name);
+                        if let Some(sm) = state_manager {
+                            sm.push_notification(
+                                format!("Conversation saved: {}", conv.name),
+                                NotificationKind::Success,
+                            );
+                        }
                     }
-                } else {
-                    println!("Conversation persistence is not enabled.\n");
+                } else if let Some(sm) = state_manager {
+                    sm.push_notification(
+                        "Conversation persistence is not enabled.".to_string(),
+                        NotificationKind::Warning,
+                    );
                 }
             }
             _ if cmd_lower.starts_with("/load ") => {
                 if let Some(id_str) = cmd.strip_prefix("/load ") {
                     if let Some(cm) = conversation_manager.as_ref() {
-                        // Parse UUID outside the lock
                         let id = match uuid::Uuid::parse_str(id_str) {
                             Ok(id) => id,
                             Err(_) => {
-                                eprintln!("Invalid conversation ID. Use /conversations to see available IDs.\n");
+                                if let Some(sm) = state_manager {
+                                    sm.push_notification("Invalid conversation ID. Use /conversations to see available IDs.".to_string(), NotificationKind::Error);
+                                }
                                 return;
                             }
                         };
-                        // Load outside the lock
                         let result = {
                             let guard = cm.lock().unwrap();
                             guard.load(id)
@@ -727,40 +719,74 @@ impl AgentRunner {
                                     guard.load_and_set_current(id).ok();
                                 }
                                 chat_history.lock().await.clear();
-                                *chat_history.lock().await = crate::convert_conversation_to_rig_messages(&conv);
-                                println!("\n--- Loaded conversation: '{}' ---\n", conv.name);
+                                *chat_history.lock().await =
+                                    crate::convert_conversation_to_rig_messages(&conv);
+                                if let Some(sm) = state_manager {
+                                    sm.add_system_message(format!(
+                                        "Loaded conversation: '{}'",
+                                        conv.name
+                                    ));
+                                }
                             }
                             Err(e) => {
-                                eprintln!("Failed to load conversation: {}\n", e);
+                                if let Some(sm) = state_manager {
+                                    sm.push_notification(
+                                        format!("Failed to load conversation: {}", e),
+                                        NotificationKind::Error,
+                                    );
+                                }
                             }
                         }
-                    } else {
-                        println!("Conversation persistence is not enabled.\n");
+                    } else if let Some(sm) = state_manager {
+                        sm.push_notification(
+                            "Conversation persistence is not enabled.".to_string(),
+                            NotificationKind::Warning,
+                        );
                     }
                 }
             }
             _ if cmd_lower.starts_with("/delete ") => {
                 if let Some(id_str) = cmd.strip_prefix("/delete ") {
                     if let Some(cm) = conversation_manager.as_ref() {
-                        // Parse UUID outside the lock
                         let id = match uuid::Uuid::parse_str(id_str) {
                             Ok(id) => id,
                             Err(_) => {
-                                eprintln!("Invalid conversation ID.\n");
+                                if let Some(sm) = state_manager {
+                                    sm.push_notification(
+                                        "Invalid conversation ID.".to_string(),
+                                        NotificationKind::Error,
+                                    );
+                                }
                                 return;
                             }
                         };
-                        // Delete outside the lock
                         let result = {
                             let guard = cm.lock().unwrap();
                             guard.delete(id)
                         };
                         match result {
-                            Ok(_) => println!("Conversation deleted.\n"),
-                            Err(e) => eprintln!("Failed to delete: {}\n", e),
+                            Ok(_) => {
+                                if let Some(sm) = state_manager {
+                                    sm.push_notification(
+                                        "Conversation deleted.".to_string(),
+                                        NotificationKind::Success,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(sm) = state_manager {
+                                    sm.push_notification(
+                                        format!("Failed to delete: {}", e),
+                                        NotificationKind::Error,
+                                    );
+                                }
+                            }
                         }
-                    } else {
-                        println!("Conversation persistence is not enabled.\n");
+                    } else if let Some(sm) = state_manager {
+                        sm.push_notification(
+                            "Conversation persistence is not enabled.".to_string(),
+                            NotificationKind::Warning,
+                        );
                     }
                 }
             }
@@ -771,47 +797,73 @@ impl AgentRunner {
                         if let Some(cm) = conversation_manager.as_ref() {
                             let id_str = parts[0];
                             let format = parts[1].to_lowercase();
-                            // Parse UUID outside the lock
                             let id = match uuid::Uuid::parse_str(id_str) {
                                 Ok(id) => id,
                                 Err(_) => {
-                                    eprintln!("Invalid conversation ID.\n");
+                                    if let Some(sm) = state_manager {
+                                        sm.push_notification(
+                                            "Invalid conversation ID.".to_string(),
+                                            NotificationKind::Error,
+                                        );
+                                    }
                                     return;
                                 }
                             };
-                            // Load outside the lock
                             let conv_result = {
                                 let guard = cm.lock().unwrap();
                                 guard.load(id)
                             };
                             match conv_result {
                                 Ok(conv) => {
-                                    // Export outside the lock
                                     let output = {
                                         let guard = cm.lock().unwrap();
                                         match format.as_str() {
                                             "markdown" | "md" => guard.export_markdown(&conv),
                                             "json" => guard.export_json(&conv),
                                             _ => {
-                                                eprintln!("Unknown format '{}'. Use 'json' or 'markdown'.\n", format);
+                                                if let Some(sm) = state_manager {
+                                                    sm.push_notification(format!("Unknown format '{}'. Use 'json' or 'markdown'.", format), NotificationKind::Error);
+                                                }
                                                 return;
                                             }
                                         }
                                     };
                                     match output {
                                         Ok(s) => {
-                                            println!("\n--- Export ---\n{}\n--- End ---\n", s);
+                                            if let Some(sm) = state_manager {
+                                                sm.add_system_message(format!("Export:\n{}", s));
+                                            }
                                         }
-                                        Err(e) => eprintln!("Export failed: {}\n", e),
+                                        Err(e) => {
+                                            if let Some(sm) = state_manager {
+                                                sm.push_notification(
+                                                    format!("Export failed: {}", e),
+                                                    NotificationKind::Error,
+                                                );
+                                            }
+                                        }
                                     }
                                 }
-                                Err(e) => eprintln!("Failed to load conversation: {}\n", e),
+                                Err(e) => {
+                                    if let Some(sm) = state_manager {
+                                        sm.push_notification(
+                                            format!("Failed to load conversation: {}", e),
+                                            NotificationKind::Error,
+                                        );
+                                    }
+                                }
                             }
-                        } else {
-                            println!("Conversation persistence is not enabled.\n");
+                        } else if let Some(sm) = state_manager {
+                            sm.push_notification(
+                                "Conversation persistence is not enabled.".to_string(),
+                                NotificationKind::Warning,
+                            );
                         }
-                    } else {
-                        println!("Usage: /export <id> <json|markdown>\n");
+                    } else if let Some(sm) = state_manager {
+                        sm.push_notification(
+                            "Usage: /export <id> <json|markdown>".to_string(),
+                            NotificationKind::Info,
+                        );
                     }
                 }
             }
@@ -823,18 +875,34 @@ impl AgentRunner {
                             guard.rename(name.to_string())
                         };
                         match result {
-                            Ok(_) => println!("Conversation renamed to: {}\n", name),
-                            Err(e) => eprintln!("Failed to rename: {}\n", e),
+                            Ok(_) => {
+                                if let Some(sm) = state_manager {
+                                    sm.push_notification(
+                                        format!("Conversation renamed to: {}", name),
+                                        NotificationKind::Success,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(sm) = state_manager {
+                                    sm.push_notification(
+                                        format!("Failed to rename: {}", e),
+                                        NotificationKind::Error,
+                                    );
+                                }
+                            }
                         }
-                    } else {
-                        println!("Conversation persistence is not enabled.\n");
+                    } else if let Some(sm) = state_manager {
+                        sm.push_notification(
+                            "Conversation persistence is not enabled.".to_string(),
+                            NotificationKind::Warning,
+                        );
                     }
                 }
             }
             _ => {
-                // Unknown command — treat as a message to the agent
-                // For simplicity, just print a message
-                println!("Unknown command: {}\n", cmd);
+                // Unknown command — for now, let the agent handle it
+                // The agent will respond via StateManager
             }
         }
     }
@@ -856,7 +924,6 @@ impl McpServerHandle {
     pub fn take_tools(self) -> Vec<Box<dyn ToolDyn>> {
         self.tools
             .into_iter()
-            .map(|tool| LoggingToolDyn::new(tool, &self.name))
             .map(|tool| Box::new(tool) as Box<dyn ToolDyn>)
             .collect()
     }

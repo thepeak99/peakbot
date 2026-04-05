@@ -158,6 +158,7 @@ pub enum TodoError {
 /// Arguments for the todo tool
 #[derive(Deserialize, Debug)]
 pub struct TodoArgs {
+    thought: String,
     /// The action to perform: add, update, remove, list, clear
     action: String,
     /// Task descriptions (for add) - ALWAYS use array, even for single task
@@ -218,6 +219,10 @@ impl Tool for TodoTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "thought": {
+                        "type": "string",
+                        "description": "Briefly explain what you're about to do and why, before acting."
+                    },
                     "action": {
                         "type": "string",
                         "enum": ["add", "update", "remove", "list", "clear"],
@@ -238,7 +243,7 @@ impl Tool for TodoTool {
                         "description": "Task ID (required for update and remove actions)"
                     }
                 },
-                "required": ["action"]
+                "required": ["thought", "action"]
             }),
         }
     }
