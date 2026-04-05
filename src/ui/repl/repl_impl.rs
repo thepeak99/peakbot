@@ -11,9 +11,7 @@
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, MouseEventKind};
 use crossterm::execute;
-use crossterm::terminal::{
-    LeaveAlternateScreen, disable_raw_mode,
-};
+use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use futures::StreamExt;
 use ratatui::{
     Terminal,
@@ -32,9 +30,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::ui::app_state::{AppState, ChatState, MessageRole};
 use crate::ui::state_manager::StateManager;
 use crate::ui::ui_trait::{Ui, UiAction};
-
-/// Maximum input height in lines
-const MAX_INPUT_LINES: usize = 5;
 
 /// Minimum terminal height
 const MIN_TERMINAL_HEIGHT: u16 = 10;
@@ -113,10 +108,15 @@ impl ReplUi {
             }
         }
 
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100), Constraint::Length(1)])
+            .split(area);
+
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
         let mut scroll_state = ScrollbarState::new(message_lines.len()).position(scroll as usize);
-        f.render_stateful_widget(scrollbar, area, &mut scroll_state);
+        f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state);
 
         let paragraph = Paragraph::new(Text::from(message_lines))
             .style(Style::default().fg(Color::White))
@@ -127,7 +127,7 @@ impl ReplUi {
                     .title(" Chat Messages ")
                     .borders(Borders::ALL),
             );
-        f.render_widget(paragraph, area);
+        f.render_widget(paragraph, chunks[0]);
     }
 
     /// Render the input area with cursor (returns Paragraph for testing)
@@ -180,7 +180,6 @@ impl ReplUi {
     /// Main render function
     fn render(&mut self, state: &AppState) -> Result<()> {
         // Calculate content height and extract scroll state before borrowing terminal
-        let new_content_height = self.calculate_content_height(&state.chat);
         let current_scroll_position = self.scroll_position;
         let current_auto_scroll = self.auto_scroll;
         let state_auto_scroll = state.chat.auto_scroll;
@@ -223,48 +222,8 @@ impl ReplUi {
                 Self::render_status_bar(f, chunks[2], state);
                 f.render_widget(input, chunks[1]);
             })?;
-
-            // Now update self state after terminal.draw() completes
-            self.content_height = new_content_height;
-            // Use the viewport height from the last draw call
-            if let Some(ref mut terminal) = self.terminal {
-                let size = terminal.size().unwrap_or_default();
-                let rect = Rect::new(0, 0, size.width, size.height);
-                let input = Self::get_input_area(&self.input_buffer, self.cursor_pos);
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(100),
-                        Constraint::Min(input.line_count(size.width - 2) as u16),
-                        Constraint::Length(1),
-                    ])
-                    .split(rect);
-                self.viewport_height = chunks[0].height;
-            }
-
-            // Determine new auto_scroll and scroll_position based on scroll state
-            let max_scroll = self.content_height.saturating_sub(self.viewport_height);
-            // Check if we should enable auto-scroll
-            let should_auto_scroll = state_auto_scroll || (current_auto_scroll && current_scroll_position >= max_scroll);
-
-            self.auto_scroll = should_auto_scroll;
-
-            // If not auto-scrolling, keep the current scroll position
-            if !should_auto_scroll {
-                self.scroll_position = current_scroll_position.min(max_scroll);
-            } else {
-                self.scroll_position = max_scroll;
-            }
         }
         Ok(())
-    }
-
-    /// Calculate total content height (number of message lines)
-    fn calculate_content_height(&self, chat: &ChatState) -> u16 {
-        if chat.messages.is_empty() {
-            return 1; // Welcome message
-        }
-        chat.messages.len() as u16
     }
 
     fn handle_keyboard_input(&mut self, key: KeyEvent) {
@@ -330,21 +289,19 @@ impl ReplUi {
         match event {
             Event::Key(key_event) => self.handle_keyboard_input(key_event),
             // Mouse wheel scrolling
-            Event::Mouse(mouse_event) => {
-                match mouse_event.kind {
-                    MouseEventKind::ScrollUp => {
-                        let max_scroll = self.content_height.saturating_sub(self.viewport_height);
-                        self.scroll_position = self.scroll_position.saturating_sub(3).min(max_scroll);
-                        self.auto_scroll = false;
-                    }
-                    MouseEventKind::ScrollDown => {
-                        let max_scroll = self.content_height.saturating_sub(self.viewport_height);
-                        self.scroll_position = (self.scroll_position + 3).min(max_scroll);
-                        self.auto_scroll = false;
-                    }
-                    _ => {}
+            Event::Mouse(mouse_event) => match mouse_event.kind {
+                MouseEventKind::ScrollUp => {
+                    let max_scroll = self.content_height.saturating_sub(self.viewport_height);
+                    self.scroll_position = self.scroll_position.saturating_sub(3).min(max_scroll);
+                    self.auto_scroll = false;
                 }
-            }
+                MouseEventKind::ScrollDown => {
+                    let max_scroll = self.content_height.saturating_sub(self.viewport_height);
+                    self.scroll_position = (self.scroll_position + 3).min(max_scroll);
+                    self.auto_scroll = false;
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -363,9 +320,9 @@ impl Ui for ReplUi {
         while self.running {
             tokio::select! {
                 // Handle keyboard events via tokio::select!
-                key = events.next() => {
-                    if let Some(Ok(key)) = key {
-                        self.handle_input(key);
+                e = events.next() => {
+                    if let Some(Ok(e)) = e {
+                        self.handle_input(e);
                         let state = self.state_manager.get_state();
                         self.render(&state)?;
                     }
