@@ -30,7 +30,7 @@ regex = "1"
 clap = { version = "4", features = ["derive"] }
 
 # TUI support
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3.32"
 

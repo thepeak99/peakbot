@@ -556,10 +556,10 @@ impl AgentRunner {
             }
 
             // Call the agent
-            let mut history = chat_history.lock().await;
+            let history = chat_history.lock().await;
             let result = agent
                 .as_ref()
-                .prompt_with_history(&current_msg, &mut history)
+                .prompt_with_history(&current_msg, &history)
                 .await;
 
             match result {

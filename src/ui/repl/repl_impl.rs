@@ -9,7 +9,7 @@
 //!   User input → UiAction → Controller → Model (StateManager) → broadcast → View (render)
 
 use anyhow::Result;
-use crossterm::event::{self, Event as TuiEvent, KeyEvent};
+use crossterm::event::{self, Event, EventStream, KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -112,13 +112,6 @@ impl ReplUi {
                     Span::styled(prefix, Style::default().fg(color)),
                     Span::raw(":"),
                 ]));
-
-                // Use Paragraph's native wrapping instead of manual word wrapping
-                let wrap_width = (chat_area.width.saturating_sub(4)) as usize;
-                let wrapped_lines = Self::wrap_text(&msg.content, wrap_width);
-                message_lines.extend(wrapped_lines);
-
-                message_lines.push(Line::from(""));
             }
         }
 
@@ -140,7 +133,7 @@ impl ReplUi {
 
         let paragraph = Paragraph::new(Text::from(visible_lines))
             .style(Style::default().fg(Color::White))
-            .wrap(Wrap { trim: false })
+            .wrap(Wrap { trim: true })
             .block(
                 Block::default()
                     .title(" Chat Messages ")
@@ -160,7 +153,7 @@ impl ReplUi {
     }
 
     /// Render the input area with cursor
-    fn render_input_area(f: &mut ratatui::Frame, area: Rect, input: &str, cursor_pos: usize) {
+    fn render_input_area<'a>(input: &str, cursor_pos: usize) -> Paragraph<'a> {
         let (prompt_text, prompt_color) = if input.is_empty() {
             ("💬 Message...", Color::DarkGray)
         } else {
@@ -179,14 +172,14 @@ impl ReplUi {
         }
 
         let paragraph = Paragraph::new(Line::from(spans))
-            .wrap(Wrap { trim: false })
+            .wrap(Wrap { trim: true })
             .block(Block::default().title(" Input ").borders(Borders::ALL));
 
-        f.render_widget(paragraph, area);
+        paragraph
     }
 
     /// Render the status bar
-    fn render_status_bar(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    fn render_status_bar<'a>(state: &AppState) -> Paragraph<'a> {
         let stats = &state.stats;
         let context = &state.context;
 
@@ -204,11 +197,11 @@ impl ReplUi {
             .style(Style::default().fg(Color::LightCyan))
             .block(Block::default().borders(Borders::NONE));
 
-        f.render_widget(paragraph, area);
+        paragraph
     }
 
     /// Main render function
-    fn render(&mut self, state: &AppState) -> io::Result<()> {
+    fn render(&mut self, state: &AppState) -> Result<()> {
         if let Some(ref mut terminal) = self.terminal {
             terminal.draw(|f| {
                 let size = f.area();
@@ -219,30 +212,27 @@ impl ReplUi {
                     return;
                 }
 
-                let input_height =
-                    Self::calculate_input_height(&self.input_buffer, size.width) as u16;
+                let input = Self::render_input_area(&self.input_buffer, self.cursor_pos);
+                let status_bar = Self::render_status_bar(state);
 
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Fill(1),
-                        Constraint::Length(input_height + 4),
+                        Constraint::Percentage(100),
+                        Constraint::Min(input.line_count(size.width - 2) as u16),
                         Constraint::Length(1),
                     ])
                     .split(size);
 
                 Self::render_chat_history(f, chunks[0], &state.chat);
-                Self::render_input_area(f, chunks[1], &self.input_buffer, self.cursor_pos);
-                Self::render_status_bar(f, chunks[2], state);
+                f.render_widget(input, chunks[1]);
+                f.render_widget(status_bar, chunks[2]);
             })?;
         }
         Ok(())
     }
 
-    /// Handle input events
-    fn handle_input(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::KeyCode;
-
+    fn handle_keyboard_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) => {
                 self.input_buffer.insert(self.cursor_pos, c);
@@ -282,6 +272,17 @@ impl ReplUi {
             KeyCode::Up | KeyCode::Down => {
                 // Command history navigation - placeholder
             }
+            KeyCode::Esc => {
+                panic!("At the disco");
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle input events
+    fn handle_input(&mut self, event: Event) {
+        match event {
+            Event::Key(key_event) => self.handle_keyboard_input(key_event),
             _ => {}
         }
     }
@@ -295,7 +296,7 @@ impl Ui for ReplUi {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let mut events = crossterm::event::EventStream::new();
+        let mut events = EventStream::new();
         let mut state_rx = self.state_manager.subscribe();
         while self.running {
             tokio::select! {

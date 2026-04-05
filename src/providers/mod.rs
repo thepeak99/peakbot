@@ -182,13 +182,13 @@ impl DynAgent {
     pub async fn prompt_with_history(
         &self,
         prompt: &str,
-        history: &mut Vec<Message>,
+        history: &[Message],
     ) -> Result<String, PromptError> {
         match self {
-            DynAgent::OpenRouter(agent) => agent.prompt(prompt).with_history(history).await,
-            DynAgent::OpenAI(agent) => agent.prompt(prompt).with_history(history).await,
-            DynAgent::LlamaCpp(agent) => agent.prompt(prompt).with_history(history).await,
-            DynAgent::Ollama(agent) => agent.prompt(prompt).with_history(history).await,
+            DynAgent::OpenRouter(agent) => agent.prompt(prompt).with_history(history.iter().cloned()).await,
+            DynAgent::OpenAI(agent) => agent.prompt(prompt).with_history(history.iter().cloned()).await,
+            DynAgent::LlamaCpp(agent) => agent.prompt(prompt).with_history(history.iter().cloned()).await,
+            DynAgent::Ollama(agent) => agent.prompt(prompt).with_history(history.iter().cloned()).await,
         }
     }
 }
