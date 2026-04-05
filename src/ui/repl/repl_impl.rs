@@ -97,16 +97,28 @@ impl ReplUi {
                     MessageRole::ToolResult => ("📋 Result", Color::Blue),
                 };
 
-                let timestamp_str = msg.timestamp.format("%H:%M:%S").to_string();
-
-                message_lines.push(Line::from(vec![
-                    Span::raw("["),
-                    Span::styled(timestamp_str, Style::default().fg(Color::DarkGray)),
-                    Span::raw("] "),
-                    Span::styled(prefix, Style::default().fg(color)),
-                    Span::raw(": "),
-                    Span::raw(&msg.content),
-                ]));
+                // Split content by newlines to handle multiline messages
+                let content_lines: Vec<&str> = msg.content.split('\n').collect();
+                
+                for (i, content_line) in content_lines.iter().enumerate() {
+                    // First line gets the full header (timestamp + role), subsequent lines get indentation
+                    let line_content = if i == 0 {
+                        vec![
+                            Span::raw("["),
+                            Span::styled(format!("{}", msg.timestamp.format("%H:%M:%S")), Style::default().fg(Color::DarkGray)),
+                            Span::raw("] "),
+                            Span::styled(prefix, Style::default().fg(color)),
+                            Span::raw(": "),
+                            Span::raw(*content_line),
+                        ]
+                    } else {
+                        vec![
+                            Span::raw("         "),  // Align with role label
+                            Span::raw(*content_line),
+                        ]
+                    };
+                    message_lines.push(Line::from(line_content));
+                }
             }
         }
 
