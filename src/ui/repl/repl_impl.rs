@@ -67,8 +67,6 @@ impl ReplUi {
             terminal: None,
             input_buffer: String::new(),
             cursor_pos: 0,
-            welcome_printed: false,
-            event_receiver: None,
         }
     }
 
@@ -297,21 +295,26 @@ impl Ui for ReplUi {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let events = crossterm::event::EventStream::new();
-        let state_events = self.state_manager.subscribe();
+        let mut events = crossterm::event::EventStream::new();
+        let mut state_rx = self.state_manager.subscribe();
         while self.running {
             tokio::select! {
                 // Handle keyboard events via tokio::select!
                 key = events.next() => {
-                    if let Some(key) = key {
+                    if let Some(Ok(key)) = key {
                         self.handle_input(key);
                         let state = self.state_manager.get_state();
                         self.render(&state)?;
                     }
                 }
-                // Periodic render to keep UI responsive to state changes
-                state = state_events.recv() => {
-                    self.render(&state)?;
+                // Async stream subscription — receive state updates
+                state = state_rx.recv() => {
+                    if let Some(state) = state {
+                        self.render(&state)?;
+                    } else {
+                        // Channel closed, subscriber was dropped
+                        break;
+                    }
                 }
             }
         }

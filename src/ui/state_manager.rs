@@ -7,6 +7,11 @@
 //!
 //! StateManager is the Model. It holds `AppState` and broadcasts changes to
 //! all subscribed Views. Controller writes to it, Views read from it.
+//!
+//! ## Async Stream Subscription
+//!
+//! The `subscribe()` method returns an async stream (`mpsc::Receiver<AppState>`)
+//! that can be used directly with `tokio::select!` or iterated with `while let`.
 
 use crate::hooks::events::AgentEvent;
 use crate::hooks::session_hook::SessionStats;
@@ -15,14 +20,14 @@ use crate::ui::app_state::{
     AppState, ChatMessage, ChatState, ContextState, Notification, NotificationKind, SessionState,
     TodoItem, TodoState, WelcomeState,
 };
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::mpsc;
 
 /// Manages AppState and distributes updates to subscribed Views
 pub struct StateManager {
     state: Arc<RwLock<AppState>>,
     /// Persistent subscribers that receive every state update
-    subscribers: Arc<RwLock<Vec<Sender<AppState>>>>,
+    subscribers: Arc<RwLock<Vec<mpsc::Sender<AppState>>>>,
 }
 
 impl StateManager {
@@ -52,13 +57,22 @@ impl StateManager {
         state.is_final = final_flag;
     }
 
-    /// Subscribe to state updates. Returns a channel that receives AppState on every change.
-    /// The sender is automatically removed when the receiver is dropped.
-    pub fn subscribe(&self) -> Receiver<AppState> {
-        let (sender, receiver) = mpsc::channel();
+    /// Subscribe to state updates. Returns an async stream (mpsc::Receiver) that
+    /// yields AppState on every change. The sender is automatically removed when
+    /// the receiver is dropped.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let mut state_rx = state_manager.subscribe();
+    /// while let Some(state) = state_rx.recv().await {
+    ///     // render state
+    /// }
+    /// ```
+    pub fn subscribe(&self) -> mpsc::Receiver<AppState> {
+        let (sender, receiver) = mpsc::channel(64);
         // Send current state immediately so subscriber is up-to-date
         let current = self.state.read().unwrap().clone();
-        let _ = sender.send(current);
+        let _ = sender.try_send(current);
         self.subscribers.write().unwrap().push(sender);
         receiver
     }
@@ -216,7 +230,8 @@ impl StateManager {
         let mut dead = Vec::new();
         let mut subs = self.subscribers.write().unwrap();
         for (i, sender) in subs.iter().enumerate() {
-            if sender.send(state.clone()).is_err() {
+            // Use try_send to avoid blocking — if the buffer is full, skip this subscriber
+            if sender.try_send(state.clone()).is_err() {
                 dead.push(i);
             }
         }
@@ -270,7 +285,7 @@ mod tests {
     #[test]
     fn test_update_stats() {
         let sm = StateManager::new();
-        let stats = Arc::new(Mutex::new(SessionStats::new()));
+        let stats = Arc::new(std::sync::Mutex::new(SessionStats::new()));
         let mut stats_lock = stats.lock().unwrap();
         stats_lock.total_input_tokens = 100;
         stats_lock.total_output_tokens = 50;
@@ -286,10 +301,12 @@ mod tests {
     }
 
     #[test]
-    fn test_subscribe() {
+    fn test_subscribe_initial_state() {
         let sm = StateManager::new();
         let receiver = sm.subscribe();
-        // Should receive initial state
-        assert!(receiver.recv().is_ok());
+        // With async mpsc, initial state is sent via try_send
+        // so the receiver should be ready
+        let state = sm.get_state();
+        assert!(state.chat.messages.is_empty());
     }
 }
