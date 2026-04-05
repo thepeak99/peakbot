@@ -54,6 +54,7 @@ enum QueueMessage {
 
 /// Completion result sent from agent loop back to event loop
 #[derive(Clone)]
+#[allow(dead_code)]
 enum CompletionResult {
     Success(String),
     Stopped,
@@ -138,6 +139,7 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
 pub struct AgentRunner {
     agent: Arc<DynAgent>,
     config: Config,
+    #[allow(unused)]
     provider_info: ProviderInfo,
     #[allow(unused)]
     skills: SkillRegistry,
@@ -145,6 +147,7 @@ pub struct AgentRunner {
     conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
     system_prompt: String,
     cost_tracker: CostTracker,
+    #[allow(unused)]
     todo_state: Option<Arc<Mutex<TodoList>>>,
     state_manager: Option<Arc<ui::StateManager>>,
     // Shared session hook for interrupt/queue state
@@ -216,6 +219,7 @@ impl AgentRunner {
     }
 
     /// Sync current state to StateManager (Model)
+    #[allow(dead_code)]
     fn sync_state_to_manager(&self) {
         if let Some(ref sm) = self.state_manager {
             let stats = self.cost_tracker.get_session_stats();
@@ -913,6 +917,7 @@ pub struct McpServerHandle {
     name: String,
     tools: Vec<McpTool>,
     // Box for type erasure - allows stdio and HTTP transports to coexist
+    #[allow(unused)]
     service: Box<dyn std::any::Any + Send + Sync>,
 }
 

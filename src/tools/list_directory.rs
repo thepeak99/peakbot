@@ -14,6 +14,7 @@ pub enum ListDirectoryError {
 
 #[derive(Deserialize)]
 pub struct ListDirectoryArgs {
+    #[allow(dead_code)]
     thought: String,
     path: String,
     recursive: Option<bool>,

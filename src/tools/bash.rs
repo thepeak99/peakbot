@@ -25,6 +25,7 @@ pub enum BashError {
 
 #[derive(Deserialize)]
 pub struct BashArgs {
+    #[allow(dead_code)]
     thought: String,
     command: String,
     timeout_seconds: Option<u64>,
