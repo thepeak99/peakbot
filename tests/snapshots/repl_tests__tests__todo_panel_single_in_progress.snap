@@ -1,0 +1,14 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+┌ ✓ TODO ────────────────────┐
+│◐ #2 Implement feature      │
+│                            │
+│                            │
+│                            │
+│                            │
+│                            │
+│                            │
+│                            │
+└────────────────────────────┘

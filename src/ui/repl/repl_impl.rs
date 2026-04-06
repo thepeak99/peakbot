@@ -10,7 +10,8 @@
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
@@ -33,6 +34,9 @@ use tokio::time;
 
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState, MessageRole};
+use crate::ui::repl::todo_panel::{
+    render_todo_panel, should_show_panel, DEFAULT_PANEL_PERCENT,
+};
 use crate::ui::state_manager::StateManager;
 use crate::ui::ui_trait::{Ui, UiAction};
 
@@ -57,6 +61,10 @@ pub struct UiState {
     pub viewport_height: u16,
     /// Whether to auto-scroll to bottom when new messages arrive
     pub auto_scroll: bool,
+    /// Whether the todo panel is visible
+    pub show_todo_panel: bool,
+    /// Scroll position in todo panel
+    pub todo_scroll_position: u16,
 }
 
 impl UiState {
@@ -68,6 +76,8 @@ impl UiState {
             content_height: 0,
             viewport_height: 0,
             auto_scroll: true,
+            show_todo_panel: false,
+            todo_scroll_position: 0,
         }
     }
 }
@@ -339,36 +349,66 @@ impl ReplUi {
                     self.ui_state.cursor_pos,
                 );
 
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(100),
-                        Constraint::Min(input.line_count(size.width - 2) as u16),
-                        Constraint::Length(1),
-                    ])
-                    .split(size);
+                // Check if todo panel should be shown (based on terminal size)
+                let show_todo = self.ui_state.show_todo_panel && should_show_panel(size.width);
 
-                let chat_history = Self::build_chat_history_paragraph(&state.chat);
-                self.ui_state.viewport_height = chunks[0].height;
-                self.ui_state.content_height =
-                    chat_history.line_count(size.width.saturating_sub(2)) as u16;
-
-                // Calculate scroll based on auto_scroll setting
-                let max_scroll = self
-                    .ui_state
-                    .content_height
-                    .saturating_sub(self.ui_state.viewport_height);
-                let scroll = if self.ui_state.auto_scroll {
-                    // Scroll to bottom
-                    max_scroll
+                // Layout: either full width (no todo) or split horizontally (with todo)
+                let (main_area, todo_area) = if show_todo {
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Percentage(100 - DEFAULT_PANEL_PERCENT),
+                            Constraint::Percentage(DEFAULT_PANEL_PERCENT),
+                        ])
+                        .split(size);
+                    (Some(chunks[0]), Some(chunks[1]))
                 } else {
-                    // Use stored position (clamped to valid range)
-                    self.ui_state.scroll_position.min(max_scroll)
+                    (Some(size), None)
                 };
 
-                Self::render_chat_history(f, chunks[0], scroll, chat_history);
-                Self::render_input_area(f, chunks[1], input);
-                Self::render_status_bar(f, chunks[2], state);
+                // Split main area vertically: chat, input, status
+                if let Some(main) = main_area {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Percentage(100),
+                            Constraint::Min(input.line_count(main.width - 2) as u16),
+                            Constraint::Length(1),
+                        ])
+                        .split(main);
+
+                    let chat_history = Self::build_chat_history_paragraph(&state.chat);
+                    self.ui_state.viewport_height = chunks[0].height;
+                    self.ui_state.content_height =
+                        chat_history.line_count(main.width.saturating_sub(2)) as u16;
+
+                    // Calculate scroll based on auto_scroll setting
+                    let max_scroll = self
+                        .ui_state
+                        .content_height
+                        .saturating_sub(self.ui_state.viewport_height);
+                    let scroll = if self.ui_state.auto_scroll {
+                        // Scroll to bottom
+                        max_scroll
+                    } else {
+                        // Use stored position (clamped to valid range)
+                        self.ui_state.scroll_position.min(max_scroll)
+                    };
+
+                    Self::render_chat_history(f, chunks[0], scroll, chat_history);
+                    Self::render_input_area(f, chunks[1], input);
+                    Self::render_status_bar(f, chunks[2], state);
+                }
+
+                // Render todo panel if visible
+                if let Some(todo_rect) = todo_area {
+                    render_todo_panel(
+                        f,
+                        todo_rect,
+                        &state.todo,
+                        self.ui_state.todo_scroll_position,
+                    );
+                }
 
                 // Render quit confirmation dialog if visible
                 if self.show_quit_confirm {
@@ -381,6 +421,20 @@ impl ReplUi {
 
     fn handle_keyboard_input(&mut self, key: KeyEvent) {
         match key.code {
+            // Toggle todo panel with Ctrl+T
+            KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.ui_state.show_todo_panel = !self.ui_state.show_todo_panel;
+                // Reset scroll position when toggling
+                self.ui_state.todo_scroll_position = 0;
+            }
+            // Scroll todo panel with Ctrl+Up/Down when panel is visible
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) && self.ui_state.show_todo_panel => {
+                self.ui_state.todo_scroll_position = self.ui_state.todo_scroll_position.saturating_sub(1);
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) && self.ui_state.show_todo_panel => {
+                // Simple increment - will be clamped during render
+                self.ui_state.todo_scroll_position += 1;
+            }
             // Quit confirmation dialog handlers (must come before general handlers)
             KeyCode::Esc if self.show_quit_confirm => {
                 // ESC while dialog is open = cancel (close dialog)
