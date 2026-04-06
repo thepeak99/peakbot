@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
         _ => 128_000, // default
     };
 
-    let (agent, provider_info, cost_tracker, todo_state, event_receiver, session_hook) = create_provider(
+    let (agent, provider_info, session_stats, todo_state, event_receiver, session_hook) = create_provider(
         &config.provider,
         &config.context,
         context_window,
@@ -110,7 +110,8 @@ async fn main() -> Result<()> {
     if let Ok(list) = todo_state.lock() {
         state_manager.update_todo(&list);
     }
-    state_manager.update_stats(&cost_tracker.get_session_stats());
+    state_manager.update_stats(&session_stats);
+    state_manager.set_model(provider_info.model.clone());
 
     // Channel: View → Controller
     let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
@@ -121,7 +122,7 @@ async fn main() -> Result<()> {
         config.clone(),
         provider_info.clone(),
         skills,
-        cost_tracker,
+        session_stats,
         Some(todo_state),
         event_receiver,
         Some(state_manager.clone()),

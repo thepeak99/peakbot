@@ -37,123 +37,6 @@ pub struct ProviderInfo {
     pub supports_pricing: bool,
 }
 
-/// Cost tracking handle that provides access to session statistics
-pub struct CostTracker {
-    /// Session statistics for tracking tokens and costs
-    stats: Arc<Mutex<SessionStats>>,
-    /// Model pricing for cost calculation
-    pricing: crate::hooks::ModelPricing,
-}
-
-impl CostTracker {
-    /// Create a new cost tracker with the given pricing
-    /// Note: Event processing is handled externally by the caller (e.g., AgentRunner)
-    /// Use track_event() to process events for cost tracking
-    pub fn new(pricing: crate::hooks::ModelPricing) -> Self {
-        Self {
-            stats: Arc::new(Mutex::new(SessionStats::new())),
-            pricing,
-        }
-    }
-
-    /// Process an event for cost tracking
-    /// This should be called by the external event processor
-    pub fn track_event(&self, event: &AgentEvent) {
-        if let AgentEvent::CompletionResponse { usage, .. } = event {
-            let cost = (usage.input_tokens as f64 * self.pricing.input_per_token)
-                + (usage.output_tokens as f64 * self.pricing.output_per_token);
-
-            let total_cost = if let Ok(mut stats) = self.stats.lock() {
-                stats.add_request(usage.input_tokens, usage.output_tokens, cost);
-                stats.total_cost
-            } else {
-                return;
-            };
-
-            // Log outside the lock to avoid holding the mutex during I/O
-            tracing::info!(
-                "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
-                usage.input_tokens,
-                usage.output_tokens,
-                cost,
-                total_cost
-            );
-        }
-    }
-
-    /// Create a cost tracker with no tracking (for providers that don't support it)
-    pub fn none() -> Self {
-        Self {
-            stats: Arc::new(Mutex::new(SessionStats::new())),
-            pricing: crate::hooks::ModelPricing::default(),
-        }
-    }
-
-    /// Update stats with token usage from a completion response
-    pub fn track_completion(&self, input_tokens: u64, output_tokens: u64) {
-        let cost = (input_tokens as f64 * self.pricing.input_per_token)
-            + (output_tokens as f64 * self.pricing.output_per_token);
-
-        if let Ok(mut stats) = self.stats.lock() {
-            stats.add_request(input_tokens, output_tokens, cost);
-
-            tracing::info!(
-                "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
-                input_tokens,
-                output_tokens,
-                cost,
-                stats.total_cost
-            );
-        }
-    }
-
-    /// Get stats for the last request
-    pub fn get_last_request_stats(&self) -> Option<String> {
-        let stats = self.stats.lock().ok()?;
-        let last = stats.last_request()?;
-        Some(stats.format_per_request(last.input_tokens, last.output_tokens, last.cost))
-    }
-
-    /// Get session summary
-    pub fn get_session_summary(&self) -> Option<String> {
-        let stats = self.stats.lock().ok()?;
-        Some(stats.summary())
-    }
-
-    /// Reset session stats
-    pub fn reset_stats(&self) {
-        if let Ok(mut stats) = self.stats.lock() {
-            stats.reset();
-        }
-    }
-
-    /// Get the underlying SessionStats for context tracking
-    pub fn get_session_stats(&self) -> Arc<Mutex<SessionStats>> {
-        self.stats.clone()
-    }
-
-    /// Get the pricing model
-    pub fn get_pricing(&self) -> &crate::hooks::ModelPricing {
-        &self.pricing
-    }
-
-    /// Get total tokens used in this session
-    pub fn get_total_tokens(&self) -> u64 {
-        if let Ok(stats) = self.stats.lock() {
-            return stats.total_tokens();
-        }
-        0
-    }
-
-    /// Get total cost for this session
-    pub fn get_total_cost(&self) -> f64 {
-        if let Ok(stats) = self.stats.lock() {
-            return stats.total_cost;
-        }
-        0.0
-    }
-}
-
 /// A dynamic agent type that can work with any provider
 /// This allows us to abstract over different provider agent types at runtime
 pub enum DynAgent {
@@ -197,8 +80,7 @@ impl DynAgent {
 ///
 /// If mcp_tools is provided, they will be added to the agent along with built-in tools.
 /// The system_prompt is used as the agent's preamble.
-/// Create the provider agent with all tools and hooks.
-/// Returns the agent, provider info, cost tracker, todo state, event receiver, and shared session hook.
+/// Returns the agent, provider info, session stats, todo state, event receiver, and shared session hook.
 pub fn create_provider(
     config: &ProviderConfig,
     context_config: &crate::config::ContextConfig,
@@ -213,14 +95,14 @@ pub fn create_provider(
 ) -> Result<(
     DynAgent,
     ProviderInfo,
-    CostTracker,
+    Arc<Mutex<SessionStats>>,
     Arc<Mutex<TodoList>>,
     Option<mpsc::UnboundedReceiver<AgentEvent>>,
     Arc<SessionHook>,
 )> {
     match config {
         ProviderConfig::OpenRouter(c) => {
-            let (agent, info, cost_tracker, todo_state, receiver, hook) = create_openrouter_agent(
+            let (agent, info, session_stats, todo_state, receiver, hook) = create_openrouter_agent(
                 c,
                 context_config,
                 context_window,
@@ -235,14 +117,14 @@ pub fn create_provider(
             Ok((
                 DynAgent::OpenRouter(agent),
                 info,
-                cost_tracker,
+                session_stats,
                 todo_state,
                 Some(receiver),
                 Arc::new(hook),
             ))
         }
         ProviderConfig::OpenAI(c) => {
-            let (agent, info, cost_tracker, todo_state, receiver, hook) = create_openai_agent(
+            let (agent, info, session_stats, todo_state, receiver, hook) = create_openai_agent(
                 c,
                 context_config,
                 context_window,
@@ -257,14 +139,14 @@ pub fn create_provider(
             Ok((
                 DynAgent::OpenAI(agent),
                 info,
-                cost_tracker,
+                session_stats,
                 todo_state,
                 Some(receiver),
                 Arc::new(hook),
             ))
         }
         ProviderConfig::LlamaCpp(c) => {
-            let (agent, info, cost_tracker, todo_state, receiver, hook) = create_llamacpp_agent(
+            let (agent, info, session_stats, todo_state, receiver, hook) = create_llamacpp_agent(
                 c,
                 context_config,
                 context_window,
@@ -279,7 +161,7 @@ pub fn create_provider(
             Ok((
                 DynAgent::LlamaCpp(agent),
                 info,
-                cost_tracker,
+                session_stats,
                 todo_state,
                 Some(receiver),
                 Arc::new(hook),
@@ -299,10 +181,10 @@ pub fn create_provider(
             Ok((
                 DynAgent::Ollama(agent),
                 info,
-                CostTracker::none(),
+                Arc::new(Mutex::new(SessionStats::new())), // Empty stats for Ollama
                 todo_state,
-                None,                             // No event channel for Ollama
-                Arc::new(SessionHook::new(None)), // Empty hook for Ollama (no injection support)
+                None,                                       // No event channel for Ollama
+                Arc::new(SessionHook::new(None)),           // Empty hook for Ollama
             ))
         }
     }
@@ -316,7 +198,7 @@ fn add_builtin_tools<M, P>(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
-    cost_tracker: Arc<Mutex<crate::hooks::SessionStats>>,
+    session_stats: Arc<Mutex<SessionStats>>,
 ) -> (
     rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
     Arc<Mutex<TodoList>>,
@@ -349,14 +231,14 @@ where
     // Add DelegateTool if pipeline is enabled
     if let Some(registry) = pipeline_registry {
         let delegate_tool =
-            crate::pipeline::DelegateTool::new(Arc::new(registry.clone()), cost_tracker);
+            crate::pipeline::DelegateTool::new(Arc::new(registry.clone()), session_stats);
         builder = builder.tool(delegate_tool);
     }
 
     (builder, todo_state)
 }
 
-/// Create OpenRouter agent and info with cost tracking
+/// Create OpenRouter agent and info
 fn create_openrouter_agent(
     config: &OpenRouterConfig,
     context_config: &crate::config::ContextConfig,
@@ -371,7 +253,7 @@ fn create_openrouter_agent(
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
-    CostTracker,
+    Arc<Mutex<SessionStats>>,
     Arc<Mutex<TodoList>>,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
@@ -396,15 +278,14 @@ fn create_openrouter_agent(
 
     let model = config.model.clone();
 
-    // Create cost tracker first (needed for session hook stats)
-    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
-    let cost_tracker_stats = cost_tracker.get_session_stats();
+    // Create session stats for context tracking
+    let session_stats = Arc::new(Mutex::new(SessionStats::new()));
 
     // Create session hook with context tracking
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(
         Some(sender),
-        cost_tracker_stats.clone(),
+        session_stats.clone(),
         context_window as u64,
         context_config.threshold,
     );
@@ -424,7 +305,7 @@ fn create_openrouter_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
-        cost_tracker_stats,
+        session_stats.clone(),
     );
 
     // Add MCP tools and build
@@ -440,7 +321,7 @@ fn create_openrouter_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, cost_tracker, todo_state, receiver, hook))
+    Ok((agent, info, session_stats, todo_state, receiver, hook))
 }
 
 /// Create Ollama agent and info (no cost tracking for local models)
@@ -520,7 +401,7 @@ fn create_ollama_agent(
     Ok((agent, info, todo_state))
 }
 
-/// Create OpenAI agent and info with cost tracking
+/// Create OpenAI agent and info
 fn create_openai_agent(
     config: &OpenAIConfig,
     context_config: &crate::config::ContextConfig,
@@ -535,7 +416,7 @@ fn create_openai_agent(
 ) -> Result<(
     Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
-    CostTracker,
+    Arc<Mutex<SessionStats>>,
     Arc<Mutex<TodoList>>,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
@@ -554,7 +435,6 @@ fn create_openai_agent(
     }
 
     // Build the OpenAI client with configurable base URL
-    // Note: Using default responses API (not completions_api) for modern OpenAI compatibility
     let client = openai::Client::builder()
         .api_key(&api_key)
         .base_url(&config.base_url)
@@ -563,15 +443,14 @@ fn create_openai_agent(
 
     let model = config.model.clone();
 
-    // Create cost tracker first (needed for session hook stats)
-    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
-    let cost_tracker_stats = cost_tracker.get_session_stats();
+    // Create session stats for context tracking
+    let session_stats = Arc::new(Mutex::new(SessionStats::new()));
 
     // Create session hook with context tracking
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(
         Some(sender),
-        cost_tracker_stats.clone(),
+        session_stats.clone(),
         context_window as u64,
         context_config.threshold,
     );
@@ -591,7 +470,7 @@ fn create_openai_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
-        cost_tracker_stats,
+        session_stats.clone(),
     );
 
     // Add MCP tools and build
@@ -607,7 +486,7 @@ fn create_openai_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, cost_tracker, todo_state, receiver, hook))
+    Ok((agent, info, session_stats, todo_state, receiver, hook))
 }
 
 /// Create LlamaCpp agent and info (uses completions API for compatibility)
@@ -625,7 +504,7 @@ fn create_llamacpp_agent(
 ) -> Result<(
     Agent<rig::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
-    CostTracker,
+    Arc<Mutex<SessionStats>>,
     Arc<Mutex<TodoList>>,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
@@ -651,15 +530,14 @@ fn create_llamacpp_agent(
 
     let model = config.model.clone();
 
-    // Create cost tracker first (needed for session hook stats)
-    let cost_tracker = CostTracker::new(crate::hooks::ModelPricing::default());
-    let cost_tracker_stats = cost_tracker.get_session_stats();
+    // Create session stats for context tracking
+    let session_stats = Arc::new(Mutex::new(SessionStats::new()));
 
     // Create session hook with context tracking
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(
         Some(sender),
-        cost_tracker_stats.clone(),
+        session_stats.clone(),
         context_window as u64,
         context_config.threshold,
     );
@@ -679,7 +557,7 @@ fn create_llamacpp_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
-        cost_tracker_stats,
+        session_stats.clone(),
     );
 
     // Add MCP tools and build
@@ -695,5 +573,5 @@ fn create_llamacpp_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, cost_tracker, todo_state, receiver, hook))
+    Ok((agent, info, session_stats, todo_state, receiver, hook))
 }
