@@ -97,30 +97,13 @@ fn render_todo_item(item: &TodoItem) -> Line<'static> {
     let id_style = Style::default().fg(Color::DarkGray);
     let icon_style = Style::default().fg(color);
 
-    // Truncate text if too long (panel is narrow)
-    let max_text_len = 30;
-    let text = truncate_text(&item.text, max_text_len);
-
     Line::from(vec![
         Span::styled(icon, icon_style),
         Span::raw(" "),
         Span::styled(format!("#{}", item.id), id_style),
         Span::raw(" "),
-        Span::styled(text, text_style),
+        Span::styled(item.text.clone(), text_style),
     ])
-}
-
-/// Truncate text to max_len, adding "..." if truncated
-fn truncate_text(s: &str, max_len: usize) -> String {
-    let width = s.chars().count();
-    if width <= max_len {
-        s.to_string()
-    } else if max_len < 3 {
-        "...".to_string()
-    } else {
-        let end = max_len - 3;
-        s.chars().take(end).collect::<String>() + "..."
-    }
 }
 
 /// Calculate how many lines the todo panel needs to display all items

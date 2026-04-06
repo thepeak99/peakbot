@@ -34,9 +34,7 @@ use tokio::time;
 
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState, MessageRole};
-use crate::ui::repl::todo_panel::{
-    render_todo_panel, should_show_panel, DEFAULT_PANEL_PERCENT,
-};
+use crate::ui::repl::todo_panel::{DEFAULT_PANEL_PERCENT, render_todo_panel, should_show_panel};
 use crate::ui::state_manager::StateManager;
 use crate::ui::ui_trait::{Ui, UiAction};
 
@@ -79,6 +77,11 @@ impl UiState {
             show_todo_panel: false,
             todo_scroll_position: 0,
         }
+    }
+
+    /// Maximum scroll position (content height minus viewport height)
+    pub fn max_scroll(&self) -> u16 {
+        self.content_height.saturating_sub(self.viewport_height) + 1
     }
 }
 
@@ -305,7 +308,10 @@ impl ReplUi {
 
         let content = vec![
             Line::from(vec![Span::raw("")]),
-            Line::from(vec![Span::styled(warning, Style::default().fg(Color::LightRed))]),
+            Line::from(vec![Span::styled(
+                warning,
+                Style::default().fg(Color::LightRed),
+            )]),
             Line::from(vec![Span::raw("")]),
             Line::from(vec![Span::raw(question)]),
             Line::from(vec![Span::raw("")]),
@@ -316,7 +322,10 @@ impl ReplUi {
                 Span::styled(no_btn, no_style),
             ]),
             Line::from(vec![Span::raw("")]),
-            Line::from(vec![Span::styled(hint, Style::default().fg(Color::DarkGray))]),
+            Line::from(vec![Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            )]),
             Line::from(vec![Span::raw("")]),
         ];
 
@@ -383,10 +392,7 @@ impl ReplUi {
                         chat_history.line_count(main.width.saturating_sub(2)) as u16;
 
                     // Calculate scroll based on auto_scroll setting
-                    let max_scroll = self
-                        .ui_state
-                        .content_height
-                        .saturating_sub(self.ui_state.viewport_height);
+                    let max_scroll = self.ui_state.max_scroll();
                     let scroll = if self.ui_state.auto_scroll {
                         // Scroll to bottom
                         max_scroll
@@ -428,10 +434,17 @@ impl ReplUi {
                 self.ui_state.todo_scroll_position = 0;
             }
             // Scroll todo panel with Ctrl+Up/Down when panel is visible
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) && self.ui_state.show_todo_panel => {
-                self.ui_state.todo_scroll_position = self.ui_state.todo_scroll_position.saturating_sub(1);
+            KeyCode::Up
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.ui_state.show_todo_panel =>
+            {
+                self.ui_state.todo_scroll_position =
+                    self.ui_state.todo_scroll_position.saturating_sub(1);
             }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) && self.ui_state.show_todo_panel => {
+            KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.ui_state.show_todo_panel =>
+            {
                 // Simple increment - will be clamped during render
                 self.ui_state.todo_scroll_position += 1;
             }
@@ -495,14 +508,11 @@ impl ReplUi {
                 self.ui_state.cursor_pos = 0;
             }
             KeyCode::Up | KeyCode::Down => {
-                // Command history navigation - placeholder
+                // Command history navigation
             }
             // Scroll handling
             KeyCode::PageUp => {
-                let max_scroll = self
-                    .ui_state
-                    .content_height
-                    .saturating_sub(self.ui_state.viewport_height);
+                let max_scroll = self.ui_state.max_scroll();
                 self.ui_state.scroll_position = self
                     .ui_state
                     .scroll_position
@@ -511,10 +521,7 @@ impl ReplUi {
                 self.ui_state.auto_scroll = false;
             }
             KeyCode::PageDown => {
-                let max_scroll = self
-                    .ui_state
-                    .content_height
-                    .saturating_sub(self.ui_state.viewport_height);
+                let max_scroll = self.ui_state.max_scroll();
                 self.ui_state.scroll_position =
                     (self.ui_state.scroll_position + 10).min(max_scroll);
                 // Re-enable auto-scroll when reaching bottom
@@ -538,10 +545,7 @@ impl ReplUi {
             // Mouse wheel scrolling
             Event::Mouse(mouse_event) => match mouse_event.kind {
                 MouseEventKind::ScrollUp => {
-                    let max_scroll = self
-                        .ui_state
-                        .content_height
-                        .saturating_sub(self.ui_state.viewport_height);
+                    let max_scroll = self.ui_state.max_scroll();
                     self.ui_state.scroll_position = self
                         .ui_state
                         .scroll_position
@@ -550,10 +554,7 @@ impl ReplUi {
                     self.ui_state.auto_scroll = false;
                 }
                 MouseEventKind::ScrollDown => {
-                    let max_scroll = self
-                        .ui_state
-                        .content_height
-                        .saturating_sub(self.ui_state.viewport_height);
+                    let max_scroll = self.ui_state.max_scroll();
                     self.ui_state.scroll_position =
                         (self.ui_state.scroll_position + 3).min(max_scroll);
                     // Re-enable auto-scroll when reaching bottom

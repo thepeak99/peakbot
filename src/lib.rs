@@ -33,7 +33,7 @@ use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpC
 pub use skills::{SkillRegistry, load_default_skills};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
-    TodoList, TodoStatus, TodoTool,
+    TodoStatus, TodoTool,
 };
 pub use ui::{Ui, UiAction};
 
@@ -53,7 +53,6 @@ enum QueueMessage {
 
 /// Completion result sent from agent loop back to event loop
 #[derive(Clone)]
-#[allow(dead_code)]
 enum CompletionResult {
     Success(String),
     Stopped,
@@ -146,8 +145,6 @@ pub struct AgentRunner {
     conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
     system_prompt: String,
     session_stats: Arc<Mutex<SessionStats>>,
-    #[allow(unused)]
-    todo_state: Option<Arc<Mutex<TodoList>>>,
     state_manager: Option<Arc<ui::StateManager>>,
     // Shared session hook for interrupt/queue state
     session_hook: Arc<SessionHook>,
@@ -162,7 +159,6 @@ impl AgentRunner {
         provider_info: ProviderInfo,
         skills: SkillRegistry,
         session_stats: Arc<Mutex<SessionStats>>,
-        todo_state: Option<Arc<Mutex<TodoList>>>,
         event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
         state_manager: Option<Arc<ui::StateManager>>,
         session_hook: Arc<SessionHook>,
@@ -205,24 +201,9 @@ impl AgentRunner {
             conversation_manager,
             system_prompt,
             session_stats,
-            todo_state,
             state_manager,
             session_hook,
             _event_receiver: event_receiver,
-        }
-    }
-
-    /// Sync current state to StateManager (Model)
-    #[allow(dead_code)]
-    fn sync_state_to_manager(&self) {
-        if let Some(ref sm) = self.state_manager {
-            sm.update_stats(&self.session_stats);
-
-            if let Some(ref todo) = self.todo_state {
-                if let Ok(list) = todo.lock() {
-                    sm.update_todo(&list);
-                }
-            }
         }
     }
 
@@ -622,7 +603,6 @@ impl AgentRunner {
                     }
 
                     // Sync stats and todo to StateManager
-                    // (simplified - would need cost_tracker and todo_state)
 
                     // Save conversation
                     if let Some(cm) = conversation_manager.as_ref() {

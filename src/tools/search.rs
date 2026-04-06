@@ -223,7 +223,7 @@ impl Tool for SearchTool {
 
         // Add optional parameters
         if let Some(ref category) = args.category {
-            // Map our simplified category names to SearXNG category names
+            // Map our category names to SearXNG category names
             let searxng_category = match category.as_str() {
                 "images" => "images",
                 "videos" => "videos",

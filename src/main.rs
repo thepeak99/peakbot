@@ -38,7 +38,10 @@ async fn main() -> Result<()> {
 
     let searxng_config = config.searxng_enabled().then(|| config.searxng.as_ref()).flatten();
 
-    let todo_tool = TodoTool::new();
+    // StateManager must be created before TodoTool so we can pass it in
+    let state_manager = Arc::new(peakbot::ui::StateManager::new());
+
+    let todo_tool = TodoTool::new(state_manager.clone());
 
     // Pipeline
     let pipeline_registry = if config.pipeline_enabled() {
@@ -86,7 +89,7 @@ async fn main() -> Result<()> {
         _ => 128_000, // default
     };
 
-    let (agent, provider_info, session_stats, todo_state, event_receiver, session_hook) = create_provider(
+    let (agent, provider_info, session_stats, event_receiver, session_hook) = create_provider(
         &config.provider,
         &config.context,
         context_window,
@@ -105,11 +108,7 @@ async fn main() -> Result<()> {
         provider_info.model
     );
 
-    // StateManager (Model) — shared by all
-    let state_manager = Arc::new(peakbot::ui::StateManager::new());
-    if let Ok(list) = todo_state.lock() {
-        state_manager.update_todo(&list);
-    }
+    // StateManager is already created above and shared with TodoTool
     state_manager.update_stats(&session_stats);
     state_manager.set_model(provider_info.model.clone());
 
@@ -123,7 +122,6 @@ async fn main() -> Result<()> {
         provider_info.clone(),
         skills,
         session_stats,
-        Some(todo_state),
         event_receiver,
         Some(state_manager.clone()),
         session_hook,

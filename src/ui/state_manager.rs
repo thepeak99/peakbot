@@ -15,7 +15,7 @@
 
 use crate::hooks::events::AgentEvent;
 use crate::hooks::session_hook::SessionStats;
-use crate::TodoList;
+use crate::tools::todo::{TodoList, TodoStatus};
 use crate::ui::app_state::{
     AppState, ChatMessage, ChatState, ContextState, Notification, NotificationKind, SessionState,
     TodoItem, TodoState, WelcomeState,
@@ -26,6 +26,8 @@ use tokio::sync::mpsc;
 /// Manages AppState and distributes updates to subscribed Views
 pub struct StateManager {
     state: Arc<RwLock<AppState>>,
+    /// Todo list (single source of truth for todo state)
+    todo_list: Arc<Mutex<TodoList>>,
     /// Persistent subscribers that receive every state update
     subscribers: Arc<RwLock<Vec<mpsc::Sender<AppState>>>>,
 }
@@ -35,8 +37,141 @@ impl StateManager {
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(AppState::new())),
+            todo_list: Arc::new(Mutex::new(TodoList::new())),
             subscribers: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Get a clone of the todo list (read-only snapshot).
+    /// All mutations must go through StateManager methods.
+    pub fn get_todo_list(&self) -> TodoList {
+        self.todo_list.lock().unwrap().clone()
+    }
+
+    // ── Todo Operations ────────────────────────────────────────────────────────
+
+    /// Add a new todo item
+    pub fn add_todo(&self, task: String) -> String {
+        let item = {
+            let mut list = self.todo_list.lock().unwrap();
+            let item = list.add(task);
+            self.sync_todo_to_ui(&list);
+            item
+        };
+        format!("Added task #{}: {}", item.id, item.task)
+    }
+
+    /// Add multiple todo items
+    pub fn add_todos(&self, tasks: Vec<String>) -> String {
+        if tasks.is_empty() {
+            return "No tasks provided.".to_string();
+        }
+        let items = {
+            let mut list = self.todo_list.lock().unwrap();
+            let items = list.add_many(tasks);
+            self.sync_todo_to_ui(&list);
+            items
+        };
+        if items.len() == 1 {
+            format!("Added task #{}: {}", items[0].id, items[0].task)
+        } else {
+            let task_list: Vec<String> = items
+                .iter()
+                .map(|i| format!("#{}: {}", i.id, i.task))
+                .collect();
+            format!("Added {} tasks: {}", items.len(), task_list.join(", "))
+        }
+    }
+
+    /// Update todo item status
+    pub fn update_todo_status(&self, id: usize, status: TodoStatus) -> String {
+        let result = {
+            let mut list = self.todo_list.lock().unwrap();
+            let result = list.update_status(id, status.clone());
+            if result.is_some() {
+                self.sync_todo_to_ui(&list);
+            }
+            result
+        };
+        match result {
+            Some(item) => format!("Updated task #{} to {}", item.id, item.status),
+            None => format!("Task #{} not found", id),
+        }
+    }
+
+    /// Remove a todo item
+    pub fn remove_todo(&self, id: usize) -> String {
+        let result = {
+            let mut list = self.todo_list.lock().unwrap();
+            let result = list.remove(id);
+            if result.is_some() {
+                self.sync_todo_to_ui(&list);
+            }
+            result
+        };
+        match result {
+            Some(item) => format!("Removed task #{}: {}", item.id, item.task),
+            None => format!("Task #{} not found", id),
+        }
+    }
+
+    /// List all todo items
+    pub fn list_todos(&self) -> String {
+        let list = self.todo_list.lock().unwrap();
+        let tasks = list.list();
+
+        if tasks.is_empty() {
+            return "No tasks in the todo list.".to_string();
+        }
+
+        let (pending, in_progress, completed, cancelled) = list.count_by_status();
+
+        let mut output = String::new();
+        output.push_str("## Todo List\n\n");
+
+        for item in tasks {
+            let status_icon = match item.status {
+                TodoStatus::Pending => "○",
+                TodoStatus::InProgress => "◐",
+                TodoStatus::Completed => "●",
+                TodoStatus::Cancelled => "✗",
+            };
+            output.push_str(&format!(
+                "{} #{} [{}] {}\n",
+                status_icon, item.id, item.status, item.task
+            ));
+        }
+
+        output.push_str(&format!(
+            "\n**Summary:** {} pending, {} in progress, {} completed, {} cancelled",
+            pending, in_progress, completed, cancelled
+        ));
+
+        output
+    }
+
+    /// Clear completed todo items
+    pub fn clear_completed_todos(&self) -> String {
+        let cleared = {
+            let mut list = self.todo_list.lock().unwrap();
+            let cleared = list.clear_completed();
+            self.sync_todo_to_ui(&list);
+            cleared
+        };
+        format!("Cleared {} completed tasks", cleared)
+    }
+
+    /// Sync todo list to UI state
+    fn sync_todo_to_ui(&self, list: &TodoList) {
+        let items: Vec<TodoItem> = list
+            .list()
+            .iter()
+            .map(TodoItem::from)
+            .collect();
+
+        let mut state = self.state.write().unwrap();
+        state.todo.items = items;
+        self.notify_update(&state);
     }
 
     /// Get current state snapshot
