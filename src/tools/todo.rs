@@ -1,11 +1,13 @@
 //! Todo tool - allows the model to track progress on multi-step tasks.
 
+use crate::ui::StateManager;
 use chrono::{DateTime, Utc};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+
+// Domain types (defined here, exported for use by StateManager and other modules)
 
 /// Status of a todo item
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -118,26 +120,10 @@ impl TodoList {
 
     /// Count tasks by status
     pub fn count_by_status(&self) -> (usize, usize, usize, usize) {
-        let pending = self
-            .tasks
-            .iter()
-            .filter(|t| t.status == TodoStatus::Pending)
-            .count();
-        let in_progress = self
-            .tasks
-            .iter()
-            .filter(|t| t.status == TodoStatus::InProgress)
-            .count();
-        let completed = self
-            .tasks
-            .iter()
-            .filter(|t| t.status == TodoStatus::Completed)
-            .count();
-        let cancelled = self
-            .tasks
-            .iter()
-            .filter(|t| t.status == TodoStatus::Cancelled)
-            .count();
+        let pending = self.tasks.iter().filter(|t| t.status == TodoStatus::Pending).count();
+        let in_progress = self.tasks.iter().filter(|t| t.status == TodoStatus::InProgress).count();
+        let completed = self.tasks.iter().filter(|t| t.status == TodoStatus::Completed).count();
+        let cancelled = self.tasks.iter().filter(|t| t.status == TodoStatus::Cancelled).count();
         (pending, in_progress, completed, cancelled)
     }
 }
@@ -151,18 +137,43 @@ pub enum TodoError {
     #[error("Invalid action: {0}")]
     InvalidAction(String),
 
-    #[error("Lock error: {0}")]
-    LockError(String),
+    #[error("StateManager not set: {0}")]
+    StateManagerNotSet(String),
+}
+
+/// The todo tool - a stateless controller that delegates to StateManager.
+/// All todo state lives in StateManager; this tool just updates it.
+pub struct TodoTool {
+    /// Reference to StateManager (single source of truth for todo state)
+    state_manager: Option<std::sync::Arc<StateManager>>,
+}
+
+impl TodoTool {
+    /// Create a new todo tool with a StateManager reference
+    pub fn new(state_manager: std::sync::Arc<StateManager>) -> Self {
+        Self {
+            state_manager: Some(state_manager),
+        }
+    }
+}
+
+impl Default for TodoTool {
+    fn default() -> Self {
+        Self {
+            state_manager: None,
+        }
+    }
 }
 
 /// Arguments for the todo tool
 #[derive(Deserialize, Debug)]
 pub struct TodoArgs {
+    /// Brief explanation of what you're doing
     #[allow(dead_code)]
     thought: String,
     /// The action to perform: add, update, remove, list, clear
     action: String,
-    /// Task descriptions (for add) - ALWAYS use array, even for single task
+    /// Task descriptions (for add)
     #[serde(default)]
     tasks: Option<Vec<String>>,
     /// Task status (for update): pending, in_progress, completed, cancelled
@@ -171,40 +182,6 @@ pub struct TodoArgs {
     /// Task ID (for update/remove)
     #[serde(default)]
     task_id: Option<usize>,
-}
-
-/// The todo tool - allows the model to track progress on multi-step tasks
-pub struct TodoTool {
-    /// Shared todo list state
-    todo_list: Arc<Mutex<TodoList>>,
-}
-
-impl TodoTool {
-    /// Create a new todo tool
-    pub fn new() -> Self {
-        Self {
-            todo_list: Arc::new(Mutex::new(TodoList::new())),
-        }
-    }
-
-    /// Create with existing todo list (for testing)
-    #[allow(dead_code)]
-    pub fn with_list(todo_list: TodoList) -> Self {
-        Self {
-            todo_list: Arc::new(Mutex::new(todo_list)),
-        }
-    }
-
-    /// Get the underlying Arc for sharing with AgentRunner
-    pub fn get_state(&self) -> Arc<Mutex<TodoList>> {
-        self.todo_list.clone()
-    }
-}
-
-impl Default for TodoTool {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Tool for TodoTool {
@@ -250,10 +227,9 @@ impl Tool for TodoTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let mut list = self
-            .todo_list
-            .lock()
-            .map_err(|e| TodoError::LockError(e.to_string()))?;
+        let sm = self.state_manager.as_ref().ok_or_else(|| {
+            TodoError::StateManagerNotSet("StateManager not initialized. Todo tool cannot update UI state.".to_string())
+        })?;
 
         match args.action.as_str() {
             "add" => {
@@ -269,22 +245,7 @@ impl Tool for TodoTool {
                     ));
                 }
                 
-                let items = list.add_many(tasks);
-                
-                // Format response based on count
-                if items.len() == 1 {
-                    Ok(format!("Added task #{}: {}", items[0].id, items[0].task))
-                } else {
-                    let task_list: Vec<String> = items
-                        .iter()
-                        .map(|i| format!("#{}: {}", i.id, i.task))
-                        .collect();
-                    Ok(format!(
-                        "Added {} tasks: {}",
-                        items.len(),
-                        task_list.join(", ")
-                    ))
-                }
+                Ok(sm.add_todos(tasks))
             }
 
             "update" => {
@@ -308,10 +269,7 @@ impl Tool for TodoTool {
                     }
                 };
 
-                match list.update_status(task_id, status) {
-                    Some(item) => Ok(format!("Updated task #{} to {}", item.id, item.status)),
-                    None => Err(TodoError::TaskNotFound(task_id)),
-                }
+                Ok(sm.update_todo_status(task_id, status))
             }
 
             "remove" => {
@@ -319,49 +277,12 @@ impl Tool for TodoTool {
                     TodoError::InvalidAction("task_id required for 'remove' action".to_string())
                 })?;
 
-                match list.remove(task_id) {
-                    Some(item) => Ok(format!("Removed task #{}: {}", item.id, item.task)),
-                    None => Err(TodoError::TaskNotFound(task_id)),
-                }
+                Ok(sm.remove_todo(task_id))
             }
 
-            "list" => {
-                let tasks = list.list();
+            "list" => Ok(sm.list_todos()),
 
-                if tasks.is_empty() {
-                    return Ok("No tasks in the todo list.".to_string());
-                }
-
-                let (pending, in_progress, completed, cancelled) = list.count_by_status();
-
-                let mut output = String::new();
-                output.push_str("## Todo List\n\n");
-
-                for item in tasks {
-                    let status_icon = match item.status {
-                        TodoStatus::Pending => "○",
-                        TodoStatus::InProgress => "◐",
-                        TodoStatus::Completed => "●",
-                        TodoStatus::Cancelled => "✗",
-                    };
-                    output.push_str(&format!(
-                        "{} #{} [{}] {}\n",
-                        status_icon, item.id, item.status, item.task
-                    ));
-                }
-
-                output.push_str(&format!(
-                    "\n**Summary:** {} pending, {} in progress, {} completed, {} cancelled",
-                    pending, in_progress, completed, cancelled
-                ));
-
-                Ok(output)
-            }
-
-            "clear" => {
-                let cleared = list.clear_completed();
-                Ok(format!("Cleared {} completed tasks", cleared))
-            }
+            "clear" => Ok(sm.clear_completed_todos()),
 
             _ => Err(TodoError::InvalidAction(format!(
                 "Unknown action: {}. Valid actions: add, update, remove, list, clear",

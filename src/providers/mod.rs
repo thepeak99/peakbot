@@ -11,7 +11,7 @@ use crate::hooks::events::AgentEvent;
 use crate::hooks::{SessionHook, SessionStats};
 use crate::tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
-    TodoList, TodoTool,
+    TodoTool,
 };
 use anyhow::{Context, Result};
 use rig::agent::Agent;
@@ -80,7 +80,7 @@ impl DynAgent {
 ///
 /// If mcp_tools is provided, they will be added to the agent along with built-in tools.
 /// The system_prompt is used as the agent's preamble.
-/// Returns the agent, provider info, session stats, todo state, event receiver, and shared session hook.
+/// Returns the agent, provider info, session stats, event receiver, and shared session hook.
 pub fn create_provider(
     config: &ProviderConfig,
     context_config: &crate::config::ContextConfig,
@@ -96,13 +96,12 @@ pub fn create_provider(
     DynAgent,
     ProviderInfo,
     Arc<Mutex<SessionStats>>,
-    Arc<Mutex<TodoList>>,
     Option<mpsc::UnboundedReceiver<AgentEvent>>,
     Arc<SessionHook>,
 )> {
     match config {
         ProviderConfig::OpenRouter(c) => {
-            let (agent, info, session_stats, todo_state, receiver, hook) = create_openrouter_agent(
+            let (agent, info, session_stats, receiver, hook) = create_openrouter_agent(
                 c,
                 context_config,
                 context_window,
@@ -118,13 +117,12 @@ pub fn create_provider(
                 DynAgent::OpenRouter(agent),
                 info,
                 session_stats,
-                todo_state,
                 Some(receiver),
                 Arc::new(hook),
             ))
         }
         ProviderConfig::OpenAI(c) => {
-            let (agent, info, session_stats, todo_state, receiver, hook) = create_openai_agent(
+            let (agent, info, session_stats, receiver, hook) = create_openai_agent(
                 c,
                 context_config,
                 context_window,
@@ -140,13 +138,12 @@ pub fn create_provider(
                 DynAgent::OpenAI(agent),
                 info,
                 session_stats,
-                todo_state,
                 Some(receiver),
                 Arc::new(hook),
             ))
         }
         ProviderConfig::LlamaCpp(c) => {
-            let (agent, info, session_stats, todo_state, receiver, hook) = create_llamacpp_agent(
+            let (agent, info, session_stats, receiver, hook) = create_llamacpp_agent(
                 c,
                 context_config,
                 context_window,
@@ -162,13 +159,12 @@ pub fn create_provider(
                 DynAgent::LlamaCpp(agent),
                 info,
                 session_stats,
-                todo_state,
                 Some(receiver),
                 Arc::new(hook),
             ))
         }
         ProviderConfig::Ollama(c) => {
-            let (agent, info, todo_state) = create_ollama_agent(
+            let (agent, info, _session_stats) = create_ollama_agent(
                 c,
                 mcp_tools,
                 system_prompt,
@@ -182,7 +178,6 @@ pub fn create_provider(
                 DynAgent::Ollama(agent),
                 info,
                 Arc::new(Mutex::new(SessionStats::new())), // Empty stats for Ollama
-                todo_state,
                 None,                                       // No event channel for Ollama
                 Arc::new(SessionHook::new(None)),           // Empty hook for Ollama
             ))
@@ -199,17 +194,13 @@ fn add_builtin_tools<M, P>(
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     session_stats: Arc<Mutex<SessionStats>>,
-) -> (
-    rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
-    Arc<Mutex<TodoList>>,
-)
+) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
 where
     M: rig::completion::CompletionModel,
     P: rig::agent::PromptHook<M>,
 {
-    // Use provided tool or create a new one
+    // Use provided tool or create a new one (with optional StateManager)
     let todo = todo_tool.unwrap_or_default();
-    let todo_state = todo.get_state();
 
     // Create BashTool with configured environment variables
     let bash_tool = BashTool::new(bash_config.env.clone());
@@ -235,7 +226,7 @@ where
         builder = builder.tool(delegate_tool);
     }
 
-    (builder, todo_state)
+    builder
 }
 
 /// Create OpenRouter agent and info
@@ -254,7 +245,6 @@ fn create_openrouter_agent(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
     Arc<Mutex<SessionStats>>,
-    Arc<Mutex<TodoList>>,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
 )> {
@@ -299,7 +289,7 @@ fn create_openrouter_agent(
         .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) = add_builtin_tools(
+    let agent_builder = add_builtin_tools(
         agent_builder,
         searxng_config,
         todo_tool,
@@ -321,7 +311,7 @@ fn create_openrouter_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, session_stats, todo_state, receiver, hook))
+    Ok((agent, info, session_stats, receiver, hook))
 }
 
 /// Create Ollama agent and info (no cost tracking for local models)
@@ -337,7 +327,7 @@ fn create_ollama_agent(
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
-    Arc<Mutex<TodoList>>,
+    Arc<Mutex<SessionStats>>,
 )> {
     if config.model.is_empty() {
         anyhow::bail!("Ollama model not specified");
@@ -376,13 +366,13 @@ fn create_ollama_agent(
     let dummy_stats = Arc::new(Mutex::new(crate::hooks::SessionStats::new()));
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) = add_builtin_tools(
+    let agent_builder = add_builtin_tools(
         agent_builder,
         searxng_config,
         todo_tool,
         bash_config,
         pipeline_registry,
-        dummy_stats,
+        dummy_stats.clone(),
     );
 
     // Add MCP tools and build
@@ -398,7 +388,7 @@ fn create_ollama_agent(
         supports_pricing: false,
     };
 
-    Ok((agent, info, todo_state))
+    Ok((agent, info, dummy_stats))
 }
 
 /// Create OpenAI agent and info
@@ -417,7 +407,6 @@ fn create_openai_agent(
     Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
     Arc<Mutex<SessionStats>>,
-    Arc<Mutex<TodoList>>,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
 )> {
@@ -464,7 +453,7 @@ fn create_openai_agent(
         .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) = add_builtin_tools(
+    let agent_builder = add_builtin_tools(
         agent_builder,
         searxng_config,
         todo_tool,
@@ -486,7 +475,7 @@ fn create_openai_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, session_stats, todo_state, receiver, hook))
+    Ok((agent, info, session_stats, receiver, hook))
 }
 
 /// Create LlamaCpp agent and info (uses completions API for compatibility)
@@ -505,7 +494,6 @@ fn create_llamacpp_agent(
     Agent<rig::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
     Arc<Mutex<SessionStats>>,
-    Arc<Mutex<TodoList>>,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
 )> {
@@ -551,7 +539,7 @@ fn create_llamacpp_agent(
         .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) = add_builtin_tools(
+    let agent_builder = add_builtin_tools(
         agent_builder,
         searxng_config,
         todo_tool,
@@ -573,5 +561,5 @@ fn create_llamacpp_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, session_stats, todo_state, receiver, hook))
+    Ok((agent, info, session_stats, receiver, hook))
 }

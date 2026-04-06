@@ -369,7 +369,6 @@ impl SessionHook {
 }
 
 /// Extract text and reasoning from the response choice
-/// Simplified extraction - just gets basic info without worrying about all edge cases
 fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (String, Option<String>) {
     let mut text = String::new();
     let mut reasoning = None;
