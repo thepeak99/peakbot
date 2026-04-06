@@ -542,4 +542,76 @@ mod tests {
         let scroll_down = (9u16 + 3).min(max_scroll);
         assert_eq!(scroll_down, 10);
     }
+
+    // === Quit Confirmation Dialog Tests ===
+
+    /// Test quit confirmation dialog with "No" selected (default state)
+    #[test]
+    fn quit_confirm_no_selected() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            ReplUi::render_quit_confirm(f, f.area(), false);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("quit_confirm_no_selected", lines.join("\n"));
+    }
+
+    /// Test quit confirmation dialog with "Yes" selected
+    #[test]
+    fn quit_confirm_yes_selected() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            ReplUi::render_quit_confirm(f, f.area(), true);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("quit_confirm_yes_selected", lines.join("\n"));
+    }
+
+    /// Test quit confirmation dialog centered on a larger terminal
+    #[test]
+    fn quit_confirm_large_terminal() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            ReplUi::render_quit_confirm(f, f.area(), false);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("quit_confirm_large_terminal", lines.join("\n"));
+    }
+
+    /// Test quit confirmation dialog on a minimal-sized terminal
+    #[test]
+    fn quit_confirm_minimal_terminal() {
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            ReplUi::render_quit_confirm(f, f.area(), false);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("quit_confirm_minimal_terminal", lines.join("\n"));
+    }
+
+    /// Test quit confirmation dialog with Yes selected on large terminal
+    #[test]
+    fn quit_confirm_yes_selected_large() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            ReplUi::render_quit_confirm(f, f.area(), true);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("quit_confirm_yes_selected_large", lines.join("\n"));
+    }
 }

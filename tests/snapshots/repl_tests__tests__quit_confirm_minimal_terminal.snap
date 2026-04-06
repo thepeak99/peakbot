@@ -1,0 +1,16 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+                                                            
+                                                            
+                                                            
+     ┌────────────────────────────────────────────────┐     
+     │                                                │     
+     │              ⚠️   WAIT! DON'T LEAVE!  ⚠️         │     
+     │                                                │     
+     │       Are you sure you want to quit PeakBot?   │     
+     │                                                │     
+     │           Yes, leave      [ No, stay ]         │     
+     │                                                │     
+     └────────────────────────────────────────────────┘
