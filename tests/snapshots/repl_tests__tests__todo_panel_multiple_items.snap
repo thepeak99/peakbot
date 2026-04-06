@@ -1,0 +1,16 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+┌ ✓ TODO ────────────────────┐
+│● #1 First task             │
+│◐ #2 Second task            │
+│○ #3 Third task             │
+│                            │
+│                            │
+│                            │
+│                            │
+│                            │
+│                            │
+│                            │
+└────────────────────────────┘

@@ -614,4 +614,325 @@ mod tests {
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("quit_confirm_yes_selected_large", lines.join("\n"));
     }
+
+    // === Todo Panel Snapshot Tests ===
+
+    /// Test todo panel with no items (empty state)
+    #[test]
+    fn todo_panel_empty() {
+        use peakbot::ui::app_state::{TodoItem, TodoState};
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+
+        let state = TodoState::default();
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_empty", lines.join("\n"));
+    }
+
+    /// Test todo panel with a single pending item
+    #[test]
+    fn todo_panel_single_pending() {
+        use peakbot::ui::app_state::TodoState;
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+        use peakbot::TodoStatus;
+
+        let mut state = TodoState::default();
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 1,
+            text: "Write documentation".to_string(),
+            completed: false,
+            status: TodoStatus::Pending,
+            selected: false,
+        });
+
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_single_pending", lines.join("\n"));
+    }
+
+    /// Test todo panel with a single in-progress item
+    #[test]
+    fn todo_panel_single_in_progress() {
+        use peakbot::ui::app_state::TodoState;
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+        use peakbot::TodoStatus;
+
+        let mut state = TodoState::default();
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 2,
+            text: "Implement feature".to_string(),
+            completed: false,
+            status: TodoStatus::InProgress,
+            selected: false,
+        });
+
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_single_in_progress", lines.join("\n"));
+    }
+
+    /// Test todo panel with a single completed item (should show strikethrough)
+    #[test]
+    fn todo_panel_single_completed() {
+        use peakbot::ui::app_state::TodoState;
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+        use peakbot::TodoStatus;
+
+        let mut state = TodoState::default();
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 3,
+            text: "Fix bug".to_string(),
+            completed: true,
+            status: TodoStatus::Completed,
+            selected: false,
+        });
+
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_single_completed", lines.join("\n"));
+    }
+
+    /// Test todo panel with a single cancelled item
+    #[test]
+    fn todo_panel_single_cancelled() {
+        use peakbot::ui::app_state::TodoState;
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+        use peakbot::TodoStatus;
+
+        let mut state = TodoState::default();
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 4,
+            text: "Deprecated feature".to_string(),
+            completed: false,
+            status: TodoStatus::Cancelled,
+            selected: false,
+        });
+
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_single_cancelled", lines.join("\n"));
+    }
+
+    /// Test todo panel with multiple items
+    #[test]
+    fn todo_panel_multiple_items() {
+        use peakbot::ui::app_state::TodoState;
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+        use peakbot::TodoStatus;
+
+        let mut state = TodoState::default();
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 1,
+            text: "First task".to_string(),
+            completed: false,
+            status: TodoStatus::Completed,
+            selected: false,
+        });
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 2,
+            text: "Second task".to_string(),
+            completed: false,
+            status: TodoStatus::InProgress,
+            selected: false,
+        });
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 3,
+            text: "Third task".to_string(),
+            completed: false,
+            status: TodoStatus::Pending,
+            selected: false,
+        });
+
+        let backend = TestBackend::new(30, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_multiple_items", lines.join("\n"));
+    }
+
+    /// Test todo panel with many items (tests scroll behavior)
+    #[test]
+    fn todo_panel_many_items() {
+        use peakbot::ui::app_state::TodoState;
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+        use peakbot::TodoStatus;
+
+        let mut state = TodoState::default();
+        for i in 1..=15 {
+            let status = match i % 4 {
+                1 => TodoStatus::Completed,
+                2 => TodoStatus::InProgress,
+                3 => TodoStatus::Pending,
+                _ => TodoStatus::Cancelled,
+            };
+            state.items.push(peakbot::ui::app_state::TodoItem {
+                id: i,
+                text: format!("Task number {}", i),
+                completed: matches!(status, TodoStatus::Completed),
+                status,
+                selected: false,
+            });
+        }
+
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_many_items", lines.join("\n"));
+    }
+
+    /// Test todo panel with long task text (truncation)
+    #[test]
+    fn todo_panel_long_text() {
+        use peakbot::ui::app_state::TodoState;
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+
+        let mut state = TodoState::default();
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 1,
+            text: "This is a very long task description that should definitely be truncated when displayed".to_string(),
+            completed: false,
+            status: peakbot::TodoStatus::Pending,
+            selected: false,
+        });
+
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_long_text", lines.join("\n"));
+    }
+
+    /// Test todo panel with narrow width
+    #[test]
+    fn todo_panel_narrow() {
+        use peakbot::ui::app_state::TodoState;
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+
+        let mut state = TodoState::default();
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 1,
+            text: "Task".to_string(),
+            completed: false,
+            status: peakbot::TodoStatus::Pending,
+            selected: false,
+        });
+
+        let backend = TestBackend::new(20, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_narrow", lines.join("\n"));
+    }
+
+    /// Test todo panel on very small area (should not render)
+    #[test]
+    fn todo_panel_too_small() {
+        use peakbot::ui::app_state::TodoState;
+        use peakbot::ui::repl::todo_panel::render_todo_panel;
+
+        let mut state = TodoState::default();
+        state.items.push(peakbot::ui::app_state::TodoItem {
+            id: 1,
+            text: "Task".to_string(),
+            completed: false,
+            status: peakbot::TodoStatus::Pending,
+            selected: false,
+        });
+
+        // Area too small (2x2)
+        let backend = TestBackend::new(2, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| {
+            render_todo_panel(f, f.area(), &state, 0);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("todo_panel_too_small", lines.join("\n"));
+    }
+
+    // === Todo Panel Unit Tests (no snapshots needed) ===
+
+    #[test]
+    fn test_todo_panel_should_show() {
+        use peakbot::ui::repl::todo_panel::should_show_panel;
+
+        // Should show on wide terminals
+        assert!(should_show_panel(80));
+        assert!(should_show_panel(60));
+        assert!(should_show_panel(61));
+
+        // Should not show on narrow terminals
+        assert!(!should_show_panel(59));
+        assert!(!should_show_panel(40));
+        assert!(!should_show_panel(20));
+    }
+
+    #[test]
+    fn test_todo_item_status_icons() {
+        use peakbot::TodoStatus;
+
+        // Pending
+        let pending = TodoStatus::Pending;
+        assert_eq!(pending.to_string(), "pending");
+
+        // InProgress
+        let in_progress = TodoStatus::InProgress;
+        assert_eq!(in_progress.to_string(), "in_progress");
+
+        // Completed
+        let completed = TodoStatus::Completed;
+        assert_eq!(completed.to_string(), "completed");
+
+        // Cancelled
+        let cancelled = TodoStatus::Cancelled;
+        assert_eq!(cancelled.to_string(), "cancelled");
+    }
 }

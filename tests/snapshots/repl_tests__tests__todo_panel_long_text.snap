@@ -1,0 +1,14 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+┌ ✓ TODO ────────────────────┐
+│○ #1 This is a very long    │
+│task de...                  │
+│                            │
+│                            │
+│                            │
+│                            │
+│                            │
+│                            │
+└────────────────────────────┘
