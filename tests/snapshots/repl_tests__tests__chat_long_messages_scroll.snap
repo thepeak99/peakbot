@@ -3,11 +3,11 @@ source: tests/repl_tests.rs
 expression: "lines.join(\"\\n\")"
 ---
 ┌ Chat Messages ──────────────────────────────────────────┐▲
-│[12:00:00] 👤  User: This is a very long message that     │█
-│should wrap to multiple lines when displayed in the      │█
-│terminal. It contains lots of text that will need to be  │█
-│wrapped.                                                 │║
-│[12:00:01] 🤖  Agent: Here is another lengthy response    │║
-│that will definitely require multiple lines to display   │║
+│[12:00:00] 👤  User: This is a very long message that     │║
+│should wrap to multiple lines when displayed in the      │║
+│terminal. It contains lots of text that will need to be  │║
+│wrapped.                                                 │█
+│[12:00:01] 🤖  Agent: Here is another lengthy response    │█
+│that will definitely require multiple lines to display   │█
 │properly. It has detailed explanations and lots of       │║
 └─────────────────────────────────────────────────────────┘▼

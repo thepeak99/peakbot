@@ -3,11 +3,11 @@ source: tests/repl_tests.rs
 expression: "lines.join(\"\\n\")"
 ---
 ┌ Chat Messages ──────────────────────────────────────────┐▲
-│Welcome to PeakBot! Start a conversation or use /help for│█
-│commands.                                                │█
+│Welcome to PeakBot! Start a conversation or use /help for│║
+│commands.                                                │║
 │                                                         │█
 │                                                         │█
 │                                                         │█
-│                                                         │║
-│                                                         │║
+│                                                         │█
+│                                                         │█
 └─────────────────────────────────────────────────────────┘▼

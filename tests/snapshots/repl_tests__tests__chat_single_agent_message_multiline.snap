@@ -3,11 +3,11 @@ source: tests/repl_tests.rs
 expression: "lines.join(\"\\n\")"
 ---
 ┌ Chat Messages ──────────────────────────────────────────┐▲
-│[12:00:00] 🤖  Agent: Line one                            │█
-│Line two                                                 │█
+│[12:00:00] 🤖  Agent: Line one                            │║
+│Line two                                                 │║
 │Line three                                               │█
 │                                                         │█
 │                                                         │█
-│                                                         │║
-│                                                         │║
+│                                                         │█
+│                                                         │█
 └─────────────────────────────────────────────────────────┘▼

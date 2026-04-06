@@ -180,7 +180,8 @@ impl ReplUi {
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
-        let mut scroll_state = ScrollbarState::new(content_height).position(scroll as usize);
+        let mut scroll_state =
+            ScrollbarState::new(content_height).position((scroll + area.height - 2) as usize);
         f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state);
 
         let scrolled = paragraph.scroll((scroll, 0));
