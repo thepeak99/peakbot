@@ -41,6 +41,42 @@ const MIN_TERMINAL_HEIGHT: u16 = 10;
 /// Minimum terminal width
 const MIN_TERMINAL_WIDTH: u16 = 20;
 
+/// UI state for rendering — what the user sees and interacts with
+/// Extracted from ReplUi to keep orchestration separate from rendering state
+pub struct UiState {
+    /// Local input buffer
+    pub input_buffer: String,
+    /// Cursor position in input buffer
+    pub cursor_pos: usize,
+    /// Current scroll position (line offset)
+    pub scroll_position: u16,
+    /// Total content height in lines
+    pub content_height: u16,
+    /// Visible area height
+    pub viewport_height: u16,
+    /// Whether to auto-scroll to bottom when new messages arrive
+    pub auto_scroll: bool,
+}
+
+impl UiState {
+    pub fn new() -> Self {
+        Self {
+            input_buffer: String::new(),
+            cursor_pos: 0,
+            scroll_position: 0,
+            content_height: 0,
+            viewport_height: 0,
+            auto_scroll: true,
+        }
+    }
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// REPL View — subscribes to StateManager and renders to stdout
 pub struct ReplUi {
     state_manager: Arc<StateManager>,
@@ -50,18 +86,8 @@ pub struct ReplUi {
     running: bool,
     /// Terminal for TUI rendering
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
-    /// Local input buffer
-    input_buffer: String,
-    /// Cursor position in input buffer
-    cursor_pos: usize,
-    /// Current scroll position (line offset)
-    scroll_position: u16,
-    /// Total content height in lines
-    content_height: u16,
-    /// Visible area height
-    viewport_height: u16,
-    /// Whether to auto-scroll to bottom when new messages arrive
-    auto_scroll: bool,
+    /// UI state for rendering (input, scroll, viewport)
+    ui_state: UiState,
 }
 
 impl ReplUi {
@@ -71,12 +97,7 @@ impl ReplUi {
             action_sender,
             running: true,
             terminal: None,
-            input_buffer: String::new(),
-            cursor_pos: 0,
-            scroll_position: 0,
-            content_height: 0,
-            viewport_height: 0,
-            auto_scroll: true,
+            ui_state: UiState::new(),
         }
     }
 
@@ -226,7 +247,7 @@ impl ReplUi {
                     return;
                 }
 
-                let input = Self::build_input_paragraph(&self.input_buffer, self.cursor_pos);
+                let input = Self::build_input_paragraph(&self.ui_state.input_buffer, self.ui_state.cursor_pos);
 
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -238,17 +259,17 @@ impl ReplUi {
                     .split(size);
 
                 let chat_history = Self::build_chat_history_paragraph(&state.chat);
-                self.viewport_height = chunks[0].height;
-                self.content_height = chat_history.line_count(size.width.saturating_sub(2)) as u16;
+                self.ui_state.viewport_height = chunks[0].height;
+                self.ui_state.content_height = chat_history.line_count(size.width.saturating_sub(2)) as u16;
 
                 // Calculate scroll based on auto_scroll setting
-                let max_scroll = self.content_height.saturating_sub(self.viewport_height);
-                let scroll = if self.auto_scroll {
+                let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
+                let scroll = if self.ui_state.auto_scroll {
                     // Scroll to bottom
                     max_scroll
                 } else {
                     // Use stored position (clamped to valid range)
-                    self.scroll_position.min(max_scroll)
+                    self.ui_state.scroll_position.min(max_scroll)
                 };
 
                 Self::render_chat_history(f, chunks[0], scroll, chat_history);
@@ -262,53 +283,53 @@ impl ReplUi {
     fn handle_keyboard_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) => {
-                self.input_buffer.insert(self.cursor_pos, c);
-                self.cursor_pos += 1;
+                self.ui_state.input_buffer.insert(self.ui_state.cursor_pos, c);
+                self.ui_state.cursor_pos += 1;
             }
             KeyCode::Backspace => {
-                if self.cursor_pos > 0 {
-                    self.cursor_pos -= 1;
-                    self.input_buffer.remove(self.cursor_pos);
+                if self.ui_state.cursor_pos > 0 {
+                    self.ui_state.cursor_pos -= 1;
+                    self.ui_state.input_buffer.remove(self.ui_state.cursor_pos);
                 }
             }
             KeyCode::Delete => {
-                if self.cursor_pos < self.input_buffer.len() {
-                    self.input_buffer.remove(self.cursor_pos);
+                if self.ui_state.cursor_pos < self.ui_state.input_buffer.len() {
+                    self.ui_state.input_buffer.remove(self.ui_state.cursor_pos);
                 }
             }
             KeyCode::Left => {
-                self.cursor_pos = self.cursor_pos.saturating_sub(1);
+                self.ui_state.cursor_pos = self.ui_state.cursor_pos.saturating_sub(1);
             }
             KeyCode::Right => {
-                self.cursor_pos = (self.cursor_pos + 1).min(self.input_buffer.len());
+                self.ui_state.cursor_pos = (self.ui_state.cursor_pos + 1).min(self.ui_state.input_buffer.len());
             }
             KeyCode::Home => {
-                self.cursor_pos = 0;
+                self.ui_state.cursor_pos = 0;
             }
             KeyCode::End => {
-                self.cursor_pos = self.input_buffer.len();
+                self.ui_state.cursor_pos = self.ui_state.input_buffer.len();
             }
             KeyCode::Enter => {
-                let msg = self.input_buffer.clone();
+                let msg = self.ui_state.input_buffer.clone();
                 if !msg.trim().is_empty() {
                     let _ = self.action_sender.send(UiAction::SendMessage(msg));
                 }
-                self.input_buffer.clear();
-                self.cursor_pos = 0;
+                self.ui_state.input_buffer.clear();
+                self.ui_state.cursor_pos = 0;
             }
             KeyCode::Up | KeyCode::Down => {
                 // Command history navigation - placeholder
             }
             // Scroll handling
             KeyCode::PageUp => {
-                let max_scroll = self.content_height.saturating_sub(self.viewport_height);
-                self.scroll_position = self.scroll_position.saturating_sub(10).min(max_scroll);
-                self.auto_scroll = false;
+                let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
+                self.ui_state.scroll_position = self.ui_state.scroll_position.saturating_sub(10).min(max_scroll);
+                self.ui_state.auto_scroll = false;
             }
             KeyCode::PageDown => {
-                let max_scroll = self.content_height.saturating_sub(self.viewport_height);
-                self.scroll_position = (self.scroll_position + 10).min(max_scroll);
-                self.auto_scroll = false;
+                let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
+                self.ui_state.scroll_position = (self.ui_state.scroll_position + 10).min(max_scroll);
+                self.ui_state.auto_scroll = false;
             }
             KeyCode::Esc => {
                 self.running = false;
@@ -324,14 +345,14 @@ impl ReplUi {
             // Mouse wheel scrolling
             Event::Mouse(mouse_event) => match mouse_event.kind {
                 MouseEventKind::ScrollUp => {
-                    let max_scroll = self.content_height.saturating_sub(self.viewport_height);
-                    self.scroll_position = self.scroll_position.saturating_sub(3).min(max_scroll);
-                    self.auto_scroll = false;
+                    let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
+                    self.ui_state.scroll_position = self.ui_state.scroll_position.saturating_sub(3).min(max_scroll);
+                    self.ui_state.auto_scroll = false;
                 }
                 MouseEventKind::ScrollDown => {
-                    let max_scroll = self.content_height.saturating_sub(self.viewport_height);
-                    self.scroll_position = (self.scroll_position + 3).min(max_scroll);
-                    self.auto_scroll = false;
+                    let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
+                    self.ui_state.scroll_position = (self.ui_state.scroll_position + 3).min(max_scroll);
+                    self.ui_state.auto_scroll = false;
                 }
                 _ => {}
             },

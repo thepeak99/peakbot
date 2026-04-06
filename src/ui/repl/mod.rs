@@ -4,4 +4,4 @@
 
 pub mod repl_impl;
 
-pub use repl_impl::ReplUi;
+pub use repl_impl::{ReplUi, UiState};
