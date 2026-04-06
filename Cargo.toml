@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rig-core = { version = "0.34", features = ["rmcp"] }
+rig-core = { version = "0.33", features = ["rmcp"] }
 rmcp = { version = "0.16", features = [
     "client",
     "transport-child-process",

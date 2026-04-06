@@ -31,6 +31,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time;
 
+use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState, MessageRole};
 use crate::ui::state_manager::StateManager;
 use crate::ui::ui_trait::{Ui, UiAction};
@@ -112,39 +113,7 @@ impl ReplUi {
             )));
         } else {
             for msg in &chat.messages {
-                let (prefix, color) = match msg.role {
-                    MessageRole::User => ("👤 User", Color::LightGreen),
-                    MessageRole::Agent => ("🤖 Agent", Color::LightMagenta),
-                    MessageRole::System => ("⚙️ System", Color::LightYellow),
-                    MessageRole::ToolCall => ("🔧 Tool", Color::Cyan),
-                    MessageRole::ToolResult => ("📋 Result", Color::Blue),
-                };
-
-                // Split content by newlines to handle multiline messages
-                let content_lines: Vec<&str> = msg.content.split('\n').collect();
-
-                for (i, content_line) in content_lines.iter().enumerate() {
-                    // First line gets the full header (timestamp + role), subsequent lines get indentation
-                    let line_content = if i == 0 {
-                        vec![
-                            Span::raw("["),
-                            Span::styled(
-                                format!("{}", msg.timestamp.format("%H:%M:%S")),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                            Span::raw("] "),
-                            Span::styled(prefix, Style::default().fg(color)),
-                            Span::raw(": "),
-                            Span::raw(*content_line),
-                        ]
-                    } else {
-                        vec![
-                            Span::raw("         "), // Align with role label
-                            Span::raw(*content_line),
-                        ]
-                    };
-                    message_lines.push(Line::from(line_content));
-                }
+                message_lines.extend(Self::build_chat_message_lines(msg, 20));
             }
         }
 
@@ -156,6 +125,44 @@ impl ReplUi {
                     .title(" Chat Messages ")
                     .borders(Borders::ALL),
             )
+    }
+
+    // AI: Add line splitting logic in this function
+    pub fn build_chat_message_lines<'a>(msg: &'a ChatMessage, width: u16) -> Vec<Line<'a>> {
+        let (prefix, color) = match msg.role {
+            MessageRole::User => ("👤 User", Color::LightGreen),
+            MessageRole::Agent => ("🤖 Agent", Color::LightMagenta),
+            MessageRole::System => ("⚙️ System", Color::LightYellow),
+            MessageRole::ToolCall => ("🔧 Tool", Color::Cyan),
+            MessageRole::ToolResult => ("📋 Result", Color::Blue),
+        };
+
+        // Split content by newlines to handle multiline messages
+        let content_lines: Vec<&str> = msg.content.split('\n').collect();
+
+        let mut out = Vec::new();
+
+        for (i, content_line) in content_lines.iter().enumerate() {
+            // First line gets the full header (timestamp + role), subsequent lines get indentation
+            let line_content = if i == 0 {
+                vec![
+                    Span::raw("["),
+                    Span::styled(
+                        format!("{}", msg.timestamp.format("%H:%M:%S")),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw("] "),
+                    Span::styled(prefix, Style::default().fg(color)),
+                    Span::raw(": "),
+                    Span::raw(*content_line),
+                ]
+            } else {
+                vec![Span::raw(*content_line)]
+            };
+
+            out.push(Line::from(line_content));
+        }
+        out
     }
 
     /// Render the chat history area with scrollbar
@@ -247,7 +254,10 @@ impl ReplUi {
                     return;
                 }
 
-                let input = Self::build_input_paragraph(&self.ui_state.input_buffer, self.ui_state.cursor_pos);
+                let input = Self::build_input_paragraph(
+                    &self.ui_state.input_buffer,
+                    self.ui_state.cursor_pos,
+                );
 
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -260,10 +270,14 @@ impl ReplUi {
 
                 let chat_history = Self::build_chat_history_paragraph(&state.chat);
                 self.ui_state.viewport_height = chunks[0].height;
-                self.ui_state.content_height = chat_history.line_count(size.width.saturating_sub(2)) as u16;
+                self.ui_state.content_height =
+                    chat_history.line_count(size.width.saturating_sub(2)) as u16;
 
                 // Calculate scroll based on auto_scroll setting
-                let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
+                let max_scroll = self
+                    .ui_state
+                    .content_height
+                    .saturating_sub(self.ui_state.viewport_height);
                 let scroll = if self.ui_state.auto_scroll {
                     // Scroll to bottom
                     max_scroll
@@ -283,7 +297,9 @@ impl ReplUi {
     fn handle_keyboard_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(c) => {
-                self.ui_state.input_buffer.insert(self.ui_state.cursor_pos, c);
+                self.ui_state
+                    .input_buffer
+                    .insert(self.ui_state.cursor_pos, c);
                 self.ui_state.cursor_pos += 1;
             }
             KeyCode::Backspace => {
@@ -301,7 +317,8 @@ impl ReplUi {
                 self.ui_state.cursor_pos = self.ui_state.cursor_pos.saturating_sub(1);
             }
             KeyCode::Right => {
-                self.ui_state.cursor_pos = (self.ui_state.cursor_pos + 1).min(self.ui_state.input_buffer.len());
+                self.ui_state.cursor_pos =
+                    (self.ui_state.cursor_pos + 1).min(self.ui_state.input_buffer.len());
             }
             KeyCode::Home => {
                 self.ui_state.cursor_pos = 0;
@@ -322,13 +339,24 @@ impl ReplUi {
             }
             // Scroll handling
             KeyCode::PageUp => {
-                let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
-                self.ui_state.scroll_position = self.ui_state.scroll_position.saturating_sub(10).min(max_scroll);
+                let max_scroll = self
+                    .ui_state
+                    .content_height
+                    .saturating_sub(self.ui_state.viewport_height);
+                self.ui_state.scroll_position = self
+                    .ui_state
+                    .scroll_position
+                    .saturating_sub(10)
+                    .min(max_scroll);
                 self.ui_state.auto_scroll = false;
             }
             KeyCode::PageDown => {
-                let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
-                self.ui_state.scroll_position = (self.ui_state.scroll_position + 10).min(max_scroll);
+                let max_scroll = self
+                    .ui_state
+                    .content_height
+                    .saturating_sub(self.ui_state.viewport_height);
+                self.ui_state.scroll_position =
+                    (self.ui_state.scroll_position + 10).min(max_scroll);
                 self.ui_state.auto_scroll = false;
             }
             KeyCode::Esc => {
@@ -345,13 +373,24 @@ impl ReplUi {
             // Mouse wheel scrolling
             Event::Mouse(mouse_event) => match mouse_event.kind {
                 MouseEventKind::ScrollUp => {
-                    let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
-                    self.ui_state.scroll_position = self.ui_state.scroll_position.saturating_sub(3).min(max_scroll);
+                    let max_scroll = self
+                        .ui_state
+                        .content_height
+                        .saturating_sub(self.ui_state.viewport_height);
+                    self.ui_state.scroll_position = self
+                        .ui_state
+                        .scroll_position
+                        .saturating_sub(3)
+                        .min(max_scroll);
                     self.ui_state.auto_scroll = false;
                 }
                 MouseEventKind::ScrollDown => {
-                    let max_scroll = self.ui_state.content_height.saturating_sub(self.ui_state.viewport_height);
-                    self.ui_state.scroll_position = (self.ui_state.scroll_position + 3).min(max_scroll);
+                    let max_scroll = self
+                        .ui_state
+                        .content_height
+                        .saturating_sub(self.ui_state.viewport_height);
+                    self.ui_state.scroll_position =
+                        (self.ui_state.scroll_position + 3).min(max_scroll);
                     self.ui_state.auto_scroll = false;
                 }
                 _ => {}

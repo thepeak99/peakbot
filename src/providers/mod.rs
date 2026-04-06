@@ -7,9 +7,8 @@ use crate::config::{
     BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig,
     SearXngConfig,
 };
-use crate::hooks::{SessionHook, SessionStats};
 use crate::hooks::events::AgentEvent;
-use tokio::sync::mpsc;
+use crate::hooks::{SessionHook, SessionStats};
 use crate::tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
     TodoList, TodoTool,
@@ -25,6 +24,7 @@ use rig::providers::openai;
 use rig::providers::openrouter;
 use rig::tool::ToolDyn;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 /// Provider info - metadata about the current provider
 #[derive(Debug, Clone)]
@@ -93,10 +93,10 @@ impl CostTracker {
     pub fn track_completion(&self, input_tokens: u64, output_tokens: u64) {
         let cost = (input_tokens as f64 * self.pricing.input_per_token)
             + (output_tokens as f64 * self.pricing.output_per_token);
-        
+
         if let Ok(mut stats) = self.stats.lock() {
             stats.add_request(input_tokens, output_tokens, cost);
-            
+
             tracing::info!(
                 "Tokens: {} in / {} out | Cost: ${:.4} | Total: ${:.4}",
                 input_tokens,
@@ -182,13 +182,13 @@ impl DynAgent {
     pub async fn prompt_with_history(
         &self,
         prompt: &str,
-        history: &[Message],
+        history: &mut Vec<Message>,
     ) -> Result<String, PromptError> {
         match self {
-            DynAgent::OpenRouter(agent) => agent.prompt(prompt).with_history(history.iter().cloned()).await,
-            DynAgent::OpenAI(agent) => agent.prompt(prompt).with_history(history.iter().cloned()).await,
-            DynAgent::LlamaCpp(agent) => agent.prompt(prompt).with_history(history.iter().cloned()).await,
-            DynAgent::Ollama(agent) => agent.prompt(prompt).with_history(history.iter().cloned()).await,
+            DynAgent::OpenRouter(agent) => agent.prompt(prompt).with_history(history).await,
+            DynAgent::OpenAI(agent) => agent.prompt(prompt).with_history(history).await,
+            DynAgent::LlamaCpp(agent) => agent.prompt(prompt).with_history(history).await,
+            DynAgent::Ollama(agent) => agent.prompt(prompt).with_history(history).await,
         }
     }
 }
@@ -210,7 +210,14 @@ pub fn create_provider(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
-) -> Result<(DynAgent, ProviderInfo, CostTracker, Arc<Mutex<TodoList>>, Option<mpsc::UnboundedReceiver<AgentEvent>>, Arc<SessionHook>)> {
+) -> Result<(
+    DynAgent,
+    ProviderInfo,
+    CostTracker,
+    Arc<Mutex<TodoList>>,
+    Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    Arc<SessionHook>,
+)> {
     match config {
         ProviderConfig::OpenRouter(c) => {
             let (agent, info, cost_tracker, todo_state, receiver, hook) = create_openrouter_agent(
@@ -294,7 +301,7 @@ pub fn create_provider(
                 info,
                 CostTracker::none(),
                 todo_state,
-                None, // No event channel for Ollama
+                None,                             // No event channel for Ollama
                 Arc::new(SessionHook::new(None)), // Empty hook for Ollama (no injection support)
             ))
         }
@@ -341,10 +348,8 @@ where
 
     // Add DelegateTool if pipeline is enabled
     if let Some(registry) = pipeline_registry {
-        let delegate_tool = crate::pipeline::DelegateTool::new(
-            Arc::new(registry.clone()),
-            cost_tracker,
-        );
+        let delegate_tool =
+            crate::pipeline::DelegateTool::new(Arc::new(registry.clone()), cost_tracker);
         builder = builder.tool(delegate_tool);
     }
 
@@ -413,8 +418,14 @@ fn create_openrouter_agent(
         .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) =
-        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config, pipeline_registry, cost_tracker_stats);
+    let (agent_builder, todo_state) = add_builtin_tools(
+        agent_builder,
+        searxng_config,
+        todo_tool,
+        bash_config,
+        pipeline_registry,
+        cost_tracker_stats,
+    );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -482,10 +493,16 @@ fn create_ollama_agent(
 
     // Ollama doesn't have cost tracking, so use a dummy stats tracker
     let dummy_stats = Arc::new(Mutex::new(crate::hooks::SessionStats::new()));
-    
+
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) =
-        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config, pipeline_registry, dummy_stats);
+    let (agent_builder, todo_state) = add_builtin_tools(
+        agent_builder,
+        searxng_config,
+        todo_tool,
+        bash_config,
+        pipeline_registry,
+        dummy_stats,
+    );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -568,8 +585,14 @@ fn create_openai_agent(
         .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) =
-        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config, pipeline_registry, cost_tracker_stats);
+    let (agent_builder, todo_state) = add_builtin_tools(
+        agent_builder,
+        searxng_config,
+        todo_tool,
+        bash_config,
+        pipeline_registry,
+        cost_tracker_stats,
+    );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
@@ -650,8 +673,14 @@ fn create_llamacpp_agent(
         .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let (agent_builder, todo_state) =
-        add_builtin_tools(agent_builder, searxng_config, todo_tool, bash_config, pipeline_registry, cost_tracker_stats);
+    let (agent_builder, todo_state) = add_builtin_tools(
+        agent_builder,
+        searxng_config,
+        todo_tool,
+        bash_config,
+        pipeline_registry,
+        cost_tracker_stats,
+    );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
