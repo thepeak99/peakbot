@@ -22,8 +22,7 @@ pub use conversation::{
 };
 pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
-    AgentEvent, CostHandler, EventChannel, EventHandler, EventProcessor, ModelPricing, SessionHook,
-    SessionStats, StateManagerHandler, TokenUsage, create_event_channel, fetch_model_pricing,
+    AgentEvent, ModelPricing, SessionHook, SessionStats, TokenUsage, fetch_model_pricing,
 };
 pub use pipeline::{DelegateTool, SubAgentRegistry};
 pub use providers::{CostTracker, DynAgent, ProviderInfo, create_provider};
@@ -282,25 +281,6 @@ impl AgentRunner {
 
         // Shared chat history (needed by both loops)
         let chat_history = Arc::new(tokio::sync::Mutex::new(Vec::<Message>::new()));
-
-        // Spawn event processing task for live state updates
-        if let Some(receiver) = self._event_receiver.take() {
-            let mut handlers: Vec<Arc<dyn EventHandler>> = Vec::new();
-
-            let stats = self.cost_tracker.get_session_stats();
-            let pricing = self.cost_tracker.get_pricing().clone();
-            handlers.push(Arc::new(CostHandler::new(pricing, stats)));
-
-            // StateManagerHandler forwards live events (tool calls, tool results) to StateManager
-            if let Some(ref sm) = self.state_manager {
-                handlers.push(Arc::new(StateManagerHandler::new(sm.clone())));
-            }
-
-            tokio::spawn(async move {
-                let mut processor = EventProcessor::new(receiver, handlers);
-                processor.run().await;
-            });
-        }
 
         // Extract fields we need to pass to spawned loops
         let conversation_manager = self.conversation_manager.clone();
