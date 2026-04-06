@@ -181,7 +181,6 @@ impl ReplUi {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
         let mut scroll_state = ScrollbarState::new(content_height).position(scroll as usize);
-
         f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state);
 
         let scrolled = paragraph.scroll((scroll, 0));
@@ -356,7 +355,10 @@ impl ReplUi {
                     .saturating_sub(self.ui_state.viewport_height);
                 self.ui_state.scroll_position =
                     (self.ui_state.scroll_position + 10).min(max_scroll);
-                self.ui_state.auto_scroll = false;
+                // Re-enable auto-scroll when reaching bottom
+                if self.ui_state.scroll_position >= max_scroll {
+                    self.ui_state.auto_scroll = true;
+                }
             }
             KeyCode::Esc => {
                 self.running = false;
@@ -390,7 +392,10 @@ impl ReplUi {
                         .saturating_sub(self.ui_state.viewport_height);
                     self.ui_state.scroll_position =
                         (self.ui_state.scroll_position + 3).min(max_scroll);
-                    self.ui_state.auto_scroll = false;
+                    // Re-enable auto-scroll when reaching bottom
+                    if self.ui_state.scroll_position >= max_scroll {
+                        self.ui_state.auto_scroll = true;
+                    }
                 }
                 _ => {}
             },
