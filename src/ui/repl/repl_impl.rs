@@ -113,7 +113,7 @@ impl ReplUi {
             )));
         } else {
             for msg in &chat.messages {
-                message_lines.extend(Self::build_chat_message_lines(msg, 20));
+                message_lines.extend(Self::build_chat_message_lines(msg));
             }
         }
 
@@ -127,8 +127,7 @@ impl ReplUi {
             )
     }
 
-    // AI: Add line splitting logic in this function
-    pub fn build_chat_message_lines<'a>(msg: &'a ChatMessage, width: u16) -> Vec<Line<'a>> {
+    pub fn build_chat_message_lines<'a>(msg: &'a ChatMessage) -> Vec<Line<'a>> {
         let (prefix, color) = match msg.role {
             MessageRole::User => ("👤 User", Color::LightGreen),
             MessageRole::Agent => ("🤖 Agent", Color::LightMagenta),
@@ -172,7 +171,7 @@ impl ReplUi {
         scroll: u16,
         paragraph: Paragraph,
     ) {
-        let content_height = paragraph.line_count(area.width.saturating_sub(2)) as u16;
+        let content_height = paragraph.line_count(area.width.saturating_sub(2)) as usize;
 
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -181,8 +180,8 @@ impl ReplUi {
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
-        let mut scroll_state =
-            ScrollbarState::new(content_height as usize).position(scroll as usize);
+        let mut scroll_state = ScrollbarState::new(content_height).position(scroll as usize);
+
         f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state);
 
         let scrolled = paragraph.scroll((scroll, 0));
