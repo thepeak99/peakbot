@@ -6,13 +6,13 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
-use rig::completion::{CompletionModel, CompletionResponse, message::Message};
 use rig::completion::message::AssistantContent;
+use rig::completion::{CompletionModel, CompletionResponse, message::Message};
 use rig::one_or_many::OneOrMany;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 use crate::hooks::events::AgentEvent;
 use crate::hooks::events::TokenUsage as EventTokenUsage;
@@ -346,7 +346,7 @@ impl SessionHook {
             stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
-    
+
     /// Request the agent to stop
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::SeqCst);
@@ -467,16 +467,16 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             };
             let _ = sender.send(event);
         }
-        
+
         // Check for interruptions at LLM boundary (before tool execution)
-        
+
         // 1. Stop flag takes priority over everything
         if self.stop_requested.load(Ordering::SeqCst) {
             self.stop_requested.store(false, Ordering::SeqCst);
             tracing::info!("Stop requested, terminating");
             return HookAction::terminate("stop");
         }
-        
+
         // 2. Context limit check - we have usage data directly here
         let threshold_tokens = (self.context_window as f64 * self.threshold) as u64;
         if response.usage.input_tokens > threshold_tokens {
@@ -487,7 +487,7 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             );
             return HookAction::terminate("compact");
         }
-        
+
         HookAction::Continue
     }
 

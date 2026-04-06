@@ -148,6 +148,13 @@ impl StateManager {
         self.notify_update(&state);
     }
 
+    /// Set the model name in stats
+    pub fn set_model(&self, model: String) {
+        let mut state = self.state.write().unwrap();
+        state.stats.model = model;
+        self.notify_update(&state);
+    }
+
     /// Update context state
     pub fn update_context(&self, context_state: ContextState) {
         let mut state = self.state.write().unwrap();

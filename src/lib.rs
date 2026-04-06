@@ -25,7 +25,7 @@ pub use hooks::{
     AgentEvent, ModelPricing, SessionHook, SessionStats, TokenUsage, fetch_model_pricing,
 };
 pub use pipeline::{DelegateTool, SubAgentRegistry};
-pub use providers::{CostTracker, DynAgent, ProviderInfo, create_provider};
+pub use providers::{DynAgent, ProviderInfo, create_provider};
 use rig::completion::{Message, PromptError};
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
@@ -145,7 +145,7 @@ pub struct AgentRunner {
     context_manager: Option<ContextManager>,
     conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
     system_prompt: String,
-    cost_tracker: CostTracker,
+    session_stats: Arc<Mutex<SessionStats>>,
     #[allow(unused)]
     todo_state: Option<Arc<Mutex<TodoList>>>,
     state_manager: Option<Arc<ui::StateManager>>,
@@ -161,7 +161,7 @@ impl AgentRunner {
         config: Config,
         provider_info: ProviderInfo,
         skills: SkillRegistry,
-        cost_tracker: CostTracker,
+        session_stats: Arc<Mutex<SessionStats>>,
         todo_state: Option<Arc<Mutex<TodoList>>>,
         event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
         state_manager: Option<Arc<ui::StateManager>>,
@@ -174,7 +174,7 @@ impl AgentRunner {
         let context_manager = Some(ContextManager::new(
             config.context.clone(),
             provider_info.model.as_str(),
-            cost_tracker.get_session_stats(),
+            session_stats.clone(),
             system_prompt_tokens,
             Some(agent.clone()),
         ));
@@ -204,7 +204,7 @@ impl AgentRunner {
             context_manager,
             conversation_manager,
             system_prompt,
-            cost_tracker,
+            session_stats,
             todo_state,
             state_manager,
             session_hook,
@@ -212,17 +212,11 @@ impl AgentRunner {
         }
     }
 
-    /// Reset session stats — backend concern
-    pub fn reset_stats(&self) {
-        self.cost_tracker.reset_stats();
-    }
-
     /// Sync current state to StateManager (Model)
     #[allow(dead_code)]
     fn sync_state_to_manager(&self) {
         if let Some(ref sm) = self.state_manager {
-            let stats = self.cost_tracker.get_session_stats();
-            sm.update_stats(&stats);
+            sm.update_stats(&self.session_stats);
 
             if let Some(ref todo) = self.todo_state {
                 if let Ok(list) = todo.lock() {
@@ -293,6 +287,56 @@ impl AgentRunner {
         let agent = self.agent.clone();
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
+        let session_stats = self.session_stats.clone();
+        let event_receiver = self._event_receiver.take();
+
+        // Spawn event processor task (Phase 2: wire the event channel)
+        let event_processor_handle = tokio::spawn({
+            let state_manager = state_manager.clone();
+            let session_stats = session_stats.clone();
+
+            async move {
+                if let Some(mut receiver) = event_receiver {
+                    while let Some(event) = receiver.recv().await {
+                        match &event {
+                            AgentEvent::ToolCall {
+                                tool_name,
+                                arguments,
+                                ..
+                            } => {
+                                if let Some(ref sm) = state_manager {
+                                    use crate::ui::app_state::ChatMessage;
+                                    sm.update_chat(ChatMessage::tool_call(
+                                        tool_name, arguments, "",
+                                    ));
+                                }
+                            }
+                            AgentEvent::ToolResult {
+                                tool_name, result, ..
+                            } => {
+                                if let Some(ref sm) = state_manager {
+                                    use crate::ui::app_state::ChatMessage;
+                                    sm.update_chat(ChatMessage::tool_result(tool_name, result));
+                                }
+                            }
+                            AgentEvent::CompletionResponse { usage, .. } => {
+                                if let Some(ref sm) = state_manager {
+                                    // Update session_stats (the source of truth)
+                                    if let Ok(mut stats) = session_stats.lock() {
+                                        stats.total_input_tokens = usage.input_tokens as u64;
+                                        stats.total_output_tokens = usage.output_tokens as u64;
+                                        stats.total_api_calls += 1;
+                                    }
+                                    // Sync to AppState via update_stats
+                                    sm.update_stats(&session_stats);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
 
         // Spawn the two loops
         let event_handle = tokio::spawn({
@@ -338,6 +382,7 @@ impl AgentRunner {
 
         // Wait for event loop to exit (View closed)
         event_handle.await.ok();
+        event_processor_handle.abort();
         agent_handle.abort();
     }
 
