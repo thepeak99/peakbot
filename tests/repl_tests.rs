@@ -7,17 +7,17 @@ mod snapshot_helpers;
 
 #[cfg(test)]
 mod tests {
+    use insta::assert_snapshot;
     use ratatui::{
+        Terminal,
         backend::TestBackend,
         layout::{Constraint, Direction, Layout},
-        Terminal,
         widgets::Widget,
     };
-    use insta::assert_snapshot;
 
+    use super::snapshot_helpers::*;
     use peakbot::ui::app_state::{AppState, ChatMessage, ChatState, MessageRole};
     use peakbot::ui::repl::ReplUi;
-    use super::snapshot_helpers::*;
 
     // === Input Area Tests ===
 
@@ -55,7 +55,10 @@ mod tests {
 
     #[test]
     fn input_area_long_text() {
-        let paragraph = ReplUi::build_input_paragraph("This is a very long input that will wrap to multiple lines", 0);
+        let paragraph = ReplUi::build_input_paragraph(
+            "This is a very long input that will wrap to multiple lines",
+            0,
+        );
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_long_text", lines.join("\n"));
@@ -73,10 +76,7 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
@@ -100,10 +100,7 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
@@ -127,10 +124,7 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
@@ -154,10 +148,7 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
@@ -181,10 +172,7 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
@@ -249,7 +237,10 @@ mod tests {
         assert!(!chat.auto_scroll, "Initial auto_scroll should be false");
 
         chat.add_message(ChatMessage::user("test".to_string()));
-        assert!(chat.auto_scroll, "auto_scroll should be true after adding message");
+        assert!(
+            chat.auto_scroll,
+            "auto_scroll should be true after adding message"
+        );
     }
 
     #[test]
@@ -299,10 +290,7 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             // Scroll position 0 = showing top of content
             ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
@@ -330,10 +318,7 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             // Scroll position 5 = showing middle of content
             ReplUi::render_chat_history(f, chunks[0], 5, paragraph);
@@ -361,13 +346,10 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             // Max scroll = 15 messages - 8 visible = 7 (show last messages)
-            ReplUi::render_chat_history(f, chunks[0], 7, paragraph);
+            ReplUi::render_chat_history(f, chunks[0], 8, paragraph);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -415,10 +397,7 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
@@ -453,10 +432,7 @@ mod tests {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
         });
@@ -508,7 +484,7 @@ mod tests {
     #[test]
     fn test_auto_scroll_toggle() {
         let mut chat = ChatState::new();
-        
+
         // Initially no messages, auto_scroll should be false
         assert!(!chat.auto_scroll);
 
@@ -557,7 +533,7 @@ mod tests {
         let content_height: u16 = 20;
         let viewport_height: u16 = 10;
         let max_scroll = content_height.saturating_sub(viewport_height);
-        
+
         // ScrollUp by 3 from position 1
         let scroll_up = 1u16.saturating_sub(3).min(max_scroll);
         assert_eq!(scroll_up, 0);
