@@ -89,6 +89,10 @@ pub struct ReplUi {
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
     /// UI state for rendering (input, scroll, viewport)
     ui_state: UiState,
+    /// Whether the quit confirmation dialog is visible
+    show_quit_confirm: bool,
+    /// Which button is selected: true = "Yes", false = "No" (default)
+    confirm_yes_selected: bool,
 }
 
 impl ReplUi {
@@ -99,6 +103,8 @@ impl ReplUi {
             running: true,
             terminal: None,
             ui_state: UiState::new(),
+            show_quit_confirm: false,
+            confirm_yes_selected: false,
         }
     }
 
@@ -240,6 +246,81 @@ impl ReplUi {
         f.render_widget(paragraph, area);
     }
 
+    /// Render the quit confirmation dialog overlay
+    pub fn render_quit_confirm(f: &mut ratatui::Frame, area: Rect, yes_selected: bool) {
+        // Calculate centered popup dimensions
+        let popup_width = 50;
+        let popup_height = 9;
+        let x = (area.width.saturating_sub(popup_width)) / 2;
+        let y = (area.height.saturating_sub(popup_height)) / 2;
+        let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+        // Clear the popup area
+        f.render_widget(Clear, popup_area);
+
+        // Fixed-width button labels for proper centering
+        // Both buttons are padded to 14 characters
+        const YES_BTN: &str = "  Yes, leave   ";
+        const NO_BTN: &str = "  No, stay     ";
+        const BTN_SEPARATOR: &str = "   ";
+        const BTN_TOTAL_WIDTH: usize = 14 + 3 + 14; // yes + separator + no
+
+        // Calculate centering offset for buttons
+        let btn_left_padding = (popup_width as usize).saturating_sub(BTN_TOTAL_WIDTH) / 2;
+
+        // Style for selected vs unselected
+        let selected_style = Style::default().fg(Color::Yellow).bg(Color::DarkGray);
+        let unselected_style = Style::default().fg(Color::White);
+
+        let (yes_btn, yes_style) = if yes_selected {
+            ("[ Yes, leave ]", selected_style)
+        } else {
+            (YES_BTN, unselected_style)
+        };
+        let (no_btn, no_style) = if !yes_selected {
+            ("[ No, stay ]", selected_style)
+        } else {
+            (NO_BTN, unselected_style)
+        };
+
+        // Centered warning text (⚠️ = 2 visual chars, total = 30 visual)
+        let warning = "              ⚠️  WAIT! DON'T LEAVE!  ⚠️";
+        // Centered question (36 chars, centered = 7 spaces)
+        let question = "       Are you sure you want to quit PeakBot?";
+        // Centered hint text
+        let hint = "      ←/→ to switch  ·  Enter to confirm  ·  Esc to cancel";
+
+        // Build padding strings
+        let btn_padding = " ".repeat(btn_left_padding);
+
+        let content = vec![
+            Line::from(vec![Span::raw("")]),
+            Line::from(vec![Span::styled(warning, Style::default().fg(Color::LightRed))]),
+            Line::from(vec![Span::raw("")]),
+            Line::from(vec![Span::raw(question)]),
+            Line::from(vec![Span::raw("")]),
+            Line::from(vec![
+                Span::raw(btn_padding),
+                Span::styled(yes_btn, yes_style),
+                Span::raw(BTN_SEPARATOR),
+                Span::styled(no_btn, no_style),
+            ]),
+            Line::from(vec![Span::raw("")]),
+            Line::from(vec![Span::styled(hint, Style::default().fg(Color::DarkGray))]),
+            Line::from(vec![Span::raw("")]),
+        ];
+
+        let paragraph = Paragraph::new(content)
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::LightCyan)),
+            );
+
+        f.render_widget(paragraph, popup_area);
+    }
+
     /// Main render function
     fn render(&mut self, state: &AppState) -> Result<()> {
         // Calculate content height and extract scroll state before borrowing terminal
@@ -288,6 +369,11 @@ impl ReplUi {
                 Self::render_chat_history(f, chunks[0], scroll, chat_history);
                 Self::render_input_area(f, chunks[1], input);
                 Self::render_status_bar(f, chunks[2], state);
+
+                // Render quit confirmation dialog if visible
+                if self.show_quit_confirm {
+                    Self::render_quit_confirm(f, size, self.confirm_yes_selected);
+                }
             })?;
         }
         Ok(())
@@ -295,6 +381,27 @@ impl ReplUi {
 
     fn handle_keyboard_input(&mut self, key: KeyEvent) {
         match key.code {
+            // Quit confirmation dialog handlers (must come before general handlers)
+            KeyCode::Esc if self.show_quit_confirm => {
+                // ESC while dialog is open = cancel (close dialog)
+                self.show_quit_confirm = false;
+            }
+            KeyCode::Enter if self.show_quit_confirm => {
+                if self.confirm_yes_selected {
+                    self.running = false;
+                }
+                self.show_quit_confirm = false;
+            }
+            KeyCode::Char('y' | 'Y') if self.show_quit_confirm => {
+                self.confirm_yes_selected = true;
+            }
+            KeyCode::Char('n' | 'N') if self.show_quit_confirm => {
+                self.confirm_yes_selected = false;
+            }
+            KeyCode::Left | KeyCode::Right if self.show_quit_confirm => {
+                self.confirm_yes_selected = !self.confirm_yes_selected;
+            }
+            // Default handlers
             KeyCode::Char(c) => {
                 self.ui_state
                     .input_buffer
@@ -362,7 +469,9 @@ impl ReplUi {
                 }
             }
             KeyCode::Esc => {
-                self.running = false;
+                // First ESC = show confirmation dialog
+                self.show_quit_confirm = true;
+                self.confirm_yes_selected = false; // Default to "No"
             }
             _ => {}
         }
