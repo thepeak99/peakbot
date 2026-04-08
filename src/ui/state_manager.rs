@@ -378,18 +378,20 @@ impl StateManager {
 
     /// Process an AgentEvent and update state accordingly.
     ///
-    /// Note: For CompletionResponse, only stats are updated here.
-    /// The final response content is added by process_message_internal in lib.rs
-    /// to avoid duplicates. Intermediate responses (during tool loops) are not
-    /// added to chat to keep the UI clean.
+    /// Note: For CompletionResponse, stats use SET (=) not += because events
+    /// fire for EVERY LLM call (initial + each tool result). Using += would
+    /// double/triple count tokens. The SET operation ensures stats reflect the
+    /// most recent request's token counts.
     pub fn process_agent_event(&self, event: AgentEvent) {
         match event {
             AgentEvent::CompletionResponse { usage, .. } => {
-                // Only update stats here. The final response is added by
-                // process_message_internal to avoid duplicates.
+                // Use SET (=) not += because:
+                // 1. CompletionResponse fires for every LLM call (initial + tool results)
+                // 2. Each response's usage reflects ALL tokens used so far
+                // 3. SET ensures we track the cumulative session totals correctly
                 let mut state = self.state.write().unwrap();
-                state.stats.total_input_tokens += usage.input_tokens;
-                state.stats.total_output_tokens += usage.output_tokens;
+                state.stats.total_input_tokens = usage.input_tokens;
+                state.stats.total_output_tokens = usage.output_tokens;
                 state.stats.total_api_calls += 1;
                 self.notify_update(&state);
             }
