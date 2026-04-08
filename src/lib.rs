@@ -274,17 +274,18 @@ impl AgentRunner {
         // Spawn event processor task (Phase 2: wire the event channel)
         let event_processor_handle = tokio::spawn({
             let state_manager = state_manager.clone();
+            let session_stats = _session_stats.clone();
 
             async move {
                 if let Some(mut receiver) = event_receiver {
                     while let Some(event) = receiver.recv().await {
-                        // Use process_agent_event for all events - it correctly:
-                        // 1. Accumulates stats (+=) instead of setting (=)
-                        // 2. Adds CompletionResponse content to chat
-                        // 3. Handles ToolCall and ToolResult
-                        if let Some(ref sm) = state_manager {
-                            sm.process_agent_event(event);
-                        }
+                        // Process event and update StateManager — the Controller (AgentRunner)
+                        // decides how events affect state, not the Model (StateManager)
+                        Self::process_event_for_ui(
+                            &state_manager,
+                            &session_stats,
+                            event,
+                        );
                     }
                 }
             }
@@ -501,6 +502,54 @@ impl AgentRunner {
                     // Channel closed, exit
                     break;
                 }
+            }
+        }
+    }
+
+    /// Process an AgentEvent and update StateManager accordingly.
+    ///
+    /// This is the Controller's responsibility — it decides how domain events
+    /// affect the UI state. The Model (StateManager) is passive and only holds data.
+    fn process_event_for_ui(
+        state_manager: &Option<Arc<ui::StateManager>>,
+        session_stats: &Arc<Mutex<SessionStats>>,
+        event: AgentEvent,
+    ) {
+        use crate::ui::app_state::ChatMessage;
+
+        match event {
+            AgentEvent::CompletionResponse { usage, .. } => {
+                // Update session_stats with actual token usage from the event
+                session_stats.lock().unwrap().add_request(
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cost,
+                );
+                // Now sync the updated stats to StateManager
+                if let Some(sm) = state_manager {
+                    sm.update_stats(session_stats);
+                }
+            }
+            AgentEvent::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
+                if let Some(sm) = state_manager {
+                    sm.update_chat(ChatMessage::tool_call(&tool_name, &arguments, ""));
+                }
+            }
+            AgentEvent::ToolResult {
+                tool_name, result, ..
+            } => {
+                if let Some(sm) = state_manager {
+                    sm.update_chat(ChatMessage::tool_result(&tool_name, &result));
+                }
+            }
+            AgentEvent::CompletionRequest { .. }
+            | AgentEvent::SessionStart { .. }
+            | AgentEvent::SessionEnd { .. } => {
+                // No UI update needed for these events
             }
         }
     }
