@@ -268,7 +268,7 @@ impl AgentRunner {
         let agent = self.agent.clone();
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
-        let session_stats = self.session_stats.clone();
+        let _session_stats = self.session_stats.clone(); // Kept to maintain struct field lifetime
         let event_receiver = self._event_receiver.take();
 
         // Spawn event processor task (Phase 2: wire the event channel)
