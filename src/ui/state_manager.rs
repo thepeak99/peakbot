@@ -13,7 +13,6 @@
 //! The `subscribe()` method returns an async stream (`mpsc::Receiver<AppState>`)
 //! that can be used directly with `tokio::select!` or iterated with `while let`.
 
-use crate::hooks::events::AgentEvent;
 use crate::hooks::session_hook::SessionStats;
 use crate::tools::todo::{TodoList, TodoStatus};
 use crate::ui::app_state::{
@@ -374,47 +373,6 @@ impl StateManager {
     pub fn add_system_message(&self, content: String) {
         let msg = ChatMessage::system(content);
         self.update_chat(msg);
-    }
-
-    /// Process an AgentEvent and update state accordingly.
-    ///
-    /// Note: For CompletionResponse, stats use SET (=) not += because events
-    /// fire for EVERY LLM call (initial + each tool result). Using += would
-    /// double/triple count tokens. The SET operation ensures stats reflect the
-    /// most recent request's token counts.
-    pub fn process_agent_event(&self, event: AgentEvent) {
-        match event {
-            AgentEvent::CompletionResponse { usage, .. } => {
-                // Use SET (=) not += because:
-                // 1. CompletionResponse fires for every LLM call (initial + tool results)
-                // 2. Each response's usage reflects ALL tokens used so far
-                // 3. SET ensures we track the cumulative session totals correctly
-                let mut state = self.state.write().unwrap();
-                state.stats.total_input_tokens = usage.input_tokens;
-                state.stats.total_output_tokens = usage.output_tokens;
-                state.stats.total_api_calls += 1;
-                self.notify_update(&state);
-            }
-            AgentEvent::ToolCall {
-                tool_name,
-                arguments,
-                ..
-            } => {
-                let mut state = self.state.write().unwrap();
-                state.chat.add_message(ChatMessage::tool_call(&tool_name, &arguments, ""));
-                self.notify_update(&state);
-            }
-            AgentEvent::ToolResult {
-                tool_name, result, ..
-            } => {
-                let mut state = self.state.write().unwrap();
-                state.chat.add_message(ChatMessage::tool_result(&tool_name, &result));
-                self.notify_update(&state);
-            }
-            AgentEvent::CompletionRequest { .. }
-            | AgentEvent::SessionStart { .. }
-            | AgentEvent::SessionEnd { .. } => {}
-        }
     }
 
     /// Broadcast current state to all subscribers.
