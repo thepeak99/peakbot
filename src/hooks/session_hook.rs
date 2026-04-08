@@ -70,8 +70,8 @@ impl SessionStats {
 
     /// Add a request's stats to the session
     pub fn add_request(&mut self, input: u64, output: u64, cost: f64) {
-        self.total_input_tokens += input;
-        self.total_output_tokens += output;
+        self.total_input_tokens = input; //Input and output are totals not deltas
+        self.total_output_tokens = output;
         self.total_api_calls += 1;
         self.total_cost += cost;
         self.requests.push(RequestStats {

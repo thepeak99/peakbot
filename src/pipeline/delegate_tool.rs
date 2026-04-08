@@ -10,7 +10,6 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
-use std::sync::Mutex;
 
 /// Default timeout for delegation (2 minutes)
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
@@ -23,38 +22,21 @@ const DEFAULT_MODE: &str = "series";
 pub struct DelegateTool {
     /// Registry of available sub-agents
     registry: Arc<SubAgentRegistry>,
-    /// Cost tracker for aggregating costs
-    #[allow(unused)]
-    cost_tracker: Arc<Mutex<crate::hooks::SessionStats>>,
-    /// Default timeout for agent execution
-    #[allow(unused)]
-    default_timeout: Duration,
 }
 
 impl DelegateTool {
     /// Create a new delegate tool
-    pub fn new(
-        registry: Arc<SubAgentRegistry>,
-        cost_tracker: Arc<Mutex<crate::hooks::SessionStats>>,
-    ) -> Self {
-        Self {
-            registry,
-            cost_tracker,
-            default_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
-        }
+    pub fn new(registry: Arc<SubAgentRegistry>) -> Self {
+        Self { registry }
     }
 
     /// Create a new delegate tool with custom timeout
-    pub fn with_timeout(
-        registry: Arc<SubAgentRegistry>,
-        cost_tracker: Arc<Mutex<crate::hooks::SessionStats>>,
-        timeout_seconds: u64,
-    ) -> Self {
-        Self {
-            registry,
-            cost_tracker,
-            default_timeout: Duration::from_secs(timeout_seconds),
-        }
+    ///
+    /// Note: The timeout_seconds parameter is accepted for API compatibility
+    /// but the actual timeout is determined by `DEFAULT_TIMEOUT_SECONDS`.
+    pub fn with_timeout(registry: Arc<SubAgentRegistry>, timeout_seconds: u64) -> Self {
+        let _ = timeout_seconds; // Accepted for API compatibility
+        Self { registry }
     }
 
     /// Get the list of available agents for tool description

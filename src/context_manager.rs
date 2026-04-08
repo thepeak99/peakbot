@@ -3,11 +3,11 @@
 //! Uses actual token counts from the provider (via token_cost hook) instead of estimates.
 
 use crate::config::ContextConfig;
-use crate::hooks::session_hook::SessionStats;
 use crate::providers::DynAgent;
+use crate::state::StateManager;
 use anyhow::{Context as AnyhowContext, Result};
 use rig::completion::message::Message;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Default context window size (128k tokens)
 const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
@@ -30,14 +30,14 @@ pub struct CompactionResult {
 }
 
 /// Manages context window usage and performs compaction when needed
-/// Uses actual token counts from the provider via SessionStats
+/// Uses actual token counts from StateManager
 pub struct ContextManager {
     config: ContextConfig,
     context_window: usize,
     /// System prompt size (in tokens) - used to subtract from total
     system_prompt_tokens: usize,
-    /// Reference to session stats for actual token counts
-    stats: Arc<Mutex<SessionStats>>,
+    /// Reference to StateManager for stats
+    state_manager: Arc<StateManager>,
     /// Reference to the LLM agent for summarization
     agent: Option<Arc<DynAgent>>,
 }
@@ -48,7 +48,7 @@ impl ContextManager {
     pub fn new(
         config: ContextConfig,
         model_name: &str,
-        stats: Arc<Mutex<SessionStats>>,
+        state_manager: Arc<StateManager>,
         system_prompt_tokens: usize,
         agent: Option<Arc<DynAgent>>,
     ) -> Self {
@@ -76,7 +76,7 @@ impl ContextManager {
             config,
             context_window,
             system_prompt_tokens,
-            stats,
+            state_manager,
             agent,
         }
     }
@@ -94,7 +94,8 @@ impl ContextManager {
     /// Get current total tokens from actual API response
     /// This is the EXACT token count from the provider, not an estimate
     pub fn get_current_tokens(&self) -> usize {
-        let stats = self.stats.lock().unwrap();
+        let stats_arc = self.state_manager.stats_arc();
+        let stats = stats_arc.lock().unwrap();
         stats.last_input_tokens().unwrap_or(0) as usize
     }
 

@@ -8,6 +8,7 @@ mod hooks;
 mod pipeline;
 mod providers;
 mod skills;
+pub mod state;
 mod tools;
 pub mod ui;
 
@@ -36,6 +37,7 @@ pub use tools::{
     TodoStatus, TodoTool,
 };
 pub use ui::{Ui, UiAction};
+pub use state::StateManager;
 
 use anyhow::{Result, anyhow};
 use rmcp::service::ServiceExt;
@@ -54,9 +56,9 @@ enum QueueMessage {
 /// Completion result sent from agent loop back to event loop
 #[derive(Clone)]
 enum CompletionResult {
-    Success(String),
+    Success,
     Stopped,
-    Error(String),
+    Error,
     CommandDone,
 }
 
@@ -144,8 +146,7 @@ pub struct AgentRunner {
     context_manager: Option<ContextManager>,
     conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
     system_prompt: String,
-    session_stats: Arc<Mutex<SessionStats>>,
-    state_manager: Option<Arc<ui::StateManager>>,
+    state_manager: Option<Arc<StateManager>>,
     // Shared session hook for interrupt/queue state
     session_hook: Arc<SessionHook>,
     // Retained for streaming output handler (view concern, set up by main.rs)
@@ -158,22 +159,23 @@ impl AgentRunner {
         config: Config,
         provider_info: ProviderInfo,
         skills: SkillRegistry,
-        session_stats: Arc<Mutex<SessionStats>>,
         event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
-        state_manager: Option<Arc<ui::StateManager>>,
+        state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
     ) -> Self {
         let agent = Arc::new(agent);
         let system_prompt = build_system_prompt(&skills);
         let system_prompt_tokens = system_prompt.len() / 4;
 
-        let context_manager = Some(ContextManager::new(
-            config.context.clone(),
-            provider_info.model.as_str(),
-            session_stats.clone(),
-            system_prompt_tokens,
-            Some(agent.clone()),
-        ));
+        let context_manager = state_manager.as_ref().map(|sm| {
+            ContextManager::new(
+                config.context.clone(),
+                provider_info.model.as_str(),
+                sm.clone(),
+                system_prompt_tokens,
+                Some(agent.clone()),
+            )
+        });
 
         let conversation_manager = if config.conversation_enabled() {
             match ConversationManager::new(ConversationManagerConfig {
@@ -200,7 +202,6 @@ impl AgentRunner {
             context_manager,
             conversation_manager,
             system_prompt,
-            session_stats,
             state_manager,
             session_hook,
             _event_receiver: event_receiver,
@@ -268,24 +269,18 @@ impl AgentRunner {
         let agent = self.agent.clone();
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
-        let _session_stats = self.session_stats.clone(); // Kept to maintain struct field lifetime
         let event_receiver = self._event_receiver.take();
 
         // Spawn event processor task (Phase 2: wire the event channel)
         let event_processor_handle = tokio::spawn({
             let state_manager = state_manager.clone();
-            let session_stats = _session_stats.clone();
 
             async move {
                 if let Some(mut receiver) = event_receiver {
                     while let Some(event) = receiver.recv().await {
                         // Process event and update StateManager — the Controller (AgentRunner)
                         // decides how events affect state, not the Model (StateManager)
-                        Self::process_event_for_ui(
-                            &state_manager,
-                            &session_stats,
-                            event,
-                        );
+                        Self::process_event_for_ui(&state_manager, event);
                     }
                 }
             }
@@ -346,7 +341,7 @@ impl AgentRunner {
         _completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
         _chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
         conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
-        state_manager: Option<Arc<ui::StateManager>>,
+        state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
         config_model: String,
     ) {
@@ -428,7 +423,7 @@ impl AgentRunner {
         chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
         mut context_manager: Option<ContextManager>,
         conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
-        state_manager: Option<Arc<ui::StateManager>>,
+        state_manager: Option<Arc<StateManager>>,
         agent: Arc<DynAgent>,
         config: Config,
         system_prompt: String,
@@ -511,23 +506,20 @@ impl AgentRunner {
     /// This is the Controller's responsibility — it decides how domain events
     /// affect the UI state. The Model (StateManager) is passive and only holds data.
     fn process_event_for_ui(
-        state_manager: &Option<Arc<ui::StateManager>>,
-        session_stats: &Arc<Mutex<SessionStats>>,
+        state_manager: &Option<Arc<StateManager>>,
         event: AgentEvent,
     ) {
         use crate::ui::app_state::ChatMessage;
 
         match event {
             AgentEvent::CompletionResponse { usage, .. } => {
-                // Update session_stats with actual token usage from the event
-                session_stats.lock().unwrap().add_request(
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cost,
-                );
-                // Now sync the updated stats to StateManager
+                // Update stats in StateManager (single source of truth)
                 if let Some(sm) = state_manager {
-                    sm.update_stats(session_stats);
+                    sm.add_request(
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cost,
+                    );
                 }
             }
             AgentEvent::ToolCall {
@@ -560,7 +552,7 @@ impl AgentRunner {
         chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
         context_manager: &mut Option<ContextManager>,
         conversation_manager: &Option<Arc<Mutex<ConversationManager>>>,
-        state_manager: &Option<Arc<ui::StateManager>>,
+        state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
         system_prompt: &str,
@@ -631,7 +623,7 @@ impl AgentRunner {
                         }
                     }
 
-                    return CompletionResult::Success(response);
+                    return CompletionResult::Success;
                 }
 
                 Err(PromptError::PromptCancelled { reason, .. }) => {
@@ -650,9 +642,7 @@ impl AgentRunner {
                                 crate::ui::app_state::NotificationKind::Error,
                             );
                         }
-                        return CompletionResult::Error(
-                            "Maximum number of retries exceeded".to_string(),
-                        );
+                        return CompletionResult::Error;
                     }
                     if let Some(sm) = state_manager {
                         sm.push_notification(
@@ -672,7 +662,7 @@ impl AgentRunner {
         chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
         _context_manager: &mut Option<ContextManager>,
         conversation_manager: &Option<Arc<Mutex<ConversationManager>>>,
-        state_manager: &Option<Arc<ui::StateManager>>,
+        state_manager: &Option<Arc<StateManager>>,
         _agent: &Arc<DynAgent>,
         config: &Config,
         _system_prompt: &str,
