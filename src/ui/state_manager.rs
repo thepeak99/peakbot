@@ -52,12 +52,20 @@ impl StateManager {
 
     /// Add a new todo item
     pub fn add_todo(&self, task: String) -> String {
+        let was_empty = {
+            let list = self.todo_list.lock().unwrap();
+            list.list().is_empty()
+        };
         let item = {
             let mut list = self.todo_list.lock().unwrap();
             let item = list.add(task);
             self.sync_todo_to_ui(&list);
             item
         };
+        // Auto-show todo panel when first task is added
+        if was_empty {
+            self.show_todo_panel();
+        }
         format!("Added task #{}: {}", item.id, item.task)
     }
 
@@ -66,12 +74,20 @@ impl StateManager {
         if tasks.is_empty() {
             return "No tasks provided.".to_string();
         }
+        let was_empty = {
+            let list = self.todo_list.lock().unwrap();
+            list.list().is_empty()
+        };
         let items = {
             let mut list = self.todo_list.lock().unwrap();
             let items = list.add_many(tasks);
             self.sync_todo_to_ui(&list);
             items
         };
+        // Auto-show todo panel when first tasks are added to empty list
+        if was_empty {
+            self.show_todo_panel();
+        }
         if items.len() == 1 {
             format!("Added task #{}: {}", items[0].id, items[0].task)
         } else {
@@ -171,6 +187,34 @@ impl StateManager {
 
         let mut state = self.state.write().unwrap();
         state.todo.items = items;
+        self.notify_update(&state);
+    }
+
+    // ── Todo Visibility ──────────────────────────────────────────────────────
+
+    /// Get current todo visibility state
+    pub fn is_todo_panel_visible(&self) -> bool {
+        self.state.read().unwrap().todo.visible
+    }
+
+    /// Show the todo panel
+    pub fn show_todo_panel(&self) {
+        let mut state = self.state.write().unwrap();
+        state.todo.visible = true;
+        self.notify_update(&state);
+    }
+
+    /// Hide the todo panel
+    pub fn hide_todo_panel(&self) {
+        let mut state = self.state.write().unwrap();
+        state.todo.visible = false;
+        self.notify_update(&state);
+    }
+
+    /// Toggle todo panel visibility
+    pub fn toggle_todo_panel(&self) {
+        let mut state = self.state.write().unwrap();
+        state.todo.visible = !state.todo.visible;
         self.notify_update(&state);
     }
 

@@ -274,45 +274,16 @@ impl AgentRunner {
         // Spawn event processor task (Phase 2: wire the event channel)
         let event_processor_handle = tokio::spawn({
             let state_manager = state_manager.clone();
-            let session_stats = session_stats.clone();
 
             async move {
                 if let Some(mut receiver) = event_receiver {
                     while let Some(event) = receiver.recv().await {
-                        match &event {
-                            AgentEvent::ToolCall {
-                                tool_name,
-                                arguments,
-                                ..
-                            } => {
-                                if let Some(ref sm) = state_manager {
-                                    use crate::ui::app_state::ChatMessage;
-                                    sm.update_chat(ChatMessage::tool_call(
-                                        tool_name, arguments, "",
-                                    ));
-                                }
-                            }
-                            AgentEvent::ToolResult {
-                                tool_name, result, ..
-                            } => {
-                                if let Some(ref sm) = state_manager {
-                                    use crate::ui::app_state::ChatMessage;
-                                    sm.update_chat(ChatMessage::tool_result(tool_name, result));
-                                }
-                            }
-                            AgentEvent::CompletionResponse { usage, .. } => {
-                                if let Some(ref sm) = state_manager {
-                                    // Update session_stats (the source of truth)
-                                    if let Ok(mut stats) = session_stats.lock() {
-                                        stats.total_input_tokens = usage.input_tokens as u64;
-                                        stats.total_output_tokens = usage.output_tokens as u64;
-                                        stats.total_api_calls += 1;
-                                    }
-                                    // Sync to AppState via update_stats
-                                    sm.update_stats(&session_stats);
-                                }
-                            }
-                            _ => {}
+                        // Use process_agent_event for all events - it correctly:
+                        // 1. Accumulates stats (+=) instead of setting (=)
+                        // 2. Adds CompletionResponse content to chat
+                        // 3. Handles ToolCall and ToolResult
+                        if let Some(ref sm) = state_manager {
+                            sm.process_agent_event(event);
                         }
                     }
                 }
