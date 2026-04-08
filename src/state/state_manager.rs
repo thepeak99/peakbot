@@ -1,7 +1,7 @@
 //! State Manager
 //!
-//! This module provides centralized state management for all UI implementations.
-//! It serves as the single source of truth for UI-renderable state.
+//! This module provides centralized state management for the application.
+//! It serves as the single source of truth for all state (stats, todos, chat, etc.).
 //!
 //! ## MVC Model
 //!
@@ -29,6 +29,8 @@ pub struct StateManager {
     todo_list: Arc<Mutex<TodoList>>,
     /// Persistent subscribers that receive every state update
     subscribers: Arc<RwLock<Vec<mpsc::Sender<AppState>>>>,
+    /// Session statistics (tokens, cost, API calls) - single source of truth
+    stats: Arc<Mutex<SessionStats>>,
 }
 
 impl StateManager {
@@ -38,6 +40,7 @@ impl StateManager {
             state: Arc::new(RwLock::new(AppState::new())),
             todo_list: Arc::new(Mutex::new(TodoList::new())),
             subscribers: Arc::new(RwLock::new(Vec::new())),
+            stats: Arc::new(Mutex::new(SessionStats::new())),
         }
     }
 
@@ -45,6 +48,46 @@ impl StateManager {
     /// All mutations must go through StateManager methods.
     pub fn get_todo_list(&self) -> TodoList {
         self.todo_list.lock().unwrap().clone()
+    }
+
+    // ── Stats Operations ────────────────────────────────────────────────────────
+
+    /// Add a request's stats to the session
+    pub fn add_request(&self, input: u64, output: u64, cost: f64) {
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.add_request(input, output, cost);
+        }
+        // Sync to UI
+        self.sync_stats_to_ui();
+    }
+
+    /// Get a clone of the current stats
+    pub fn get_stats(&self) -> SessionStats {
+        self.stats.lock().unwrap().clone()
+    }
+
+    /// Get the raw stats Arc for consumers that need direct access
+    pub fn stats_arc(&self) -> Arc<Mutex<SessionStats>> {
+        self.stats.clone()
+    }
+
+    /// Reset all statistics
+    pub fn reset_stats(&self) {
+        self.stats.lock().unwrap().reset();
+        self.sync_stats_to_ui();
+    }
+
+    /// Sync stats to AppState (internal method)
+    fn sync_stats_to_ui(&self) {
+        let stats = self.stats.lock().unwrap();
+        let mut state = self.state.write().unwrap();
+        state.stats.total_input_tokens = stats.total_input_tokens;
+        state.stats.total_output_tokens = stats.total_output_tokens;
+        state.stats.total_api_calls = stats.total_api_calls;
+        state.stats.total_cost = stats.total_cost;
+        drop(state);
+        self.notify_update(&self.state.read().unwrap());
     }
 
     // ── Todo Operations ────────────────────────────────────────────────────────
@@ -308,17 +351,6 @@ impl StateManager {
         self.notify_update(&state);
     }
 
-    /// Update session stats — syncs with CostTracker/SessionStats
-    pub fn update_stats(&self, stats: &Arc<Mutex<SessionStats>>) {
-        let stats_lock = stats.lock().unwrap();
-        let mut state = self.state.write().unwrap();
-        state.stats.total_input_tokens = stats_lock.total_input_tokens;
-        state.stats.total_output_tokens = stats_lock.total_output_tokens;
-        state.stats.total_api_calls = stats_lock.total_api_calls;
-        state.stats.total_cost = stats_lock.total_cost;
-        self.notify_update(&state);
-    }
-
     /// Update session state entirely
     pub fn update_session_state(&self, session_state: SessionState) {
         let mut state = self.state.write().unwrap();
@@ -435,29 +467,46 @@ mod tests {
     }
 
     #[test]
-    fn test_update_stats() {
+    fn test_add_request() {
         let sm = StateManager::new();
-        let stats = Arc::new(std::sync::Mutex::new(SessionStats::new()));
-        let mut stats_lock = stats.lock().unwrap();
-        stats_lock.total_input_tokens = 100;
-        stats_lock.total_output_tokens = 50;
-        stats_lock.total_api_calls = 5;
-        stats_lock.total_cost = 0.123;
-        drop(stats_lock);
-        sm.update_stats(&stats);
+        sm.add_request(100, 50, 0.123);
         let state = sm.get_state();
         assert_eq!(state.stats.total_input_tokens, 100);
         assert_eq!(state.stats.total_output_tokens, 50);
-        assert_eq!(state.stats.total_api_calls, 5);
+        assert_eq!(state.stats.total_api_calls, 1);
         assert!((state.stats.total_cost - 0.123).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_stats_accumulation() {
+        let sm = StateManager::new();
+        sm.add_request(100, 50, 0.10);
+        sm.add_request(200, 100, 0.20);
+        let state = sm.get_state();
+        // Input/output tokens are replaced, API calls and cost are accumulated
+        assert_eq!(state.stats.total_input_tokens, 200);
+        assert_eq!(state.stats.total_output_tokens, 100);
+        assert_eq!(state.stats.total_api_calls, 2);
+        assert!((state.stats.total_cost - 0.30).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_reset_stats() {
+        let sm = StateManager::new();
+        sm.add_request(100, 50, 0.10);
+        sm.reset_stats();
+        let state = sm.get_state();
+        assert_eq!(state.stats.total_input_tokens, 0);
+        assert_eq!(state.stats.total_output_tokens, 0);
+        assert_eq!(state.stats.total_api_calls, 0);
+        assert!((state.stats.total_cost - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_subscribe_initial_state() {
         let sm = StateManager::new();
-        let receiver = sm.subscribe();
+        let _receiver = sm.subscribe();
         // With async mpsc, initial state is sent via try_send
-        // so the receiver should be ready
         let state = sm.get_state();
         assert!(state.chat.messages.is_empty());
     }

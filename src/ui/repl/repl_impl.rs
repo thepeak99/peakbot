@@ -35,7 +35,7 @@ use tokio::time;
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState, MessageRole};
 use crate::ui::repl::todo_panel::{DEFAULT_PANEL_PERCENT, render_todo_panel, should_show_panel};
-use crate::ui::state_manager::StateManager;
+use crate::state::StateManager;
 use crate::ui::ui_trait::{Ui, UiAction};
 
 /// Minimum terminal height

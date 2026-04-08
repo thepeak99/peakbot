@@ -5,7 +5,7 @@
 //!
 //! ## MVC Architecture
 //!
-//! - **Model** (`StateManager`): single source of truth for UI state. Broadcasts to subscribers.
+//! - **Model** (`StateManager` in `crate::state`): single source of truth for state.
 //! - **View** (`Ui` impls): read state from Model, render to screen, send user input to Controller.
 //! - **Controller** (`AgentRunner`): receive input from View, call agent, write to Model.
 //!
@@ -13,7 +13,6 @@
 //!   View ──UiAction──► Controller ──writes──► Model ──broadcasts──► View
 
 pub mod app_state;
-pub mod state_manager;
 pub mod ui_trait;
 
 // REPL UI
@@ -21,7 +20,6 @@ pub mod repl;
 
 // Re-export commonly used types
 pub use app_state::*;
-pub use state_manager::*;
 pub use ui_trait::*;
 
 // Re-export UI implementations

@@ -1,6 +1,6 @@
 //! Todo tool - allows the model to track progress on multi-step tasks.
 
-use crate::ui::StateManager;
+use crate::state::StateManager;
 use chrono::{DateTime, Utc};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;

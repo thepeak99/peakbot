@@ -8,7 +8,8 @@ use crate::config::{
     SearXngConfig,
 };
 use crate::hooks::events::AgentEvent;
-use crate::hooks::{SessionHook, SessionStats};
+use crate::hooks::SessionHook;
+use crate::state::StateManager;
 use crate::tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
     TodoTool,
@@ -23,7 +24,7 @@ use rig::providers::ollama;
 use rig::providers::openai;
 use rig::providers::openrouter;
 use rig::tool::ToolDyn;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Provider info - metadata about the current provider
@@ -80,7 +81,8 @@ impl DynAgent {
 ///
 /// If mcp_tools is provided, they will be added to the agent along with built-in tools.
 /// The system_prompt is used as the agent's preamble.
-/// Returns the agent, provider info, session stats, event receiver, and shared session hook.
+/// Returns the agent, provider info, event receiver, and shared session hook.
+/// Stats are managed by the provided StateManager.
 pub fn create_provider(
     config: &ProviderConfig,
     context_config: &crate::config::ContextConfig,
@@ -92,16 +94,16 @@ pub fn create_provider(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
+    state_manager: Arc<StateManager>,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
-    Arc<Mutex<SessionStats>>,
     Option<mpsc::UnboundedReceiver<AgentEvent>>,
     Arc<SessionHook>,
 )> {
     match config {
         ProviderConfig::OpenRouter(c) => {
-            let (agent, info, session_stats, receiver, hook) = create_openrouter_agent(
+            let (agent, info, receiver, hook) = create_openrouter_agent(
                 c,
                 context_config,
                 context_window,
@@ -112,17 +114,12 @@ pub fn create_provider(
                 todo_tool,
                 bash_config,
                 pipeline_registry,
+                state_manager,
             )?;
-            Ok((
-                DynAgent::OpenRouter(agent),
-                info,
-                session_stats,
-                Some(receiver),
-                Arc::new(hook),
-            ))
+            Ok((DynAgent::OpenRouter(agent), info, Some(receiver), Arc::new(hook)))
         }
         ProviderConfig::OpenAI(c) => {
-            let (agent, info, session_stats, receiver, hook) = create_openai_agent(
+            let (agent, info, receiver, hook) = create_openai_agent(
                 c,
                 context_config,
                 context_window,
@@ -133,17 +130,12 @@ pub fn create_provider(
                 todo_tool,
                 bash_config,
                 pipeline_registry,
+                state_manager,
             )?;
-            Ok((
-                DynAgent::OpenAI(agent),
-                info,
-                session_stats,
-                Some(receiver),
-                Arc::new(hook),
-            ))
+            Ok((DynAgent::OpenAI(agent), info, Some(receiver), Arc::new(hook)))
         }
         ProviderConfig::LlamaCpp(c) => {
-            let (agent, info, session_stats, receiver, hook) = create_llamacpp_agent(
+            let (agent, info, receiver, hook) = create_llamacpp_agent(
                 c,
                 context_config,
                 context_window,
@@ -154,17 +146,12 @@ pub fn create_provider(
                 todo_tool,
                 bash_config,
                 pipeline_registry,
+                state_manager,
             )?;
-            Ok((
-                DynAgent::LlamaCpp(agent),
-                info,
-                session_stats,
-                Some(receiver),
-                Arc::new(hook),
-            ))
+            Ok((DynAgent::LlamaCpp(agent), info, Some(receiver), Arc::new(hook)))
         }
         ProviderConfig::Ollama(c) => {
-            let (agent, info, _session_stats) = create_ollama_agent(
+            let (agent, info) = create_ollama_agent(
                 c,
                 mcp_tools,
                 system_prompt,
@@ -173,13 +160,13 @@ pub fn create_provider(
                 todo_tool,
                 bash_config,
                 pipeline_registry,
+                state_manager,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
                 info,
-                Arc::new(Mutex::new(SessionStats::new())), // Empty stats for Ollama
-                None,                                       // No event channel for Ollama
-                Arc::new(SessionHook::new(None)),           // Empty hook for Ollama
+                None, // No event channel for Ollama
+                Arc::new(SessionHook::new(None)), // Empty hook for Ollama
             ))
         }
     }
@@ -193,7 +180,6 @@ fn add_builtin_tools<M, P>(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
-    session_stats: Arc<Mutex<SessionStats>>,
 ) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
 where
     M: rig::completion::CompletionModel,
@@ -221,8 +207,7 @@ where
 
     // Add DelegateTool if pipeline is enabled
     if let Some(registry) = pipeline_registry {
-        let delegate_tool =
-            crate::pipeline::DelegateTool::new(Arc::new(registry.clone()), session_stats);
+        let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(registry.clone()));
         builder = builder.tool(delegate_tool);
     }
 
@@ -241,10 +226,10 @@ fn create_openrouter_agent(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
+    state_manager: Arc<StateManager>,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
-    Arc<Mutex<SessionStats>>,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
 )> {
@@ -268,14 +253,14 @@ fn create_openrouter_agent(
 
     let model = config.model.clone();
 
-    // Create session stats for context tracking
-    let session_stats = Arc::new(Mutex::new(SessionStats::new()));
+    // Get session stats from StateManager for context tracking
+    let session_stats = state_manager.stats_arc();
 
     // Create session hook with context tracking
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(
         Some(sender),
-        session_stats.clone(),
+        session_stats,
         context_window as u64,
         context_config.threshold,
     );
@@ -295,7 +280,6 @@ fn create_openrouter_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
-        session_stats.clone(),
     );
 
     // Add MCP tools and build
@@ -311,7 +295,7 @@ fn create_openrouter_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, session_stats, receiver, hook))
+    Ok((agent, info, receiver, hook))
 }
 
 /// Create Ollama agent and info (no cost tracking for local models)
@@ -324,10 +308,10 @@ fn create_ollama_agent(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
+    _state_manager: Arc<StateManager>,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
-    Arc<Mutex<SessionStats>>,
 )> {
     if config.model.is_empty() {
         anyhow::bail!("Ollama model not specified");
@@ -362,9 +346,6 @@ fn create_ollama_agent(
         agent_builder = agent_builder.additional_params(params);
     }
 
-    // Ollama doesn't have cost tracking, so use a dummy stats tracker
-    let dummy_stats = Arc::new(Mutex::new(crate::hooks::SessionStats::new()));
-
     // Add built-in tools (including optional SearchTool and TodoTool)
     let agent_builder = add_builtin_tools(
         agent_builder,
@@ -372,7 +353,6 @@ fn create_ollama_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
-        dummy_stats.clone(),
     );
 
     // Add MCP tools and build
@@ -388,7 +368,7 @@ fn create_ollama_agent(
         supports_pricing: false,
     };
 
-    Ok((agent, info, dummy_stats))
+    Ok((agent, info))
 }
 
 /// Create OpenAI agent and info
@@ -403,10 +383,10 @@ fn create_openai_agent(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
+    state_manager: Arc<StateManager>,
 ) -> Result<(
     Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
-    Arc<Mutex<SessionStats>>,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
 )> {
@@ -432,14 +412,14 @@ fn create_openai_agent(
 
     let model = config.model.clone();
 
-    // Create session stats for context tracking
-    let session_stats = Arc::new(Mutex::new(SessionStats::new()));
+    // Get session stats from StateManager for context tracking
+    let session_stats = state_manager.stats_arc();
 
     // Create session hook with context tracking
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(
         Some(sender),
-        session_stats.clone(),
+        session_stats,
         context_window as u64,
         context_config.threshold,
     );
@@ -459,7 +439,6 @@ fn create_openai_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
-        session_stats.clone(),
     );
 
     // Add MCP tools and build
@@ -475,7 +454,7 @@ fn create_openai_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, session_stats, receiver, hook))
+    Ok((agent, info, receiver, hook))
 }
 
 /// Create LlamaCpp agent and info (uses completions API for compatibility)
@@ -490,10 +469,10 @@ fn create_llamacpp_agent(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
+    state_manager: Arc<StateManager>,
 ) -> Result<(
     Agent<rig::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
-    Arc<Mutex<SessionStats>>,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
 )> {
@@ -518,14 +497,14 @@ fn create_llamacpp_agent(
 
     let model = config.model.clone();
 
-    // Create session stats for context tracking
-    let session_stats = Arc::new(Mutex::new(SessionStats::new()));
+    // Get session stats from StateManager for context tracking
+    let session_stats = state_manager.stats_arc();
 
     // Create session hook with context tracking
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(
         Some(sender),
-        session_stats.clone(),
+        session_stats,
         context_window as u64,
         context_config.threshold,
     );
@@ -545,7 +524,6 @@ fn create_llamacpp_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
-        session_stats.clone(),
     );
 
     // Add MCP tools and build
@@ -561,5 +539,5 @@ fn create_llamacpp_agent(
         supports_pricing: true,
     };
 
-    Ok((agent, info, session_stats, receiver, hook))
+    Ok((agent, info, receiver, hook))
 }
