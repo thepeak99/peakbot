@@ -59,8 +59,6 @@ pub struct UiState {
     pub viewport_height: u16,
     /// Whether to auto-scroll to bottom when new messages arrive
     pub auto_scroll: bool,
-    /// Whether the todo panel is visible
-    pub show_todo_panel: bool,
     /// Scroll position in todo panel
     pub todo_scroll_position: u16,
 }
@@ -74,7 +72,6 @@ impl UiState {
             content_height: 0,
             viewport_height: 0,
             auto_scroll: true,
-            show_todo_panel: false,
             todo_scroll_position: 0,
         }
     }
@@ -358,8 +355,8 @@ impl ReplUi {
                     self.ui_state.cursor_pos,
                 );
 
-                // Check if todo panel should be shown (based on terminal size)
-                let show_todo = self.ui_state.show_todo_panel && should_show_panel(size.width);
+                // Check if todo panel should be shown (based on terminal size and visibility state)
+                let show_todo = state.todo.visible && should_show_panel(size.width);
 
                 // Layout: either full width (no todo) or split horizontally (with todo)
                 let (main_area, todo_area) = if show_todo {
@@ -429,21 +426,21 @@ impl ReplUi {
         match key.code {
             // Toggle todo panel with Ctrl+T
             KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.ui_state.show_todo_panel = !self.ui_state.show_todo_panel;
+                self.state_manager.toggle_todo_panel();
                 // Reset scroll position when toggling
                 self.ui_state.todo_scroll_position = 0;
             }
             // Scroll todo panel with Ctrl+Up/Down when panel is visible
             KeyCode::Up
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.ui_state.show_todo_panel =>
+                    && self.state_manager.is_todo_panel_visible() =>
             {
                 self.ui_state.todo_scroll_position =
                     self.ui_state.todo_scroll_position.saturating_sub(1);
             }
             KeyCode::Down
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.ui_state.show_todo_panel =>
+                    && self.state_manager.is_todo_panel_visible() =>
             {
                 // Simple increment - will be clamped during render
                 self.ui_state.todo_scroll_position += 1;
