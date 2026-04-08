@@ -376,15 +376,21 @@ impl StateManager {
         self.update_chat(msg);
     }
 
-    /// Process an AgentEvent and update state accordingly
+    /// Process an AgentEvent and update state accordingly.
+    ///
+    /// Note: For CompletionResponse, only stats are updated here.
+    /// The final response content is added by process_message_internal in lib.rs
+    /// to avoid duplicates. Intermediate responses (during tool loops) are not
+    /// added to chat to keep the UI clean.
     pub fn process_agent_event(&self, event: AgentEvent) {
         match event {
-            AgentEvent::CompletionResponse { content, usage, .. } => {
+            AgentEvent::CompletionResponse { usage, .. } => {
+                // Only update stats here. The final response is added by
+                // process_message_internal to avoid duplicates.
                 let mut state = self.state.write().unwrap();
                 state.stats.total_input_tokens += usage.input_tokens;
                 state.stats.total_output_tokens += usage.output_tokens;
                 state.stats.total_api_calls += 1;
-                state.chat.add_message(ChatMessage::agent(content));
                 self.notify_update(&state);
             }
             AgentEvent::ToolCall {
