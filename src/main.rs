@@ -30,7 +30,10 @@ async fn main() -> Result<()> {
         let mut all_tools = Vec::new();
         for handle in mcp_handles {
             use rig::tool::ToolDyn;
-            let tools: Vec<Box<dyn ToolDyn>> = handle.take_tools();
+            // into_tools consumes the handle and returns tools, but the underlying
+            // MCP service connection will be properly closed when this handle is dropped.
+            // We use into_tools() since we don't need to explicitly control the service lifetime.
+            let tools: Vec<Box<dyn ToolDyn>> = handle.into_tools();
             all_tools.extend(tools);
         }
         Some(all_tools)

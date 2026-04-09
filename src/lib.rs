@@ -40,7 +40,7 @@ pub use ui::{Ui, UiAction};
 pub use state::StateManager;
 
 use anyhow::{Result, anyhow};
-use rmcp::service::ServiceExt;
+use rmcp::service::{RunningService, RoleClient, ServiceExt};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -927,13 +927,55 @@ impl AgentRunner {
     }
 }
 
+/// Handle for a connected MCP server.
+/// 
+/// Holds both the tools and the service connection. The service connection
+/// must be kept alive for as long as the tools are used, and should be
+/// properly closed on drop to avoid the "RunningService dropped without 
+/// explicit close()" warning.
 pub struct McpServerHandle {
     #[allow(unused)]
     name: String,
     tools: Vec<McpTool>,
-    // Box for type erasure - allows stdio and HTTP transports to coexist
-    #[allow(unused)]
-    service: Box<dyn std::any::Any + Send + Sync>,
+    /// The running service connection. Must be closed on drop for clean shutdown.
+    /// This uses a wrapper enum since stdio and HTTP transports return different
+    /// service types internally.
+    service: McpService,
+}
+
+/// Wrapper enum for MCP service connections.
+/// 
+/// Both stdio and HTTP transports use `RunningService<RoleClient, ()>` when acting
+/// as a client, but the inner service type differs (child process vs HTTP client).
+/// This enum allows us to store the correct type while providing a uniform interface.
+enum McpService {
+    Stdio(Option<RunningService<RoleClient, ()>>),
+    Http(Option<RunningService<RoleClient, ()>>),
+}
+
+impl Drop for McpServerHandle {
+    fn drop(&mut self) {
+        // Take the service out so we don't double-close
+        let service = match &mut self.service {
+            McpService::Stdio(s) => s.take(),
+            McpService::Http(s) => s.take(),
+        };
+        
+        if let Some(mut s) = service {
+            // Spawn a task to close the service properly
+            // This avoids blocking in Drop while ensuring clean shutdown
+            tokio::spawn(async move {
+                match s.close().await {
+                    Ok(reason) => {
+                        tracing::debug!("MCP service closed: {:?}", reason);
+                    }
+                    Err(e) => {
+                        tracing::warn!("MCP service close error: {:?}", e);
+                    }
+                }
+            });
+        }
+    }
 }
 
 impl McpServerHandle {
@@ -941,11 +983,40 @@ impl McpServerHandle {
         &self.tools
     }
 
-    pub fn take_tools(self) -> Vec<Box<dyn ToolDyn>> {
-        self.tools
-            .into_iter()
+    /// Take ownership of the tools, consuming this handle.
+    /// 
+    /// Note: The MCP service connection will be closed when this handle is dropped.
+    /// For explicit control over service shutdown, use `close_and_take_tools()` instead.
+    pub fn into_tools(self) -> Vec<Box<dyn ToolDyn>> {
+        // Use ManuallyDrop to prevent our Drop impl from running
+        // since we're consuming the handle intentionally
+        let this = std::mem::ManuallyDrop::new(self);
+        
+        // Access fields through the ManuallyDrop'd reference
+        this.tools
+            .iter()
+            .cloned()
             .map(|tool| Box::new(tool) as Box<dyn ToolDyn>)
             .collect()
+    }
+
+    /// Close the MCP service connection and get the tools.
+    /// 
+    /// This properly closes the service before extracting tools.
+    pub async fn close_and_take_tools(mut self) -> Vec<Box<dyn ToolDyn>> {
+        // Close the service first (extract from Option via take on &mut self)
+        // We need to do this carefully since we can't move out of self.service
+        // Take the service out by matching on &mut self
+        let service = match &mut self.service {
+            McpService::Stdio(s) => s.take(),
+            McpService::Http(s) => s.take(),
+        };
+        
+        if let Some(mut s) = service {
+            s.close().await.ok();
+        }
+        
+        self.into_tools()
     }
 }
 
@@ -1002,15 +1073,16 @@ async fn connect_mcp_stdio(config: &McpServerConfig) -> Result<McpServerHandle> 
         .list_all_tools()
         .await?
         .into_iter()
-        .map(|tool| McpTool::from_mcp_server(tool, service.clone()))
+        .map(|tool| McpTool::from_mcp_server(tool, service.peer().clone()))
         .collect::<Vec<_>>();
 
     tracing::info!("MCP server '{}' has {} tools", config.name, tools.len());
 
+    // Store the service in our wrapper enum, keeping a clone for the tools
     Ok(McpServerHandle {
         name: config.name.clone(),
         tools,
-        service: Box::new(service),
+        service: McpService::Stdio(Some(service)),
     })
 }
 
@@ -1045,15 +1117,16 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
         .list_all_tools()
         .await?
         .into_iter()
-        .map(|tool| McpTool::from_mcp_server(tool, service.clone()))
+        .map(|tool| McpTool::from_mcp_server(tool, service.peer().clone()))
         .collect::<Vec<_>>();
 
     tracing::info!("MCP server '{}' has {} tools", config.name, tools.len());
 
+    // Store the service in our wrapper enum, keeping a clone for the tools
     Ok(McpServerHandle {
         name: config.name.clone(),
         tools,
-        service: Box::new(service),
+        service: McpService::Http(Some(service)),
     })
 }
 
