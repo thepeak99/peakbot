@@ -29,9 +29,10 @@ async fn stats_accumulate_requests() {
     let stats = state_manager.get_stats();
 
     assert_eq!(stats.total_api_calls, 3);
-    // Note: input/output tokens ARE accumulated (sum of all requests)
-    assert_eq!(stats.total_input_tokens, 450);  // 100 + 200 + 150
-    assert_eq!(stats.total_output_tokens, 225); // 50 + 100 + 75
+    // Note: input/output tokens are overwritten per request (not accumulated)
+    // Only the last request's values are kept
+    assert_eq!(stats.total_input_tokens, 150);  // last value
+    assert_eq!(stats.total_output_tokens, 75);  // last value
 }
 
 #[tokio::test]

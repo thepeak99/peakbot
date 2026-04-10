@@ -69,9 +69,13 @@ impl SessionStats {
     }
 
     /// Add a request's stats to the session
+    ///
+    /// Token counts (input/output) are overwritten per request — only the most recent
+    /// request's token usage is tracked. This mirrors rig's per-request usage reporting.
+    /// API call count and total cost accumulate across all requests.
     pub fn add_request(&mut self, input: u64, output: u64, cost: f64) {
-        self.total_input_tokens += input;  // Accumulate input tokens
-        self.total_output_tokens += output;  // Accumulate output tokens
+        self.total_input_tokens = input;
+        self.total_output_tokens = output;
         self.total_api_calls += 1;
         self.total_cost += cost;
         self.requests.push(RequestStats {
@@ -464,7 +468,7 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         response: &CompletionResponse<M::Response>,
     ) -> HookAction {
         let usage = &response.usage;
-        
+
         // Update the session stats with this request's usage
         // This is critical for ContextManager to track actual token counts
         if let Ok(mut stats) = self.stats.lock() {
