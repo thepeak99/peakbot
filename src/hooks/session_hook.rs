@@ -70,8 +70,8 @@ impl SessionStats {
 
     /// Add a request's stats to the session
     pub fn add_request(&mut self, input: u64, output: u64, cost: f64) {
-        self.total_input_tokens = input; //Input and output are totals not deltas
-        self.total_output_tokens = output;
+        self.total_input_tokens += input;  // Accumulate input tokens
+        self.total_output_tokens += output;  // Accumulate output tokens
         self.total_api_calls += 1;
         self.total_cost += cost;
         self.requests.push(RequestStats {
@@ -119,6 +119,18 @@ impl SessionStats {
     /// This is the sum of all input tokens from all requests
     pub fn total_input_tokens(&self) -> u64 {
         self.total_input_tokens
+    }
+
+    /// Get the sum of all input tokens across all requests.
+    /// Unlike total_input_tokens which stores the last request's value,
+    /// this computes the cumulative sum of all requests.
+    pub fn cumulative_input_tokens(&self) -> u64 {
+        self.requests.iter().map(|r| r.input_tokens).sum()
+    }
+
+    /// Get all request stats for detailed inspection.
+    pub fn all_requests(&self) -> Vec<RequestStats> {
+        self.requests.clone()
     }
 
     /// Get total output tokens used so far
@@ -352,6 +364,11 @@ impl SessionHook {
         self.stop_requested.store(true, Ordering::SeqCst);
     }
 
+    /// Get a clone of the current session stats
+    pub fn get_stats(&self) -> SessionStats {
+        self.stats.lock().unwrap().clone()
+    }
+
     /// Create a new session hook with a new event channel (backward compatible)
     pub fn with_channel() -> (Self, mpsc::UnboundedReceiver<AgentEvent>) {
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -446,9 +463,19 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         _prompt: &Message,
         response: &CompletionResponse<M::Response>,
     ) -> HookAction {
-        if let Some(ref sender) = self.event_sender {
-            let usage = &response.usage;
+        let usage = &response.usage;
+        
+        // Update the session stats with this request's usage
+        // This is critical for ContextManager to track actual token counts
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.add_request(
+                usage.input_tokens,
+                usage.output_tokens,
+                0.0, // Cost is calculated externally
+            );
+        }
 
+        if let Some(ref sender) = self.event_sender {
             // Extract content and reasoning from response using rig's API
             let (content, reasoning) = extract_content_from_response(&response.choice);
 

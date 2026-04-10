@@ -475,9 +475,9 @@ mod tests {
         sm.add_request(100, 50, 0.10);
         sm.add_request(200, 100, 0.20);
         let state = sm.get_state();
-        // Input/output tokens are replaced, API calls and cost are accumulated
-        assert_eq!(state.stats.total_input_tokens, 200);
-        assert_eq!(state.stats.total_output_tokens, 100);
+        // Input/output tokens ARE accumulated (sum of all requests)
+        assert_eq!(state.stats.total_input_tokens, 300);  // 100 + 200
+        assert_eq!(state.stats.total_output_tokens, 150); // 50 + 100
         assert_eq!(state.stats.total_api_calls, 2);
         assert!((state.stats.total_cost - 0.30).abs() < f64::EPSILON);
     }

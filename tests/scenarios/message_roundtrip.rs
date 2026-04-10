@@ -3,12 +3,12 @@
 //! Tests for verifying the complete message flow through the agent.
 
 use crate::harness::TestHarness;
-use crate::mock::{MockCompletionModel, MockResponse};
+use peakbot::mock::{MockCompletionModel, MockResponse};
 use peakbot::{AgentEvent, SessionHook, TokenUsage};
 
 #[tokio::test]
 async fn simple_message_roundtrip() {
-    let harness = TestHarness::new();
+    let mut harness = TestHarness::new();
     harness.add_response(MockResponse::text("Hi there!"));
 
     let response = harness.run_message("Hello").await;
@@ -23,7 +23,7 @@ async fn simple_message_roundtrip() {
 
 #[tokio::test]
 async fn multiple_messages_persist() {
-    let harness = TestHarness::new();
+    let mut harness = TestHarness::new();
     harness.add_responses(vec![
         MockResponse::text("First response"),
         MockResponse::text("Second response"),
@@ -58,7 +58,7 @@ async fn multiple_messages_persist() {
 
 #[tokio::test]
 async fn agent_preamble_respected() {
-    let harness =
+    let mut harness =
         TestHarness::with_system_prompt("You are a pirate assistant. Always speak like a pirate.");
     harness.add_response(MockResponse::text("Ahoy matey! How can I help ye?"));
 
@@ -71,7 +71,7 @@ async fn agent_preamble_respected() {
 
 #[tokio::test]
 async fn tool_call_with_follow_up() {
-    let harness = TestHarness::new();
+    let mut harness = TestHarness::new();
 
     // Queue two responses:
     // 1. The tool call response
@@ -99,7 +99,7 @@ async fn tool_call_with_follow_up() {
 /// Test that the harness correctly reports event emission
 #[tokio::test]
 async fn event_emission_simple() {
-    let harness = TestHarness::new();
+    let mut harness = TestHarness::new();
     harness.add_response(MockResponse::text("Hello back!"));
 
     let response = harness.run_message("Hello").await;
@@ -127,7 +127,7 @@ async fn stats_accumulate_after_messages() {
 /// Test message history is maintained correctly
 #[tokio::test]
 async fn history_maintained_across_messages() {
-    let harness = TestHarness::new();
+    let mut harness = TestHarness::new();
     harness.add_responses(vec![
         MockResponse::text("First"),
         MockResponse::text("Second"),

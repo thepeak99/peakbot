@@ -1,7 +1,7 @@
-//! Mock completion model for testing
+//! Mock completion model for integration testing
 //!
-//! Implements rig's CompletionModel trait to allow testing the agent loop
-//! without real API calls.
+//! This module is only compiled when running tests (`cargo test`).
+//! It provides MockCompletionModel for testing the agent loop without real API calls.
 
 use crate::mock::response::MockResponse;
 use rig::completion::message::{Text, ToolCall, ToolFunction};

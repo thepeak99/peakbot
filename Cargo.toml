@@ -3,6 +3,9 @@ name = "peakbot"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+mock = []
+
 [dependencies]
 rig-core = { version = "0.33", features = ["rmcp"] }
 rmcp = { version = "0.16", features = [
@@ -37,3 +40,4 @@ ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
 [dev-dependencies]
 tempfile = "3.27"
 insta = { version = "1.40", features = ["yaml", "serde"] }
+peakbot = { path = ".", features = ["mock"] }

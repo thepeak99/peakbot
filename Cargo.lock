@@ -1698,6 +1698,7 @@ dependencies = [
  "dirs",
  "futures",
  "insta",
+ "peakbot",
  "ratatui",
  "regex",
  "reqwest",

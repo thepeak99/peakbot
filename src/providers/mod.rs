@@ -3,6 +3,8 @@
 //! This module provides a unified interface for different LLM providers
 //! (OpenRouter, Ollama, etc.) to make the codebase provider-independent.
 
+#[cfg(feature = "mock")]
+use crate::mock::MockCompletionModel;
 use crate::config::{
     BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig,
     SearXngConfig,
@@ -49,6 +51,9 @@ pub enum DynAgent {
     LlamaCpp(Agent<rig::providers::openai::completion::CompletionModel, SessionHook>),
     /// Ollama agent (no hook for local models)
     Ollama(Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>),
+    /// Mock agent for testing (uses MockCompletionModel with session hook)
+    #[cfg(feature = "mock")]
+    Mock(Agent<MockCompletionModel, SessionHook>),
 }
 
 impl DynAgent {
@@ -59,6 +64,8 @@ impl DynAgent {
             DynAgent::OpenAI(agent) => agent.prompt(prompt).await,
             DynAgent::LlamaCpp(agent) => agent.prompt(prompt).await,
             DynAgent::Ollama(agent) => agent.prompt(prompt).await,
+            #[cfg(feature = "mock")]
+            DynAgent::Mock(agent) => agent.prompt(prompt).await,
         }
     }
 
@@ -73,6 +80,20 @@ impl DynAgent {
             DynAgent::OpenAI(agent) => agent.prompt(prompt).with_history(history).await,
             DynAgent::LlamaCpp(agent) => agent.prompt(prompt).with_history(history).await,
             DynAgent::Ollama(agent) => agent.prompt(prompt).with_history(history).await,
+            #[cfg(feature = "mock")]
+            DynAgent::Mock(agent) => agent.prompt(prompt).with_history(history).await,
+        }
+    }
+
+    /// Check if this is a mock agent
+    pub fn is_mock(&self) -> bool {
+        #[cfg(feature = "mock")]
+        {
+            matches!(self, DynAgent::Mock(_))
+        }
+        #[cfg(not(feature = "mock"))]
+        {
+            false
         }
     }
 }
@@ -555,4 +576,65 @@ fn create_llamacpp_agent(
     };
 
     Ok((agent, info, receiver, hook))
+}
+
+/// Create a mock agent for testing with MockCompletionModel and SessionHook
+///
+/// This is only available when the "mock" feature is enabled and allows the test harness to create
+/// a DynAgent::Mock variant that can be used with AgentRunner.
+#[cfg(feature = "mock")]
+pub fn create_mock_agent(
+    system_prompt: &str,
+    max_turns: usize,
+    state_manager: Arc<StateManager>,
+) -> Result<(
+    DynAgent,
+    ProviderInfo,
+    mpsc::UnboundedReceiver<AgentEvent>,
+    Arc<SessionHook>,
+    MockCompletionModel,
+)> {
+    use rig::agent::AgentBuilder;
+
+    let mock_model = MockCompletionModel::new();
+    let model_clone = mock_model.clone();
+
+    // Create session hook with stats tracking (using context_tracking for full functionality)
+    let session_stats = state_manager.stats_arc();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let hook = SessionHook::with_context_tracking(
+        Some(sender),
+        session_stats,
+        128_000, // context_window
+        0.8,     // threshold
+    );
+
+    // Build agent with mock model, session hook, and built-in tools
+    let agent_builder = AgentBuilder::new(mock_model)
+        .preamble(system_prompt)
+        .max_tokens(1024)
+        .default_max_turns(max_turns)
+        .hook(hook.clone());
+
+    // Add built-in tools (simplified for testing)
+    let bash_tool = BashTool::default();
+    let todo = TodoTool::new(state_manager.clone());
+
+    let agent = agent_builder
+        .tool(FileEditTool::default())
+        .tool(FileReadTool)
+        .tool(bash_tool)
+        .tool(ListDirectoryTool)
+        .tool(FetchUrlTool)
+        .tool(ThinkTool)
+        .tool(todo)
+        .build();
+
+    let info = ProviderInfo {
+        name: "mock".to_string(),
+        model: "mock-model".to_string(),
+        supports_pricing: true,
+    };
+
+    Ok((DynAgent::Mock(agent), info, receiver, Arc::new(hook), model_clone))
 }
