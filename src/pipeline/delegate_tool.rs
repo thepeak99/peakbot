@@ -58,29 +58,22 @@ impl DelegateTool {
     ) -> Result<AgentExecutionResult, DelegateError> {
         let start = Instant::now();
 
-        let (agent, _info) = self
-            .registry
-            .create_agent(name)
-            .map_err(|e| DelegateError::AgentCreation {
-                agent: name.to_string(),
-                error: e.to_string(),
-            })?;
+        let (agent, _info) =
+            self.registry
+                .create_agent(name)
+                .map_err(|e| DelegateError::AgentCreation {
+                    agent: name.to_string(),
+                    error: e.to_string(),
+                })?;
 
         // Run the agent with timeout
-        let result = timeout(timeout_duration, async {
-            agent.prompt(task).await
-        })
-        .await;
+        let result = timeout(timeout_duration, async { agent.prompt(task).await }).await;
 
         let duration = start.elapsed();
 
         match result {
             Ok(Ok(response)) => {
-                tracing::info!(
-                    "Agent '{}' completed successfully in {:?}",
-                    name,
-                    duration
-                );
+                tracing::info!("Agent '{}' completed successfully in {:?}", name, duration);
 
                 Ok(AgentExecutionResult {
                     agent_name: name.to_string(),
@@ -144,10 +137,7 @@ impl DelegateTool {
     ) -> Result<String, DelegateError> {
         let timeout_duration = Duration::from_secs(timeout_seconds);
 
-        tracing::info!(
-            "Parallel: Running {} agents simultaneously",
-            agents.len()
-        );
+        tracing::info!("Parallel: Running {} agents simultaneously", agents.len());
 
         // Create a tool clone for each task
         let mut handles = Vec::new();
@@ -158,9 +148,10 @@ impl DelegateTool {
             let tool = self.clone();
             let timeout = timeout_duration;
 
-            let handle = tokio::spawn(async move {
-                tool.run_single_agent(&agent_name, &task, timeout).await
-            });
+            let handle =
+                tokio::spawn(
+                    async move { tool.run_single_agent(&agent_name, &task, timeout).await },
+                );
 
             handles.push(handle);
         }
@@ -310,7 +301,7 @@ impl Tool for DelegateTool {
         // Get the agent names list before async block
         let agents_list = self.registry.list_agents();
         let agents_vec: Vec<String> = agents_list.into_iter().map(|s| s.to_string()).collect();
-        
+
         // Validate agent exists
         if !self.registry.has_agent(&args.agent) {
             return Err(DelegateError::UnknownAgent {
@@ -356,7 +347,8 @@ impl Tool for DelegateTool {
                 if agents.len() < 2 {
                     return Err(DelegateError::InvalidMode {
                         mode: mode.to_string(),
-                        reason: "parallel mode requires at least 2 agents (comma-separated)".to_string(),
+                        reason: "parallel mode requires at least 2 agents (comma-separated)"
+                            .to_string(),
                     });
                 }
 
@@ -451,4 +443,3 @@ mod tests {
         assert_eq!(format_duration(125.5), "2m 5.5s");
     }
 }
-

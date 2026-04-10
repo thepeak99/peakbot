@@ -1,5 +1,5 @@
 //! State module
-//! 
+//!
 //! Contains application state management. StateManager is the single source of truth
 //! for all application state (stats, todo, chat, etc.).
 

@@ -12,17 +12,13 @@ use serde_json::json;
 /// Status of a todo item
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TodoStatus {
+    #[default]
     Pending,
     InProgress,
     Completed,
     Cancelled,
-}
-
-impl Default for TodoStatus {
-    fn default() -> Self {
-        TodoStatus::Pending
-    }
 }
 
 impl std::fmt::Display for TodoStatus {
@@ -120,10 +116,26 @@ impl TodoList {
 
     /// Count tasks by status
     pub fn count_by_status(&self) -> (usize, usize, usize, usize) {
-        let pending = self.tasks.iter().filter(|t| t.status == TodoStatus::Pending).count();
-        let in_progress = self.tasks.iter().filter(|t| t.status == TodoStatus::InProgress).count();
-        let completed = self.tasks.iter().filter(|t| t.status == TodoStatus::Completed).count();
-        let cancelled = self.tasks.iter().filter(|t| t.status == TodoStatus::Cancelled).count();
+        let pending = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TodoStatus::Pending)
+            .count();
+        let in_progress = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TodoStatus::InProgress)
+            .count();
+        let completed = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TodoStatus::Completed)
+            .count();
+        let cancelled = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TodoStatus::Cancelled)
+            .count();
         (pending, in_progress, completed, cancelled)
     }
 }
@@ -143,6 +155,7 @@ pub enum TodoError {
 
 /// The todo tool - a stateless controller that delegates to StateManager.
 /// All todo state lives in StateManager; this tool just updates it.
+#[derive(Default)]
 pub struct TodoTool {
     /// Reference to StateManager (single source of truth for todo state)
     state_manager: Option<std::sync::Arc<StateManager>>,
@@ -157,31 +170,81 @@ impl TodoTool {
     }
 }
 
-impl Default for TodoTool {
-    fn default() -> Self {
-        Self {
-            state_manager: None,
-        }
-    }
-}
-
 /// Arguments for the todo tool
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
 pub struct TodoArgs {
     /// Brief explanation of what you're doing
     #[allow(dead_code)]
-    thought: String,
+    pub thought: String,
     /// The action to perform: add, update, remove, list, clear
-    action: String,
+    pub action: String,
     /// Task descriptions (for add)
     #[serde(default)]
-    tasks: Option<Vec<String>>,
+    pub tasks: Option<Vec<String>>,
     /// Task status (for update): pending, in_progress, completed, cancelled
     #[serde(default)]
-    status: Option<String>,
+    pub status: Option<String>,
     /// Task ID (for update/remove)
     #[serde(default)]
-    task_id: Option<usize>,
+    pub task_id: Option<usize>,
+}
+
+impl TodoArgs {
+    /// Create a new TodoArgs for adding tasks
+    pub fn add(tasks: Vec<String>) -> Self {
+        Self {
+            thought: "Adding tasks".to_string(),
+            action: "add".to_string(),
+            tasks: Some(tasks),
+            status: None,
+            task_id: None,
+        }
+    }
+
+    /// Create a new TodoArgs for listing tasks
+    pub fn list() -> Self {
+        Self {
+            thought: "Listing tasks".to_string(),
+            action: "list".to_string(),
+            tasks: None,
+            status: None,
+            task_id: None,
+        }
+    }
+
+    /// Create a new TodoArgs for updating a task
+    pub fn update(id: usize, status: &str) -> Self {
+        Self {
+            thought: "Updating task".to_string(),
+            action: "update".to_string(),
+            tasks: None,
+            status: Some(status.to_string()),
+            task_id: Some(id),
+        }
+    }
+
+    /// Create a new TodoArgs for removing a task
+    pub fn remove(id: usize) -> Self {
+        Self {
+            thought: "Removing task".to_string(),
+            action: "remove".to_string(),
+            tasks: None,
+            status: None,
+            task_id: Some(id),
+        }
+    }
+
+    /// Create a new TodoArgs for clearing completed tasks
+    pub fn clear() -> Self {
+        Self {
+            thought: "Clearing completed".to_string(),
+            action: "clear".to_string(),
+            tasks: None,
+            status: None,
+            task_id: None,
+        }
+    }
 }
 
 impl Tool for TodoTool {
@@ -228,23 +291,23 @@ impl Tool for TodoTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let sm = self.state_manager.as_ref().ok_or_else(|| {
-            TodoError::StateManagerNotSet("StateManager not initialized. Todo tool cannot update UI state.".to_string())
+            TodoError::StateManagerNotSet(
+                "StateManager not initialized. Todo tool cannot update UI state.".to_string(),
+            )
         })?;
 
         match args.action.as_str() {
             "add" => {
                 let tasks = args.tasks.ok_or_else(|| {
-                    TodoError::InvalidAction(
-                        "Tasks array required for 'add' action".to_string(),
-                    )
+                    TodoError::InvalidAction("Tasks array required for 'add' action".to_string())
                 })?;
-                
+
                 if tasks.is_empty() {
                     return Err(TodoError::InvalidAction(
                         "Tasks array is empty for 'add' action".to_string(),
                     ));
                 }
-                
+
                 Ok(sm.add_todos(tasks))
             }
 

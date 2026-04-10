@@ -24,7 +24,9 @@ pub enum SearchError {
     #[error("Failed to parse response: {0}")]
     ParseError(String),
 
-    #[error("SearXNG instance does not have JSON format enabled. Please use a different instance or contact the administrator.")]
+    #[error(
+        "SearXNG instance does not have JSON format enabled. Please use a different instance or contact the administrator."
+    )]
     JsonFormatDisabled,
 
     #[error("SearXNG instance returned an error: {0}")]
@@ -116,7 +118,9 @@ pub struct SearchArgs {
     time_range: Option<String>,
 }
 
-fn default_num_results() -> Option<u32> { Some(10) }
+fn default_num_results() -> Option<u32> {
+    Some(10)
+}
 
 /// The search tool for querying SearXNG
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,7 +220,8 @@ impl Tool for SearchTool {
             args.query.clone()
         };
 
-        url_obj.query_pairs_mut()
+        url_obj
+            .query_pairs_mut()
             .append_pair("q", &query_string)
             .append_pair("format", "json")
             .append_pair("pageno", "1");
@@ -233,11 +238,15 @@ impl Tool for SearchTool {
                 "science" => "science",
                 _ => "general",
             };
-            url_obj.query_pairs_mut().append_pair("categories", searxng_category);
+            url_obj
+                .query_pairs_mut()
+                .append_pair("categories", searxng_category);
         }
 
         if let Some(ref time_range) = args.time_range {
-            url_obj.query_pairs_mut().append_pair("time_range", time_range);
+            url_obj
+                .query_pairs_mut()
+                .append_pair("time_range", time_range);
         }
 
         // Make the HTTP request
@@ -259,7 +268,9 @@ impl Tool for SearchTool {
         }
 
         if status.as_u16() == 429 {
-            return Err(SearchError::InstanceError("Rate limited. Try again later.".to_string()));
+            return Err(SearchError::InstanceError(
+                "Rate limited. Try again later.".to_string(),
+            ));
         }
 
         if !status.is_success() {
@@ -272,8 +283,9 @@ impl Tool for SearchTool {
 
         // Parse JSON response
         let body = response.text().await?;
-        let searxng_response: SearXngResponse = serde_json::from_str(&body)
-            .map_err(|e| SearchError::ParseError(format!("{}: {}", e, &body[..body.len().min(500)])))?;
+        let searxng_response: SearXngResponse = serde_json::from_str(&body).map_err(|e| {
+            SearchError::ParseError(format!("{}: {}", e, &body[..body.len().min(500)]))
+        })?;
 
         // Format results
         let mut output = String::new();
@@ -286,27 +298,31 @@ impl Tool for SearchTool {
         output.push_str("---\n\n");
 
         // Add suggestions if available
-        if let Some(suggestions) = searxng_response.suggestions {
-            if !suggestions.is_empty() {
-                output.push_str("Suggestions: ");
-                output.push_str(&suggestions.join(", "));
-                output.push_str("\n\n---\n\n");
-            }
+        if let Some(suggestions) = searxng_response.suggestions
+            && !suggestions.is_empty()
+        {
+            output.push_str("Suggestions: ");
+            output.push_str(&suggestions.join(", "));
+            output.push_str("\n\n---\n\n");
         }
 
         // Add answers if available
-        if let Some(answers) = searxng_response.answers {
-            if !answers.is_empty() {
-                output.push_str("Direct Answers:\n");
-                for answer in &answers {
-                    output.push_str(&format!("- {}\n", answer));
-                }
-                output.push_str("\n---\n\n");
+        if let Some(answers) = searxng_response.answers
+            && !answers.is_empty()
+        {
+            output.push_str("Direct Answers:\n");
+            for answer in &answers {
+                output.push_str(&format!("- {}\n", answer));
             }
+            output.push_str("\n---\n\n");
         }
 
         // Add results
-        let results: Vec<_> = searxng_response.results.into_iter().take(num_results as usize).collect();
+        let results: Vec<_> = searxng_response
+            .results
+            .into_iter()
+            .take(num_results as usize)
+            .collect();
 
         if results.is_empty() {
             return Err(SearchError::NoResults(args.query));
@@ -332,7 +348,7 @@ impl Tool for SearchTool {
                 output.push_str(&format!("   [{}]\n", engine));
             }
 
-            output.push_str("\n");
+            output.push('\n');
         }
 
         // Truncate if too long

@@ -108,9 +108,8 @@ impl ContextManager {
 
         // Subtract system prompt to get conversation history size
         // (add a buffer since we can't know exact system prompt size)
-        let history_tokens = current_input.saturating_sub(self.system_prompt_tokens);
 
-        history_tokens
+        current_input.saturating_sub(self.system_prompt_tokens)
     }
 
     /// Check if compaction is needed based on current message count
@@ -164,7 +163,8 @@ impl ContextManager {
             let (role, content) = match msg {
                 Message::User { content } => {
                     // Extract text from User content
-                    let text = content.iter()
+                    let text = content
+                        .iter()
                         .filter_map(|c| {
                             if let rig::completion::message::UserContent::Text(t) = c {
                                 Some(t.text.as_str())
@@ -178,7 +178,8 @@ impl ContextManager {
                 }
                 Message::Assistant { content, .. } => {
                     // Extract text from Assistant content
-                    let text = content.iter()
+                    let text = content
+                        .iter()
                         .filter_map(|c| {
                             if let rig::completion::message::AssistantContent::Text(t) = c {
                                 Some(t.text.as_str())
@@ -204,7 +205,9 @@ impl ContextManager {
 
     /// Summarize messages using the LLM
     async fn summarize_messages(&self, messages: &[Message]) -> Result<String> {
-        let agent = self.agent.as_ref()
+        let agent = self
+            .agent
+            .as_ref()
             .context("No LLM agent available for summarization")?;
 
         let formatted = self.format_messages_for_summary(messages);
@@ -213,7 +216,6 @@ impl ContextManager {
             "Please summarize the following conversation concisely, preserving the key information, decisions, and important details. \
             Focus on what matters for continuing the conversation:\n\n{}\n\n\
             Provide a concise summary (2-4 sentences) that captures the essential context:",
-
             formatted
         );
 
@@ -293,8 +295,8 @@ impl ContextManager {
         }
 
         // Add the recent messages (from keep_start to end)
-        for i in keep_start..messages.len() {
-            to_keep.push(messages[i].clone());
+        for msg in messages.iter().skip(keep_start) {
+            to_keep.push(msg.clone());
         }
 
         // Try to summarize the older messages if we have an agent
@@ -310,7 +312,10 @@ impl ContextManager {
                 }
                 Err(e) => {
                     // If summarization fails, log and fall back to truncation
-                    tracing::warn!("Failed to summarize messages: {}. Falling back to truncation.", e);
+                    tracing::warn!(
+                        "Failed to summarize messages: {}. Falling back to truncation.",
+                        e
+                    );
                     None
                 }
             }
@@ -385,13 +390,13 @@ fn extract_call_id_from_tool_result(msg: &Message) -> Option<String> {
 /// Find a ToolCall message that has the given call_id.
 /// Searches the full message list.
 fn find_tool_call_by_id(messages: &[Message], call_id: &str) -> Option<usize> {
-    for i in 0..messages.len() {
-        if let Message::Assistant { content, .. } = &messages[i] {
+    for (i, msg) in messages.iter().enumerate() {
+        if let Message::Assistant { content, .. } = msg {
             for item in content.iter() {
-                if let AssistantContent::ToolCall(tc) = item {
-                    if tc.id == call_id {
-                        return Some(i);
-                    }
+                if let AssistantContent::ToolCall(tc) = item
+                    && tc.id == call_id
+                {
+                    return Some(i);
                 }
             }
         }
@@ -449,7 +454,9 @@ impl Default for ContextConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig::completion::message::{AssistantContent, ToolCall, ToolFunction, UserContent, ToolResult, ToolResultContent};
+    use rig::completion::message::{
+        AssistantContent, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
+    };
     use rig::one_or_many::OneOrMany;
 
     // ContextManager tests would need SessionStats mock
@@ -469,10 +476,7 @@ mod tests {
             id: None,
             content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
                 id.to_string(),
-                ToolFunction::new(
-                    tool_name.to_string(),
-                    serde_json::json!({}),
-                ),
+                ToolFunction::new(tool_name.to_string(), serde_json::json!({})),
             ))),
         }
     }
@@ -483,11 +487,9 @@ mod tests {
             content: OneOrMany::one(UserContent::ToolResult(ToolResult {
                 id: id.to_string(),
                 call_id: None,
-                content: OneOrMany::one(ToolResultContent::Text(
-                    rig::completion::message::Text {
-                        text: result.to_string(),
-                    },
-                )),
+                content: OneOrMany::one(ToolResultContent::Text(rig::completion::message::Text {
+                    text: result.to_string(),
+                })),
             })),
         }
     }
@@ -502,11 +504,9 @@ mod tests {
             },
             _ => Message::Assistant {
                 id: None,
-                content: OneOrMany::one(AssistantContent::Text(
-                    rig::completion::message::Text {
-                        text: text.to_string(),
-                    },
-                )),
+                content: OneOrMany::one(AssistantContent::Text(rig::completion::message::Text {
+                    text: text.to_string(),
+                })),
             },
         }
     }
@@ -539,16 +539,10 @@ mod tests {
         ];
 
         // Find the tool call for call_123 (should be at index 1)
-        assert_eq!(
-            find_tool_call_by_id(&messages, "call_123"),
-            Some(1)
-        );
+        assert_eq!(find_tool_call_by_id(&messages, "call_123"), Some(1));
 
         // Find non-existent call
-        assert_eq!(
-            find_tool_call_by_id(&messages, "call_nonexistent"),
-            None
-        );
+        assert_eq!(find_tool_call_by_id(&messages, "call_nonexistent"), None);
     }
 
     #[test]
@@ -616,11 +610,11 @@ mod tests {
         // Actually, tool_result_1 is at index 2, which is NOT in keep region, so we don't scan it
         let messages = vec![
             make_text_message("user", "task 1"),
-            make_tool_call("call_1", "bash"),      // index 1
+            make_tool_call("call_1", "bash"),       // index 1
             make_tool_result("call_1", "result 1"), // index 2
             make_tool_call("call_2", "read"),       // index 3
             make_tool_result("call_2", "result 2"), // index 4 - in keep region, references call_2
-            make_text_message("assistant", "done"),  // index 5
+            make_text_message("assistant", "done"), // index 5
         ];
 
         let keep_start = 3; // Keep from index 3 onwards
@@ -642,10 +636,10 @@ mod tests {
         let messages = vec![
             make_text_message("user", "task 1"),
             make_tool_call("call_1", "bash"),       // index 1
-            make_tool_result("call_1", "result 1"),  // index 2
-            make_tool_call("call_2", "read"),        // index 3 - BEFORE keep_start
-            make_tool_result("call_2", "result 2"),  // index 4 - IN keep region
-            make_text_message("assistant", "done"),   // index 5
+            make_tool_result("call_1", "result 1"), // index 2
+            make_tool_call("call_2", "read"),       // index 3 - BEFORE keep_start
+            make_tool_result("call_2", "result 2"), // index 4 - IN keep region
+            make_text_message("assistant", "done"), // index 5
         ];
 
         let keep_start = 4; // Keep from index 4 onwards
@@ -666,11 +660,11 @@ mod tests {
         // tool_result(3) references call_1 which is at index 1 (BEFORE keep_start!)
         // This is the bug we were fixing - we MUST include index 1
         let messages = vec![
-            make_text_message("user", "old question"),   // index 0
-            make_tool_call("call_1", "bash"),           // index 1 - BEFORE keep_start
-            make_text_message("user", "new question"),  // index 2 - IN keep region
-            make_tool_result("call_1", "output"),       // index 3 - IN keep region, references call_1
-            make_text_message("assistant", "answer"),    // index 4 - IN keep region
+            make_text_message("user", "old question"), // index 0
+            make_tool_call("call_1", "bash"),          // index 1 - BEFORE keep_start
+            make_text_message("user", "new question"), // index 2 - IN keep region
+            make_tool_result("call_1", "output"), // index 3 - IN keep region, references call_1
+            make_text_message("assistant", "answer"), // index 4 - IN keep region
         ];
 
         let keep_start = 2; // Keep from index 2 onwards

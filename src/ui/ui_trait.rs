@@ -13,9 +13,9 @@
 //! Data flows one way only:
 //!   View ──UiAction──► Controller ──writes──► Model ──broadcasts──► View
 
+use crate::TodoStatus;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use crate::TodoStatus;
 
 /// Trait that all UI implementations must implement — View in MVC
 #[allow(async_fn_in_trait)]
@@ -136,10 +136,7 @@ impl CommandPopupState {
     pub fn selected_command(&self) -> Option<SlashCommand> {
         let filtered = self.filtered_commands();
         filtered
-            .get(
-                self.selected_index
-                    .min(filtered.len().saturating_sub(1)),
-            )
+            .get(self.selected_index.min(filtered.len().saturating_sub(1)))
             .cloned()
     }
 

@@ -35,17 +35,11 @@ pub struct BashArgs {
     tail: Option<usize>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct BashTool {
     /// Optional environment variables to set for the command
     #[serde(default)]
     env: Option<HashMap<String, String>>,
-}
-
-impl Default for BashTool {
-    fn default() -> Self {
-        Self { env: None }
-    }
 }
 
 impl BashTool {
@@ -134,13 +128,13 @@ fn apply_head_tail(s: &str, head: Option<usize>, tail: Option<usize>) -> (String
     }
 
     // Only head specified
-    if let Some(h) = head {
-        if tail.is_none() {
-            if total_lines <= h {
-                return (s.to_string(), false);
-            }
-            return (lines[..h].join("\n"), true);
+    if let Some(h) = head
+        && tail.is_none()
+    {
+        if total_lines <= h {
+            return (s.to_string(), false);
         }
+        return (lines[..h].join("\n"), true);
     }
 
     // Only tail specified (default 100)
@@ -285,16 +279,10 @@ impl Tool for BashTool {
 
                 // Apply head/tail truncation (defaults to tail: 100)
                 let default_tail = Some(100);
-                let (stdout, stdout_modified) = apply_head_tail(
-                    &stdout_raw,
-                    args.head,
-                    args.tail.or(default_tail),
-                );
-                let (stderr, stderr_modified) = apply_head_tail(
-                    &stderr_raw,
-                    args.head,
-                    args.tail.or(default_tail),
-                );
+                let (stdout, stdout_modified) =
+                    apply_head_tail(&stdout_raw, args.head, args.tail.or(default_tail));
+                let (stderr, stderr_modified) =
+                    apply_head_tail(&stderr_raw, args.head, args.tail.or(default_tail));
 
                 let mut result = format!("Exit code: {}\n", exit_code);
                 if !stdout_raw.is_empty() {

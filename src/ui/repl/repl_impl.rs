@@ -32,10 +32,10 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time;
 
+use crate::state::StateManager;
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState, MessageRole};
 use crate::ui::repl::todo_panel::{DEFAULT_PANEL_PERCENT, render_todo_panel, should_show_panel};
-use crate::state::StateManager;
 use crate::ui::ui_trait::{Ui, UiAction};
 
 /// Minimum terminal height
@@ -187,7 +187,7 @@ impl ReplUi {
         scroll: u16,
         paragraph: Paragraph,
     ) {
-        let content_height = paragraph.line_count(area.width.saturating_sub(2)) as usize;
+        let content_height = paragraph.line_count(area.width.saturating_sub(2));
 
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -223,10 +223,9 @@ impl ReplUi {
             spans.push(Span::raw(after_cursor));
         }
 
-        let paragraph = Paragraph::new(Line::from(spans))
+        Paragraph::new(Line::from(spans))
             .wrap(Wrap { trim: true })
-            .block(Block::default().title(" Input ").borders(Borders::ALL));
-        paragraph
+            .block(Block::default().title(" Input ").borders(Borders::ALL))
     }
 
     /// Render the input area (takes built paragraph and renders it)

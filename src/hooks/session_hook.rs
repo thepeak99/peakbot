@@ -190,7 +190,7 @@ pub async fn fetch_model_pricing(api_key: &str, model: &str) -> Result<ModelPric
         .await?;
 
     if !response.status().is_success() {
-        return Err(anyhow!("OpenRouter API error: {}", response.status()).into());
+        return Err(anyhow!("OpenRouter API error: {}", response.status()));
     }
 
     let models: OpenRouterModelsResponse = response.json().await?;

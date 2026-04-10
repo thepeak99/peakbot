@@ -435,16 +435,14 @@ Tip: For global replacements, use replace_all: true",
             let positions: Vec<usize> =
                 content.match_indices(old_str).map(|(pos, _)| pos).collect();
             MatchResult::MultipleMatches { count, positions }
-        } else {
-            if let Some((pos, _)) = content.match_indices(old_str).next() {
-                MatchResult::UniqueMatch {
-                    position: pos,
-                    match_level: MatchLevel::Exact,
-                    confidence: 1.0,
-                }
-            } else {
-                MatchResult::NoMatch
+        } else if let Some((pos, _)) = content.match_indices(old_str).next() {
+            MatchResult::UniqueMatch {
+                position: pos,
+                match_level: MatchLevel::Exact,
+                confidence: 1.0,
             }
+        } else {
+            MatchResult::NoMatch
         }
     }
 
@@ -475,36 +473,34 @@ Tip: For global replacements, use replace_all: true",
                 .map(|(pos, _)| pos)
                 .collect();
             MatchResult::MultipleMatches { count, positions }
-        } else {
-            if let Some((norm_pos, _)) = norm_content.match_indices(&norm_old).next() {
-                // Map normalized position back to original content
-                // We need to find the corresponding line in original content
-                let norm_lines: Vec<&str> = norm_content.lines().collect();
-                let orig_lines: Vec<&str> = content.lines().collect();
+        } else if let Some((norm_pos, _)) = norm_content.match_indices(&norm_old).next() {
+            // Map normalized position back to original content
+            // We need to find the corresponding line in original content
+            let norm_lines: Vec<&str> = norm_content.lines().collect();
+            let orig_lines: Vec<&str> = content.lines().collect();
 
-                // Find which line the match starts on
-                let match_start_line = norm_lines
-                    .iter()
-                    .take_while(|&&line| {
-                        norm_pos >= line.len() + 1 // +1 for newline
-                    })
-                    .count();
+            // Find which line the match starts on
+            let match_start_line = norm_lines
+                .iter()
+                .take_while(|&&line| {
+                    norm_pos > line.len() // +1 for newline
+                })
+                .count();
 
-                // Find the position in original content
-                let orig_pos: usize = orig_lines
-                    .iter()
-                    .take(match_start_line)
-                    .map(|l| l.len() + 1) // +1 for newline
-                    .sum();
+            // Find the position in original content
+            let orig_pos: usize = orig_lines
+                .iter()
+                .take(match_start_line)
+                .map(|l| l.len() + 1) // +1 for newline
+                .sum();
 
-                MatchResult::UniqueMatch {
-                    position: orig_pos,
-                    match_level: MatchLevel::WhitespaceNormalized,
-                    confidence: 0.95,
-                }
-            } else {
-                MatchResult::NoMatch
+            MatchResult::UniqueMatch {
+                position: orig_pos,
+                match_level: MatchLevel::WhitespaceNormalized,
+                confidence: 0.95,
             }
+        } else {
+            MatchResult::NoMatch
         }
     }
 
@@ -550,16 +546,14 @@ Tip: For global replacements, use replace_all: true",
             } else if count > 1 {
                 let positions: Vec<usize> = re.find_iter(content).map(|m| m.start()).collect();
                 MatchResult::MultipleMatches { count, positions }
-            } else {
-                if let Some(m) = re.find(content) {
-                    MatchResult::UniqueMatch {
-                        position: m.start(),
-                        match_level: MatchLevel::FlexibleWhitespace,
-                        confidence: 0.85,
-                    }
-                } else {
-                    MatchResult::NoMatch
+            } else if let Some(m) = re.find(content) {
+                MatchResult::UniqueMatch {
+                    position: m.start(),
+                    match_level: MatchLevel::FlexibleWhitespace,
+                    confidence: 0.85,
                 }
+            } else {
+                MatchResult::NoMatch
             }
         } else {
             // Single line: use the token-based pattern
@@ -575,16 +569,14 @@ Tip: For global replacements, use replace_all: true",
             } else if count > 1 {
                 let positions: Vec<usize> = re.find_iter(content).map(|m| m.start()).collect();
                 MatchResult::MultipleMatches { count, positions }
-            } else {
-                if let Some(m) = re.find(content) {
-                    MatchResult::UniqueMatch {
-                        position: m.start(),
-                        match_level: MatchLevel::FlexibleWhitespace,
-                        confidence: 0.85,
-                    }
-                } else {
-                    MatchResult::NoMatch
+            } else if let Some(m) = re.find(content) {
+                MatchResult::UniqueMatch {
+                    position: m.start(),
+                    match_level: MatchLevel::FlexibleWhitespace,
+                    confidence: 0.85,
                 }
+            } else {
+                MatchResult::NoMatch
             }
         }
     }

@@ -67,11 +67,11 @@ impl ConversationManager {
         if let Ok(entries) = fs::read_dir(storage_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_name() {
-                    if name.to_string_lossy().starts_with(".tmp") {
-                        tracing::debug!("Cleaning up temp file: {}", path.display());
-                        let _ = fs::remove_file(path);
-                    }
+                if let Some(name) = path.file_name()
+                    && name.to_string_lossy().starts_with(".tmp")
+                {
+                    tracing::debug!("Cleaning up temp file: {}", path.display());
+                    let _ = fs::remove_file(path);
                 }
             }
         }
@@ -271,7 +271,12 @@ impl ConversationManager {
     }
 
     /// Add a tool result to the current conversation (without auto-save)
-    pub fn add_tool_result(&mut self, tool_name: String, arguments: String, result: String) -> Result<()> {
+    pub fn add_tool_result(
+        &mut self,
+        tool_name: String,
+        arguments: String,
+        result: String,
+    ) -> Result<()> {
         if let Some(ref mut conv) = self.current_conversation {
             conv.add_tool_result(tool_name, arguments, result);
         }

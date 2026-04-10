@@ -5,18 +5,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Metadata about a conversation (stats, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConversationMetadata {
     /// Number of messages in the conversation
     pub message_count: usize,
-}
-
-impl Default for ConversationMetadata {
-    fn default() -> Self {
-        Self {
-            message_count: 0,
-        }
-    }
 }
 
 /// A message in the conversation history
@@ -163,7 +155,8 @@ impl Conversation {
 
     /// Add a tool result to the conversation
     pub fn add_tool_result(&mut self, tool_name: String, arguments: String, result: String) {
-        self.messages.push(Message::tool_result(tool_name, arguments, result));
+        self.messages
+            .push(Message::tool_result(tool_name, arguments, result));
         self.metadata.message_count = self.messages.len();
         self.updated_at = Utc::now();
     }
@@ -220,19 +213,26 @@ mod tests {
     #[test]
     fn test_add_messages() {
         let mut conv = Conversation::new("Test".to_string(), "claude-3".to_string());
-        
+
         conv.add_user_message("Hello".to_string());
         assert_eq!(conv.messages.len(), 1);
-        
+
         conv.add_assistant_message("Hi there!".to_string());
         assert_eq!(conv.messages.len(), 2);
-        
-        conv.add_tool_result("bash".to_string(), r#"{"command": "ls"}"#.to_string(), "output".to_string());
+
+        conv.add_tool_result(
+            "bash".to_string(),
+            r#"{"command": "ls"}"#.to_string(),
+            "output".to_string(),
+        );
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.metadata.message_count, 3);
-        
+
         // Test adding a tool call
-        conv.add_tool_call("file_read".to_string(), r#"{"path": "/test/file.txt"}"#.to_string());
+        conv.add_tool_call(
+            "file_read".to_string(),
+            r#"{"path": "/test/file.txt"}"#.to_string(),
+        );
         assert_eq!(conv.messages.len(), 4);
     }
 
@@ -241,10 +241,10 @@ mod tests {
         let mut conv = Conversation::new("Test".to_string(), "claude-3".to_string());
         conv.add_user_message("Hello".to_string());
         conv.add_assistant_message("Hi!".to_string());
-        
+
         let json = serde_json::to_string(&conv).unwrap();
         let loaded: Conversation = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(loaded.id, conv.id);
         assert_eq!(loaded.name, conv.name);
         assert_eq!(loaded.messages.len(), 2);

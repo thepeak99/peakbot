@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use peakbot::{
-    AgentRunner, Config, SubAgentRegistry, TodoTool, UiAction, Ui, build_system_prompt,
+    AgentRunner, Config, SubAgentRegistry, TodoTool, Ui, UiAction, build_system_prompt,
     create_provider, load_default_skills, load_mcp_servers,
 };
 use std::sync::Arc;
@@ -39,7 +39,10 @@ async fn main() -> Result<()> {
         Some(all_tools)
     };
 
-    let searxng_config = config.searxng_enabled().then(|| config.searxng.as_ref()).flatten();
+    let searxng_config = config
+        .searxng_enabled()
+        .then_some(config.searxng.as_ref())
+        .flatten();
 
     // StateManager must be created before TodoTool so we can pass it in
     let state_manager = Arc::new(peakbot::StateManager::new());
@@ -161,7 +164,7 @@ async fn main() -> Result<()> {
     ui.run().await?;
     ui.shutdown().await?;
 
-    let _ = runner_handle.abort();
+    runner_handle.abort();
     let _ = runner_handle.await;
 
     Ok(())

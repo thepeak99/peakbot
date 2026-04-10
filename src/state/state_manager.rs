@@ -221,11 +221,7 @@ impl StateManager {
 
     /// Sync todo list to UI state
     fn sync_todo_to_ui(&self, list: &TodoList) {
-        let items: Vec<TodoItem> = list
-            .list()
-            .iter()
-            .map(TodoItem::from)
-            .collect();
+        let items: Vec<TodoItem> = list.list().iter().map(TodoItem::from).collect();
 
         let mut state = self.state.write().unwrap();
         state.todo.items = items;
@@ -333,11 +329,7 @@ impl StateManager {
 
     /// Update TODO state — syncs with core TodoList
     pub fn update_todo(&self, todo_list: &TodoList) {
-        let items: Vec<TodoItem> = todo_list
-            .list()
-            .iter()
-            .map(TodoItem::from)
-            .collect();
+        let items: Vec<TodoItem> = todo_list.list().iter().map(TodoItem::from).collect();
 
         let mut state = self.state.write().unwrap();
         state.todo.items = items;
