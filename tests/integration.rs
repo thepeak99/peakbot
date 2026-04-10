@@ -5,6 +5,5 @@
 #![cfg(test)]
 
 mod harness;
-mod mock;
 mod scenarios;
 mod storage;

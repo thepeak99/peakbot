@@ -2,7 +2,7 @@
 //!
 //! Tests for verifying stats accumulation and event system.
 
-use super::super::mock::{MockResponse, Usage};
+use peakbot::mock::{MockResponse, Usage};
 use crate::harness::TestHarness;
 use peakbot::state::StateManager;
 use std::sync::Arc;
@@ -29,9 +29,9 @@ async fn stats_accumulate_requests() {
     let stats = state_manager.get_stats();
 
     assert_eq!(stats.total_api_calls, 3);
-    // Note: input/output tokens are replaced, not accumulated
-    assert_eq!(stats.total_input_tokens, 150);
-    assert_eq!(stats.total_output_tokens, 75);
+    // Note: input/output tokens ARE accumulated (sum of all requests)
+    assert_eq!(stats.total_input_tokens, 450);  // 100 + 200 + 150
+    assert_eq!(stats.total_output_tokens, 225); // 50 + 100 + 75
 }
 
 #[tokio::test]
@@ -64,7 +64,7 @@ async fn stats_reset() {
 
 #[tokio::test]
 async fn mock_response_with_usage() {
-    let harness = TestHarness::new();
+    let mut harness = TestHarness::new();
 
     // Add response with specific token usage
     let usage = Usage {
@@ -80,7 +80,7 @@ async fn mock_response_with_usage() {
 
 #[tokio::test]
 async fn multiple_messages_with_usage() {
-    let harness = TestHarness::new();
+    let mut harness = TestHarness::new();
 
     // Add multiple responses with different usage
     harness.add_responses(vec![

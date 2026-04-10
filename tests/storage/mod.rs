@@ -1,7 +1,11 @@
 //! Storage abstraction for integration testing
+//!
+//! Re-exports storage types from the main peakbot crate for use in tests.
 
 mod in_memory;
-mod storage_trait;
 
+// Re-export InMemoryStorage for tests
 pub use in_memory::InMemoryStorage;
-pub use storage_trait::ConversationStorage;
+
+// Re-export ConversationStorage trait from peakbot
+pub use peakbot::ConversationStorage;

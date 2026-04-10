@@ -1,5 +1,7 @@
 //! PeakBot library - Core functionality for connecting to MCP servers and managing tools.
 
+#[cfg(feature = "mock")]
+pub mod mock;
 mod config;
 mod context_manager;
 mod conversation;
@@ -9,6 +11,8 @@ mod pipeline;
 mod providers;
 mod skills;
 pub mod state;
+pub mod storage;
+pub mod test_runner;
 mod tools;
 pub mod ui;
 
@@ -27,12 +31,17 @@ pub use hooks::{
 };
 pub use pipeline::{DelegateTool, SubAgentRegistry};
 pub use providers::{DynAgent, ProviderInfo, create_provider};
+#[cfg(feature = "mock")]
+pub use providers::create_mock_agent;
+
+pub use test_runner::{CompactionInfo, TestRunner};
 use rig::completion::{Message, PromptError};
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
 use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpClientTransport};
 pub use skills::{SkillRegistry, load_default_skills};
 pub use state::StateManager;
+pub use storage::{ConversationStorage, FileStorage};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
     TodoArgs, TodoItem, TodoStatus, TodoTool,
@@ -144,7 +153,7 @@ pub struct AgentRunner {
     #[allow(unused)]
     skills: SkillRegistry,
     context_manager: Option<ContextManager>,
-    conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
+    conversation_manager: Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
     system_prompt: String,
     state_manager: Option<Arc<StateManager>>,
     // Shared session hook for interrupt/queue state
@@ -178,12 +187,31 @@ impl AgentRunner {
         });
 
         let conversation_manager = if config.conversation_enabled() {
-            match ConversationManager::new(ConversationManagerConfig {
-                auto_save: true,
-                storage_dir: config.conversation_storage_dir(),
-                max_conversations: config.conversation_max(),
-                auto_resume: config.conversation_auto_resume(),
-            }) {
+            let storage = match FileStorage::new(config.conversation_storage_dir()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to create file storage: {}", e);
+                    return Self {
+                        agent,
+                        config,
+                        provider_info,
+                        skills,
+                        context_manager: None,
+                        conversation_manager: None,
+                        system_prompt,
+                        state_manager,
+                        session_hook,
+                        _event_receiver: event_receiver,
+                    };
+                }
+            };
+            match ConversationManager::new(
+                storage,
+                ConversationManagerConfig {
+                    auto_save: true,
+                    max_conversations: config.conversation_max(),
+                },
+            ) {
                 Ok(cm) => Some(Arc::new(Mutex::new(cm))),
                 Err(e) => {
                     tracing::warn!("Failed to initialize conversation manager: {}", e);
@@ -340,7 +368,7 @@ impl AgentRunner {
         msg_tx: tokio::sync::mpsc::Sender<QueueMessage>,
         _completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
         _chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
-        conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
+        conversation_manager: Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
         state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
         config_model: String,
@@ -422,7 +450,7 @@ impl AgentRunner {
         completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
         chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
         mut context_manager: Option<ContextManager>,
-        conversation_manager: Option<Arc<Mutex<ConversationManager>>>,
+        conversation_manager: Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
         state_manager: Option<Arc<StateManager>>,
         agent: Arc<DynAgent>,
         config: Config,
@@ -544,7 +572,7 @@ impl AgentRunner {
         msg: &str,
         chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
         context_manager: &mut Option<ContextManager>,
-        conversation_manager: &Option<Arc<Mutex<ConversationManager>>>,
+        conversation_manager: &Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
@@ -654,7 +682,7 @@ impl AgentRunner {
         cmd: &str,
         chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
         _context_manager: &mut Option<ContextManager>,
-        conversation_manager: &Option<Arc<Mutex<ConversationManager>>>,
+        conversation_manager: &Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
         state_manager: &Option<Arc<StateManager>>,
         _agent: &Arc<DynAgent>,
         config: &Config,

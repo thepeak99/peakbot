@@ -96,7 +96,9 @@ impl ContextManager {
     pub fn get_current_tokens(&self) -> usize {
         let stats_arc = self.state_manager.stats_arc();
         let stats = stats_arc.lock().unwrap();
-        stats.last_input_tokens().unwrap_or(0) as usize
+        // Get cumulative sum of all input tokens across all requests
+        // This represents the actual context size accumulated so far
+        stats.cumulative_input_tokens() as usize
     }
 
     /// Estimate total tokens for messages plus system prompt

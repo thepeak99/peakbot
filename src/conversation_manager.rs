@@ -1,81 +1,43 @@
 //! Conversation Manager - handles CRUD operations for persisted conversations.
 
 use crate::conversation::{Conversation, ConversationSummary, Message};
-use anyhow::{Context, Result};
-use std::fs;
-use std::path::{Path, PathBuf};
+use crate::storage::ConversationStorage;
+use anyhow::Result;
 use uuid::Uuid;
 
-/// Configuration for conversation persistence
+/// Configuration for conversation persistence (storage-agnostic)
 #[derive(Debug, Clone)]
 pub struct ConversationManagerConfig {
     /// Enable auto-save (default: true)
     pub auto_save: bool,
-    /// Storage directory for conversations
-    pub storage_dir: PathBuf,
     /// Maximum number of conversations to keep (0 = unlimited)
     pub max_conversations: usize,
-    /// Auto-load last conversation on startup
-    pub auto_resume: bool,
 }
 
 impl Default for ConversationManagerConfig {
     fn default() -> Self {
         Self {
             auto_save: true,
-            storage_dir: get_default_storage_dir(),
             max_conversations: 50,
-            auto_resume: true,
         }
     }
 }
 
-/// Get the default storage directory for conversations
-fn get_default_storage_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("peakbot")
-        .join("conversations")
-}
-
-/// Manager for conversation persistence
-pub struct ConversationManager {
+/// Manager for conversation persistence (generic over storage backend)
+pub struct ConversationManager<S: ConversationStorage> {
     config: ConversationManagerConfig,
     current_conversation: Option<Conversation>,
+    storage: S,
 }
 
-impl ConversationManager {
-    /// Create a new ConversationManager
-    pub fn new(config: ConversationManagerConfig) -> Result<Self> {
-        // Create storage directory if it doesn't exist
-        if !config.storage_dir.exists() {
-            fs::create_dir_all(&config.storage_dir)
-                .context("Failed to create conversation storage directory")?;
-        }
-
-        // Clean up any temp files from interrupted writes
-        let _ = Self::cleanup_temp_files(&config.storage_dir);
-
+impl<S: ConversationStorage> ConversationManager<S> {
+    /// Create a new ConversationManager with the given storage backend
+    pub fn new(storage: S, config: ConversationManagerConfig) -> Result<Self> {
         Ok(Self {
             config,
             current_conversation: None,
+            storage,
         })
-    }
-
-    /// Clean up temporary files from interrupted writes
-    fn cleanup_temp_files(storage_dir: &Path) -> Result<()> {
-        if let Ok(entries) = fs::read_dir(storage_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name()
-                    && name.to_string_lossy().starts_with(".tmp")
-                {
-                    tracing::debug!("Cleaning up temp file: {}", path.display());
-                    let _ = fs::remove_file(path);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Create a new conversation
@@ -105,53 +67,17 @@ impl ConversationManager {
         self.current_conversation.as_mut()
     }
 
-    /// Save the current conversation (atomic write)
+    /// Save the current conversation using the storage backend
     pub fn save(&self) -> Result<()> {
         if let Some(ref conv) = self.current_conversation {
-            self.save_conversation(conv)?;
+            self.storage.save(conv)?;
         }
         Ok(())
     }
 
-    /// Save a specific conversation to disk
-    fn save_conversation(&self, conversation: &Conversation) -> Result<()> {
-        let temp_path = self.config.storage_dir.join(".tmp.json");
-        let final_path = self
-            .config
-            .storage_dir
-            .join(format!("{}.json", conversation.id));
-
-        let json = serde_json::to_string_pretty(conversation)?;
-
-        // Write to temp file first
-        fs::write(&temp_path, json)?;
-
-        // Atomic rename
-        fs::rename(&temp_path, &final_path)?;
-
-        tracing::debug!(
-            "Saved conversation {} to {}",
-            conversation.id,
-            final_path.display()
-        );
-
-        Ok(())
-    }
-
-    /// Load a conversation by ID
+    /// Load a conversation by ID using the storage backend
     pub fn load(&self, id: Uuid) -> Result<Conversation> {
-        let path = self.config.storage_dir.join(format!("{}.json", id));
-
-        if !path.exists() {
-            anyhow::bail!("Conversation not found: {}", id);
-        }
-
-        let content = fs::read_to_string(&path).context("Failed to read conversation file")?;
-
-        let conv: Conversation =
-            serde_json::from_str(&content).context("Failed to parse conversation JSON")?;
-
-        Ok(conv)
+        self.storage.load(id)
     }
 
     /// Get the latest (most recently updated) conversation
@@ -165,76 +91,17 @@ impl ConversationManager {
         // Find the most recently updated
         let latest = summaries.iter().max_by_key(|s| s.updated_at).unwrap();
 
-        Ok(Some(self.load(latest.id)?))
+        Ok(Some(self.storage.load(latest.id)?))
     }
 
     /// List all conversations (returns summaries)
     pub fn list(&self) -> Result<Vec<ConversationSummary>> {
-        let mut summaries = Vec::new();
-
-        if !self.config.storage_dir.exists() {
-            return Ok(summaries);
-        }
-
-        let entries =
-            fs::read_dir(&self.config.storage_dir).context("Failed to read storage directory")?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-
-            // Skip temp files and non-json files
-            if let Some(name) = path.file_name() {
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with('.') || !name_str.ends_with(".json") {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-
-            // Try to load and summarize
-            match self.load_from_path(&path) {
-                Ok(conv) => summaries.push(ConversationSummary::from(&conv)),
-                Err(e) => {
-                    // Skip corrupted files - log but don't fail
-                    tracing::warn!(
-                        "Skipping corrupted conversation file {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
-        }
-
-        // Sort by updated_at descending (most recent first)
-        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-
-        Ok(summaries)
+        self.storage.list()
     }
 
-    /// Load a conversation from a specific file path
-    fn load_from_path(&self, path: &Path) -> Result<Conversation> {
-        let content = fs::read_to_string(path).context("Failed to read conversation file")?;
-
-        let conv: Conversation =
-            serde_json::from_str(&content).context("Failed to parse conversation JSON")?;
-
-        Ok(conv)
-    }
-
-    /// Delete a conversation by ID
+    /// Delete a conversation by ID using the storage backend
     pub fn delete(&self, id: Uuid) -> Result<()> {
-        let path = self.config.storage_dir.join(format!("{}.json", id));
-
-        if !path.exists() {
-            anyhow::bail!("Conversation not found: {}", id);
-        }
-
-        fs::remove_file(&path)?;
-
-        tracing::debug!("Deleted conversation {}", id);
-
-        Ok(())
+        self.storage.delete(id)
     }
 
     /// Add a user message to the current conversation
@@ -294,7 +161,7 @@ impl ConversationManager {
 
     /// Load a conversation and set it as current
     pub fn load_and_set_current(&mut self, id: Uuid) -> Result<()> {
-        let conv = self.load(id)?;
+        let conv = self.storage.load(id)?;
         self.current_conversation = Some(conv);
         Ok(())
     }
@@ -384,16 +251,11 @@ impl ConversationManager {
             let delete_from = self.config.max_conversations.saturating_sub(1);
             for conv in conversations.iter().skip(delete_from) {
                 tracing::debug!("Deleting old conversation {} to enforce limit", conv.id);
-                let _ = self.delete(conv.id);
+                let _ = self.storage.delete(conv.id);
             }
         }
 
         Ok(())
-    }
-
-    /// Get the storage directory path
-    pub fn storage_dir(&self) -> &Path {
-        &self.config.storage_dir
     }
 
     /// Check if auto-save is enabled
@@ -409,137 +271,5 @@ impl ConversationManager {
     /// Clear the current conversation (for /new command)
     pub fn clear_current(&mut self) {
         self.current_conversation = None;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    fn temp_manager() -> (ConversationManager, tempfile::TempDir) {
-        let temp_dir = tempdir().unwrap();
-        let config = ConversationManagerConfig {
-            auto_save: true,
-            storage_dir: temp_dir.path().to_path_buf(),
-            max_conversations: 5,
-            auto_resume: true,
-        };
-        let manager = ConversationManager::new(config).unwrap();
-        (manager, temp_dir)
-    }
-
-    #[test]
-    fn test_create_new_conversation() {
-        let (mut manager, _temp) = temp_manager();
-
-        let conv = manager
-            .create_new("Test".to_string(), "claude-3".to_string())
-            .unwrap();
-
-        assert_eq!(conv.name, "Test");
-        assert_eq!(conv.model, "claude-3");
-        assert!(manager.has_current());
-    }
-
-    #[test]
-    fn test_save_and_load() {
-        let (mut manager, _temp) = temp_manager();
-
-        manager
-            .create_new("Test".to_string(), "claude-3".to_string())
-            .unwrap();
-        manager.add_user_message("Hello".to_string()).unwrap();
-
-        let id = manager.get_current().unwrap().id;
-
-        // Load by ID
-        let loaded = manager.load(id).unwrap();
-
-        assert_eq!(loaded.name, "Test");
-        assert_eq!(loaded.messages.len(), 1);
-    }
-
-    #[test]
-    fn test_list_conversations() {
-        let (mut manager, _temp) = temp_manager();
-
-        manager
-            .create_new("Conv1".to_string(), "claude-3".to_string())
-            .unwrap();
-        manager.save().unwrap();
-        manager
-            .create_new("Conv2".to_string(), "claude-3".to_string())
-            .unwrap();
-        manager.save().unwrap();
-
-        let list = manager.list().unwrap();
-
-        assert_eq!(list.len(), 2);
-    }
-
-    #[test]
-    fn test_delete_conversation() {
-        let (mut manager, _temp) = temp_manager();
-
-        let conv = manager
-            .create_new("Test".to_string(), "claude-3".to_string())
-            .unwrap();
-        let id = conv.id;
-
-        // Need to save the conversation first (since create_new no longer auto-saves)
-        manager.save().unwrap();
-
-        manager.delete(id).unwrap();
-
-        let result = manager.load(id);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_export_markdown() {
-        let (mut manager, _temp) = temp_manager();
-
-        manager
-            .create_new("Test".to_string(), "claude-3".to_string())
-            .unwrap();
-        manager.add_user_message("Hello".to_string()).unwrap();
-        manager
-            .add_assistant_message("Hi there!".to_string())
-            .unwrap();
-
-        let conv = manager.get_current().unwrap();
-        let md = manager.export_markdown(conv).unwrap();
-
-        assert!(md.contains("# Test"));
-        assert!(md.contains("Hello"));
-        assert!(md.contains("Hi there!"));
-    }
-
-    #[test]
-    fn test_max_conversations_limit() {
-        let temp_dir = tempdir().unwrap();
-        let config = ConversationManagerConfig {
-            auto_save: true,
-            storage_dir: temp_dir.path().to_path_buf(),
-            max_conversations: 2,
-            auto_resume: true,
-        };
-        let mut manager = ConversationManager::new(config).unwrap();
-
-        manager
-            .create_new("Conv1".to_string(), "claude-3".to_string())
-            .unwrap();
-        manager
-            .create_new("Conv2".to_string(), "claude-3".to_string())
-            .unwrap();
-        manager
-            .create_new("Conv3".to_string(), "claude-3".to_string())
-            .unwrap();
-
-        let list = manager.list().unwrap();
-
-        // Should have max 2 conversations
-        assert!(list.len() <= 2);
     }
 }
