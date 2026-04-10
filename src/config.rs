@@ -194,7 +194,7 @@ pub struct Config {
 }
 
 /// Multi-agent pipeline configuration
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
 pub struct PipelineConfig {
     /// Whether multi-agent pipelines are enabled (default: false)
     #[serde(default)]
@@ -203,15 +203,6 @@ pub struct PipelineConfig {
     /// Sub-agent definitions keyed by agent name
     #[serde(default)]
     pub agents: HashMap<String, AgentDefinition>,
-}
-
-impl Default for PipelineConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            agents: HashMap::new(),
-        }
-    }
 }
 
 /// Definition of a sub-agent that can be delegated to
@@ -615,12 +606,12 @@ impl Config {
         }
 
         // mcp_servers - only override if explicitly set
-        if other.mcp_servers != None {
+        if other.mcp_servers.is_some() {
             self.mcp_servers = other.mcp_servers;
         }
 
         // searxng - override if set
-        if other.searxng != None {
+        if other.searxng.is_some() {
             self.searxng = other.searxng;
         }
 
@@ -635,7 +626,7 @@ impl Config {
         }
 
         // conversation - override if set
-        if other.conversation != None {
+        if other.conversation.is_some() {
             self.conversation = other.conversation;
         }
 
@@ -650,12 +641,11 @@ impl Config {
         }
 
         // pipeline - override if set
-        if other.pipeline != None {
+        if other.pipeline.is_some() {
             self.pipeline = other.pipeline;
         }
     }
 }
-
 
 impl Default for Config {
     fn default() -> Self {
@@ -711,9 +701,7 @@ fn load_yaml_config() -> Option<Config> {
 /// If the file is malformed, logs a warning and returns None.
 fn load_per_repo_config() -> Option<Config> {
     // Look for .peakbot/config.yaml in the current working directory
-    let per_repo_path = std::env::current_dir()
-        .ok()?
-        .join(".peakbot/config.yaml");
+    let per_repo_path = std::env::current_dir().ok()?.join(".peakbot/config.yaml");
 
     if !per_repo_path.exists() {
         tracing::debug!("No per-repo config found at {}", per_repo_path.display());
@@ -759,7 +747,10 @@ impl Config {
         // Step 3: Load and merge per-repo config if present (top-level key override)
         if let Some(repo_config) = load_per_repo_config() {
             config.merge_with(repo_config);
-            tracing::debug!("Config after per-repo merge: provider = {:?}", config.provider);
+            tracing::debug!(
+                "Config after per-repo merge: provider = {:?}",
+                config.provider
+            );
         }
 
         // Load environment variables and merge (env vars override YAML/defaults)
@@ -800,26 +791,23 @@ impl Config {
                 // OpenRouter config via legacy env vars
                 if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY")
                     && !api_key.is_empty()
+                    && let ProviderConfig::OpenRouter(ref mut c) = config.provider
                 {
-                    if let ProviderConfig::OpenRouter(ref mut c) = config.provider {
-                        c.api_key = Some(api_key);
-                    }
+                    c.api_key = Some(api_key);
                 }
 
                 if let Ok(model) = std::env::var("OPENROUTER_MODEL")
                     && !model.is_empty()
+                    && let ProviderConfig::OpenRouter(ref mut c) = config.provider
                 {
-                    if let ProviderConfig::OpenRouter(ref mut c) = config.provider {
-                        c.model = model;
-                    }
+                    c.model = model;
                 }
 
                 if let Ok(tokens) = std::env::var("OPENROUTER_MAX_TOKENS")
                     && let Ok(tokens) = tokens.parse()
+                    && let ProviderConfig::OpenRouter(ref mut c) = config.provider
                 {
-                    if let ProviderConfig::OpenRouter(ref mut c) = config.provider {
-                        c.max_tokens = tokens;
-                    }
+                    c.max_tokens = tokens;
                 }
             }
         }
@@ -843,152 +831,140 @@ impl Config {
         tracing::debug!("Final config: provider = {:?}", config.provider);
 
         // SEARXNG_BASE_URL
-        if let Ok(url) = std::env::var("SEARXNG_BASE_URL") {
-            if !url.is_empty() {
-                let searxng = config.searxng.get_or_insert_with(|| SearXngConfig {
-                    base_url: String::new(),
-                    enabled: true,
-                    timeout_seconds: 30,
-                    max_results: 10,
-                });
-                searxng.base_url = url;
-            }
+        if let Ok(url) = std::env::var("SEARXNG_BASE_URL")
+            && !url.is_empty()
+        {
+            let searxng = config.searxng.get_or_insert_with(|| SearXngConfig {
+                base_url: String::new(),
+                enabled: true,
+                timeout_seconds: 30,
+                max_results: 10,
+            });
+            searxng.base_url = url;
         }
 
         // SEARXNG_ENABLED
-        if let Ok(enabled) = std::env::var("SEARXNG_ENABLED") {
-            if let Ok(enabled) = enabled.parse() {
-                let searxng = config.searxng.get_or_insert_with(|| SearXngConfig {
-                    base_url: String::new(),
-                    enabled: true,
-                    timeout_seconds: 30,
-                    max_results: 10,
-                });
-                searxng.enabled = enabled;
-            }
+        if let Ok(enabled) = std::env::var("SEARXNG_ENABLED")
+            && let Ok(enabled) = enabled.parse()
+        {
+            let searxng = config.searxng.get_or_insert_with(|| SearXngConfig {
+                base_url: String::new(),
+                enabled: true,
+                timeout_seconds: 30,
+                max_results: 10,
+            });
+            searxng.enabled = enabled;
         }
 
         // SEARXNG_TIMEOUT
-        if let Ok(timeout) = std::env::var("SEARXNG_TIMEOUT") {
-            if let Ok(timeout) = timeout.parse() {
-                if let Some(searxng) = config.searxng.as_mut() {
-                    searxng.timeout_seconds = timeout;
-                }
-            }
+        if let Ok(timeout) = std::env::var("SEARXNG_TIMEOUT")
+            && let Ok(timeout) = timeout.parse()
+            && let Some(searxng) = config.searxng.as_mut()
+        {
+            searxng.timeout_seconds = timeout;
         }
 
         // SEARXNG_MAX_RESULTS
-        if let Ok(max) = std::env::var("SEARXNG_MAX_RESULTS") {
-            if let Ok(max) = max.parse() {
-                if let Some(searxng) = config.searxng.as_mut() {
-                    searxng.max_results = max;
-                }
-            }
+        if let Ok(max) = std::env::var("SEARXNG_MAX_RESULTS")
+            && let Ok(max) = max.parse()
+            && let Some(searxng) = config.searxng.as_mut()
+        {
+            searxng.max_results = max;
         }
 
         // COST_TRACKING
-        if let Ok(enabled) = std::env::var("COST_TRACKING") {
-            if let Ok(enabled) = enabled.parse() {
-                config.cost_tracking = enabled;
-            }
+        if let Ok(enabled) = std::env::var("COST_TRACKING")
+            && let Ok(enabled) = enabled.parse()
+        {
+            config.cost_tracking = enabled;
         }
 
         // Context compaction config via environment variables
         // CONTEXT_ENABLED
-        if let Ok(enabled) = std::env::var("CONTEXT_ENABLED") {
-            if let Ok(enabled) = enabled.parse() {
-                config.context.enabled = enabled;
-            }
+        if let Ok(enabled) = std::env::var("CONTEXT_ENABLED")
+            && let Ok(enabled) = enabled.parse()
+        {
+            config.context.enabled = enabled;
         }
 
         // CONTEXT_THRESHOLD
-        if let Ok(threshold) = std::env::var("CONTEXT_THRESHOLD") {
-            if let Ok(threshold) = threshold.parse::<f64>() {
-                if threshold >= 0.0 && threshold <= 1.0 {
-                    config.context.threshold = threshold;
-                }
-            }
+        if let Ok(threshold) = std::env::var("CONTEXT_THRESHOLD")
+            && let Ok(threshold) = threshold.parse::<f64>()
+            && (0.0..=1.0).contains(&threshold)
+        {
+            config.context.threshold = threshold;
         }
 
         // CONTEXT_KEEP_RECENT
-        if let Ok(keep_recent) = std::env::var("CONTEXT_KEEP_RECENT") {
-            if let Ok(keep_recent) = keep_recent.parse() {
-                config.context.keep_recent = keep_recent;
-            }
+        if let Ok(keep_recent) = std::env::var("CONTEXT_KEEP_RECENT")
+            && let Ok(keep_recent) = keep_recent.parse()
+        {
+            config.context.keep_recent = keep_recent;
         }
 
         // CONTEXT_WINDOW
-        if let Ok(window) = std::env::var("CONTEXT_WINDOW") {
-            if let Ok(window) = window.parse() {
-                config.context.context_window = Some(window);
-            }
+        if let Ok(window) = std::env::var("CONTEXT_WINDOW")
+            && let Ok(window) = window.parse()
+        {
+            config.context.context_window = Some(window);
         }
 
         // Conversation persistence config via environment variables
         // CONVERSATION_AUTO_SAVE
-        if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_SAVE") {
-            if let Ok(enabled) = enabled.parse() {
-                let conv = config
-                    .conversation
-                    .get_or_insert_with(|| ConversationConfig {
-                        auto_save: true,
-                        storage_dir: None,
-                        max_conversations: 50,
-                        auto_resume: true,
-                    });
-                conv.auto_save = enabled;
-            }
+        if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_SAVE")
+            && let Ok(enabled) = enabled.parse()
+        {
+            let conv = config.conversation.get_or_insert(ConversationConfig {
+                auto_save: true,
+                storage_dir: None,
+                max_conversations: 50,
+                auto_resume: true,
+            });
+            conv.auto_save = enabled;
         }
 
         // CONVERSATION_STORAGE_DIR
-        if let Ok(dir) = std::env::var("CONVERSATION_STORAGE_DIR") {
-            if !dir.is_empty() {
-                let conv = config
-                    .conversation
-                    .get_or_insert_with(|| ConversationConfig {
-                        auto_save: true,
-                        storage_dir: None,
-                        max_conversations: 50,
-                        auto_resume: true,
-                    });
-                conv.storage_dir = Some(std::path::PathBuf::from(dir));
-            }
+        if let Ok(dir) = std::env::var("CONVERSATION_STORAGE_DIR")
+            && !dir.is_empty()
+        {
+            let conv = config.conversation.get_or_insert(ConversationConfig {
+                auto_save: true,
+                storage_dir: None,
+                max_conversations: 50,
+                auto_resume: true,
+            });
+            conv.storage_dir = Some(std::path::PathBuf::from(dir));
         }
 
         // CONVERSATION_MAX_CONVERSATIONS
-        if let Ok(max) = std::env::var("CONVERSATION_MAX_CONVERSATIONS") {
-            if let Ok(max) = max.parse() {
-                let conv = config
-                    .conversation
-                    .get_or_insert_with(|| ConversationConfig {
-                        auto_save: true,
-                        storage_dir: None,
-                        max_conversations: 50,
-                        auto_resume: true,
-                    });
-                conv.max_conversations = max;
-            }
+        if let Ok(max) = std::env::var("CONVERSATION_MAX_CONVERSATIONS")
+            && let Ok(max) = max.parse()
+        {
+            let conv = config.conversation.get_or_insert(ConversationConfig {
+                auto_save: true,
+                storage_dir: None,
+                max_conversations: 50,
+                auto_resume: true,
+            });
+            conv.max_conversations = max;
         }
 
         // CONVERSATION_AUTO_RESUME
-        if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_RESUME") {
-            if let Ok(enabled) = enabled.parse() {
-                let conv = config
-                    .conversation
-                    .get_or_insert_with(|| ConversationConfig {
-                        auto_save: true,
-                        storage_dir: None,
-                        max_conversations: 50,
-                        auto_resume: true,
-                    });
-                conv.auto_resume = enabled;
-            }
+        if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_RESUME")
+            && let Ok(enabled) = enabled.parse()
+        {
+            let conv = config.conversation.get_or_insert(ConversationConfig {
+                auto_save: true,
+                storage_dir: None,
+                max_conversations: 50,
+                auto_resume: true,
+            });
+            conv.auto_resume = enabled;
         }
 
         Ok(config)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1056,30 +1032,26 @@ mod tests {
     #[test]
     fn test_merge_mcp_servers_replacement() {
         let mut master = Config::default();
-        master.mcp_servers = Some(vec![
-            McpServerConfig {
-                name: "master-server".to_string(),
+        master.mcp_servers = Some(vec![McpServerConfig {
+            name: "master-server".to_string(),
+            transport_type: McpTransportType::Stdio,
+            command: Some("npx".to_string()),
+            args: None,
+            env: None,
+            url: None,
+            enabled: true,
+        }]);
+
+        let repo_config = Config {
+            mcp_servers: Some(vec![McpServerConfig {
+                name: "repo-server".to_string(),
                 transport_type: McpTransportType::Stdio,
                 command: Some("npx".to_string()),
                 args: None,
                 env: None,
                 url: None,
                 enabled: true,
-            }
-        ]);
-
-        let repo_config = Config {
-            mcp_servers: Some(vec![
-                McpServerConfig {
-                    name: "repo-server".to_string(),
-                    transport_type: McpTransportType::Stdio,
-                    command: Some("npx".to_string()),
-                    args: None,
-                    env: None,
-                    url: None,
-                    enabled: true,
-                }
-            ]),
+            }]),
             ..Config::default()
         };
 
@@ -1095,7 +1067,7 @@ mod tests {
     #[test]
     fn test_merge_context_config() {
         let master = Config::default();
-        
+
         // Repo overrides context settings
         let repo_config = Config {
             context: ContextConfig {

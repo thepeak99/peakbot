@@ -4,9 +4,9 @@
 //! It mirrors the patterns from ui-example.rs while being compatible
 //! with existing PeakBot types (TodoList, SessionStats, etc.).
 
-use crate::ui::ui_trait::{CommandPopupState, TodoItemAction};
-use crate::tools::todo::TodoItem as CoreTodoItem;
 use crate::TodoStatus;
+use crate::tools::todo::TodoItem as CoreTodoItem;
+use crate::ui::ui_trait::{CommandPopupState, TodoItemAction};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -20,28 +20,28 @@ use std::fmt;
 pub struct AppState {
     /// Chat messages
     pub chat: ChatState,
-    
+
     /// TODO items
     pub todo: TodoState,
-    
+
     /// Input field state
     pub input: InputState,
-    
+
     /// Session statistics (tokens, cost, etc.)
     pub stats: SessionState,
-    
+
     /// Context usage
     pub context: ContextState,
-    
+
     /// Active command popup (for slash commands)
     pub command_popup: Option<CommandPopupState>,
-    
+
     /// Current conversation info
     pub conversation: Option<ConversationState>,
-    
+
     /// UI preferences
     pub preferences: UiPreferences,
-    
+
     /// Whether the agent is currently processing
     #[serde(default)]
     pub is_running: bool,
@@ -61,7 +61,7 @@ pub struct AppState {
     /// Pending notifications for the UI to display
     #[serde(default)]
     pub notifications: Vec<Notification>,
-    
+
     /// Agent status message (e.g., "Compacting...", "Stopped")
     pub status_message: Option<String>,
 }
@@ -78,10 +78,10 @@ impl AppState {
 pub struct ChatState {
     /// Chat messages
     pub messages: Vec<ChatMessage>,
-    
+
     /// Whether to auto-scroll to latest message
     pub auto_scroll: bool,
-    
+
     /// Manual scroll offset (when auto_scroll is disabled)
     pub scroll_offset: usize,
 }
@@ -91,20 +91,20 @@ impl ChatState {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Add a message to the chat
     pub fn add_message(&mut self, message: ChatMessage) {
         self.messages.push(message);
         // Auto-scroll when new messages are added
         self.auto_scroll = true;
     }
-    
+
     /// Clear all messages
     pub fn clear(&mut self) {
         self.messages.clear();
         self.auto_scroll = true;
     }
-    
+
     /// Get the number of messages
     pub fn message_count(&self) -> usize {
         self.messages.len()
@@ -116,10 +116,10 @@ impl ChatState {
 pub struct ChatMessage {
     /// Role of the message sender
     pub role: MessageRole,
-    
+
     /// Message content
     pub content: String,
-    
+
     /// Timestamp when message was created
     pub timestamp: DateTime<Local>,
 }
@@ -133,7 +133,7 @@ impl ChatMessage {
             timestamp: Local::now(),
         }
     }
-    
+
     /// Create a new agent message
     pub fn agent(content: String) -> Self {
         Self {
@@ -142,7 +142,7 @@ impl ChatMessage {
             timestamp: Local::now(),
         }
     }
-    
+
     /// Create a new system message
     pub fn system(content: String) -> Self {
         Self {
@@ -151,7 +151,7 @@ impl ChatMessage {
             timestamp: Local::now(),
         }
     }
-    
+
     /// Create a new tool call message with structured display:
     /// - Shows thought intent first
     /// - Shows key params (2-3 lines max)
@@ -173,12 +173,12 @@ impl ChatMessage {
             timestamp: Local::now(),
         }
     }
-    
+
     /// Create a new assistant message (alias for agent)
     pub fn assistant(content: String) -> Self {
         Self::agent(content)
     }
-    
+
     /// Create a new error message
     pub fn error(content: String) -> Self {
         Self {
@@ -209,10 +209,10 @@ fn format_tool_call(tool_name: &str, args: &str) -> String {
         let mut lines = Vec::new();
 
         // Line 1: Thought intent (always first if present)
-        if let Some(thought) = parsed.get("thought").and_then(|v| v.as_str()) {
-            if !thought.is_empty() {
-                lines.push(format!("💭 {}", truncate_str(thought, 100)));
-            }
+        if let Some(thought) = parsed.get("thought").and_then(|v| v.as_str())
+            && !thought.is_empty()
+        {
+            lines.push(format!("💭 {}", truncate_str(thought, 100)));
         }
 
         // Line 2: Tool name with key params
@@ -280,17 +280,23 @@ fn truncate_line(s: &str, max_len: usize) -> String {
 fn truncate_lines(s: &str, max_lines: usize, max_chars: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     let total = lines.len();
-    
+
     // First truncate each line
-    let truncated: Vec<String> = lines.iter()
-        .map(|l| truncate_line(l, max_chars))
-        .collect();
-    
+    let truncated: Vec<String> = lines.iter().map(|l| truncate_line(l, max_chars)).collect();
+
     if total <= max_lines {
         truncated.join("\n")
     } else {
-        let preview: Vec<&str> = truncated.iter().take(max_lines).map(|s| s.as_str()).collect();
-        format!("{}\n... [{} lines truncated]", preview.join("\n"), total - max_lines)
+        let preview: Vec<&str> = truncated
+            .iter()
+            .take(max_lines)
+            .map(|s| s.as_str())
+            .collect();
+        format!(
+            "{}\n... [{} lines truncated]",
+            preview.join("\n"),
+            total - max_lines
+        )
     }
 }
 
@@ -304,7 +310,8 @@ fn format_bash_result(result: &str) -> String {
     let lines: Vec<&str> = result.lines().collect();
 
     // Extract exit code
-    let exit_code = lines.iter()
+    let exit_code = lines
+        .iter()
         .find(|l| l.starts_with("Exit code:"))
         .map(|l| l.split_whitespace().last().unwrap_or("0"))
         .unwrap_or("0");
@@ -336,7 +343,8 @@ fn format_bash_result(result: &str) -> String {
     let mut output = format!("{} Exit {}", exit_icon, exit_code);
 
     // Show first 2-3 lines of stdout (truncated to 60 chars each)
-    let stdout_preview: Vec<String> = stdout_lines.iter()
+    let stdout_preview: Vec<String> = stdout_lines
+        .iter()
         .take(2)
         .map(|l| truncate_line(l, 60))
         .collect();
@@ -366,10 +374,7 @@ fn format_file_read_result(result: &str) -> String {
     let total_lines = lines.len();
 
     // Truncate lines and show first 3 only
-    let truncated: Vec<String> = lines.iter()
-        .take(3)
-        .map(|l| truncate_line(l, 60))
-        .collect();
+    let truncated: Vec<String> = lines.iter().take(3).map(|l| truncate_line(l, 60)).collect();
     let preview_str = truncated.join("\n");
 
     let mut output = format!("📄 {} lines\n{}", total_lines, preview_str);
@@ -386,10 +391,7 @@ fn format_list_directory_result(result: &str) -> String {
     let total = lines.len();
 
     // Truncate each entry and show first 3
-    let preview: Vec<String> = lines.iter()
-        .take(3)
-        .map(|l| truncate_line(l, 60))
-        .collect();
+    let preview: Vec<String> = lines.iter().take(3).map(|l| truncate_line(l, 60)).collect();
     let preview_str = preview.join(", ");
 
     let mut output = format!("📁 {} entries\n{}", total, preview_str);
@@ -404,10 +406,7 @@ fn format_list_directory_result(result: &str) -> String {
 fn format_search_result(result: &str) -> String {
     // Truncate each line and show first 3 results
     let lines: Vec<&str> = result.lines().collect();
-    let preview: Vec<String> = lines.iter()
-        .take(3)
-        .map(|l| truncate_line(l, 60))
-        .collect();
+    let preview: Vec<String> = lines.iter().take(3).map(|l| truncate_line(l, 60)).collect();
     let preview_str = preview.join("\n");
 
     let mut output = preview_str;
@@ -430,16 +429,16 @@ fn format_generic_result(result: &str) -> String {
 pub enum MessageRole {
     /// User message
     User,
-    
+
     /// Agent (AI) message
     Agent,
-    
+
     /// System message
     System,
-    
+
     /// Tool invocation
     ToolCall,
-    
+
     /// Tool execution result
     ToolResult,
 }
@@ -461,7 +460,7 @@ impl fmt::Display for MessageRole {
 pub struct TodoState {
     /// Whether the TODO panel is visible
     pub visible: bool,
-    
+
     /// TODO items
     pub items: Vec<TodoItem>,
 }
@@ -471,19 +470,19 @@ impl TodoState {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Toggle visibility
     pub fn toggle_visibility(&mut self) {
         self.visible = !self.visible;
     }
-    
+
     /// Add a TODO item
     pub fn add_item(&mut self, text: String) -> TodoItem {
         let item = TodoItem::new(text);
         self.items.push(item.clone());
         item
     }
-    
+
     /// Update a TODO item by index
     pub fn update_item(&mut self, index: usize, action: TodoItemAction) -> Option<TodoItem> {
         if let Some(item) = self.items.get_mut(index) {
@@ -509,26 +508,26 @@ impl TodoState {
             None
         }
     }
-    
+
     /// Remove a TODO item by index
     pub fn remove_item(&mut self, index: usize) -> Option<TodoItem> {
         Some(self.items.remove(index))
     }
-    
+
     /// Clear completed items
     pub fn clear_completed(&mut self) -> usize {
         let initial = self.items.len();
         self.items.retain(|item| !item.completed);
         initial - self.items.len()
     }
-    
+
     /// Get count of items by status
     pub fn count_by_status(&self) -> (usize, usize, usize, usize) {
         let mut pending = 0;
         let mut in_progress = 0;
         let mut completed = 0;
         let mut cancelled = 0;
-        
+
         for item in &self.items {
             match item.status {
                 TodoStatus::Pending => pending += 1,
@@ -537,7 +536,7 @@ impl TodoState {
                 TodoStatus::Cancelled => cancelled += 1,
             }
         }
-        
+
         (pending, in_progress, completed, cancelled)
     }
 }
@@ -551,16 +550,16 @@ impl TodoState {
 pub struct TodoItem {
     /// Unique ID (from core TodoItem)
     pub id: usize,
-    
+
     /// Task description
     pub text: String,
-    
+
     /// Whether the item is completed
     pub completed: bool,
-    
+
     /// Status of the item
     pub status: TodoStatus,
-    
+
     /// Whether this item is currently selected
     #[serde(default)]
     pub selected: bool,
@@ -597,15 +596,15 @@ impl From<&CoreTodoItem> for TodoItem {
 pub struct InputState {
     /// Current input buffer
     pub buffer: String,
-    
+
     /// Cursor position in the buffer
     #[serde(default)]
     pub cursor_pos: usize,
-    
+
     /// Whether the input is in command mode (after typing /)
     #[serde(default)]
     pub in_command_mode: bool,
-    
+
     /// Number of wrapped lines in the input (for dynamic height)
     #[serde(default)]
     pub wrapped_lines: usize,
@@ -616,7 +615,7 @@ impl InputState {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Clear the input buffer
     pub fn clear(&mut self) {
         self.buffer.clear();
@@ -624,22 +623,22 @@ impl InputState {
         self.in_command_mode = false;
         self.wrapped_lines = 0;
     }
-    
+
     /// Check if the buffer is empty
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
-    
+
     /// Get the current cursor position
     pub fn cursor(&self) -> usize {
         self.cursor_pos
     }
-    
+
     /// Set the cursor position
     pub fn set_cursor(&mut self, pos: usize) {
         self.cursor_pos = pos.min(self.buffer.len());
     }
-    
+
     /// Set the wrapped line count
     pub fn set_wrapped_lines(&mut self, lines: usize) {
         self.wrapped_lines = lines;
@@ -651,16 +650,16 @@ impl InputState {
 pub struct SessionState {
     /// Total input tokens
     pub total_input_tokens: u64,
-    
+
     /// Total output tokens
     pub total_output_tokens: u64,
-    
+
     /// Total API calls
     pub total_api_calls: u64,
-    
+
     /// Total cost in USD
     pub total_cost: f64,
-    
+
     /// Current model name
     pub model: String,
 }
@@ -670,17 +669,17 @@ impl SessionState {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Get total tokens
     pub fn total_tokens(&self) -> u64 {
         self.total_input_tokens + self.total_output_tokens
     }
-    
+
     /// Format cost as a string
     pub fn format_cost(&self) -> String {
         format!("{:.4}", self.total_cost)
     }
-    
+
     /// Format tokens as a string with K/M suffix
     pub fn format_tokens(&self, tokens: u64) -> String {
         if tokens >= 1_000_000 {
@@ -698,14 +697,14 @@ impl SessionState {
 pub struct ContextState {
     /// Current context usage (tokens)
     pub current_usage: u64,
-    
+
     /// Context window size (tokens)
     pub window_size: u64,
-    
+
     /// Whether compaction is enabled
     #[serde(default)]
     pub compaction_enabled: bool,
-    
+
     /// Compaction threshold (0.0 - 1.0)
     #[serde(default = "default_threshold")]
     pub compaction_threshold: f64,
@@ -716,7 +715,7 @@ impl ContextState {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Get usage as a percentage
     pub fn usage_percentage(&self) -> f64 {
         if self.window_size == 0 {
@@ -724,7 +723,7 @@ impl ContextState {
         }
         (self.current_usage as f64 / self.window_size as f64) * 100.0
     }
-    
+
     /// Check if compaction should be triggered
     pub fn should_compact(&self) -> bool {
         self.compaction_enabled && self.usage_percentage() >= (self.compaction_threshold * 100.0)
@@ -740,16 +739,16 @@ fn default_threshold() -> f64 {
 pub struct ConversationState {
     /// Conversation ID
     pub id: String,
-    
+
     /// Conversation name
     pub name: String,
-    
+
     /// Model used
     pub model: String,
-    
+
     /// Message count
     pub message_count: usize,
-    
+
     /// Last updated timestamp
     pub updated_at: DateTime<Local>,
 }
@@ -773,15 +772,15 @@ pub struct UiPreferences {
     /// Theme (light/dark)
     #[serde(default = "default_theme")]
     pub theme: String,
-    
+
     /// Font size
     #[serde(default = "default_font_size")]
     pub font_size: u8,
-    
+
     /// Show timestamps
     #[serde(default)]
     pub show_timestamps: bool,
-    
+
     /// Wrap long lines
     #[serde(default = "default_true")]
     pub wrap_lines: bool,

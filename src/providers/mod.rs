@@ -7,8 +7,8 @@ use crate::config::{
     BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig,
     SearXngConfig,
 };
-use crate::hooks::events::AgentEvent;
 use crate::hooks::SessionHook;
+use crate::hooks::events::AgentEvent;
 use crate::state::StateManager;
 use crate::tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
@@ -116,7 +116,12 @@ pub fn create_provider(
                 pipeline_registry,
                 state_manager,
             )?;
-            Ok((DynAgent::OpenRouter(agent), info, Some(receiver), Arc::new(hook)))
+            Ok((
+                DynAgent::OpenRouter(agent),
+                info,
+                Some(receiver),
+                Arc::new(hook),
+            ))
         }
         ProviderConfig::OpenAI(c) => {
             let (agent, info, receiver, hook) = create_openai_agent(
@@ -132,7 +137,12 @@ pub fn create_provider(
                 pipeline_registry,
                 state_manager,
             )?;
-            Ok((DynAgent::OpenAI(agent), info, Some(receiver), Arc::new(hook)))
+            Ok((
+                DynAgent::OpenAI(agent),
+                info,
+                Some(receiver),
+                Arc::new(hook),
+            ))
         }
         ProviderConfig::LlamaCpp(c) => {
             let (agent, info, receiver, hook) = create_llamacpp_agent(
@@ -148,7 +158,12 @@ pub fn create_provider(
                 pipeline_registry,
                 state_manager,
             )?;
-            Ok((DynAgent::LlamaCpp(agent), info, Some(receiver), Arc::new(hook)))
+            Ok((
+                DynAgent::LlamaCpp(agent),
+                info,
+                Some(receiver),
+                Arc::new(hook),
+            ))
         }
         ProviderConfig::Ollama(c) => {
             let (agent, info) = create_ollama_agent(
@@ -165,7 +180,7 @@ pub fn create_provider(
             Ok((
                 DynAgent::Ollama(agent),
                 info,
-                None, // No event channel for Ollama
+                None,                             // No event channel for Ollama
                 Arc::new(SessionHook::new(None)), // Empty hook for Ollama
             ))
         }

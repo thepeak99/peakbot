@@ -41,10 +41,7 @@ pub fn render_todo_panel(
             Style::default().fg(Color::DarkGray).italic(),
         )])]
     } else {
-        items
-            .iter()
-            .map(render_todo_item)
-            .collect::<Vec<_>>()
+        items.iter().map(render_todo_item).collect::<Vec<_>>()
     };
 
     let content_height = content_lines.len();
@@ -70,7 +67,7 @@ pub fn render_todo_panel(
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
         let scroll_state = ScrollbarState::new(content_height).position(scroll);
-        
+
         // Render scrollbar on the right edge
         let scroll_area = Rect::new(area.right() - 1, area.top(), 1, area.height);
         f.render_stateful_widget(scrollbar, scroll_area, &mut scroll_state.clone());
@@ -97,13 +94,30 @@ fn render_todo_item(item: &TodoItem) -> Line<'static> {
     let id_style = Style::default().fg(Color::DarkGray);
     let icon_style = Style::default().fg(color);
 
+    // Truncate text if too long (panel is narrow)
+    let max_text_len = 30;
+    let text = truncate_text(&item.text, max_text_len);
+
     Line::from(vec![
         Span::styled(icon, icon_style),
         Span::raw(" "),
         Span::styled(format!("#{}", item.id), id_style),
         Span::raw(" "),
-        Span::styled(item.text.clone(), text_style),
+        Span::styled(text, text_style),
     ])
+}
+
+/// Truncate text to max_len, adding "..." if truncated
+fn truncate_text(s: &str, max_len: usize) -> String {
+    let width = s.chars().count();
+    if width <= max_len {
+        s.to_string()
+    } else if max_len < 3 {
+        "...".to_string()
+    } else {
+        let end = max_len - 3;
+        s.chars().take(end).collect::<String>() + "..."
+    }
 }
 
 /// Calculate how many lines the todo panel needs to display all items

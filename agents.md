@@ -2,7 +2,7 @@
 
 ## Overview
 
-PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.31). It runs as a terminal REPL, equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills. Additional features include conversation persistence, todo list management, and an event-driven hooks system for cost tracking.
+PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.33). It runs as a terminal REPL, equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills. Additional features include conversation persistence, todo list management, and an event-driven hooks system for cost tracking.
 
 ## Architecture
 
@@ -501,5 +501,85 @@ src/
     ├── think.rs            # ThinkTool -- reasoning tool
     ├── todo.rs             # TodoTool -- todo list management
     └── logging_wrapper.rs  # LoggingToolDyn -- wrapper for MCP tool tracing
+└── tests/
+    ├── integration.rs         # Test module entry point
+    ├── harness/               # Test utilities (TestHarness, mock providers)
+    ├── mock/                  # MockCompletionModel for testing
+    ├── scenarios/              # Test scenarios
+    │   ├── message_roundtrip.rs
+    │   ├── stats_tests.rs
+    │   └── tool_tests.rs
+    └── storage/               # Storage implementations for tests
+```
+
+## Testing
+
+PeakBot includes a comprehensive integration test suite in `tests/integration.rs` that uses a `MockCompletionModel` for testing without requiring API calls.
+
+### Test Architecture
+
+**MockCompletionModel** (`tests/mock/`): A mock implementation of Rig's `CompletionModel` trait that returns pre-configured responses:
+- Supports text responses, tool calls, and streamed responses
+- Configurable delay simulation for async operations
+- Tracks all requests for verification
+
+**ConversationStorage Trait** (`tests/storage/`): Abstract storage interface for conversation persistence:
+- `InMemoryStorage` - Default implementation for tests
+- Enables testing conversation save/load without filesystem
+
+**TestHarness** (`tests/harness/`): Test utility that creates an agent with:
+- MockCompletionModel for LLM responses
+- InMemoryStorage for conversation persistence
+- Isolated todo state per test
+
+**Test Scenarios** (`tests/scenarios/`):
+- `message_roundtrip.rs` - Message flow through the agent
+- `stats_tests.rs` - Cost tracking and statistics
+- `tool_tests.rs` - Tool functionality tests
+
+### Running Tests
+
+```bash
+# Run all tests
+cargo test
+
+# Run integration tests only
+cargo test --test integration
+
+# Run with output
+cargo test -- --nocapture
+```
+
+### Test Categories
+
+| Category | Tests | Description |
+|----------|-------|-------------|
+| **Message Roundtrips** | Basic roundtrip, multi-turn, system prompt preservation | Tests that messages flow correctly through the agent |
+| **Stats Tracking** | Cost tracking, token counting, sequential requests | Verifies cost tracking works correctly |
+| **Storage Operations** | Save/load conversations, clear history | Tests conversation persistence |
+| **Todo Tool** | Add, update, remove, list todos | Direct TodoTool functionality |
+| **Error Handling** | Empty responses, invalid inputs | Edge case handling |
+
+### Writing New Tests
+
+```rust
+#[test]
+fn my_new_test() {
+    let harness = TestHarness::new()
+        .with_text_response("Hello!")
+        .build();
+    
+    let (output, _) = harness.run_prompt("Say hello");
+    assert!(output.contains("Hello!"));
+}
+```
+
+For testing specific provider behavior or error conditions, use the builder pattern:
+
+```rust
+let harness = TestHarness::new()
+    .with_streamed_response(vec!["Part ", "one"])
+    .with_conversation_id("test-session")
+    .build();
 ```
 

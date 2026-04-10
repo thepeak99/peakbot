@@ -122,7 +122,10 @@ impl SubAgentRegistry {
             .get(&provider_name)
             .ok_or_else(|| SubAgentError::UnsupportedProvider(provider_name.clone()))?;
 
-        let model = def.model.clone().unwrap_or_else(|| default_config.model.clone());
+        let model = def
+            .model
+            .clone()
+            .unwrap_or_else(|| default_config.model.clone());
         let max_tokens = def.max_tokens.unwrap_or(default_config.max_tokens);
         let base_url = default_config.base_url.clone();
 
@@ -138,7 +141,7 @@ impl SubAgentRegistry {
                     .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?;
 
                 let (hook, _receiver) = SessionHook::with_channel();
-                
+
                 let agent = client
                     .agent(&model)
                     .preamble(&def.prompt)
@@ -170,7 +173,7 @@ impl SubAgentRegistry {
                     .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?;
 
                 let (hook, _receiver) = SessionHook::with_channel();
-                
+
                 let agent = client
                     .agent(&model)
                     .preamble(&def.prompt)
@@ -200,7 +203,7 @@ impl SubAgentRegistry {
                     .completions_api();
 
                 let (hook, _receiver) = SessionHook::with_channel();
-                
+
                 let agent = client
                     .agent(&model)
                     .preamble(&def.prompt)

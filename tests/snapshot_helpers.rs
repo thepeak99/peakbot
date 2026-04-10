@@ -1,10 +1,6 @@
 //! Helper functions for testing Ratatui widgets with TestBackend.
 
-use ratatui::{
-    backend::TestBackend,
-    widgets::Widget,
-    Terminal,
-};
+use ratatui::{Terminal, backend::TestBackend, widgets::Widget};
 
 /// Render a widget to a TestBackend terminal and return it for assertions.
 pub fn render_widget<W: Widget>(widget: W, width: u16, height: u16) -> Terminal<TestBackend> {
@@ -24,7 +20,7 @@ pub fn buffer_to_lines(backend: &TestBackend) -> Vec<String> {
     let buf = backend.buffer();
     let width = buf.area.width as usize;
     let content = buf.content();
-    
+
     content
         .chunks(width)
         .map(|row| {

@@ -14,4 +14,4 @@ pub use file_read::FileReadTool;
 pub use list_directory::ListDirectoryTool;
 pub use search::SearchTool;
 pub use think::ThinkTool;
-pub use todo::{TodoStatus, TodoTool};
+pub use todo::{TodoArgs, TodoItem, TodoStatus, TodoTool};

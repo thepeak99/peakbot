@@ -638,9 +638,9 @@ mod tests {
     /// Test todo panel with a single pending item
     #[test]
     fn todo_panel_single_pending() {
+        use peakbot::TodoStatus;
         use peakbot::ui::app_state::TodoState;
         use peakbot::ui::repl::todo_panel::render_todo_panel;
-        use peakbot::TodoStatus;
 
         let mut state = TodoState::default();
         state.items.push(peakbot::ui::app_state::TodoItem {
@@ -665,9 +665,9 @@ mod tests {
     /// Test todo panel with a single in-progress item
     #[test]
     fn todo_panel_single_in_progress() {
+        use peakbot::TodoStatus;
         use peakbot::ui::app_state::TodoState;
         use peakbot::ui::repl::todo_panel::render_todo_panel;
-        use peakbot::TodoStatus;
 
         let mut state = TodoState::default();
         state.items.push(peakbot::ui::app_state::TodoItem {
@@ -692,9 +692,9 @@ mod tests {
     /// Test todo panel with a single completed item (should show strikethrough)
     #[test]
     fn todo_panel_single_completed() {
+        use peakbot::TodoStatus;
         use peakbot::ui::app_state::TodoState;
         use peakbot::ui::repl::todo_panel::render_todo_panel;
-        use peakbot::TodoStatus;
 
         let mut state = TodoState::default();
         state.items.push(peakbot::ui::app_state::TodoItem {
@@ -719,9 +719,9 @@ mod tests {
     /// Test todo panel with a single cancelled item
     #[test]
     fn todo_panel_single_cancelled() {
+        use peakbot::TodoStatus;
         use peakbot::ui::app_state::TodoState;
         use peakbot::ui::repl::todo_panel::render_todo_panel;
-        use peakbot::TodoStatus;
 
         let mut state = TodoState::default();
         state.items.push(peakbot::ui::app_state::TodoItem {
@@ -746,9 +746,9 @@ mod tests {
     /// Test todo panel with multiple items
     #[test]
     fn todo_panel_multiple_items() {
+        use peakbot::TodoStatus;
         use peakbot::ui::app_state::TodoState;
         use peakbot::ui::repl::todo_panel::render_todo_panel;
-        use peakbot::TodoStatus;
 
         let mut state = TodoState::default();
         state.items.push(peakbot::ui::app_state::TodoItem {
@@ -787,9 +787,9 @@ mod tests {
     /// Test todo panel with many items (tests scroll behavior)
     #[test]
     fn todo_panel_many_items() {
+        use peakbot::TodoStatus;
         use peakbot::ui::app_state::TodoState;
         use peakbot::ui::repl::todo_panel::render_todo_panel;
-        use peakbot::TodoStatus;
 
         let mut state = TodoState::default();
         for i in 1..=15 {

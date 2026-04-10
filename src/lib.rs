@@ -32,15 +32,15 @@ use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
 use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpClientTransport};
 pub use skills::{SkillRegistry, load_default_skills};
+pub use state::StateManager;
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
-    TodoStatus, TodoTool,
+    TodoArgs, TodoItem, TodoStatus, TodoTool,
 };
 pub use ui::{Ui, UiAction};
-pub use state::StateManager;
 
 use anyhow::{Result, anyhow};
-use rmcp::service::{RunningService, RoleClient, ServiceExt};
+use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -368,7 +368,7 @@ impl AgentRunner {
                     }
 
                     // If agent is running, interrupt it first
-                    if state_manager.as_ref().map_or(false, |sm| sm.is_running()) {
+                    if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
                         session_hook.request_stop();
                     }
 
@@ -379,7 +379,7 @@ impl AgentRunner {
                 UiAction::ExecuteCommand(cmd) => {
                     if cmd == "/stop" {
                         // Only stop if agent is actually running
-                        if state_manager.as_ref().map_or(false, |sm| sm.is_running()) {
+                        if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
                             session_hook.request_stop();
                             msg_tx.send(QueueMessage::StopMarker).await.ok();
                             if let Some(ref sm) = state_manager {
@@ -397,7 +397,7 @@ impl AgentRunner {
 
                 UiAction::RequestStop => {
                     // Only stop if agent is actually running
-                    if state_manager.as_ref().map_or(false, |sm| sm.is_running()) {
+                    if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
                         session_hook.request_stop();
                         msg_tx.send(QueueMessage::StopMarker).await.ok();
                         if let Some(ref sm) = state_manager {
@@ -505,21 +505,14 @@ impl AgentRunner {
     ///
     /// This is the Controller's responsibility — it decides how domain events
     /// affect the UI state. The Model (StateManager) is passive and only holds data.
-    fn process_event_for_ui(
-        state_manager: &Option<Arc<StateManager>>,
-        event: AgentEvent,
-    ) {
+    fn process_event_for_ui(state_manager: &Option<Arc<StateManager>>, event: AgentEvent) {
         use crate::ui::app_state::ChatMessage;
 
         match event {
             AgentEvent::CompletionResponse { usage, .. } => {
                 // Update stats in StateManager (single source of truth)
                 if let Some(sm) = state_manager {
-                    sm.add_request(
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.cost,
-                    );
+                    sm.add_request(usage.input_tokens, usage.output_tokens, usage.cost);
                 }
             }
             AgentEvent::ToolCall {
@@ -617,10 +610,10 @@ impl AgentRunner {
                     // Sync stats and todo to StateManager
 
                     // Save conversation
-                    if let Some(cm) = conversation_manager.as_ref() {
-                        if let Err(e) = cm.lock().unwrap().save() {
-                            tracing::warn!("Failed to save conversation: {}", e);
-                        }
+                    if let Some(cm) = conversation_manager.as_ref()
+                        && let Err(e) = cm.lock().unwrap().save()
+                    {
+                        tracing::warn!("Failed to save conversation: {}", e);
                     }
 
                     return CompletionResult::Success;
@@ -928,10 +921,10 @@ impl AgentRunner {
 }
 
 /// Handle for a connected MCP server.
-/// 
+///
 /// Holds both the tools and the service connection. The service connection
 /// must be kept alive for as long as the tools are used, and should be
-/// properly closed on drop to avoid the "RunningService dropped without 
+/// properly closed on drop to avoid the "RunningService dropped without
 /// explicit close()" warning.
 pub struct McpServerHandle {
     #[allow(unused)]
@@ -944,7 +937,7 @@ pub struct McpServerHandle {
 }
 
 /// Wrapper enum for MCP service connections.
-/// 
+///
 /// Both stdio and HTTP transports use `RunningService<RoleClient, ()>` when acting
 /// as a client, but the inner service type differs (child process vs HTTP client).
 /// This enum allows us to store the correct type while providing a uniform interface.
@@ -960,7 +953,7 @@ impl Drop for McpServerHandle {
             McpService::Stdio(s) => s.take(),
             McpService::Http(s) => s.take(),
         };
-        
+
         if let Some(mut s) = service {
             // Spawn a task to close the service properly
             // This avoids blocking in Drop while ensuring clean shutdown
@@ -984,14 +977,14 @@ impl McpServerHandle {
     }
 
     /// Take ownership of the tools, consuming this handle.
-    /// 
+    ///
     /// Note: The MCP service connection will be closed when this handle is dropped.
     /// For explicit control over service shutdown, use `close_and_take_tools()` instead.
     pub fn into_tools(self) -> Vec<Box<dyn ToolDyn>> {
         // Use ManuallyDrop to prevent our Drop impl from running
         // since we're consuming the handle intentionally
         let this = std::mem::ManuallyDrop::new(self);
-        
+
         // Access fields through the ManuallyDrop'd reference
         this.tools
             .iter()
@@ -1001,7 +994,7 @@ impl McpServerHandle {
     }
 
     /// Close the MCP service connection and get the tools.
-    /// 
+    ///
     /// This properly closes the service before extracting tools.
     pub async fn close_and_take_tools(mut self) -> Vec<Box<dyn ToolDyn>> {
         // Close the service first (extract from Option via take on &mut self)
@@ -1011,11 +1004,11 @@ impl McpServerHandle {
             McpService::Stdio(s) => s.take(),
             McpService::Http(s) => s.take(),
         };
-        
+
         if let Some(mut s) = service {
             s.close().await.ok();
         }
-        
+
         self.into_tools()
     }
 }
