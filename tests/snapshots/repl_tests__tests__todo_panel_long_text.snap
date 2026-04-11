@@ -4,9 +4,9 @@ expression: "lines.join(\"\\n\")"
 ---
 ┌ ✓ TODO ────────────────────┐
 │○ #1 This is a very long    │
-│task de...                  │
-│                            │
-│                            │
+│task description that should│
+│definitely be truncated when│
+│displayed                   │
 │                            │
 │                            │
 │                            │

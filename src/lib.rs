@@ -1,12 +1,12 @@
 //! PeakBot library - Core functionality for connecting to MCP servers and managing tools.
 
-#[cfg(feature = "mock")]
-pub mod mock;
 mod config;
 mod context_manager;
 mod conversation;
 mod conversation_manager;
 mod hooks;
+#[cfg(feature = "mock")]
+pub mod mock;
 mod pipeline;
 mod providers;
 mod skills;
@@ -30,11 +30,10 @@ pub use hooks::{
     AgentEvent, ModelPricing, SessionHook, SessionStats, TokenUsage, fetch_model_pricing,
 };
 pub use pipeline::{DelegateTool, SubAgentRegistry};
-pub use providers::{DynAgent, ProviderInfo, create_provider};
 #[cfg(feature = "mock")]
 pub use providers::create_mock_agent;
+pub use providers::{DynAgent, ProviderInfo, create_provider};
 
-pub use test_runner::{CompactionInfo, TestRunner};
 use rig::completion::{Message, PromptError};
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
@@ -42,6 +41,7 @@ use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpC
 pub use skills::{SkillRegistry, load_default_skills};
 pub use state::StateManager;
 pub use storage::{ConversationStorage, FileStorage};
+pub use test_runner::{CompactionInfo, TestRunner};
 pub use tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
     TodoArgs, TodoItem, TodoStatus, TodoTool,

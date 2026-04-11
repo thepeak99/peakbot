@@ -3,8 +3,8 @@
 //! Provides a fast, isolated storage backend for tests.
 //! No disk I/O, no cleanup needed.
 
-use peakbot::ConversationStorage;
 use anyhow::Result;
+use peakbot::ConversationStorage;
 use peakbot::{Conversation, ConversationSummary};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

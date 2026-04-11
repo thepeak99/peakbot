@@ -258,21 +258,21 @@ fn format_tool_result(tool_name: &str, result: &str) -> String {
     }
 }
 
-/// Truncate a string to max_len, adding "..." if truncated
+/// Truncate a string to max_len chars, adding "..." if truncated
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        s.chars().take(max_len.saturating_sub(3)).collect::<String>() + "..."
     }
 }
 
 /// Truncate a single line to max chars, adding "..." if truncated
 fn truncate_line(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        s.chars().take(max_len.saturating_sub(3)).collect::<String>() + "..."
     }
 }
 

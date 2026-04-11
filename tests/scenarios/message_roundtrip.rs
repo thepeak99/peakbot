@@ -3,8 +3,7 @@
 //! Tests for verifying the complete message flow through the agent.
 
 use crate::harness::TestHarness;
-use peakbot::mock::{MockCompletionModel, MockResponse};
-use peakbot::{AgentEvent, SessionHook, TokenUsage};
+use peakbot::mock::MockResponse;
 
 #[tokio::test]
 async fn simple_message_roundtrip() {

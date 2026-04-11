@@ -92,26 +92,33 @@ impl StateManager {
 
     // ── Todo Operations ────────────────────────────────────────────────────────
 
-    /// Add a new todo item
-    pub fn add_todo(&self, task: String) -> String {
+    /// Add a new todo item (fails if duplicate exists)
+    /// Returns Ok(String) on success, Err(String) if duplicate
+    pub fn add_todo(&self, task: String) -> Result<String, String> {
         let was_empty = {
             let list = self.todo_list.lock().unwrap();
             list.list().is_empty()
         };
-        let item = {
+        
+        let add_result = {
             let mut list = self.todo_list.lock().unwrap();
-            let item = list.add(task);
-            self.sync_todo_to_ui(&list);
-            item
+            list.add(task)
         };
-        // Auto-show todo panel when first task is added
-        if was_empty {
-            self.show_todo_panel();
+        
+        match add_result {
+            Ok(item) => {
+                self.sync_todo_to_ui(&self.todo_list.lock().unwrap());
+                // Auto-show todo panel when first task is added
+                if was_empty {
+                    self.show_todo_panel();
+                }
+                Ok(format!("Added task #{}: {}", item.id, item.task))
+            }
+            Err(msg) => Err(msg),
         }
-        format!("Added task #{}: {}", item.id, item.task)
     }
 
-    /// Add multiple todo items
+    /// Add multiple todo items (skips duplicates silently)
     pub fn add_todos(&self, tasks: Vec<String>) -> String {
         if tasks.is_empty() {
             return "No tasks provided.".to_string();
@@ -127,10 +134,12 @@ impl StateManager {
             items
         };
         // Auto-show todo panel when first tasks are added to empty list
-        if was_empty {
+        if was_empty && !items.is_empty() {
             self.show_todo_panel();
         }
-        if items.len() == 1 {
+        if items.is_empty() {
+            "No new tasks added (all were duplicates or empty).".to_string()
+        } else if items.len() == 1 {
             format!("Added task #{}: {}", items[0].id, items[0].task)
         } else {
             let task_list: Vec<String> = items

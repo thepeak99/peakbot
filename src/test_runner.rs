@@ -8,15 +8,15 @@
 //! - Exposes state managers for direct verification
 //! - Simplified configuration for testing
 
+use crate::ContextManager;
 use crate::config::ContextConfig;
 use crate::conversation_manager::{ConversationManager, ConversationManagerConfig};
 use crate::hooks::{AgentEvent, SessionHook};
 use crate::providers::DynAgent;
 use crate::state::StateManager;
 use crate::storage::InMemoryStorage;
-use crate::ContextManager;
-use rig::completion::message::Message;
 use rig::completion::PromptError;
+use rig::completion::message::Message;
 use std::sync::{Arc, Mutex};
 
 /// Result of processing a message through the TestRunner
@@ -262,30 +262,27 @@ impl TestRunner {
         self.state_manager.set_running(true);
 
         // Context compaction check
-        if let Some(ref mut cm) = self.context_manager {
-            if cm.needs_compaction(history) {
-                let original_count = history.len();
-                match cm.compact(history, &self.system_prompt).await {
-                    Ok(result) => {
-                        // Track compaction event for test verification
-                        self.compaction_events.lock().unwrap().push(CompactionInfo {
-                            original_count,
-                            compacted_count: result.compacted_count,
-                            num_discarded: result.num_discarded,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("Context compaction failed: {}", e);
-                    }
+        if let Some(ref mut cm) = self.context_manager
+            && cm.needs_compaction(history)
+        {
+            let original_count = history.len();
+            match cm.compact(history, &self.system_prompt).await {
+                Ok(result) => {
+                    // Track compaction event for test verification
+                    self.compaction_events.lock().unwrap().push(CompactionInfo {
+                        original_count,
+                        compacted_count: result.compacted_count,
+                        num_discarded: result.num_discarded,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Context compaction failed: {}", e);
                 }
             }
         }
 
         // Call the agent with history
-        let result = self
-            .agent
-            .prompt_with_history(&current_msg, history)
-            .await;
+        let result = self.agent.prompt_with_history(&current_msg, history).await;
 
         // Process events from the session hook to update stats
         // This is needed because ContextManager reads token counts from StateManager
@@ -301,7 +298,8 @@ impl TestRunner {
                     let mut cm = cm.lock().unwrap();
                     // Create a new conversation if none exists
                     if !cm.has_current() {
-                        let _ = cm.create_new("test-conversation".to_string(), "mock-model".to_string());
+                        let _ = cm
+                            .create_new("test-conversation".to_string(), "mock-model".to_string());
                     }
                     // Add the user message
                     let _ = cm.add_user_message(current_msg.clone());
@@ -326,17 +324,17 @@ impl TestRunner {
     }
 
     /// Process events from the session hook to update StateManager stats.
-    /// 
+    ///
     /// This is critical for E2E compression tests because ContextManager reads
     /// token counts from StateManager. Without this, the token counts will be 0
     /// and compaction will never trigger.
     fn process_session_hook_events(&self) {
         // Get the stats from the session hook and sync to state manager
         let hook_stats = self.session_hook.get_stats();
-        
+
         // Reset state manager stats (also syncs to AppState)
         self.state_manager.reset_stats();
-        
+
         // Replay each request through StateManager.add_request() which:
         //   - accumulates API call count and cost
         //   - syncs stats to AppState (so get_state() reflects them)
@@ -345,7 +343,8 @@ impl TestRunner {
         for req in hook_stats.all_requests() {
             let cost = (req.input_tokens as f64 * pricing.input_per_token)
                 + (req.output_tokens as f64 * pricing.output_per_token);
-            self.state_manager.add_request(req.input_tokens, req.output_tokens, cost);
+            self.state_manager
+                .add_request(req.input_tokens, req.output_tokens, cost);
         }
     }
 
@@ -395,7 +394,9 @@ impl TestRunner {
     }
 
     /// Get a reference to the conversation manager
-    pub fn conversation_manager(&self) -> Option<&Arc<Mutex<ConversationManager<InMemoryStorage>>>> {
+    pub fn conversation_manager(
+        &self,
+    ) -> Option<&Arc<Mutex<ConversationManager<InMemoryStorage>>>> {
         self.conversation_manager.as_ref()
     }
 }

@@ -33,10 +33,8 @@ async fn compaction_triggers_with_small_window() {
         enabled: true,
     };
 
-    let mut harness = TestHarness::with_system_prompt_and_context(
-        "You are a helpful assistant.",
-        context_config,
-    );
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
     // With 150 tokens per request:
     // Stats are synced AFTER each agent call, so compaction triggers
@@ -110,23 +108,51 @@ async fn compaction_reduces_history() {
     let context_config = ContextConfig {
         context_window: Some(300), // Very small window
         threshold: 0.5,            // 50% = 150 tokens threshold
-        keep_recent: 1,           // Keep only last message
+        keep_recent: 1,            // Keep only last message
         enabled: true,
     };
 
-    let mut harness = TestHarness::with_system_prompt_and_context(
-        "You are a helpful assistant.",
-        context_config,
-    );
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
     // Use realistic token counts - 100 tokens per request
     // After 2 requests: 200 tokens (above 150 threshold)
     harness.add_responses(vec![
-        MockResponse::text_with_usage("Response 1", Usage { input_tokens: 100, output_tokens: 20 }),
-        MockResponse::text_with_usage("Response 2", Usage { input_tokens: 100, output_tokens: 20 }),
-        MockResponse::text_with_usage("Response 3", Usage { input_tokens: 100, output_tokens: 20 }),
-        MockResponse::text_with_usage("Response 4", Usage { input_tokens: 100, output_tokens: 20 }),
-        MockResponse::text_with_usage("Response 5", Usage { input_tokens: 100, output_tokens: 20 }),
+        MockResponse::text_with_usage(
+            "Response 1",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 2",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 3",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 4",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 5",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+        ),
     ]);
 
     // Build up conversation history
@@ -157,21 +183,43 @@ async fn compaction_reduces_history() {
 async fn compaction_preserves_recent_messages() {
     let context_config = ContextConfig {
         context_window: Some(400),
-        threshold: 0.75,           // 75% = 300 tokens
-        keep_recent: 3,            // Keep last 3 messages
+        threshold: 0.75, // 75% = 300 tokens
+        keep_recent: 3,  // Keep last 3 messages
         enabled: true,
     };
 
-    let mut harness = TestHarness::with_system_prompt_and_context(
-        "You are a helpful assistant.",
-        context_config,
-    );
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
     harness.add_responses(vec![
-        MockResponse::text_with_usage("Response 1", Usage { input_tokens: 100, output_tokens: 20 }),
-        MockResponse::text_with_usage("Response 2", Usage { input_tokens: 100, output_tokens: 20 }),
-        MockResponse::text_with_usage("Response 3", Usage { input_tokens: 100, output_tokens: 20 }),
-        MockResponse::text_with_usage("Response 4", Usage { input_tokens: 100, output_tokens: 20 }),
+        MockResponse::text_with_usage(
+            "Response 1",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 2",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 3",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 4",
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+        ),
     ]);
 
     // Run messages until compaction triggers
@@ -202,19 +250,41 @@ async fn compaction_skipped_when_disabled() {
         context_window: Some(100), // Tiny window
         threshold: 0.5,
         keep_recent: 2,
-        enabled: false,           // DISABLED
+        enabled: false, // DISABLED
     };
 
-    let mut harness = TestHarness::with_system_prompt_and_context(
-        "You are a helpful assistant.",
-        context_config,
-    );
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
     harness.add_responses(vec![
-        MockResponse::text_with_usage("Response 1", Usage { input_tokens: 50, output_tokens: 10 }),
-        MockResponse::text_with_usage("Response 2", Usage { input_tokens: 50, output_tokens: 10 }),
-        MockResponse::text_with_usage("Response 3", Usage { input_tokens: 50, output_tokens: 10 }),
-        MockResponse::text_with_usage("Response 4", Usage { input_tokens: 50, output_tokens: 10 }),
+        MockResponse::text_with_usage(
+            "Response 1",
+            Usage {
+                input_tokens: 50,
+                output_tokens: 10,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 2",
+            Usage {
+                input_tokens: 50,
+                output_tokens: 10,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 3",
+            Usage {
+                input_tokens: 50,
+                output_tokens: 10,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response 4",
+            Usage {
+                input_tokens: 50,
+                output_tokens: 10,
+            },
+        ),
     ]);
 
     // Run many messages
@@ -235,24 +305,58 @@ async fn compaction_skipped_when_disabled() {
 async fn multiple_compaction_events() {
     let context_config = ContextConfig {
         context_window: Some(200), // Very small window
-        threshold: 0.6,           // 60% = 120 tokens
-        keep_recent: 1,           // Keep only last message
+        threshold: 0.6,            // 60% = 120 tokens
+        keep_recent: 1,            // Keep only last message
         enabled: true,
     };
 
-    let mut harness = TestHarness::with_system_prompt_and_context(
-        "You are a helpful assistant.",
-        context_config,
-    );
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
     // Use small token counts to trigger multiple compactions
     harness.add_responses(vec![
-        MockResponse::text_with_usage("Response", Usage { input_tokens: 80, output_tokens: 15 }),
-        MockResponse::text_with_usage("Response", Usage { input_tokens: 80, output_tokens: 15 }),
-        MockResponse::text_with_usage("Response", Usage { input_tokens: 80, output_tokens: 15 }),
-        MockResponse::text_with_usage("Response", Usage { input_tokens: 80, output_tokens: 15 }),
-        MockResponse::text_with_usage("Response", Usage { input_tokens: 80, output_tokens: 15 }),
-        MockResponse::text_with_usage("Response", Usage { input_tokens: 80, output_tokens: 15 }),
+        MockResponse::text_with_usage(
+            "Response",
+            Usage {
+                input_tokens: 80,
+                output_tokens: 15,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response",
+            Usage {
+                input_tokens: 80,
+                output_tokens: 15,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response",
+            Usage {
+                input_tokens: 80,
+                output_tokens: 15,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response",
+            Usage {
+                input_tokens: 80,
+                output_tokens: 15,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response",
+            Usage {
+                input_tokens: 80,
+                output_tokens: 15,
+            },
+        ),
+        MockResponse::text_with_usage(
+            "Response",
+            Usage {
+                input_tokens: 80,
+                output_tokens: 15,
+            },
+        ),
     ]);
 
     // Build up conversation - should trigger multiple compactions
@@ -337,12 +441,18 @@ async fn history_cleared() {
     harness.run_message("Test").await;
 
     let history_before = harness.get_chat_history().await;
-    assert!(!history_before.is_empty(), "Should have history before clear");
+    assert!(
+        !history_before.is_empty(),
+        "Should have history before clear"
+    );
 
     harness.clear_chat_history().await;
 
     let history_after = harness.get_chat_history().await;
-    assert!(history_after.is_empty(), "Should have empty history after clear");
+    assert!(
+        history_after.is_empty(),
+        "Should have empty history after clear"
+    );
 }
 
 /// Test conversation continues after multiple messages (basic flow test)

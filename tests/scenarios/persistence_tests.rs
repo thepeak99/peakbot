@@ -21,7 +21,11 @@ async fn conversation_save_via_agent() {
         let cm = cm.lock().unwrap();
         let conv = cm.get_current();
         assert!(conv.is_some(), "Conversation should exist after save");
-        assert_eq!(conv.unwrap().messages.len(), 2, "Should have user + assistant message");
+        assert_eq!(
+            conv.unwrap().messages.len(),
+            2,
+            "Should have user + assistant message"
+        );
     }
 }
 
@@ -57,15 +61,18 @@ async fn conversation_list_functionality() {
 
     // Create a conversation
     harness.run_message("Test message").await;
-    
+
     // List conversations in the same harness instance
     if let Some(cm) = harness.conversation_manager() {
         let cm = cm.lock().unwrap();
         let list = cm.list().unwrap();
         // Should have at least one conversation
-        assert!(!list.is_empty(), "Should have at least one conversation in the list");
+        assert!(
+            !list.is_empty(),
+            "Should have at least one conversation in the list"
+        );
     }
-    
+
     // Note: Testing conversation persistence across harness instances
     // requires shared storage, which is a more advanced feature.
     // For now, we verify the list functionality works within a single instance.
@@ -85,10 +92,13 @@ async fn conversation_metadata_preserved() {
         let conv = cm.get_current();
         assert!(conv.is_some());
         let conv = conv.unwrap();
-        
+
         assert!(!conv.name.is_empty(), "Conversation should have a name");
         assert!(!conv.model.is_empty(), "Conversation should have a model");
-        assert!(conv.created_at <= chrono::Utc::now(), "Created at should be in the past");
+        assert!(
+            conv.created_at <= chrono::Utc::now(),
+            "Created at should be in the past"
+        );
     }
 }
 
@@ -96,7 +106,7 @@ async fn conversation_metadata_preserved() {
 #[tokio::test]
 async fn tool_calls_recorded_in_conversation() {
     let mut harness = TestHarness::new();
-    
+
     // Queue tool call followed by final response
     harness.add_response(MockResponse::tool_call(
         "todo",
@@ -114,10 +124,14 @@ async fn tool_calls_recorded_in_conversation() {
         let cm = cm.lock().unwrap();
         let conv = cm.get_current();
         assert!(conv.is_some());
-        
+
         // Check message count - should have user + tool call + assistant response
         let message_count = conv.unwrap().messages.len();
         // With tool call: user message + tool call message + assistant response
-        assert!(message_count >= 2, "Should have at least user + assistant message, got {}", message_count);
+        assert!(
+            message_count >= 2,
+            "Should have at least user + assistant message, got {}",
+            message_count
+        );
     }
 }

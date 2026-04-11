@@ -5,7 +5,5 @@
 mod in_memory;
 
 // Re-export InMemoryStorage for tests
+#[allow(unused_imports)]
 pub use in_memory::InMemoryStorage;
-
-// Re-export ConversationStorage trait from peakbot
-pub use peakbot::ConversationStorage;

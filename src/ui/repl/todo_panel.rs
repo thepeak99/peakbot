@@ -94,9 +94,7 @@ fn render_todo_item(item: &TodoItem) -> Line<'static> {
     let id_style = Style::default().fg(Color::DarkGray);
     let icon_style = Style::default().fg(color);
 
-    // Truncate text if too long (panel is narrow)
-    let max_text_len = 30;
-    let text = truncate_text(&item.text, max_text_len);
+    let text = item.text.clone();
 
     Line::from(vec![
         Span::styled(icon, icon_style),

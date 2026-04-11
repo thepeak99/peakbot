@@ -178,7 +178,7 @@ impl TestHarness {
     }
 
     /// Get a reference to the state manager for assertions
-    /// 
+    ///
     /// Allows tests to verify state changes after tool execution,
     /// todo modifications, stats accumulation, etc.
     pub fn state_manager(&self) -> &Arc<StateManager> {
@@ -189,7 +189,9 @@ impl TestHarness {
     ///
     /// Allows tests to verify conversation persistence behavior.
     /// Returns None if conversation manager was not initialized.
-    pub fn conversation_manager(&self) -> Option<&Arc<Mutex<ConversationManager<InMemoryStorage>>>> {
+    pub fn conversation_manager(
+        &self,
+    ) -> Option<&Arc<Mutex<ConversationManager<InMemoryStorage>>>> {
         self.runner.conversation_manager()
     }
 

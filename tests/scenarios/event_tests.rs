@@ -4,8 +4,8 @@
 //! All tests verify that events are correctly emitted and contain expected data.
 
 use crate::harness::TestHarness;
-use peakbot::mock::{MockResponse, Usage};
 use peakbot::AgentEvent;
+use peakbot::mock::{MockResponse, Usage};
 
 /// Test that CompletionResponse event is emitted after agent response
 #[tokio::test]
@@ -19,9 +19,9 @@ async fn completion_response_event_emitted() {
 
     // Drain all events and verify CompletionResponse was emitted
     let events = harness.drain_events();
-    let has_completion = events.iter().any(|e| {
-        matches!(e, AgentEvent::CompletionResponse { .. })
-    });
+    let has_completion = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::CompletionResponse { .. }));
     assert!(has_completion, "Should emit CompletionResponse event");
 }
 
@@ -42,11 +42,9 @@ async fn tool_call_event_emitted() {
 
     // Drain all events and verify ToolCall was emitted
     let events = harness.drain_events();
-    let has_tool_call = events.iter().any(|e| {
-        match e {
-            AgentEvent::ToolCall { tool_name, .. } => tool_name == "todo",
-            _ => false,
-        }
+    let has_tool_call = events.iter().any(|e| match e {
+        AgentEvent::ToolCall { tool_name, .. } => tool_name == "todo",
+        _ => false,
     });
     assert!(has_tool_call, "Should emit ToolCall event for 'todo' tool");
 }
@@ -68,22 +66,23 @@ async fn tool_result_event_emitted() {
 
     // Drain all events and verify ToolResult was emitted
     let events = harness.drain_events();
-    let has_tool_result = events.iter().any(|e| {
-        match e {
-            AgentEvent::ToolResult { tool_name, success, .. } => {
-                tool_name == "todo" && *success
-            }
-            _ => false,
-        }
+    let has_tool_result = events.iter().any(|e| match e {
+        AgentEvent::ToolResult {
+            tool_name, success, ..
+        } => tool_name == "todo" && *success,
+        _ => false,
     });
-    assert!(has_tool_result, "Should emit ToolResult event with success=true");
+    assert!(
+        has_tool_result,
+        "Should emit ToolResult event with success=true"
+    );
 }
 
 /// Test that stats accumulate from events (token counting)
 #[tokio::test]
 async fn stats_accumulate_from_events() {
     let mut harness = TestHarness::new();
-    
+
     // Add response with specific token usage
     let usage = Usage {
         input_tokens: 100,
@@ -95,16 +94,17 @@ async fn stats_accumulate_from_events() {
 
     // Drain events and verify token usage is tracked
     let events = harness.drain_events();
-    
+
     // Find CompletionResponse event with usage
-    let completion_event = events.iter().find_map(|e| {
-        match e {
-            AgentEvent::CompletionResponse { usage, .. } => Some(usage),
-            _ => None,
-        }
+    let completion_event = events.iter().find_map(|e| match e {
+        AgentEvent::CompletionResponse { usage, .. } => Some(usage),
+        _ => None,
     });
 
-    assert!(completion_event.is_some(), "Should have CompletionResponse with usage");
+    assert!(
+        completion_event.is_some(),
+        "Should have CompletionResponse with usage"
+    );
     let usage = completion_event.unwrap();
     assert_eq!(usage.input_tokens, 100, "Input tokens should be tracked");
     assert_eq!(usage.output_tokens, 50, "Output tokens should be tracked");
@@ -119,17 +119,17 @@ async fn events_emitted_in_order() {
     harness.run_message("Test").await;
 
     let events = harness.drain_events();
-    
+
     // Verify we have events
     assert!(!events.is_empty(), "Should have emitted at least one event");
-    
+
     // If we have both request and response, response should come after request
-    let request_idx = events.iter().position(|e| {
-        matches!(e, AgentEvent::CompletionRequest { .. })
-    });
-    let response_idx = events.iter().position(|e| {
-        matches!(e, AgentEvent::CompletionResponse { .. })
-    });
+    let request_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::CompletionRequest { .. }));
+    let response_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::CompletionResponse { .. }));
 
     if let (Some(req_idx), Some(resp_idx)) = (request_idx, response_idx) {
         assert!(
