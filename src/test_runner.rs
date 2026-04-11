@@ -11,7 +11,7 @@
 use crate::ContextManager;
 use crate::config::ContextConfig;
 use crate::conversation_manager::{ConversationManager, ConversationManagerConfig};
-use crate::hooks::{AgentEvent, SessionHook};
+use crate::hooks::SessionHook;
 use crate::providers::DynAgent;
 use crate::state::StateManager;
 use crate::storage::InMemoryStorage;
@@ -60,20 +60,15 @@ pub struct TestRunner {
     chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
     /// System prompt
     pub system_prompt: String,
-    /// Sender for external event access (kept for future use)
-    #[allow(dead_code)]
-    event_sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
     /// Track compaction events for testing verification
     compaction_events: Arc<Mutex<Vec<CompactionInfo>>>,
 }
 
 impl TestRunner {
     /// Create a new TestRunner with the given configuration
-    #[allow(dead_code)]
     pub fn new(
         agent: DynAgent,
         state_manager: Arc<StateManager>,
-        _event_receiver: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
         session_hook: Arc<SessionHook>,
         system_prompt: String,
     ) -> Self {
@@ -101,9 +96,6 @@ impl TestRunner {
             Err(_) => None,
         };
 
-        // Create channel for external event access
-        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-
         Self {
             agent,
             state_manager,
@@ -112,7 +104,6 @@ impl TestRunner {
             session_hook,
             chat_history: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             system_prompt,
-            event_sender: sender,
             compaction_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -121,14 +112,12 @@ impl TestRunner {
     pub fn new_with_shared_events(
         agent: DynAgent,
         state_manager: Arc<StateManager>,
-        event_sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         session_hook: Arc<SessionHook>,
         system_prompt: String,
     ) -> Self {
         Self::new_with_context(
             agent,
             state_manager,
-            event_sender,
             session_hook,
             system_prompt,
             ContextConfig::default(),
@@ -143,7 +132,6 @@ impl TestRunner {
     pub fn new_with_context(
         agent: DynAgent,
         state_manager: Arc<StateManager>,
-        event_sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         session_hook: Arc<SessionHook>,
         system_prompt: String,
         context_config: ContextConfig,
@@ -180,7 +168,6 @@ impl TestRunner {
             session_hook,
             chat_history: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             system_prompt,
-            event_sender,
             compaction_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -231,25 +218,6 @@ impl TestRunner {
             ProcessResult::Stopped => "Agent stopped".to_string(),
             ProcessResult::Error => "Error occurred".to_string(),
         }
-    }
-
-    /// Internal message processing - mirrors AgentRunner::process_message_internal
-    #[allow(dead_code)]
-    async fn process_message_internal(&mut self, msg: &str) -> ProcessResult {
-        // Get and clear current history
-        let mut history_guard = self.chat_history.lock().await;
-        let mut history: Vec<Message> = std::mem::take(&mut *history_guard);
-        drop(history_guard);
-
-        let result = self
-            .process_message_internal_with_history(msg, &mut history)
-            .await;
-
-        // Put history back
-        let mut history_guard = self.chat_history.lock().await;
-        *history_guard = history;
-
-        result
     }
 
     /// Internal message processing with explicit history
@@ -430,7 +398,6 @@ mod tests {
         let mut runner = TestRunner::new_with_shared_events(
             DynAgent::Mock(agent),
             state_manager,
-            sender,
             session_hook_arc,
             "You are a helpful assistant.".to_string(),
         );
@@ -466,7 +433,6 @@ mod tests {
         let mut runner = TestRunner::new_with_shared_events(
             DynAgent::Mock(agent),
             state_manager.clone(),
-            sender,
             session_hook_arc,
             "You are a helpful assistant.".to_string(),
         );
