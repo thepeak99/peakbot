@@ -91,7 +91,6 @@ impl TestHarness {
         let runner = TestRunner::new_with_context(
             peakbot::DynAgent::Mock(agent),
             state_manager.clone(),
-            sender,
             session_hook_arc,
             preamble.to_string(),
             context_config,
