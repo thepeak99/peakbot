@@ -128,7 +128,7 @@ impl CompletionModel for MockCompletionModel {
                         total_tokens: u.input_tokens + u.output_tokens,
                         cached_input_tokens: 0,
                     })
-                    .unwrap_or(self.default_usage.clone());
+                    .unwrap_or(self.default_usage);
 
                 let content_clone = content.clone();
                 Ok(CompletionResponse {
@@ -169,7 +169,7 @@ impl CompletionModel for MockCompletionModel {
                         total_tokens: u.input_tokens + u.output_tokens,
                         cached_input_tokens: 0,
                     })
-                    .unwrap_or(self.default_usage.clone());
+                    .unwrap_or(self.default_usage);
 
                 Ok(CompletionResponse {
                     choice: OneOrMany::many(contents)
