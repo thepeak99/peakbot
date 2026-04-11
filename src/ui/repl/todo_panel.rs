@@ -105,19 +105,6 @@ fn render_todo_item(item: &TodoItem) -> Line<'static> {
     ])
 }
 
-/// Truncate text to max_len, adding "..." if truncated
-fn truncate_text(s: &str, max_len: usize) -> String {
-    let width = s.chars().count();
-    if width <= max_len {
-        s.to_string()
-    } else if max_len < 3 {
-        "...".to_string()
-    } else {
-        let end = max_len - 3;
-        s.chars().take(end).collect::<String>() + "..."
-    }
-}
-
 /// Calculate how many lines the todo panel needs to display all items
 #[allow(dead_code)]
 pub fn calculate_content_height(state: &TodoState, _width: u16) -> usize {

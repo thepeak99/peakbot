@@ -92,62 +92,81 @@ impl StateManager {
 
     // ── Todo Operations ────────────────────────────────────────────────────────
 
-    /// Add a new todo item (fails if duplicate exists)
-    /// Returns Ok(String) on success, Err(String) if duplicate
-    pub fn add_todo(&self, task: String) -> Result<String, String> {
+    /// Add a new todo item (returns result indicating if new or already existed)
+    pub fn add_todo(&self, task: String) -> String {
         let was_empty = {
             let list = self.todo_list.lock().unwrap();
             list.list().is_empty()
         };
         
-        let add_result = {
+        let result = {
             let mut list = self.todo_list.lock().unwrap();
             list.add(task)
         };
         
-        match add_result {
-            Ok(item) => {
-                self.sync_todo_to_ui(&self.todo_list.lock().unwrap());
-                // Auto-show todo panel when first task is added
-                if was_empty {
-                    self.show_todo_panel();
-                }
-                Ok(format!("Added task #{}: {}", item.id, item.task))
-            }
-            Err(msg) => Err(msg),
+        // Sync to UI
+        self.sync_todo_to_ui(&self.todo_list.lock().unwrap());
+        
+        // Auto-show todo panel when first task is added
+        if was_empty && result.is_new {
+            self.show_todo_panel();
+        }
+        
+        if result.is_new {
+            format!("Added task #{}: {}", result.id, result.task)
+        } else {
+            format!("Task already exists as #{}: {}", result.id, result.task)
         }
     }
 
-    /// Add multiple todo items (skips duplicates silently)
+    /// Add multiple todo items
+    /// Returns results for all tasks (both new and existing)
     pub fn add_todos(&self, tasks: Vec<String>) -> String {
         if tasks.is_empty() {
             return "No tasks provided.".to_string();
         }
+        
         let was_empty = {
             let list = self.todo_list.lock().unwrap();
             list.list().is_empty()
         };
-        let items = {
+        
+        let results = {
             let mut list = self.todo_list.lock().unwrap();
-            let items = list.add_many(tasks);
+            let results = list.add_many(tasks);
             self.sync_todo_to_ui(&list);
-            items
+            results
         };
+        
+        // Separate new and existing tasks
+        let new_tasks: Vec<_> = results.iter().filter(|r| r.is_new).collect();
+        let existing_tasks: Vec<_> = results.iter().filter(|r| !r.is_new).collect();
+        
         // Auto-show todo panel when first tasks are added to empty list
-        if was_empty && !items.is_empty() {
+        if was_empty && !new_tasks.is_empty() {
             self.show_todo_panel();
         }
-        if items.is_empty() {
-            "No new tasks added (all were duplicates or empty).".to_string()
-        } else if items.len() == 1 {
-            format!("Added task #{}: {}", items[0].id, items[0].task)
-        } else {
-            let task_list: Vec<String> = items
+        
+        // Build response message
+        let mut output = String::new();
+        
+        if !new_tasks.is_empty() {
+            let new_list: Vec<String> = new_tasks
                 .iter()
-                .map(|i| format!("#{}: {}", i.id, i.task))
+                .map(|r| format!("#{}: {}", r.id, r.task))
                 .collect();
-            format!("Added {} tasks: {}", items.len(), task_list.join(", "))
+            output.push_str(&format!("Added {} task(s): {}\n", new_tasks.len(), new_list.join(", ")));
         }
+        
+        if !existing_tasks.is_empty() {
+            let existing_list: Vec<String> = existing_tasks
+                .iter()
+                .map(|r| format!("#{}: {}", r.id, r.task))
+                .collect();
+            output.push_str(&format!("Already existed: {}", existing_list.join(", ")));
+        }
+        
+        output.trim().to_string()
     }
 
     /// Update todo item status

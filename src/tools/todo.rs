@@ -42,6 +42,14 @@ pub struct TodoItem {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Result of adding a task - either newly added or already exists
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddTaskResult {
+    pub id: usize,
+    pub task: String,
+    pub is_new: bool,
+}
+
 /// The todo list manager
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TodoList {
@@ -58,21 +66,24 @@ impl TodoList {
         }
     }
 
-    /// Check if a task with the same text already exists (case-insensitive)
-    pub fn contains_task(&self, task: &str) -> bool {
+    /// Add a new task (returns AddTaskResult indicating if new or already existed)
+    /// Returns the task info with is_new=false if duplicate exists (case-insensitive)
+    pub fn add(&mut self, task: String) -> AddTaskResult {
         let task_lower = task.to_lowercase();
-        self.tasks.iter().any(|t| t.task.to_lowercase() == task_lower)
-    }
-
-    /// Add a new task (fails if duplicate exists)
-    /// Returns Ok(TodoItem) on success, Err(message) if duplicate
-    pub fn add(&mut self, task: String) -> Result<TodoItem, String> {
-        if self.contains_task(&task) {
-            return Err(format!("Task already exists: {}", task));
+        
+        // Check if task already exists (case-insensitive)
+        if let Some(existing) = self.tasks.iter().find(|t| t.task.to_lowercase() == task_lower) {
+            return AddTaskResult {
+                id: existing.id,
+                task: existing.task.clone(),
+                is_new: false,
+            };
         }
+        
         let now = Utc::now();
+        let id = self.next_id;
         let item = TodoItem {
-            id: self.next_id,
+            id,
             task,
             status: TodoStatus::Pending,
             created_at: now,
@@ -80,12 +91,18 @@ impl TodoList {
         };
         self.next_id += 1;
         self.tasks.push(item.clone());
-        Ok(item)
+        
+        AddTaskResult {
+            id,
+            task: item.task,
+            is_new: true,
+        }
     }
 
-    /// Add multiple tasks at once (skips duplicates silently)
-    pub fn add_many(&mut self, tasks: Vec<String>) -> Vec<TodoItem> {
-        tasks.into_iter().filter_map(|task| self.add(task).ok()).collect()
+    /// Add multiple tasks at once
+    /// Returns results for all tasks (both new and existing)
+    pub fn add_many(&mut self, tasks: Vec<String>) -> Vec<AddTaskResult> {
+        tasks.into_iter().map(|task| self.add(task)).collect()
     }
 
     /// Update task status
@@ -322,13 +339,10 @@ impl Tool for TodoTool {
                     ));
                 }
 
-                // If single task, use add_todo which fails on duplicate
-                // If multiple tasks, use add_todos which skips duplicates silently
+                // Use add_todo for single task, add_todos for multiple
+                // Both now return strings with info about new vs existing tasks
                 if tasks.len() == 1 {
-                    match sm.add_todo(tasks.into_iter().next().unwrap()) {
-                        Ok(result) => Ok(result),
-                        Err(msg) => Err(TodoError::DuplicateTask(msg)),
-                    }
+                    Ok(sm.add_todo(tasks.into_iter().next().unwrap()))
                 } else {
                     Ok(sm.add_todos(tasks))
                 }
@@ -385,36 +399,40 @@ mod tests {
     #[test]
     fn test_add_task() {
         let mut list = TodoList::new();
-        let item = list.add("Test task".to_string()).unwrap();
+        let result = list.add("Test task".to_string());
 
-        assert_eq!(item.id, 1);
-        assert_eq!(item.task, "Test task");
-        assert_eq!(item.status, TodoStatus::Pending);
+        assert!(result.is_new);
+        assert_eq!(result.id, 1);
+        assert_eq!(result.task, "Test task");
     }
 
     #[test]
-    fn test_add_duplicate_fails() {
+    fn test_add_duplicate_returns_existing() {
         let mut list = TodoList::new();
-        list.add("Test task".to_string()).unwrap();
-        
-        let result = list.add("Test task".to_string());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("already exists"));
+        let first = list.add("Test task".to_string());
+        assert_eq!(first.id, 1);
+        assert!(first.is_new);
+
+        let second = list.add("Test task".to_string());
+        assert!(!second.is_new);
+        assert_eq!(second.id, 1);
+        assert_eq!(second.task, "Test task");
     }
 
     #[test]
     fn test_add_duplicate_case_insensitive() {
         let mut list = TodoList::new();
-        list.add("Test task".to_string()).unwrap();
-        
+        list.add("Test task".to_string());
+
         let result = list.add("test task".to_string());
-        assert!(result.is_err());
+        assert!(!result.is_new);
+        assert_eq!(result.id, 1);
     }
 
     #[test]
     fn test_update_status() {
         let mut list = TodoList::new();
-        list.add("Test task".to_string()).unwrap();
+        list.add("Test task".to_string());
 
         let updated = list.update_status(1, TodoStatus::InProgress);
         assert!(updated.is_some());
@@ -424,7 +442,7 @@ mod tests {
     #[test]
     fn test_remove_task() {
         let mut list = TodoList::new();
-        list.add("Test task".to_string()).unwrap();
+        list.add("Test task".to_string());
 
         let removed = list.remove(1);
         assert!(removed.is_some());
@@ -434,8 +452,8 @@ mod tests {
     #[test]
     fn test_clear_completed() {
         let mut list = TodoList::new();
-        list.add("Task 1".to_string()).unwrap();
-        list.add("Task 2".to_string()).unwrap();
+        list.add("Task 1".to_string());
+        list.add("Task 2".to_string());
 
         list.update_status(1, TodoStatus::Completed).unwrap();
 
@@ -455,9 +473,9 @@ mod tests {
     #[test]
     fn test_count_by_status() {
         let mut list = TodoList::new();
-        list.add("Task 1".to_string()).unwrap();
-        list.add("Task 2".to_string()).unwrap();
-        list.add("Task 3".to_string()).unwrap();
+        list.add("Task 1".to_string());
+        list.add("Task 2".to_string());
+        list.add("Task 3".to_string());
 
         list.update_status(1, TodoStatus::Pending).unwrap();
         list.update_status(2, TodoStatus::InProgress).unwrap();
@@ -473,29 +491,47 @@ mod tests {
     #[test]
     fn test_add_many_tasks() {
         let mut list = TodoList::new();
-        let items = list.add_many(vec![
+        let results = list.add_many(vec![
             "Task 1".to_string(),
             "Task 2".to_string(),
             "Task 3".to_string(),
         ]);
 
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].id, 1);
-        assert_eq!(items[1].id, 2);
-        assert_eq!(items[2].id, 3);
-        assert_eq!(items[0].task, "Task 1");
-        assert_eq!(items[1].task, "Task 2");
-        assert_eq!(items[2].task, "Task 3");
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_new);
+        assert!(results[1].is_new);
+        assert!(results[2].is_new);
+        assert_eq!(results[0].id, 1);
+        assert_eq!(results[1].id, 2);
+        assert_eq!(results[2].id, 3);
         assert_eq!(list.list().len(), 3);
+    }
+
+    #[test]
+    fn test_add_many_with_duplicates() {
+        let mut list = TodoList::new();
+        list.add("Task 1".to_string());
+        
+        let results = list.add_many(vec![
+            "Task 1".to_string(),  // duplicate
+            "Task 2".to_string(), // new
+        ]);
+
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].is_new); // Task 1 was already there
+        assert!(results[1].is_new);   // Task 2 is new
+        assert_eq!(results[0].id, 1); // existing id
+        assert_eq!(results[1].id, 2); // new id
+        assert_eq!(list.list().len(), 2); // only Task 1 and Task 2
     }
 
     #[test]
     fn test_add_many_single_task() {
         let mut list = TodoList::new();
-        let items = list.add_many(vec!["Single task".to_string()]);
+        let results = list.add_many(vec!["Single task".to_string()]);
 
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, 1);
-        assert_eq!(items[0].task, "Single task");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_new);
+        assert_eq!(results[0].id, 1);
     }
 }
