@@ -328,16 +328,6 @@ impl TestRunner {
         !self.compaction_events.lock().unwrap().is_empty()
     }
 
-    /// Get the number of compaction events
-    pub fn compaction_count(&self) -> usize {
-        self.compaction_events.lock().unwrap().len()
-    }
-
-    /// Clear compaction events (for resetting test state)
-    pub fn clear_compaction_events(&self) {
-        self.compaction_events.lock().unwrap().clear();
-    }
-
     /// Get current chat history
     pub async fn get_chat_history(&self) -> Vec<Message> {
         self.chat_history.lock().await.clone()
@@ -443,8 +433,6 @@ mod tests {
         // that are processed by the StateManager. This test verifies the
         // runner completes without errors. Stats verification requires
         // integration with the full agent system.
-        let stats = state_manager.get_stats();
-        // Just verify the call completes successfully
-        assert!(true);
+        // Just verify the call completes successfully (assert!(true))
     }
 }
