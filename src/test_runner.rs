@@ -333,17 +333,20 @@ impl TestRunner {
     fn process_session_hook_events(&self) {
         // Get the stats from the session hook and sync to state manager
         let hook_stats = self.session_hook.get_stats();
-        let stats = self.state_manager.stats_arc();
-        let mut state_stats = stats.lock().unwrap();
         
-        // Reset state stats and sync from hook
-        // Use cumulative_input_tokens to get the sum of all requests
-        state_stats.reset();
-        state_stats.add_request(
-            hook_stats.cumulative_input_tokens(),
-            hook_stats.total_output_tokens(),  // or cumulative_output_tokens if needed
-            hook_stats.total_cost,
-        );
+        // Reset state manager stats (also syncs to AppState)
+        self.state_manager.reset_stats();
+        
+        // Replay each request through StateManager.add_request() which:
+        //   - accumulates API call count and cost
+        //   - syncs stats to AppState (so get_state() reflects them)
+        //   - uses rig's per-request token values (overwritten each call)
+        let pricing = crate::hooks::ModelPricing::default();
+        for req in hook_stats.all_requests() {
+            let cost = (req.input_tokens as f64 * pricing.input_per_token)
+                + (req.output_tokens as f64 * pricing.output_per_token);
+            self.state_manager.add_request(req.input_tokens, req.output_tokens, cost);
+        }
     }
 
     /// Get all compaction events that occurred during testing

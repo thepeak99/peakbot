@@ -176,6 +176,7 @@ impl TodoTool {
 pub struct TodoArgs {
     /// Brief explanation of what you're doing
     #[allow(dead_code)]
+    #[serde(default)]
     pub thought: String,
     /// The action to perform: add, update, remove, list, clear
     pub action: String,

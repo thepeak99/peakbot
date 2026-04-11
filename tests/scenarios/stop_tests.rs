@@ -20,15 +20,14 @@ async fn agent_responds_normally() {
     assert!(response.contains("Normal") || response.contains("response"));
 }
 
-/// Test that stop flag can be checked on session hook
+/// Test that stop flag can be set and checked on session hook
 #[tokio::test]
 async fn stop_flag_infrastructure() {
     let harness = TestHarness::new();
     
-    // The session hook should be accessible through the harness
-    // For now, verify the harness is properly initialized
+    // Verify is_running starts false
     let state = harness.state_manager.get_state();
-    assert!(state.is_running == false || state.is_running == true, "State should be accessible");
+    assert!(!state.is_running, "is_running should start false");
 }
 
 /// Test agent continues normally through multiple messages
@@ -87,19 +86,26 @@ async fn conversation_state_after_normal_flow() {
 #[tokio::test]
 async fn stats_accumulate_through_messages() {
     let mut harness = TestHarness::new();
-    harness.add_response(MockResponse::text("First"));
-    harness.add_response(MockResponse::text("Second"));
+    harness.add_response(MockResponse::text_with_usage(
+        "First",
+        peakbot::mock::Usage { input_tokens: 100, output_tokens: 50 },
+    ));
+    harness.add_response(MockResponse::text_with_usage(
+        "Second",
+        peakbot::mock::Usage { input_tokens: 200, output_tokens: 80 },
+    ));
 
     harness.run_message("One").await;
     harness.run_message("Two").await;
 
-    // Verify the harness processed both messages
     let stats = harness.get_stats();
-    // Note: stats.total_api_calls may or may not reflect the actual count
-    // depending on whether events are being processed by StateManager.
-    // We verify that the stats structure is accessible.
+    assert_eq!(stats.total_api_calls, 2, "Should track 2 API calls");
     assert!(
-        stats.total_input_tokens >= 0,
-        "Stats should be accessible with non-negative values"
+        stats.total_input_tokens > 0,
+        "Input tokens should be nonzero after agent loop"
+    );
+    assert!(
+        stats.total_cost > 0.0,
+        "Cost should accumulate across messages"
     );
 }

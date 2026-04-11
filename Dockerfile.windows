@@ -1,0 +1,46 @@
+# PeakBot Windows Cross-Compile Builder
+# Usage: podman build --output type=local,dest=./output .
+# (or: docker build --output type=local,dest=./output .)
+
+FROM rust:1.88-bookworm AS builder
+
+# Install mingw-w64 for cross-compilation to Windows
+RUN apt-get update && apt-get install -y \
+    mingw-w64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set default build target to Windows x86_64
+ARG TARGET=x86_64-pc-windows-gnu
+ENV TARGET=${TARGET}
+
+# Add Windows target and install cross-compile linker
+RUN rustup target add ${TARGET} \
+    && rustup target list --installed
+
+# Copy manifests first for better layer caching
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+
+# Create dummy main.rs for dependency caching
+RUN mkdir -p src && \
+    echo "fn main() {}" > src/main.rs
+
+# Build dependencies only (faster layer caching)
+RUN cargo build --target ${TARGET} --release && \
+    rm -rf target/${TARGET}/deps/*.rlib target/${TARGET}/deps/*.d
+
+# Copy actual source
+COPY src/ src/
+
+# Build the actual binary
+RUN touch src/main.rs && \
+    cargo build --target ${TARGET} --release
+
+# Extract just the .exe
+FROM alpine:3.19 AS extract
+WORKDIR /output
+COPY --from=builder /build/target/x86_64-pc-windows-gnu/release/peakbot.exe .
+
+# Export only the .exe
+FROM scratch
+COPY --from=extract /output/peakbot.exe /peakbot.exe

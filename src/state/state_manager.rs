@@ -503,4 +503,32 @@ mod tests {
         let state = sm.get_state();
         assert!(state.chat.messages.is_empty());
     }
+
+    #[test]
+    fn test_app_state_sync() {
+        let sm = StateManager::new();
+
+        // Add stats via StateManager
+        sm.add_request(100, 50, 0.01);
+
+        // Get AppState and verify stats are synced
+        let app_state = sm.get_state();
+
+        assert_eq!(app_state.stats.total_input_tokens, 100);
+        assert_eq!(app_state.stats.total_output_tokens, 50);
+        assert_eq!(app_state.stats.total_api_calls, 1);
+    }
+
+    #[test]
+    fn test_stats_arc_sharing() {
+        let sm = StateManager::new();
+        let stats_arc = sm.stats_arc();
+
+        // Add request first
+        sm.add_request(100, 50, 0.01);
+
+        // Both references should see the same data via stats arc
+        let stats = sm.get_stats();
+        assert_eq!(stats.total_api_calls, 1);
+    }
 }
