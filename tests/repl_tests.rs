@@ -12,7 +12,6 @@ mod tests {
         Terminal,
         backend::TestBackend,
         layout::{Constraint, Direction, Layout},
-        widgets::Widget,
     };
 
     use super::snapshot_helpers::*;
@@ -73,7 +72,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -97,7 +96,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -121,7 +120,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -145,7 +144,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -169,7 +168,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -189,7 +188,7 @@ mod tests {
         let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             ReplUi::render_status_bar(f, f.area(), &state);
         });
 
@@ -209,7 +208,7 @@ mod tests {
         let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             ReplUi::render_status_bar(f, f.area(), &state);
         });
 
@@ -287,7 +286,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -315,7 +314,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -343,7 +342,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -394,7 +393,7 @@ mod tests {
         let backend = TestBackend::new(70, 12);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -429,7 +428,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -551,7 +550,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             ReplUi::render_quit_confirm(f, f.area(), false);
         });
 
@@ -565,7 +564,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             ReplUi::render_quit_confirm(f, f.area(), true);
         });
 
@@ -579,7 +578,7 @@ mod tests {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             ReplUi::render_quit_confirm(f, f.area(), false);
         });
 
@@ -593,7 +592,7 @@ mod tests {
         let backend = TestBackend::new(60, 15);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             ReplUi::render_quit_confirm(f, f.area(), false);
         });
 
@@ -607,7 +606,7 @@ mod tests {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             ReplUi::render_quit_confirm(f, f.area(), true);
         });
 
@@ -627,7 +626,7 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 
@@ -654,7 +653,7 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 
@@ -681,7 +680,7 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 
@@ -708,7 +707,7 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 
@@ -735,7 +734,7 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 
@@ -776,7 +775,7 @@ mod tests {
         let backend = TestBackend::new(30, 12);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 
@@ -811,7 +810,7 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 
@@ -837,7 +836,7 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 
@@ -863,7 +862,7 @@ mod tests {
         let backend = TestBackend::new(20, 5);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 
@@ -890,7 +889,7 @@ mod tests {
         let backend = TestBackend::new(2, 2);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| {
+        let _ = terminal.draw(|f| {
             render_todo_panel(f, f.area(), &state, 0);
         });
 

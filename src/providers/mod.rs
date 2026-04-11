@@ -3,14 +3,14 @@
 //! This module provides a unified interface for different LLM providers
 //! (OpenRouter, Ollama, etc.) to make the codebase provider-independent.
 
-#[cfg(feature = "mock")]
-use crate::mock::MockCompletionModel;
 use crate::config::{
     BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig,
     SearXngConfig,
 };
 use crate::hooks::SessionHook;
 use crate::hooks::events::AgentEvent;
+#[cfg(feature = "mock")]
+use crate::mock::MockCompletionModel;
 use crate::state::StateManager;
 use crate::tools::{
     BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
@@ -636,5 +636,11 @@ pub fn create_mock_agent(
         supports_pricing: true,
     };
 
-    Ok((DynAgent::Mock(agent), info, receiver, Arc::new(hook), model_clone))
+    Ok((
+        DynAgent::Mock(agent),
+        info,
+        receiver,
+        Arc::new(hook),
+        model_clone,
+    ))
 }

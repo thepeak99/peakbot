@@ -6,8 +6,8 @@
 //! Only MockCompletionModel is faked. Everything else is production code.
 
 use crate::harness::TestHarness;
-use peakbot::mock::{MockResponse, Usage};
 use peakbot::AgentEvent;
+use peakbot::mock::{MockResponse, Usage};
 
 /// Helper: minimal valid todo tool_call JSON with `thought` filled in.
 fn todo_add_args(tasks: &[&str]) -> serde_json::Value {
@@ -42,7 +42,10 @@ fn todo_remove_args(id: usize) -> serde_json::Value {
 #[tokio::test]
 async fn todo_add_through_agent_loop() {
     let mut harness = TestHarness::new();
-    harness.add_response(MockResponse::tool_call("todo", todo_add_args(&["Fix the bug"])));
+    harness.add_response(MockResponse::tool_call(
+        "todo",
+        todo_add_args(&["Fix the bug"]),
+    ));
     harness.add_response(MockResponse::text("Done"));
 
     harness.run_message("Add a todo: Fix the bug").await;
@@ -59,7 +62,9 @@ async fn todo_add_through_agent_loop() {
     // Events must be emitted
     let events = harness.drain_events();
     assert!(
-        events.iter().any(|e| matches!(e, AgentEvent::ToolCall { tool_name, .. } if tool_name == "todo")),
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { tool_name, .. } if tool_name == "todo")),
         "Should emit ToolCall event for todo"
     );
     assert!(
@@ -104,14 +109,20 @@ async fn todo_update_status_through_agent_loop() {
     let mut harness = TestHarness::new();
 
     // Turn 1: add
-    harness.add_response(MockResponse::tool_call("todo", todo_add_args(&["Write tests"])));
+    harness.add_response(MockResponse::tool_call(
+        "todo",
+        todo_add_args(&["Write tests"]),
+    ));
     harness.add_response(MockResponse::text("Added."));
 
     harness.run_message("Add todo: Write tests").await;
     assert_eq!(harness.get_todos().len(), 1);
 
     // Turn 2: update status
-    harness.add_response(MockResponse::tool_call("todo", todo_update_args(1, "completed")));
+    harness.add_response(MockResponse::tool_call(
+        "todo",
+        todo_update_args(1, "completed"),
+    ));
     harness.add_response(MockResponse::text("Marked done."));
 
     harness.run_message("Mark task 1 completed").await;
@@ -127,7 +138,10 @@ async fn todo_lifecycle_through_agent_loop() {
     let mut harness = TestHarness::new();
 
     // Add
-    harness.add_response(MockResponse::tool_call("todo", todo_add_args(&["Temporary task"])));
+    harness.add_response(MockResponse::tool_call(
+        "todo",
+        todo_add_args(&["Temporary task"]),
+    ));
     harness.add_response(MockResponse::text("Added."));
     harness.run_message("Add a task").await;
     assert_eq!(harness.get_todos().len(), 1);
@@ -181,11 +195,17 @@ async fn cost_accumulates_across_turns() {
 
     harness.add_response(MockResponse::text_with_usage(
         "First",
-        Usage { input_tokens: 100, output_tokens: 50 },
+        Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+        },
     ));
     harness.add_response(MockResponse::text_with_usage(
         "Second",
-        Usage { input_tokens: 150, output_tokens: 75 },
+        Usage {
+            input_tokens: 150,
+            output_tokens: 75,
+        },
     ));
 
     harness.run_message("One").await;
@@ -208,7 +228,10 @@ async fn stats_synced_to_app_state() {
     let mut harness = TestHarness::new();
     harness.add_response(MockResponse::text_with_usage(
         "Response",
-        Usage { input_tokens: 100, output_tokens: 50 },
+        Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+        },
     ));
 
     harness.run_message("Test").await;
@@ -234,11 +257,17 @@ async fn full_pipeline_tool_call_with_stats_and_events() {
     harness.add_response(MockResponse::tool_call_with_usage(
         "todo",
         todo_add_args(&["E2E task"]),
-        Usage { input_tokens: 300, output_tokens: 40 },
+        Usage {
+            input_tokens: 300,
+            output_tokens: 40,
+        },
     ));
     harness.add_response(MockResponse::text_with_usage(
         "Task added.",
-        Usage { input_tokens: 350, output_tokens: 30 },
+        Usage {
+            input_tokens: 350,
+            output_tokens: 30,
+        },
     ));
 
     harness.run_message("Add a task").await;
@@ -254,12 +283,12 @@ async fn full_pipeline_tool_call_with_stats_and_events() {
 
     // 3. Events in correct order
     let events = harness.drain_events();
-    let tool_call_idx = events.iter().position(|e| {
-        matches!(e, AgentEvent::ToolCall { tool_name, .. } if tool_name == "todo")
-    });
-    let tool_result_idx = events.iter().position(|e| {
-        matches!(e, AgentEvent::ToolResult { tool_name, .. } if tool_name == "todo")
-    });
+    let tool_call_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolCall { tool_name, .. } if tool_name == "todo"));
+    let tool_result_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolResult { tool_name, .. } if tool_name == "todo"));
     assert!(tool_call_idx.is_some(), "Should have ToolCall event");
     assert!(tool_result_idx.is_some(), "Should have ToolResult event");
     assert!(

@@ -58,8 +58,18 @@ impl TodoList {
         }
     }
 
-    /// Add a new task
-    pub fn add(&mut self, task: String) -> TodoItem {
+    /// Check if a task with the same text already exists (case-insensitive)
+    pub fn contains_task(&self, task: &str) -> bool {
+        let task_lower = task.to_lowercase();
+        self.tasks.iter().any(|t| t.task.to_lowercase() == task_lower)
+    }
+
+    /// Add a new task (fails if duplicate exists)
+    /// Returns Ok(TodoItem) on success, Err(message) if duplicate
+    pub fn add(&mut self, task: String) -> Result<TodoItem, String> {
+        if self.contains_task(&task) {
+            return Err(format!("Task already exists: {}", task));
+        }
         let now = Utc::now();
         let item = TodoItem {
             id: self.next_id,
@@ -70,12 +80,12 @@ impl TodoList {
         };
         self.next_id += 1;
         self.tasks.push(item.clone());
-        item
+        Ok(item)
     }
 
-    /// Add multiple tasks at once
+    /// Add multiple tasks at once (skips duplicates silently)
     pub fn add_many(&mut self, tasks: Vec<String>) -> Vec<TodoItem> {
-        tasks.into_iter().map(|task| self.add(task)).collect()
+        tasks.into_iter().filter_map(|task| self.add(task).ok()).collect()
     }
 
     /// Update task status
@@ -148,6 +158,9 @@ pub enum TodoError {
 
     #[error("Invalid action: {0}")]
     InvalidAction(String),
+
+    #[error("Task already exists: {0}")]
+    DuplicateTask(String),
 
     #[error("StateManager not set: {0}")]
     StateManagerNotSet(String),
@@ -309,7 +322,16 @@ impl Tool for TodoTool {
                     ));
                 }
 
-                Ok(sm.add_todos(tasks))
+                // If single task, use add_todo which fails on duplicate
+                // If multiple tasks, use add_todos which skips duplicates silently
+                if tasks.len() == 1 {
+                    match sm.add_todo(tasks.into_iter().next().unwrap()) {
+                        Ok(result) => Ok(result),
+                        Err(msg) => Err(TodoError::DuplicateTask(msg)),
+                    }
+                } else {
+                    Ok(sm.add_todos(tasks))
+                }
             }
 
             "update" => {
@@ -363,7 +385,7 @@ mod tests {
     #[test]
     fn test_add_task() {
         let mut list = TodoList::new();
-        let item = list.add("Test task".to_string());
+        let item = list.add("Test task".to_string()).unwrap();
 
         assert_eq!(item.id, 1);
         assert_eq!(item.task, "Test task");
@@ -371,9 +393,28 @@ mod tests {
     }
 
     #[test]
+    fn test_add_duplicate_fails() {
+        let mut list = TodoList::new();
+        list.add("Test task".to_string()).unwrap();
+        
+        let result = list.add("Test task".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already exists"));
+    }
+
+    #[test]
+    fn test_add_duplicate_case_insensitive() {
+        let mut list = TodoList::new();
+        list.add("Test task".to_string()).unwrap();
+        
+        let result = list.add("test task".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_update_status() {
         let mut list = TodoList::new();
-        list.add("Test task".to_string());
+        list.add("Test task".to_string()).unwrap();
 
         let updated = list.update_status(1, TodoStatus::InProgress);
         assert!(updated.is_some());
@@ -383,7 +424,7 @@ mod tests {
     #[test]
     fn test_remove_task() {
         let mut list = TodoList::new();
-        list.add("Test task".to_string());
+        list.add("Test task".to_string()).unwrap();
 
         let removed = list.remove(1);
         assert!(removed.is_some());
@@ -393,8 +434,8 @@ mod tests {
     #[test]
     fn test_clear_completed() {
         let mut list = TodoList::new();
-        list.add("Task 1".to_string());
-        list.add("Task 2".to_string());
+        list.add("Task 1".to_string()).unwrap();
+        list.add("Task 2".to_string()).unwrap();
 
         list.update_status(1, TodoStatus::Completed).unwrap();
 
@@ -414,9 +455,9 @@ mod tests {
     #[test]
     fn test_count_by_status() {
         let mut list = TodoList::new();
-        list.add("Task 1".to_string());
-        list.add("Task 2".to_string());
-        list.add("Task 3".to_string());
+        list.add("Task 1".to_string()).unwrap();
+        list.add("Task 2".to_string()).unwrap();
+        list.add("Task 3".to_string()).unwrap();
 
         list.update_status(1, TodoStatus::Pending).unwrap();
         list.update_status(2, TodoStatus::InProgress).unwrap();

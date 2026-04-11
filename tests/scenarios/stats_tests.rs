@@ -3,8 +3,8 @@
 //! Integration tests for verifying stats accumulation via TestHarness.
 //! Unit tests for StateManager live in src/state/state_manager.rs.
 
-use peakbot::mock::{MockResponse, Usage};
 use crate::harness::TestHarness;
+use peakbot::mock::{MockResponse, Usage};
 
 #[tokio::test]
 async fn mock_response_with_usage() {

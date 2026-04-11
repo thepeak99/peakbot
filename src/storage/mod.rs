@@ -5,12 +5,12 @@
 
 mod file_storage;
 
-pub use file_storage::FileStorage;
 pub use crate::conversation::{Conversation, ConversationSummary};
 pub use anyhow::Result;
-pub use uuid::Uuid;
+pub use file_storage::FileStorage;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+pub use uuid::Uuid;
 
 /// Trait for conversation storage backends.
 ///
@@ -71,7 +71,7 @@ impl ConversationStorage for InMemoryStorage {
 
     fn list(&self) -> Result<Vec<ConversationSummary>> {
         let map = self.conversations.read().unwrap();
-        Ok(map.values().map(|c| ConversationSummary::from(c)).collect())
+        Ok(map.values().map(ConversationSummary::from).collect())
     }
 
     fn delete(&self, id: Uuid) -> Result<()> {

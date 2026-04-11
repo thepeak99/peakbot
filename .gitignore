@@ -1,3 +1,5 @@
 /target
 *.tar
 *.md.bak
+output
+*.md
