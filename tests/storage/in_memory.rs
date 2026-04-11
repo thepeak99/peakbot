@@ -25,21 +25,6 @@ impl InMemoryStorage {
             conversations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-
-    /// Get the number of stored conversations
-    pub fn len(&self) -> usize {
-        self.conversations.lock().unwrap().len()
-    }
-
-    /// Check if storage is empty
-    pub fn is_empty(&self) -> bool {
-        self.conversations.lock().unwrap().is_empty()
-    }
-
-    /// Get all conversation IDs
-    pub fn ids(&self) -> Vec<Uuid> {
-        self.conversations.lock().unwrap().keys().cloned().collect()
-    }
 }
 
 impl Default for InMemoryStorage {

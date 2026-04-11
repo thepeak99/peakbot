@@ -394,15 +394,11 @@ async fn context_status_accessible() {
 
     harness.run_message("Test").await;
 
-    // Get the state and verify context info
+    // Verify context status is accessible after running a message
     let state = harness.get_state();
-
-    // State should be accessible - the stats may or may not have API calls
-    // depending on whether SessionHook events are processed by StateManager
-    assert!(
-        state.stats.total_input_tokens >= 0,
-        "Stats should be accessible with non-negative values"
-    );
+    // Context info should be accessible - we just verify the field is readable
+    let _ = state.context.current_usage;
+    let _ = state.context.window_size;
 }
 
 /// Test that messages are properly added to history

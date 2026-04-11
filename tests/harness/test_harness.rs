@@ -36,8 +36,6 @@ pub struct TestHarness {
     pub mock_model: MockCompletionModel,
     /// Event receiver for collecting agent events
     pub event_receiver: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
-    /// Conversation storage for persistence tests
-    pub storage: Arc<InMemoryStorage>,
     /// Temp directory for file-based tests
     _temp_dir: Option<TempDir>,
     /// Internal test runner for processing messages through the full loop
@@ -100,7 +98,6 @@ impl TestHarness {
             state_manager,
             mock_model,
             event_receiver: receiver,
-            storage: Arc::new(InMemoryStorage::new()),
             _temp_dir: None,
             runner,
         }
@@ -161,11 +158,6 @@ impl TestHarness {
         self.mock_model.remaining()
     }
 
-    /// Clear all queued responses
-    pub fn clear_responses(&self) {
-        self.mock_model.clear();
-    }
-
     /// Get a clone of the chat history (for verification)
     pub async fn get_chat_history(&self) -> Vec<Message> {
         self.runner.get_chat_history().await
@@ -174,14 +166,6 @@ impl TestHarness {
     /// Clear the chat history
     pub async fn clear_chat_history(&self) {
         self.runner.clear_history().await;
-    }
-
-    /// Get a reference to the state manager for assertions
-    ///
-    /// Allows tests to verify state changes after tool execution,
-    /// todo modifications, stats accumulation, etc.
-    pub fn state_manager(&self) -> &Arc<StateManager> {
-        &self.state_manager
     }
 
     /// Get a reference to the conversation manager for assertions
@@ -216,16 +200,6 @@ impl TestHarness {
     /// Check if any compaction occurred during testing
     pub fn has_compaction_occurred(&self) -> bool {
         self.runner.has_compaction_occurred()
-    }
-
-    /// Get the number of compaction events that occurred
-    pub fn compaction_count(&self) -> usize {
-        self.runner.compaction_count()
-    }
-
-    /// Clear compaction events (for resetting test state)
-    pub fn clear_compaction_events(&self) {
-        self.runner.clear_compaction_events();
     }
 }
 

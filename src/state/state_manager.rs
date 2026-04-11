@@ -555,8 +555,8 @@ mod tests {
         // Add request first
         sm.add_request(100, 50, 0.01);
 
-        // Both references should see the same data via stats arc
-        let stats = sm.get_stats();
-        assert_eq!(stats.total_api_calls, 1);
+        // Verify the Arc contains the updated data (testing Arc sharing)
+        let stats = stats_arc.lock().unwrap();
+        assert_eq!(stats.total_api_calls, 1, "Arc reference should see the shared data");
     }
 }

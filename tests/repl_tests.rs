@@ -619,7 +619,7 @@ mod tests {
     /// Test todo panel with no items (empty state)
     #[test]
     fn todo_panel_empty() {
-        use peakbot::ui::app_state::{TodoItem, TodoState};
+        use peakbot::ui::app_state::TodoState;
         use peakbot::ui::repl::todo_panel::render_todo_panel;
 
         let state = TodoState::default();

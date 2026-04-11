@@ -5,8 +5,8 @@ use ratatui::{Terminal, backend::TestBackend, widgets::Widget};
 /// Render a widget to a TestBackend terminal and return it for assertions.
 pub fn render_widget<W: Widget>(widget: W, width: u16, height: u16) -> Terminal<TestBackend> {
     let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| {
+    let mut terminal = Terminal::new(backend).expect("Failed to create terminal");
+    let _ = terminal.draw(|f| {
         f.render_widget(widget, f.area());
     });
     terminal
@@ -14,7 +14,7 @@ pub fn render_widget<W: Widget>(widget: W, width: u16, height: u16) -> Terminal<
 
 /// Convert TestBackend buffer to lines for inspection.
 pub fn buffer_to_lines(backend: &TestBackend) -> Vec<String> {
-    use ratatui::buffer::Buffer;
+    
     // Access the buffer content - TestBackend stores it internally
     // We need to use Display trait or reconstruct lines manually
     let buf = backend.buffer();
