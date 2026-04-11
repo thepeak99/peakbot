@@ -60,7 +60,8 @@ pub struct TestRunner {
     chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
     /// System prompt
     pub system_prompt: String,
-    /// Sender for external event access
+    /// Sender for external event access (kept for future use)
+    #[allow(dead_code)]
     event_sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
     /// Track compaction events for testing verification
     compaction_events: Arc<Mutex<Vec<CompactionInfo>>>,
@@ -233,6 +234,7 @@ impl TestRunner {
     }
 
     /// Internal message processing - mirrors AgentRunner::process_message_internal
+    #[allow(dead_code)]
     async fn process_message_internal(&mut self, msg: &str) -> ProcessResult {
         // Get and clear current history
         let mut history_guard = self.chat_history.lock().await;
