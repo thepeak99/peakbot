@@ -259,20 +259,30 @@ fn format_tool_result(tool_name: &str, result: &str) -> String {
 }
 
 /// Truncate a string to max_len chars, adding "..." if truncated
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
+pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
+    let s_len = s.chars().count();
+
+    if s_len <= max_len {
         s.to_string()
+    } else if max_len < 3 {
+        // Not enough room for "...", just truncate to what fits
+        s.chars().take(max_len).collect()
     } else {
-        s.chars().take(max_len.saturating_sub(3)).collect::<String>() + "..."
+        s.chars().take(max_len - 3).collect::<String>() + "..."
     }
 }
 
 /// Truncate a single line to max chars, adding "..." if truncated
-fn truncate_line(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
+pub(crate) fn truncate_line(s: &str, max_len: usize) -> String {
+    let s_len = s.chars().count();
+
+    if s_len <= max_len {
         s.to_string()
+    } else if max_len < 3 {
+        // Not enough room for "...", just truncate to what fits
+        s.chars().take(max_len).collect()
     } else {
-        s.chars().take(max_len.saturating_sub(3)).collect::<String>() + "..."
+        s.chars().take(max_len - 3).collect::<String>() + "..."
     }
 }
 
@@ -854,5 +864,94 @@ impl NotificationKind {
             NotificationKind::Warning => "warning",
             NotificationKind::Error => "error",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_str_normal() {
+        let s = "hello world"; // 11 characters
+        // max_len = 10: take (10-3)=7 chars = "hello w", add "..." = "hello w..." (10 chars)
+        assert_eq!(truncate_str(s, 10), "hello w...");
+        // max_len = 8: take (8-3)=5 chars = "hello", add "..." = "hello..." (8 chars)
+        assert_eq!(truncate_str(s, 8), "hello...");
+        // max_len = 5: take (5-3)=2 chars = "he", add "..." = "he..." (5 chars)
+        assert_eq!(truncate_str(s, 5), "he...");
+    }
+
+    #[test]
+    fn test_truncate_str_no_truncation_needed() {
+        let s = "hi";
+        assert_eq!(truncate_str(s, 10), "hi");
+        assert_eq!(truncate_str(s, 2), "hi");
+    }
+
+    #[test]
+    fn test_truncate_str_exact_length() {
+        let s = "hello";
+        assert_eq!(truncate_str(s, 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_bug_max_len_less_than_3() {
+        // When max_len < 3, the output should NOT exceed max_len
+        let s = "hello world";
+        
+        // max_len = 2 should return at most 2 characters
+        let result = truncate_str(s, 2);
+        assert!(
+            result.chars().count() <= 2,
+            "truncate_str(s, 2) returned '{}' with {} chars, expected <= 2",
+            result,
+            result.chars().count()
+        );
+
+        // max_len = 1 should return at most 1 character
+        let result = truncate_str(s, 1);
+        assert!(
+            result.chars().count() <= 1,
+            "truncate_str(s, 1) returned '{}' with {} chars, expected <= 1",
+            result,
+            result.chars().count()
+        );
+
+        // max_len = 0 should return empty string
+        let result = truncate_str(s, 0);
+        assert!(
+            result.chars().count() <= 0,
+            "truncate_str(s, 0) returned '{}' with {} chars, expected <= 0",
+            result,
+            result.chars().count()
+        );
+    }
+
+    #[test]
+    fn test_truncate_str_edge_cases() {
+        // max_len = 3 should return at most 3 characters (no room for "...")
+        let s = "hello world";
+        let result = truncate_str(s, 3);
+        assert!(
+            result.chars().count() <= 3,
+            "truncate_str(s, 3) returned '{}' with {} chars, expected <= 3",
+            result,
+            result.chars().count()
+        );
+    }
+
+    #[test]
+    fn test_truncate_line_bug_max_len_less_than_3() {
+        // Same bug should exist in truncate_line
+        let s = "hello world";
+        
+        let result = truncate_line(s, 2);
+        assert!(
+            result.chars().count() <= 2,
+            "truncate_line(s, 2) returned '{}' with {} chars, expected <= 2",
+            result,
+            result.chars().count()
+        );
     }
 }

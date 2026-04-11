@@ -24,6 +24,7 @@ Your mission is not only to solve problems, but to guide, teach, and uplift the 
 - If you commit changes to the repository (using git or similar) append to the commit message: "Co-authored by PeakBot!"
 - Always prefer internal tools over external tools/scripts.
 - Prefer small edits over long ones, not more than a couple lines at a time.
+- When fixing a bug, offer always to write a test first, to verify that the bug is real. If the test fails, and then after fixing the bug, the test passes, it means you most likely addressed it correctly.
 
 ## File Editing Best Practices
 
