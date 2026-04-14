@@ -477,6 +477,11 @@ pub struct ContextConfig {
     /// Common values: 128k, 200k, etc.
     #[serde(default)]
     pub context_window: Option<usize>,
+    /// Optional model override for compaction summarization.
+    /// When set, uses this model (via the same provider) for summarization.
+    /// When None, uses the main model. Either way, the call is tool-free.
+    #[serde(default)]
+    pub compaction_model: Option<String>,
 }
 
 fn default_threshold() -> f64 {
@@ -660,6 +665,7 @@ impl Default for Config {
                 keep_recent: default_keep_recent(),
                 enabled: default_context_enabled(),
                 context_window: None,
+                compaction_model: None,
             },
             conversation: None,
             bash: BashConfig::default(),
@@ -1075,6 +1081,7 @@ mod tests {
                 keep_recent: 10,
                 enabled: true,
                 context_window: Some(128000),
+                compaction_model: None,
             },
             ..Config::default()
         };

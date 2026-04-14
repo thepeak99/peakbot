@@ -45,6 +45,7 @@ async fn compaction_triggers_with_small_window() {
         threshold: 0.5,             // 50% = 250 tokens threshold
         keep_recent: 2,             // Keep last 2 messages
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -54,7 +55,7 @@ async fn compaction_triggers_with_small_window() {
     // compact() calls agent.prompt() for summarization, consuming one response.
     harness.add_response(agent_response("Response 1", 300));
     harness.add_response(agent_response("Response 2", 300));
-    harness.add_response(summarization_response()); // consumed by compact()
+    harness.add_compaction_response(summarization_response()); // consumed by compact()
     harness.add_response(agent_response("Response 3", 300));
     harness.add_response(agent_response("Response 4", 300));
 
@@ -90,6 +91,7 @@ async fn compaction_reduces_history() {
         threshold: 0.5,            // 50% = 150 tokens threshold
         keep_recent: 1,            // Keep only last message
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -97,9 +99,9 @@ async fn compaction_reduces_history() {
 
     // Queue responses: agent responses + summarization responses consumed by compact()
     harness.add_response(agent_response("Response 1", 200));
-    harness.add_response(summarization_response()); // compact() after msg 2
+    harness.add_compaction_response(summarization_response()); // compact() after msg 2
     harness.add_response(agent_response("Response 2", 200));
-    harness.add_response(summarization_response()); // compact() after msg 3
+    harness.add_compaction_response(summarization_response()); // compact() after msg 3
     harness.add_response(agent_response("Response 3", 200));
 
     // Build up conversation history
@@ -133,18 +135,24 @@ async fn compaction_reduces_history() {
         );
     }
 
-    // The StateManager history should be smaller than if no compaction happened.
-    // Without compaction, 3 user + 3 assistant = 6 messages (plus count_after_1 base).
-    // With compaction and keep_recent=1, older messages get replaced by a summary.
-    let final_count = harness.get_chat_message_count();
-    // After compaction + adding new messages, the count should be less than
-    // what it would be without any compaction (count_after_1 was the baseline
-    // before compaction started firing).
+    // With tag-and-skip compaction, total message count doesn't decrease — old
+    // messages are tagged compacted and a Summary message is inserted. But what the
+    // LLM sees (uncompacted messages) should be fewer.
     assert!(
-        final_count < count_after_1 + 4, // 4 = 2 more user + 2 more assistant
-        "StateManager history should reflect compaction. Got {} messages, \
-         expected fewer than {} (baseline {} + 4 new)",
-        final_count, count_after_1 + 4, count_after_1
+        harness.has_compacted_messages(),
+        "Some messages should be tagged as compacted"
+    );
+    assert!(
+        harness.has_summary_message(),
+        "A Summary message should have been inserted"
+    );
+    // The LLM-visible history should be smaller than total
+    let uncompacted = harness.get_uncompacted_message_count();
+    let total = harness.get_chat_message_count();
+    assert!(
+        uncompacted < total,
+        "Uncompacted count ({}) should be less than total ({})",
+        uncompacted, total
     );
 }
 
@@ -156,6 +164,7 @@ async fn compaction_preserves_recent_messages() {
         threshold: 0.5,  // 50% = 200 tokens
         keep_recent: 2,  // Keep last 2 messages
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -163,7 +172,7 @@ async fn compaction_preserves_recent_messages() {
 
     harness.add_response(agent_response("Response 1", 250));
     harness.add_response(agent_response("Response 2", 250));
-    harness.add_response(summarization_response()); // compact() consumes this
+    harness.add_compaction_response(summarization_response()); // compact() consumes this
     harness.add_response(agent_response("Response 3", 250));
 
     harness.run_message("Message 1").await;
@@ -193,6 +202,7 @@ async fn compaction_skipped_when_disabled() {
         threshold: 0.5,
         keep_recent: 2,
         enabled: false, // DISABLED
+        compaction_model: None,
     };
 
     let mut harness =
@@ -233,6 +243,7 @@ async fn multiple_compaction_events() {
         threshold: 0.6,             // 60% = 120 tokens threshold
         keep_recent: 1,            // Keep only last message
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -245,7 +256,7 @@ async fn multiple_compaction_events() {
         harness.add_response(agent_response("Response", 150));
     }
     for _ in 0..6 {
-        harness.add_response(summarization_response());
+        harness.add_compaction_response(summarization_response());
     }
 
     for i in 1..=6 {
@@ -355,6 +366,7 @@ async fn compaction_persists_to_state_manager() {
         threshold: 0.5, // 150 tokens
         keep_recent: 1,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -362,9 +374,9 @@ async fn compaction_persists_to_state_manager() {
 
     // 3 messages: builds up chat entries. Each compaction consumes a summarization response.
     harness.add_response(agent_response("Response 1", 200));
-    harness.add_response(summarization_response()); // compact after msg 1
+    harness.add_compaction_response(summarization_response()); // compact after msg 1
     harness.add_response(agent_response("Response 2", 200));
-    harness.add_response(summarization_response()); // compact after msg 2
+    harness.add_compaction_response(summarization_response()); // compact after msg 2
     harness.add_response(agent_response("Response 3", 200));
 
     harness.run_message("Message 1").await;
@@ -381,17 +393,23 @@ async fn compaction_persists_to_state_manager() {
     );
     harness.assert_compaction_actually_discarded();
 
-    // After compaction + message 3:
-    // Compacted: summary (1) + keep_recent (1) = 2 messages
-    // Then msg3 adds: user (1) + assistant (1) = +2
-    // Total: 4 messages
-    // Without compaction it would be: 4 + 2 = 6
-    let after_count = harness.get_chat_message_count();
+    // With tag-and-skip, compaction tags old messages and inserts a Summary.
+    // Total count goes up, but compacted messages exist and a summary was inserted.
     assert!(
-        after_count < count_before_compact_turn + 2,
-        "StateManager should reflect compaction. Before compact turn: {}, After: {} \
-         (expected < {} without compaction)",
-        count_before_compact_turn, after_count, count_before_compact_turn + 2
+        harness.has_compacted_messages(),
+        "Some messages should be tagged as compacted after compaction"
+    );
+    assert!(
+        harness.has_summary_message(),
+        "A Summary message should exist in StateManager after compaction"
+    );
+    // The LLM-visible count should be less than total
+    let uncompacted = harness.get_uncompacted_message_count();
+    let total = harness.get_chat_message_count();
+    assert!(
+        uncompacted < total,
+        "Uncompacted ({}) should be less than total ({}) after compaction",
+        uncompacted, total
     );
 }
 
@@ -404,6 +422,7 @@ async fn no_compaction_under_threshold() {
         threshold: 0.8, // 800 tokens
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =

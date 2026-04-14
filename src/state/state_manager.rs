@@ -104,65 +104,56 @@ impl StateManager {
     /// Called internally after each message is added. Synchronous check,
     /// spawns an async task if compaction is needed.
     fn maybe_compact(&self) {
-        // Quick sync check: is compaction needed?
         let cm_clone = {
             let guard = self.context_manager.lock().unwrap();
             let cm = match guard.as_ref() {
                 Some(cm) => cm,
                 None => return,
             };
-            let history = self.get_agent_history();
-            if !cm.needs_compaction(&history) {
+            let uncompacted = self.uncompacted_message_count();
+            if !cm.needs_compaction(uncompacted) {
                 return;
             }
             cm.clone()
         };
 
-        // Get Arc<Self> from weak reference for the spawned task
         let sm = match self.self_ref.read().unwrap().as_ref().and_then(Weak::upgrade) {
             Some(arc) => arc,
-            None => return, // No Arc available (bare StateManager in tests), skip async compaction
+            None => return,
         };
-        let system_prompt = self.system_prompt.read().unwrap().clone();
 
         tokio::spawn(async move {
             sm.set_status(Some("Compacting context...".to_string()));
-            match cm_clone.compact_from_state_manager_on(&sm, &system_prompt).await {
-                Ok(result) if result.num_discarded > 0 => {
+            match sm.run_compaction(&cm_clone).await {
+                Some(result) => {
                     sm.push_notification(
                         format!(
-                            "Context compacted: {} → {} messages, {} discarded",
+                            "Context compacted: {} → {} messages, {} compacted",
                             result.original_count, result.compacted_count, result.num_discarded
                         ),
                         NotificationKind::Info,
                     );
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("Context compaction failed: {}", e);
-                }
+                None => {}
             }
             sm.set_status(None);
         });
     }
 
-    /// Check if compaction is needed and run it synchronously (async).
-    /// Used by TestRunner and force_compact. Returns the result if compaction ran.
-    pub async fn compact_if_needed(&self) -> Option<CompactionResult> {
-        let cm_clone = {
-            let guard = self.context_manager.lock().unwrap();
-            let cm = guard.as_ref()?;
-            let history = self.get_agent_history();
-            if !cm.needs_compaction(&history) {
-                return None;
+    /// Run compaction: produce a plan, apply it, return the result.
+    async fn run_compaction(&self, cm: &ContextManager) -> Option<CompactionResult> {
+        let messages = self.get_chat_messages();
+        match cm.compact(&messages).await {
+            Ok(plan) => {
+                let result = cm.estimate_compaction(&messages, plan.boundary);
+                if result.num_discarded > 0 {
+                    self.apply_compaction(&plan);
+                    self.persist_current().ok();
+                    Some(result)
+                } else {
+                    None
+                }
             }
-            cm.clone()
-        };
-
-        let system_prompt = self.system_prompt.read().unwrap().clone();
-        match cm_clone.compact_from_state_manager_on(self, &system_prompt).await {
-            Ok(result) if result.num_discarded > 0 => Some(result),
-            Ok(_) => None,
             Err(e) => {
                 tracing::warn!("Context compaction failed: {}", e);
                 None
@@ -170,21 +161,70 @@ impl StateManager {
         }
     }
 
+    /// Check if compaction is needed and run it (async).
+    /// Used by TestRunner and force_compact. Returns the result if compaction ran.
+    pub async fn compact_if_needed(&self) -> Option<CompactionResult> {
+        let cm_clone = {
+            let guard = self.context_manager.lock().unwrap();
+            let cm = guard.as_ref()?;
+            let uncompacted = self.uncompacted_message_count();
+            if !cm.needs_compaction(uncompacted) {
+                return None;
+            }
+            cm.clone()
+        };
+
+        self.run_compaction(&cm_clone).await
+    }
+
     /// Force compaction regardless of threshold. Returns the result.
-    pub async fn force_compact(self: &Arc<Self>, system_prompt: &str) -> Option<CompactionResult> {
+    pub async fn force_compact(&self) -> Option<CompactionResult> {
         let cm_clone = {
             let guard = self.context_manager.lock().unwrap();
             guard.as_ref()?.clone()
         };
 
-        match cm_clone.compact_from_state_manager_on(self, system_prompt).await {
-            Ok(result) if result.num_discarded > 0 => Some(result),
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!("Force compaction failed: {}", e);
-                None
+        self.run_compaction(&cm_clone).await
+    }
+
+    /// Apply a CompactionPlan: tag old messages as compacted, insert the summary.
+    /// Preserves tool calls that are referenced by tool results in the kept region.
+    fn apply_compaction(&self, plan: &crate::context_manager::CompactionPlan) {
+        use crate::context_manager::find_needed_tool_calls_chat;
+
+        let mut state = self.state.write().unwrap();
+        let messages = &mut state.chat.messages;
+
+        // Find tool calls before boundary that are needed by results after boundary
+        let needed_tc: std::collections::HashSet<usize> =
+            find_needed_tool_calls_chat(messages, plan.boundary)
+                .into_iter()
+                .collect();
+
+        // Tag messages before boundary as compacted, except needed tool calls
+        for i in 0..plan.boundary {
+            if !messages[i].compacted && !needed_tc.contains(&i) {
+                messages[i].compacted = true;
             }
         }
+
+        // Insert the summary message at the boundary position
+        let summary = ChatMessage::summary(plan.summary.clone());
+        messages.insert(plan.boundary, summary);
+
+        self.notify_update(&state);
+    }
+
+    /// Count of messages that are not compacted (what the LLM would see).
+    fn uncompacted_message_count(&self) -> usize {
+        let state = self.state.read().unwrap();
+        state.chat.messages.iter().filter(|m| !m.compacted).count()
+    }
+
+    /// Get a snapshot of the current chat messages.
+    fn get_chat_messages(&self) -> Vec<ChatMessage> {
+        let state = self.state.read().unwrap();
+        state.chat.messages.clone()
     }
 
     /// Get a clone of the todo list (read-only snapshot).
@@ -848,7 +888,7 @@ impl StateManager {
                                 timestamp: chrono::Utc::now(),
                             })
                         }
-                        MessageRole::System => None,
+                        MessageRole::Summary | MessageRole::System => None,
                     }
                 })
                 .collect();
@@ -930,6 +970,7 @@ impl StateManager {
             .chat
             .messages
             .iter()
+            .filter(|msg| !msg.compacted)
             .filter_map(|msg| {
                 match msg.role {
                     MessageRole::User => Some(RigMessage::User {
@@ -976,6 +1017,11 @@ impl StateManager {
                             })),
                         })
                     }
+                    MessageRole::Summary => Some(RigMessage::User {
+                        content: OneOrMany::one(UserContent::Text(Text {
+                            text: format!("[Conversation summary] {}", msg.content),
+                        })),
+                    }),
                     MessageRole::System => None,
                 }
             })

@@ -55,6 +55,9 @@ pub struct TestRunner {
     pub system_prompt: String,
     /// Track compaction events for testing verification
     compaction_events: Arc<Mutex<Vec<CompactionInfo>>>,
+    /// Mock model used for compaction summarization (tests can queue responses on this)
+    #[cfg(feature = "mock")]
+    pub compaction_mock: Option<crate::mock::MockCompletionModel>,
 }
 
 impl TestRunner {
@@ -103,11 +106,20 @@ impl TestRunner {
         let agent = Arc::new(agent);
 
         // Initialize ContextManager inside StateManager (same as AgentRunner)
+        // Create a mock compaction model for testing
+        #[cfg(feature = "mock")]
+        let (compaction_model, compaction_mock_model) = {
+            let (model, mock) = crate::providers::create_mock_compaction_model();
+            (Some(Arc::new(model)), Some(mock))
+        };
+        #[cfg(not(feature = "mock"))]
+        let compaction_model = None;
+
         let cm = ContextManager::new(
             context_config,
             "mock-model",
             state_manager.clone(),
-            Some(agent.clone()),
+            compaction_model,
         );
         state_manager.init_context_manager(cm, system_prompt.clone());
 
@@ -117,6 +129,8 @@ impl TestRunner {
             session_hook,
             system_prompt,
             compaction_events: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(feature = "mock")]
+            compaction_mock: compaction_mock_model,
         }
     }
 

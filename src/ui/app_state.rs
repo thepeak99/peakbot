@@ -143,6 +143,12 @@ pub struct ChatMessage {
     /// Tool call ID for correlating calls with results
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
+
+    /// Whether this message has been compacted (summarized).
+    /// Compacted messages are kept for UI display but skipped when
+    /// building the rig message array sent to the LLM.
+    #[serde(default)]
+    pub compacted: bool,
 }
 
 impl ChatMessage {
@@ -156,6 +162,7 @@ impl ChatMessage {
             tool_args: None,
             tool_result: None,
             call_id: None,
+            compacted: false,
         }
     }
 
@@ -169,6 +176,7 @@ impl ChatMessage {
             tool_args: None,
             tool_result: None,
             call_id: None,
+            compacted: false,
         }
     }
 
@@ -182,6 +190,21 @@ impl ChatMessage {
             tool_args: None,
             tool_result: None,
             call_id: None,
+            compacted: false,
+        }
+    }
+
+    /// Create a compaction summary message
+    pub fn summary(content: String) -> Self {
+        Self {
+            role: MessageRole::Summary,
+            content,
+            timestamp: Local::now(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            call_id: None,
+            compacted: false,
         }
     }
 
@@ -199,6 +222,7 @@ impl ChatMessage {
             tool_args: Some(args.to_string()),
             tool_result: None,
             call_id,
+            compacted: false,
         }
     }
 
@@ -219,6 +243,7 @@ impl ChatMessage {
             tool_args: Some(args.to_string()),
             tool_result: Some(result.to_string()),
             call_id,
+            compacted: false,
         }
     }
 
@@ -237,6 +262,7 @@ impl ChatMessage {
             tool_args: None,
             tool_result: None,
             call_id: None,
+            compacted: false,
         }
     }
 
@@ -254,6 +280,7 @@ impl ChatMessage {
             tool_args: None,
             tool_result: None,
             call_id: None,
+            compacted: false,
         }
     }
 }
@@ -507,6 +534,9 @@ pub enum MessageRole {
 
     /// Tool execution result
     ToolResult,
+
+    /// Compaction summary (injected by the compactor)
+    Summary,
 }
 
 impl fmt::Display for MessageRole {
@@ -517,6 +547,7 @@ impl fmt::Display for MessageRole {
             MessageRole::System => write!(f, "System"),
             MessageRole::ToolCall => write!(f, "Tool Call"),
             MessageRole::ToolResult => write!(f, "Tool Result"),
+            MessageRole::Summary => write!(f, "Summary"),
         }
     }
 }
