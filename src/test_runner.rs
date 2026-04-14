@@ -5,16 +5,15 @@
 //!
 //! Key differences from AgentRunner:
 //! - Does not spawn loops (tests call methods directly)
-//! - Exposes state managers for direct verification
+//! - Uses StateManager as the single source of truth for history
+//! - Compaction is owned by StateManager (same as production)
 //! - Simplified configuration for testing
 
-use crate::ContextManager;
+use crate::context_manager::ContextManager;
 use crate::config::ContextConfig;
-use crate::conversation_manager::{ConversationManager, ConversationManagerConfig};
 use crate::hooks::SessionHook;
 use crate::providers::DynAgent;
 use crate::state::StateManager;
-use crate::storage::InMemoryStorage;
 use rig::completion::PromptError;
 use rig::completion::message::Message;
 use std::sync::{Arc, Mutex};
@@ -43,21 +42,15 @@ pub struct CompactionInfo {
 
 /// TestRunner provides a test-friendly interface to the agent processing pipeline.
 ///
-/// This struct mirrors the key functionality of AgentRunner::process_message_internal
-/// but exposes it directly for synchronous testing without spawning async loops.
+/// Mirrors AgentRunner::process_message_internal but exposes it directly for
+/// synchronous testing. Compaction is handled by StateManager (same as production).
 pub struct TestRunner {
     /// The agent (with mock LLM in tests)
     pub agent: Arc<DynAgent>,
-    /// State manager for tracking state changes
+    /// State manager for tracking state changes (single source of truth)
     pub state_manager: Arc<StateManager>,
-    /// Context manager for compaction
-    pub context_manager: Option<ContextManager>,
-    /// Conversation manager for persistence
-    pub conversation_manager: Option<Arc<Mutex<ConversationManager<InMemoryStorage>>>>,
     /// Session hook for event emission
     pub session_hook: Arc<SessionHook>,
-    /// Chat history for multi-turn conversations
-    chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
     /// System prompt
     pub system_prompt: String,
     /// Track compaction events for testing verification
@@ -65,47 +58,20 @@ pub struct TestRunner {
 }
 
 impl TestRunner {
-    /// Create a new TestRunner with the given configuration
+    /// Create a new TestRunner with default context configuration
     pub fn new(
         agent: DynAgent,
         state_manager: Arc<StateManager>,
         session_hook: Arc<SessionHook>,
         system_prompt: String,
     ) -> Self {
-        let agent = Arc::new(agent);
-
-        // Create context manager if state manager is available
-        let context_manager = Some(ContextManager::new(
-            ContextConfig::default(),
-            "mock-model",
-            state_manager.clone(),
-            system_prompt.len() / 4,
-            Some(agent.clone()),
-        ));
-
-        // Create in-memory conversation manager
-        let storage = InMemoryStorage::new();
-        let conversation_manager = match ConversationManager::new(
-            storage,
-            ConversationManagerConfig {
-                auto_save: true,
-                max_conversations: 100,
-            },
-        ) {
-            Ok(cm) => Some(Arc::new(Mutex::new(cm))),
-            Err(_) => None,
-        };
-
-        Self {
+        Self::new_with_context(
             agent,
             state_manager,
-            context_manager,
-            conversation_manager,
             session_hook,
-            chat_history: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             system_prompt,
-            compaction_events: Arc::new(Mutex::new(Vec::new())),
-        }
+            ContextConfig::default(),
+        )
     }
 
     /// Create a TestRunner that shares an event channel with the caller
@@ -126,9 +92,7 @@ impl TestRunner {
 
     /// Create a TestRunner with custom context configuration.
     ///
-    /// This allows tests to configure a small context window to trigger compaction
-    /// with fewer messages. For E2E compression tests, use this with a small
-    /// context_window value (e.g., 500 tokens).
+    /// Initializes the ContextManager inside StateManager (same as production).
     pub fn new_with_context(
         agent: DynAgent,
         state_manager: Arc<StateManager>,
@@ -138,63 +102,28 @@ impl TestRunner {
     ) -> Self {
         let agent = Arc::new(agent);
 
-        // Create context manager with custom config
-        let context_manager = Some(ContextManager::new(
+        // Initialize ContextManager inside StateManager (same as AgentRunner)
+        let cm = ContextManager::new(
             context_config,
             "mock-model",
             state_manager.clone(),
-            system_prompt.len() / 4,
             Some(agent.clone()),
-        ));
-
-        // Create in-memory conversation manager
-        let storage = InMemoryStorage::new();
-        let conversation_manager = match ConversationManager::new(
-            storage,
-            ConversationManagerConfig {
-                auto_save: true,
-                max_conversations: 100,
-            },
-        ) {
-            Ok(cm) => Some(Arc::new(Mutex::new(cm))),
-            Err(_) => None,
-        };
+        );
+        state_manager.init_context_manager(cm, system_prompt.clone());
 
         Self {
             agent,
             state_manager,
-            context_manager,
-            conversation_manager,
             session_hook,
-            chat_history: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             system_prompt,
             compaction_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Process a message through the full agentic loop.
-    ///
-    /// This method mirrors AgentRunner::process_message_internal and:
-    /// - Checks context compaction
-    /// - Calls agent.prompt_with_history()
-    /// - Handles tool execution (via Rig)
-    /// - Updates conversation manager
-    /// - Emits events via SessionHook
-    ///
-    /// Returns the agent's response text.
     pub async fn run_message(&mut self, message: &str) -> String {
-        // Get and clear current history
-        let mut history_guard = self.chat_history.lock().await;
-        let mut history: Vec<Message> = std::mem::take(&mut *history_guard);
-        drop(history_guard);
-
-        let result = self
-            .process_message_internal_with_history(message, &mut history)
-            .await;
-
-        // Put history back
-        let mut history_guard = self.chat_history.lock().await;
-        *history_guard = history;
+        let history = self.state_manager.get_agent_history();
+        let result = self.process_message_internal(message, history).await;
 
         match result {
             ProcessResult::Success(response) => response,
@@ -203,85 +132,49 @@ impl TestRunner {
         }
     }
 
-    /// Process a message with explicit history (for advanced testing)
-    pub async fn run_message_with_history(
-        &mut self,
-        message: &str,
-        history: &mut Vec<Message>,
-    ) -> String {
-        let result = self
-            .process_message_internal_with_history(message, history)
-            .await;
-
-        match result {
-            ProcessResult::Success(response) => response,
-            ProcessResult::Stopped => "Agent stopped".to_string(),
-            ProcessResult::Error => "Error occurred".to_string(),
-        }
-    }
-
-    /// Internal message processing with explicit history
-    async fn process_message_internal_with_history(
+    /// Internal message processing
+    async fn process_message_internal(
         &mut self,
         msg: &str,
-        history: &mut Vec<Message>,
+        mut history: Vec<Message>,
     ) -> ProcessResult {
         let current_msg = msg.to_string();
 
         // Mark as running
         self.state_manager.set_running(true);
 
-        // Context compaction check
-        if let Some(ref mut cm) = self.context_manager
-            && cm.needs_compaction(history)
-        {
-            let original_count = history.len();
-            match cm.compact(history, &self.system_prompt).await {
-                Ok(result) => {
-                    // Track compaction event for test verification
-                    self.compaction_events.lock().unwrap().push(CompactionInfo {
-                        original_count,
-                        compacted_count: result.compacted_count,
-                        num_discarded: result.num_discarded,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("Context compaction failed: {}", e);
-                }
-            }
+        // Sync stats from session hook BEFORE compaction check, so
+        // needs_compaction sees the latest token counts from previous turns.
+        self.process_session_hook_events();
+
+        // Context compaction — same as production, but synchronous so tests can verify
+        if let Some(result) = self.state_manager.compact_if_needed().await {
+            self.compaction_events.lock().unwrap().push(CompactionInfo {
+                original_count: result.original_count,
+                compacted_count: result.compacted_count,
+                num_discarded: result.num_discarded,
+            });
+            // Re-read history after compaction
+            history = self.state_manager.get_agent_history();
         }
 
         // Call the agent with history
-        let result = self.agent.prompt_with_history(&current_msg, history).await;
+        let result = self.agent.prompt_with_history(&current_msg, &mut history).await;
 
         // Process events from the session hook to update stats
-        // This is needed because ContextManager reads token counts from StateManager
         self.process_session_hook_events();
+
+        // Add messages to StateManager (single source of truth)
+        self.state_manager.add_user_message(current_msg.clone());
+        if let Ok(response) = &result {
+            self.state_manager.add_assistant_message(response.clone());
+        }
 
         // Mark as done
         self.state_manager.set_running(false);
 
         match result {
-            Ok(response) => {
-                // Ensure conversation exists and save
-                if let Some(ref cm) = self.conversation_manager {
-                    let mut cm = cm.lock().unwrap();
-                    // Create a new conversation if none exists
-                    if !cm.has_current() {
-                        let _ = cm
-                            .create_new("test-conversation".to_string(), "mock-model".to_string());
-                    }
-                    // Add the user message
-                    let _ = cm.add_user_message(current_msg.clone());
-                    // Add the assistant response
-                    let _ = cm.add_assistant_message(response.clone());
-                    // Save the conversation
-                    if let Err(e) = cm.save() {
-                        tracing::warn!("Failed to save conversation: {}", e);
-                    }
-                }
-                ProcessResult::Success(response)
-            }
+            Ok(response) => ProcessResult::Success(response),
             Err(PromptError::PromptCancelled { reason, .. }) => {
                 if reason == "stop" {
                     ProcessResult::Stopped
@@ -294,21 +187,9 @@ impl TestRunner {
     }
 
     /// Process events from the session hook to update StateManager stats.
-    ///
-    /// This is critical for E2E compression tests because ContextManager reads
-    /// token counts from StateManager. Without this, the token counts will be 0
-    /// and compaction will never trigger.
     fn process_session_hook_events(&self) {
-        // Get the stats from the session hook and sync to state manager
         let hook_stats = self.session_hook.get_stats();
-
-        // Reset state manager stats (also syncs to AppState)
         self.state_manager.reset_stats();
-
-        // Replay each request through StateManager.add_request() which:
-        //   - accumulates API call count and cost
-        //   - syncs stats to AppState (so get_state() reflects them)
-        //   - uses rig's per-request token values (overwritten each call)
         let pricing = crate::hooks::ModelPricing::default();
         for req in hook_stats.all_requests() {
             let cost = (req.input_tokens as f64 * pricing.input_per_token)
@@ -328,14 +209,14 @@ impl TestRunner {
         !self.compaction_events.lock().unwrap().is_empty()
     }
 
-    /// Get current chat history
-    pub async fn get_chat_history(&self) -> Vec<Message> {
-        self.chat_history.lock().await.clone()
+    /// Get current chat history from StateManager (single source of truth)
+    pub fn get_chat_history(&self) -> Vec<Message> {
+        self.state_manager.get_agent_history()
     }
 
-    /// Clear chat history
-    pub async fn clear_history(&self) {
-        self.chat_history.lock().await.clear();
+    /// Clear chat history via StateManager
+    pub fn clear_history(&self) {
+        self.state_manager.clear_chat();
     }
 
     /// Get current state
@@ -351,13 +232,6 @@ impl TestRunner {
     /// Get stats
     pub fn get_stats(&self) -> crate::hooks::SessionStats {
         self.state_manager.get_stats()
-    }
-
-    /// Get a reference to the conversation manager
-    pub fn conversation_manager(
-        &self,
-    ) -> Option<&Arc<Mutex<ConversationManager<InMemoryStorage>>>> {
-        self.conversation_manager.as_ref()
     }
 }
 
@@ -375,7 +249,6 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let session_hook = SessionHook::new(Some(sender.clone()));
 
-        // Build a simple agent for testing
         let agent = rig::agent::AgentBuilder::new(mock_model)
             .preamble("You are a helpful assistant.")
             .max_tokens(1024)
@@ -428,11 +301,5 @@ mod tests {
         );
 
         runner.run_message("Test").await;
-
-        // Note: stats accumulation depends on the SessionHook emitting events
-        // that are processed by the StateManager. This test verifies the
-        // runner completes without errors. Stats verification requires
-        // integration with the full agent system.
-        // Just verify the call completes successfully (assert!(true))
     }
 }

@@ -72,16 +72,12 @@ async fn todo_add_through_agent_loop() {
         "Should emit ToolResult event with success=true"
     );
 
-    // Conversation must be saved
-    if let Some(cm) = harness.conversation_manager() {
-        let cm = cm.lock().unwrap();
-        let conv = cm.get_current();
-        assert!(conv.is_some(), "Conversation should exist");
-        assert!(
-            conv.unwrap().messages.len() >= 2,
-            "Should have user + assistant messages"
-        );
-    }
+    // Conversation must be saved - verify via StateManager
+    let state = harness.get_state();
+    assert!(
+        state.chat.messages.len() >= 2,
+        "Should have user + assistant messages"
+    );
 }
 
 /// Add multiple todos through the agent loop, verify all arrive in StateManager.
@@ -296,11 +292,10 @@ async fn full_pipeline_tool_call_with_stats_and_events() {
         "ToolCall should come before ToolResult"
     );
 
-    // 4. Conversation saved with messages
-    if let Some(cm) = harness.conversation_manager() {
-        let cm = cm.lock().unwrap();
-        let conv = cm.get_current();
-        assert!(conv.is_some());
-        assert!(conv.unwrap().messages.len() >= 2);
-    }
+    // 4. Conversation saved with messages via StateManager
+    let state = harness.get_state();
+    assert!(
+        state.chat.messages.len() >= 2,
+        "Should have user + assistant messages"
+    );
 }

@@ -3,5 +3,5 @@
 pub mod completion_model;
 pub mod response;
 
-pub use completion_model::MockCompletionModel;
+pub use completion_model::{MockCompletionModel, RecordedRequest};
 pub use response::{MockResponse, Usage};

@@ -3,106 +3,86 @@
 //! Tests for verifying ContextManager compaction behavior through the full agentic loop.
 //! All tests verify that compaction works correctly when triggered with realistic
 //! token counts and small context windows.
+//!
+//! These tests verify ACTUAL behavior, not just event emission:
+//! - Messages are actually discarded (num_discarded > 0)
+//! - History in StateManager actually shrinks
+//! - Recent messages are preserved after compaction
 
 use crate::harness::TestHarness;
 use peakbot::ContextConfig;
 use peakbot::mock::{MockResponse, Usage};
 
+/// Helper: create a mock response with the given token counts.
+/// These are the responses consumed by the agent for user messages.
+fn agent_response(text: &str, input_tokens: u64) -> MockResponse {
+    MockResponse::text_with_usage(
+        text,
+        Usage {
+            input_tokens,
+            output_tokens: 20,
+        },
+    )
+}
+
+/// Helper: create a mock response that will be consumed by the summarization
+/// call inside compact(). When compaction triggers, ContextManager calls
+/// agent.prompt() to summarize old messages, which consumes a queued response.
+fn summarization_response() -> MockResponse {
+    MockResponse::text("Summary of previous conversation.")
+}
+
 /// Test that compaction IS actually triggered with a small context window
+/// AND that it actually discards messages.
 ///
 /// With a 500-token context window and 50% threshold (250 tokens),
-/// and each response using ~150 input tokens, compaction triggers
+/// and each response using ~300 input tokens, compaction triggers
 /// when there are more messages than keep_recent AND tokens exceed threshold.
-///
-/// IMPORTANT: The compaction check uses stats from the PREVIOUS message cycle.
-/// This is because stats are synced AFTER the agent call completes.
-///
-/// Flow:
-/// - Message 1: 2 messages, check stats from "start" (0 tokens) -> no check (2 <= 2)
-/// - After msg 1: agent called, stats sync (150 tokens)
-/// - Message 2: 4 messages, check stats from after msg 1 (150 tokens) -> no check (150 <= 250)
-/// - After msg 2: agent called, stats sync (300 tokens)
-/// - Message 3: 6 messages, check stats from after msg 2 (300 tokens) -> check (300 > 250) -> compact!
 #[tokio::test]
 async fn compaction_triggers_with_small_window() {
-    // Configure a tiny context window so compaction triggers quickly
     let context_config = ContextConfig {
         context_window: Some(500), // 500 tokens total
-        threshold: 0.5,            // 50% = 250 tokens threshold
-        keep_recent: 2,            // Keep last 2 messages (triggers when > 2)
+        threshold: 0.5,             // 50% = 250 tokens threshold
+        keep_recent: 2,             // Keep last 2 messages
         enabled: true,
     };
 
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
-    // With 150 tokens per request:
-    // Stats are synced AFTER each agent call, so compaction triggers
-    // one message later than expected (at message 3, not message 2)
-    harness.add_response(MockResponse::text_with_usage(
-        "Response 1",
-        Usage {
-            input_tokens: 150,
-            output_tokens: 20,
-        },
-    ));
-    harness.add_response(MockResponse::text_with_usage(
-        "Response 2",
-        Usage {
-            input_tokens: 150,
-            output_tokens: 20,
-        },
-    ));
-    harness.add_response(MockResponse::text_with_usage(
-        "Response 3",
-        Usage {
-            input_tokens: 150,
-            output_tokens: 20,
-        },
-    ));
-    harness.add_response(MockResponse::text_with_usage(
-        "Response 4",
-        Usage {
-            input_tokens: 150,
-            output_tokens: 20,
-        },
-    ));
+    // Queue agent responses + extra for summarization calls.
+    // compact() calls agent.prompt() for summarization, consuming one response.
+    harness.add_response(agent_response("Response 1", 300));
+    harness.add_response(agent_response("Response 2", 300));
+    harness.add_response(summarization_response()); // consumed by compact()
+    harness.add_response(agent_response("Response 3", 300));
+    harness.add_response(agent_response("Response 4", 300));
 
-    // Message 1: 2 messages (user + assistant), 2 <= 2 (keep_recent), no token check
+    // Message 1: 2 messages (user + assistant), 2 <= 2 (keep_recent), no compaction
     harness.run_message("Message 1").await;
     assert!(
         !harness.has_compaction_occurred(),
         "Compaction should not trigger on first message (2 <= 2)"
     );
 
-    // Message 2: 4 messages, 4 > 2, checks tokens from PREVIOUS cycle (150)
-    // 150 <= 250 threshold, so no compaction
+    // Message 2: history grows, now > keep_recent, and 300 > 250 threshold
     harness.run_message("Message 2").await;
-    assert!(
-        !harness.has_compaction_occurred(),
-        "Compaction should not trigger on message 2 (checks 150 tokens from msg 1, 150 <= 250)"
-    );
 
-    // Message 3: 6 messages, 6 > 2, checks tokens from after msg 2 (300)
-    // 300 > 250 threshold -> compaction triggers!
+    // Message 3: compaction should have occurred by now
     harness.run_message("Message 3").await;
-
-    // Verify compaction occurred
     assert!(
         harness.has_compaction_occurred(),
-        "Compaction should have occurred by message 3 (checks 300 tokens from msg 2, 300 > 250 threshold)"
+        "Compaction should have occurred (history > 2 messages AND 300 > 250 threshold)"
     );
-    let events = harness.get_compaction_events();
-    assert!(
-        !events.is_empty(),
-        "Should have at least one compaction event"
-    );
+
+    // Verify compaction actually did something, not just fired an event
+    harness.assert_compaction_actually_discarded();
 }
 
-/// Test that compaction reduces history length
+/// Test that compaction actually reduces history length in StateManager.
 ///
-/// Verifies that compaction actually discards messages by checking
-/// the compaction event's num_discarded field.
+/// This is the critical test that was missing: verify the persisted state
+/// actually shrinks, not just that a CompactionInfo event was emitted.
 #[tokio::test]
 async fn compaction_reduces_history() {
     let context_config = ContextConfig {
@@ -115,67 +95,57 @@ async fn compaction_reduces_history() {
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
-    // Use realistic token counts - 100 tokens per request
-    // After 2 requests: 200 tokens (above 150 threshold)
-    harness.add_responses(vec![
-        MockResponse::text_with_usage(
-            "Response 1",
-            Usage {
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 2",
-            Usage {
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 3",
-            Usage {
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 4",
-            Usage {
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 5",
-            Usage {
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ),
-    ]);
+    // Queue responses: agent responses + summarization responses consumed by compact()
+    harness.add_response(agent_response("Response 1", 200));
+    harness.add_response(summarization_response()); // compact() after msg 2
+    harness.add_response(agent_response("Response 2", 200));
+    harness.add_response(summarization_response()); // compact() after msg 3
+    harness.add_response(agent_response("Response 3", 200));
 
     // Build up conversation history
     harness.run_message("Message 1").await;
+    let count_after_1 = harness.get_chat_message_count();
+
     harness.run_message("Message 2").await;
     harness.run_message("Message 3").await;
 
-    // After message 3, compaction should have occurred
-    // Check the compaction event to verify messages were actually discarded
+    // Compaction must have occurred
     let events = harness.get_compaction_events();
-    if !events.is_empty() {
-        // At least one compaction should have happened
-        // Check that some messages were actually discarded
-        for event in &events {
-            assert!(
-                event.num_discarded > 0,
-                "Compaction should have discarded messages (num_discarded: {})",
-                event.num_discarded
-            );
-        }
-    } else {
-        panic!("Compaction should have occurred by message 3");
+    assert!(
+        !events.is_empty(),
+        "Compaction should have occurred by message 3"
+    );
+
+    // Verify actual message reduction, not just event emission
+    for event in &events {
+        assert!(
+            event.num_discarded > 0,
+            "Compaction event should have discarded messages (num_discarded: {})",
+            event.num_discarded
+        );
+        // compacted_count can equal original_count when summarization replaces
+        // the discarded messages with a summary (1:1 replacement for small discards).
+        // The key indicator is num_discarded > 0.
+        assert!(
+            event.compacted_count <= event.original_count,
+            "Compacted count ({}) should not exceed original ({})",
+            event.compacted_count, event.original_count
+        );
     }
+
+    // The StateManager history should be smaller than if no compaction happened.
+    // Without compaction, 3 user + 3 assistant = 6 messages (plus count_after_1 base).
+    // With compaction and keep_recent=1, older messages get replaced by a summary.
+    let final_count = harness.get_chat_message_count();
+    // After compaction + adding new messages, the count should be less than
+    // what it would be without any compaction (count_after_1 was the baseline
+    // before compaction started firing).
+    assert!(
+        final_count < count_after_1 + 4, // 4 = 2 more user + 2 more assistant
+        "StateManager history should reflect compaction. Got {} messages, \
+         expected fewer than {} (baseline {} + 4 new)",
+        final_count, count_after_1 + 4, count_after_1
+    );
 }
 
 /// Test that recent messages are preserved after compaction
@@ -183,61 +153,33 @@ async fn compaction_reduces_history() {
 async fn compaction_preserves_recent_messages() {
     let context_config = ContextConfig {
         context_window: Some(400),
-        threshold: 0.75, // 75% = 300 tokens
-        keep_recent: 3,  // Keep last 3 messages
+        threshold: 0.5,  // 50% = 200 tokens
+        keep_recent: 2,  // Keep last 2 messages
         enabled: true,
     };
 
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
-    harness.add_responses(vec![
-        MockResponse::text_with_usage(
-            "Response 1",
-            Usage {
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 2",
-            Usage {
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 3",
-            Usage {
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 4",
-            Usage {
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ),
-    ]);
+    harness.add_response(agent_response("Response 1", 250));
+    harness.add_response(agent_response("Response 2", 250));
+    harness.add_response(summarization_response()); // compact() consumes this
+    harness.add_response(agent_response("Response 3", 250));
 
-    // Run messages until compaction triggers
     harness.run_message("Message 1").await;
     harness.run_message("Message 2").await;
     harness.run_message("Message 3").await;
 
-    let history = harness.get_chat_history().await;
-
-    // After compaction, should have:
-    // - Summary message (if summarization worked) or just kept messages
-    // - Plus the recent messages that were kept
-    // Should NOT have all 6 original messages (3 user + 3 assistant)
     if harness.has_compaction_occurred() {
-        // Should be less than full history
+        harness.assert_compaction_actually_discarded();
+
+        // After compaction, the history should contain at most:
+        // summary (1) + keep_recent (2) + new messages added after compaction
+        // It should NOT have all 6 original messages (3 user + 3 assistant)
+        let history = harness.get_chat_history();
         assert!(
             history.len() < 6,
-            "History should be compacted, but got {} messages",
+            "History should be compacted, but got {} messages (expected < 6)",
             history.len()
         );
     }
@@ -257,37 +199,12 @@ async fn compaction_skipped_when_disabled() {
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
     harness.add_responses(vec![
-        MockResponse::text_with_usage(
-            "Response 1",
-            Usage {
-                input_tokens: 50,
-                output_tokens: 10,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 2",
-            Usage {
-                input_tokens: 50,
-                output_tokens: 10,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 3",
-            Usage {
-                input_tokens: 50,
-                output_tokens: 10,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response 4",
-            Usage {
-                input_tokens: 50,
-                output_tokens: 10,
-            },
-        ),
+        agent_response("Response 1", 50),
+        agent_response("Response 2", 50),
+        agent_response("Response 3", 50),
+        agent_response("Response 4", 50),
     ]);
 
-    // Run many messages
     harness.run_message("Message 1").await;
     harness.run_message("Message 2").await;
     harness.run_message("Message 3").await;
@@ -298,14 +215,22 @@ async fn compaction_skipped_when_disabled() {
         !harness.has_compaction_occurred(),
         "Compaction should not occur when disabled"
     );
+
+    // All messages should be present (no compaction)
+    let count = harness.get_chat_message_count();
+    assert_eq!(
+        count, 8,
+        "All 8 messages (4 user + 4 assistant) should be present when compaction is disabled"
+    );
 }
 
 /// Test multiple compaction events occur over long conversations
+/// and each one actually discards messages.
 #[tokio::test]
 async fn multiple_compaction_events() {
     let context_config = ContextConfig {
         context_window: Some(200), // Very small window
-        threshold: 0.6,            // 60% = 120 tokens
+        threshold: 0.6,             // 60% = 120 tokens threshold
         keep_recent: 1,            // Keep only last message
         enabled: true,
     };
@@ -313,76 +238,36 @@ async fn multiple_compaction_events() {
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
 
-    // Use small token counts to trigger multiple compactions
-    harness.add_responses(vec![
-        MockResponse::text_with_usage(
-            "Response",
-            Usage {
-                input_tokens: 80,
-                output_tokens: 15,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response",
-            Usage {
-                input_tokens: 80,
-                output_tokens: 15,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response",
-            Usage {
-                input_tokens: 80,
-                output_tokens: 15,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response",
-            Usage {
-                input_tokens: 80,
-                output_tokens: 15,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response",
-            Usage {
-                input_tokens: 80,
-                output_tokens: 15,
-            },
-        ),
-        MockResponse::text_with_usage(
-            "Response",
-            Usage {
-                input_tokens: 80,
-                output_tokens: 15,
-            },
-        ),
-    ]);
+    // Queue enough responses for 6 messages plus summarization calls.
+    // With keep_recent=1 and 150 > 120 threshold, compaction fires frequently.
+    // Each compaction consumes one summarization response.
+    for _ in 0..12 {
+        harness.add_response(agent_response("Response", 150));
+    }
+    for _ in 0..6 {
+        harness.add_response(summarization_response());
+    }
 
-    // Build up conversation - should trigger multiple compactions
-    harness.run_message("Message 1").await;
-    harness.run_message("Message 2").await;
-    harness.run_message("Message 3").await;
-    harness.run_message("Message 4").await;
-    harness.run_message("Message 5").await;
-    harness.run_message("Message 6").await;
+    for i in 1..=6 {
+        harness.run_message(&format!("Message {}", i)).await;
+    }
 
-    // Should have at least one compaction event
     assert!(
         harness.has_compaction_occurred(),
         "At least one compaction should have occurred"
     );
 
-    // Could have multiple compactions depending on how fast history grows
     let events = harness.get_compaction_events();
-    if !events.is_empty() {
-        for event in &events {
-            // Verify compaction info makes sense
-            assert!(
-                event.compacted_count <= event.original_count,
-                "Compacted count should not exceed original count"
-            );
-        }
+    for (i, event) in events.iter().enumerate() {
+        assert!(
+            event.compacted_count <= event.original_count,
+            "Compaction event {} should not increase message count", i
+        );
+        // Every compaction that fires should actually discard something
+        assert!(
+            event.num_discarded > 0,
+            "Compaction event {} fired but discarded 0 messages -- no-op stub detected", i
+        );
     }
 }
 
@@ -394,9 +279,7 @@ async fn context_status_accessible() {
 
     harness.run_message("Test").await;
 
-    // Verify context status is accessible after running a message
     let state = harness.get_state();
-    // Context info should be accessible - we just verify the field is readable
     let _ = state.context.current_usage;
     let _ = state.context.window_size;
 }
@@ -409,22 +292,19 @@ async fn messages_added_to_history() {
     harness.add_response(MockResponse::text("Response 2"));
     harness.add_response(MockResponse::text("Response 3"));
 
-    let history_before = harness.get_chat_history().await;
-    let count_before = history_before.len();
+    let count_before = harness.get_chat_message_count();
 
     harness.run_message("First").await;
     harness.run_message("Second").await;
     harness.run_message("Third").await;
 
-    let history_after = harness.get_chat_history().await;
-    let count_after = history_after.len();
+    let count_after = harness.get_chat_message_count();
 
-    // Should have more messages after running
-    assert!(
-        count_after > count_before,
-        "Should have more messages after running, before: {}, after: {}",
-        count_before,
-        count_after
+    // 3 user + 3 assistant = 6 new messages
+    assert_eq!(
+        count_after - count_before, 6,
+        "Should have 6 new messages (3 user + 3 assistant), before: {}, after: {}",
+        count_before, count_after
     );
 }
 
@@ -436,17 +316,15 @@ async fn history_cleared() {
 
     harness.run_message("Test").await;
 
-    let history_before = harness.get_chat_history().await;
     assert!(
-        !history_before.is_empty(),
+        harness.get_chat_message_count() > 0,
         "Should have history before clear"
     );
 
-    harness.clear_chat_history().await;
+    harness.clear_chat_history();
 
-    let history_after = harness.get_chat_history().await;
-    assert!(
-        history_after.is_empty(),
+    assert_eq!(
+        harness.get_chat_message_count(), 0,
         "Should have empty history after clear"
     );
 }
@@ -455,12 +333,99 @@ async fn history_cleared() {
 #[tokio::test]
 async fn conversation_continues_after_many_messages() {
     let mut harness = TestHarness::new();
-    harness.add_response(MockResponse::text("Continued response"));
+    for _ in 0..5 {
+        harness.add_response(MockResponse::text("Continued response"));
+    }
 
-    // Run multiple messages
     for i in 0..5 {
         let msg = format!("Message {}", i);
         let response = harness.run_message(&msg).await;
         assert!(!response.is_empty(), "Should respond to message {}", i);
     }
+}
+
+/// Verify that compaction through StateManager persists results.
+///
+/// Build up enough history that compaction discards MORE messages than the
+/// summary adds (requires > 1 message to discard with keep_recent=1).
+#[tokio::test]
+async fn compaction_persists_to_state_manager() {
+    let context_config = ContextConfig {
+        context_window: Some(300),
+        threshold: 0.5, // 150 tokens
+        keep_recent: 1,
+        enabled: true,
+    };
+
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+
+    // 3 messages: builds up chat entries. Each compaction consumes a summarization response.
+    harness.add_response(agent_response("Response 1", 200));
+    harness.add_response(summarization_response()); // compact after msg 1
+    harness.add_response(agent_response("Response 2", 200));
+    harness.add_response(summarization_response()); // compact after msg 2
+    harness.add_response(agent_response("Response 3", 200));
+
+    harness.run_message("Message 1").await;
+    harness.run_message("Message 2").await;
+
+    let count_before_compact_turn = harness.get_chat_message_count();
+    // Should be 4 (msg1_user, msg1_assistant, msg2_user, msg2_assistant)
+
+    harness.run_message("Message 3").await;
+
+    assert!(
+        harness.has_compaction_occurred(),
+        "Compaction should have triggered"
+    );
+    harness.assert_compaction_actually_discarded();
+
+    // After compaction + message 3:
+    // Compacted: summary (1) + keep_recent (1) = 2 messages
+    // Then msg3 adds: user (1) + assistant (1) = +2
+    // Total: 4 messages
+    // Without compaction it would be: 4 + 2 = 6
+    let after_count = harness.get_chat_message_count();
+    assert!(
+        after_count < count_before_compact_turn + 2,
+        "StateManager should reflect compaction. Before compact turn: {}, After: {} \
+         (expected < {} without compaction)",
+        count_before_compact_turn, after_count, count_before_compact_turn + 2
+    );
+}
+
+/// Test that compaction under threshold does NOT trigger.
+/// Verifies no false positives when token usage is well under the limit.
+#[tokio::test]
+async fn no_compaction_under_threshold() {
+    let context_config = ContextConfig {
+        context_window: Some(1000),
+        threshold: 0.8, // 800 tokens
+        keep_recent: 2,
+        enabled: true,
+    };
+
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+
+    // 100 tokens per request, well under 800 threshold
+    for _ in 0..5 {
+        harness.add_response(agent_response("Response", 100));
+    }
+
+    for i in 1..=5 {
+        harness.run_message(&format!("Message {}", i)).await;
+    }
+
+    assert!(
+        !harness.has_compaction_occurred(),
+        "Compaction should NOT trigger when tokens (100) are well under threshold (800)"
+    );
+
+    // All messages should be present
+    assert_eq!(
+        harness.get_chat_message_count(), 10,
+        "All 10 messages (5 user + 5 assistant) should be present"
+    );
 }

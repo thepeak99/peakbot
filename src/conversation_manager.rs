@@ -129,9 +129,14 @@ impl<S: ConversationStorage> ConversationManager<S> {
     }
 
     /// Add a tool call to the current conversation (without auto-save)
-    pub fn add_tool_call(&mut self, tool_name: String, arguments: String) -> Result<()> {
+    pub fn add_tool_call(
+        &mut self,
+        tool_name: String,
+        arguments: String,
+        call_id: Option<String>,
+    ) -> Result<()> {
         if let Some(ref mut conv) = self.current_conversation {
-            conv.add_tool_call(tool_name, arguments);
+            conv.add_tool_call(tool_name, arguments, call_id);
             // Auto-save is handled by the caller (ConversationHandler) to avoid nested locks
         }
         Ok(())
@@ -143,9 +148,10 @@ impl<S: ConversationStorage> ConversationManager<S> {
         tool_name: String,
         arguments: String,
         result: String,
+        call_id: Option<String>,
     ) -> Result<()> {
         if let Some(ref mut conv) = self.current_conversation {
-            conv.add_tool_result(tool_name, arguments, result);
+            conv.add_tool_result(tool_name, arguments, result, call_id);
         }
         Ok(())
     }
@@ -203,6 +209,7 @@ impl<S: ConversationStorage> ConversationManager<S> {
                     tool_name,
                     arguments,
                     timestamp,
+                    ..
                 } => {
                     md.push_str(&format!(
                         "### Tool Call: {} ({})\n\n```json\n{}\n```\n\n",
@@ -216,6 +223,7 @@ impl<S: ConversationStorage> ConversationManager<S> {
                     arguments,
                     result,
                     timestamp,
+                    ..
                 } => {
                     md.push_str(&format!(
                         "### Tool Result: {} ({})\n\n**Arguments:**\n```json\n{}\n```\n\n**Output:**\n```\n{}\n```\n\n",

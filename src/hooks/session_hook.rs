@@ -48,11 +48,17 @@ pub struct RequestStats {
 }
 
 /// Accumulated session statistics
+///
+/// NOTE: `total_input_tokens` and `total_output_tokens` are OVERWRITTEN per
+/// request (not accumulated). They reflect the LAST request's token counts.
+/// This mirrors rig's per-request usage reporting where input_tokens is the
+/// full context size sent to the LLM. For the true cumulative sum across all
+/// requests, use `cumulative_input_tokens()`.
 #[derive(Clone, Debug, Default)]
 pub struct SessionStats {
-    /// Total input tokens across all requests
+    /// Input tokens from the LAST request (overwritten, not accumulated)
     pub total_input_tokens: u64,
-    /// Total output tokens across all requests
+    /// Output tokens from the LAST request (overwritten, not accumulated)
     pub total_output_tokens: u64,
     /// Total number of API calls
     pub total_api_calls: u64,
@@ -327,38 +333,30 @@ pub struct SessionHook {
     /// Reference to session stats for token tracking
     #[allow(dead_code)]
     stats: Arc<Mutex<SessionStats>>,
-    /// Context window size in tokens
-    context_window: u64,
-    /// Compaction threshold (0.0-1.0)
-    threshold: f64,
     /// User requested stop
     stop_requested: Arc<AtomicBool>,
 }
 
 impl SessionHook {
-    /// Create a new minimal session hook (no context checking)
+    /// Create a new session hook
     pub fn new(event_sender: Option<mpsc::UnboundedSender<AgentEvent>>) -> Self {
         Self {
             event_sender,
             stats: Arc::new(Mutex::new(SessionStats::new())),
-            context_window: 128_000,
-            threshold: 0.8,
             stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Create a new session hook with full context checking
+    /// Create a new session hook with shared stats tracking
     pub fn with_context_tracking(
         event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
         stats: Arc<Mutex<SessionStats>>,
-        context_window: u64,
-        threshold: f64,
+        _context_window: u64,
+        _threshold: f64,
     ) -> Self {
         Self {
             event_sender,
             stats,
-            context_window,
-            threshold,
             stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -380,8 +378,6 @@ impl SessionHook {
             Self {
                 event_sender: Some(sender),
                 stats: Arc::new(Mutex::new(SessionStats::new())),
-                context_window: 128_000,
-                threshold: 0.8,
                 stop_requested: Arc::new(AtomicBool::new(false)),
             },
             receiver,
@@ -500,22 +496,15 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
 
         // Check for interruptions at LLM boundary (before tool execution)
 
-        // 1. Stop flag takes priority over everything
+        // Stop flag check — only interruption handled here.
+        // Context compaction is handled by ContextManager at the top of the
+        // AgentRunner loop (before the next LLM call), not here. Terminating
+        // mid-response would throw away the LLM's output and previously caused
+        // an infinite retry loop (see compactfuck.md Bug #2 and #3).
         if self.stop_requested.load(Ordering::SeqCst) {
             self.stop_requested.store(false, Ordering::SeqCst);
             tracing::info!("Stop requested, terminating");
             return HookAction::terminate("stop");
-        }
-
-        // 2. Context limit check - we have usage data directly here
-        let threshold_tokens = (self.context_window as f64 * self.threshold) as u64;
-        if response.usage.input_tokens > threshold_tokens {
-            tracing::info!(
-                "Context at {:.1}% ({} tokens), triggering compact",
-                (response.usage.input_tokens as f64 / self.context_window as f64) * 100.0,
-                response.usage.input_tokens
-            );
-            return HookAction::terminate("compact");
         }
 
         HookAction::Continue

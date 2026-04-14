@@ -35,6 +35,9 @@ pub enum Message {
         tool_name: String,
         /// Arguments passed to the tool (JSON string)
         arguments: String,
+        /// Tool call ID for correlating calls with results
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
         /// Timestamp when tool was called
         timestamp: DateTime<Utc>,
     },
@@ -46,6 +49,9 @@ pub enum Message {
         arguments: String,
         /// Tool execution result (or error message)
         result: String,
+        /// Tool call ID for correlating calls with results
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
         /// Timestamp when tool was executed
         timestamp: DateTime<Utc>,
     },
@@ -69,20 +75,27 @@ impl Message {
     }
 
     /// Create a new tool call message
-    pub fn tool_call(tool_name: String, arguments: String) -> Self {
+    pub fn tool_call(tool_name: String, arguments: String, call_id: Option<String>) -> Self {
         Message::ToolCall {
             tool_name,
             arguments,
+            call_id,
             timestamp: Utc::now(),
         }
     }
 
     /// Create a new tool result message
-    pub fn tool_result(tool_name: String, arguments: String, result: String) -> Self {
+    pub fn tool_result(
+        tool_name: String,
+        arguments: String,
+        result: String,
+        call_id: Option<String>,
+    ) -> Self {
         Message::ToolResult {
             tool_name,
             arguments,
             result,
+            call_id,
             timestamp: Utc::now(),
         }
     }
@@ -147,16 +160,28 @@ impl Conversation {
     }
 
     /// Add a tool call to the conversation
-    pub fn add_tool_call(&mut self, tool_name: String, arguments: String) {
-        self.messages.push(Message::tool_call(tool_name, arguments));
+    pub fn add_tool_call(
+        &mut self,
+        tool_name: String,
+        arguments: String,
+        call_id: Option<String>,
+    ) {
+        self.messages
+            .push(Message::tool_call(tool_name, arguments, call_id));
         self.metadata.message_count = self.messages.len();
         self.updated_at = Utc::now();
     }
 
     /// Add a tool result to the conversation
-    pub fn add_tool_result(&mut self, tool_name: String, arguments: String, result: String) {
+    pub fn add_tool_result(
+        &mut self,
+        tool_name: String,
+        arguments: String,
+        result: String,
+        call_id: Option<String>,
+    ) {
         self.messages
-            .push(Message::tool_result(tool_name, arguments, result));
+            .push(Message::tool_result(tool_name, arguments, result, call_id));
         self.metadata.message_count = self.messages.len();
         self.updated_at = Utc::now();
     }
@@ -224,6 +249,7 @@ mod tests {
             "bash".to_string(),
             r#"{"command": "ls"}"#.to_string(),
             "output".to_string(),
+            Some("call_1".to_string()),
         );
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.metadata.message_count, 3);
@@ -232,6 +258,7 @@ mod tests {
         conv.add_tool_call(
             "file_read".to_string(),
             r#"{"path": "/test/file.txt"}"#.to_string(),
+            Some("call_2".to_string()),
         );
         assert_eq!(conv.messages.len(), 4);
     }
@@ -248,5 +275,89 @@ mod tests {
         assert_eq!(loaded.id, conv.id);
         assert_eq!(loaded.name, conv.name);
         assert_eq!(loaded.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_serialization_with_tool_calls() {
+        let mut conv = Conversation::new("Test".to_string(), "claude-3".to_string());
+        conv.add_user_message("List files".to_string());
+        conv.add_tool_call(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            Some("call_1".to_string()),
+        );
+        conv.add_tool_result(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            "file1.txt\nfile2.txt".to_string(),
+            Some("call_1".to_string()),
+        );
+        conv.add_assistant_message("Here are the files.".to_string());
+
+        let json = serde_json::to_string_pretty(&conv).unwrap();
+        let loaded: Conversation = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.messages.len(), 4);
+
+        // Verify tool call roundtrip
+        match &loaded.messages[1] {
+            Message::ToolCall {
+                tool_name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                assert_eq!(tool_name, "bash");
+                assert_eq!(arguments, r#"{"command":"ls"}"#);
+                assert_eq!(call_id.as_deref(), Some("call_1"));
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+
+        // Verify tool result roundtrip
+        match &loaded.messages[2] {
+            Message::ToolResult {
+                tool_name,
+                arguments,
+                result,
+                call_id,
+                ..
+            } => {
+                assert_eq!(tool_name, "bash");
+                assert_eq!(arguments, r#"{"command":"ls"}"#);
+                assert_eq!(result, "file1.txt\nfile2.txt");
+                assert_eq!(call_id.as_deref(), Some("call_1"));
+            }
+            other => panic!("Expected ToolResult, got {:?}", other),
+        }
+    }
+
+    /// Verify backward compatibility: JSON without call_id fields still deserializes
+    #[test]
+    fn test_backward_compat_no_call_id() {
+        let json = r#"{
+            "id": "10da8b9d-f242-4786-9c75-c3fbc2530f1f",
+            "name": "Test",
+            "created_at": "2026-04-14T09:14:07Z",
+            "updated_at": "2026-04-14T09:15:41Z",
+            "messages": [
+                {"role": "ToolCall", "tool_name": "bash", "arguments": "{}", "timestamp": "2026-04-14T09:15:41Z"},
+                {"role": "ToolResult", "tool_name": "bash", "arguments": "{}", "result": "ok", "timestamp": "2026-04-14T09:15:41Z"}
+            ],
+            "model": "test",
+            "metadata": {"message_count": 2}
+        }"#;
+
+        let conv: Conversation = serde_json::from_str(json).unwrap();
+        assert_eq!(conv.messages.len(), 2);
+
+        match &conv.messages[0] {
+            Message::ToolCall { call_id, .. } => assert!(call_id.is_none()),
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+        match &conv.messages[1] {
+            Message::ToolResult { call_id, .. } => assert!(call_id.is_none()),
+            other => panic!("Expected ToolResult, got {:?}", other),
+        }
     }
 }

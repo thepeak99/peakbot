@@ -1,7 +1,7 @@
 //! Test harness for integration testing
 //!
 //! TestHarness provides a unified way to set up tests with:
-//! - StateManager for tracking state changes
+//! - StateManager for tracking state changes (single source of truth)
 //! - MockCompletionModel for simulating LLM responses
 //! - Storage abstraction for conversation persistence
 //! - Event collection for verifying agent behavior
@@ -10,13 +10,12 @@
 //! enabling true E2E tests where only the LLM provider is mocked.
 
 use peakbot::ContextConfig;
-use peakbot::mock::{MockCompletionModel, MockResponse};
-use peakbot::storage::InMemoryStorage;
+use peakbot::mock::{MockCompletionModel, MockResponse, RecordedRequest};
 use peakbot::test_runner::TestRunner;
 use peakbot::ui::AppState;
-use peakbot::{AgentEvent, ConversationManager, SessionStats, StateManager, TodoItem};
+use peakbot::{AgentEvent, SessionStats, StateManager, TodoItem};
 use rig::completion::message::Message;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 /// Test harness for integration tests
@@ -124,15 +123,6 @@ impl TestHarness {
         self.runner.run_message(message).await
     }
 
-    /// Run a message with history (backward compatible)
-    pub async fn run_message_with_history(
-        &mut self,
-        message: &str,
-        history: &mut Vec<Message>,
-    ) -> String {
-        self.runner.run_message_with_history(message, history).await
-    }
-
     /// Get current state snapshot
     pub fn get_state(&self) -> AppState {
         self.state_manager.get_state()
@@ -158,24 +148,14 @@ impl TestHarness {
         self.mock_model.remaining()
     }
 
-    /// Get a clone of the chat history (for verification)
-    pub async fn get_chat_history(&self) -> Vec<Message> {
-        self.runner.get_chat_history().await
+    /// Get a clone of the chat history from StateManager (for verification)
+    pub fn get_chat_history(&self) -> Vec<Message> {
+        self.runner.get_chat_history()
     }
 
-    /// Clear the chat history
-    pub async fn clear_chat_history(&self) {
-        self.runner.clear_history().await;
-    }
-
-    /// Get a reference to the conversation manager for assertions
-    ///
-    /// Allows tests to verify conversation persistence behavior.
-    /// Returns None if conversation manager was not initialized.
-    pub fn conversation_manager(
-        &self,
-    ) -> Option<&Arc<Mutex<ConversationManager<InMemoryStorage>>>> {
-        self.runner.conversation_manager()
+    /// Clear the chat history via StateManager
+    pub fn clear_chat_history(&self) {
+        self.runner.clear_history();
     }
 
     /// Drain all emitted events from the event receiver
@@ -200,6 +180,122 @@ impl TestHarness {
     /// Check if any compaction occurred during testing
     pub fn has_compaction_occurred(&self) -> bool {
         self.runner.has_compaction_occurred()
+    }
+
+    /// Get the number of chat messages currently in StateManager.
+    /// This reflects the ACTUAL persisted state, not just what the agent sees.
+    pub fn get_chat_message_count(&self) -> usize {
+        self.state_manager.get_state().chat.messages.len()
+    }
+
+    // ── Request Recording ───────────────────────────────────────────────────────
+
+    /// Get all recorded LLM requests (both regular and summarization).
+    pub fn get_recorded_requests(&self) -> Vec<RecordedRequest> {
+        self.mock_model.get_recorded_requests()
+    }
+
+    /// Get the total number of LLM calls made.
+    pub fn request_count(&self) -> usize {
+        self.mock_model.request_count()
+    }
+
+    /// Get only the summarization requests (sent by ContextManager::summarize_messages).
+    ///
+    /// Identified by the prompt containing the summarization prefix.
+    pub fn get_summarization_requests(&self) -> Vec<RecordedRequest> {
+        self.get_recorded_requests()
+            .into_iter()
+            .filter(|r| {
+                r.chat_history.iter().any(|msg| {
+                    if let rig::completion::message::Message::User { content } = msg {
+                        content.iter().any(|c| {
+                            if let rig::completion::message::UserContent::Text(t) = c {
+                                t.text.contains("Please summarize the following conversation")
+                            } else {
+                                false
+                            }
+                        })
+                    } else {
+                        false
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Get only the regular (non-summarization) requests.
+    pub fn get_regular_requests(&self) -> Vec<RecordedRequest> {
+        self.get_recorded_requests()
+            .into_iter()
+            .filter(|r| {
+                !r.chat_history.iter().any(|msg| {
+                    if let rig::completion::message::Message::User { content } = msg {
+                        content.iter().any(|c| {
+                            if let rig::completion::message::UserContent::Text(t) = c {
+                                t.text.contains("Please summarize the following conversation")
+                            } else {
+                                false
+                            }
+                        })
+                    } else {
+                        false
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Extract the prompt text from the last message of a summarization request.
+    /// Returns None if the request isn't a summarization request.
+    pub fn extract_summarization_prompt(request: &RecordedRequest) -> Option<String> {
+        request.chat_history.last().and_then(|msg| {
+            if let rig::completion::message::Message::User { content } = msg {
+                content.iter().find_map(|c| {
+                    if let rig::completion::message::UserContent::Text(t) = c {
+                        if t.text.contains("Please summarize the following conversation") {
+                            Some(t.text.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    // ── Assertions ─────────────────────────────────────────────────────────────
+
+    /// Assert that the last compaction event actually discarded messages.
+    /// Panics with a descriptive message if no compaction occurred or if
+    /// num_discarded was 0 (the stub behavior).
+    ///
+    /// Note: compacted_count can equal original_count when summarization replaces
+    /// discarded messages 1:1 (e.g., 1 discarded message replaced by 1 summary).
+    /// The reliable indicator is num_discarded > 0.
+    pub fn assert_compaction_actually_discarded(&self) {
+        let events = self.get_compaction_events();
+        assert!(
+            !events.is_empty(),
+            "Expected compaction to have occurred, but no compaction events were recorded"
+        );
+        let last = events.last().unwrap();
+        assert!(
+            last.num_discarded > 0,
+            "Compaction event fired but num_discarded is 0 -- compaction was a no-op stub. \
+             original_count: {}, compacted_count: {}",
+            last.original_count, last.compacted_count
+        );
+        assert!(
+            last.compacted_count <= last.original_count,
+            "Compaction event fired but compacted_count ({}) > original_count ({}) -- \
+             compaction somehow ADDED messages",
+            last.compacted_count, last.original_count
+        );
     }
 }
 

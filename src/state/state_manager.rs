@@ -13,16 +13,23 @@
 //! The `subscribe()` method returns an async stream (`mpsc::Receiver<AppState>`)
 //! that can be used directly with `tokio::select!` or iterated with `while let`.
 
+use crate::context_manager::{CompactionResult, ContextManager};
+use crate::conversation::Conversation;
 use crate::hooks::session_hook::SessionStats;
+use crate::storage::{ConversationStorage, ConversationSummary};
 use crate::tools::todo::{TodoList, TodoStatus};
 use crate::ui::app_state::{
     AppState, ChatMessage, ChatState, ContextState, Notification, NotificationKind, SessionState,
     TodoItem, TodoState, WelcomeState,
 };
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
-/// Manages AppState and distributes updates to subscribed Views
+/// Manages AppState and distributes updates to subscribed Views.
+///
+/// Owns the ContextManager internally. Compaction is triggered automatically
+/// when messages are added — callers never touch ContextManager directly.
 pub struct StateManager {
     state: Arc<RwLock<AppState>>,
     /// Todo list (single source of truth for todo state)
@@ -31,16 +38,152 @@ pub struct StateManager {
     subscribers: Arc<RwLock<Vec<mpsc::Sender<AppState>>>>,
     /// Session statistics (tokens, cost, API calls) - single source of truth
     stats: Arc<Mutex<SessionStats>>,
+
+    // ── Context Compaction ───────────────────────────────────────────────────
+    /// Context manager for automatic compaction (private, not exposed)
+    context_manager: Mutex<Option<ContextManager>>,
+    /// System prompt needed for summarization during compaction
+    system_prompt: RwLock<String>,
+    /// Weak self-reference for spawning async compaction tasks from sync methods
+    self_ref: RwLock<Option<Weak<Self>>>,
+
+    // ── Conversation Persistence (Single Source of Truth) ─────────────────────
+    /// Storage backend for conversations
+    storage: Option<Arc<dyn ConversationStorage>>,
+    /// Current conversation being edited
+    current_conversation: Arc<Mutex<Option<Conversation>>>,
 }
 
 impl StateManager {
-    /// Create a new StateManager
+    /// Create a new StateManager wrapped in Arc.
+    /// The Arc is required so StateManager can spawn async compaction tasks.
+    pub fn new_arc() -> Arc<Self> {
+        let sm = Arc::new(Self::new_inner(None));
+        *sm.self_ref.write().unwrap() = Some(Arc::downgrade(&sm));
+        sm
+    }
+
+    /// Create a new StateManager with conversation storage, wrapped in Arc.
+    pub fn new_arc_with_storage(storage: Arc<dyn ConversationStorage>) -> Arc<Self> {
+        let sm = Arc::new(Self::new_inner(Some(storage)));
+        *sm.self_ref.write().unwrap() = Some(Arc::downgrade(&sm));
+        sm
+    }
+
+    /// Create a bare StateManager (no Arc, no auto-compaction).
+    /// Use `new_arc()` in production for automatic compaction support.
     pub fn new() -> Self {
+        Self::new_inner(None)
+    }
+
+    fn new_inner(storage: Option<Arc<dyn ConversationStorage>>) -> Self {
         Self {
             state: Arc::new(RwLock::new(AppState::new())),
             todo_list: Arc::new(Mutex::new(TodoList::new())),
             subscribers: Arc::new(RwLock::new(Vec::new())),
             stats: Arc::new(Mutex::new(SessionStats::new())),
+            context_manager: Mutex::new(None),
+            system_prompt: RwLock::new(String::new()),
+            self_ref: RwLock::new(None),
+            storage,
+            current_conversation: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    // ── Context Compaction ──────────────────────────────────────────────────────
+
+    /// Initialize the context manager for automatic compaction.
+    /// Must be called once after construction with the agent, config, and system prompt.
+    /// After this, compaction triggers automatically when messages are added.
+    pub(crate) fn init_context_manager(&self, cm: ContextManager, system_prompt: String) {
+        *self.context_manager.lock().unwrap() = Some(cm);
+        *self.system_prompt.write().unwrap() = system_prompt;
+    }
+
+    /// Check if compaction is needed and trigger it in the background.
+    /// Called internally after each message is added. Synchronous check,
+    /// spawns an async task if compaction is needed.
+    fn maybe_compact(&self) {
+        // Quick sync check: is compaction needed?
+        let cm_clone = {
+            let guard = self.context_manager.lock().unwrap();
+            let cm = match guard.as_ref() {
+                Some(cm) => cm,
+                None => return,
+            };
+            let history = self.get_agent_history();
+            if !cm.needs_compaction(&history) {
+                return;
+            }
+            cm.clone()
+        };
+
+        // Get Arc<Self> from weak reference for the spawned task
+        let sm = match self.self_ref.read().unwrap().as_ref().and_then(Weak::upgrade) {
+            Some(arc) => arc,
+            None => return, // No Arc available (bare StateManager in tests), skip async compaction
+        };
+        let system_prompt = self.system_prompt.read().unwrap().clone();
+
+        tokio::spawn(async move {
+            sm.set_status(Some("Compacting context...".to_string()));
+            match cm_clone.compact_from_state_manager_on(&sm, &system_prompt).await {
+                Ok(result) if result.num_discarded > 0 => {
+                    sm.push_notification(
+                        format!(
+                            "Context compacted: {} → {} messages, {} discarded",
+                            result.original_count, result.compacted_count, result.num_discarded
+                        ),
+                        NotificationKind::Info,
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("Context compaction failed: {}", e);
+                }
+            }
+            sm.set_status(None);
+        });
+    }
+
+    /// Check if compaction is needed and run it synchronously (async).
+    /// Used by TestRunner and force_compact. Returns the result if compaction ran.
+    pub async fn compact_if_needed(&self) -> Option<CompactionResult> {
+        let cm_clone = {
+            let guard = self.context_manager.lock().unwrap();
+            let cm = guard.as_ref()?;
+            let history = self.get_agent_history();
+            if !cm.needs_compaction(&history) {
+                return None;
+            }
+            cm.clone()
+        };
+
+        let system_prompt = self.system_prompt.read().unwrap().clone();
+        match cm_clone.compact_from_state_manager_on(self, &system_prompt).await {
+            Ok(result) if result.num_discarded > 0 => Some(result),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("Context compaction failed: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Force compaction regardless of threshold. Returns the result.
+    pub async fn force_compact(self: &Arc<Self>, system_prompt: &str) -> Option<CompactionResult> {
+        let cm_clone = {
+            let guard = self.context_manager.lock().unwrap();
+            guard.as_ref()?.clone()
+        };
+
+        match cm_clone.compact_from_state_manager_on(self, system_prompt).await {
+            Ok(result) if result.num_discarded > 0 => Some(result),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("Force compaction failed: {}", e);
+                None
+            }
         }
     }
 
@@ -98,20 +241,20 @@ impl StateManager {
             let list = self.todo_list.lock().unwrap();
             list.list().is_empty()
         };
-        
+
         let result = {
             let mut list = self.todo_list.lock().unwrap();
             list.add(task)
         };
-        
+
         // Sync to UI
         self.sync_todo_to_ui(&self.todo_list.lock().unwrap());
-        
+
         // Auto-show todo panel when first task is added
         if was_empty && result.is_new {
             self.show_todo_panel();
         }
-        
+
         if result.is_new {
             format!("Added task #{}: {}", result.id, result.task)
         } else {
@@ -125,39 +268,43 @@ impl StateManager {
         if tasks.is_empty() {
             return "No tasks provided.".to_string();
         }
-        
+
         let was_empty = {
             let list = self.todo_list.lock().unwrap();
             list.list().is_empty()
         };
-        
+
         let results = {
             let mut list = self.todo_list.lock().unwrap();
             let results = list.add_many(tasks);
             self.sync_todo_to_ui(&list);
             results
         };
-        
+
         // Separate new and existing tasks
         let new_tasks: Vec<_> = results.iter().filter(|r| r.is_new).collect();
         let existing_tasks: Vec<_> = results.iter().filter(|r| !r.is_new).collect();
-        
+
         // Auto-show todo panel when first tasks are added to empty list
         if was_empty && !new_tasks.is_empty() {
             self.show_todo_panel();
         }
-        
+
         // Build response message
         let mut output = String::new();
-        
+
         if !new_tasks.is_empty() {
             let new_list: Vec<String> = new_tasks
                 .iter()
                 .map(|r| format!("#{}: {}", r.id, r.task))
                 .collect();
-            output.push_str(&format!("Added {} task(s): {}\n", new_tasks.len(), new_list.join(", ")));
+            output.push_str(&format!(
+                "Added {} task(s): {}\n",
+                new_tasks.len(),
+                new_list.join(", ")
+            ));
         }
-        
+
         if !existing_tasks.is_empty() {
             let existing_list: Vec<String> = existing_tasks
                 .iter()
@@ -165,7 +312,7 @@ impl StateManager {
                 .collect();
             output.push_str(&format!("Already existed: {}", existing_list.join(", ")));
         }
-        
+
         output.trim().to_string()
     }
 
@@ -323,7 +470,7 @@ impl StateManager {
     }
 
     /// Update chat messages — called by Controller after agent response
-    pub fn update_chat(&self, message: ChatMessage) {
+    fn update_chat(&self, message: ChatMessage) {
         let mut state = self.state.write().unwrap();
         state.chat.add_message(message);
         self.notify_update(&state);
@@ -333,6 +480,17 @@ impl StateManager {
     pub fn clear_chat(&self) {
         let mut state = self.state.write().unwrap();
         state.chat.clear();
+        self.notify_update(&state);
+    }
+
+    /// Replace all chat messages with the given list.
+    ///
+    /// Used after context compaction to persist the compacted history back
+    /// into StateManager (the single source of truth).
+    pub fn replace_chat_messages(&self, messages: Vec<ChatMessage>) {
+        let mut state = self.state.write().unwrap();
+        state.chat.messages = messages;
+        state.chat.auto_scroll = true;
         self.notify_update(&state);
     }
 
@@ -456,6 +614,373 @@ impl StateManager {
         *state = new_state;
         self.notify_update(&state);
     }
+
+    // ── Conversation Management ────────────────────────────────────────────────
+
+    /// Create a new conversation and set it as current
+    pub fn create_conversation(&self, name: String, model: String) {
+        let conv = Conversation::new(name, model);
+        *self.current_conversation.lock().unwrap() = Some(conv);
+    }
+
+    /// List all saved conversations
+    pub fn list_conversations(&self) -> Option<Vec<ConversationSummary>> {
+        self.storage.as_ref().and_then(|s| s.list().ok())
+    }
+
+    /// Load a conversation by ID into current
+    pub fn load_conversation(&self, id: Uuid) -> anyhow::Result<()> {
+        if let Some(ref storage) = self.storage {
+            let conv = storage.load(id)?;
+            *self.current_conversation.lock().unwrap() = Some(conv);
+            self.sync_from_conversation();
+        }
+        Ok(())
+    }
+
+    /// Get the current conversation ID
+    pub fn get_current_conversation_id(&self) -> Option<Uuid> {
+        self.current_conversation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.id)
+    }
+
+    /// Get the current conversation
+    pub fn get_current_conversation(&self) -> Option<Conversation> {
+        self.current_conversation.lock().unwrap().clone()
+    }
+
+    /// Check if there is a current conversation
+    pub fn has_current_conversation(&self) -> bool {
+        self.current_conversation.lock().unwrap().is_some()
+    }
+
+    /// Clear the current conversation
+    pub fn clear_current_conversation(&self) {
+        *self.current_conversation.lock().unwrap() = None;
+    }
+
+    /// Save the current conversation to storage
+    pub fn save_conversation(&self) {
+        if let (Some(ref storage), Some(ref mut conv)) = (
+            self.storage.as_ref(),
+            self.current_conversation.lock().unwrap().as_mut(),
+        ) {
+            // Sync chat state to conversation before saving
+            self.sync_to_conversation();
+            // Update timestamp
+            conv.updated_at = chrono::Utc::now();
+            // Save to storage
+            let _ = storage.save(conv);
+        }
+    }
+
+    /// Delete a conversation by ID
+    pub fn delete_conversation(&self, id: Uuid) -> anyhow::Result<()> {
+        if let Some(ref storage) = self.storage {
+            // If deleting current conversation, clear it
+            if self.get_current_conversation_id() == Some(id) {
+                self.clear_current_conversation();
+                self.clear_chat();
+            }
+            storage.delete(id)
+        } else {
+            Err(anyhow::anyhow!("Storage not configured"))
+        }
+    }
+
+    /// Export a conversation by ID in the specified format (json or markdown)
+    pub fn export_conversation(&self, id: Uuid, format: &str) -> anyhow::Result<String> {
+        if let Some(ref storage) = self.storage {
+            let conv = storage.load(id)?;
+            match format {
+                "markdown" | "md" => self.export_markdown(&conv),
+                "json" => self.export_json(&conv),
+                _ => Err(anyhow::anyhow!(
+                    "Unknown format '{}'. Use 'json' or 'markdown'.",
+                    format
+                )),
+            }
+        } else {
+            Err(anyhow::anyhow!("Storage not configured"))
+        }
+    }
+
+    /// Export conversation as markdown
+    fn export_markdown(&self, conv: &Conversation) -> anyhow::Result<String> {
+        use crate::conversation::Message as ConvMsg;
+
+        let mut output = format!("# {}\n\n", conv.name);
+        output.push_str(&format!("**Model:** {}\n", conv.model));
+        output.push_str(&format!(
+            "**Created:** {}\n\n",
+            conv.created_at.format("%Y-%m-%d %H:%M:%S")
+        ));
+
+        for msg in &conv.messages {
+            match msg {
+                ConvMsg::User { content, .. } => {
+                    output.push_str(&format!("## User\n\n{}\n\n", content));
+                }
+                ConvMsg::Assistant { content, .. } => {
+                    output.push_str(&format!("## Assistant\n\n{}\n\n", content));
+                }
+                ConvMsg::ToolCall {
+                    tool_name,
+                    arguments,
+                    ..
+                } => {
+                    output.push_str(&format!(
+                        "### Tool Call: {}\n\n```json\n{}\n```\n\n",
+                        tool_name, arguments
+                    ));
+                }
+                ConvMsg::ToolResult {
+                    tool_name, result, ..
+                } => {
+                    output.push_str(&format!("### Tool Result: {}\n\n{}\n\n", tool_name, result));
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Export conversation as JSON
+    fn export_json(&self, conv: &Conversation) -> anyhow::Result<String> {
+        serde_json::to_string_pretty(conv)
+            .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))
+    }
+
+    /// Rename the current conversation
+    pub fn rename_conversation(&self, name: String) -> anyhow::Result<()> {
+        if let Some(ref mut conv) = *self.current_conversation.lock().unwrap() {
+            conv.name = name;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("No current conversation"))
+        }
+    }
+
+    /// Clear chat history and current conversation
+    pub fn clear_history(&self) {
+        self.clear_current_conversation();
+        self.clear_chat();
+    }
+
+    /// Sync chat state from current conversation (on load)
+    fn sync_from_conversation(&self) {
+        let conv_guard = self.current_conversation.lock().unwrap();
+        if let Some(ref conv) = *conv_guard {
+            use crate::conversation::Message as ConvMsg;
+
+            let messages: Vec<ChatMessage> = conv
+                .messages
+                .iter()
+                .map(|msg| match msg {
+                    ConvMsg::User { content, .. } => ChatMessage::user(content.clone()),
+                    ConvMsg::Assistant { content, .. } => ChatMessage::agent(content.clone()),
+                    ConvMsg::ToolCall {
+                        tool_name,
+                        arguments,
+                        call_id,
+                        ..
+                    } => ChatMessage::tool_call(tool_name, arguments, call_id.clone()),
+                    ConvMsg::ToolResult {
+                        tool_name,
+                        arguments,
+                        result,
+                        call_id,
+                        ..
+                    } => ChatMessage::tool_result(tool_name, arguments, result, call_id.clone()),
+                })
+                .collect();
+
+            let mut state = self.state.write().unwrap();
+            state.chat.messages = messages;
+            drop(state);
+            self.notify_update(&self.state.read().unwrap());
+        }
+    }
+
+    /// Sync chat state to current conversation (before save)
+    fn sync_to_conversation(&self) {
+        let state = self.state.read().unwrap();
+        if let Some(ref mut conv) = *self.current_conversation.lock().unwrap() {
+            use crate::conversation::Message as ConvMsg;
+            use crate::ui::app_state::MessageRole;
+
+            conv.messages = state
+                .chat
+                .messages
+                .iter()
+                .filter_map(|msg| {
+                    match msg.role {
+                        MessageRole::User => Some(ConvMsg::User {
+                            content: msg.content.clone(),
+                            timestamp: chrono::Utc::now(),
+                        }),
+                        MessageRole::Agent => Some(ConvMsg::Assistant {
+                            content: msg.content.clone(),
+                            timestamp: chrono::Utc::now(),
+                        }),
+                        MessageRole::ToolCall => {
+                            let tool_name = msg.tool_name.clone()?;
+                            let arguments = msg.tool_args.clone().unwrap_or_default();
+                            Some(ConvMsg::ToolCall {
+                                tool_name,
+                                arguments,
+                                call_id: msg.call_id.clone(),
+                                timestamp: chrono::Utc::now(),
+                            })
+                        }
+                        MessageRole::ToolResult => {
+                            let tool_name = msg.tool_name.clone()?;
+                            let arguments = msg.tool_args.clone().unwrap_or_default();
+                            let result = msg.tool_result.clone().unwrap_or_default();
+                            Some(ConvMsg::ToolResult {
+                                tool_name,
+                                arguments,
+                                result,
+                                call_id: msg.call_id.clone(),
+                                timestamp: chrono::Utc::now(),
+                            })
+                        }
+                        MessageRole::System => None,
+                    }
+                })
+                .collect();
+            conv.metadata.message_count = conv.messages.len();
+            conv.updated_at = chrono::Utc::now();
+        }
+    }
+
+    /// Persist the current conversation to storage
+    fn persist_current(&self) -> anyhow::Result<()> {
+        self.sync_to_conversation();
+        let guard = self.current_conversation.lock().unwrap();
+        if let Some(ref conv) = *guard {
+            if let Some(ref storage) = self.storage {
+                storage.save(conv)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ── Message Methods with Persistence ───────────────────────────────────────
+
+    /// Add a user message to chat, persist, and trigger compaction if needed.
+    pub fn add_user_message(&self, content: String) {
+        let msg = ChatMessage::user(content);
+        self.update_chat(msg);
+        self.persist_current().ok();
+        self.maybe_compact();
+    }
+
+    /// Add an assistant message to chat, persist, and trigger compaction if needed.
+    pub fn add_assistant_message(&self, content: String) {
+        let msg = ChatMessage::agent(content);
+        self.update_chat(msg);
+        self.persist_current().ok();
+        self.maybe_compact();
+    }
+
+    /// Add a tool call message to chat and persist immediately
+    pub fn add_tool_call(&self, tool_name: String, args: String, call_id: Option<String>) {
+        let msg = ChatMessage::tool_call(&tool_name, &args, call_id);
+        self.update_chat(msg);
+        self.persist_current().ok();
+    }
+
+    /// Add a tool result message to chat and persist immediately
+    pub fn add_tool_result(
+        &self,
+        tool_name: String,
+        args: String,
+        result: String,
+        call_id: Option<String>,
+    ) {
+        let msg = ChatMessage::tool_result(&tool_name, &args, &result, call_id);
+        self.update_chat(msg);
+        self.persist_current().ok();
+    }
+
+    // ── History Conversion for Agent ───────────────────────────────────────────
+
+    /// Convert chat messages to rig::Message for agent history.
+    /// Produces proper rig message types:
+    /// - User → `Message::User` with text content
+    /// - Agent → `Message::Assistant` with text content
+    /// - ToolCall → `Message::Assistant` with `AssistantContent::ToolCall`
+    /// - ToolResult → `Message::User` with `UserContent::ToolResult`
+    /// System messages are skipped.
+    pub fn get_agent_history(&self) -> Vec<rig::completion::message::Message> {
+        use crate::ui::app_state::MessageRole;
+        use rig::completion::message::{
+            AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
+            ToolResultContent, UserContent,
+        };
+        use rig::one_or_many::OneOrMany;
+
+        let state = self.state.read().unwrap();
+
+        state
+            .chat
+            .messages
+            .iter()
+            .filter_map(|msg| {
+                match msg.role {
+                    MessageRole::User => Some(RigMessage::User {
+                        content: OneOrMany::one(UserContent::Text(Text {
+                            text: msg.content.clone(),
+                        })),
+                    }),
+                    MessageRole::Agent => Some(RigMessage::Assistant {
+                        id: None,
+                        content: OneOrMany::one(AssistantContent::Text(Text {
+                            text: msg.content.clone(),
+                        })),
+                    }),
+                    MessageRole::ToolCall => {
+                        let tool_name = msg.tool_name.as_deref()?;
+                        let args_str = msg.tool_args.as_deref().unwrap_or("{}");
+                        let arguments = serde_json::from_str(args_str)
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                        let call_id =
+                            msg.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+
+                        Some(RigMessage::Assistant {
+                            id: None,
+                            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                                call_id,
+                                ToolFunction::new(tool_name.to_string(), arguments),
+                            ))),
+                        })
+                    }
+                    MessageRole::ToolResult => {
+                        let tool_name = msg.tool_name.as_deref()?;
+                        let result_text =
+                            msg.tool_result.as_deref().unwrap_or("");
+                        let call_id =
+                            msg.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+
+                        Some(RigMessage::User {
+                            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                                id: call_id,
+                                call_id: None,
+                                content: OneOrMany::one(ToolResultContent::Text(Text {
+                                    text: result_text.to_string(),
+                                })),
+                            })),
+                        })
+                    }
+                    MessageRole::System => None,
+                }
+            })
+            .collect()
+    }
 }
 
 impl Default for StateManager {
@@ -557,6 +1082,280 @@ mod tests {
 
         // Verify the Arc contains the updated data (testing Arc sharing)
         let stats = stats_arc.lock().unwrap();
-        assert_eq!(stats.total_api_calls, 1, "Arc reference should see the shared data");
+        assert_eq!(
+            stats.total_api_calls, 1,
+            "Arc reference should see the shared data"
+        );
+    }
+
+    /// Test that get_agent_history() includes ToolCall and ToolResult messages
+    /// as proper rig message types (AssistantContent::ToolCall and UserContent::ToolResult).
+    #[test]
+    fn test_get_agent_history_includes_tool_messages() {
+        let sm = StateManager::new();
+
+        // Add a realistic conversation with tool calls
+        sm.add_user_message("List the files".to_string());
+        sm.add_tool_call("bash".to_string(), r#"{"command":"ls"}"#.to_string(), Some("call_1".to_string()));
+        sm.add_tool_result("bash".to_string(), r#"{"command":"ls"}"#.to_string(), "file1.txt\nfile2.txt".to_string(), Some("call_1".to_string()));
+        sm.add_assistant_message("Here are the files: file1.txt and file2.txt".to_string());
+
+        // StateManager should have 4 messages in its chat state
+        let state = sm.get_state();
+        assert_eq!(
+            state.chat.messages.len(), 4,
+            "StateManager should have 4 chat messages (user, tool_call, tool_result, assistant)"
+        );
+
+        // get_agent_history() MUST return all 4 messages including tool messages.
+        // The compaction algorithm's find_needed_tool_calls() depends on seeing
+        // ToolCall messages to preserve tool call/result integrity.
+        let history = sm.get_agent_history();
+        assert_eq!(
+            history.len(), 4,
+            "get_agent_history() should return all 4 messages including tool messages. \
+             Got {} -- tool messages are being silently dropped.",
+            history.len()
+        );
+    }
+
+    /// Test that get_agent_history() produces proper rig ToolCall messages (not text approximations)
+    #[test]
+    fn test_get_agent_history_tool_call_is_structured() {
+        use rig::completion::message::{AssistantContent, Message as RigMessage};
+
+        let sm = StateManager::new();
+        sm.add_tool_call(
+            "bash".to_string(),
+            r#"{"command":"ls -la"}"#.to_string(),
+            Some("call_42".to_string()),
+        );
+
+        let history = sm.get_agent_history();
+        assert_eq!(history.len(), 1);
+
+        match &history[0] {
+            RigMessage::Assistant { content, .. } => {
+                let first = content.first();
+                match first {
+                    AssistantContent::ToolCall(tc) => {
+                        assert_eq!(tc.function.name, "bash");
+                        assert_eq!(tc.id, "call_42");
+                        assert_eq!(
+                            tc.function.arguments,
+                            serde_json::json!({"command": "ls -la"})
+                        );
+                    }
+                    other => panic!("Expected ToolCall, got {:?}", other),
+                }
+            }
+            other => panic!("Expected Assistant message, got {:?}", other),
+        }
+    }
+
+    /// Test that get_agent_history() produces proper rig ToolResult messages
+    #[test]
+    fn test_get_agent_history_tool_result_is_structured() {
+        use rig::completion::message::{Message as RigMessage, ToolResultContent, UserContent};
+
+        let sm = StateManager::new();
+        sm.add_tool_result(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            "file1.txt\nfile2.txt".to_string(),
+            Some("call_42".to_string()),
+        );
+
+        let history = sm.get_agent_history();
+        assert_eq!(history.len(), 1);
+
+        match &history[0] {
+            RigMessage::User { content } => {
+                let first = content.first();
+                match first {
+                    UserContent::ToolResult(tr) => {
+                        assert_eq!(tr.id, "call_42");
+                        match tr.content.first() {
+                            ToolResultContent::Text(t) => {
+                                assert_eq!(t.text, "file1.txt\nfile2.txt");
+                            }
+                            other => panic!("Expected Text, got {:?}", other),
+                        }
+                    }
+                    other => panic!("Expected ToolResult, got {:?}", other),
+                }
+            }
+            other => panic!("Expected User message, got {:?}", other),
+        }
+    }
+
+    /// ChatMessage structured fields are correctly populated for tool messages
+    #[test]
+    fn test_chat_message_structured_fields() {
+        let sm = StateManager::new();
+
+        sm.add_user_message("List files".to_string());
+        sm.add_tool_call(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            Some("call_1".to_string()),
+        );
+        sm.add_tool_result(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            "file1.txt\nfile2.txt".to_string(),
+            Some("call_1".to_string()),
+        );
+        sm.add_assistant_message("Here are the files.".to_string());
+
+        let state = sm.get_state();
+        assert_eq!(state.chat.messages.len(), 4);
+
+        // User message has no tool fields
+        let user_msg = &state.chat.messages[0];
+        assert!(user_msg.tool_name.is_none());
+
+        // Tool call preserves structured data
+        let tc_msg = &state.chat.messages[1];
+        assert_eq!(tc_msg.tool_name.as_deref(), Some("bash"));
+        assert_eq!(tc_msg.tool_args.as_deref(), Some(r#"{"command":"ls"}"#));
+        assert_eq!(tc_msg.call_id.as_deref(), Some("call_1"));
+
+        // Tool result preserves structured data
+        let tr_msg = &state.chat.messages[2];
+        assert_eq!(tr_msg.tool_name.as_deref(), Some("bash"));
+        assert_eq!(tr_msg.tool_args.as_deref(), Some(r#"{"command":"ls"}"#));
+        assert_eq!(tr_msg.tool_result.as_deref(), Some("file1.txt\nfile2.txt"));
+        assert_eq!(tr_msg.call_id.as_deref(), Some("call_1"));
+
+        // Assistant message has no tool fields
+        let asst_msg = &state.chat.messages[3];
+        assert!(asst_msg.tool_name.is_none());
+    }
+
+    /// Roundtrip: Conversation JSON -> ChatMessage -> rig Message preserves tool data
+    #[test]
+    fn test_roundtrip_conversation_json_to_rig_messages() {
+        use crate::conversation::{Conversation, Message as ConvMsg};
+        use rig::completion::message::{
+            AssistantContent, Message as RigMessage, ToolResultContent, UserContent,
+        };
+
+        // Simulate loading a conversation from JSON
+        let mut conv = Conversation::new("test".to_string(), "test-model".to_string());
+        conv.add_user_message("List files".to_string());
+        conv.add_tool_call(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            Some("call_1".to_string()),
+        );
+        conv.add_tool_result(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            "file1.txt\nfile2.txt".to_string(),
+            Some("call_1".to_string()),
+        );
+        conv.add_assistant_message("Here are the files.".to_string());
+
+        // Serialize to JSON and back (simulating file persistence)
+        let json = serde_json::to_string_pretty(&conv).unwrap();
+        let loaded: Conversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.messages.len(), 4);
+
+        // Verify tool call survived JSON roundtrip
+        match &loaded.messages[1] {
+            ConvMsg::ToolCall {
+                tool_name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                assert_eq!(tool_name, "bash");
+                assert_eq!(arguments, r#"{"command":"ls"}"#);
+                assert_eq!(call_id.as_deref(), Some("call_1"));
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+
+        // Verify tool result survived JSON roundtrip
+        match &loaded.messages[2] {
+            ConvMsg::ToolResult {
+                tool_name,
+                arguments,
+                result,
+                call_id,
+                ..
+            } => {
+                assert_eq!(tool_name, "bash");
+                assert_eq!(arguments, r#"{"command":"ls"}"#);
+                assert_eq!(result, "file1.txt\nfile2.txt");
+                assert_eq!(call_id.as_deref(), Some("call_1"));
+            }
+            other => panic!("Expected ToolResult, got {:?}", other),
+        }
+
+        // Convert to rig messages (the path used by convert_conversation_to_rig_messages)
+        let rig_messages = crate::convert_conversation_to_rig_messages(&loaded);
+        assert_eq!(rig_messages.len(), 4, "All 4 messages should convert to rig messages");
+
+        // Verify rig tool call is structured
+        match &rig_messages[1] {
+            RigMessage::Assistant { content, .. } => match content.first() {
+                AssistantContent::ToolCall(tc) => {
+                    assert_eq!(tc.function.name, "bash");
+                    assert_eq!(tc.id, "call_1");
+                }
+                other => panic!("Expected ToolCall content, got {:?}", other),
+            },
+            other => panic!("Expected Assistant, got {:?}", other),
+        }
+
+        // Verify rig tool result is structured
+        match &rig_messages[2] {
+            RigMessage::User { content } => match content.first() {
+                UserContent::ToolResult(tr) => {
+                    assert_eq!(tr.id, "call_1");
+                    match tr.content.first() {
+                        ToolResultContent::Text(t) => {
+                            assert_eq!(t.text, "file1.txt\nfile2.txt");
+                        }
+                        other => panic!("Expected Text result, got {:?}", other),
+                    }
+                }
+                other => panic!("Expected ToolResult content, got {:?}", other),
+            },
+            other => panic!("Expected User, got {:?}", other),
+        }
+    }
+
+    /// Test that replace_chat_messages works correctly for compaction persistence.
+    #[test]
+    fn test_replace_chat_messages() {
+        let sm = StateManager::new();
+
+        // Add some messages
+        sm.add_user_message("Hello".to_string());
+        sm.add_assistant_message("Hi there".to_string());
+        sm.add_user_message("How are you?".to_string());
+        sm.add_assistant_message("I'm fine".to_string());
+        assert_eq!(sm.get_state().chat.messages.len(), 4);
+
+        // Replace with compacted messages (simulating compaction)
+        let compacted = vec![
+            ChatMessage::user("[Summary of previous conversation]".to_string()),
+            ChatMessage::user("How are you?".to_string()),
+            ChatMessage::agent("I'm fine".to_string()),
+        ];
+        sm.replace_chat_messages(compacted);
+
+        let state = sm.get_state();
+        assert_eq!(
+            state.chat.messages.len(), 3,
+            "Should have 3 messages after replace (summary + 2 recent)"
+        );
+        assert!(
+            state.chat.messages[0].content.contains("Summary"),
+            "First message should be the summary"
+        );
     }
 }

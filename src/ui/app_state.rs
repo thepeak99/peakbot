@@ -117,11 +117,32 @@ pub struct ChatMessage {
     /// Role of the message sender
     pub role: MessageRole,
 
-    /// Message content
+    /// Display content (formatted for UI rendering)
     pub content: String,
 
     /// Timestamp when message was created
     pub timestamp: DateTime<Local>,
+
+    // ── Structured tool data (lossless) ──────────────────────────────
+    // These fields preserve the original data from rig so that
+    // ChatMessage → Conversation::Message and ChatMessage → rig::Message
+    // roundtrips are lossless.
+
+    /// Tool name (for ToolCall and ToolResult roles)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+
+    /// Raw tool arguments JSON string (for ToolCall and ToolResult roles)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_args: Option<String>,
+
+    /// Tool execution result (for ToolResult role)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<String>,
+
+    /// Tool call ID for correlating calls with results
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -131,6 +152,10 @@ impl ChatMessage {
             role: MessageRole::User,
             content,
             timestamp: Local::now(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            call_id: None,
         }
     }
 
@@ -140,6 +165,10 @@ impl ChatMessage {
             role: MessageRole::Agent,
             content,
             timestamp: Local::now(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            call_id: None,
         }
     }
 
@@ -149,28 +178,47 @@ impl ChatMessage {
             role: MessageRole::System,
             content,
             timestamp: Local::now(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            call_id: None,
         }
     }
 
     /// Create a new tool call message with structured display:
     /// - Shows thought intent first
     /// - Shows key params (2-3 lines max)
-    pub fn tool_call(tool_name: &str, args: &str, _result: &str) -> Self {
+    /// Stores raw tool_name and args for lossless persistence.
+    pub fn tool_call(tool_name: &str, args: &str, call_id: Option<String>) -> Self {
         let content = format_tool_call(tool_name, args);
         Self {
             role: MessageRole::ToolCall,
             content,
             timestamp: Local::now(),
+            tool_name: Some(tool_name.to_string()),
+            tool_args: Some(args.to_string()),
+            tool_result: None,
+            call_id,
         }
     }
 
-    /// Create a new tool result message with truncation to top 2-3 lines
-    pub fn tool_result(tool_name: &str, result: &str) -> Self {
+    /// Create a new tool result message with truncation to top 2-3 lines.
+    /// Stores raw tool_name, args, result, and call_id for lossless persistence.
+    pub fn tool_result(
+        tool_name: &str,
+        args: &str,
+        result: &str,
+        call_id: Option<String>,
+    ) -> Self {
         let content = format_tool_result(tool_name, result);
         Self {
             role: MessageRole::ToolResult,
             content,
             timestamp: Local::now(),
+            tool_name: Some(tool_name.to_string()),
+            tool_args: Some(args.to_string()),
+            tool_result: Some(result.to_string()),
+            call_id,
         }
     }
 
@@ -185,6 +233,10 @@ impl ChatMessage {
             role: MessageRole::System,
             content,
             timestamp: Local::now(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            call_id: None,
         }
     }
 
@@ -198,12 +250,16 @@ impl ChatMessage {
                 .unwrap()
                 .and_local_timezone(Local)
                 .unwrap(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            call_id: None,
         }
     }
 }
 
 /// Format tool call with structured output: thought intent first, then params
-fn format_tool_call(tool_name: &str, args: &str) -> String {
+pub(crate) fn format_tool_call(tool_name: &str, args: &str) -> String {
     // Try to parse JSON args to extract thought and key params
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
         let mut lines = Vec::new();
@@ -247,7 +303,7 @@ fn format_tool_call(tool_name: &str, args: &str) -> String {
 }
 
 /// Format tool result with truncation to top 2-3 lines
-fn format_tool_result(tool_name: &str, result: &str) -> String {
+pub(crate) fn format_tool_result(tool_name: &str, result: &str) -> String {
     // Special handling per tool type
     match tool_name {
         "bash" => format_bash_result(result),
