@@ -33,7 +33,7 @@ pub use hooks::{
 pub use pipeline::{DelegateTool, SubAgentRegistry};
 #[cfg(feature = "mock")]
 pub use providers::create_mock_agent;
-pub use providers::{DynAgent, ProviderInfo, create_provider};
+pub use providers::{CompactionModel, DynAgent, ProviderInfo, create_compaction_model, create_provider};
 
 use rig::completion::{Message, PromptError};
 use rig::tool::ToolDyn;
@@ -216,11 +216,19 @@ impl AgentRunner {
 
         // Initialize ContextManager inside StateManager (StateManager owns it)
         if let Some(ref sm) = state_manager {
+            // Create a tool-free compaction model from the same provider
+            let compaction_model = crate::providers::create_compaction_model(
+                &config.provider,
+                config.context.compaction_model.as_deref(),
+            )
+            .ok()
+            .map(Arc::new);
+
             let cm = ContextManager::new(
                 config.context.clone(),
                 provider_info.model.as_str(),
                 sm.clone(),
-                Some(agent.clone()),
+                compaction_model,
             );
             sm.init_context_manager(cm, system_prompt.clone());
         }
@@ -242,7 +250,7 @@ impl AgentRunner {
         use crate::ui::app_state::NotificationKind;
 
         if let Some(ref sm) = self.state_manager {
-            match sm.force_compact(&self.system_prompt).await {
+            match sm.force_compact().await {
                 Some(result) => {
                     sm.push_notification(
                         format!(
