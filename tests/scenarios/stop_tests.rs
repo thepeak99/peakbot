@@ -75,18 +75,13 @@ async fn conversation_state_after_normal_flow() {
 
     harness.run_message("Test").await;
 
-    // Verify conversation has messages
-    if let Some(cm) = harness.conversation_manager() {
-        let cm = cm.lock().unwrap();
-        let conv = cm.get_current();
-        assert!(conv.is_some(), "Conversation should exist");
-        let conv = conv.unwrap();
-        assert_eq!(
-            conv.messages.len(),
-            2,
-            "Should have user + assistant message"
-        );
-    }
+    // Verify conversation has messages via StateManager
+    let state = harness.get_state();
+    assert_eq!(
+        state.chat.messages.len(),
+        2,
+        "Should have user + assistant message"
+    );
 }
 
 /// Test stats accumulate through multiple messages (prerequisite for stop tests)

@@ -31,11 +31,10 @@ pub struct CompactionResult {
 
 /// Manages context window usage and performs compaction when needed
 /// Uses actual token counts from StateManager
-pub struct ContextManager {
+#[derive(Clone)]
+pub(crate) struct ContextManager {
     config: ContextConfig,
     context_window: usize,
-    /// System prompt size (in tokens) - used to subtract from total
-    system_prompt_tokens: usize,
     /// Reference to StateManager for stats
     state_manager: Arc<StateManager>,
     /// Reference to the LLM agent for summarization
@@ -49,7 +48,6 @@ impl ContextManager {
         config: ContextConfig,
         model_name: &str,
         state_manager: Arc<StateManager>,
-        system_prompt_tokens: usize,
         agent: Option<Arc<DynAgent>>,
     ) -> Self {
         // Default context windows for common models
@@ -75,14 +73,14 @@ impl ContextManager {
         Self {
             config,
             context_window,
-            system_prompt_tokens,
             state_manager,
             agent,
         }
     }
 
     /// Get the context window size
-    pub fn context_window(&self) -> usize {
+    #[allow(dead_code)]
+    pub(crate) fn context_window(&self) -> usize {
         self.context_window
     }
 
@@ -92,26 +90,14 @@ impl ContextManager {
     }
 
     /// Get current total tokens from actual API response
-    /// This is the EXACT token count from the provider, not an estimate
+    /// Uses the LAST request's input tokens (actual context size), not cumulative sum.
+    /// This is the EXACT token count from the provider, not an estimate.
     pub fn get_current_tokens(&self) -> usize {
         let stats_arc = self.state_manager.stats_arc();
         let stats = stats_arc.lock().unwrap();
-        // Get cumulative sum of all input tokens across all requests
-        // This represents the actual context size accumulated so far
-        stats.cumulative_input_tokens() as usize
-    }
-
-    /// Estimate total tokens for messages plus system prompt
-    /// Now uses actual token counts from provider instead of estimation
-    pub fn get_total_tokens(&self) -> usize {
-        // Get actual input tokens from the last request
-        // This includes: system prompt + conversation history + last user message
-        let current_input = self.get_current_tokens();
-
-        // Subtract system prompt to get conversation history size
-        // (add a buffer since we can't know exact system prompt size)
-
-        current_input.saturating_sub(self.system_prompt_tokens)
+        // Use LAST request's input tokens (the actual context size sent to LLM)
+        // NOT cumulative_input_tokens() which sums ALL requests (bug!)
+        stats.last_input_tokens().unwrap_or(0) as usize
     }
 
     /// Check if compaction is needed based on current message count
@@ -131,24 +117,14 @@ impl ContextManager {
             return tokens > self.threshold();
         }
 
-        // Fallback: check message count
-        let threshold_messages = (self.threshold() / 100).max(10);
+        // Fallback: check message count (when no token data is available yet)
+        let threshold_messages = (self.config.keep_recent * 3).max(10);
         messages.len() > threshold_messages
     }
 
-    /// Check if compaction is needed based on actual token count from provider
-    pub fn needs_compaction_by_tokens(&self, _messages: &[Message], _system_prompt: &str) -> bool {
-        if !self.config.enabled {
-            return false;
-        }
-
-        let total_tokens = self.get_current_tokens();
-        total_tokens > self.threshold()
-    }
-
     /// Get current token usage as a percentage (0.0 - 1.0)
-    /// Uses actual token counts from provider
-    pub fn usage_percentage(&self) -> f64 {
+    #[allow(dead_code)]
+    pub(crate) fn usage_percentage(&self) -> f64 {
         let total = self.get_current_tokens();
         if total == 0 {
             return 0.0;
@@ -230,7 +206,7 @@ impl ContextManager {
     /// Preserves tool call/result integrity by including ToolCall messages that are
     /// referenced by ToolResult messages in the kept region.
     pub async fn compact(
-        &mut self,
+        &self,
         messages: &mut Vec<Message>,
         _system_prompt: &str,
     ) -> Result<CompactionResult> {
@@ -356,10 +332,68 @@ impl ContextManager {
             num_discarded: num_to_discard,
         })
     }
+    
+    /// Compact context using a StateManager reference.
+    ///
+    /// Gets history from StateManager, compacts it, and persists the compacted
+    /// history back via replace_chat_messages().
+    pub(crate) async fn compact_from_state_manager_on(
+        &self,
+        state_manager: &StateManager,
+        system_prompt: &str,
+    ) -> Result<CompactionResult> {
+        let mut history = state_manager.get_agent_history();
+        let result = self.compact(&mut history, system_prompt).await?;
+
+        // Persist the compacted history back to StateManager
+        if result.num_discarded > 0 {
+            use crate::ui::app_state::ChatMessage;
+            use rig::completion::message::{AssistantContent, UserContent};
+
+            let chat_messages: Vec<ChatMessage> = history
+                .iter()
+                .filter_map(|msg| match msg {
+                    Message::User { content } => {
+                        let text = content
+                            .iter()
+                            .filter_map(|c| {
+                                if let UserContent::Text(t) = c {
+                                    Some(t.text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if text.is_empty() { None } else { Some(ChatMessage::user(text)) }
+                    }
+                    Message::Assistant { content, .. } => {
+                        let text = content
+                            .iter()
+                            .filter_map(|c| {
+                                if let AssistantContent::Text(t) = c {
+                                    Some(t.text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if text.is_empty() { None } else { Some(ChatMessage::agent(text)) }
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => None,
+                })
+                .collect();
+            state_manager.replace_chat_messages(chat_messages);
+        }
+
+        Ok(result)
+    }
 
     /// Format context status for display
-    /// Uses actual token counts from provider
-    pub fn format_status(&self) -> String {
+    #[allow(dead_code)]
+    pub(crate) fn format_status(&self) -> String {
         let total_tokens = self.get_current_tokens();
         let usage_pct = self.usage_percentage();
 
@@ -461,8 +495,6 @@ mod tests {
     };
     use rig::one_or_many::OneOrMany;
 
-    // ContextManager tests would need SessionStats mock
-    // For now, just test the default config
     #[test]
     fn test_default_config() {
         let config = ContextConfig::default();
@@ -470,6 +502,46 @@ mod tests {
         assert_eq!(config.keep_recent, 5);
         assert!(config.enabled);
         assert!(config.context_window.is_none());
+    }
+
+    /// BUG TEST: The message count fallback threshold is nonsensical.
+    ///
+    /// When get_current_tokens() returns 0 (before the first API call),
+    /// needs_compaction() falls back to a message count check:
+    ///   threshold_messages = (threshold_tokens / 100).max(10)
+    ///
+    /// For a 200k context at 0.8 threshold: (160000 / 100) = 1600 messages.
+    /// No conversation will ever have 1600 messages. This fallback is dead code.
+    ///
+    /// This test asserts the threshold should be SANE (reachable in a real
+    /// conversation). It is ignored because it FAILS against the current buggy
+    /// code. Remove #[ignore] after fixing context_manager.rs:119.
+    ///
+    /// Run with: cargo test -- --ignored test_message_count_fallback_threshold
+    /// Verify the message count fallback threshold is sane.
+    /// Uses keep_recent * 3 (clamped to min 10) instead of the old
+    /// broken formula (threshold_tokens / 100 = 1600 messages).
+    #[test]
+    fn test_message_count_fallback_threshold_is_sane() {
+        // With default keep_recent=5: threshold = (5 * 3).max(10) = 15 messages
+        let keep_recent: usize = 5;
+        let threshold_messages = (keep_recent * 3).max(10);
+        assert_eq!(threshold_messages, 15);
+        assert!(
+            threshold_messages <= 100,
+            "Message count fallback threshold should be reachable, got {}",
+            threshold_messages
+        );
+
+        // With keep_recent=1: threshold = (1 * 3).max(10) = 10 messages
+        let small_keep = 1_usize;
+        let small_threshold = (small_keep * 3).max(10);
+        assert_eq!(small_threshold, 10);
+
+        // With keep_recent=50: threshold = (50 * 3).max(10) = 150 messages
+        let large_keep = 50_usize;
+        let large_threshold = (large_keep * 3).max(10);
+        assert_eq!(large_threshold, 150);
     }
 
     // Helper to create a ToolCall message

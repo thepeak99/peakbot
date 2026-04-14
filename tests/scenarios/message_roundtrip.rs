@@ -1,6 +1,7 @@
 //! Message roundtrip tests
 //!
 //! Tests for verifying the complete message flow through the agent.
+//! Uses StateManager as the single source of truth.
 
 use crate::harness::TestHarness;
 use peakbot::mock::MockResponse;
@@ -29,29 +30,18 @@ async fn multiple_messages_persist() {
         MockResponse::text("Third response"),
     ]);
 
-    let mut history = Vec::new();
-
-    // Run multiple messages
-    let r1 = harness
-        .run_message_with_history("First message", &mut history)
-        .await;
-    let r2 = harness
-        .run_message_with_history("Second message", &mut history)
-        .await;
-    let r3 = harness
-        .run_message_with_history("Third message", &mut history)
-        .await;
+    // Run multiple messages via StateManager
+    harness.run_message("First message").await;
+    harness.run_message("Second message").await;
+    harness.run_message("Third message").await;
 
     // Verify responses
-    assert!(r1.contains("First"));
-    assert!(r2.contains("Second"));
-    assert!(r3.contains("Third"));
-
-    // Verify history accumulated
+    // Verify via StateManager that history accumulated
+    let state = harness.get_state();
     assert!(
-        history.len() >= 2,
-        "History should have messages, got: {}",
-        history.len()
+        state.chat.messages.len() >= 6,
+        "Should have 6 messages (3 user + 3 assistant), got {}",
+        state.chat.messages.len()
     );
 }
 
@@ -123,7 +113,7 @@ async fn stats_accumulate_after_messages() {
     assert_eq!(stats.total_api_calls, 2);
 }
 
-/// Test message history is maintained correctly
+/// Test message history is maintained correctly via StateManager
 #[tokio::test]
 async fn history_maintained_across_messages() {
     let mut harness = TestHarness::new();
@@ -132,18 +122,15 @@ async fn history_maintained_across_messages() {
         MockResponse::text("Second"),
     ]);
 
-    let mut history = Vec::new();
+    // Run messages - StateManager handles history
+    harness.run_message("One").await;
+    harness.run_message("Two").await;
 
-    let r1 = harness.run_message_with_history("One", &mut history).await;
-    let r2 = harness.run_message_with_history("Two", &mut history).await;
-
-    // Both responses should be correct
-    assert!(r1.contains("First"));
-    assert!(r2.contains("Second"));
-
-    // History should have accumulated messages
+    // Verify history via StateManager
+    let state = harness.get_state();
     assert!(
-        history.len() >= 2,
-        "History should have at least 2 messages"
+        state.chat.messages.len() >= 4,
+        "Should have at least 4 messages (2 user + 2 assistant), got {}",
+        state.chat.messages.len()
     );
 }

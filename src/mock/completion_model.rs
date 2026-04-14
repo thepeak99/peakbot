@@ -9,19 +9,35 @@ use rig::completion::{
     AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
     GetTokenUsage, Usage as RigUsage,
 };
+use rig::completion::message::Message;
 use rig::one_or_many::OneOrMany;
 use rig::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+/// A recorded LLM request captured by MockCompletionModel.
+///
+/// Stores the fields from `CompletionRequest` that tests need to inspect.
+#[derive(Debug, Clone)]
+pub struct RecordedRequest {
+    /// The system prompt / preamble
+    pub preamble: Option<String>,
+    /// The full chat history (including the prompt as the last message)
+    pub chat_history: Vec<Message>,
+    /// Number of tool definitions attached to the request
+    pub tool_count: usize,
+}
+
 /// A mock completion model for testing.
 ///
 /// Queue mock responses and the model will return them in order.
+/// Records every `CompletionRequest` it receives for later inspection.
 /// Used to test the agent loop without real API calls.
 #[derive(Clone)]
 pub struct MockCompletionModel {
     responses: Arc<Mutex<VecDeque<MockResponse>>>,
+    recorded_requests: Arc<Mutex<Vec<RecordedRequest>>>,
     default_usage: RigUsage,
 }
 
@@ -32,6 +48,7 @@ impl MockCompletionModel {
     pub fn new() -> Self {
         Self {
             responses: Arc::new(Mutex::new(VecDeque::new())),
+            recorded_requests: Arc::new(Mutex::new(Vec::new())),
             default_usage: RigUsage::default(),
         }
     }
@@ -75,6 +92,16 @@ impl MockCompletionModel {
     pub fn remaining(&self) -> usize {
         self.responses.lock().unwrap().len()
     }
+
+    /// Get all recorded requests in order.
+    pub fn get_recorded_requests(&self) -> Vec<RecordedRequest> {
+        self.recorded_requests.lock().unwrap().clone()
+    }
+
+    /// Get the total number of LLM calls made.
+    pub fn request_count(&self) -> usize {
+        self.recorded_requests.lock().unwrap().len()
+    }
 }
 
 impl Default for MockCompletionModel {
@@ -113,8 +140,15 @@ impl CompletionModel for MockCompletionModel {
 
     async fn completion(
         &self,
-        _request: CompletionRequest,
+        request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+        // Record the request for test inspection
+        self.recorded_requests.lock().unwrap().push(RecordedRequest {
+            preamble: request.preamble.clone(),
+            chat_history: request.chat_history.iter().cloned().collect(),
+            tool_count: request.tools.len(),
+        });
+
         let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             CompletionError::ProviderError("MockCompletionModel: no responses queued".to_string())
         });
@@ -189,13 +223,13 @@ impl CompletionModel for MockCompletionModel {
 
     async fn stream(
         &self,
-        _request: CompletionRequest,
+        request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         use futures::stream;
         use rig::streaming::RawStreamingChoice;
 
         // For simplicity, return a single-item stream with the completion
-        let response = self.completion(_request).await?;
+        let response = self.completion(request).await?;
         let stream_response =
             RawStreamingChoice::<MockModelResponse>::Message(response.raw_response.content);
         let stream = stream::once(async move { Ok(stream_response) });

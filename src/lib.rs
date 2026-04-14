@@ -16,12 +16,13 @@ pub mod test_runner;
 mod tools;
 pub mod ui;
 
+use context_manager::ContextManager;
 pub use config::{
     AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig,
     McpTransportType, OllamaConfig, OpenRouterConfig, PipelineConfig, ProviderConfig, ProviderType,
     RetryConfig, SearXngConfig,
 };
-pub use context_manager::{CompactionResult, ContextManager};
+pub use context_manager::CompactionResult;
 pub use conversation::{
     Conversation, ConversationMetadata, ConversationSummary, Message as ConversationMessage,
 };
@@ -51,7 +52,7 @@ pub use ui::{Ui, UiAction};
 use anyhow::{Result, anyhow};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -122,6 +123,10 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
 /// Convert stored conversation messages to rig Messages for LLM chat history
 pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message> {
     use crate::conversation::Message as StoredMessage;
+    use rig::completion::message::{
+        AssistantContent, Text, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
+    };
+    use rig::one_or_many::OneOrMany;
 
     let mut messages = Vec::new();
 
@@ -133,8 +138,44 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
             StoredMessage::Assistant { content, .. } => {
                 messages.push(Message::assistant(content.clone()));
             }
-            StoredMessage::ToolCall { .. } => {}
-            StoredMessage::ToolResult { .. } => {}
+            StoredMessage::ToolCall {
+                tool_name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                let args = serde_json::from_str(arguments)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                let id = call_id
+                    .clone()
+                    .unwrap_or_else(|| tool_name.clone());
+                messages.push(Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                        id,
+                        ToolFunction::new(tool_name.clone(), args),
+                    ))),
+                });
+            }
+            StoredMessage::ToolResult {
+                tool_name,
+                result,
+                call_id,
+                ..
+            } => {
+                let id = call_id
+                    .clone()
+                    .unwrap_or_else(|| tool_name.clone());
+                messages.push(Message::User {
+                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                        id,
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::Text(Text {
+                            text: result.clone(),
+                        })),
+                    })),
+                });
+            }
         }
     }
 
@@ -152,8 +193,6 @@ pub struct AgentRunner {
     provider_info: ProviderInfo,
     #[allow(unused)]
     skills: SkillRegistry,
-    context_manager: Option<ContextManager>,
-    conversation_manager: Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
     system_prompt: String,
     state_manager: Option<Arc<StateManager>>,
     // Shared session hook for interrupt/queue state
@@ -174,61 +213,23 @@ impl AgentRunner {
     ) -> Self {
         let agent = Arc::new(agent);
         let system_prompt = build_system_prompt(&skills);
-        let system_prompt_tokens = system_prompt.len() / 4;
 
-        let context_manager = state_manager.as_ref().map(|sm| {
-            ContextManager::new(
+        // Initialize ContextManager inside StateManager (StateManager owns it)
+        if let Some(ref sm) = state_manager {
+            let cm = ContextManager::new(
                 config.context.clone(),
                 provider_info.model.as_str(),
                 sm.clone(),
-                system_prompt_tokens,
                 Some(agent.clone()),
-            )
-        });
-
-        let conversation_manager = if config.conversation_enabled() {
-            let storage = match FileStorage::new(config.conversation_storage_dir()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Failed to create file storage: {}", e);
-                    return Self {
-                        agent,
-                        config,
-                        provider_info,
-                        skills,
-                        context_manager: None,
-                        conversation_manager: None,
-                        system_prompt,
-                        state_manager,
-                        session_hook,
-                        _event_receiver: event_receiver,
-                    };
-                }
-            };
-            match ConversationManager::new(
-                storage,
-                ConversationManagerConfig {
-                    auto_save: true,
-                    max_conversations: config.conversation_max(),
-                },
-            ) {
-                Ok(cm) => Some(Arc::new(Mutex::new(cm))),
-                Err(e) => {
-                    tracing::warn!("Failed to initialize conversation manager: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            );
+            sm.init_context_manager(cm, system_prompt.clone());
+        }
 
         Self {
             agent,
             config,
             provider_info,
             skills,
-            context_manager,
-            conversation_manager,
             system_prompt,
             state_manager,
             session_hook,
@@ -237,36 +238,24 @@ impl AgentRunner {
     }
 
     /// Force context compaction
-    pub async fn force_compact(&mut self, chat_history: &mut Vec<Message>) {
+    pub async fn force_compact(&mut self) {
         use crate::ui::app_state::NotificationKind;
 
-        if let Some(ref mut cm) = self.context_manager {
-            match cm.compact(chat_history, &self.system_prompt).await {
-                Ok(result) => {
-                    if let Some(ref sm) = self.state_manager {
-                        sm.push_notification(
-                            format!(
-                                "Context compacted: {} → {} messages, {} discarded",
-                                result.original_count, result.compacted_count, result.num_discarded
-                            ),
-                            NotificationKind::Info,
-                        );
-                    }
+        if let Some(ref sm) = self.state_manager {
+            match sm.force_compact(&self.system_prompt).await {
+                Some(result) => {
+                    sm.push_notification(
+                        format!(
+                            "Context compacted: {} → {} messages, {} discarded",
+                            result.original_count, result.compacted_count, result.num_discarded
+                        ),
+                        NotificationKind::Info,
+                    );
                 }
-                Err(e) => {
-                    if let Some(ref sm) = self.state_manager {
-                        sm.push_notification(
-                            format!("Error compacting context: {}", e),
-                            NotificationKind::Error,
-                        );
-                    }
+                None => {
+                    sm.push_notification("Nothing to compact.".to_string(), NotificationKind::Info);
                 }
             }
-        } else if let Some(ref sm) = self.state_manager {
-            sm.push_notification(
-                "Context compaction is not enabled.".to_string(),
-                NotificationKind::Warning,
-            );
         }
     }
 
@@ -283,17 +272,11 @@ impl AgentRunner {
         let (completion_tx, _completion_rx) =
             tokio::sync::broadcast::channel::<CompletionResult>(8);
 
-        // Shared chat history (needed by both loops)
-        let chat_history = Arc::new(tokio::sync::Mutex::new(Vec::<Message>::new()));
-
         // Extract fields we need to pass to spawned loops
-        let conversation_manager = self.conversation_manager.clone();
         let state_manager = self.state_manager.clone();
         let session_hook = self.session_hook.clone();
         let config_model = self.config.model().to_string();
         let system_prompt = self.system_prompt.clone();
-        let context_manager = self.context_manager.take();
-        let conversation_manager_for_agent = self.conversation_manager.clone();
         let agent = self.agent.clone();
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
@@ -318,15 +301,12 @@ impl AgentRunner {
         let event_handle = tokio::spawn({
             let msg_tx = msg_tx.clone();
             let completion_tx = completion_tx.clone();
-            let chat_history = chat_history.clone();
 
             async move {
                 Self::event_loop(
                     action_receiver,
                     msg_tx,
                     completion_tx,
-                    chat_history,
-                    conversation_manager,
                     state_manager,
                     session_hook,
                     config_model,
@@ -338,15 +318,11 @@ impl AgentRunner {
         let agent_handle = tokio::spawn({
             let msg_rx = tokio::sync::Mutex::new(msg_rx);
             let completion_tx = completion_tx.clone();
-            let chat_history = chat_history.clone();
 
             async move {
                 Self::agent_loop(
                     msg_rx,
                     completion_tx,
-                    chat_history,
-                    context_manager,
-                    conversation_manager_for_agent,
                     state_manager_for_agent,
                     agent,
                     config_for_agent,
@@ -367,32 +343,25 @@ impl AgentRunner {
         mut action_receiver: mpsc::UnboundedReceiver<UiAction>,
         msg_tx: tokio::sync::mpsc::Sender<QueueMessage>,
         _completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
-        _chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
-        conversation_manager: Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
         state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
         config_model: String,
     ) {
-        // Initialize conversation
-        if let Some(ref cm) = conversation_manager {
+        // Initialize conversation in StateManager (single source of truth)
+        if let Some(ref sm) = state_manager {
             let name = format!(
                 "Conversation {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M")
             );
-            let _ = cm.lock().unwrap().create_new(name, config_model);
+            sm.create_conversation(name, config_model);
         }
 
         while let Some(action) = action_receiver.recv().await {
             match action {
                 UiAction::SendMessage(msg) => {
-                    // Auto-save user message
-                    if let Some(ref cm) = conversation_manager {
-                        let _ = cm.lock().unwrap().add_user_message(msg.clone());
-                    }
-                    // Add user message to chat for live rendering
+                    // Add user message to chat AND persist (StateManager handles persistence)
                     if let Some(ref sm) = state_manager {
-                        use crate::ui::app_state::ChatMessage;
-                        sm.update_chat(ChatMessage::user(msg.clone()));
+                        sm.add_user_message(msg.clone());
                     }
 
                     // If agent is running, interrupt it first
@@ -448,9 +417,6 @@ impl AgentRunner {
     async fn agent_loop(
         msg_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<QueueMessage>>,
         completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
-        chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
-        mut context_manager: Option<ContextManager>,
-        conversation_manager: Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
         state_manager: Option<Arc<StateManager>>,
         agent: Arc<DynAgent>,
         config: Config,
@@ -469,9 +435,6 @@ impl AgentRunner {
 
                     let result = Self::process_message_internal(
                         &content,
-                        chat_history.clone(),
-                        &mut context_manager,
-                        &conversation_manager,
                         &state_manager,
                         &agent,
                         &config,
@@ -494,13 +457,8 @@ impl AgentRunner {
                     }
                     Self::process_command_internal(
                         &cmd,
-                        chat_history.clone(),
-                        &mut context_manager,
-                        &conversation_manager,
                         &state_manager,
-                        &agent,
                         &config,
-                        &system_prompt,
                     )
                     .await;
                     if let Some(ref sm) = state_manager {
@@ -533,31 +491,38 @@ impl AgentRunner {
     ///
     /// This is the Controller's responsibility — it decides how domain events
     /// affect the UI state. The Model (StateManager) is passive and only holds data.
+    /// 
+    /// Note: This now persists ALL messages (including tool calls/results) to
+    /// StateManager, which serves as the single source of truth for persistence.
     fn process_event_for_ui(state_manager: &Option<Arc<StateManager>>, event: AgentEvent) {
-        use crate::ui::app_state::ChatMessage;
+        let sm = match state_manager {
+            Some(sm) => sm,
+            None => return,
+        };
 
         match event {
             AgentEvent::CompletionResponse { usage, .. } => {
                 // Update stats in StateManager (single source of truth)
-                if let Some(sm) = state_manager {
-                    sm.add_request(usage.input_tokens, usage.output_tokens, usage.cost);
-                }
+                sm.add_request(usage.input_tokens, usage.output_tokens, usage.cost);
             }
             AgentEvent::ToolCall {
                 tool_name,
                 arguments,
+                call_id,
                 ..
             } => {
-                if let Some(sm) = state_manager {
-                    sm.update_chat(ChatMessage::tool_call(&tool_name, &arguments, ""));
-                }
+                // Add to chat AND persist (StateManager handles persistence)
+                sm.add_tool_call(tool_name, arguments, call_id);
             }
             AgentEvent::ToolResult {
-                tool_name, result, ..
+                tool_name,
+                arguments,
+                result,
+                call_id,
+                ..
             } => {
-                if let Some(sm) = state_manager {
-                    sm.update_chat(ChatMessage::tool_result(&tool_name, &result));
-                }
+                // Add to chat AND persist (StateManager handles persistence)
+                sm.add_tool_result(tool_name, arguments, result, call_id);
             }
             AgentEvent::CompletionRequest { .. }
             | AgentEvent::SessionStart { .. }
@@ -570,57 +535,24 @@ impl AgentRunner {
     /// Internal process_message - returns CompletionResult instead of handling directly
     async fn process_message_internal(
         msg: &str,
-        chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
-        context_manager: &mut Option<ContextManager>,
-        conversation_manager: &Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
-        system_prompt: &str,
+        _system_prompt: &str,
     ) -> CompletionResult {
         let mut retry_count = 0;
         let current_msg = msg.to_string();
 
         loop {
-            // Context compaction check
-            if let Some(cm) = context_manager.as_mut() {
-                let mut history = chat_history.lock().await;
-                if cm.needs_compaction(&history) {
-                    // Set status message for UI
-                    if let Some(sm) = state_manager {
-                        sm.set_status(Some("Compacting context...".to_string()));
-                    }
-                    // Compact and continue
-                    match cm.compact(&mut history, system_prompt).await {
-                        Ok(result) => {
-                            if let Some(sm) = state_manager {
-                                sm.push_notification(
-                                    format!(
-                                        "Context compacted: {} → {} messages, {} discarded",
-                                        result.original_count,
-                                        result.compacted_count,
-                                        result.num_discarded
-                                    ),
-                                    crate::ui::app_state::NotificationKind::Info,
-                                );
-                                sm.set_status(None);
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(sm) = state_manager {
-                                sm.push_notification(
-                                    format!("Context compaction failed: {}", e),
-                                    crate::ui::app_state::NotificationKind::Warning,
-                                );
-                                sm.set_status(None);
-                            }
-                        }
-                    }
-                }
-            }
+            // Compaction is handled automatically by StateManager when messages
+            // are added (add_user_message / add_assistant_message). No explicit
+            // check needed here.
 
-            // Call the agent
-            let mut history = chat_history.lock().await;
+            // Call the agent with history from StateManager (single source of truth)
+            let mut history = state_manager
+                .as_ref()
+                .map(|sm| sm.get_agent_history())
+                .unwrap_or_default();
             let result = agent
                 .as_ref()
                 .prompt_with_history(&current_msg, &mut history)
@@ -628,31 +560,22 @@ impl AgentRunner {
 
             match result {
                 Ok(response) => {
-                    // Add assistant response to chat for live rendering
+                    // Add assistant response to chat AND persist (StateManager handles persistence)
                     if let Some(sm) = state_manager.as_ref() {
-                        use crate::ui::app_state::ChatMessage;
-                        sm.update_chat(ChatMessage::agent(response.clone()));
+                        sm.add_assistant_message(response.clone());
                         sm.set_final_broadcast(true);
-                    }
-
-                    // Sync stats and todo to StateManager
-
-                    // Save conversation
-                    if let Some(cm) = conversation_manager.as_ref()
-                        && let Err(e) = cm.lock().unwrap().save()
-                    {
-                        tracing::warn!("Failed to save conversation: {}", e);
                     }
 
                     return CompletionResult::Success;
                 }
 
                 Err(PromptError::PromptCancelled { reason, .. }) => {
-                    // On stop, just return Stopped. Let the loop handle the StopMarker.
                     if reason == "stop" {
                         return CompletionResult::Stopped;
                     }
-                    // Other cancellations (compact, etc) - loop continues
+                    // Any other cancellation reason — return error instead of
+                    // silently looping (which previously caused an infinite loop).
+                    return CompletionResult::Error;
                 }
 
                 Err(_) => {
@@ -680,13 +603,8 @@ impl AgentRunner {
     /// Internal process_command
     async fn process_command_internal(
         cmd: &str,
-        chat_history: Arc<tokio::sync::Mutex<Vec<Message>>>,
-        _context_manager: &mut Option<ContextManager>,
-        conversation_manager: &Option<Arc<Mutex<ConversationManager<FileStorage>>>>,
         state_manager: &Option<Arc<StateManager>>,
-        _agent: &Arc<DynAgent>,
         config: &Config,
-        _system_prompt: &str,
     ) {
         use crate::ui::app_state::NotificationKind;
 
@@ -698,70 +616,47 @@ impl AgentRunner {
                 // No notification needed - UI pulls this data
             }
             "/new" => {
-                if let Some(cm) = conversation_manager.as_ref() {
+                // Create new conversation via StateManager (single source of truth)
+                if let Some(sm) = state_manager {
                     let name = format!(
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")
                     );
-                    let _ = cm
-                        .lock()
-                        .unwrap()
-                        .create_new(name, config.model().to_string());
-                    chat_history.lock().await.clear();
-                    if let Some(sm) = state_manager {
-                        sm.add_system_message("Started a new conversation.".to_string());
-                    }
-                } else if let Some(sm) = state_manager {
-                    sm.push_notification(
-                        "Conversation persistence is not enabled.".to_string(),
-                        NotificationKind::Warning,
-                    );
+                    sm.create_conversation(name, config.model().to_string());
+                    sm.add_system_message("Started a new conversation.".to_string());
+                } else {
+                    tracing::warn!("State manager not available for /new command");
                 }
             }
             "/save" => {
-                if let Some(cm) = conversation_manager.as_ref() {
-                    if let Some(conv) = cm.lock().unwrap().get_current() {
-                        let _ = cm.lock().unwrap().save();
-                        if let Some(sm) = state_manager {
-                            sm.push_notification(
-                                format!("Conversation saved: {}", conv.name),
-                                NotificationKind::Success,
-                            );
-                        }
+                // Explicit save via StateManager
+                if let Some(sm) = state_manager {
+                    sm.save_conversation();
+                    if let Some(conv) = sm.get_current_conversation() {
+                        sm.push_notification(
+                            format!("Conversation saved: {}", conv.name),
+                            NotificationKind::Success,
+                        );
                     }
-                } else if let Some(sm) = state_manager {
-                    sm.push_notification(
-                        "Conversation persistence is not enabled.".to_string(),
-                        NotificationKind::Warning,
-                    );
+                } else {
+                    tracing::warn!("State manager not available for /save command");
                 }
             }
             _ if cmd_lower.starts_with("/load ") => {
                 if let Some(id_str) = cmd.strip_prefix("/load ") {
-                    if let Some(cm) = conversation_manager.as_ref() {
-                        let id = match uuid::Uuid::parse_str(id_str) {
-                            Ok(id) => id,
-                            Err(_) => {
-                                if let Some(sm) = state_manager {
-                                    sm.push_notification("Invalid conversation ID. Use /conversations to see available IDs.".to_string(), NotificationKind::Error);
-                                }
-                                return;
+                    let id = match uuid::Uuid::parse_str(id_str) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            if let Some(sm) = state_manager {
+                                sm.push_notification("Invalid conversation ID. Use /conversations to see available IDs.".to_string(), NotificationKind::Error);
                             }
-                        };
-                        let result = {
-                            let guard = cm.lock().unwrap();
-                            guard.load(id)
-                        };
-                        match result {
-                            Ok(conv) => {
-                                {
-                                    let mut guard = cm.lock().unwrap();
-                                    guard.load_and_set_current(id).ok();
-                                }
-                                chat_history.lock().await.clear();
-                                *chat_history.lock().await =
-                                    crate::convert_conversation_to_rig_messages(&conv);
-                                if let Some(sm) = state_manager {
+                            return;
+                        }
+                    };
+                    if let Some(sm) = state_manager {
+                        match sm.load_conversation(id) {
+                            Ok(()) => {
+                                if let Some(conv) = sm.get_current_conversation() {
                                     sm.add_system_message(format!(
                                         "Loaded conversation: '{}'",
                                         conv.name
@@ -769,25 +664,57 @@ impl AgentRunner {
                                 }
                             }
                             Err(e) => {
-                                if let Some(sm) = state_manager {
-                                    sm.push_notification(
-                                        format!("Failed to load conversation: {}", e),
-                                        NotificationKind::Error,
-                                    );
-                                }
+                                sm.push_notification(
+                                    format!("Failed to load conversation: {}", e),
+                                    NotificationKind::Error,
+                                );
                             }
                         }
-                    } else if let Some(sm) = state_manager {
-                        sm.push_notification(
-                            "Conversation persistence is not enabled.".to_string(),
-                            NotificationKind::Warning,
-                        );
+                    } else {
+                        tracing::warn!("State manager not available for /load command");
                     }
                 }
             }
             _ if cmd_lower.starts_with("/delete ") => {
                 if let Some(id_str) = cmd.strip_prefix("/delete ") {
-                    if let Some(cm) = conversation_manager.as_ref() {
+                    let id = match uuid::Uuid::parse_str(id_str) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            if let Some(sm) = state_manager {
+                                sm.push_notification(
+                                    "Invalid conversation ID.".to_string(),
+                                    NotificationKind::Error,
+                                );
+                            }
+                            return;
+                        }
+                    };
+                    if let Some(sm) = state_manager {
+                        match sm.delete_conversation(id) {
+                            Ok(_) => {
+                                sm.push_notification(
+                                    "Conversation deleted.".to_string(),
+                                    NotificationKind::Success,
+                                );
+                            }
+                            Err(e) => {
+                                sm.push_notification(
+                                    format!("Failed to delete: {}", e),
+                                    NotificationKind::Error,
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!("State manager not available for /delete command");
+                    }
+                }
+            }
+            _ if cmd_lower.starts_with("/export ") => {
+                if let Some(args) = cmd.strip_prefix("/export ") {
+                    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let id_str = parts[0];
+                        let format = parts[1].to_lowercase();
                         let id = match uuid::Uuid::parse_str(id_str) {
                             Ok(id) => id,
                             Err(_) => {
@@ -800,143 +727,50 @@ impl AgentRunner {
                                 return;
                             }
                         };
-                        let result = {
-                            let guard = cm.lock().unwrap();
-                            guard.delete(id)
-                        };
-                        match result {
-                            Ok(_) => {
-                                if let Some(sm) = state_manager {
-                                    sm.push_notification(
-                                        "Conversation deleted.".to_string(),
-                                        NotificationKind::Success,
-                                    );
+                        if let Some(sm) = state_manager {
+                            match sm.export_conversation(id, &format) {
+                                Ok(output) => {
+                                    sm.add_system_message(format!("Export:\n{}", output));
                                 }
-                            }
-                            Err(e) => {
-                                if let Some(sm) = state_manager {
+                                Err(e) => {
                                     sm.push_notification(
-                                        format!("Failed to delete: {}", e),
+                                        format!("Export failed: {}", e),
                                         NotificationKind::Error,
                                     );
                                 }
                             }
+                        } else {
+                            tracing::warn!("State manager not available for /export command");
                         }
-                    } else if let Some(sm) = state_manager {
-                        sm.push_notification(
-                            "Conversation persistence is not enabled.".to_string(),
-                            NotificationKind::Warning,
-                        );
-                    }
-                }
-            }
-            _ if cmd_lower.starts_with("/export ") => {
-                if let Some(args) = cmd.strip_prefix("/export ") {
-                    let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                    if parts.len() == 2 {
-                        if let Some(cm) = conversation_manager.as_ref() {
-                            let id_str = parts[0];
-                            let format = parts[1].to_lowercase();
-                            let id = match uuid::Uuid::parse_str(id_str) {
-                                Ok(id) => id,
-                                Err(_) => {
-                                    if let Some(sm) = state_manager {
-                                        sm.push_notification(
-                                            "Invalid conversation ID.".to_string(),
-                                            NotificationKind::Error,
-                                        );
-                                    }
-                                    return;
-                                }
-                            };
-                            let conv_result = {
-                                let guard = cm.lock().unwrap();
-                                guard.load(id)
-                            };
-                            match conv_result {
-                                Ok(conv) => {
-                                    let output = {
-                                        let guard = cm.lock().unwrap();
-                                        match format.as_str() {
-                                            "markdown" | "md" => guard.export_markdown(&conv),
-                                            "json" => guard.export_json(&conv),
-                                            _ => {
-                                                if let Some(sm) = state_manager {
-                                                    sm.push_notification(format!("Unknown format '{}'. Use 'json' or 'markdown'.", format), NotificationKind::Error);
-                                                }
-                                                return;
-                                            }
-                                        }
-                                    };
-                                    match output {
-                                        Ok(s) => {
-                                            if let Some(sm) = state_manager {
-                                                sm.add_system_message(format!("Export:\n{}", s));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            if let Some(sm) = state_manager {
-                                                sm.push_notification(
-                                                    format!("Export failed: {}", e),
-                                                    NotificationKind::Error,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    if let Some(sm) = state_manager {
-                                        sm.push_notification(
-                                            format!("Failed to load conversation: {}", e),
-                                            NotificationKind::Error,
-                                        );
-                                    }
-                                }
-                            }
-                        } else if let Some(sm) = state_manager {
+                    } else {
+                        if let Some(sm) = state_manager {
                             sm.push_notification(
-                                "Conversation persistence is not enabled.".to_string(),
-                                NotificationKind::Warning,
+                                "Usage: /export <id> <json|markdown>".to_string(),
+                                NotificationKind::Info,
                             );
                         }
-                    } else if let Some(sm) = state_manager {
-                        sm.push_notification(
-                            "Usage: /export <id> <json|markdown>".to_string(),
-                            NotificationKind::Info,
-                        );
                     }
                 }
             }
             _ if cmd_lower.starts_with("/rename ") => {
                 if let Some(name) = cmd.strip_prefix("/rename ") {
-                    if let Some(cm) = conversation_manager.as_ref() {
-                        let result = {
-                            let mut guard = cm.lock().unwrap();
-                            guard.rename(name.to_string())
-                        };
-                        match result {
+                    if let Some(sm) = state_manager {
+                        match sm.rename_conversation(name.to_string()) {
                             Ok(_) => {
-                                if let Some(sm) = state_manager {
-                                    sm.push_notification(
-                                        format!("Conversation renamed to: {}", name),
-                                        NotificationKind::Success,
-                                    );
-                                }
+                                sm.push_notification(
+                                    format!("Conversation renamed to: {}", name),
+                                    NotificationKind::Success,
+                                );
                             }
                             Err(e) => {
-                                if let Some(sm) = state_manager {
-                                    sm.push_notification(
-                                        format!("Failed to rename: {}", e),
-                                        NotificationKind::Error,
-                                    );
-                                }
+                                sm.push_notification(
+                                    format!("Failed to rename: {}", e),
+                                    NotificationKind::Error,
+                                );
                             }
                         }
-                    } else if let Some(sm) = state_manager {
-                        sm.push_notification(
-                            "Conversation persistence is not enabled.".to_string(),
-                            NotificationKind::Warning,
-                        );
+                    } else {
+                        tracing::warn!("State manager not available for /rename command");
                     }
                 }
             }

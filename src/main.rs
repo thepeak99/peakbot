@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use peakbot::{
-    AgentRunner, Config, SubAgentRegistry, TodoTool, Ui, UiAction, build_system_prompt,
+    AgentRunner, Config, FileStorage, SubAgentRegistry, TodoTool, Ui, UiAction, build_system_prompt,
     create_provider, load_default_skills, load_mcp_servers,
 };
 use std::sync::Arc;
@@ -44,8 +44,27 @@ async fn main() -> Result<()> {
         .then_some(config.searxng.as_ref())
         .flatten();
 
-    // StateManager must be created before TodoTool so we can pass it in
-    let state_manager = Arc::new(peakbot::StateManager::new());
+    // Create conversation storage if enabled
+    let state_manager = if config.conversation_enabled() {
+        let storage_dir = config.conversation_storage_dir();
+        match FileStorage::new(storage_dir.clone()) {
+            Ok(storage) => {
+                tracing::info!("Conversation storage enabled at: {:?}", storage_dir);
+                peakbot::StateManager::new_arc_with_storage(Arc::new(storage))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to create conversation storage at {:?}: {}. \
+                     Continuing without persistence.",
+                    storage_dir,
+                    e
+                );
+                peakbot::StateManager::new_arc()
+            }
+        }
+    } else {
+        peakbot::StateManager::new_arc()
+    };
 
     let todo_tool = TodoTool::new(state_manager.clone());
 
