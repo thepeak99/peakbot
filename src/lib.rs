@@ -16,13 +16,13 @@ pub mod test_runner;
 mod tools;
 pub mod ui;
 
-use context_manager::ContextManager;
 pub use config::{
     AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig,
     McpTransportType, OllamaConfig, OpenRouterConfig, PipelineConfig, ProviderConfig, ProviderType,
     RetryConfig, SearXngConfig,
 };
 pub use context_manager::CompactionResult;
+use context_manager::ContextManager;
 pub use conversation::{
     Conversation, ConversationMetadata, ConversationSummary, Message as ConversationMessage,
 };
@@ -33,7 +33,9 @@ pub use hooks::{
 pub use pipeline::{DelegateTool, SubAgentRegistry};
 #[cfg(feature = "mock")]
 pub use providers::create_mock_agent;
-pub use providers::{CompactionModel, DynAgent, ProviderInfo, create_compaction_model, create_provider};
+pub use providers::{
+    CompactionModel, DynAgent, ProviderInfo, create_compaction_model, create_provider,
+};
 
 use rig::completion::{Message, PromptError};
 use rig::tool::ToolDyn;
@@ -146,9 +148,7 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
             } => {
                 let args = serde_json::from_str(arguments)
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                let id = call_id
-                    .clone()
-                    .unwrap_or_else(|| tool_name.clone());
+                let id = call_id.clone().unwrap_or_else(|| tool_name.clone());
                 messages.push(Message::Assistant {
                     id: None,
                     content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
@@ -163,9 +163,7 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
                 call_id,
                 ..
             } => {
-                let id = call_id
-                    .clone()
-                    .unwrap_or_else(|| tool_name.clone());
+                let id = call_id.clone().unwrap_or_else(|| tool_name.clone());
                 messages.push(Message::User {
                     content: OneOrMany::one(UserContent::ToolResult(ToolResult {
                         id,
@@ -193,12 +191,11 @@ pub struct AgentRunner {
     provider_info: ProviderInfo,
     #[allow(unused)]
     skills: SkillRegistry,
-    system_prompt: String,
     state_manager: Option<Arc<StateManager>>,
     // Shared session hook for interrupt/queue state
     session_hook: Arc<SessionHook>,
     // Retained for streaming output handler (view concern, set up by main.rs)
-    _event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
 }
 
 impl AgentRunner {
@@ -238,10 +235,9 @@ impl AgentRunner {
             config,
             provider_info,
             skills,
-            system_prompt,
             state_manager,
             session_hook,
-            _event_receiver: event_receiver,
+            event_receiver,
         }
     }
 
@@ -284,11 +280,10 @@ impl AgentRunner {
         let state_manager = self.state_manager.clone();
         let session_hook = self.session_hook.clone();
         let config_model = self.config.model().to_string();
-        let system_prompt = self.system_prompt.clone();
         let agent = self.agent.clone();
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
-        let event_receiver = self._event_receiver.take();
+        let event_receiver = self.event_receiver.take();
 
         // Spawn event processor task (Phase 2: wire the event channel)
         let event_processor_handle = tokio::spawn({
@@ -334,7 +329,6 @@ impl AgentRunner {
                     state_manager_for_agent,
                     agent,
                     config_for_agent,
-                    system_prompt,
                 )
                 .await;
             }
@@ -428,7 +422,6 @@ impl AgentRunner {
         state_manager: Option<Arc<StateManager>>,
         agent: Arc<DynAgent>,
         config: Config,
-        system_prompt: String,
     ) {
         loop {
             // Wait for a message
@@ -441,14 +434,9 @@ impl AgentRunner {
                         sm.set_running(true);
                     }
 
-                    let result = Self::process_message_internal(
-                        &content,
-                        &state_manager,
-                        &agent,
-                        &config,
-                        &system_prompt,
-                    )
-                    .await;
+                    let result =
+                        Self::process_message_internal(&content, &state_manager, &agent, &config)
+                            .await;
 
                     // Mark as done
                     if let Some(ref sm) = state_manager {
@@ -463,12 +451,7 @@ impl AgentRunner {
                     if let Some(ref sm) = state_manager {
                         sm.set_running(true);
                     }
-                    Self::process_command_internal(
-                        &cmd,
-                        &state_manager,
-                        &config,
-                    )
-                    .await;
+                    Self::process_command_internal(&cmd, &state_manager, &config).await;
                     if let Some(ref sm) = state_manager {
                         sm.set_running(false);
                     }
@@ -499,7 +482,7 @@ impl AgentRunner {
     ///
     /// This is the Controller's responsibility — it decides how domain events
     /// affect the UI state. The Model (StateManager) is passive and only holds data.
-    /// 
+    ///
     /// Note: This now persists ALL messages (including tool calls/results) to
     /// StateManager, which serves as the single source of truth for persistence.
     fn process_event_for_ui(state_manager: &Option<Arc<StateManager>>, event: AgentEvent) {
@@ -546,7 +529,6 @@ impl AgentRunner {
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
-        _system_prompt: &str,
     ) -> CompletionResult {
         let mut retry_count = 0;
         let current_msg = msg.to_string();

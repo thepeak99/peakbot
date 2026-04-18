@@ -956,6 +956,12 @@ impl StateManager {
     /// - ToolCall → `Message::Assistant` with `AssistantContent::ToolCall`
     /// - ToolResult → `Message::User` with `UserContent::ToolResult`
     /// System messages are skipped.
+    ///
+    /// The trailing user message is excluded from the returned history because
+    /// rig's `prompt_with_history(msg, history)` appends `msg` as the current
+    /// user turn. Since `add_user_message()` is called before this method in
+    /// the production flow, including it here would send the same message to
+    /// the model twice.
     pub fn get_agent_history(&self) -> Vec<rig::completion::message::Message> {
         use crate::ui::app_state::MessageRole;
         use rig::completion::message::{
@@ -966,11 +972,29 @@ impl StateManager {
 
         let state = self.state.read().unwrap();
 
+        // If the very last uncompacted message is a User message, exclude it.
+        // It will be supplied separately as the prompt argument to prompt_with_history().
+        // Only exclude it when it's truly trailing — if there are assistant/tool messages
+        // after it, it's part of the conversation history and must be kept.
+        let last_uncompacted = state
+            .chat
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, msg)| !msg.compacted);
+        let skip_last_idx = last_uncompacted
+            .filter(|(_, msg)| msg.role == MessageRole::User)
+            .map(|(i, _)| i);
+
         state
             .chat
             .messages
             .iter()
-            .filter(|msg| !msg.compacted)
+            .enumerate()
+            .filter(|(_, msg)| !msg.compacted)
+            .filter(|(i, _)| Some(*i) != skip_last_idx)
+            .map(|(_, msg)| msg)
             .filter_map(|msg| {
                 match msg.role {
                     MessageRole::User => Some(RigMessage::User {
