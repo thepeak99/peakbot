@@ -172,6 +172,15 @@ impl TestHarness {
 
     // ── Compaction Tracking ─────────────────────────────────────────────────────
 
+    /// Add a mock response for the compaction summarization model.
+    /// When compaction fires, it uses a separate tool-free model.
+    /// Queue responses here to control what the summarizer returns.
+    pub fn add_compaction_response(&self, response: MockResponse) {
+        if let Some(ref mock) = self.runner.compaction_mock {
+            mock.add_response(response);
+        }
+    }
+
     /// Get all compaction events that occurred during testing
     pub fn get_compaction_events(&self) -> Vec<peakbot::CompactionInfo> {
         self.runner.get_compaction_events()
@@ -188,6 +197,49 @@ impl TestHarness {
         self.state_manager.get_state().chat.messages.len()
     }
 
+    /// Get the number of uncompacted messages (what the LLM would see).
+    pub fn get_uncompacted_message_count(&self) -> usize {
+        self.state_manager
+            .get_state()
+            .chat
+            .messages
+            .iter()
+            .filter(|m| !m.compacted)
+            .count()
+    }
+
+    /// Check if any messages are tagged as compacted.
+    pub fn has_compacted_messages(&self) -> bool {
+        self.state_manager
+            .get_state()
+            .chat
+            .messages
+            .iter()
+            .any(|m| m.compacted)
+    }
+
+    /// Get the number of messages tagged as compacted.
+    pub fn compacted_message_count(&self) -> usize {
+        self.state_manager
+            .get_state()
+            .chat
+            .messages
+            .iter()
+            .filter(|m| m.compacted)
+            .count()
+    }
+
+    /// Check if a Summary message exists in the chat.
+    pub fn has_summary_message(&self) -> bool {
+        use peakbot::ui::app_state::MessageRole;
+        self.state_manager
+            .get_state()
+            .chat
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Summary)
+    }
+
     // ── Request Recording ───────────────────────────────────────────────────────
 
     /// Get all recorded LLM requests (both regular and summarization).
@@ -200,60 +252,37 @@ impl TestHarness {
         self.mock_model.request_count()
     }
 
-    /// Get only the summarization requests (sent by ContextManager::summarize_messages).
-    ///
-    /// Identified by the prompt containing the summarization prefix.
-    pub fn get_summarization_requests(&self) -> Vec<RecordedRequest> {
-        self.get_recorded_requests()
-            .into_iter()
-            .filter(|r| {
-                r.chat_history.iter().any(|msg| {
-                    if let rig::completion::message::Message::User { content } = msg {
-                        content.iter().any(|c| {
-                            if let rig::completion::message::UserContent::Text(t) = c {
-                                t.text.contains("Please summarize the following conversation")
-                            } else {
-                                false
-                            }
-                        })
-                    } else {
-                        false
-                    }
-                })
-            })
-            .collect()
+    /// Get recorded requests from the compaction model (summarization calls).
+    pub fn get_compaction_requests(&self) -> Vec<RecordedRequest> {
+        self.runner
+            .compaction_mock
+            .as_ref()
+            .map(|m| m.get_recorded_requests())
+            .unwrap_or_default()
     }
 
-    /// Get only the regular (non-summarization) requests.
+    /// Get only the summarization requests (sent to the compaction model).
+    /// With the new architecture, summarization goes through a separate tool-free model.
+    pub fn get_summarization_requests(&self) -> Vec<RecordedRequest> {
+        self.get_compaction_requests()
+    }
+
+    /// Get only the regular (non-summarization) requests — all main agent requests.
     pub fn get_regular_requests(&self) -> Vec<RecordedRequest> {
         self.get_recorded_requests()
-            .into_iter()
-            .filter(|r| {
-                !r.chat_history.iter().any(|msg| {
-                    if let rig::completion::message::Message::User { content } = msg {
-                        content.iter().any(|c| {
-                            if let rig::completion::message::UserContent::Text(t) = c {
-                                t.text.contains("Please summarize the following conversation")
-                            } else {
-                                false
-                            }
-                        })
-                    } else {
-                        false
-                    }
-                })
-            })
-            .collect()
     }
 
-    /// Extract the prompt text from the last message of a summarization request.
-    /// Returns None if the request isn't a summarization request.
+    /// Extract the prompt text from a summarization request.
+    /// The prompt is sent as the main prompt (not in chat_history) to the compaction model.
     pub fn extract_summarization_prompt(request: &RecordedRequest) -> Option<String> {
+        // The compaction model receives the prompt as the last user message
         request.chat_history.last().and_then(|msg| {
             if let rig::completion::message::Message::User { content } = msg {
                 content.iter().find_map(|c| {
                     if let rig::completion::message::UserContent::Text(t) = c {
-                        if t.text.contains("Please summarize the following conversation") {
+                        if t.text.contains("Summarize this conversation concisely")
+                            || t.text.contains("Previous conversation:")
+                        {
                             Some(t.text.clone())
                         } else {
                             None

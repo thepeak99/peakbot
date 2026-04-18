@@ -50,6 +50,7 @@ async fn summarization_request_contains_old_messages() {
         threshold: 0.5, // 250 tokens
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -61,7 +62,7 @@ async fn summarization_request_contains_old_messages() {
     harness.add_response(agent_response("OLD_REPLY_2", 300));
     // Turn 3: compaction fires first (consuming summarization response),
     //         then regular response
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("RECENT_REPLY_3", 300));
 
     harness.run_message("OLD_MSG_1").await;
@@ -102,6 +103,7 @@ async fn summarization_request_excludes_recent_messages() {
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -109,7 +111,7 @@ async fn summarization_request_excludes_recent_messages() {
 
     harness.add_response(agent_response("REPLY_ALPHA", 300));
     harness.add_response(agent_response("REPLY_BETA", 300));
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("REPLY_GAMMA", 300));
 
     harness.run_message("MSG_ALPHA").await;
@@ -152,6 +154,7 @@ async fn summarization_excludes_tool_messages_from_prompt() {
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -166,7 +169,7 @@ async fn summarization_excludes_tool_messages_from_prompt() {
     // Turn 2: text response, high tokens to trigger compaction
     harness.add_response(agent_response("TEXT_REPLY_2", 300));
     // Turn 3: compaction + response
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("TEXT_REPLY_3", 300));
 
     harness.run_message("Add a todo TOOL_TASK_XYZ").await;
@@ -201,6 +204,7 @@ async fn llm_call_count_matches_expectations() {
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -208,7 +212,7 @@ async fn llm_call_count_matches_expectations() {
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 300));
 
     harness.run_message("M1").await;
@@ -217,21 +221,22 @@ async fn llm_call_count_matches_expectations() {
 
     assert!(harness.has_compaction_occurred());
 
-    // 3 regular + 1 summarization = 4 total
+    // With independent compaction model: 3 main agent calls + 1 compaction model call
     assert_eq!(
         harness.get_summarization_requests().len(),
         1,
-        "Should have exactly 1 summarization call"
+        "Should have exactly 1 summarization call (on compaction model)"
     );
     assert_eq!(
         harness.get_regular_requests().len(),
         3,
-        "Should have exactly 3 regular calls"
+        "Should have exactly 3 regular calls (on main agent)"
     );
+    // request_count() only counts main agent calls
     assert_eq!(
         harness.request_count(),
-        4,
-        "Total LLM calls should be 4 (3 regular + 1 summarization)"
+        3,
+        "Main agent LLM calls should be 3 (summarization is on separate model)"
     );
 }
 
@@ -246,6 +251,7 @@ async fn post_compaction_request_has_compacted_history() {
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -253,7 +259,7 @@ async fn post_compaction_request_has_compacted_history() {
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 100));
 
     harness.run_message("M1").await;
@@ -277,7 +283,7 @@ async fn post_compaction_request_has_compacted_history() {
         if let rig::completion::message::Message::User { content } = msg {
             content.iter().any(|c| {
                 if let rig::completion::message::UserContent::Text(t) = c {
-                    t.text.contains("[Previous conversation summary:")
+                    t.text.contains("[Conversation summary]")
                 } else {
                     false
                 }
@@ -304,13 +310,14 @@ async fn summary_text_appears_in_history() {
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
 
     harness.add_response(agent_response("R1", 200));
-    harness.add_response(summarization_response_with("THE_CUSTOM_SUMMARY_TEXT"));
+    harness.add_compaction_response(summarization_response_with("THE_CUSTOM_SUMMARY_TEXT"));
     harness.add_response(agent_response("R2", 200));
 
     harness.run_message("M1").await;
@@ -318,12 +325,14 @@ async fn summary_text_appears_in_history() {
 
     assert!(harness.has_compaction_occurred());
 
+    // With tag-and-skip, the summary appears as a Summary role message.
+    // In get_agent_history() it's converted to a User message with "[Conversation summary]" prefix.
     let history = harness.get_chat_history();
     let has_summary = history.iter().any(|msg| {
         if let rig::completion::message::Message::User { content } = msg {
             content.iter().any(|c| {
                 if let rig::completion::message::UserContent::Text(t) = c {
-                    t.text.contains("[Previous conversation summary:")
+                    t.text.contains("[Conversation summary]")
                         && t.text.contains("THE_CUSTOM_SUMMARY_TEXT")
                 } else {
                     false
@@ -355,13 +364,14 @@ async fn post_compaction_history_structure() {
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
 
     harness.add_response(agent_response("R1", 200));
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R2", 200));
 
     harness.run_message("M1").await;
@@ -386,7 +396,7 @@ async fn post_compaction_history_structure() {
     {
         content.iter().any(|c| {
             if let rig::completion::message::UserContent::Text(t) = c {
-                t.text.contains("[Previous conversation summary:")
+                t.text.contains("[Conversation summary]")
             } else {
                 false
             }
@@ -409,13 +419,14 @@ async fn summary_persists_to_state_manager() {
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
 
     harness.add_response(agent_response("R1", 200));
-    harness.add_response(summarization_response_with("PERSISTED_SUMMARY"));
+    harness.add_compaction_response(summarization_response_with("PERSISTED_SUMMARY"));
     harness.add_response(agent_response("R2", 200));
 
     harness.run_message("M1").await;
@@ -441,17 +452,18 @@ async fn summary_persists_to_state_manager() {
     );
 }
 
-/// 2.4 — Summarization failure falls back to truncation.
+/// 2.4 — Summarization failure is gracefully handled.
 ///
-/// Queue no summarization response so agent.prompt() errors.
-/// Compaction should still complete via truncation fallback.
+/// Queue no compaction response so the summarization call errors.
+/// Compaction should fail silently and the agent continues normally.
 #[tokio::test]
-async fn summarization_failure_falls_back_to_truncation() {
+async fn summarization_failure_is_graceful() {
     let config = ContextConfig {
         context_window: Some(300),
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -459,33 +471,25 @@ async fn summarization_failure_falls_back_to_truncation() {
 
     // Turn 1: normal
     harness.add_response(agent_response("R1", 200));
-    // Turn 2: compaction fires, tries to summarize, but the next queued response
-    // is the agent response (not a summarization response). The summarization
-    // call will consume it and return "R2" as the "summary", then the actual
-    // agent call will fail with "no responses queued".
-    //
-    // Actually, to test summarization FAILURE, we need the summarization call
-    // itself to fail. Queue an error response for it.
-    harness.add_response(MockResponse::error("Simulated LLM failure for summarization"));
+    // Turn 2: compaction fires, tries to summarize via compaction model,
+    // but no compaction response is queued — summarization fails.
+    // The agent should still respond normally.
     harness.add_response(agent_response("R2", 200));
 
     harness.run_message("M1").await;
     let response = harness.run_message("M2").await;
 
-    // The agent should still respond (truncation fallback, not crash)
+    // Agent should still respond (compaction failure doesn't crash the agent)
     assert!(
         !response.is_empty() && response != "Error occurred",
         "Agent should still respond after summarization failure. Got: {}",
         response
     );
 
-    // History should be shorter than uncompacted (truncation happened)
-    // Without compaction: 4 messages (2 user + 2 assistant)
-    let count = harness.get_chat_message_count();
+    // No compaction should have occurred (summarization failed)
     assert!(
-        count <= 4,
-        "History should not grow unbounded after failed summarization. Got {} messages",
-        count
+        !harness.has_compaction_occurred(),
+        "Compaction should not have succeeded with no summarization response"
     );
 }
 
@@ -518,6 +522,7 @@ async fn compaction_triggers_at_exact_turn() {
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -525,7 +530,7 @@ async fn compaction_triggers_at_exact_turn() {
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 300));
 
     // Turn 1: no compaction
@@ -563,6 +568,7 @@ async fn no_compaction_below_threshold_verified_by_request_count() {
         threshold: 0.8, // 800 tokens
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -598,6 +604,7 @@ async fn no_compaction_when_msgs_lte_keep_recent() {
         threshold: 0.5, // 200 tokens
         keep_recent: 10, // Very high — 3 turns = 6 msgs < 10
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -631,6 +638,7 @@ async fn token_stats_pipeline_ordering() {
         threshold: 0.5, // 300 tokens
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -645,7 +653,7 @@ async fn token_stats_pipeline_ordering() {
     // After turn 2, last_input_tokens = 100. So turn 3's check sees 100 < 300.
     harness.add_response(agent_response("R3", 500));
     // Turn 4: check sees turn 3's 500 > 300, AND 6 msgs > 2. COMPACT!
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R4", 100));
 
     harness.run_message("M1").await;
@@ -680,6 +688,7 @@ async fn compaction_turn_consumes_two_responses() {
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -687,7 +696,7 @@ async fn compaction_turn_consumes_two_responses() {
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 300));
 
     harness.run_message("M1").await;
@@ -699,10 +708,12 @@ async fn compaction_turn_consumes_two_responses() {
     let remaining_after = harness.remaining_responses();
 
     assert!(harness.has_compaction_occurred());
+    // With independent compaction model, the compaction turn only consumes 1 from
+    // the main agent queue (summarization goes to the separate compaction model).
     assert_eq!(
         remaining_before - remaining_after,
-        2,
-        "Compaction turn should consume 2 responses (1 summarization + 1 regular). \
+        1,
+        "Compaction turn should consume 1 main agent response (summarization is on separate model). \
          Before: {}, After: {}",
         remaining_before,
         remaining_after
@@ -717,6 +728,7 @@ async fn non_compaction_turn_consumes_one_response() {
         threshold: 0.8, // high threshold, won't trigger
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -748,6 +760,7 @@ async fn queue_consumption_pattern_across_turns() {
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -755,7 +768,7 @@ async fn queue_consumption_pattern_across_turns() {
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 100));
     harness.add_response(agent_response("R4", 100));
 
@@ -768,13 +781,12 @@ async fn queue_consumption_pattern_across_turns() {
         consumed_per_turn.push(before - after);
     }
 
-    // Turns 1,2: no compaction → 1 response each
-    // Turn 3: compaction → 2 responses
-    // Turn 4: no compaction → 1 response
+    // With independent compaction model, every turn consumes exactly 1 from the
+    // main agent queue. Summarization goes to the separate compaction model.
     assert_eq!(
         consumed_per_turn,
-        vec![1, 1, 2, 1],
-        "Queue consumption pattern should be [1, 1, 2, 1] (compaction on turn 3). Got: {:?}",
+        vec![1, 1, 1, 1],
+        "Each turn should consume 1 main agent response (compaction is on separate model). Got: {:?}",
         consumed_per_turn
     );
 }
@@ -794,6 +806,7 @@ async fn multiple_compactions_stack_summaries() {
         threshold: 0.5, // 150 tokens
         keep_recent: 1,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -802,10 +815,10 @@ async fn multiple_compactions_stack_summaries() {
     // Turn 1: normal
     harness.add_response(agent_response("R1", 200));
     // Turn 2: compaction #1 fires
-    harness.add_response(summarization_response_with("FIRST_SUMMARY"));
+    harness.add_compaction_response(summarization_response_with("FIRST_SUMMARY"));
     harness.add_response(agent_response("R2", 200));
     // Turn 3: compaction #2 fires (the first summary is now old)
-    harness.add_response(summarization_response_with("SECOND_SUMMARY"));
+    harness.add_compaction_response(summarization_response_with("SECOND_SUMMARY"));
     harness.add_response(agent_response("R3", 200));
 
     harness.run_message("M1").await;
@@ -845,6 +858,7 @@ async fn tool_calls_crossing_boundary_preserved() {
         threshold: 0.5, // 250 tokens
         keep_recent: 3, // Keep last 3 messages
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -859,7 +873,7 @@ async fn tool_calls_crossing_boundary_preserved() {
     // Turn 2: text, high tokens
     harness.add_response(agent_response("R2", 300));
     // Turn 3: compaction + response
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 300));
 
     harness.run_message("Add boundary task").await;
@@ -891,6 +905,7 @@ async fn message_count_fallback_triggers_compaction() {
         threshold: 0.8,
         keep_recent: 3,
         enabled: true,
+        compaction_model: None,
         // Fallback: (3 * 3).max(10) = 10 messages
     };
 
@@ -911,7 +926,7 @@ async fn message_count_fallback_triggers_compaction() {
     for _ in 0..6 {
         harness.add_response(MockResponse::text("Response"));
     }
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(MockResponse::text("Final response"));
 
     for i in 1..=6 {
@@ -944,13 +959,14 @@ async fn compaction_handles_empty_messages() {
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
 
     harness.add_response(agent_response("", 200)); // empty response
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R2", 200));
 
     harness.run_message("").await; // empty user message
@@ -968,13 +984,14 @@ async fn keep_recent_zero_summarizes_everything() {
         threshold: 0.5,
         keep_recent: 0,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
 
     harness.add_response(agent_response("R1", 200));
-    harness.add_response(summarization_response_with("TOTAL_SUMMARY"));
+    harness.add_compaction_response(summarization_response_with("TOTAL_SUMMARY"));
     harness.add_response(agent_response("R2", 200));
 
     harness.run_message("M1").await;
@@ -1014,6 +1031,7 @@ async fn compaction_must_preserve_recent_messages() {
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -1021,7 +1039,7 @@ async fn compaction_must_preserve_recent_messages() {
 
     harness.add_response(agent_response("R1", 250));
     harness.add_response(agent_response("R2", 250));
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 250));
 
     harness.run_message("M1").await;
@@ -1051,13 +1069,14 @@ async fn compaction_reduces_history_exact_count() {
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
         TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
 
     harness.add_response(agent_response("R1", 200));
-    harness.add_response(summarization_response());
+    harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R2", 200));
 
     harness.run_message("M1").await;
@@ -1082,9 +1101,9 @@ async fn compaction_reduces_history_exact_count() {
         );
     }
 
-    // Verify via request count: 2 regular + 1 summarization
-    assert_eq!(harness.request_count(), 3);
-    assert_eq!(harness.get_summarization_requests().len(), 1);
+    // Verify via request count: 2 regular (main agent) + 1 summarization (compaction model)
+    assert_eq!(harness.request_count(), 2, "Main agent should have 2 calls");
+    assert_eq!(harness.get_summarization_requests().len(), 1, "Should have 1 summarization call");
 }
 
 /// Strengthened multiple_compaction_events: verify each discard count and
@@ -1096,6 +1115,7 @@ async fn multiple_compaction_events_verified() {
         threshold: 0.6, // 120 tokens
         keep_recent: 1,
         enabled: true,
+        compaction_model: None,
     };
 
     let mut harness =
@@ -1106,7 +1126,7 @@ async fn multiple_compaction_events_verified() {
         harness.add_response(agent_response("R", 150));
     }
     for _ in 0..4 {
-        harness.add_response(summarization_response());
+        harness.add_compaction_response(summarization_response());
     }
 
     for i in 1..=5 {

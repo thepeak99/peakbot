@@ -40,6 +40,30 @@ pub struct ProviderInfo {
     pub supports_pricing: bool,
 }
 
+/// Tool-free completion model for compaction summarization.
+/// No tools, no hooks — just text in, text out.
+pub enum CompactionModel {
+    OpenRouter(Agent<<openrouter::Client as CompletionClient>::CompletionModel, ()>),
+    OpenAI(Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, ()>),
+    LlamaCpp(Agent<rig::providers::openai::completion::CompletionModel, ()>),
+    Ollama(Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>),
+    #[cfg(feature = "mock")]
+    Mock(Agent<MockCompletionModel, ()>),
+}
+
+impl CompactionModel {
+    pub async fn summarize(&self, prompt: &str) -> Result<String, PromptError> {
+        match self {
+            CompactionModel::OpenRouter(a) => a.prompt(prompt).await,
+            CompactionModel::OpenAI(a) => a.prompt(prompt).await,
+            CompactionModel::LlamaCpp(a) => a.prompt(prompt).await,
+            CompactionModel::Ollama(a) => a.prompt(prompt).await,
+            #[cfg(feature = "mock")]
+            CompactionModel::Mock(a) => a.prompt(prompt).await,
+        }
+    }
+}
+
 /// A dynamic agent type that can work with any provider
 /// This allows us to abstract over different provider agent types at runtime
 pub enum DynAgent {
@@ -206,6 +230,88 @@ pub fn create_provider(
             ))
         }
     }
+}
+
+const COMPACTION_PREAMBLE: &str = "\
+You are a conversation summarizer. Given a conversation transcript, produce a concise summary \
+that preserves: key decisions made, important facts and context, tool calls and their results, \
+and any state needed to continue the conversation. Be specific about what was done, not vague.";
+
+/// Create a tool-free CompactionModel from the provider config.
+/// Uses `model_override` if set, otherwise the provider's default model.
+pub fn create_compaction_model(
+    config: &ProviderConfig,
+    model_override: Option<&str>,
+) -> Result<CompactionModel> {
+    match config {
+        ProviderConfig::OpenRouter(c) => {
+            let api_key = c
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .context("OpenRouter API key not configured")?;
+            let client = openrouter::Client::builder()
+                .api_key(&api_key)
+                .build()
+                .context("Failed to create OpenRouter client for compaction")?;
+            let model = model_override.unwrap_or(&c.model);
+            let agent = client.agent(model).preamble(COMPACTION_PREAMBLE).build();
+            Ok(CompactionModel::OpenRouter(agent))
+        }
+        ProviderConfig::OpenAI(c) => {
+            let api_key = c
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .context("OpenAI API key not configured")?;
+            let client = openai::Client::builder()
+                .api_key(&api_key)
+                .base_url(&c.base_url)
+                .build()
+                .context("Failed to create OpenAI client for compaction")?;
+            let model = model_override.unwrap_or(&c.model);
+            let agent = client.agent(model).preamble(COMPACTION_PREAMBLE).build();
+            Ok(CompactionModel::OpenAI(agent))
+        }
+        ProviderConfig::LlamaCpp(c) => {
+            let api_key = c
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .unwrap_or_default();
+            let client = openai::Client::builder()
+                .api_key(&api_key)
+                .base_url(&c.base_url)
+                .build()
+                .context("Failed to create LlamaCpp client for compaction")?
+                .completions_api();
+            let model = model_override.unwrap_or(&c.model);
+            let agent = client.agent(model).preamble(COMPACTION_PREAMBLE).build();
+            Ok(CompactionModel::LlamaCpp(agent))
+        }
+        ProviderConfig::Ollama(c) => {
+            let client = ollama::Client::builder()
+                .base_url(&c.base_url)
+                .api_key(rig::client::Nothing)
+                .build()
+                .context("Failed to create Ollama client for compaction")?;
+            let model = model_override.unwrap_or(&c.model);
+            let agent = client.agent(model).preamble(COMPACTION_PREAMBLE).build();
+            Ok(CompactionModel::Ollama(agent))
+        }
+    }
+}
+
+/// Create a mock CompactionModel for testing
+#[cfg(feature = "mock")]
+pub fn create_mock_compaction_model() -> (CompactionModel, MockCompletionModel) {
+    use rig::agent::AgentBuilder;
+    let mock_model = MockCompletionModel::new();
+    let model_clone = mock_model.clone();
+    let agent = AgentBuilder::new(mock_model)
+        .preamble(COMPACTION_PREAMBLE)
+        .build();
+    (CompactionModel::Mock(agent), model_clone)
 }
 
 /// Get built-in tools for PeakBot (excluding SearchTool which requires config)

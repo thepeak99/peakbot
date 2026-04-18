@@ -150,6 +150,7 @@ impl ReplUi {
             MessageRole::System => ("⚙️ System", Color::LightYellow),
             MessageRole::ToolCall => ("🔧 Tool", Color::Cyan),
             MessageRole::ToolResult => ("📋 Result", Color::Blue),
+            MessageRole::Summary => ("📝 Summary", Color::DarkGray),
         };
 
         // Split content by newlines to handle multiline messages

@@ -1,12 +1,16 @@
 //! Context management for handling long conversations.
 //! Implements automatic context compaction when approaching the context window limit.
 //! Uses actual token counts from the provider (via token_cost hook) instead of estimates.
+//!
+//! Compaction is an independent LLM call with no tools — text in, summary out.
+//! Old messages are tagged `compacted = true` and skipped in get_agent_history(),
+//! but kept in the ChatMessage array for UI display and persistence.
 
 use crate::config::ContextConfig;
-use crate::providers::DynAgent;
+use crate::providers::CompactionModel;
 use crate::state::StateManager;
+use crate::ui::app_state::ChatMessage;
 use anyhow::{Context as AnyhowContext, Result};
-use rig::completion::message::{AssistantContent, Message, UserContent};
 use std::sync::Arc;
 
 /// Default context window size (128k tokens)
@@ -21,36 +25,47 @@ const SUMMARY_TOKENS: usize = 75;
 pub struct CompactionResult {
     /// Number of messages before compaction
     pub original_count: usize,
-    /// Number of messages after compaction
+    /// Number of messages after compaction (visible to LLM)
     pub compacted_count: usize,
     /// Estimated tokens saved
     pub tokens_saved: usize,
-    /// Number of messages that were discarded (truncated)
+    /// Number of messages that were compacted
     pub num_discarded: usize,
 }
 
-/// Manages context window usage and performs compaction when needed
-/// Uses actual token counts from StateManager
+/// Plan produced by compact() — describes what to do, doesn't do it.
+/// StateManager::apply_compaction() executes this plan.
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    /// The summary text produced by the CompactionModel
+    pub summary: String,
+    /// Messages at indices 0..boundary are candidates for compaction.
+    /// apply_compaction() will mark them compacted except tool calls
+    /// needed by ToolResults in the kept region.
+    pub boundary: usize,
+}
+
+/// Manages context window usage and performs compaction when needed.
+/// Uses actual token counts from StateManager.
 #[derive(Clone)]
 pub(crate) struct ContextManager {
     config: ContextConfig,
     context_window: usize,
     /// Reference to StateManager for stats
     state_manager: Arc<StateManager>,
-    /// Reference to the LLM agent for summarization
-    agent: Option<Arc<DynAgent>>,
+    /// Tool-free model for summarization (independent call, no tools)
+    compaction_model: Option<Arc<CompactionModel>>,
 }
 
 impl ContextManager {
-    /// Create a new ContextManager with the given configuration
-    /// If context_window is 0 or None, attempts to auto-detect from model name
+    /// Create a new ContextManager with the given configuration.
+    /// If context_window is 0 or None, attempts to auto-detect from model name.
     pub fn new(
         config: ContextConfig,
         model_name: &str,
         state_manager: Arc<StateManager>,
-        agent: Option<Arc<DynAgent>>,
+        compaction_model: Option<Arc<CompactionModel>>,
     ) -> Self {
-        // Default context windows for common models
         let context_window = config.context_window.unwrap_or_else(|| {
             match model_name.to_lowercase().as_str() {
                 m if m.contains("claude-3.7-sonnet") => 200_000,
@@ -66,7 +81,7 @@ impl ContextManager {
                 m if m.contains("gemini-2.0") => 1_000_000,
                 m if m.contains("gemini-1.5-pro") => 2_000_000,
                 m if m.contains("gemini-1.5-flash") => 1_000_000,
-                _ => DEFAULT_CONTEXT_WINDOW, // Default fallback
+                _ => DEFAULT_CONTEXT_WINDOW,
             }
         });
 
@@ -74,7 +89,7 @@ impl ContextManager {
             config,
             context_window,
             state_manager,
-            agent,
+            compaction_model,
         }
     }
 
@@ -89,25 +104,21 @@ impl ContextManager {
         ((self.context_window as f64) * self.config.threshold) as usize
     }
 
-    /// Get current total tokens from actual API response
+    /// Get current total tokens from actual API response.
     /// Uses the LAST request's input tokens (actual context size), not cumulative sum.
-    /// This is the EXACT token count from the provider, not an estimate.
     pub fn get_current_tokens(&self) -> usize {
         let stats_arc = self.state_manager.stats_arc();
         let stats = stats_arc.lock().unwrap();
-        // Use LAST request's input tokens (the actual context size sent to LLM)
-        // NOT cumulative_input_tokens() which sums ALL requests (bug!)
         stats.last_input_tokens().unwrap_or(0) as usize
     }
 
-    /// Check if compaction is needed based on current message count
-    pub fn needs_compaction(&self, messages: &[Message]) -> bool {
+    /// Check if compaction is needed based on uncompacted message count and token usage.
+    pub fn needs_compaction(&self, uncompacted_count: usize) -> bool {
         if !self.config.enabled {
             return false;
         }
 
-        // Edge cases: no compaction needed for empty or very short history
-        if messages.len() <= self.config.keep_recent {
+        if uncompacted_count <= self.config.keep_recent {
             return false;
         }
 
@@ -117,9 +128,9 @@ impl ContextManager {
             return tokens > self.threshold();
         }
 
-        // Fallback: check message count (when no token data is available yet)
+        // Fallback: message count (when no token data is available yet)
         let threshold_messages = (self.config.keep_recent * 3).max(10);
-        messages.len() > threshold_messages
+        uncompacted_count > threshold_messages
     }
 
     /// Get current token usage as a percentage (0.0 - 1.0)
@@ -132,263 +143,74 @@ impl ContextManager {
         total as f64 / self.context_window as f64
     }
 
-    /// Format messages for summarization prompt
-    fn format_messages_for_summary(&self, messages: &[Message]) -> String {
-        let mut output = String::new();
-        output.push_str("Previous conversation:\n\n");
+    /// Produce a CompactionPlan by summarizing older messages.
+    /// This is a pure function — it reads messages but doesn't mutate them.
+    /// The actual tagging is done by StateManager::apply_compaction().
+    pub async fn compact(&self, messages: &[ChatMessage]) -> Result<CompactionPlan> {
+        let model = self
+            .compaction_model
+            .as_ref()
+            .context("No compaction model available for summarization")?;
 
-        for msg in messages {
-            let (role, content) = match msg {
-                Message::User { content } => {
-                    // Extract text from User content
-                    let text = content
-                        .iter()
-                        .filter_map(|c| {
-                            if let rig::completion::message::UserContent::Text(t) = c {
-                                Some(t.text.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    ("User", text)
-                }
-                Message::Assistant { content, .. } => {
-                    // Extract text from Assistant content
-                    let text = content
-                        .iter()
-                        .filter_map(|c| {
-                            if let rig::completion::message::AssistantContent::Text(t) = c {
-                                Some(t.text.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    ("Assistant", text)
-                }
-                // ToolResult and other variants - skip them for summarization
-                #[allow(unreachable_patterns)]
-                _ => continue,
-            };
-            if !content.is_empty() {
-                output.push_str(&format!("{}: {}\n\n", role, content));
-            }
+        // Only consider uncompacted messages
+        let uncompacted: Vec<(usize, &ChatMessage)> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.compacted)
+            .collect();
+
+        if uncompacted.len() <= self.config.keep_recent {
+            anyhow::bail!("Not enough uncompacted messages to compact");
         }
 
-        output
-    }
+        // The boundary: compact everything except the last keep_recent uncompacted messages
+        let keep_count = self.config.keep_recent;
+        let compact_count = uncompacted.len() - keep_count;
+        // boundary is the original index of the first message to keep.
+        // When keep_recent=0, compact everything — boundary is past the last message.
+        let boundary = if compact_count >= uncompacted.len() {
+            messages.len()
+        } else {
+            uncompacted[compact_count].0
+        };
 
-    /// Summarize messages using the LLM
-    async fn summarize_messages(&self, messages: &[Message]) -> Result<String> {
-        let agent = self
-            .agent
-            .as_ref()
-            .context("No LLM agent available for summarization")?;
+        // Format older messages for summarization (everything before boundary that isn't already compacted)
+        let to_summarize: Vec<&ChatMessage> = messages[..boundary]
+            .iter()
+            .filter(|m| !m.compacted)
+            .collect();
 
-        let formatted = self.format_messages_for_summary(messages);
+        let formatted = format_chat_messages_for_summary(&to_summarize);
 
         let prompt = format!(
-            "Please summarize the following conversation concisely, preserving the key information, decisions, and important details. \
-            Focus on what matters for continuing the conversation:\n\n{}\n\n\
-            Provide a concise summary (2-4 sentences) that captures the essential context:",
+            "Summarize this conversation concisely. Preserve: key decisions, important facts, \
+            tool calls and their results, and any state needed to continue the conversation. \
+            Be specific about what was done.\n\n{}\n\n\
+            Provide a concise summary that captures the essential context:",
             formatted
         );
 
-        let summary = agent.prompt(&prompt).await?;
-        Ok(summary)
+        let summary = model.summarize(&prompt).await
+            .map_err(|e| anyhow::anyhow!("Compaction summarization failed: {}", e))?;
+
+        Ok(CompactionPlan { summary, boundary })
     }
 
-    /// Perform context compaction
-    /// Uses summarization approach: summarize older messages instead of just truncating
-    /// Preserves tool call/result integrity by including ToolCall messages that are
-    /// referenced by ToolResult messages in the kept region.
-    pub async fn compact(
-        &self,
-        messages: &mut Vec<Message>,
-        _system_prompt: &str,
-    ) -> Result<CompactionResult> {
-        if !self.config.enabled {
-            return Ok(CompactionResult {
-                original_count: messages.len(),
-                compacted_count: messages.len(),
-                tokens_saved: 0,
-                num_discarded: 0,
-            });
-        }
-
-        let original_count = messages.len();
-
-        // Edge cases
-        if messages.len() <= self.config.keep_recent {
-            return Ok(CompactionResult {
-                original_count,
-                compacted_count: messages.len(),
-                tokens_saved: 0,
-                num_discarded: 0,
-            });
-        }
-
-        // Get token count before compaction
-        let tokens_before = self.get_current_tokens();
-
-        // Split messages: keep recent, discard older
-        let keep_start = messages.len().saturating_sub(self.config.keep_recent);
-
-        // Find tool calls that are referenced by tool results in the keep region.
-        // These must be preserved to maintain conversation integrity.
-        let needed_tc_indices = find_needed_tool_calls(messages, keep_start);
-
-        // Calculate which messages to discard (old messages minus needed tool calls)
-        let needed_tc_set: std::collections::HashSet<usize> =
-            needed_tc_indices.iter().cloned().collect();
-
-        let num_to_discard = keep_start - needed_tc_indices.len();
-
-        if num_to_discard == 0 && needed_tc_indices.is_empty() {
-            return Ok(CompactionResult {
-                original_count,
-                compacted_count: messages.len(),
-                tokens_saved: 0,
-                num_discarded: 0,
-            });
-        }
-
-        // Get the messages to summarize (the older ones, excluding needed tool calls)
-        let to_summarize: Vec<Message> = messages[0..keep_start]
+    /// How many messages would be compacted for a given plan
+    pub fn estimate_compaction(&self, messages: &[ChatMessage], boundary: usize) -> CompactionResult {
+        let original_uncompacted = messages.iter().filter(|m| !m.compacted).count();
+        let would_compact = messages[..boundary]
             .iter()
-            .enumerate()
-            .filter(|(i, _)| !needed_tc_set.contains(i))
-            .map(|(_, msg)| msg.clone())
-            .collect();
-
-        // Collect messages to keep: needed tool calls + the recent messages
-        let mut to_keep: Vec<Message> = Vec::new();
-
-        // Add needed tool calls (in order)
-        for &idx in &needed_tc_indices {
-            to_keep.push(messages[idx].clone());
+            .filter(|m| !m.compacted)
+            .count();
+        // After compaction: 1 summary + (original_uncompacted - would_compact) kept
+        let after = 1 + (original_uncompacted - would_compact);
+        CompactionResult {
+            original_count: original_uncompacted,
+            compacted_count: after,
+            tokens_saved: would_compact.saturating_mul(TOKENS_PER_MESSAGE).saturating_sub(SUMMARY_TOKENS),
+            num_discarded: would_compact,
         }
-
-        // Add the recent messages (from keep_start to end)
-        for msg in messages.iter().skip(keep_start) {
-            to_keep.push(msg.clone());
-        }
-
-        // Try to summarize the older messages if we have an agent
-        let has_agent = self.agent.is_some();
-        let summary_message = if has_agent {
-            match self.summarize_messages(&to_summarize).await {
-                Ok(summary) => {
-                    // Create a user message with the summary as context
-                    Some(Message::user(format!(
-                        "[Previous conversation summary: {}]",
-                        summary
-                    )))
-                }
-                Err(e) => {
-                    // If summarization fails, log and fall back to truncation
-                    tracing::warn!(
-                        "Failed to summarize messages: {}. Falling back to truncation.",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            // No agent available, fall back to truncation
-            None
-        };
-
-        // Clear all messages
-        messages.clear();
-
-        // Add summary message if we have one, otherwise just start fresh
-        let summary_created = summary_message.is_some();
-        if let Some(summary) = summary_message {
-            messages.push(summary);
-        }
-
-        // Add back the messages we wanted to keep (tool calls + recent)
-        messages.extend(to_keep);
-
-        let compacted_count = messages.len();
-
-        // Estimate tokens saved - summarization is much more efficient than truncation
-        let tokens_saved = if summary_created {
-            // Estimate: original had TOKENS_PER_MESSAGE tokens per message, summary is SUMMARY_TOKENS
-            (num_to_discard * TOKENS_PER_MESSAGE).saturating_sub(SUMMARY_TOKENS)
-        } else {
-            // Fallback to truncation calculation
-            tokens_before.saturating_sub(self.config.keep_recent * TOKENS_PER_MESSAGE)
-        };
-
-        Ok(CompactionResult {
-            original_count,
-            compacted_count,
-            tokens_saved,
-            num_discarded: num_to_discard,
-        })
-    }
-    
-    /// Compact context using a StateManager reference.
-    ///
-    /// Gets history from StateManager, compacts it, and persists the compacted
-    /// history back via replace_chat_messages().
-    pub(crate) async fn compact_from_state_manager_on(
-        &self,
-        state_manager: &StateManager,
-        system_prompt: &str,
-    ) -> Result<CompactionResult> {
-        let mut history = state_manager.get_agent_history();
-        let result = self.compact(&mut history, system_prompt).await?;
-
-        // Persist the compacted history back to StateManager
-        if result.num_discarded > 0 {
-            use crate::ui::app_state::ChatMessage;
-            use rig::completion::message::{AssistantContent, UserContent};
-
-            let chat_messages: Vec<ChatMessage> = history
-                .iter()
-                .filter_map(|msg| match msg {
-                    Message::User { content } => {
-                        let text = content
-                            .iter()
-                            .filter_map(|c| {
-                                if let UserContent::Text(t) = c {
-                                    Some(t.text.as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if text.is_empty() { None } else { Some(ChatMessage::user(text)) }
-                    }
-                    Message::Assistant { content, .. } => {
-                        let text = content
-                            .iter()
-                            .filter_map(|c| {
-                                if let AssistantContent::Text(t) = c {
-                                    Some(t.text.as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if text.is_empty() { None } else { Some(ChatMessage::agent(text)) }
-                    }
-                    #[allow(unreachable_patterns)]
-                    _ => None,
-                })
-                .collect();
-            state_manager.replace_chat_messages(chat_messages);
-        }
-
-        Ok(result)
     }
 
     /// Format context status for display
@@ -409,70 +231,94 @@ impl ContextManager {
     }
 }
 
-/// Extract the call_id from a ToolResult message.
-/// Returns the ID that links a ToolResult to its ToolCall.
-fn extract_call_id_from_tool_result(msg: &Message) -> Option<String> {
-    if let Message::User { content, .. } = msg {
-        for item in content.iter() {
-            if let UserContent::ToolResult(tr) = item {
-                // Use the id field which is the primary identifier
-                return Some(tr.id.clone());
+/// Format ChatMessages for the summarization prompt.
+/// Includes all message types: user, agent, tool calls, and tool results.
+fn format_chat_messages_for_summary(messages: &[&ChatMessage]) -> String {
+    use crate::ui::app_state::MessageRole;
+
+    let mut output = String::new();
+    output.push_str("Previous conversation:\n\n");
+
+    for msg in messages {
+        match msg.role {
+            MessageRole::User => {
+                output.push_str(&format!("User: {}\n\n", msg.content));
             }
+            MessageRole::Agent => {
+                output.push_str(&format!("Assistant: {}\n\n", msg.content));
+            }
+            MessageRole::ToolCall => {
+                let name = msg.tool_name.as_deref().unwrap_or("unknown");
+                let args = msg.tool_args.as_deref().unwrap_or("{}");
+                // Truncate args to avoid blowing up the summary prompt
+                let args_short = truncate_str(args, 200);
+                output.push_str(&format!(
+                    "Assistant [called {}({})]\n\n",
+                    name, args_short
+                ));
+            }
+            MessageRole::ToolResult => {
+                let name = msg.tool_name.as_deref().unwrap_or("unknown");
+                let result = msg.tool_result.as_deref().unwrap_or("");
+                let result_short = truncate_str(result, 500);
+                output.push_str(&format!(
+                    "Tool [{}] returned: {}\n\n",
+                    name, result_short
+                ));
+            }
+            MessageRole::Summary => {
+                output.push_str(&format!("Previous summary: {}\n\n", msg.content));
+            }
+            MessageRole::System => {}
         }
     }
-    None
+
+    output
 }
 
-/// Find a ToolCall message that has the given call_id.
-/// Searches the full message list.
-fn find_tool_call_by_id(messages: &[Message], call_id: &str) -> Option<usize> {
-    for (i, msg) in messages.iter().enumerate() {
-        if let Message::Assistant { content, .. } = msg {
-            for item in content.iter() {
-                if let AssistantContent::ToolCall(tc) = item
-                    && tc.id == call_id
-                {
-                    return Some(i);
-                }
-            }
-        }
+/// Truncate a string to max_len, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        s
+    } else if max_len < 3 {
+        &s[..max_len]
+    } else {
+        // Find a valid char boundary
+        let end = s.floor_char_boundary(max_len.saturating_sub(3));
+        &s[..end]
     }
-    None
 }
 
-/// Find all ToolCall indices that are needed by ToolResults in the keep region.
-/// These are ToolCalls that exist before keep_start but are referenced by
-/// ToolResults that we want to keep.
-fn find_needed_tool_calls(messages: &[Message], keep_start: usize) -> Vec<usize> {
-    let mut needed_indices = Vec::new();
-    let mut seen_call_ids = std::collections::HashSet::new();
+/// Find indices of tool calls in messages[..boundary] that are needed by
+/// tool results in messages[boundary..]. These must NOT be compacted.
+pub(crate) fn find_needed_tool_calls_chat(messages: &[ChatMessage], boundary: usize) -> Vec<usize> {
+    use crate::ui::app_state::MessageRole;
+    use std::collections::HashSet;
 
-    // Scan the keep region for ToolResults and find their corresponding ToolCalls
-    for i in keep_start..messages.len() {
-        if let Some(call_id) = extract_call_id_from_tool_result(&messages[i]) {
-            // Skip if we've already found this call_id
-            if seen_call_ids.contains(&call_id) {
+    let mut needed = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    // Scan kept region for ToolResults, find their matching ToolCalls before boundary
+    for msg in &messages[boundary..] {
+        if msg.role == MessageRole::ToolResult
+            && let Some(ref call_id) = msg.call_id
+        {
+            if seen_ids.contains(call_id) {
                 continue;
             }
-            seen_call_ids.insert(call_id.clone());
+            seen_ids.insert(call_id.clone());
 
-            // Find the ToolCall for this result (search full list)
-            if let Some(tc_index) = find_tool_call_by_id(messages, &call_id) {
-                // Only add if the ToolCall is before keep_start (not already kept)
-                if tc_index < keep_start {
-                    needed_indices.push(tc_index);
+            // Find the ToolCall with this call_id before boundary
+            for (i, m) in messages[..boundary].iter().enumerate() {
+                if m.role == MessageRole::ToolCall && m.call_id.as_ref() == Some(call_id) {
+                    needed.push(i);
+                    break;
                 }
-                // If tc_index >= keep_start, it's already in the kept region - skip
-            } else {
-                tracing::warn!(
-                    "ToolResult references call_id '{}' but no matching ToolCall found",
-                    call_id
-                );
             }
         }
     }
 
-    needed_indices
+    needed
 }
 
 /// Get the default context config
@@ -483,6 +329,7 @@ impl Default for ContextConfig {
             keep_recent: 5,
             enabled: true,
             context_window: None,
+            compaction_model: None,
         }
     }
 }
@@ -490,10 +337,7 @@ impl Default for ContextConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig::completion::message::{
-        AssistantContent, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
-    };
-    use rig::one_or_many::OneOrMany;
+    use crate::ui::app_state::MessageRole;
 
     #[test]
     fn test_default_config() {
@@ -502,28 +346,11 @@ mod tests {
         assert_eq!(config.keep_recent, 5);
         assert!(config.enabled);
         assert!(config.context_window.is_none());
+        assert!(config.compaction_model.is_none());
     }
 
-    /// BUG TEST: The message count fallback threshold is nonsensical.
-    ///
-    /// When get_current_tokens() returns 0 (before the first API call),
-    /// needs_compaction() falls back to a message count check:
-    ///   threshold_messages = (threshold_tokens / 100).max(10)
-    ///
-    /// For a 200k context at 0.8 threshold: (160000 / 100) = 1600 messages.
-    /// No conversation will ever have 1600 messages. This fallback is dead code.
-    ///
-    /// This test asserts the threshold should be SANE (reachable in a real
-    /// conversation). It is ignored because it FAILS against the current buggy
-    /// code. Remove #[ignore] after fixing context_manager.rs:119.
-    ///
-    /// Run with: cargo test -- --ignored test_message_count_fallback_threshold
-    /// Verify the message count fallback threshold is sane.
-    /// Uses keep_recent * 3 (clamped to min 10) instead of the old
-    /// broken formula (threshold_tokens / 100 = 1600 messages).
     #[test]
     fn test_message_count_fallback_threshold_is_sane() {
-        // With default keep_recent=5: threshold = (5 * 3).max(10) = 15 messages
         let keep_recent: usize = 5;
         let threshold_messages = (keep_recent * 3).max(10);
         assert_eq!(threshold_messages, 15);
@@ -533,257 +360,145 @@ mod tests {
             threshold_messages
         );
 
-        // With keep_recent=1: threshold = (1 * 3).max(10) = 10 messages
         let small_keep = 1_usize;
         let small_threshold = (small_keep * 3).max(10);
         assert_eq!(small_threshold, 10);
 
-        // With keep_recent=50: threshold = (50 * 3).max(10) = 150 messages
         let large_keep = 50_usize;
         let large_threshold = (large_keep * 3).max(10);
         assert_eq!(large_threshold, 150);
     }
 
-    // Helper to create a ToolCall message
-    fn make_tool_call(id: &str, tool_name: &str) -> Message {
-        Message::Assistant {
-            id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
-                id.to_string(),
-                ToolFunction::new(tool_name.to_string(), serde_json::json!({})),
-            ))),
-        }
-    }
-
-    // Helper to create a ToolResult message
-    fn make_tool_result(id: &str, result: &str) -> Message {
-        Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: id.to_string(),
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::Text(rig::completion::message::Text {
-                    text: result.to_string(),
-                })),
-            })),
-        }
-    }
-
-    // Helper to create a simple text message
-    fn make_text_message(role: &str, text: &str) -> Message {
-        match role {
-            "user" => Message::User {
-                content: OneOrMany::one(UserContent::Text(rig::completion::message::Text {
-                    text: text.to_string(),
-                })),
-            },
-            _ => Message::Assistant {
-                id: None,
-                content: OneOrMany::one(AssistantContent::Text(rig::completion::message::Text {
-                    text: text.to_string(),
-                })),
-            },
-        }
-    }
-
     #[test]
-    fn test_extract_call_id_from_tool_result() {
-        let result_msg = make_tool_result("call_abc123", "output");
-        assert_eq!(
-            extract_call_id_from_tool_result(&result_msg),
-            Some("call_abc123".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_call_id_from_non_result_message() {
-        let text_msg = make_text_message("user", "hello");
-        assert_eq!(extract_call_id_from_tool_result(&text_msg), None);
-
-        let tool_call_msg = make_tool_call("call_xyz", "bash");
-        assert_eq!(extract_call_id_from_tool_result(&tool_call_msg), None);
-    }
-
-    #[test]
-    fn test_find_tool_call_by_id() {
+    fn test_format_chat_messages_includes_tool_calls() {
         let messages = vec![
-            make_text_message("user", "hello"),
-            make_tool_call("call_123", "bash"),
-            make_text_message("assistant", "running"),
-            make_tool_result("call_123", "ls output"),
+            ChatMessage::user("List my files".to_string()),
+            ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("call_1".to_string())),
+            ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "file1.txt\nfile2.txt", Some("call_1".to_string())),
+            ChatMessage::agent("Here are your files: file1.txt and file2.txt".to_string()),
         ];
 
-        // Find the tool call for call_123 (should be at index 1)
-        assert_eq!(find_tool_call_by_id(&messages, "call_123"), Some(1));
+        let refs: Vec<&ChatMessage> = messages.iter().collect();
+        let formatted = format_chat_messages_for_summary(&refs);
 
-        // Find non-existent call
-        assert_eq!(find_tool_call_by_id(&messages, "call_nonexistent"), None);
+        assert!(formatted.contains("User: List my files"));
+        assert!(formatted.contains("Assistant [called bash("));
+        assert!(formatted.contains("Tool [bash] returned:"));
+        assert!(formatted.contains("file1.txt"));
+        assert!(formatted.contains("Assistant: Here are your files"));
     }
 
     #[test]
-    fn test_find_needed_tool_calls_basic() {
-        // Simulate: [user, tool_call, tool_result, assistant] with keep_start=2
-        // So we keep tool_result and assistant, but need to find tool_call
+    fn test_format_chat_messages_includes_summary() {
         let messages = vec![
-            make_text_message("user", "list files"),
-            make_tool_call("call_abc", "bash"),
-            make_tool_result("call_abc", "file1.txt\nfile2.txt"),
-            make_text_message("assistant", "Here are your files"),
+            ChatMessage::summary("Previous work: set up the project".to_string()),
+            ChatMessage::user("Continue from where we left off".to_string()),
         ];
 
-        let keep_start = 2; // Keep messages at index 2 and 3
+        let refs: Vec<&ChatMessage> = messages.iter().collect();
+        let formatted = format_chat_messages_for_summary(&refs);
 
-        let needed = find_needed_tool_calls(&messages, keep_start);
+        assert!(formatted.contains("Previous summary: Previous work: set up the project"));
+        assert!(formatted.contains("User: Continue from where we left off"));
+    }
 
-        // Should find the tool call at index 1
+    #[test]
+    fn test_find_needed_tool_calls_chat_basic() {
+        let messages = vec![
+            ChatMessage::user("list files".to_string()),
+            ChatMessage::tool_call("bash", r#"{"cmd":"ls"}"#, Some("call_1".to_string())),
+            ChatMessage::tool_result("bash", r#"{"cmd":"ls"}"#, "file1.txt", Some("call_1".to_string())),
+            ChatMessage::agent("Here are your files".to_string()),
+        ];
+
+        // boundary=2: keep messages at index 2,3; compact 0,1
+        let needed = find_needed_tool_calls_chat(&messages, 2);
+        // tool_result at index 2 references call_1, which is at index 1 (before boundary)
         assert_eq!(needed, vec![1]);
     }
 
     #[test]
-    fn test_find_needed_tool_calls_none_needed() {
-        // No tool results in the keep region
+    fn test_find_needed_tool_calls_chat_none_needed() {
         let messages = vec![
-            make_text_message("user", "hello"),
-            make_text_message("assistant", "hi"),
-            make_text_message("user", "how are you?"),
-            make_text_message("assistant", "fine thanks"),
+            ChatMessage::user("hello".to_string()),
+            ChatMessage::agent("hi".to_string()),
+            ChatMessage::user("how are you?".to_string()),
+            ChatMessage::agent("fine".to_string()),
         ];
 
-        let keep_start = 2;
-
-        let needed = find_needed_tool_calls(&messages, keep_start);
-
+        let needed = find_needed_tool_calls_chat(&messages, 2);
         assert!(needed.is_empty());
     }
 
     #[test]
-    fn test_find_needed_tool_calls_already_kept() {
-        // Tool call and result both in keep region
+    fn test_find_needed_tool_calls_chat_already_kept() {
         let messages = vec![
-            make_text_message("user", "old"),
-            make_tool_call("call_abc", "bash"),
-            make_tool_result("call_abc", "output"),
+            ChatMessage::user("old".to_string()),
+            ChatMessage::tool_call("bash", "{}", Some("call_1".to_string())),
+            ChatMessage::tool_result("bash", "{}", "output", Some("call_1".to_string())),
         ];
 
-        let keep_start = 1; // Keep messages at index 1 and 2
-
-        let needed = find_needed_tool_calls(&messages, keep_start);
-
-        // Tool call is at index 1, which IS in the kept region (>= keep_start)
-        // So no additional tool calls are needed
+        // boundary=1: both tool_call and tool_result are in the kept region
+        let needed = find_needed_tool_calls_chat(&messages, 1);
         assert!(needed.is_empty());
     }
 
     #[test]
-    fn test_find_needed_tool_calls_multiple_results() {
-        // Test case where we have tool calls/results in different positions
-        // [user(0), tool_call_1(1), tool_result_1(2), tool_call_2(3), tool_result_2(4), assistant(5)]
-        // keep_start = 3 (keep from index 3 onwards)
-        // Keep region: tool_call_2(3), tool_result_2(4), assistant(5)
-        // tool_result_2 references call_2 which is at index 3 (already kept)
-        // But wait - we need call_1 for the summarize, which is at index 1
-        // Actually, tool_result_1 is at index 2, which is NOT in keep region, so we don't scan it
+    fn test_find_needed_tool_calls_chat_cross_boundary() {
         let messages = vec![
-            make_text_message("user", "task 1"),
-            make_tool_call("call_1", "bash"),       // index 1
-            make_tool_result("call_1", "result 1"), // index 2
-            make_tool_call("call_2", "read"),       // index 3
-            make_tool_result("call_2", "result 2"), // index 4 - in keep region, references call_2
-            make_text_message("assistant", "done"), // index 5
+            ChatMessage::user("old question".to_string()),
+            ChatMessage::tool_call("bash", "{}", Some("call_1".to_string())),
+            ChatMessage::user("new question".to_string()),
+            ChatMessage::tool_result("bash", "{}", "output", Some("call_1".to_string())),
+            ChatMessage::agent("answer".to_string()),
         ];
 
-        let keep_start = 3; // Keep from index 3 onwards
-
-        let needed = find_needed_tool_calls(&messages, keep_start);
-
-        // tool_result_2 (index 4) references call_2 which is at index 3 (in keep region)
-        // So no additional tool calls needed
-        assert!(needed.is_empty());
-    }
-
-    #[test]
-    fn test_find_needed_tool_calls_two_needed() {
-        // [user(0), tool_call_1(1), tool_result_1(2), tool_call_2(3), tool_result_2(4), assistant(5)]
-        // keep_start = 4 (keep from index 4 onwards)
-        // Keep region: tool_result_2(4), assistant(5)
-        // tool_result_2 (index 4) references call_2 which is at index 3
-        // 3 < 4, so index 3 is NOT in the keep region and MUST be included
-        let messages = vec![
-            make_text_message("user", "task 1"),
-            make_tool_call("call_1", "bash"),       // index 1
-            make_tool_result("call_1", "result 1"), // index 2
-            make_tool_call("call_2", "read"),       // index 3 - BEFORE keep_start
-            make_tool_result("call_2", "result 2"), // index 4 - IN keep region
-            make_text_message("assistant", "done"), // index 5
-        ];
-
-        let keep_start = 4; // Keep from index 4 onwards
-
-        let needed = find_needed_tool_calls(&messages, keep_start);
-
-        // tool_result_2 (index 4) references call_2 which is at index 3
-        // index 3 < keep_start (4), so it must be included
-        assert_eq!(needed, vec![3]);
-    }
-
-    #[test]
-    fn test_find_needed_tool_calls_cross_boundary() {
-        // This is the key scenario: tool call BEFORE keep_start, tool result IN keep_start
-        // [user(0), tool_call(1), user(2), tool_result(3), assistant(4)]
-        // keep_start = 2 (keep from index 2 onwards)
-        // Keep region: user(2), tool_result(3), assistant(4)
-        // tool_result(3) references call_1 which is at index 1 (BEFORE keep_start!)
-        // This is the bug we were fixing - we MUST include index 1
-        let messages = vec![
-            make_text_message("user", "old question"), // index 0
-            make_tool_call("call_1", "bash"),          // index 1 - BEFORE keep_start
-            make_text_message("user", "new question"), // index 2 - IN keep region
-            make_tool_result("call_1", "output"), // index 3 - IN keep region, references call_1
-            make_text_message("assistant", "answer"), // index 4 - IN keep region
-        ];
-
-        let keep_start = 2; // Keep from index 2 onwards
-
-        let needed = find_needed_tool_calls(&messages, keep_start);
-
-        // tool_result (index 3) references call_1 which is at index 1 (before keep_start)
-        // We MUST include this tool call
+        let needed = find_needed_tool_calls_chat(&messages, 2);
         assert_eq!(needed, vec![1]);
     }
 
     #[test]
-    fn test_find_needed_tool_calls_duplicate_call_ids() {
-        // Same call_id referenced multiple times (edge case)
+    fn test_find_needed_tool_calls_chat_duplicate_ids() {
         let messages = vec![
-            make_text_message("user", "old"),
-            make_tool_call("call_same", "bash"),
-            make_tool_result("call_same", "first result"),
-            make_tool_result("call_same", "second result"),
-            make_text_message("assistant", "done"),
+            ChatMessage::user("old".to_string()),
+            ChatMessage::tool_call("bash", "{}", Some("call_same".to_string())),
+            ChatMessage::tool_result("bash", "{}", "first", Some("call_same".to_string())),
+            ChatMessage::tool_result("bash", "{}", "second", Some("call_same".to_string())),
+            ChatMessage::agent("done".to_string()),
         ];
 
-        let keep_start = 2; // Keep from index 2 onwards
-
-        let needed = find_needed_tool_calls(&messages, keep_start);
-
-        // Should only find the tool call once
+        let needed = find_needed_tool_calls_chat(&messages, 2);
         assert_eq!(needed, vec![1]);
     }
 
     #[test]
-    fn test_find_needed_tool_calls_missing_tool_call() {
-        // ToolResult references a call_id that doesn't exist
-        let messages = vec![
-            make_text_message("user", "old message"),
-            make_tool_result("call_orphan", "result without call"),
-            make_text_message("assistant", "response"),
-        ];
+    fn test_truncate_str() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 5), "he");
+        assert_eq!(truncate_str("hi", 1), "h");
+        assert_eq!(truncate_str("", 5), "");
+    }
 
-        let keep_start = 1;
+    #[test]
+    fn test_compacted_messages_skipped_in_format() {
+        let mut msg = ChatMessage::user("old message".to_string());
+        msg.compacted = true;
+        let new_msg = ChatMessage::user("new message".to_string());
 
-        let needed = find_needed_tool_calls(&messages, keep_start);
+        let messages = vec![&msg, &new_msg];
 
-        // Should return empty since no tool call was found
-        // (warning is logged but we handle it gracefully)
-        assert!(needed.is_empty());
+        // format_chat_messages_for_summary doesn't filter compacted — that's the caller's job.
+        // But verify it formats both if passed both.
+        let formatted = format_chat_messages_for_summary(&messages);
+        assert!(formatted.contains("old message"));
+        assert!(formatted.contains("new message"));
+    }
+
+    #[test]
+    fn test_summary_message_constructor() {
+        let msg = ChatMessage::summary("Test summary content".to_string());
+        assert_eq!(msg.role, MessageRole::Summary);
+        assert_eq!(msg.content, "Test summary content");
+        assert!(!msg.compacted);
     }
 }

@@ -20,6 +20,7 @@ async fn test_compactor_uses_last_request_tokens() {
         keep_recent: 2,
         enabled: true,
         context_window: Some(500), // 500 token context = 400 token threshold
+        compaction_model: None,
     };
 
     let mut harness = TestHarness::with_system_prompt_and_context(
@@ -57,6 +58,7 @@ async fn test_compactor_threshold_calculation() {
         keep_recent: 2,
         enabled: true,
         context_window: Some(1000),
+        compaction_model: None,
     };
 
     let harness = TestHarness::with_system_prompt_and_context(
@@ -83,6 +85,7 @@ async fn test_compactor_triggers_above_threshold() {
         keep_recent: 1,
         enabled: true,
         context_window: Some(500), // 500 * 0.8 = 400 token threshold
+        compaction_model: None,
     };
 
     let mut harness = TestHarness::with_system_prompt_and_context(
@@ -99,7 +102,7 @@ async fn test_compactor_triggers_above_threshold() {
     // Agent responses + summarization responses for compact()
     harness.add_response(MockResponse::text_with_usage("Response 1", usage.clone()));
     harness.add_response(MockResponse::text_with_usage("Response 2", usage.clone()));
-    harness.add_response(MockResponse::text("Summary of previous conversation.")); // summarization
+    harness.add_compaction_response(MockResponse::text("Summary of previous conversation.")); // summarization
     harness.add_response(MockResponse::text_with_usage("Response 3", usage.clone()));
 
     harness.run_message("Message 1").await;
