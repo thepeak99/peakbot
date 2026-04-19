@@ -3,6 +3,7 @@
 //! Each scenario file tests a specific domain through the full agent loop.
 //! Unit tests for individual components live in their respective source files.
 
+mod bash_tests;
 mod compaction_tests;
 mod context_tests;
 mod e2e_tests;
