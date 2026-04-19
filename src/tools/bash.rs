@@ -235,10 +235,15 @@ impl Tool for BashTool {
 
         let start_time = std::time::Instant::now();
 
-        // Build the command with optional environment variables
+        // Build the command with optional environment variables.
+        // stdin is explicitly detached: agent tools are non-interactive, and
+        // inheriting the parent's TTY lets the child (e.g. `sudo`, `ssh`,
+        // `$EDITOR`) fight ratatui for input and corrupt termios state.
+        // See `better-tty.md` for the full rationale.
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
             .arg(&args.command)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
