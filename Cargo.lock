@@ -1697,6 +1697,7 @@ dependencies = [
  "directories-next",
  "dirs",
  "futures",
+ "http",
  "insta",
  "peakbot",
  "ratatui",
