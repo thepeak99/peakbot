@@ -77,7 +77,8 @@ mod tests {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -101,7 +102,8 @@ mod tests {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -125,7 +127,8 @@ mod tests {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -149,7 +152,8 @@ mod tests {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -173,7 +177,8 @@ mod tests {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -292,7 +297,8 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             // Scroll position 0 = showing top of content
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -320,7 +326,8 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             // Scroll position 5 = showing middle of content
-            ReplUi::render_chat_history(f, chunks[0], 5, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 5, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -348,7 +355,8 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             // Max scroll = 15 messages - 8 visible = 7 (show last messages)
-            ReplUi::render_chat_history(f, chunks[0], 8, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 8, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -398,7 +406,8 @@ mod tests {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -433,7 +442,8 @@ mod tests {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph);
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());

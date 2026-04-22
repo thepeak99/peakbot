@@ -517,7 +517,7 @@ fn format_generic_result(result: &str) -> String {
 }
 
 /// Role of a message sender
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     /// User message
