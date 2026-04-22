@@ -34,7 +34,9 @@ use tokio::time;
 
 use crate::state::StateManager;
 use crate::ui::ChatMessage;
-use crate::ui::app_state::{AppState, ChatState, MessageRole};
+use crate::ui::app_state::{AppState, ChatState};
+use crate::ui::repl::message_renderer::{MessageRenderer, PlainRenderer};
+use crate::ui::repl::render_cache::ChatRenderCache;
 use crate::ui::repl::todo_panel::{DEFAULT_PANEL_PERCENT, render_todo_panel, should_show_panel};
 use crate::ui::ui_trait::{Ui, UiAction};
 
@@ -61,6 +63,11 @@ pub struct UiState {
     pub auto_scroll: bool,
     /// Scroll position in todo panel
     pub todo_scroll_position: u16,
+    /// Set to true whenever local (view-only) state that affects rendering
+    /// changes — e.g. input buffer, scroll, quit dialog. The render loop
+    /// combines this with `StateManager::revision()` to decide whether a
+    /// redraw is necessary. Reset to `false` after each successful render.
+    pub local_dirty: bool,
 }
 
 impl UiState {
@@ -73,6 +80,9 @@ impl UiState {
             viewport_height: 0,
             auto_scroll: true,
             todo_scroll_position: 0,
+            // Start dirty so the first frame always renders, even before any
+            // mutation has happened on the StateManager.
+            local_dirty: true,
         }
     }
 
@@ -103,10 +113,31 @@ pub struct ReplUi {
     show_quit_confirm: bool,
     /// Which button is selected: true = "Yes", false = "No" (default)
     confirm_yes_selected: bool,
+    /// Last state revision we successfully rendered. Used with `local_dirty`
+    /// to skip idle-tick redraws. See `slow-messages.md` §4.4.
+    last_rendered_revision: u64,
+    /// Last terminal size we laid out for. A mismatch (resize) forces a
+    /// render even when nothing else changed.
+    last_size: (u16, u16),
+    /// Per-message rendered-line cache. Holds pre-built `Line`s keyed by a
+    /// cheap fingerprint, plus per-message wrapped heights and a prefix-sum
+    /// for O(log N) viewport lookup. See `slow-messages.md` §4.1.
+    chat_cache: ChatRenderCache,
 }
 
 impl ReplUi {
     pub fn new(state_manager: Arc<StateManager>, action_sender: UnboundedSender<UiAction>) -> Self {
+        Self::with_renderer(state_manager, action_sender, Box::new(PlainRenderer))
+    }
+
+    /// Construct a `ReplUi` with a custom [`MessageRenderer`] — the seam
+    /// through which a future markdown renderer slots in without touching
+    /// anything else in this file. See `slow-messages.md` §4.2.
+    pub fn with_renderer(
+        state_manager: Arc<StateManager>,
+        action_sender: UnboundedSender<UiAction>,
+        renderer: Box<dyn MessageRenderer>,
+    ) -> Self {
         Self {
             state_manager,
             action_sender,
@@ -115,10 +146,19 @@ impl ReplUi {
             ui_state: UiState::new(),
             show_quit_confirm: false,
             confirm_yes_selected: false,
+            last_rendered_revision: 0,
+            last_size: (0, 0),
+            chat_cache: ChatRenderCache::new(renderer),
         }
     }
 
-    /// Build the chat history paragraph (returns Paragraph, caller handles rendering)
+    /// Build the full chat-history paragraph from scratch.
+    ///
+    /// Kept for backwards compatibility (the snapshot-test suite in
+    /// `tests/repl_tests.rs` uses this). The live render path no longer
+    /// calls this — it goes through [`ChatRenderCache`] instead, which is
+    /// what makes rendering independent of history size. See
+    /// `slow-messages.md`.
     pub fn build_chat_history_paragraph<'a>(chat: &'a ChatState) -> Paragraph<'a> {
         let mut message_lines: Vec<Line> = Vec::new();
 
@@ -143,53 +183,29 @@ impl ReplUi {
             )
     }
 
-    pub fn build_chat_message_lines<'a>(msg: &'a ChatMessage) -> Vec<Line<'a>> {
-        let (prefix, color) = match msg.role {
-            MessageRole::User => ("👤 User", Color::LightGreen),
-            MessageRole::Agent => ("🤖 Agent", Color::LightMagenta),
-            MessageRole::System => ("⚙️ System", Color::LightYellow),
-            MessageRole::ToolCall => ("🔧 Tool", Color::Cyan),
-            MessageRole::ToolResult => ("📋 Result", Color::Blue),
-            MessageRole::Summary => ("📝 Summary", Color::DarkGray),
-        };
-
-        // Split content by newlines to handle multiline messages
-        let content_lines: Vec<&str> = msg.content.split('\n').collect();
-
-        let mut out = Vec::new();
-
-        for (i, content_line) in content_lines.iter().enumerate() {
-            // First line gets the full header (timestamp + role), subsequent lines get indentation
-            let line_content = if i == 0 {
-                vec![
-                    Span::raw("["),
-                    Span::styled(
-                        format!("{}", msg.timestamp.format("%H:%M:%S")),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::raw("] "),
-                    Span::styled(prefix, Style::default().fg(color)),
-                    Span::raw(": "),
-                    Span::raw(*content_line),
-                ]
-            } else {
-                vec![Span::raw(*content_line)]
-            };
-
-            out.push(Line::from(line_content));
-        }
-        out
+    /// Render a single chat message into owned `Line`s.
+    ///
+    /// Thin wrapper over [`PlainRenderer`] preserved for the existing
+    /// snapshot tests. Prefer calling the renderer (or the cache) in new
+    /// code.
+    pub fn build_chat_message_lines(msg: &ChatMessage) -> Vec<Line<'static>> {
+        PlainRenderer.render(msg)
     }
 
-    /// Render the chat history area with scrollbar
+    /// Render the chat history area with scrollbar.
+    ///
+    /// `content_height` is the total wrapped line count, passed in from the
+    /// caller so we don't recompute word-wrap here. The same value was
+    /// already computed by `render()` to drive scrolling/layout — previously
+    /// we re-ran `paragraph.line_count(width)` in this function, duplicating
+    /// O(N·M·W) work on every frame. See `slow-messages.md`.
     pub fn render_chat_history(
         f: &mut ratatui::Frame,
         area: Rect,
         scroll: u16,
         paragraph: Paragraph,
+        content_height: u16,
     ) {
-        let content_height = paragraph.line_count(area.width.saturating_sub(2));
-
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -197,8 +213,8 @@ impl ReplUi {
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
-        let mut scroll_state =
-            ScrollbarState::new(content_height).position((scroll + area.height - 2) as usize);
+        let mut scroll_state = ScrollbarState::new(content_height as usize)
+            .position((scroll + area.height - 2) as usize);
         f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state);
 
         let scrolled = paragraph.scroll((scroll, 0));
@@ -383,10 +399,19 @@ impl ReplUi {
                         ])
                         .split(main);
 
-                    let chat_history = Self::build_chat_history_paragraph(&state.chat);
+                    // Width inside the chat block borders is (main.width - 2).
+                    let chat_wrap_width = main.width.saturating_sub(2);
+
+                    // Sync per-message cache against current messages at
+                    // current width. Only mutated rows are re-rendered;
+                    // only mutated/resized rows are re-wrapped. See
+                    // `slow-messages.md` §4.1.
+                    self.chat_cache
+                        .sync(&state.chat.messages, chat_wrap_width);
+
                     self.ui_state.viewport_height = chunks[0].height;
                     self.ui_state.content_height =
-                        chat_history.line_count(main.width.saturating_sub(2)) as u16;
+                        self.chat_cache.total_height().min(u16::MAX as u32) as u16;
 
                     // Calculate scroll based on auto_scroll setting
                     let max_scroll = self.ui_state.max_scroll();
@@ -398,7 +423,44 @@ impl ReplUi {
                         self.ui_state.scroll_position.min(max_scroll)
                     };
 
-                    Self::render_chat_history(f, chunks[0], scroll, chat_history);
+                    // Build the viewport-sized paragraph from the cache.
+                    // Work here is O(viewport), independent of history size.
+                    // `window()` returns both the Lines covering the viewport
+                    // AND the partial-line offset into the first visible
+                    // message; we feed the offset straight into `Paragraph::scroll`.
+                    let view = self.chat_cache.window(scroll as u32, chunks[0].height);
+                    let chat_history = if view.lines.is_empty() && state.chat.messages.is_empty()
+                    {
+                        // Empty transcript — show the welcome banner.
+                        Paragraph::new(Line::from(Span::styled(
+                            "Welcome to PeakBot! Start a conversation or use /help for commands.",
+                            Style::default().fg(Color::DarkGray),
+                        )))
+                        .style(Style::default().fg(Color::White))
+                        .wrap(Wrap { trim: true })
+                        .block(
+                            Block::default()
+                                .title(" Chat Messages ")
+                                .borders(Borders::ALL),
+                        )
+                    } else {
+                        Paragraph::new(Text::from(view.lines))
+                            .style(Style::default().fg(Color::White))
+                            .wrap(Wrap { trim: true })
+                            .block(
+                                Block::default()
+                                    .title(" Chat Messages ")
+                                    .borders(Borders::ALL),
+                            )
+                    };
+
+                    Self::render_chat_history(
+                        f,
+                        chunks[0],
+                        view.inner_scroll,
+                        chat_history,
+                        self.ui_state.content_height,
+                    );
                     Self::render_input_area(f, chunks[1], input);
                     Self::render_status_bar(f, chunks[2], state);
                 }
@@ -582,12 +644,38 @@ impl Ui for ReplUi {
                 // Handle keyboard events via tokio::select!
                 e = events.next() => {
                     if let Some(Ok(e)) = e {
+                        // Any input event may have changed local view state
+                        // (input buffer, cursor, scroll, dialogs). Mark
+                        // dirty so the next tick renders.
+                        self.ui_state.local_dirty = true;
                         self.handle_input(e);
                     }
                 }
                 _ = ticks.tick() => {
+                    // Skip-idle-tick: redraw only when something meaningful
+                    // has changed. `revision()` covers all StateManager
+                    // mutations; `local_dirty` covers view-only changes;
+                    // `last_size` catches terminal resize.
+                    let revision = self.state_manager.revision();
+                    let size = self.terminal
+                        .as_ref()
+                        .and_then(|t| t.size().ok())
+                        .map(|s| (s.width, s.height))
+                        .unwrap_or((0, 0));
+
+                    let needs_render = revision != self.last_rendered_revision
+                        || self.ui_state.local_dirty
+                        || size != self.last_size;
+
+                    if !needs_render {
+                        continue;
+                    }
+
                     let state = self.state_manager.get_state();
                     self.render(&state)?;
+                    self.last_rendered_revision = revision;
+                    self.last_size = size;
+                    self.ui_state.local_dirty = false;
                 }
             }
         }

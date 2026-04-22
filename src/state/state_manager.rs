@@ -23,6 +23,7 @@ use crate::ui::app_state::{
     TodoItem, TodoState, WelcomeState,
 };
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -52,6 +53,14 @@ pub struct StateManager {
     storage: Option<Arc<dyn ConversationStorage>>,
     /// Current conversation being edited
     current_conversation: Arc<Mutex<Option<Conversation>>>,
+
+    // ── Rendering Coalescence ─────────────────────────────────────────────────
+    /// Monotonic counter bumped on every state mutation.
+    ///
+    /// Views (e.g. `ReplUi`) cache the revision they last rendered and skip
+    /// their render pass when nothing has changed, turning an idle REPL from
+    /// `20 draws/sec × O(N)` into a no-op. See `slow-messages.md` §4.4.
+    revision: AtomicU64,
 }
 
 impl StateManager {
@@ -87,6 +96,7 @@ impl StateManager {
             self_ref: RwLock::new(None),
             storage,
             current_conversation: Arc::new(Mutex::new(None)),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -480,7 +490,10 @@ impl StateManager {
     pub fn set_welcome(&self, welcome: WelcomeState) {
         let mut state = self.state.write().unwrap();
         state.welcome = Some(welcome);
-        // Don't broadcast — welcome is set once before the View subscribes
+        // Don't broadcast — welcome is set once before the View subscribes.
+        // But still bump the revision so the first render after startup
+        // sees a non-zero value and doesn't skip itself.
+        self.revision.fetch_add(1, Ordering::Release);
     }
 
     /// Mark the next broadcast as final (called before final agent response)
@@ -628,6 +641,12 @@ impl StateManager {
     /// Broadcast current state to all subscribers.
     /// Removes dead subscribers (receivers that have been dropped).
     fn notify_update(&self, state: &AppState) {
+        // Bump the revision before cloning/dispatching so any thread that
+        // reads `revision()` between a mutation and the broadcast sees the
+        // new value. Every mutation path in this file goes through
+        // `notify_update`, so this is the single source of truth.
+        self.revision.fetch_add(1, Ordering::Release);
+
         let state = state.clone();
         let mut dead = Vec::new();
         let mut subs = self.subscribers.write().unwrap();
@@ -641,6 +660,13 @@ impl StateManager {
         for i in dead.into_iter().rev() {
             subs.remove(i);
         }
+    }
+
+    /// Current state revision — monotonically increasing counter bumped on
+    /// every mutation. Views compare this against their last-rendered value
+    /// to decide whether a redraw is necessary.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 
     /// Get a clone of the internal state Arc
@@ -1125,6 +1151,34 @@ mod tests {
         // With async mpsc, initial state is sent via try_send
         let state = sm.get_state();
         assert!(state.chat.messages.is_empty());
+    }
+
+    #[test]
+    fn test_revision_starts_at_zero_and_bumps_on_mutation() {
+        let sm = StateManager::new();
+        assert_eq!(sm.revision(), 0, "fresh manager should have revision 0");
+
+        sm.add_user_message("hello".to_string());
+        let r1 = sm.revision();
+        assert!(r1 > 0, "mutation must bump revision, got {r1}");
+
+        sm.add_assistant_message("world".to_string());
+        let r2 = sm.revision();
+        assert!(r2 > r1, "second mutation must bump again ({r1} -> {r2})");
+    }
+
+    #[test]
+    fn test_revision_stable_on_pure_reads() {
+        let sm = StateManager::new();
+        sm.add_user_message("hi".to_string());
+        let before = sm.revision();
+
+        // Pure reads must not bump — otherwise idle-tick skipping is broken.
+        let _ = sm.get_state();
+        let _ = sm.get_state();
+        let _ = sm.revision();
+
+        assert_eq!(sm.revision(), before, "reads must not bump revision");
     }
 
     #[test]
