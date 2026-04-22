@@ -40,6 +40,7 @@ pub use providers::{
 use rig::completion::{Message, PromptError};
 use rig::tool::ToolDyn;
 use rig::tool::rmcp::McpTool;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpClientTransport};
 pub use skills::{SkillRegistry, load_default_skills};
 pub use state::StateManager;
@@ -873,7 +874,20 @@ pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpServerHan
 
     match config.transport_type() {
         McpTransportType::Stdio => connect_mcp_stdio(config).await,
-        McpTransportType::Sse | McpTransportType::StreamableHttp => connect_mcp_http(config).await,
+        McpTransportType::Sse => {
+            // rmcp 0.16 dropped the dedicated SSE client transport. The MCP
+            // spec (2025-03-26) replaced SSE with Streamable HTTP, which is
+            // wire-compatible with most existing "sse" servers. We route
+            // there and warn loudly so users aren't surprised.
+            tracing::warn!(
+                "MCP server '{}': transport_type 'sse' is deprecated; \
+                 routing through streamable-http. Set 'type: streamable-http' \
+                 in your config to silence this warning.",
+                config.name
+            );
+            connect_mcp_http(config).await
+        }
+        McpTransportType::StreamableHttp => connect_mcp_http(config).await,
     }
 }
 
@@ -940,8 +954,43 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
 
     tracing::info!("Connecting to MCP server '{}' at {}", config.name, url);
 
-    // Create the HTTP transport using reqwest
-    let transport = StreamableHttpClientTransport::from_uri(url.clone());
+    // Build the streamable-http config with optional bearer token + custom headers.
+    let mut transport_config =
+        StreamableHttpClientTransportConfig::with_uri(url.clone());
+
+    if let Some(token) = config.auth_token.as_ref()
+        && !token.is_empty()
+    {
+        transport_config = transport_config.auth_header(token.clone());
+    }
+
+    if let Some(headers) = config.headers.as_ref() {
+        let mut parsed: std::collections::HashMap<http::HeaderName, http::HeaderValue> =
+            std::collections::HashMap::with_capacity(headers.len());
+        for (k, v) in headers {
+            match (
+                http::HeaderName::try_from(k.as_str()),
+                http::HeaderValue::try_from(v.as_str()),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    parsed.insert(name, value);
+                }
+                _ => {
+                    tracing::warn!(
+                        "MCP server '{}': skipping invalid header '{}: {}'",
+                        config.name,
+                        k,
+                        v
+                    );
+                }
+            }
+        }
+        if !parsed.is_empty() {
+            transport_config = transport_config.custom_headers(parsed);
+        }
+    }
+
+    let transport = StreamableHttpClientTransport::from_config(transport_config);
 
     let service = ()
         .serve(transport)
@@ -1026,6 +1075,8 @@ mod tests {
             args: None,
             env: Some(env),
             url: None,
+            auth_token: None,
+            headers: None,
             enabled: true,
         };
 
@@ -1046,6 +1097,8 @@ mod tests {
             ]),
             env: None,
             url: None,
+            auth_token: None,
+            headers: None,
             enabled: true,
         };
 
@@ -1073,6 +1126,8 @@ mod tests {
             ]),
             env: Some(env),
             url: None,
+            auth_token: None,
+            headers: None,
             enabled: true,
         };
 
@@ -1099,6 +1154,8 @@ mod tests {
             ]),
             env: None,
             url: None,
+            auth_token: None,
+            headers: None,
             enabled: true,
         };
 
@@ -1170,6 +1227,43 @@ url: https://example.com/mcp
     }
 
     #[test]
+    fn test_mcp_http_auth_deserialization() {
+        // Defaults: no auth_token, no headers
+        let yaml = r#"
+name: plain-http
+type: streamablehttp
+url: https://example.com/mcp
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.auth_token.is_none());
+        assert!(config.headers.is_none());
+
+        // Bearer token
+        let yaml = r#"
+name: with-token
+type: streamablehttp
+url: https://example.com/mcp
+auth_token: "sk-abc123"
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.auth_token.as_deref(), Some("sk-abc123"));
+
+        // Custom headers
+        let yaml = r#"
+name: with-headers
+type: streamablehttp
+url: https://example.com/mcp
+headers:
+  X-Api-Key: my-key
+  X-Tenant: acme
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let headers = config.headers.expect("headers should deserialize");
+        assert_eq!(headers.get("X-Api-Key").map(String::as_str), Some("my-key"));
+        assert_eq!(headers.get("X-Tenant").map(String::as_str), Some("acme"));
+    }
+
+    #[test]
     fn test_mcp_config_validation() {
         // Valid stdio config
         let config = McpServerConfig {
@@ -1179,6 +1273,8 @@ url: https://example.com/mcp
             args: None,
             env: None,
             url: None,
+            auth_token: None,
+            headers: None,
             enabled: true,
         };
         assert!(config.validate().is_ok());
@@ -1191,6 +1287,8 @@ url: https://example.com/mcp
             args: None,
             env: None,
             url: None,
+            auth_token: None,
+            headers: None,
             enabled: true,
         };
         assert!(config.validate().is_err());
@@ -1203,6 +1301,8 @@ url: https://example.com/mcp
             args: None,
             env: None,
             url: Some("https://example.com/mcp".to_string()),
+            auth_token: None,
+            headers: None,
             enabled: true,
         };
         assert!(config.validate().is_ok());
@@ -1215,6 +1315,8 @@ url: https://example.com/mcp
             args: None,
             env: None,
             url: None,
+            auth_token: None,
+            headers: None,
             enabled: true,
         };
         assert!(config.validate().is_err());

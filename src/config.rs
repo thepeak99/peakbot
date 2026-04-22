@@ -409,6 +409,15 @@ pub struct McpServerConfig {
     pub env: Option<HashMap<String, String>>,
     /// URL for remote transports (sse, streamable-http)
     pub url: Option<String>,
+    /// Bearer token sent in the `Authorization: Bearer <token>` header
+    /// for remote transports. Convenience for the most common auth case.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// Custom HTTP headers sent with every request for remote transports.
+    /// Header names must be valid HTTP token characters; values must be
+    /// visible ASCII. Invalid entries are logged and skipped.
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
     /// Enable/disable this server (default: true)
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -1045,6 +1054,8 @@ mod tests {
             args: None,
             env: None,
             url: None,
+            auth_token: None,
+            headers: None,
             enabled: true,
         }]);
 
@@ -1056,6 +1067,8 @@ mod tests {
                 args: None,
                 env: None,
                 url: None,
+                auth_token: None,
+                headers: None,
                 enabled: true,
             }]),
             ..Config::default()
