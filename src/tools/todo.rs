@@ -129,10 +129,16 @@ impl TodoList {
         &self.tasks
     }
 
-    /// Clear completed tasks
+    /// Clear finished tasks (both completed and cancelled).
+    /// If the list becomes empty, resets the internal id counter so new
+    /// tasks start from 1 again.
     pub fn clear_completed(&mut self) -> usize {
         let initial_len = self.tasks.len();
-        self.tasks.retain(|t| t.status != TodoStatus::Completed);
+        self.tasks
+            .retain(|t| t.status != TodoStatus::Completed && t.status != TodoStatus::Cancelled);
+        if self.tasks.is_empty() {
+            self.next_id = 1;
+        }
         initial_len - self.tasks.len()
     }
 
@@ -460,6 +466,52 @@ mod tests {
         let cleared = list.clear_completed();
         assert_eq!(cleared, 1);
         assert_eq!(list.list().len(), 1);
+    }
+
+    #[test]
+    fn test_clear_also_removes_cancelled_tasks() {
+        let mut list = TodoList::new();
+        list.add("Task 1".to_string());
+        list.add("Task 2".to_string());
+        list.add("Task 3".to_string());
+
+        list.update_status(1, TodoStatus::Completed).unwrap();
+        list.update_status(2, TodoStatus::Cancelled).unwrap();
+        // Task 3 stays pending
+
+        let cleared = list.clear_completed();
+        assert_eq!(cleared, 2, "clear should remove both completed and cancelled");
+        assert_eq!(list.list().len(), 1);
+        assert_eq!(list.list()[0].id, 3);
+    }
+
+    #[test]
+    fn test_clear_resets_next_id_when_list_empty() {
+        let mut list = TodoList::new();
+        list.add("Task 1".to_string());
+        list.add("Task 2".to_string());
+        list.update_status(1, TodoStatus::Completed).unwrap();
+        list.update_status(2, TodoStatus::Cancelled).unwrap();
+
+        list.clear_completed();
+        assert_eq!(list.list().len(), 0);
+
+        // After clearing an emptied list, IDs should restart from 1
+        let result = list.add("Fresh task".to_string());
+        assert_eq!(result.id, 1, "next_id should reset when list becomes empty");
+    }
+
+    #[test]
+    fn test_clear_does_not_reset_next_id_if_tasks_remain() {
+        let mut list = TodoList::new();
+        list.add("Task 1".to_string());
+        list.add("Task 2".to_string());
+        list.update_status(1, TodoStatus::Completed).unwrap();
+
+        list.clear_completed();
+        // Task 2 still there with id=2, so next id must be 3 (not colliding)
+        let result = list.add("Task 3".to_string());
+        assert_eq!(result.id, 3);
     }
 
     #[test]
