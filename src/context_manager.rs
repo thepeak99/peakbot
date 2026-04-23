@@ -99,6 +99,16 @@ impl ContextManager {
         self.context_window
     }
 
+    /// Whether automatic compaction is enabled
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    /// Compaction threshold as a fraction (0.0 – 1.0)
+    pub(crate) fn threshold_fraction(&self) -> f64 {
+        self.config.threshold
+    }
+
     /// Get the compaction threshold (in tokens)
     pub fn threshold(&self) -> usize {
         ((self.context_window as f64) * self.config.threshold) as usize

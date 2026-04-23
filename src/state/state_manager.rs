@@ -106,8 +106,22 @@ impl StateManager {
     /// Must be called once after construction with the agent, config, and system prompt.
     /// After this, compaction triggers automatically when messages are added.
     pub(crate) fn init_context_manager(&self, cm: ContextManager, system_prompt: String) {
+        // Seed AppState.context with the static parts (window size + policy) so
+        // the status bar can render a real percentage immediately, before any
+        // API call has reported token usage. `current_usage` stays 0 until the
+        // first request lands and `sync_stats_to_ui` refreshes it.
+        {
+            let mut state = self.state.write().unwrap();
+            state.context.window_size = cm.context_window() as u64;
+            state.context.compaction_enabled = cm.is_enabled();
+            state.context.compaction_threshold = cm.threshold_fraction();
+        }
+
         *self.context_manager.lock().unwrap() = Some(cm);
         *self.system_prompt.write().unwrap() = system_prompt;
+
+        let state = self.state.read().unwrap();
+        self.notify_update(&state);
     }
 
     /// Check if compaction is needed and trigger it in the background.
@@ -271,11 +285,17 @@ impl StateManager {
     /// Sync stats to AppState (internal method)
     fn sync_stats_to_ui(&self) {
         let stats = self.stats.lock().unwrap();
+        // Snapshot the live context-token count while no locks on `state` are held.
+        // `last_input_tokens()` returns the most recent request's input tokens —
+        // that IS the current context size (not cumulative).
+        let last_input = stats.last_input_tokens().unwrap_or(0);
+
         let mut state = self.state.write().unwrap();
         state.stats.total_input_tokens = stats.total_input_tokens;
         state.stats.total_output_tokens = stats.total_output_tokens;
         state.stats.total_api_calls = stats.total_api_calls;
         state.stats.total_cost = stats.total_cost;
+        state.context.current_usage = last_input;
         drop(state);
         self.notify_update(&self.state.read().unwrap());
     }
@@ -1536,5 +1556,75 @@ mod tests {
             second > first,
             "second run start must be strictly after the first"
         );
+    }
+
+    // ── Context State Sync ──────────────────────────────────────────────────
+    // The status bar reads AppState.context.usage_percentage(). That number
+    // is computed from current_usage / window_size. If we never populate
+    // those fields the indicator is stuck at 0% forever — which is exactly
+    // what users saw before these tests existed.
+
+    fn sm_with_context_window(window: usize) -> Arc<StateManager> {
+        use crate::config::ContextConfig;
+        let sm = StateManager::new_arc();
+        let cfg = ContextConfig {
+            threshold: 0.8,
+            keep_recent: 5,
+            enabled: true,
+            context_window: Some(window),
+            compaction_model: None,
+        };
+        // No compaction model — we're not exercising compact() here.
+        let cm = ContextManager::new(cfg, "mock-model", sm.clone(), None);
+        sm.init_context_manager(cm, String::new());
+        sm
+    }
+
+    #[test]
+    fn context_window_populated_after_init_context_manager() {
+        let sm = sm_with_context_window(128_000);
+        let state = sm.get_state();
+        assert_eq!(
+            state.context.window_size, 128_000,
+            "window_size must be seeded at init so usage_percentage() isn't stuck on 0/0"
+        );
+        assert!(
+            state.context.compaction_enabled,
+            "compaction_enabled must flow from ContextConfig into AppState"
+        );
+        assert!(
+            (state.context.compaction_threshold - 0.8).abs() < f64::EPSILON,
+            "compaction_threshold must flow from ContextConfig into AppState"
+        );
+    }
+
+    #[test]
+    fn context_current_usage_tracks_last_input_tokens() {
+        let sm = sm_with_context_window(200_000);
+
+        // Before any request: usage is 0 but window is non-zero.
+        let state = sm.get_state();
+        assert_eq!(state.context.current_usage, 0);
+        assert_eq!(state.context.window_size, 200_000);
+        assert_eq!(state.context.usage_percentage(), 0.0);
+
+        // After a request: current_usage reflects the last input-token count.
+        sm.add_request(50_000, 1_000, 0.0);
+        let state = sm.get_state();
+        assert_eq!(
+            state.context.current_usage, 50_000,
+            "current_usage must be updated when stats are synced — otherwise the status bar shows 0% forever"
+        );
+        // 50k / 200k = 25%
+        assert!(
+            (state.context.usage_percentage() - 25.0).abs() < 0.01,
+            "expected ~25% usage, got {}",
+            state.context.usage_percentage()
+        );
+
+        // A later request overwrites (tokens aren't cumulative — see SessionStats docs).
+        sm.add_request(100_000, 2_000, 0.0);
+        let state = sm.get_state();
+        assert_eq!(state.context.current_usage, 100_000);
     }
 }
