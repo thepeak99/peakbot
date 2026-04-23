@@ -126,30 +126,44 @@ fn chat_render_scales_reasonably() {
     }
 }
 
-/// Regression guard: a single frame at 500 messages must complete fast
-/// enough that the 50 ms tick budget in `ReplUi::run` isn't blown.
+/// Regression guard: one tick of chat-render work at 500 messages must
+/// fit inside the 50 ms tick budget in `ReplUi::run`. "One tick" means
+/// what the app actually does every 50 ms *after* the cache has been
+/// populated — a `sync` call (fingerprint-compare, no new renders on an
+/// unchanged transcript) plus a viewport `window`. That's the real hot
+/// path the fix in `slow-messages.md` PR2 was designed to make O(viewport).
 ///
-/// Before the cache lands this may be tight; after the cache lands
-/// the threshold can be tightened further (see `slow-messages.md` §7.1).
+/// Cold-sync cost (first render of a loaded conversation) is paid once
+/// and is not a per-tick concern; it's not measured here.
+///
+/// Budget is deliberately generous (the cached path is microseconds, not
+/// milliseconds). This guard fires only if someone re-introduces O(N)
+/// work on the per-frame path.
 #[test]
 fn chat_render_one_frame_under_budget_at_500_messages() {
     const WIDTH: u16 = 100;
+    const VIEWPORT_H: u16 = 40;
     const BUDGET: Duration = Duration::from_millis(50);
 
     let chat = build_history(500);
+    let mut cache = ChatRenderCache::new(Box::new(PlainRenderer));
 
-    // Warm up.
-    let _ = one_frame_of_work(&chat, WIDTH);
+    // Prime the cache. This is the one-time cost paid when a conversation
+    // first loads; subsequent ticks walk the same messages unchanged.
+    cache.sync(&chat.messages, WIDTH);
 
+    // One steady-state tick: re-sync (fingerprint scan, zero renders) and
+    // pull a viewport window.
     let start = Instant::now();
-    let _ = one_frame_of_work(&chat, WIDTH);
+    cache.sync(&chat.messages, WIDTH);
+    let _ = cache.window(0, VIEWPORT_H);
     let elapsed = start.elapsed();
 
     assert!(
         elapsed < BUDGET,
-        "one frame of chat-render work on 500 messages took {:?}, \
-         exceeding the {:?} tick budget. This means the TUI will drop \
-         frames and feel sluggish. See slow-messages.md.",
+        "one steady-state tick on 500 messages took {:?}, exceeding \
+         the {:?} tick budget. The per-frame path has regressed to O(N). \
+         See slow-messages.md.",
         elapsed,
         BUDGET
     );
