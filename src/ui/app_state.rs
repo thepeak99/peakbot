@@ -64,6 +64,15 @@ pub struct AppState {
 
     /// Agent status message (e.g., "Compacting...", "Stopped")
     pub status_message: Option<String>,
+
+    /// When the current run started. `Some` iff `is_running`.
+    ///
+    /// Local-only (`Instant` isn't `Serialize`). The TUI reads this to render
+    /// a "working" spinner and elapsed timer in the input block title. If a
+    /// cross-process UI ever needs this, migrate to `SystemTime` or epoch
+    /// millis — do NOT pre-build that bridge.
+    #[serde(skip)]
+    pub run_started_at: Option<std::time::Instant>,
 }
 
 impl AppState {

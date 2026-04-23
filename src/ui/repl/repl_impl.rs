@@ -37,6 +37,7 @@ use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState};
 use crate::ui::repl::message_renderer::{MessageRenderer, PlainRenderer};
 use crate::ui::repl::render_cache::ChatRenderCache;
+use crate::ui::repl::spinner;
 use crate::ui::repl::todo_panel::{DEFAULT_PANEL_PERCENT, render_todo_panel, should_show_panel};
 use crate::ui::ui_trait::{Ui, UiAction};
 
@@ -221,8 +222,19 @@ impl ReplUi {
         f.render_widget(scrolled, chunks[0]);
     }
 
-    /// Build the input area paragraph (returns Paragraph for rendering)
-    pub fn build_input_paragraph<'a>(input: &str, cursor_pos: usize) -> Paragraph<'a> {
+    /// Build the input paragraph with an animated "working" title when the
+    /// agent is running.
+    ///
+    /// When `run_started_at` is `Some`, the block title becomes
+    /// `" ⠹ Working · 00:07 · <status> · esc to stop "` (see `workin-baby.md`
+    /// §5.3). Otherwise it's the plain `" Input "` title.
+    pub fn build_input_paragraph<'a>(
+        input: &str,
+        cursor_pos: usize,
+        is_running: bool,
+        run_started_at: Option<std::time::Instant>,
+        status_message: Option<&str>,
+    ) -> Paragraph<'a> {
         let (prompt_text, prompt_color) = if input.is_empty() {
             ("💬 Message...", Color::DarkGray)
         } else {
@@ -240,9 +252,29 @@ impl ReplUi {
             spans.push(Span::raw(after_cursor));
         }
 
+        let title = match (is_running, run_started_at) {
+            (true, Some(t)) => {
+                // Truncate the phase label to ~24 chars to keep the title
+                // readable on narrow terminals.
+                let phase_full = status_message.unwrap_or("thinking");
+                let phase: String = if phase_full.chars().count() > 24 {
+                    phase_full.chars().take(23).collect::<String>() + "…"
+                } else {
+                    phase_full.to_string()
+                };
+                format!(
+                    " {} Working · {} · {} · esc to stop ",
+                    spinner::frame_for(t),
+                    spinner::fmt_elapsed(t),
+                    phase,
+                )
+            }
+            _ => " Input ".to_string(),
+        };
+
         Paragraph::new(Line::from(spans))
             .wrap(Wrap { trim: true })
-            .block(Block::default().title(" Input ").borders(Borders::ALL))
+            .block(Block::default().title(title).borders(Borders::ALL))
     }
 
     /// Render the input area (takes built paragraph and renders it)
@@ -369,6 +401,9 @@ impl ReplUi {
                 let input = Self::build_input_paragraph(
                     &self.ui_state.input_buffer,
                     self.ui_state.cursor_pos,
+                    state.is_running,
+                    state.run_started_at,
+                    state.status_message.as_deref(),
                 );
 
                 // Check if todo panel should be shown (based on terminal size and visibility state)
@@ -665,7 +700,8 @@ impl Ui for ReplUi {
 
                     let needs_render = revision != self.last_rendered_revision
                         || self.ui_state.local_dirty
-                        || size != self.last_size;
+                        || size != self.last_size
+                        || self.state_manager.is_running(); // animate the spinner while working
 
                     if !needs_render {
                         continue;

@@ -22,7 +22,7 @@ mod tests {
 
     #[test]
     fn input_area_empty() {
-        let paragraph = ReplUi::build_input_paragraph("", 0);
+        let paragraph = ReplUi::build_input_paragraph("", 0, false, None, None);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_empty", lines.join("\n"));
@@ -30,7 +30,7 @@ mod tests {
 
     #[test]
     fn input_area_cursor_start() {
-        let paragraph = ReplUi::build_input_paragraph("Hello", 0);
+        let paragraph = ReplUi::build_input_paragraph("Hello", 0, false, None, None);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_cursor_start", lines.join("\n"));
@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn input_area_cursor_middle() {
-        let paragraph = ReplUi::build_input_paragraph("Hello", 2);
+        let paragraph = ReplUi::build_input_paragraph("Hello", 2, false, None, None);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_cursor_middle", lines.join("\n"));
@@ -46,7 +46,7 @@ mod tests {
 
     #[test]
     fn input_area_cursor_end() {
-        let paragraph = ReplUi::build_input_paragraph("Hello", 5);
+        let paragraph = ReplUi::build_input_paragraph("Hello", 5, false, None, None);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_cursor_end", lines.join("\n"));
@@ -57,6 +57,9 @@ mod tests {
         let paragraph = ReplUi::build_input_paragraph(
             "This is a very long input that will wrap to multiple lines",
             0,
+            false,
+            None,
+            None,
         );
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
