@@ -5,6 +5,7 @@
 pub mod message_renderer;
 pub mod render_cache;
 pub mod repl_impl;
+pub mod spinner;
 pub mod todo_panel;
 
 pub use message_renderer::{MessageRenderer, PlainRenderer};

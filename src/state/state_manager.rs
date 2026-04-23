@@ -547,10 +547,22 @@ impl StateManager {
         self.notify_update(&state);
     }
 
-    /// Set whether the agent is currently running (processing a message)
+    /// Set whether the agent is currently running (processing a message).
+    ///
+    /// Stamps `run_started_at = Some(Instant::now())` when starting, and clears
+    /// both the start-time and `status_message` when stopping. The `workin-baby`
+    /// TUI indicator keys off these fields — do not split the state.
     pub fn set_running(&self, running: bool) {
         let mut state = self.state.write().unwrap();
         state.is_running = running;
+        state.run_started_at = if running {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        if !running {
+            state.status_message = None;
+        }
         self.notify_update(&state);
     }
 
@@ -1480,6 +1492,67 @@ mod tests {
         assert!(
             state.chat.messages[0].content.contains("Summary"),
             "First message should be the summary"
+        );
+    }
+
+    // ─── workin-baby: working-indicator state transitions ────────────────
+
+    #[test]
+    fn set_running_true_stamps_run_started_at() {
+        let sm = StateManager::new();
+        let before = sm.get_state();
+        assert!(before.run_started_at.is_none(), "idle state has no start time");
+        assert!(!before.is_running);
+
+        sm.set_running(true);
+
+        let after = sm.get_state();
+        assert!(after.is_running, "is_running flips to true");
+        assert!(after.run_started_at.is_some(), "run_started_at is stamped");
+    }
+
+    #[test]
+    fn set_running_false_clears_run_started_at_and_status() {
+        let sm = StateManager::new();
+        sm.set_running(true);
+        sm.set_status(Some("bash".to_string()));
+
+        // Mid-run: both fields populated.
+        let mid = sm.get_state();
+        assert!(mid.is_running);
+        assert!(mid.run_started_at.is_some());
+        assert_eq!(mid.status_message.as_deref(), Some("bash"));
+
+        sm.set_running(false);
+
+        let after = sm.get_state();
+        assert!(!after.is_running, "is_running flips to false");
+        assert!(
+            after.run_started_at.is_none(),
+            "run_started_at must be cleared on stop"
+        );
+        assert!(
+            after.status_message.is_none(),
+            "status_message must be cleared on stop (per workin-baby §5.2)"
+        );
+    }
+
+    #[test]
+    fn set_running_toggle_restamps_run_started_at() {
+        let sm = StateManager::new();
+        sm.set_running(true);
+        let first = sm.get_state().run_started_at.expect("stamped on start");
+
+        // Sleep a hair so the second stamp is observably later than the first.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        sm.set_running(false);
+        sm.set_running(true);
+        let second = sm.get_state().run_started_at.expect("re-stamped on restart");
+
+        assert!(
+            second > first,
+            "second run start must be strictly after the first"
         );
     }
 }

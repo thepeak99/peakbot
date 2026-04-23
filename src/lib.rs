@@ -503,6 +503,9 @@ impl AgentRunner {
                 call_id,
                 ..
             } => {
+                // Indicator phase → show the tool name in the working banner
+                // (see `workin-baby.md` §6). Cleared on the matching result.
+                sm.set_status(Some(tool_name.clone()));
                 // Add to chat AND persist (StateManager handles persistence)
                 sm.add_tool_call(tool_name, arguments, call_id);
             }
@@ -513,6 +516,8 @@ impl AgentRunner {
                 call_id,
                 ..
             } => {
+                // Back to "thinking" — the model is about to reason again.
+                sm.set_status(None);
                 // Add to chat AND persist (StateManager handles persistence)
                 sm.add_tool_result(tool_name, arguments, result, call_id);
             }
