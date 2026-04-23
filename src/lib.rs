@@ -244,21 +244,16 @@ impl AgentRunner {
 
     /// Force context compaction
     pub async fn force_compact(&mut self) {
-        use crate::ui::app_state::NotificationKind;
-
         if let Some(ref sm) = self.state_manager {
             match sm.force_compact().await {
                 Some(result) => {
-                    sm.push_notification(
-                        format!(
-                            "Context compacted: {} → {} messages, {} discarded",
-                            result.original_count, result.compacted_count, result.num_discarded
-                        ),
-                        NotificationKind::Info,
-                    );
+                    sm.add_system_message(format!(
+                        "Context compacted: {} → {} messages, {} discarded",
+                        result.original_count, result.compacted_count, result.num_discarded
+                    ));
                 }
                 None => {
-                    sm.push_notification("Nothing to compact.".to_string(), NotificationKind::Info);
+                    sm.add_system_message("Nothing to compact.".to_string());
                 }
             }
         }
@@ -383,10 +378,7 @@ impl AgentRunner {
                             session_hook.request_stop();
                             msg_tx.send(QueueMessage::StopMarker).await.ok();
                             if let Some(ref sm) = state_manager {
-                                sm.push_notification(
-                                    "Stop requested...".to_string(),
-                                    crate::ui::app_state::NotificationKind::Info,
-                                );
+                                sm.set_status(Some("Stop requested...".to_string()));
                             }
                         }
                     } else {
@@ -401,10 +393,7 @@ impl AgentRunner {
                         session_hook.request_stop();
                         msg_tx.send(QueueMessage::StopMarker).await.ok();
                         if let Some(ref sm) = state_manager {
-                            sm.push_notification(
-                                "Stop requested...".to_string(),
-                                crate::ui::app_state::NotificationKind::Info,
-                            );
+                            sm.set_status(Some("Stop requested...".to_string()));
                         }
                     }
                 }
@@ -440,19 +429,16 @@ impl AgentRunner {
                             .await;
 
                     // Mark as done — snapshot run_started_at BEFORE set_running(false) clears
-                    // it, then emit a "worked for MM:SS" notification (reuses the spinner
+                    // it, then emit a "worked for MM:SS" system message (reuses the spinner
                     // formatter so the post-run figure matches the live indicator).
                     if let Some(ref sm) = state_manager {
                         let started_at = sm.get_state().run_started_at;
                         sm.set_running(false);
                         if let Some(t) = started_at {
-                            sm.push_notification(
-                                format!(
-                                    "worked for {}",
-                                    crate::ui::repl::spinner::fmt_elapsed(t)
-                                ),
-                                crate::ui::app_state::NotificationKind::Info,
-                            );
+                            sm.add_system_message(format!(
+                                "worked for {}",
+                                crate::ui::repl::spinner::fmt_elapsed(t)
+                            ));
                         }
                     }
 
@@ -475,10 +461,8 @@ impl AgentRunner {
                     // This is just an acknowledgment that stop was requested
                     // The actual stopping happened in process_message_internal
                     if let Some(ref sm) = state_manager {
-                        sm.push_notification(
-                            "Agent stopped by user".to_string(),
-                            crate::ui::app_state::NotificationKind::Info,
-                        );
+                        sm.set_status(None);
+                        sm.add_system_message("Agent stopped by user".to_string());
                     }
                     completion_tx.send(CompletionResult::Stopped).ok();
                 }
@@ -589,18 +573,13 @@ impl AgentRunner {
                 Err(_) => {
                     if retry_count == config.retry().max_retries {
                         if let Some(sm) = state_manager {
-                            sm.push_notification(
-                                "Max number of retries exceeded".to_string(),
-                                crate::ui::app_state::NotificationKind::Error,
-                            );
+                            sm.set_status(None);
+                            sm.add_system_message("❌ Max number of retries exceeded".to_string());
                         }
                         return CompletionResult::Error;
                     }
                     if let Some(sm) = state_manager {
-                        sm.push_notification(
-                            "Retrying...".to_string(),
-                            crate::ui::app_state::NotificationKind::Warning,
-                        );
+                        sm.set_status(Some(format!("Retrying (attempt {})...", retry_count + 1)));
                     }
                     retry_count += 1;
                 }
@@ -614,14 +593,12 @@ impl AgentRunner {
         state_manager: &Option<Arc<StateManager>>,
         config: &Config,
     ) {
-        use crate::ui::app_state::NotificationKind;
-
         let cmd_lower = cmd.to_lowercase();
 
         match cmd_lower.as_str() {
             "/stats" | "/reset" | "/context" | "/compact" | "/conversations" | "/history" => {
                 // These commands return data that UI can access via StateManager
-                // No notification needed - UI pulls this data
+                // No system message needed — UI pulls this data
             }
             "/new" => {
                 // Create new conversation via StateManager (single source of truth)
@@ -641,10 +618,7 @@ impl AgentRunner {
                 if let Some(sm) = state_manager {
                     sm.save_conversation();
                     if let Some(conv) = sm.get_current_conversation() {
-                        sm.push_notification(
-                            format!("Conversation saved: {}", conv.name),
-                            NotificationKind::Success,
-                        );
+                        sm.add_system_message(format!("Conversation saved: {}", conv.name));
                     }
                 } else {
                     tracing::warn!("State manager not available for /save command");
@@ -656,7 +630,7 @@ impl AgentRunner {
                         Ok(id) => id,
                         Err(_) => {
                             if let Some(sm) = state_manager {
-                                sm.push_notification("Invalid conversation ID. Use /conversations to see available IDs.".to_string(), NotificationKind::Error);
+                                sm.add_system_message("❌ Invalid conversation ID. Use /conversations to see available IDs.".to_string());
                             }
                             return;
                         }
@@ -672,10 +646,10 @@ impl AgentRunner {
                                 }
                             }
                             Err(e) => {
-                                sm.push_notification(
-                                    format!("Failed to load conversation: {}", e),
-                                    NotificationKind::Error,
-                                );
+                                sm.add_system_message(format!(
+                                    "❌ Failed to load conversation: {}",
+                                    e
+                                ));
                             }
                         }
                     } else {
@@ -689,10 +663,7 @@ impl AgentRunner {
                         Ok(id) => id,
                         Err(_) => {
                             if let Some(sm) = state_manager {
-                                sm.push_notification(
-                                    "Invalid conversation ID.".to_string(),
-                                    NotificationKind::Error,
-                                );
+                                sm.add_system_message("❌ Invalid conversation ID.".to_string());
                             }
                             return;
                         }
@@ -700,16 +671,10 @@ impl AgentRunner {
                     if let Some(sm) = state_manager {
                         match sm.delete_conversation(id) {
                             Ok(_) => {
-                                sm.push_notification(
-                                    "Conversation deleted.".to_string(),
-                                    NotificationKind::Success,
-                                );
+                                sm.add_system_message("Conversation deleted.".to_string());
                             }
                             Err(e) => {
-                                sm.push_notification(
-                                    format!("Failed to delete: {}", e),
-                                    NotificationKind::Error,
-                                );
+                                sm.add_system_message(format!("❌ Failed to delete: {}", e));
                             }
                         }
                     } else {
@@ -727,10 +692,7 @@ impl AgentRunner {
                             Ok(id) => id,
                             Err(_) => {
                                 if let Some(sm) = state_manager {
-                                    sm.push_notification(
-                                        "Invalid conversation ID.".to_string(),
-                                        NotificationKind::Error,
-                                    );
+                                    sm.add_system_message("❌ Invalid conversation ID.".to_string());
                                 }
                                 return;
                             }
@@ -741,10 +703,7 @@ impl AgentRunner {
                                     sm.add_system_message(format!("Export:\n{}", output));
                                 }
                                 Err(e) => {
-                                    sm.push_notification(
-                                        format!("Export failed: {}", e),
-                                        NotificationKind::Error,
-                                    );
+                                    sm.add_system_message(format!("❌ Export failed: {}", e));
                                 }
                             }
                         } else {
@@ -752,9 +711,8 @@ impl AgentRunner {
                         }
                     } else {
                         if let Some(sm) = state_manager {
-                            sm.push_notification(
+                            sm.add_system_message(
                                 "Usage: /export <id> <json|markdown>".to_string(),
-                                NotificationKind::Info,
                             );
                         }
                     }
@@ -765,16 +723,13 @@ impl AgentRunner {
                     if let Some(sm) = state_manager {
                         match sm.rename_conversation(name.to_string()) {
                             Ok(_) => {
-                                sm.push_notification(
-                                    format!("Conversation renamed to: {}", name),
-                                    NotificationKind::Success,
-                                );
+                                sm.add_system_message(format!(
+                                    "Conversation renamed to: {}",
+                                    name
+                                ));
                             }
                             Err(e) => {
-                                sm.push_notification(
-                                    format!("Failed to rename: {}", e),
-                                    NotificationKind::Error,
-                                );
+                                sm.add_system_message(format!("❌ Failed to rename: {}", e));
                             }
                         }
                     } else {
