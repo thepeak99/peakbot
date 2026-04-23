@@ -19,8 +19,8 @@ use crate::hooks::session_hook::SessionStats;
 use crate::storage::{ConversationStorage, ConversationSummary};
 use crate::tools::todo::{TodoList, TodoStatus};
 use crate::ui::app_state::{
-    AppState, ChatMessage, ChatState, ContextState, Notification, NotificationKind, SessionState,
-    TodoItem, TodoState, WelcomeState,
+    AppState, ChatMessage, ChatState, ContextState, SessionState, TodoItem, TodoState,
+    WelcomeState,
 };
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -136,13 +136,10 @@ impl StateManager {
             sm.set_status(Some("Compacting context...".to_string()));
             match sm.run_compaction(&cm_clone).await {
                 Some(result) => {
-                    sm.push_notification(
-                        format!(
-                            "Context compacted: {} → {} messages, {} compacted",
-                            result.original_count, result.compacted_count, result.num_discarded
-                        ),
-                        NotificationKind::Info,
-                    );
+                    sm.add_system_message(format!(
+                        "Context compacted: {} → {} messages, {} compacted",
+                        result.original_count, result.compacted_count, result.num_discarded
+                    ));
                 }
                 None => {}
             }
@@ -619,21 +616,6 @@ impl StateManager {
     pub fn set_command_popup(&self, popup: Option<crate::ui::ui_trait::CommandPopupState>) {
         let mut state = self.state.write().unwrap();
         state.command_popup = popup;
-        self.notify_update(&state);
-    }
-
-    /// Push a notification to be displayed by UI
-    pub fn push_notification(&self, message: String, kind: NotificationKind) {
-        let notification = Notification::new(message, kind);
-        let mut state = self.state.write().unwrap();
-        state.notifications.push(notification);
-        self.notify_update(&state);
-    }
-
-    /// Clear all notifications
-    pub fn clear_notifications(&self) {
-        let mut state = self.state.write().unwrap();
-        state.notifications.clear();
         self.notify_update(&state);
     }
 
