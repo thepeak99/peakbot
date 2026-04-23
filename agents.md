@@ -490,6 +490,17 @@ src/
 │   ├── discovery.rs        # Skill discovery and SkillRegistry
 │   ├── parser.rs           # SKILL.md parsing
 │   └── types.rs            # Skill data structures
+├── ui/
+│   ├── mod.rs              # UI module exports
+│   ├── app_state.rs        # AppState (single source of truth for UIs)
+│   ├── ui_trait.rs         # Ui trait + UiAction enum
+│   └── repl/
+│       ├── mod.rs              # REPL module exports
+│       ├── message_renderer.rs # MessageRenderer, PlainRenderer
+│       ├── render_cache.rs     # ChatRenderCache, WindowView
+│       ├── repl_impl.rs        # ReplUi View (ratatui) + render loop
+│       ├── spinner.rs          # Working-indicator spinner frames + elapsed formatter
+│       └── todo_panel.rs       # TODO side-panel renderer
 └── tools/
     ├── mod.rs              # Re-exports: all built-in tools
     ├── bash.rs             # BashTool -- shell execution with timeout
