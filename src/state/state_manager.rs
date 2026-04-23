@@ -433,7 +433,7 @@ impl StateManager {
         output
     }
 
-    /// Clear completed todo items
+    /// Clear finished todo items (completed and cancelled)
     pub fn clear_completed_todos(&self) -> String {
         let cleared = {
             let mut list = self.todo_list.lock().unwrap();
@@ -441,7 +441,7 @@ impl StateManager {
             self.sync_todo_to_ui(&list);
             cleared
         };
-        format!("Cleared {} completed tasks", cleared)
+        format!("Cleared {} finished tasks (completed and cancelled)", cleared)
     }
 
     /// Sync todo list to UI state
