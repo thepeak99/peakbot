@@ -153,6 +153,36 @@ impl ReplUi {
         }
     }
 
+    /// The welcome banner shown when the chat transcript is empty.
+    ///
+    /// Single source of truth so the snapshot path
+    /// ([`build_chat_history_paragraph`]) and the live cached path
+    /// ([`Self::render`]) never drift apart.
+    ///
+    /// Keybinding hints (Ctrl+C / Ctrl+T) live on the chat frame's
+    /// bottom border via [`Self::chat_block`], not here — they're
+    /// permanently visible once the transcript fills.
+    fn welcome_lines() -> Vec<Line<'static>> {
+        vec![Line::from(Span::styled(
+            "Welcome to PeakBot! Start a conversation or use /help for commands.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    }
+
+    /// The bordered block that wraps the chat transcript.
+    ///
+    /// Single source of truth for both the snapshot path and the live
+    /// render path. The bottom border carries a persistent keybinding
+    /// hint — right-aligned so the top-left `" Chat Messages "` title
+    /// stays the dominant label, and clipped gracefully on narrow
+    /// terminals (ratatui truncates titles that don't fit).
+    fn chat_block() -> Block<'static> {
+        Block::default()
+            .title(" Chat Messages ")
+            .title_bottom(Line::from(" Ctrl+C exit · Ctrl+T tasks ").right_aligned())
+            .borders(Borders::ALL)
+    }
+
     /// Build the full chat-history paragraph from scratch.
     ///
     /// Kept for backwards compatibility (the snapshot-test suite in
@@ -164,10 +194,7 @@ impl ReplUi {
         let mut message_lines: Vec<Line> = Vec::new();
 
         if chat.messages.is_empty() {
-            message_lines.push(Line::from(Span::styled(
-                "Welcome to PeakBot! Start a conversation or use /help for commands.",
-                Style::default().fg(Color::DarkGray),
-            )));
+            message_lines.extend(Self::welcome_lines());
         } else {
             for msg in &chat.messages {
                 message_lines.extend(Self::build_chat_message_lines(msg));
@@ -177,11 +204,7 @@ impl ReplUi {
         Paragraph::new(Text::from(message_lines))
             .style(Style::default().fg(Color::White))
             .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .title(" Chat Messages ")
-                    .borders(Borders::ALL),
-            )
+            .block(Self::chat_block())
     }
 
     /// Render a single chat message into owned `Line`s.
@@ -467,26 +490,15 @@ impl ReplUi {
                     let chat_history = if view.lines.is_empty() && state.chat.messages.is_empty()
                     {
                         // Empty transcript — show the welcome banner.
-                        Paragraph::new(Line::from(Span::styled(
-                            "Welcome to PeakBot! Start a conversation or use /help for commands.",
-                            Style::default().fg(Color::DarkGray),
-                        )))
+                        Paragraph::new(Text::from(Self::welcome_lines()))
                         .style(Style::default().fg(Color::White))
                         .wrap(Wrap { trim: true })
-                        .block(
-                            Block::default()
-                                .title(" Chat Messages ")
-                                .borders(Borders::ALL),
-                        )
+                        .block(Self::chat_block())
                     } else {
                         Paragraph::new(Text::from(view.lines))
                             .style(Style::default().fg(Color::White))
                             .wrap(Wrap { trim: true })
-                            .block(
-                                Block::default()
-                                    .title(" Chat Messages ")
-                                    .borders(Borders::ALL),
-                            )
+                            .block(Self::chat_block())
                     };
 
                     Self::render_chat_history(
@@ -527,8 +539,8 @@ impl ReplUi {
                 // Reset scroll position when toggling
                 self.ui_state.todo_scroll_position = 0;
             }
-            // Quit with Ctrl+Q (opens confirmation dialog)
-            KeyCode::Char('q' | 'Q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Quit with Ctrl+C (opens confirmation dialog)
+            KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.show_quit_confirm = true;
                 self.confirm_yes_selected = false; // Default to "No"
             }
@@ -630,7 +642,7 @@ impl ReplUi {
             }
             KeyCode::Esc => {
                 // Esc interrupts the agent when it's running.
-                // When idle, Esc is a no-op — use Ctrl+Q to quit.
+                // When idle, Esc is a no-op — use Ctrl+C to quit.
                 if self.state_manager.is_running() {
                     let _ = self.action_sender.send(UiAction::RequestStop);
                 }

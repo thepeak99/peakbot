@@ -10,4 +10,4 @@ expression: "lines.join(\"\\n\")"
 │[12:00:01] 🤖  Agent: Here is another lengthy response    │█
 │that will definitely require multiple lines to display   │█
 │properly. It has detailed explanations and lots of       │║
-└─────────────────────────────────────────────────────────┘▼
+└───────────────────────────── Ctrl+C exit · Ctrl+T tasks ┘▼
