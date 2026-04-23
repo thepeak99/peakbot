@@ -439,9 +439,21 @@ impl AgentRunner {
                         Self::process_message_internal(&content, &state_manager, &agent, &config)
                             .await;
 
-                    // Mark as done
+                    // Mark as done — snapshot run_started_at BEFORE set_running(false) clears
+                    // it, then emit a "worked for MM:SS" notification (reuses the spinner
+                    // formatter so the post-run figure matches the live indicator).
                     if let Some(ref sm) = state_manager {
+                        let started_at = sm.get_state().run_started_at;
                         sm.set_running(false);
+                        if let Some(t) = started_at {
+                            sm.push_notification(
+                                format!(
+                                    "worked for {}",
+                                    crate::ui::repl::spinner::fmt_elapsed(t)
+                                ),
+                                crate::ui::app_state::NotificationKind::Info,
+                            );
+                        }
                     }
 
                     // Send completion notification

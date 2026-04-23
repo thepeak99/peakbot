@@ -527,6 +527,11 @@ impl ReplUi {
                 // Reset scroll position when toggling
                 self.ui_state.todo_scroll_position = 0;
             }
+            // Quit with Ctrl+Q (opens confirmation dialog)
+            KeyCode::Char('q' | 'Q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.show_quit_confirm = true;
+                self.confirm_yes_selected = false; // Default to "No"
+            }
             // Scroll todo panel with Ctrl+Up/Down when panel is visible
             KeyCode::Up
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -624,9 +629,11 @@ impl ReplUi {
                 }
             }
             KeyCode::Esc => {
-                // First ESC = show confirmation dialog
-                self.show_quit_confirm = true;
-                self.confirm_yes_selected = false; // Default to "No"
+                // Esc interrupts the agent when it's running.
+                // When idle, Esc is a no-op — use Ctrl+Q to quit.
+                if self.state_manager.is_running() {
+                    let _ = self.action_sender.send(UiAction::RequestStop);
+                }
             }
             _ => {}
         }
