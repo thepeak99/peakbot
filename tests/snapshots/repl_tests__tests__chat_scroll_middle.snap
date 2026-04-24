@@ -4,10 +4,10 @@ expression: "lines.join(\"\\n\")"
 ---
 ┌ Chat Messages ──────────────────────────────────────────┐▲
 │[12:00:00] 👤  User: Message 6                            │║
-│[12:00:00] 👤  User: Message 7                            │║
-│[12:00:00] 👤  User: Message 8                            │║
+│[12:00:00] 👤  User: Message 7                            │█
+│[12:00:00] 👤  User: Message 8                            │█
 │[12:00:00] 👤  User: Message 9                            │█
-│[12:00:00] 👤  User: Message 10                           │█
-│[12:00:00] 👤  User: Message 11                           │█
+│[12:00:00] 👤  User: Message 10                           │║
+│[12:00:00] 👤  User: Message 11                           │║
 │[12:00:00] 👤  User: Message 12                           │║
 └───────────────────────────── Ctrl+C exit · Ctrl+T tasks ┘▼
