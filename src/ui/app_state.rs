@@ -6,7 +6,7 @@
 
 use crate::TodoStatus;
 use crate::tools::todo::TodoItem as CoreTodoItem;
-use crate::ui::ui_trait::{CommandPopupState, TodoItemAction};
+use crate::ui::ui_trait::TodoItemAction;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -32,9 +32,6 @@ pub struct AppState {
 
     /// Context usage
     pub context: ContextState,
-
-    /// Active command popup (for slash commands)
-    pub command_popup: Option<CommandPopupState>,
 
     /// Current conversation info
     pub conversation: Option<ConversationState>,

@@ -10,8 +10,8 @@
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
-    KeyboardEnhancementFlags, KeyModifiers, MouseEventKind, PopKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -40,7 +40,7 @@ use crate::ui::repl::message_renderer::{MessageRenderer, PlainRenderer};
 use crate::ui::repl::render_cache::ChatRenderCache;
 use crate::ui::repl::spinner;
 use crate::ui::repl::todo_panel::{DEFAULT_PANEL_PERCENT, render_todo_panel, should_show_panel};
-use crate::ui::ui_trait::{Ui, UiAction};
+use crate::ui::ui_trait::{CommandPopupState, Ui, UiAction};
 
 /// Minimum terminal height
 const MIN_TERMINAL_HEIGHT: u16 = 10;
@@ -201,8 +201,7 @@ impl UiState {
     pub fn move_right(&mut self) {
         if self.cursor_pos < self.input_buffer.len() {
             let mut new_pos = self.cursor_pos + 1;
-            while new_pos < self.input_buffer.len()
-                && !self.input_buffer.is_char_boundary(new_pos)
+            while new_pos < self.input_buffer.len() && !self.input_buffer.is_char_boundary(new_pos)
             {
                 new_pos += 1;
             }
@@ -327,6 +326,11 @@ pub struct ReplUi {
     /// cheap fingerprint, plus per-message wrapped heights and a prefix-sum
     /// for O(log N) viewport lookup. See `slow-messages.md` §4.1.
     chat_cache: ChatRenderCache,
+    /// Slash-command autocomplete popup — `None` when closed, `Some` when
+    /// open. Local to the REPL view (see `allehailmenu.md` §3: popup state
+    /// is view-only, mirrors the `show_quit_confirm` precedent rather than
+    /// going through `StateManager`).
+    pub(crate) command_popup: Option<CommandPopupState>,
 }
 
 impl ReplUi {
@@ -353,6 +357,7 @@ impl ReplUi {
             last_rendered_revision: 0,
             last_size: (0, 0),
             chat_cache: ChatRenderCache::new(renderer),
+            command_popup: None,
         }
     }
 
@@ -536,7 +541,7 @@ impl ReplUi {
         // belong on borders, not content (memory 2026-04-24).
         let hint = Line::from(vec![Span::styled(
             " Shift/Alt+Enter: newline · Enter: send ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::White),
         )])
         .right_aligned();
 
@@ -807,11 +812,8 @@ impl ReplUi {
                         self.ui_state.cursor_pos,
                         content_width,
                     );
-                    self.ui_state.input_scroll = compute_input_scroll(
-                        cursor_row,
-                        self.ui_state.input_scroll,
-                        content_rows,
-                    );
+                    self.ui_state.input_scroll =
+                        compute_input_scroll(cursor_row, self.ui_state.input_scroll, content_rows);
 
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
@@ -829,8 +831,7 @@ impl ReplUi {
                     // current width. Only mutated rows are re-rendered;
                     // only mutated/resized rows are re-wrapped. See
                     // `slow-messages.md` §4.1.
-                    self.chat_cache
-                        .sync(&state.chat.messages, chat_wrap_width);
+                    self.chat_cache.sync(&state.chat.messages, chat_wrap_width);
 
                     self.ui_state.viewport_height = chunks[0].height;
                     self.ui_state.content_height =
@@ -852,13 +853,12 @@ impl ReplUi {
                     // AND the partial-line offset into the first visible
                     // message; we feed the offset straight into `Paragraph::scroll`.
                     let view = self.chat_cache.window(scroll as u32, chunks[0].height);
-                    let chat_history = if view.lines.is_empty() && state.chat.messages.is_empty()
-                    {
+                    let chat_history = if view.lines.is_empty() && state.chat.messages.is_empty() {
                         // Empty transcript — show the welcome banner.
                         Paragraph::new(Text::from(Self::welcome_lines()))
-                        .style(Style::default().fg(Color::White))
-                        .wrap(Wrap { trim: true })
-                        .block(Self::chat_block())
+                            .style(Style::default().fg(Color::White))
+                            .wrap(Wrap { trim: true })
+                            .block(Self::chat_block())
                     } else {
                         Paragraph::new(Text::from(view.lines))
                             .style(Style::default().fg(Color::White))
@@ -875,6 +875,13 @@ impl ReplUi {
                     );
                     Self::render_input_area(f, chunks[1], input, self.ui_state.input_scroll);
                     Self::render_status_bar(f, chunks[2], state);
+
+                    // Render command popup ABOVE the input area if open.
+                    // Drawn after the chat + input so it sits on top (via
+                    // `Clear` inside the renderer). See `allehailmenu.md` §6.
+                    if let Some(popup) = self.command_popup.as_ref() {
+                        crate::ui::repl::command_popup::render_command_popup(f, chunks[1], popup);
+                    }
                 }
 
                 // Render todo panel if visible
@@ -943,6 +950,56 @@ impl ReplUi {
             }
             KeyCode::Left | KeyCode::Right if self.show_quit_confirm => {
                 self.confirm_yes_selected = !self.confirm_yes_selected;
+            }
+            // ── Command popup handlers ─────────────────────────────────────
+            // When the popup is open, Up/Down/Tab/Enter/Esc are diverted to
+            // popup semantics. Everything else (Char, Backspace, Left/Right,
+            // Home/End) falls through to the normal editing arms — the
+            // popup's `prefix` is re-synced from the buffer at the end of
+            // the handler (see `sync_popup`). See `allehailmenu.md` §5.2.
+            KeyCode::Esc if self.command_popup.is_some() => {
+                self.command_popup = None;
+            }
+            KeyCode::Up if self.command_popup.is_some() => {
+                if let Some(p) = self.command_popup.as_mut() {
+                    p.navigate_up();
+                }
+            }
+            KeyCode::Down if self.command_popup.is_some() => {
+                if let Some(p) = self.command_popup.as_mut() {
+                    p.navigate_down();
+                }
+            }
+            KeyCode::Tab if self.command_popup.is_some() => {
+                self.accept_command(false);
+            }
+            KeyCode::Enter
+                if self.command_popup.is_some()
+                    && (key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::ALT)) =>
+            {
+                // Shift/Alt+Enter closes popup + inserts newline (commands
+                // are one-liners — a newline means "I'm done autocompleting").
+                self.command_popup = None;
+                self.ui_state.insert_newline();
+            }
+            KeyCode::Enter if self.command_popup.is_some() => {
+                self.accept_command(true);
+            }
+            // Open the popup on a bare `/` into an empty buffer. This arm
+            // is ORDER-CRITICAL: it must come before the generic
+            // `KeyCode::Char(c)` arm below, and it must come AFTER the
+            // popup-is-open arms above (so a second `/` while the popup
+            // is open is treated as a literal char, not a re-open).
+            KeyCode::Char('/')
+                if self.ui_state.input_buffer.is_empty()
+                    && self.command_popup.is_none()
+                    && !self.show_quit_confirm
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.ui_state.insert_char('/');
+                self.command_popup = Some(CommandPopupState::new(String::new()));
             }
             // Default handlers — input buffer editing. `input_scroll` is
             // recomputed at render time using the real terminal width and
@@ -1022,6 +1079,80 @@ impl ReplUi {
                 }
             }
             _ => {}
+        }
+
+        // After every key event, keep the popup's `prefix` in sync with
+        // the buffer and close it when the user has left command-name
+        // territory (buffer empty, no leading `/`, or entered args).
+        // Single source of truth: the buffer. See `allehailmenu.md` §5.2.
+        self.sync_popup();
+    }
+
+    /// Sync the command popup's filter prefix from the input buffer, and
+    /// close the popup when the buffer no longer represents a command-name
+    /// prefix.
+    ///
+    /// Rules:
+    /// - popup closed → no-op.
+    /// - buffer doesn't start with `/` → close.
+    /// - buffer contains whitespace or newline → close (args region).
+    /// - otherwise → `popup.prefix = buffer[1..]`.
+    fn sync_popup(&mut self) {
+        let Some(popup) = self.command_popup.as_mut() else {
+            return;
+        };
+        let buf = &self.ui_state.input_buffer;
+        if !buf.starts_with('/') || buf.chars().any(|c| c.is_whitespace()) {
+            self.command_popup = None;
+            return;
+        }
+        popup.prefix = buf[1..].to_string();
+        // Clamp selection in case filter shrank.
+        let count = popup.filtered_commands().len();
+        if count == 0 {
+            popup.selected_index = 0;
+        } else if popup.selected_index >= count {
+            popup.selected_index = count - 1;
+        }
+    }
+
+    /// Accept the currently-selected command in the popup.
+    ///
+    /// - Writes `/<name>` (plus a trailing space for arg-taking commands)
+    ///   into the buffer and moves the cursor to the end.
+    /// - If `submit == true` AND the command takes no args, sends a
+    ///   `UiAction::SendMessage("/<name>")` and clears the input — this is
+    ///   the Enter-on-no-args behaviour.
+    /// - Closes the popup in every case.
+    /// - No-op when the popup's filter is empty (no selected command).
+    ///
+    /// See `allehailmenu.md` §5.2 (Tab/Enter semantics).
+    fn accept_command(&mut self, submit: bool) {
+        let Some(popup) = self.command_popup.as_ref() else {
+            return;
+        };
+        let Some(cmd) = popup.selected_command() else {
+            // Empty filter — pressing Tab/Enter is a no-op; just close.
+            self.command_popup = None;
+            return;
+        };
+        let completed = if cmd.takes_args {
+            format!("/{} ", cmd.name)
+        } else {
+            format!("/{}", cmd.name)
+        };
+        self.command_popup = None;
+
+        if submit && !cmd.takes_args {
+            // Enter on a no-args command: fire and clear.
+            let _ = self
+                .action_sender
+                .send(UiAction::SendMessage(completed.clone()));
+            self.ui_state.clear_input();
+        } else {
+            // Tab, or Enter on an arg-taking command: just fill the buffer.
+            self.ui_state.input_buffer = completed.clone();
+            self.ui_state.cursor_pos = completed.len();
         }
     }
 
@@ -1142,7 +1273,6 @@ impl Ui for ReplUi {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod multiline_input_tests {
@@ -1478,5 +1608,266 @@ mod multiline_input_tests {
         // either 0 or 1 is acceptable; pin down the "end of previous row"
         // reading which is what ratatui's line_count returns.
         assert_eq!(ReplUi::cursor_visual_row(&long, 10, 10), 0);
+    }
+}
+
+#[cfg(test)]
+mod command_popup_tests {
+    //! Test-first specs for the slash-command autocomplete popup.
+    //! See `allehailmenu.md` §5 (interaction model) and §7 (test plan).
+    //!
+    //! These tests pin down:
+    //!   - when the popup opens (only on `/` into an empty buffer)
+    //!   - prefix sync from buffer to popup on every edit
+    //!   - close conditions (backspace past `/`, whitespace, newline, esc)
+    //!   - navigation (up/down)
+    //!   - completion (Tab) and run (Enter)
+    //!
+    //! Rendering snapshots live in `tests/repl_tests.rs`.
+    use super::*;
+    use crate::state::StateManager;
+    use crate::ui::ui_trait::{CommandPopupState, UiAction};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    /// Build a ReplUi + UiAction receiver for testing keyboard handling.
+    /// No terminal is attached — `handle_keyboard_input` only mutates
+    /// local state and sends on the action channel.
+    fn harness() -> (ReplUi, UnboundedReceiver<UiAction>) {
+        let sm = StateManager::new_arc();
+        let (tx, rx) = unbounded_channel();
+        (ReplUi::new(sm, tx), rx)
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn press_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    // ─── Opening ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn slash_on_empty_buffer_opens_popup() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        assert!(ui.command_popup.is_some(), "popup should be open");
+        assert_eq!(ui.ui_state.input_buffer, "/");
+        assert_eq!(ui.ui_state.cursor_pos, 1);
+        assert_eq!(
+            ui.command_popup.as_ref().unwrap().prefix,
+            "",
+            "prefix is empty right after opening (only the slash)"
+        );
+    }
+
+    #[test]
+    fn slash_on_nonempty_buffer_stays_literal() {
+        let (mut ui, _rx) = harness();
+        ui.ui_state.insert_char('h');
+        ui.ui_state.insert_char('i');
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        assert!(
+            ui.command_popup.is_none(),
+            "popup must NOT open mid-sentence"
+        );
+        assert_eq!(ui.ui_state.input_buffer, "hi/");
+    }
+
+    #[test]
+    fn slash_while_popup_open_is_just_a_char() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('s')));
+        ui.handle_keyboard_input(press(KeyCode::Char('t')));
+        // Another '/' now — popup stays open, slash inserted literally
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        assert!(ui.command_popup.is_some());
+        assert_eq!(ui.ui_state.input_buffer, "/st/");
+        assert_eq!(ui.command_popup.as_ref().unwrap().prefix, "st/");
+    }
+
+    // ─── Prefix sync + close conditions ─────────────────────────────────
+
+    #[test]
+    fn typing_letters_updates_prefix() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('s')));
+        ui.handle_keyboard_input(press(KeyCode::Char('t')));
+        assert_eq!(ui.command_popup.as_ref().unwrap().prefix, "st");
+    }
+
+    #[test]
+    fn backspace_past_slash_closes_popup() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('s')));
+        assert!(ui.command_popup.is_some());
+        // Backspace 's'
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert!(ui.command_popup.is_some(), "still open with just '/'");
+        // Backspace '/'
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert!(
+            ui.command_popup.is_none(),
+            "popup closes when '/' is removed"
+        );
+        assert_eq!(ui.ui_state.input_buffer, "");
+    }
+
+    #[test]
+    fn typing_space_closes_popup() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('l')));
+        ui.handle_keyboard_input(press(KeyCode::Char('o')));
+        ui.handle_keyboard_input(press(KeyCode::Char('a')));
+        ui.handle_keyboard_input(press(KeyCode::Char('d')));
+        // Space → enters args region → popup closes
+        ui.handle_keyboard_input(press(KeyCode::Char(' ')));
+        assert!(
+            ui.command_popup.is_none(),
+            "popup closes when user types space (args region)"
+        );
+        assert_eq!(ui.ui_state.input_buffer, "/load ");
+    }
+
+    #[test]
+    fn shift_enter_closes_popup_and_inserts_newline() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('s')));
+        ui.handle_keyboard_input(press_with(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert!(ui.command_popup.is_none());
+        assert_eq!(ui.ui_state.input_buffer, "/s\n");
+    }
+
+    // ─── Navigation ──────────────────────────────────────────────────────
+
+    #[test]
+    fn down_arrow_advances_selection_when_popup_open() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        assert_eq!(ui.command_popup.as_ref().unwrap().selected_index, 0);
+        ui.handle_keyboard_input(press(KeyCode::Down));
+        assert_eq!(ui.command_popup.as_ref().unwrap().selected_index, 1);
+    }
+
+    #[test]
+    fn up_arrow_clamps_at_zero_when_popup_open() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Up)); // clamps at 0
+        assert_eq!(ui.command_popup.as_ref().unwrap().selected_index, 0);
+    }
+
+    #[test]
+    fn arrows_when_popup_closed_navigate_input_lines() {
+        // Up/Down should NOT be intercepted when popup is closed —
+        // they must still act as the existing line-nav keys.
+        let (mut ui, _rx) = harness();
+        // Buffer: "ab\ncd" with cursor at end (pos=5 on "d")
+        ui.ui_state.insert_char('a');
+        ui.ui_state.insert_char('b');
+        ui.ui_state.insert_newline();
+        ui.ui_state.insert_char('c');
+        ui.ui_state.insert_char('d');
+        let before = ui.ui_state.cursor_pos;
+        ui.handle_keyboard_input(press(KeyCode::Up));
+        assert!(
+            ui.ui_state.cursor_pos < before,
+            "Up should move cursor up a line when popup closed"
+        );
+    }
+
+    // ─── Completion (Tab) and Run (Enter) ────────────────────────────────
+
+    #[test]
+    fn tab_completes_no_args_command() {
+        let (mut ui, mut rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('s')));
+        ui.handle_keyboard_input(press(KeyCode::Char('t'))); // prefix "st" → /stats
+        ui.handle_keyboard_input(press(KeyCode::Tab));
+        assert!(ui.command_popup.is_none(), "tab closes popup");
+        assert_eq!(ui.ui_state.input_buffer, "/stats");
+        assert_eq!(
+            ui.ui_state.cursor_pos, 6,
+            "cursor moved to end of completion"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "tab must NOT send a UiAction — it only completes"
+        );
+    }
+
+    #[test]
+    fn tab_completes_takes_args_command_adds_space() {
+        let (mut ui, mut rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('l')));
+        ui.handle_keyboard_input(press(KeyCode::Char('o'))); // /load
+        ui.handle_keyboard_input(press(KeyCode::Tab));
+        assert!(ui.command_popup.is_none());
+        assert_eq!(ui.ui_state.input_buffer, "/load ");
+        assert_eq!(ui.ui_state.cursor_pos, 6);
+        assert!(rx.try_recv().is_err(), "tab never submits");
+    }
+
+    #[test]
+    fn enter_runs_no_args_command() {
+        let (mut ui, mut rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('s')));
+        ui.handle_keyboard_input(press(KeyCode::Char('t'))); // /stats
+        ui.handle_keyboard_input(press(KeyCode::Enter));
+        assert!(ui.command_popup.is_none());
+        // Buffer cleared after submit (same as regular Enter behaviour)
+        assert_eq!(ui.ui_state.input_buffer, "");
+        match rx.try_recv() {
+            Ok(UiAction::SendMessage(m)) => assert_eq!(m, "/stats"),
+            other => panic!("expected SendMessage(/stats), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enter_on_takes_args_command_does_not_send() {
+        let (mut ui, mut rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('l')));
+        ui.handle_keyboard_input(press(KeyCode::Char('o'))); // /load
+        ui.handle_keyboard_input(press(KeyCode::Enter));
+        assert!(ui.command_popup.is_none());
+        assert_eq!(ui.ui_state.input_buffer, "/load ");
+        assert_eq!(ui.ui_state.cursor_pos, 6);
+        assert!(
+            rx.try_recv().is_err(),
+            "enter on takes_args command must fill, not submit"
+        );
+    }
+
+    #[test]
+    fn esc_closes_popup_preserves_buffer() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('s')));
+        ui.handle_keyboard_input(press(KeyCode::Esc));
+        assert!(ui.command_popup.is_none());
+        assert_eq!(
+            ui.ui_state.input_buffer, "/s",
+            "Esc dismisses popup but keeps what user typed"
+        );
+    }
+
+    // ─── Direct CommandPopupState hooks (sanity) ─────────────────────────
+
+    #[test]
+    fn popup_state_starts_at_index_zero() {
+        let p = CommandPopupState::new(String::new());
+        assert_eq!(p.selected_index, 0);
+        assert_eq!(p.scroll_offset, 0);
     }
 }

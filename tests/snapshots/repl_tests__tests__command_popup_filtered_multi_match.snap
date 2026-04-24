@@ -1,0 +1,24 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+┌ Commands ────────────────────────────────────────────────┐                    
+│  /context  Show context usage status                     │                    
+│  /compact  Force context compaction                      │                    
+│  /conversations  List saved conversations                │                    
+└───────────── ↑/↓ · Tab complete · Enter run · Esc cancel ┘
