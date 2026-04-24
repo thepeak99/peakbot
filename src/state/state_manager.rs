@@ -588,6 +588,23 @@ impl StateManager {
         self.state.read().unwrap().is_running
     }
 
+    /// Signal the UI to quit on its next tick (the `/exit` command path).
+    ///
+    /// Bypasses the Ctrl+C confirmation dialog — `/exit` is an explicit,
+    /// unconditional request. Idempotent: calling twice is harmless.
+    /// Notifies subscribers so the View's skip-idle-tick guard wakes up
+    /// and observes the flag.
+    pub fn request_exit(&self) {
+        let mut state = self.state.write().unwrap();
+        state.exit_requested = true;
+        self.notify_update(&state);
+    }
+
+    /// Whether an exit has been requested (Views read this each tick).
+    pub fn exit_requested(&self) -> bool {
+        self.state.read().unwrap().exit_requested
+    }
+
     /// Update chat state entirely
     pub fn update_chat_state(&self, chat_state: ChatState) {
         let mut state = self.state.write().unwrap();
@@ -1548,6 +1565,43 @@ mod tests {
         assert!(
             second > first,
             "second run start must be strictly after the first"
+        );
+    }
+
+    // ─── /exit command: StateManager-side signal ─────────────────────────
+    //
+    // `/exit` can't call `ReplUi::running = false` directly — the command
+    // dispatcher runs in the agent loop, not the view. Instead it sets
+    // `AppState.exit_requested = true`, which the view observes on its
+    // next tick and uses to break its run loop. Same pattern as
+    // `is_running`: state lives in the Model, Views react.
+
+    #[test]
+    fn exit_requested_defaults_to_false() {
+        let sm = StateManager::new();
+        assert!(!sm.get_state().exit_requested);
+        assert!(!sm.exit_requested());
+    }
+
+    #[test]
+    fn request_exit_sets_the_flag() {
+        let sm = StateManager::new();
+        sm.request_exit();
+        assert!(sm.get_state().exit_requested);
+        assert!(sm.exit_requested());
+    }
+
+    #[test]
+    fn request_exit_notifies_subscribers() {
+        // The REPL's skip-idle-tick guard only redraws on revision bumps
+        // or local_dirty. If request_exit didn't notify, the view could
+        // stay parked in its idle branch and never observe the flag.
+        let sm = StateManager::new();
+        let before = sm.revision();
+        sm.request_exit();
+        assert!(
+            sm.revision() > before,
+            "request_exit must bump revision so the UI wakes up"
         );
     }
 

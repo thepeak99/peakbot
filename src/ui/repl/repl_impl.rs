@@ -1210,6 +1210,15 @@ impl Ui for ReplUi {
         let mut events = EventStream::new();
         let mut ticks = time::interval(Duration::from_millis(50));
         while self.running {
+            // /exit path: the command handler sets `AppState.exit_requested`
+            // via `StateManager::request_exit()`. We observe it on each
+            // iteration and break out — no confirmation dialog, no banner,
+            // just stop. Checked BEFORE `select!` so a pending keystroke
+            // can't stall the shutdown.
+            if self.state_manager.exit_requested() {
+                self.running = false;
+                break;
+            }
             tokio::select! {
                 // Handle keyboard events via tokio::select!
                 e = events.next() => {

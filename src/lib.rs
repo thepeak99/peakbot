@@ -647,6 +647,26 @@ impl AgentRunner {
                 // These commands return data that UI can access via StateManager
                 // No system message needed — UI pulls this data
             }
+            "/exit" => {
+                // No-confirmation quit. Bypasses the Ctrl+C confirmation
+                // dialog on purpose — /exit is an explicit request.
+                //
+                // Cannot flip `ReplUi::running` directly from here (we're
+                // in the agent loop), so we set `AppState.exit_requested`
+                // via StateManager. The view observes it each tick and
+                // breaks its run loop. See `request_exit` docs.
+                //
+                // No system banner: the terminal is about to be cleared
+                // by `ReplUi::shutdown` and any flash of text would be
+                // pointless noise. If you *want* a visible "Goodbye",
+                // add an `add_system_message` here — but honestly, the
+                // cleanest exit is a silent one.
+                if let Some(sm) = state_manager {
+                    sm.request_exit();
+                } else {
+                    tracing::warn!("State manager not available for /exit command");
+                }
+            }
             "/help" => {
                 // Derive the help text from `builtin_commands()` so the popup
                 // menu, the dispatcher, and /help stay in lockstep.
@@ -1344,6 +1364,63 @@ mod tests {
             "banner should mention the reset; got {:?}",
             system_msgs[0].content
         );
+    }
+
+    // --- /exit handler tests ------------------------------------------------
+    //
+    // /exit must signal the view to quit WITHOUT the Ctrl+C confirmation
+    // dialog. Since the dispatcher runs in the agent loop and can't
+    // touch ReplUi directly, it sets an AppState flag the view polls.
+    // The view-side wiring (ReplUi reads the flag and sets running=false)
+    // is covered by repl_impl tests; here we pin the dispatcher contract.
+
+    #[tokio::test]
+    async fn exit_command_sets_exit_requested_flag() {
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        assert!(
+            !sm.exit_requested(),
+            "precondition: no exit request in a fresh state"
+        );
+
+        AgentRunner::process_command_internal("/exit", &Some(sm.clone()), &config).await;
+
+        assert!(
+            sm.exit_requested(),
+            "/exit must flip the exit_requested flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_command_does_not_clear_chat_or_stats() {
+        // /exit leaves the world as-is — no "Goodbye" banner, no stats
+        // reset, no chat clear. The REPL is about to tear down; extra
+        // writes would just flash before the screen is cleared.
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        sm.add_user_message("keep me".to_string());
+        sm.add_assistant_message("and me".to_string());
+        {
+            let stats_arc = sm.stats_arc();
+            let mut stats = stats_arc.lock().unwrap();
+            stats.total_input_tokens = 42;
+            stats.total_cost = 0.01;
+        }
+        let msgs_before = sm.get_state().chat.messages.len();
+
+        AgentRunner::process_command_internal("/exit", &Some(sm.clone()), &config).await;
+
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            msgs_before,
+            "/exit must not touch chat messages"
+        );
+        let stats_arc = sm.stats_arc();
+        let stats = stats_arc.lock().unwrap();
+        assert_eq!(stats.total_input_tokens, 42, "/exit must not reset stats");
+        assert_eq!(stats.total_cost, 0.01, "/exit must not reset cost");
     }
 
     // --- Submission routing tests -------------------------------------------

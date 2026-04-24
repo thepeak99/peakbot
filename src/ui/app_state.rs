@@ -66,6 +66,17 @@ pub struct AppState {
     /// millis — do NOT pre-build that bridge.
     #[serde(skip)]
     pub run_started_at: Option<std::time::Instant>,
+
+    /// Signal that the view should quit on its next tick.
+    ///
+    /// Written by the `/exit` command handler (which runs in the agent
+    /// loop, far from the View), read by the View's run loop. Once set,
+    /// it never goes back to false — the process is on its way out.
+    ///
+    /// This intentionally bypasses the Ctrl+C confirmation dialog; the
+    /// user asked for an exit, they get an exit.
+    #[serde(default)]
+    pub exit_requested: bool,
 }
 
 impl AppState {
