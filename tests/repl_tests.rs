@@ -136,7 +136,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -161,7 +161,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -186,7 +186,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -211,7 +211,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -236,7 +236,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -356,7 +356,7 @@ mod tests {
                 .split(f.area());
             // Scroll position 0 = showing top of content
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -385,7 +385,7 @@ mod tests {
                 .split(f.area());
             // Scroll position 5 = showing middle of content
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 5, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 5, 5, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -414,7 +414,7 @@ mod tests {
                 .split(f.area());
             // Max scroll = 15 messages - 8 visible = 7 (show last messages)
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 8, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 8, 8, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -465,7 +465,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -501,7 +501,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -1072,5 +1072,143 @@ mod tests {
         let popup = CommandPopupState::new("l".to_string());
         let lines = snapshot_popup(&popup);
         assert_snapshot!("command_popup_takes_args_hint", lines.join("\n"));
+    }
+
+    // === Chat Scrollbar Tests ===
+
+    /// The scrollbar thumb position must be driven by the GLOBAL scroll
+    /// offset into the full transcript, not by the paragraph-local
+    /// `inner_scroll` (which is an offset into the first visible message
+    /// and is bounded by one message's wrapped height).
+    ///
+    /// Bug being pinned (2026-04-24): since commit `3b3149e` landed the
+    /// viewport render cache, `render_chat_history` took a single `scroll`
+    /// parameter that was passed `view.inner_scroll` and then used both
+    /// for `paragraph.scroll(...)` AND for `ScrollbarState::position(...)`.
+    /// With `inner_scroll` always small, the thumb was stuck near the
+    /// top in long conversations.
+    ///
+    /// Post-fix contract: `render_chat_history` takes TWO scroll args —
+    /// `global_scroll` (for the scrollbar thumb) and `paragraph_scroll`
+    /// (for the Paragraph inside the bordered block). This test exercises
+    /// the new signature; with the old one, it fails to compile (which
+    /// is a valid red state).
+    #[test]
+    fn render_chat_history_scrollbar_tracks_global_not_inner_scroll() {
+        use ratatui::{
+            text::Text,
+            widgets::{Block, Borders, Paragraph, Wrap},
+        };
+
+        const HEIGHT: u16 = 20;
+        const CONTENT_HEIGHT: u16 = 1000;
+        let global_scroll: u16 = 500; // halfway through a 1000-line transcript
+        let paragraph_scroll: u16 = 3; // tiny offset inside first visible msg
+
+        let backend = TestBackend::new(40, HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // A minimal paragraph stand-in: the scrollbar column doesn't depend
+        // on what's rendered to the left of it. Block mimics the chat block.
+        let paragraph = Paragraph::new(Text::from("line".repeat(10)))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL));
+
+        terminal
+            .draw(|f| {
+                ReplUi::render_chat_history(
+                    f,
+                    f.area(),
+                    global_scroll,
+                    paragraph_scroll,
+                    paragraph,
+                    CONTENT_HEIGHT,
+                );
+            })
+            .unwrap();
+
+        // Inspect the rightmost column (the scrollbar). Find the thumb row
+        // — ratatui 0.30's default thumb symbol is `█`.
+        let backend = terminal.backend();
+        let buf = backend.buffer();
+        let scrollbar_col = buf.area.width - 1;
+        let mut thumb_row: Option<u16> = None;
+        for row in 0..buf.area.height {
+            let cell = buf.cell((scrollbar_col, row)).unwrap();
+            if cell.symbol() == "█" {
+                thumb_row = Some(row);
+                break;
+            }
+        }
+        let thumb_row = thumb_row.expect(
+            "scrollbar thumb (█) must be rendered somewhere in the scrollbar column",
+        );
+
+        // global_scroll = 500 / content_length = 1000 → thumb belongs in
+        // the middle third of the 20-row column. Pre-fix the thumb sat
+        // at row 0–2 because `ScrollbarState.position = inner_scroll +
+        // area.height - 2` = 3 + 18 = 21 out of 1000, pinning it at the
+        // top.
+        assert!(
+            thumb_row >= 5 && thumb_row <= 14,
+            "thumb at row {thumb_row} (global_scroll=500/1000); \
+             expected middle of scrollbar column (rows 5..=14). \
+             Pre-fix this lived at rows 0–2."
+        );
+    }
+
+    /// Complements the prior test: at `global_scroll == 0` the thumb
+    /// must sit near the top of the scrollbar column. Pre-fix this
+    /// happened to pass (wrong reasons: the buggy formula yielded
+    /// `0 + area.height - 2 = 18 / 1000 ≈ top`). Post-fix it passes for
+    /// the RIGHT reason — `position = 0`.
+    #[test]
+    fn render_chat_history_scrollbar_at_top_when_global_scroll_zero() {
+        use ratatui::{
+            text::Text,
+            widgets::{Block, Borders, Paragraph, Wrap},
+        };
+
+        const HEIGHT: u16 = 20;
+        const CONTENT_HEIGHT: u16 = 1000;
+
+        let backend = TestBackend::new(40, HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let paragraph = Paragraph::new(Text::from("line"))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL));
+
+        terminal
+            .draw(|f| {
+                ReplUi::render_chat_history(
+                    f,
+                    f.area(),
+                    /* global_scroll   */ 0,
+                    /* paragraph_scroll*/ 0,
+                    paragraph,
+                    CONTENT_HEIGHT,
+                );
+            })
+            .unwrap();
+
+        let backend = terminal.backend();
+        let buf = backend.buffer();
+        let scrollbar_col = buf.area.width - 1;
+        let mut thumb_row: Option<u16> = None;
+        for row in 0..buf.area.height {
+            let cell = buf.cell((scrollbar_col, row)).unwrap();
+            if cell.symbol() == "█" {
+                thumb_row = Some(row);
+                break;
+            }
+        }
+        let thumb_row =
+            thumb_row.expect("scrollbar thumb (█) must be rendered in the scrollbar column");
+
+        assert!(
+            thumb_row <= 3,
+            "at global_scroll=0 thumb must sit near top (row ≤ 3), got row {thumb_row}"
+        );
     }
 }

@@ -133,9 +133,20 @@ impl UiState {
         }
     }
 
-    /// Maximum scroll position (content height minus viewport height)
+    /// Maximum scroll position — the offset that bottom-aligns the last
+    /// content line with the last inner viewport row.
+    ///
+    /// `viewport_height` MUST be the inner content area height (outer
+    /// bordered chat block minus its 2 border rows — see the assignment
+    /// in `ReplUi::render`). The formula is then exact:
+    /// `content_height - viewport_height`.
+    ///
+    /// Pre-fix (2026-04-24 bug) this returned `content - viewport + 1`,
+    /// which bottom-aligned the *penultimate* line and left the last
+    /// chat line clipped under the block's bottom border forever.
+    /// See `chat_scroll_tests` below.
     pub fn max_scroll(&self) -> u16 {
-        self.content_height.saturating_sub(self.viewport_height) + 1
+        self.content_height.saturating_sub(self.viewport_height)
     }
 
     // ─── Input editor: single-char edits ──────────────────────────────────
@@ -426,15 +437,31 @@ impl ReplUi {
 
     /// Render the chat history area with scrollbar.
     ///
-    /// `content_height` is the total wrapped line count, passed in from the
-    /// caller so we don't recompute word-wrap here. The same value was
-    /// already computed by `render()` to drive scrolling/layout — previously
-    /// we re-ran `paragraph.line_count(width)` in this function, duplicating
-    /// O(N·M·W) work on every frame. See `slow-messages.md`.
+    /// **Two distinct scroll values are needed** because the transcript
+    /// cache only builds a viewport-sized paragraph:
+    ///
+    /// - `global_scroll` — offset into the FULL transcript, in wrapped
+    ///   lines. Drives the scrollbar thumb only. Range `0..=max_scroll`.
+    /// - `paragraph_scroll` — offset into the local `paragraph`, which
+    ///   starts at the first visible message's boundary. Range
+    ///   `0..wrapped_counts[first_visible_message]`. Fed into
+    ///   `Paragraph::scroll`.
+    ///
+    /// Pre-fix (2026-04-24 bug): this function took a single `scroll`
+    /// parameter used for both jobs. After commit `3b3149e` landed the
+    /// O(viewport) cache, callers passed `view.inner_scroll` —
+    /// correct for `Paragraph::scroll` but tiny (bounded by one
+    /// message's wrapped height), so the scrollbar thumb got stuck near
+    /// the top in long conversations.
+    ///
+    /// `content_height` is the total wrapped line count — same value
+    /// the render loop feeds into `UiState.content_height`. Passed in
+    /// so we don't re-run word-wrap here (see `slow-messages.md`).
     pub fn render_chat_history(
         f: &mut ratatui::Frame,
         area: Rect,
-        scroll: u16,
+        global_scroll: u16,
+        paragraph_scroll: u16,
         paragraph: Paragraph,
         content_height: u16,
     ) {
@@ -446,10 +473,10 @@ impl ReplUi {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
         let mut scroll_state = ScrollbarState::new(content_height as usize)
-            .position((scroll + area.height - 2) as usize);
+            .position(global_scroll as usize);
         f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state);
 
-        let scrolled = paragraph.scroll((scroll, 0));
+        let scrolled = paragraph.scroll((paragraph_scroll, 0));
         f.render_widget(scrolled, chunks[0]);
     }
 
@@ -833,7 +860,7 @@ impl ReplUi {
                     // `slow-messages.md` §4.1.
                     self.chat_cache.sync(&state.chat.messages, chat_wrap_width);
 
-                    self.ui_state.viewport_height = chunks[0].height;
+                    self.ui_state.viewport_height = chunks[0].height.saturating_sub(2);
                     self.ui_state.content_height =
                         self.chat_cache.total_height().min(u16::MAX as u32) as u16;
 
@@ -869,7 +896,8 @@ impl ReplUi {
                     Self::render_chat_history(
                         f,
                         chunks[0],
-                        view.inner_scroll,
+                        /* global_scroll    */ scroll,
+                        /* paragraph_scroll */ view.inner_scroll,
                         chat_history,
                         self.ui_state.content_height,
                     );
@@ -1617,6 +1645,71 @@ mod multiline_input_tests {
         // either 0 or 1 is acceptable; pin down the "end of previous row"
         // reading which is what ratatui's line_count returns.
         assert_eq!(ReplUi::cursor_visual_row(&long, 10, 10), 0);
+    }
+}
+
+#[cfg(test)]
+mod chat_scroll_tests {
+    //! Test-first specs for the chat-viewport scroll math.
+    //!
+    //! Pins down two post-fix contracts (see memory.md entry
+    //! 2026-04-24 "scrollbar + last-line-hidden diagnosis"):
+    //!
+    //!   1. `UiState::viewport_height` stores the INNER chat content
+    //!      area (outer bordered block height minus the 2 border rows).
+    //!   2. `UiState::max_scroll()` returns exactly
+    //!      `content_height - viewport_height` — no `+1`, no off-by-one.
+    //!
+    //! Pre-fix behaviour: `viewport_height` was the outer bordered area
+    //! and `max_scroll` returned `content - viewport + 1`, so the last
+    //! chat line was clipped under the bottom border forever.
+    //!
+    //! Scrollbar-position contract (the sibling regression) is pinned
+    //! by an integration test in `tests/repl_tests.rs` since it needs a
+    //! `TestBackend` frame.
+    use super::*;
+
+    #[test]
+    fn max_scroll_is_content_minus_inner_viewport_no_plus_one() {
+        let mut s = UiState::new();
+        s.content_height = 100;
+        s.viewport_height = 28; // inner content area (outer bordered block was 30)
+        assert_eq!(
+            s.max_scroll(),
+            72,
+            "max_scroll must be C - V (no +1). Pre-fix returned 73."
+        );
+    }
+
+    #[test]
+    fn max_scroll_saturates_to_zero_when_content_fits_viewport() {
+        // When all content fits inside the inner viewport, there is
+        // nothing to scroll and max_scroll must be 0. Pre-fix the `+1`
+        // returned 1 here, which let `auto_scroll` push the content
+        // down by one row and hide the top line for free.
+        let mut s = UiState::new();
+        s.content_height = 10;
+        s.viewport_height = 30;
+        assert_eq!(s.max_scroll(), 0, "content fits → nothing to scroll");
+    }
+
+    #[test]
+    fn max_scroll_plus_viewport_covers_content_exactly() {
+        // Invariant: scrolling to `max_scroll` lands the last content
+        // line on the last inner viewport row. That requires
+        // `max_scroll + viewport_height == content_height` whenever
+        // content overflows. Pre-fix this equalled `content + 1`,
+        // overshooting — which also hid the last line because
+        // Paragraph::scroll skipped one extra row past where content
+        // ends.
+        let mut s = UiState::new();
+        s.content_height = 50;
+        s.viewport_height = 10;
+        assert_eq!(
+            s.max_scroll() + s.viewport_height,
+            s.content_height,
+            "max_scroll must bottom-align the final line exactly"
+        );
     }
 }
 

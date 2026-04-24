@@ -5,9 +5,9 @@ expression: "lines.join(\"\\n\")"
 ┌ Chat Messages ──────────────────────────────────────────┐▲
 │[12:00:00] 👤  User: Message 9                            │║
 │[12:00:00] 👤  User: Message 10                           │║
-│[12:00:00] 👤  User: Message 11                           │║
-│[12:00:00] 👤  User: Message 12                           │║
+│[12:00:00] 👤  User: Message 11                           │█
+│[12:00:00] 👤  User: Message 12                           │█
 │[12:00:00] 👤  User: Message 13                           │█
-│[12:00:00] 👤  User: Message 14                           │█
-│[12:00:00] 👤  User: Message 15                           │█
+│[12:00:00] 👤  User: Message 14                           │║
+│[12:00:00] 👤  User: Message 15                           │║
 └───────────────────────────── Ctrl+C exit · Ctrl+T tasks ┘▼
