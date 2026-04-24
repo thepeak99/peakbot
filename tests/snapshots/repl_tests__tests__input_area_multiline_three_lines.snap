@@ -3,5 +3,8 @@ source: tests/repl_tests.rs
 expression: "lines.join(\"\\n\")"
 ---
 ┌ Input ───────────────────────────────────────────────────┐
-│💬  Message...                                             │
+│> first                                                   │
+│se█cond                                                   │
+│third                                                     │
+│                                                          │
 └────────────────── Shift/Alt+Enter: newline · Enter: send ┘

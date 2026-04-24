@@ -6,4 +6,4 @@ expression: "lines.join(\"\\n\")"
 │> █This is a very long input that will wrap to multiple   │
 │lines                                                     │
 │                                                          │
-└──────────────────────────────────────────────────────────┘
+└────────────────── Shift/Alt+Enter: newline · Enter: send ┘
