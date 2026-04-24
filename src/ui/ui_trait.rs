@@ -97,6 +97,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("export", "Export a conversation (json|markdown)", true),
         SlashCommand::new("rename", "Rename the current conversation", true),
         SlashCommand::new("stop", "Stop the agent (interrupt current task)", false),
+        SlashCommand::new("exit", "Quit PeakBot (no confirmation)", false),
     ]
 }
 
@@ -199,6 +200,7 @@ mod tests {
                 "export",
                 "rename",
                 "stop",
+                "exit",
             ],
         );
     }
@@ -223,6 +225,7 @@ mod tests {
         assert!(!by_name("new"));
         assert!(!by_name("save"));
         assert!(!by_name("stop"));
+        assert!(!by_name("exit"));
         // Arg-taking commands — dispatcher uses `starts_with("/name ")`
         assert!(by_name("load"));
         assert!(by_name("delete"));
@@ -234,11 +237,26 @@ mod tests {
     fn builtin_commands_no_phantom_entries() {
         // These were in the old list but have no handler anywhere.
         // See allehailmenu.md §4.
+        //
+        // NOTE: /exit used to be on this list too, but was implemented
+        // 2026-04-24 as a no-confirmation quit alongside the Ctrl+C
+        // confirm-dialog path. /quit stays phantom — it's redundant with
+        // /exit and we're not picking two aliases for the same thing.
         let cmds = builtin_commands();
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
         assert!(!names.contains(&"clear"), "/clear has no handler");
-        assert!(!names.contains(&"exit"), "/exit has no handler — Ctrl+C quits");
-        assert!(!names.contains(&"quit"), "/quit has no handler — Ctrl+C quits");
+        assert!(!names.contains(&"quit"), "/quit has no handler — use /exit");
+    }
+
+    #[test]
+    fn builtin_commands_includes_exit_with_handler() {
+        // Pin the inverse of the old phantom assertion: /exit MUST be in
+        // the list because it has a live dispatcher arm. If this ever
+        // flips back (command removed), the popup and /help will silently
+        // stop advertising a working command.
+        let cmds = builtin_commands();
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"exit"), "/exit must be in the popup list");
     }
 
     #[test]
