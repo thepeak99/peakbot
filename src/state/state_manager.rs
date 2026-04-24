@@ -632,13 +632,6 @@ impl StateManager {
         self.notify_update(&state);
     }
 
-    /// Set command popup state
-    pub fn set_command_popup(&self, popup: Option<crate::ui::ui_trait::CommandPopupState>) {
-        let mut state = self.state.write().unwrap();
-        state.command_popup = popup;
-        self.notify_update(&state);
-    }
-
     /// Set agent status message (e.g., "Compacting...", "Stopped")
     pub fn set_status(&self, message: Option<String>) {
         let mut state = self.state.write().unwrap();

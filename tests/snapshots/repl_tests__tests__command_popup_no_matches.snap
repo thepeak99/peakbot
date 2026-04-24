@@ -1,0 +1,24 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+┌ Commands ────────────────────────────────────────────────┐                    
+│  (no matching commands)                                  │                    
+└───────────── ↑/↓ · Tab complete · Enter run · Esc cancel ┘

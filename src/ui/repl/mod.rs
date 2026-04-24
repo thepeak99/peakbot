@@ -2,6 +2,7 @@
 //!
 //! This module wraps the existing REPL as a Ui trait implementation (View in MVC).
 
+pub mod command_popup;
 pub mod message_renderer;
 pub mod render_cache;
 pub mod repl_impl;

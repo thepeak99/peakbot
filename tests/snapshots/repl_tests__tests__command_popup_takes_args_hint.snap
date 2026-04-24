@@ -1,0 +1,24 @@
+---
+source: tests/repl_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+┌ Commands ────────────────────────────────────────────────┐                    
+│  /load <args>  Load a conversation by id                 │                    
+└───────────── ↑/↓ · Tab complete · Enter run · Esc cancel ┘

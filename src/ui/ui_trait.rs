@@ -28,26 +28,13 @@ pub trait Ui: Send + 'static {
 /// User input actions — flow from View to Controller
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UiAction {
-    /// Send a message to the agent
+    /// Send a message to the agent, or — if the text starts with `/` —
+    /// a slash command to be dispatched internally. The event loop in
+    /// `AgentRunner` classifies via `classify_submission`.
     SendMessage(String),
 
-    /// Execute a slash command (e.g., /stats, /context)
-    ExecuteCommand(String),
-
-    /// Request the agent to stop
+    /// Request the agent to stop (Esc key).
     RequestStop,
-
-    /// Exit the application
-    Exit,
-}
-
-/// TUI-local actions — handled directly by the TUI View, never sent to Controller
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum TuiAction {
-    CancelPopup,
-    SelectPopupItem,
-    NavigatePopup(i32),
-    ToggleTodoPanel,
 }
 
 /// Actions that can be performed on a TODO item (used by TodoState in app_state)
@@ -82,18 +69,34 @@ impl SlashCommand {
     }
 }
 
-/// Get built-in slash commands
+/// Get built-in slash commands.
+///
+/// This list is the **single source of truth** for:
+/// - the autocomplete popup in the REPL,
+/// - the `/help` handler in `lib.rs::process_command_internal`,
+/// - and the dispatcher arms in the same file.
+///
+/// If you add a command here, add a dispatcher arm. If you remove one from
+/// the dispatcher, remove it here. The ordering is what the popup shows on
+/// an empty prefix — keep the most commonly-used commands near the top.
+///
+/// See `allehailmenu.md` §4 for the reasoning behind this specific list.
 pub fn builtin_commands() -> Vec<SlashCommand> {
     vec![
+        SlashCommand::new("help", "List available commands", false),
         SlashCommand::new("stats", "Show session statistics (tokens, cost)", false),
         SlashCommand::new("context", "Show context usage status", false),
         SlashCommand::new("compact", "Force context compaction", false),
         SlashCommand::new("conversations", "List saved conversations", false),
-        SlashCommand::new("help", "Show available commands", false),
-        SlashCommand::new("clear", "Clear chat history", false),
+        SlashCommand::new("history", "Show conversation history", false),
+        SlashCommand::new("reset", "Reset session statistics", false),
+        SlashCommand::new("new", "Start a new conversation", false),
+        SlashCommand::new("save", "Save the current conversation", false),
+        SlashCommand::new("load", "Load a conversation by id", true),
+        SlashCommand::new("delete", "Delete a conversation by id", true),
+        SlashCommand::new("export", "Export a conversation (json|markdown)", true),
+        SlashCommand::new("rename", "Rename the current conversation", true),
         SlashCommand::new("stop", "Stop the agent (interrupt current task)", false),
-        SlashCommand::new("exit", "Exit the application", false),
-        SlashCommand::new("quit", "Exit the application", false),
     ]
 }
 
@@ -162,5 +165,103 @@ impl CommandPopupState {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the exact set of built-in slash commands. The popup UI, the
+    /// `/help` handler, and the dispatcher in `lib.rs::process_command_internal`
+    /// all read from this list. If a command is added/removed/reordered,
+    /// this test fails loudly so we remember to update the dispatcher too.
+    ///
+    /// See `allehailmenu.md` §4 for the reality-check that produced this list.
+    #[test]
+    fn builtin_commands_exact_list_and_order() {
+        let cmds = builtin_commands();
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "help",
+                "stats",
+                "context",
+                "compact",
+                "conversations",
+                "history",
+                "reset",
+                "new",
+                "save",
+                "load",
+                "delete",
+                "export",
+                "rename",
+                "stop",
+            ],
+        );
+    }
+
+    #[test]
+    fn builtin_commands_takes_args_flags_match_dispatcher() {
+        let cmds = builtin_commands();
+        let by_name = |n: &str| -> bool {
+            cmds.iter()
+                .find(|c| c.name == n)
+                .expect("command in list")
+                .takes_args
+        };
+        // No-arg commands — process_command_internal dispatches on exact match
+        assert!(!by_name("help"));
+        assert!(!by_name("stats"));
+        assert!(!by_name("context"));
+        assert!(!by_name("compact"));
+        assert!(!by_name("conversations"));
+        assert!(!by_name("history"));
+        assert!(!by_name("reset"));
+        assert!(!by_name("new"));
+        assert!(!by_name("save"));
+        assert!(!by_name("stop"));
+        // Arg-taking commands — dispatcher uses `starts_with("/name ")`
+        assert!(by_name("load"));
+        assert!(by_name("delete"));
+        assert!(by_name("export"));
+        assert!(by_name("rename"));
+    }
+
+    #[test]
+    fn builtin_commands_no_phantom_entries() {
+        // These were in the old list but have no handler anywhere.
+        // See allehailmenu.md §4.
+        let cmds = builtin_commands();
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert!(!names.contains(&"clear"), "/clear has no handler");
+        assert!(!names.contains(&"exit"), "/exit has no handler — Ctrl+C quits");
+        assert!(!names.contains(&"quit"), "/quit has no handler — Ctrl+C quits");
+    }
+
+    #[test]
+    fn filtered_commands_empty_prefix_returns_all() {
+        let popup = CommandPopupState::new(String::new());
+        assert_eq!(popup.filtered_commands().len(), builtin_commands().len());
+    }
+
+    #[test]
+    fn filtered_commands_prefix_filters_by_starts_with() {
+        let popup = CommandPopupState::new("c".to_string());
+        let names: Vec<String> = popup
+            .filtered_commands()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        // "c" matches: context, compact, conversations
+        assert_eq!(names, vec!["context", "compact", "conversations"]);
+    }
+
+    #[test]
+    fn filtered_commands_no_matches_returns_empty() {
+        let popup = CommandPopupState::new("zzz".to_string());
+        assert!(popup.filtered_commands().is_empty());
     }
 }

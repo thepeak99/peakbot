@@ -1002,4 +1002,75 @@ mod tests {
         let cancelled = TodoStatus::Cancelled;
         assert_eq!(cancelled.to_string(), "cancelled");
     }
+
+    // === Command Popup Snapshot Tests ===
+    //
+    // See `allehailmenu.md` §6 (rendering contract).
+    //
+    // The popup is rendered via `render_command_popup(f, input_area, popup)`.
+    // We anchor a "pseudo input area" low on the test terminal so the popup
+    // sits in a predictable place.
+
+    use peakbot::ui::repl::command_popup::render_command_popup;
+    use peakbot::ui::ui_trait::CommandPopupState;
+    use ratatui::layout::Rect;
+
+    /// Helper: render the popup into a test terminal and return the buffer
+    /// lines. The `input_area` is anchored at y=20 so the popup sits above
+    /// it, fully visible on a 24-row terminal.
+    fn snapshot_popup(popup: &CommandPopupState) -> Vec<String> {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            let input_area = Rect::new(0, 20, 80, 3);
+            render_command_popup(f, input_area, popup);
+        });
+        buffer_to_lines(terminal.backend())
+    }
+
+    #[test]
+    fn command_popup_just_opened() {
+        let popup = CommandPopupState::new(String::new());
+        let lines = snapshot_popup(&popup);
+        assert_snapshot!("command_popup_just_opened", lines.join("\n"));
+    }
+
+    #[test]
+    fn command_popup_filtered_single_match() {
+        let popup = CommandPopupState::new("stat".to_string());
+        let lines = snapshot_popup(&popup);
+        assert_snapshot!("command_popup_filtered_single_match", lines.join("\n"));
+    }
+
+    #[test]
+    fn command_popup_filtered_multi_match() {
+        // "c" matches: context, compact, conversations
+        let popup = CommandPopupState::new("c".to_string());
+        let lines = snapshot_popup(&popup);
+        assert_snapshot!("command_popup_filtered_multi_match", lines.join("\n"));
+    }
+
+    #[test]
+    fn command_popup_no_matches() {
+        let popup = CommandPopupState::new("xyz".to_string());
+        let lines = snapshot_popup(&popup);
+        assert_snapshot!("command_popup_no_matches", lines.join("\n"));
+    }
+
+    #[test]
+    fn command_popup_selected_second() {
+        let mut popup = CommandPopupState::new(String::new());
+        popup.navigate_down();
+        let lines = snapshot_popup(&popup);
+        assert_snapshot!("command_popup_selected_second", lines.join("\n"));
+    }
+
+    #[test]
+    fn command_popup_takes_args_hint() {
+        // `l` filters to /load (takes_args=true); popup should show the
+        // "<args>" hint on that row.
+        let popup = CommandPopupState::new("l".to_string());
+        let lines = snapshot_popup(&popup);
+        assert_snapshot!("command_popup_takes_args_hint", lines.join("\n"));
+    }
 }

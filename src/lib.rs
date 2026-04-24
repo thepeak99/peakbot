@@ -66,6 +66,38 @@ enum QueueMessage {
     StopMarker, // Signals that stop was requested
 }
 
+/// How should a submitted input buffer be routed by the event loop?
+///
+/// The REPL emits every Enter-submission as `UiAction::SendMessage(msg)` —
+/// the popup path and the plain-typed path go through the same action.
+/// `classify_submission` is the single chokepoint that decides whether the
+/// text is a slash command (dispatched internally) or a user turn (sent to
+/// the LLM).
+///
+/// Regression guard: before this existed, every slash command (`/new`,
+/// `/help`, …) was appended as a user message and billed as an LLM turn.
+/// See `allehailmenu.md`.
+#[derive(Debug, PartialEq, Eq)]
+enum SubmitKind {
+    /// `/stop` — interrupts the running agent instead of queueing.
+    StopCommand,
+    /// Any other `/xxx` — routed to `process_command_internal`.
+    Command,
+    /// Plain chat content — sent to the LLM.
+    UserMessage,
+}
+
+fn classify_submission(msg: &str) -> SubmitKind {
+    let trimmed = msg.trim();
+    if trimmed == "/stop" {
+        SubmitKind::StopCommand
+    } else if trimmed.starts_with('/') {
+        SubmitKind::Command
+    } else {
+        SubmitKind::UserMessage
+    }
+}
+
 /// Completion result sent from agent loop back to event loop
 #[derive(Clone)]
 enum CompletionResult {
@@ -357,33 +389,34 @@ impl AgentRunner {
         while let Some(action) = action_receiver.recv().await {
             match action {
                 UiAction::SendMessage(msg) => {
-                    // Add user message to chat AND persist (StateManager handles persistence)
-                    if let Some(ref sm) = state_manager {
-                        sm.add_user_message(msg.clone());
-                    }
-
-                    // If agent is running, interrupt it first
-                    if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
-                        session_hook.request_stop();
-                    }
-
-                    // Queue the new message for the agent
-                    msg_tx.send(QueueMessage::UserMessage(msg)).await.ok();
-                }
-
-                UiAction::ExecuteCommand(cmd) => {
-                    if cmd == "/stop" {
-                        // Only stop if agent is actually running
-                        if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
-                            session_hook.request_stop();
-                            msg_tx.send(QueueMessage::StopMarker).await.ok();
-                            if let Some(ref sm) = state_manager {
-                                sm.set_status(Some("Stop requested...".to_string()));
+                    // Route by shape of the text. Slash commands must NOT
+                    // be sent to the LLM, and must NOT be appended as user
+                    // messages — their handlers emit their own system
+                    // output. See `classify_submission` docs.
+                    match classify_submission(&msg) {
+                        SubmitKind::StopCommand => {
+                            if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
+                                session_hook.request_stop();
+                                msg_tx.send(QueueMessage::StopMarker).await.ok();
+                                if let Some(ref sm) = state_manager {
+                                    sm.set_status(Some("Stop requested...".to_string()));
+                                }
                             }
                         }
-                    } else {
-                        // Queue command for agent loop
-                        msg_tx.send(QueueMessage::Command(cmd)).await.ok();
+                        SubmitKind::Command => {
+                            // Dispatched by agent_loop via process_command_internal.
+                            msg_tx.send(QueueMessage::Command(msg)).await.ok();
+                        }
+                        SubmitKind::UserMessage => {
+                            if let Some(ref sm) = state_manager {
+                                sm.add_user_message(msg.clone());
+                            }
+                            // If agent is running, interrupt it first.
+                            if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
+                                session_hook.request_stop();
+                            }
+                            msg_tx.send(QueueMessage::UserMessage(msg)).await.ok();
+                        }
                     }
                 }
 
@@ -396,10 +429,6 @@ impl AgentRunner {
                             sm.set_status(Some("Stop requested...".to_string()));
                         }
                     }
-                }
-
-                UiAction::Exit => {
-                    break;
                 }
             }
         }
@@ -596,13 +625,58 @@ impl AgentRunner {
         let cmd_lower = cmd.to_lowercase();
 
         match cmd_lower.as_str() {
-            "/stats" | "/reset" | "/context" | "/compact" | "/conversations" | "/history" => {
+            // /reset was previously in the no-op arm below alongside /stats,
+            // /context, etc. with the comment "UI pulls this data". The fossil
+            // assumption was that the UI would notice the slash command and
+            // handle it itself — but nothing in the REPL does, so the command
+            // was silently inert. Per the derived-view-invalidation rule in
+            // memory.md (2026-04-24 /new bug), when a reset command is advertised
+            // in the popup as "Reset session statistics" (see
+            // `ui_trait::builtin_commands`), the handler must actually reset
+            // something visible to the user. /reset zeros the counters and keeps
+            // the conversation; /new is the one that clears chat history too.
+            "/reset" => {
+                if let Some(sm) = state_manager {
+                    sm.reset_stats();
+                    sm.add_system_message("Session statistics reset.".to_string());
+                } else {
+                    tracing::warn!("State manager not available for /reset command");
+                }
+            }
+            "/stats" | "/context" | "/compact" | "/conversations" | "/history" => {
                 // These commands return data that UI can access via StateManager
                 // No system message needed — UI pulls this data
             }
-            "/new" => {
-                // Create new conversation via StateManager (single source of truth)
+            "/help" => {
+                // Derive the help text from `builtin_commands()` so the popup
+                // menu, the dispatcher, and /help stay in lockstep.
+                // See `allehailmenu.md` §9.
                 if let Some(sm) = state_manager {
+                    let mut msg = String::from("Available commands:\n");
+                    for cmd in crate::ui::ui_trait::builtin_commands() {
+                        let args = if cmd.takes_args { " <args>" } else { "" };
+                        msg.push_str(&format!(
+                            "  /{}{} — {}\n",
+                            cmd.name, args, cmd.description
+                        ));
+                    }
+                    sm.add_system_message(msg);
+                } else {
+                    tracing::warn!("State manager not available for /help command");
+                }
+            }
+            "/new" => {
+                // Create new conversation via StateManager (single source of truth).
+                //
+                // `create_conversation` alone only swaps the current-conversation
+                // slot; the derived views (chat.messages, session stats) are
+                // untouched. Without also clearing them the agent's next turn
+                // still sees the prior history via `get_agent_history()` and
+                // the token/cost counters keep accumulating — i.e. /new would
+                // lie about starting fresh. Clear both explicitly.
+                if let Some(sm) = state_manager {
+                    sm.clear_chat();
+                    sm.reset_stats();
                     let name = format!(
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")
@@ -1034,6 +1108,312 @@ pub async fn load_mcp_servers(config: &Config) -> Result<Vec<McpServerHandle>> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // --- /help handler tests -------------------------------------------------
+
+    #[tokio::test]
+    async fn help_command_emits_system_message_listing_all_builtin_commands() {
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        AgentRunner::process_command_internal("/help", &Some(sm.clone()), &config).await;
+
+        let state = sm.get_state();
+        let system_msgs: Vec<_> = state
+            .chat
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, crate::ui::MessageRole::System))
+            .collect();
+        assert_eq!(
+            system_msgs.len(),
+            1,
+            "/help should produce exactly one system message"
+        );
+        let body = &system_msgs[0].content;
+
+        // Header
+        assert!(body.starts_with("Available commands:"));
+
+        // Every command in the list must appear in the help text
+        for cmd in crate::ui::ui_trait::builtin_commands() {
+            let needle = format!("/{}", cmd.name);
+            assert!(
+                body.contains(&needle),
+                "/help output missing command: {}",
+                needle
+            );
+            assert!(
+                body.contains(&cmd.description),
+                "/help output missing description for {}: {}",
+                needle,
+                cmd.description
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn help_command_marks_arg_taking_commands_with_args_placeholder() {
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        AgentRunner::process_command_internal("/help", &Some(sm.clone()), &config).await;
+
+        let state = sm.get_state();
+        let body = &state
+            .chat
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, crate::ui::MessageRole::System))
+            .expect("system message")
+            .content;
+
+        // Arg-taking commands should have " <args>" after their name
+        assert!(body.contains("/load <args>"));
+        assert!(body.contains("/delete <args>"));
+        assert!(body.contains("/export <args>"));
+        assert!(body.contains("/rename <args>"));
+
+        // No-arg commands must NOT have the placeholder
+        assert!(body.contains("/stats —") || body.contains("/stats"));
+        assert!(!body.contains("/stats <args>"));
+        assert!(!body.contains("/help <args>"));
+    }
+
+    // --- /new handler tests --------------------------------------------------
+    //
+    // Regression guard for the "/new doesn't actually start a new conversation"
+    // bug: `sm.create_conversation(...)` only swaps the current-conversation
+    // slot; without also clearing `chat.messages` and resetting stats, the
+    // agent's next turn still sees the old history (since `get_agent_history()`
+    // derives from `chat.messages`) and the token/cost counters keep climbing.
+
+    #[tokio::test]
+    async fn new_command_clears_chat_messages() {
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        // Seed a conversation with some user/assistant turns
+        sm.add_user_message("hello".to_string());
+        sm.add_assistant_message("hi there".to_string());
+        assert_eq!(sm.get_state().chat.messages.len(), 2);
+
+        AgentRunner::process_command_internal("/new", &Some(sm.clone()), &config).await;
+
+        // After /new, the only remaining message should be the "Started a new
+        // conversation." system banner — the prior user/assistant turns must
+        // be gone so the next prompt doesn't carry them into the agent.
+        let state = sm.get_state();
+        let non_system: Vec<_> = state
+            .chat
+            .messages
+            .iter()
+            .filter(|m| !matches!(m.role, crate::ui::MessageRole::System))
+            .collect();
+        assert!(
+            non_system.is_empty(),
+            "/new must clear user/assistant/tool messages; got {:?}",
+            non_system.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn new_command_resets_session_stats() {
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        // Seed the stats as if a request had happened
+        {
+            let stats_arc = sm.stats_arc();
+            let mut stats = stats_arc.lock().unwrap();
+            stats.total_input_tokens = 1234;
+            stats.total_output_tokens = 567;
+            stats.total_api_calls = 3;
+            stats.total_cost = 0.42;
+        }
+
+        AgentRunner::process_command_internal("/new", &Some(sm.clone()), &config).await;
+
+        let stats_arc = sm.stats_arc();
+        let stats = stats_arc.lock().unwrap();
+        assert_eq!(stats.total_input_tokens, 0, "/new must zero input tokens");
+        assert_eq!(stats.total_output_tokens, 0, "/new must zero output tokens");
+        assert_eq!(stats.total_api_calls, 0, "/new must zero api calls");
+        assert_eq!(stats.total_cost, 0.0, "/new must zero cost");
+    }
+
+    #[tokio::test]
+    async fn new_command_swaps_in_a_fresh_conversation() {
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        sm.create_conversation("old one".to_string(), "test-model".to_string());
+        let old_id = sm
+            .get_current_conversation_id()
+            .expect("seeded conversation");
+
+        AgentRunner::process_command_internal("/new", &Some(sm.clone()), &config).await;
+
+        let new_id = sm
+            .get_current_conversation_id()
+            .expect("/new must create a current conversation");
+        assert_ne!(new_id, old_id, "/new must produce a fresh conversation id");
+    }
+
+    // --- /reset handler tests -----------------------------------------------
+    //
+    // Regression guard for the "/reset is silently inert" bug: /reset used to
+    // sit in the fossil no-op match arm with a comment saying "UI pulls this
+    // data" — but nothing in the REPL handled it, so the counters stayed stuck.
+    // See memory.md derived-view-invalidation rule.
+
+    #[tokio::test]
+    async fn reset_command_zeros_session_stats() {
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        // Seed the stats as if some requests had happened
+        {
+            let stats_arc = sm.stats_arc();
+            let mut stats = stats_arc.lock().unwrap();
+            stats.total_input_tokens = 5000;
+            stats.total_output_tokens = 2000;
+            stats.total_api_calls = 7;
+            stats.total_cost = 1.23;
+        }
+
+        AgentRunner::process_command_internal("/reset", &Some(sm.clone()), &config).await;
+
+        let stats_arc = sm.stats_arc();
+        let stats = stats_arc.lock().unwrap();
+        assert_eq!(stats.total_input_tokens, 0, "/reset must zero input tokens");
+        assert_eq!(stats.total_output_tokens, 0, "/reset must zero output tokens");
+        assert_eq!(stats.total_api_calls, 0, "/reset must zero api calls");
+        assert_eq!(stats.total_cost, 0.0, "/reset must zero cost");
+    }
+
+    #[tokio::test]
+    async fn reset_command_preserves_chat_history() {
+        // /reset resets *stats only* — the conversation itself must survive.
+        // /new is the one that clears history. Keeping them orthogonal is the
+        // whole reason they're two commands.
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        sm.add_user_message("keep me".to_string());
+        sm.add_assistant_message("and me".to_string());
+        let before = sm.get_state().chat.messages.len();
+
+        AgentRunner::process_command_internal("/reset", &Some(sm.clone()), &config).await;
+
+        let after_msgs = sm.get_state().chat.messages;
+        // The two seeded messages must still be there (plus one new system
+        // banner confirming the reset).
+        let user_and_assistant: Vec<_> = after_msgs
+            .iter()
+            .filter(|m| !matches!(m.role, crate::ui::MessageRole::System))
+            .collect();
+        assert_eq!(
+            user_and_assistant.len(),
+            before,
+            "/reset must NOT clear user/assistant messages; /new is the one that does that"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_command_emits_system_banner() {
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        AgentRunner::process_command_internal("/reset", &Some(sm.clone()), &config).await;
+
+        let state = sm.get_state();
+        let system_msgs: Vec<_> = state
+            .chat
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, crate::ui::MessageRole::System))
+            .collect();
+        assert_eq!(
+            system_msgs.len(),
+            1,
+            "/reset should emit exactly one system banner"
+        );
+        assert!(
+            system_msgs[0].content.to_lowercase().contains("reset"),
+            "banner should mention the reset; got {:?}",
+            system_msgs[0].content
+        );
+    }
+
+    // --- Submission routing tests -------------------------------------------
+    //
+    // Regression guard for the "/new goes straight to the model" bug
+    // (see `allehailmenu.md`). The event loop classifies every
+    // `UiAction::SendMessage(msg)` through `classify_submission` and routes
+    // accordingly. If any arm regresses, slash commands silently become
+    // expensive LLM turns again.
+
+    #[test]
+    fn classify_plain_text_is_user_message() {
+        assert_eq!(
+            classify_submission("hello world"),
+            SubmitKind::UserMessage
+        );
+    }
+
+    #[test]
+    fn classify_slash_new_is_command() {
+        // THE bug: used to classify as UserMessage, got sent to the LLM.
+        assert_eq!(classify_submission("/new"), SubmitKind::Command);
+    }
+
+    #[test]
+    fn classify_slash_help_is_command() {
+        assert_eq!(classify_submission("/help"), SubmitKind::Command);
+    }
+
+    #[test]
+    fn classify_slash_with_args_is_command() {
+        // Arg-taking commands (popup closes on space, user finishes typing).
+        assert_eq!(
+            classify_submission("/load 123e4567-e89b-12d3-a456-426614174000"),
+            SubmitKind::Command
+        );
+    }
+
+    #[test]
+    fn classify_slash_stop_is_stop_command() {
+        // /stop is special: it interrupts the running agent rather than
+        // queueing another command behind the current run.
+        assert_eq!(classify_submission("/stop"), SubmitKind::StopCommand);
+    }
+
+    #[test]
+    fn classify_trims_whitespace_before_deciding() {
+        // Trailing newline from the input buffer must not demote a command
+        // back to UserMessage.
+        assert_eq!(classify_submission("/new\n"), SubmitKind::Command);
+        assert_eq!(classify_submission("  /stop  "), SubmitKind::StopCommand);
+    }
+
+    #[test]
+    fn classify_mid_sentence_slash_stays_user_message() {
+        // A slash that isn't at the start (after trim) is chat content.
+        assert_eq!(
+            classify_submission("TODO: /foo or /bar?"),
+            SubmitKind::UserMessage
+        );
+    }
+
+    #[test]
+    fn classify_empty_is_user_message() {
+        // The Enter handler already drops empty buffers; defensive default.
+        assert_eq!(classify_submission(""), SubmitKind::UserMessage);
+        assert_eq!(classify_submission("   "), SubmitKind::UserMessage);
+    }
+
+    // --- MCP tests (pre-existing) -------------------------------------------
 
     #[tokio::test]
     async fn test_connect_mcp_server_invalid_command() {
