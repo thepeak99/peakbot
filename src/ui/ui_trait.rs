@@ -88,7 +88,6 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("context", "Show context usage status", false),
         SlashCommand::new("compact", "Force context compaction", false),
         SlashCommand::new("conversations", "List saved conversations", false),
-        SlashCommand::new("history", "Show conversation history", false),
         SlashCommand::new("reset", "Reset session statistics", false),
         SlashCommand::new("new", "Start a new conversation", false),
         SlashCommand::new("save", "Save the current conversation", false),
@@ -191,7 +190,6 @@ mod tests {
                 "context",
                 "compact",
                 "conversations",
-                "history",
                 "reset",
                 "new",
                 "save",
@@ -220,7 +218,6 @@ mod tests {
         assert!(!by_name("context"));
         assert!(!by_name("compact"));
         assert!(!by_name("conversations"));
-        assert!(!by_name("history"));
         assert!(!by_name("reset"));
         assert!(!by_name("new"));
         assert!(!by_name("save"));

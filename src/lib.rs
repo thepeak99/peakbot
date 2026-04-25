@@ -687,6 +687,48 @@ impl AgentRunner {
         }
     }
 
+    /// Resolve a user-typed conversation reference into a UUID.
+    ///
+    /// Accepts two forms:
+    /// - **1-based ordinal index** (e.g. `1`, `2`, `42`) — looked up in the
+    ///   current `list_conversations()` sorted newest-first. This is the
+    ///   primary, human-friendly path. Indices are deliberately stateless:
+    ///   re-derived on every call so there is no cached mapping to drift out
+    ///   of sync with storage.
+    /// - **Full UUID** — fallback for scripts, log copy-paste, and the rare
+    ///   case where index addressing isn't enough.
+    ///
+    /// The two formats are syntactically disjoint (digits vs. hyphenated
+    /// 36-char string), so the parse-int-first / parse-uuid-second strategy
+    /// has no ambiguity. See `conversazione.md` § "The shared resolver" for
+    /// the full design rationale.
+    fn resolve_conversation_id(arg: &str, sm: &StateManager) -> Result<uuid::Uuid, String> {
+        // Try integer first — common case, cheaper to parse, and fails fast
+        // (no allocation) when the user typed a UUID.
+        if let Ok(n) = arg.parse::<usize>() {
+            if n == 0 {
+                return Err(
+                    "Indices are 1-based. Use /conversations to see available items.".to_string(),
+                );
+            }
+            let mut list = sm
+                .list_conversations()
+                .ok_or_else(|| "Conversation storage is not configured.".to_string())?;
+            list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            return list.get(n - 1).map(|c| c.id).ok_or_else(|| {
+                format!(
+                    "Index {} not found. /conversations shows {} saved conversation(s).",
+                    n,
+                    list.len()
+                )
+            });
+        }
+        // Fallback: full UUID.
+        uuid::Uuid::parse_str(arg).map_err(|_| {
+            "Invalid argument. Pass an index from /conversations or a full UUID.".to_string()
+        })
+    }
+
     /// Internal process_command
     async fn process_command_internal(
         cmd: &str,
@@ -714,9 +756,59 @@ impl AgentRunner {
                     tracing::warn!("State manager not available for /reset command");
                 }
             }
-            "/stats" | "/context" | "/compact" | "/conversations" | "/history" => {
-                // These commands return data that UI can access via StateManager
-                // No system message needed — UI pulls this data
+            "/stats" | "/context" | "/compact" => {
+                // /stats, /context, /compact are correctly silent: the data
+                // they expose is rendered ambiently in the status bar (see
+                // `ui::repl::repl_impl`). Nothing to do here.
+            }
+            "/conversations" => {
+                // List saved conversations as a system message, addressed by
+                // 1-based ordinal index. UUIDs are an implementation detail
+                // and deliberately hidden from the user — the index is the
+                // human-facing handle that pairs with /load <n>, /delete <n>,
+                // and /export <n>. UUIDs are still accepted as a fallback in
+                // those commands via `resolve_conversation_id`. See
+                // `conversazione.md` for the full design.
+                if let Some(sm) = state_manager {
+                    match sm.list_conversations() {
+                        None => sm.add_system_message(
+                            "Conversation storage is not configured.".to_string(),
+                        ),
+                        Some(list) if list.is_empty() => {
+                            sm.add_system_message("No saved conversations.".to_string())
+                        }
+                        Some(mut list) => {
+                            list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                            let current_id = sm.get_current_conversation_id();
+                            let mut msg = format!("Saved conversations ({}):\n", list.len());
+                            for (idx, c) in list.iter().enumerate() {
+                                let n = idx + 1;
+                                let marker = if Some(c.id) == current_id {
+                                    "▶ "
+                                } else {
+                                    "   "
+                                };
+                                msg.push_str(&format!(
+                                    "{}{:>3}  {}  {} msgs  {}  {}\n",
+                                    marker,
+                                    n,
+                                    c.name,
+                                    c.message_count,
+                                    c.updated_at
+                                        .with_timezone(&chrono::Local)
+                                        .format("%Y-%m-%d %H:%M"),
+                                    c.model,
+                                ));
+                            }
+                            msg.push_str(
+                                "\nUse /load <n> to resume, /delete <n> to remove. UUIDs also accepted.",
+                            );
+                            sm.add_system_message(msg);
+                        }
+                    }
+                } else {
+                    tracing::warn!("State manager not available for /conversations command");
+                }
             }
             "/exit" => {
                 // No-confirmation quit. Bypasses the Ctrl+C confirmation
@@ -790,94 +882,84 @@ impl AgentRunner {
                 }
             }
             _ if cmd_lower.starts_with("/load ") => {
-                if let Some(id_str) = cmd.strip_prefix("/load ") {
-                    let id = match uuid::Uuid::parse_str(id_str) {
+                if let Some(arg) = cmd.strip_prefix("/load ") {
+                    let Some(sm) = state_manager else {
+                        tracing::warn!("State manager not available for /load command");
+                        return;
+                    };
+                    let id = match Self::resolve_conversation_id(arg.trim(), sm) {
                         Ok(id) => id,
-                        Err(_) => {
-                            if let Some(sm) = state_manager {
-                                sm.add_system_message("❌ Invalid conversation ID. Use /conversations to see available IDs.".to_string());
-                            }
+                        Err(msg) => {
+                            sm.add_system_message(format!("❌ {}", msg));
                             return;
                         }
                     };
-                    if let Some(sm) = state_manager {
-                        match sm.load_conversation(id) {
-                            Ok(()) => {
-                                if let Some(conv) = sm.get_current_conversation() {
-                                    sm.add_system_message(format!(
-                                        "Loaded conversation: '{}'",
-                                        conv.name
-                                    ));
-                                }
-                            }
-                            Err(e) => {
+                    match sm.load_conversation(id) {
+                        Ok(()) => {
+                            if let Some(conv) = sm.get_current_conversation() {
                                 sm.add_system_message(format!(
-                                    "❌ Failed to load conversation: {}",
-                                    e
+                                    "Loaded conversation: '{}'",
+                                    conv.name
                                 ));
                             }
                         }
-                    } else {
-                        tracing::warn!("State manager not available for /load command");
+                        Err(e) => {
+                            sm.add_system_message(format!("❌ Failed to load conversation: {}", e));
+                        }
                     }
                 }
             }
             _ if cmd_lower.starts_with("/delete ") => {
-                if let Some(id_str) = cmd.strip_prefix("/delete ") {
-                    let id = match uuid::Uuid::parse_str(id_str) {
+                if let Some(arg) = cmd.strip_prefix("/delete ") {
+                    let Some(sm) = state_manager else {
+                        tracing::warn!("State manager not available for /delete command");
+                        return;
+                    };
+                    let id = match Self::resolve_conversation_id(arg.trim(), sm) {
                         Ok(id) => id,
-                        Err(_) => {
-                            if let Some(sm) = state_manager {
-                                sm.add_system_message("❌ Invalid conversation ID.".to_string());
-                            }
+                        Err(msg) => {
+                            sm.add_system_message(format!("❌ {}", msg));
                             return;
                         }
                     };
-                    if let Some(sm) = state_manager {
-                        match sm.delete_conversation(id) {
-                            Ok(_) => {
-                                sm.add_system_message("Conversation deleted.".to_string());
-                            }
-                            Err(e) => {
-                                sm.add_system_message(format!("❌ Failed to delete: {}", e));
-                            }
+                    match sm.delete_conversation(id) {
+                        Ok(_) => {
+                            sm.add_system_message("Conversation deleted.".to_string());
                         }
-                    } else {
-                        tracing::warn!("State manager not available for /delete command");
+                        Err(e) => {
+                            sm.add_system_message(format!("❌ Failed to delete: {}", e));
+                        }
                     }
                 }
             }
             _ if cmd_lower.starts_with("/export ") => {
                 if let Some(args) = cmd.strip_prefix("/export ") {
                     let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                    if parts.len() == 2 {
-                        let id_str = parts[0];
-                        let format = parts[1].to_lowercase();
-                        let id = match uuid::Uuid::parse_str(id_str) {
-                            Ok(id) => id,
-                            Err(_) => {
-                                if let Some(sm) = state_manager {
-                                    sm.add_system_message(
-                                        "❌ Invalid conversation ID.".to_string(),
-                                    );
-                                }
-                                return;
-                            }
-                        };
-                        if let Some(sm) = state_manager {
-                            match sm.export_conversation(id, &format) {
-                                Ok(output) => {
-                                    sm.add_system_message(format!("Export:\n{}", output));
-                                }
-                                Err(e) => {
-                                    sm.add_system_message(format!("❌ Export failed: {}", e));
-                                }
-                            }
-                        } else {
-                            tracing::warn!("State manager not available for /export command");
+                    let Some(sm) = state_manager else {
+                        tracing::warn!("State manager not available for /export command");
+                        return;
+                    };
+                    if parts.len() != 2 {
+                        sm.add_system_message(
+                            "Usage: /export <n|uuid> <json|markdown>".to_string(),
+                        );
+                        return;
+                    }
+                    let id = match Self::resolve_conversation_id(parts[0].trim(), sm) {
+                        Ok(id) => id,
+                        Err(msg) => {
+                            sm.add_system_message(format!("❌ {}", msg));
+                            return;
                         }
-                    } else if let Some(sm) = state_manager {
-                        sm.add_system_message("Usage: /export <id> <json|markdown>".to_string());
+                    };
+                    let format = parts[1].to_lowercase();
+                    match sm.export_conversation(id, &format) {
+                        Ok(output) => {
+                            sm.add_system_message(format!("Export:\n{}", output));
+                        }
+                        Err(e) => {
+                            sm.add_system_message(format!("❌ Export failed: {}", e));
+                        }
                     }
                 }
             }
@@ -1263,6 +1345,268 @@ mod tests {
         assert!(body.contains("/stats —") || body.contains("/stats"));
         assert!(!body.contains("/stats <args>"));
         assert!(!body.contains("/help <args>"));
+    }
+
+    // --- /conversations + index-resolver tests -------------------------------
+    //
+    // The shared `resolve_conversation_id` helper underpins /load, /delete and
+    // /export. The /conversations command itself is the index-publishing
+    // surface. See `conversazione.md` for the full design.
+
+    /// Minimal helper: build an Arc<StateManager> backed by a fresh
+    /// `InMemoryStorage`. Inline `pub use` would be cleaner — but importing
+    /// the storage type once at function level keeps the test module's
+    /// surface narrow.
+    fn sm_with_storage() -> Arc<StateManager> {
+        use crate::storage::InMemoryStorage;
+        StateManager::new_arc_with_storage(Arc::new(InMemoryStorage::new()))
+    }
+
+    /// Build a StateManager pre-seeded with conversations at explicit
+    /// `updated_at` offsets (in hours, relative to now). Returns the
+    /// `(name, id)` pairs in **insertion order** (NOT display order — display
+    /// order is newest-first, derived by the dispatcher at call time).
+    ///
+    /// Implementation note: we cannot use `StateManager::save_conversation`
+    /// here because it stamps `updated_at = now` on every call, defeating the
+    /// purpose. Instead we save directly through the storage trait, which is
+    /// the source of truth, and then wrap it in the StateManager. No
+    /// test-only accessor on StateManager required.
+    fn sm_with_seeded(specs: &[(&str, i64)]) -> (Arc<StateManager>, Vec<(String, uuid::Uuid)>) {
+        use crate::conversation::Conversation;
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+        use chrono::Utc;
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        let mut out = Vec::new();
+        for (name, hours_ago) in specs {
+            let mut conv = Conversation::new((*name).to_string(), "test-model".to_string());
+            conv.updated_at = Utc::now() - chrono::Duration::hours(*hours_ago);
+            storage.save(&conv).expect("seed save");
+            out.push((name.to_string(), conv.id));
+        }
+        let sm = StateManager::new_arc_with_storage(storage);
+        (sm, out)
+    }
+
+    fn last_system_msg(sm: &StateManager) -> String {
+        sm.get_state()
+            .chat
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::ui::MessageRole::System))
+            .expect("at least one system message")
+            .content
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn conversations_empty_list_emits_explicit_message() {
+        let sm = sm_with_storage();
+        let config = Config::default();
+        AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
+        assert_eq!(last_system_msg(&sm), "No saved conversations.");
+    }
+
+    #[tokio::test]
+    async fn conversations_no_storage_emits_distinct_message() {
+        let sm = StateManager::new_arc(); // no storage
+        let config = Config::default();
+        AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
+        assert_eq!(
+            last_system_msg(&sm),
+            "Conversation storage is not configured."
+        );
+    }
+
+    #[tokio::test]
+    async fn conversations_lists_every_saved_name_with_index() {
+        let (sm, seeded) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2), ("Gamma", 3)]);
+        let config = Config::default();
+        AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
+        let body = last_system_msg(&sm);
+        for (name, _) in &seeded {
+            assert!(
+                body.contains(name),
+                "missing name {} in body:\n{}",
+                name,
+                body
+            );
+        }
+        // Indices 1, 2, 3 should appear right-aligned in the row prefix.
+        assert!(body.contains("  1  "), "missing index 1 row:\n{}", body);
+        assert!(body.contains("  2  "), "missing index 2 row:\n{}", body);
+        assert!(body.contains("  3  "), "missing index 3 row:\n{}", body);
+    }
+
+    #[tokio::test]
+    async fn conversations_sorted_newest_first() {
+        // Seeded in jumbled order: 3h ago, 1h ago, 2h ago.
+        let (sm, _) = sm_with_seeded(&[("Older", 3), ("Newest", 1), ("Middle", 2)]);
+        let config = Config::default();
+        AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
+        let body = last_system_msg(&sm);
+        let pos_newest = body.find("Newest").expect("Newest present");
+        let pos_middle = body.find("Middle").expect("Middle present");
+        let pos_older = body.find("Older").expect("Older present");
+        assert!(
+            pos_newest < pos_middle && pos_middle < pos_older,
+            "wrong order in body:\n{}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn conversations_marks_current() {
+        let (sm, seeded) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2)]);
+        let config = Config::default();
+        // Set Beta as current.
+        sm.load_conversation(seeded[1].1).expect("load Beta");
+        AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
+        let body = last_system_msg(&sm);
+        // ▶ marker should appear exactly once.
+        assert_eq!(
+            body.matches("▶ ").count(),
+            1,
+            "expected exactly one ▶ marker, body:\n{}",
+            body
+        );
+        // It should prefix Beta's row (verify by line containment).
+        let beta_line = body
+            .lines()
+            .find(|l| l.contains("Beta"))
+            .expect("Beta line");
+        assert!(
+            beta_line.contains("▶ "),
+            "▶ should mark Beta row:\n{}",
+            beta_line
+        );
+    }
+
+    #[tokio::test]
+    async fn conversations_hides_uuids() {
+        let (sm, _) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2)]);
+        let config = Config::default();
+        AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
+        let body = last_system_msg(&sm);
+        // A UUID is 8-4-4-4-12 hex chars with hyphens. Robust check: no
+        // hyphenated 36-char tokens anywhere in the rendered body.
+        for token in body.split_whitespace() {
+            assert!(
+                !(token.len() == 36 && token.matches('-').count() == 4),
+                "found UUID-shaped token in /conversations output: {}\nFull body:\n{}",
+                token,
+                body
+            );
+        }
+    }
+
+    // --- /load + resolver tests ---------------------------------------------
+
+    #[tokio::test]
+    async fn load_by_index_resolves_to_correct_uuid() {
+        let (sm, seeded) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2), ("Gamma", 3)]);
+        let config = Config::default();
+        // Newest-first: Alpha=1h ago, Beta=2h, Gamma=3h. So index 2 → Beta.
+        AgentRunner::process_command_internal("/load 2", &Some(sm.clone()), &config).await;
+        let beta_id = seeded[1].1;
+        assert_eq!(
+            sm.get_current_conversation_id(),
+            Some(beta_id),
+            "/load 2 should load Beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_by_uuid_still_works() {
+        let (sm, seeded) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2)]);
+        let config = Config::default();
+        let alpha_id = seeded[0].1;
+        let cmd = format!("/load {}", alpha_id);
+        AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
+        assert_eq!(sm.get_current_conversation_id(), Some(alpha_id));
+    }
+
+    #[tokio::test]
+    async fn load_index_zero_emits_helpful_error() {
+        let (sm, _) = sm_with_seeded(&[("Alpha", 1)]);
+        let config = Config::default();
+        AgentRunner::process_command_internal("/load 0", &Some(sm.clone()), &config).await;
+        let body = last_system_msg(&sm);
+        assert!(
+            body.contains("1-based"),
+            "expected '1-based' guidance, got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("/conversations"),
+            "expected pointer to /conversations, got:\n{}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn load_index_out_of_range_emits_count() {
+        let (sm, _) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2)]);
+        let config = Config::default();
+        AgentRunner::process_command_internal("/load 99", &Some(sm.clone()), &config).await;
+        let body = last_system_msg(&sm);
+        assert!(
+            body.contains("99"),
+            "error should cite the bad index:\n{}",
+            body
+        );
+        assert!(body.contains("2"), "error should cite the count:\n{}", body);
+    }
+
+    #[tokio::test]
+    async fn load_invalid_arg_emits_uniform_error() {
+        let (sm, _) = sm_with_seeded(&[("Alpha", 1)]);
+        let config = Config::default();
+        AgentRunner::process_command_internal(
+            "/load not-a-uuid-or-int",
+            &Some(sm.clone()),
+            &config,
+        )
+        .await;
+        let body = last_system_msg(&sm);
+        assert!(
+            body.contains("Invalid argument"),
+            "expected resolver's invalid-argument message, got:\n{}",
+            body
+        );
+    }
+
+    // --- /delete + /export by index -----------------------------------------
+
+    #[tokio::test]
+    async fn delete_by_index_works() {
+        let (sm, _) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2), ("Gamma", 3)]);
+        let config = Config::default();
+        // /delete 1 → newest (Alpha). After: 2 conversations remain.
+        AgentRunner::process_command_internal("/delete 1", &Some(sm.clone()), &config).await;
+        let remaining = sm.list_conversations().expect("storage").len();
+        assert_eq!(remaining, 2, "/delete 1 should remove one of three");
+    }
+
+    #[tokio::test]
+    async fn export_by_index_works() {
+        let (sm, _) = sm_with_seeded(&[("OnlyOne", 1)]);
+        let config = Config::default();
+        AgentRunner::process_command_internal("/export 1 markdown", &Some(sm.clone()), &config)
+            .await;
+        let body = last_system_msg(&sm);
+        assert!(
+            body.starts_with("Export:"),
+            "export header missing:\n{}",
+            body
+        );
+        assert!(
+            body.contains("OnlyOne"),
+            "export should include the conversation name:\n{}",
+            body
+        );
     }
 
     // --- /new handler tests --------------------------------------------------
