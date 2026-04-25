@@ -36,11 +36,9 @@ COPY src/ src/
 RUN touch src/main.rs && \
     cargo build --target ${TARGET} --release
 
-# Extract just the .exe
-FROM alpine:3.19 AS extract
-WORKDIR /output
-COPY --from=builder /build/target/x86_64-pc-windows-gnu/release/peakbot.exe .
-
-# Export only the .exe
+# Export only the .exe. `ARG` works fine in scratch stages — it's resolved
+# at build time by BuildKit, so we can interpolate ${TARGET} directly into
+# the COPY path without an intermediate "extract" stage.
 FROM scratch
-COPY --from=extract /output/peakbot.exe /peakbot.exe
+ARG TARGET=x86_64-pc-windows-gnu
+COPY --from=builder /build/target/${TARGET}/release/peakbot.exe /peakbot.exe

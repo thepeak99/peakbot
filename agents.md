@@ -594,6 +594,82 @@ let harness = TestHarness::new()
     .build();
 ```
 
+## Build & Release
+
+PeakBot ships as a single static binary for **Linux x86_64**, **Windows x86_64**, and **macOS universal2** (Intel + Apple Silicon in one fat binary). All three are produced from Linux via container builds — no native macOS/Windows host required. The driver is a top-level `Makefile`; cross-compilation is handled by three sibling Dockerfiles.
+
+### Dockerfiles
+
+| File | Builder image | Default `TARGET` | Notes |
+|------|---------------|------------------|-------|
+| `Dockerfile.linux` | `rust:1.88-bookworm` | `x86_64-unknown-linux-gnu` | Native build inside Debian; uses dummy-main caching trick |
+| `Dockerfile.windows` | `rust:1.88-bookworm` + mingw | `x86_64-pc-windows-gnu` | Cross via gcc-mingw; final stage `FROM scratch` |
+| `Dockerfile.macos` | `ghcr.io/rust-cross/cargo-zigbuild:latest` | `universal2-apple-darwin` | Cross via zig + bundled macOS SDK; produces fat binary (lipo merge) |
+
+All three use a `FROM scratch` final stage and `--output type=local,dest=./output` so `make` extracts only the binary into `output/` without leaving an image in the local registry. Override the rust target with `--build-arg TARGET=...` if you need a single-arch macOS or a different libc.
+
+> **Gotcha:** `ARG` does not propagate across `FROM` stage boundaries. Each Dockerfile redeclares `ARG TARGET=...` in its scratch stage so the `COPY --from=builder target/${TARGET}/release/...` path interpolates correctly.
+
+### Make targets
+
+Run `make help` for the full list. Day-to-day:
+
+| Target | What it does |
+|--------|--------------|
+| `make` / `make build` | Cross-compile to `output/peakbot.exe` (Windows) |
+| `make build-linux` | Build `output/peakbot` (Linux x86_64) |
+| `make build-macos` | Build `output/peakbot-macos` (macOS universal2) |
+| `make clean` | `rm -rf output/` |
+| `make rebuild` | `clean` + `build` |
+| `make help` | Print this table from `## ` doc comments in the Makefile |
+
+`CONTAINER_BUILDER` auto-detects `podman` (preferred) and falls back to `docker`. Override with `make build CONTAINER_BUILDER=docker`.
+
+### Release pipeline
+
+The `make release` target runs the full release flow end-to-end:
+
+```
+release-bump → release-tag → release-build-linux → release-build-windows → release-build-macos → release-publish
+```
+
+Each phase does one thing and can be re-run independently if a later phase fails. In-flight state is stashed in `.release-version` (gitignored) and deleted after a successful publish.
+
+| Phase | Action |
+|-------|--------|
+| `release-bump` | Validate semver, refuse if tag exists, refuse on dirty tree (override with `ALLOW_DIRTY=1`), rewrite `[package].version` in `Cargo.toml`, sync `Cargo.lock` via `cargo update -p peakbot --precise <v>`, commit `chore: release <v>` |
+| `release-tag` | Create annotated tag `<v>` (bare semver, no `v` prefix), push current branch + tag to `origin` |
+| `release-build-{linux,windows,macos}` | Run the matching Docker build, copy artifact to `output/peakbot-<v>-{linux-amd64,windows-amd64.exe,macos-universal2}` |
+| `release-publish` | Create a Gitea release via REST API and upload all three asset files |
+
+#### Usage
+
+```bash
+export GITEA_TOKEN=...                       # required — generate at $GITEA_URL/user/settings/applications
+make release                                 # interactive: prompts for version
+make release VERSION=0.2.0                   # non-interactive
+make release VERSION=0.2.0 ALLOW_DIRTY=1     # bypass clean-tree check
+```
+
+`GITEA_URL`, `OWNER`, and `REPO` are auto-derived from `git config --get remote.origin.url`, so a single `GITEA_TOKEN` is all you usually need. Override any of them on the CLI if your `origin` doesn't point at the release destination.
+
+#### Required tools on the release host
+
+- `git`, `cargo` — for the version bump and tag
+- `podman` or `docker` — to run the three Dockerfile builds
+- `curl`, `jq` — used by `release-publish` to talk to Gitea
+- `awk` — portable invocation only (no PCRE lazy quantifiers); works under gawk / mawk / busybox awk
+
+#### Resuming a partial failure
+
+If `release-publish` dies mid-upload, `.release-version` still exists, the tag is already pushed, and the binaries are already in `output/`. Re-run just the failing phase:
+
+```bash
+make release-publish        # retry publish only
+```
+
+To start completely over, `git tag -d <v>`, `git push origin :refs/tags/<v>`, `git reset --hard HEAD~1`, `rm .release-version`, and re-run `make release`.
+
 
 ## Vision (image input)
 

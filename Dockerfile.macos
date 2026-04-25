@@ -1,0 +1,57 @@
+# PeakBot macOS Cross-Compile Builder
+#
+# Uses cargo-zigbuild + zig as the linker, with the official image that ships
+# the macOS SDK pre-installed (required for linking against Apple frameworks
+# like CoreFoundation/Security via rustls/reqwest/etc.).
+# Docs: https://github.com/rust-cross/cargo-zigbuild
+#
+# Default target is `universal2-apple-darwin` — a true fat binary containing
+# both x86_64 (Intel) and aarch64 (Apple Silicon) slices.
+#
+# Usage:
+#   podman build -f Dockerfile.macos --output type=local,dest=./output .
+#   docker build -f Dockerfile.macos --output type=local,dest=./output .
+#
+# Build a single-arch binary instead:
+#   docker build -f Dockerfile.macos \
+#     --build-arg TARGET=aarch64-apple-darwin \
+#     --output type=local,dest=./output .
+#   docker build -f Dockerfile.macos \
+#     --build-arg TARGET=x86_64-apple-darwin \
+#     --output type=local,dest=./output .
+
+FROM ghcr.io/rust-cross/cargo-zigbuild:latest AS builder
+
+# Default to a universal2 fat binary; override with --build-arg TARGET=...
+ARG TARGET=universal2-apple-darwin
+ENV TARGET=${TARGET}
+
+# universal2 needs both single-arch targets installed; adding them
+# unconditionally is harmless when TARGET is a single arch.
+RUN rustup target add x86_64-apple-darwin aarch64-apple-darwin \
+    && rustup target list --installed
+
+# Copy manifests first for better layer caching
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+
+# Create a dummy main so we can pre-build dependencies in a cacheable layer
+RUN mkdir -p src && \
+    echo "fn main() {}" > src/main.rs
+
+# Build dependencies only (cached as long as Cargo.toml/Cargo.lock don't change)
+RUN cargo zigbuild --release --target ${TARGET}
+
+# Now bring in the real source
+COPY src/ src/
+
+# Touch main.rs so cargo rebuilds the bin crate (deps stay cached)
+RUN touch src/main.rs && \
+    cargo zigbuild --release --target ${TARGET}
+
+# Export only the binary. `ARG` works fine in scratch stages — it's resolved
+# at build time by BuildKit, so we can interpolate ${TARGET} directly into
+# the COPY path without an intermediate "extract" stage.
+FROM scratch
+ARG TARGET=universal2-apple-darwin
+COPY --from=builder /build/target/${TARGET}/release/peakbot /peakbot

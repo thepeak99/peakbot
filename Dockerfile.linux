@@ -1,0 +1,43 @@
+# PeakBot Linux Builder
+# Usage: podman build -f Dockerfile.linux --output type=local,dest=./output .
+# (or: docker build -f Dockerfile.linux --output type=local,dest=./output .)
+#
+# Default target is `x86_64-unknown-linux-gnu`. Override with --build-arg TARGET=...
+# (e.g. aarch64-unknown-linux-gnu — note that requires an appropriate cross
+# linker which this Dockerfile does not currently install).
+
+FROM rust:1.88-bookworm AS builder
+
+# Default build target
+ARG TARGET=x86_64-unknown-linux-gnu
+ENV TARGET=${TARGET}
+
+# Add the target (no-op when it's the image's native target)
+RUN rustup target add ${TARGET} \
+    && rustup target list --installed
+
+# Copy manifests first for better layer caching
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+
+# Create dummy main.rs for dependency caching
+RUN mkdir -p src && \
+    echo "fn main() {}" > src/main.rs
+
+# Build dependencies only (faster layer caching)
+RUN cargo build --target ${TARGET} --release && \
+    rm -rf target/${TARGET}/deps/*.rlib target/${TARGET}/deps/*.d
+
+# Copy actual source
+COPY src/ src/
+
+# Build the actual binary (touch main.rs so cargo rebuilds the bin crate; deps stay cached)
+RUN touch src/main.rs && \
+    cargo build --target ${TARGET} --release
+
+# Export only the binary. `ARG` works fine in scratch stages — it's resolved
+# at build time by BuildKit, so we can interpolate ${TARGET} directly into
+# the COPY path without an intermediate "extract" stage.
+FROM scratch
+ARG TARGET=x86_64-unknown-linux-gnu
+COPY --from=builder /build/target/${TARGET}/release/peakbot /peakbot
