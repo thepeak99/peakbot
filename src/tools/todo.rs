@@ -70,16 +70,20 @@ impl TodoList {
     /// Returns the task info with is_new=false if duplicate exists (case-insensitive)
     pub fn add(&mut self, task: String) -> AddTaskResult {
         let task_lower = task.to_lowercase();
-        
+
         // Check if task already exists (case-insensitive)
-        if let Some(existing) = self.tasks.iter().find(|t| t.task.to_lowercase() == task_lower) {
+        if let Some(existing) = self
+            .tasks
+            .iter()
+            .find(|t| t.task.to_lowercase() == task_lower)
+        {
             return AddTaskResult {
                 id: existing.id,
                 task: existing.task.clone(),
                 is_new: false,
             };
         }
-        
+
         let now = Utc::now();
         let id = self.next_id;
         let item = TodoItem {
@@ -91,7 +95,7 @@ impl TodoList {
         };
         self.next_id += 1;
         self.tasks.push(item.clone());
-        
+
         AddTaskResult {
             id,
             task: item.task,
@@ -480,7 +484,10 @@ mod tests {
         // Task 3 stays pending
 
         let cleared = list.clear_completed();
-        assert_eq!(cleared, 2, "clear should remove both completed and cancelled");
+        assert_eq!(
+            cleared, 2,
+            "clear should remove both completed and cancelled"
+        );
         assert_eq!(list.list().len(), 1);
         assert_eq!(list.list()[0].id, 3);
     }
@@ -563,15 +570,15 @@ mod tests {
     fn test_add_many_with_duplicates() {
         let mut list = TodoList::new();
         list.add("Task 1".to_string());
-        
+
         let results = list.add_many(vec![
-            "Task 1".to_string(),  // duplicate
+            "Task 1".to_string(), // duplicate
             "Task 2".to_string(), // new
         ]);
 
         assert_eq!(results.len(), 2);
         assert!(!results[0].is_new); // Task 1 was already there
-        assert!(results[1].is_new);   // Task 2 is new
+        assert!(results[1].is_new); // Task 2 is new
         assert_eq!(results[0].id, 1); // existing id
         assert_eq!(results[1].id, 2); // new id
         assert_eq!(list.list().len(), 2); // only Task 1 and Task 2

@@ -86,9 +86,7 @@ pub fn render_command_popup(f: &mut Frame, input_area: Rect, popup: &CommandPopu
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightCyan))
         .title(" Commands ")
-        .title_bottom(
-            Line::from(" ↑/↓ · Tab complete · Enter run · Esc cancel ").right_aligned(),
-        );
+        .title_bottom(Line::from(" ↑/↓ · Tab complete · Enter run · Esc cancel ").right_aligned());
 
     let paragraph = Paragraph::new(content)
         .style(Style::default().fg(Color::White))

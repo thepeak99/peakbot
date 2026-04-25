@@ -77,7 +77,9 @@ pub enum AttachmentError {
     },
     #[error("too many images in one turn ({count}, max {max})")]
     TooMany { count: usize, max: usize },
-    #[error("invalid attachment token `{0}` (expected `/path`, `~/path`, `./path`, or `https://…`)")]
+    #[error(
+        "invalid attachment token `{0}` (expected `/path`, `~/path`, `./path`, or `https://…`)"
+    )]
     InvalidToken(String),
 }
 
@@ -322,7 +324,10 @@ mod tests {
     fn load_image_from_path_reads_bytes_and_infers_type() {
         let path = write_tempfile("png", b"fake png bytes");
         let att = load_image_from_path(&path).expect("load");
-        assert_eq!(att.display_name, path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(
+            att.display_name,
+            path.file_name().unwrap().to_str().unwrap()
+        );
         match att.source {
             ImageSource::Base64 { bytes, media_type } => {
                 assert_eq!(bytes, b"fake png bytes");
@@ -409,8 +414,8 @@ mod tests {
 
     #[test]
     fn parse_attachments_inline_handles_url_tokens() {
-        let (text, atts) = parse_attachments_inline("look [img:https://example.com/a.jpg]")
-            .expect("parse");
+        let (text, atts) =
+            parse_attachments_inline("look [img:https://example.com/a.jpg]").expect("parse");
         assert_eq!(text, "look ");
         assert_eq!(atts.len(), 1);
         assert!(matches!(atts[0].source, ImageSource::Url(_)));

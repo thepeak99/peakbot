@@ -14,7 +14,6 @@ pub fn render_widget<W: Widget>(widget: W, width: u16, height: u16) -> Terminal<
 
 /// Convert TestBackend buffer to lines for inspection.
 pub fn buffer_to_lines(backend: &TestBackend) -> Vec<String> {
-    
     // Access the buffer content - TestBackend stores it internally
     // We need to use Display trait or reconstruct lines manually
     let buf = backend.buffer();

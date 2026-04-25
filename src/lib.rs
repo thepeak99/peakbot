@@ -670,7 +670,7 @@ impl AgentRunner {
                     return CompletionResult::Error;
                 }
 
-                Err(e) => {
+                Err(_e) => {
                     if retry_count == config.retry().max_retries {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
@@ -876,12 +876,8 @@ impl AgentRunner {
                         } else {
                             tracing::warn!("State manager not available for /export command");
                         }
-                    } else {
-                        if let Some(sm) = state_manager {
-                            sm.add_system_message(
-                                "Usage: /export <id> <json|markdown>".to_string(),
-                            );
-                        }
+                    } else if let Some(sm) = state_manager {
+                        sm.add_system_message("Usage: /export <id> <json|markdown>".to_string());
                     }
                 }
             }

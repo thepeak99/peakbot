@@ -160,12 +160,7 @@ impl Conversation {
     }
 
     /// Add a tool call to the conversation
-    pub fn add_tool_call(
-        &mut self,
-        tool_name: String,
-        arguments: String,
-        call_id: Option<String>,
-    ) {
+    pub fn add_tool_call(&mut self, tool_name: String, arguments: String, call_id: Option<String>) {
         self.messages
             .push(Message::tool_call(tool_name, arguments, call_id));
         self.metadata.message_count = self.messages.len();

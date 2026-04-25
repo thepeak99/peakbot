@@ -179,8 +179,7 @@ async fn summarization_excludes_tool_messages_from_prompt() {
     if harness.has_compaction_occurred() {
         let summ_requests = harness.get_summarization_requests();
         if !summ_requests.is_empty() {
-            let prompt_text =
-                TestHarness::extract_summarization_prompt(&summ_requests[0]).unwrap();
+            let prompt_text = TestHarness::extract_summarization_prompt(&summ_requests[0]).unwrap();
 
             // format_messages_for_summary only includes User and Assistant messages.
             // The prompt should contain user text and assistant text but NOT raw
@@ -271,7 +270,9 @@ async fn post_compaction_request_has_compacted_history() {
     // The request AFTER compaction (the last regular request) should have
     // fewer history messages than if no compaction happened.
     let regular_requests = harness.get_regular_requests();
-    let last_regular = regular_requests.last().expect("Should have regular requests");
+    let last_regular = regular_requests
+        .last()
+        .expect("Should have regular requests");
 
     // Verify the summary message is present in the post-compaction request.
     // The compaction replaced older messages with a summary, so the request
@@ -391,8 +392,7 @@ async fn post_compaction_history_structure() {
         "History should not be empty after compaction"
     );
 
-    let first_is_summary = if let rig::completion::message::Message::User { content } =
-        &history[0]
+    let first_is_summary = if let rig::completion::message::Message::User { content } = &history[0]
     {
         content.iter().any(|c| {
             if let rig::completion::message::UserContent::Text(t) = c {
@@ -601,7 +601,7 @@ async fn no_compaction_below_threshold_verified_by_request_count() {
 async fn no_compaction_when_msgs_lte_keep_recent() {
     let config = ContextConfig {
         context_window: Some(400),
-        threshold: 0.5, // 200 tokens
+        threshold: 0.5,  // 200 tokens
         keep_recent: 10, // Very high — 3 turns = 6 msgs < 10
         enabled: true,
         compaction_model: None,
@@ -834,8 +834,7 @@ async fn multiple_compactions_stack_summaries() {
 
     let summ_requests = harness.get_summarization_requests();
     if summ_requests.len() >= 2 {
-        let second_prompt =
-            TestHarness::extract_summarization_prompt(&summ_requests[1]).unwrap();
+        let second_prompt = TestHarness::extract_summarization_prompt(&summ_requests[1]).unwrap();
         // The second summarization should include the first summary text,
         // since it's now part of the old messages being summarized.
         assert!(
@@ -1015,7 +1014,10 @@ async fn keep_recent_zero_summarizes_everything() {
                 false
             }
         });
-        assert!(has_summary, "With keep_recent=0, only the summary should remain from old messages");
+        assert!(
+            has_summary,
+            "With keep_recent=0, only the summary should remain from old messages"
+        );
     }
 }
 
@@ -1103,7 +1105,11 @@ async fn compaction_reduces_history_exact_count() {
 
     // Verify via request count: 2 regular (main agent) + 1 summarization (compaction model)
     assert_eq!(harness.request_count(), 2, "Main agent should have 2 calls");
-    assert_eq!(harness.get_summarization_requests().len(), 1, "Should have 1 summarization call");
+    assert_eq!(
+        harness.get_summarization_requests().len(),
+        1,
+        "Should have 1 summarization call"
+    );
 }
 
 /// Strengthened multiple_compaction_events: verify each discard count and

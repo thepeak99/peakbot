@@ -66,24 +66,25 @@ impl ContextManager {
         state_manager: Arc<StateManager>,
         compaction_model: Option<Arc<CompactionModel>>,
     ) -> Self {
-        let context_window = config.context_window.unwrap_or_else(|| {
-            match model_name.to_lowercase().as_str() {
-                m if m.contains("claude-3.7-sonnet") => 200_000,
-                m if m.contains("claude-3.5-sonnet") => 200_000,
-                m if m.contains("claude-3-opus") => 200_000,
-                m if m.contains("claude-3-sonnet") => 200_000,
-                m if m.contains("claude-3-haiku") => 200_000,
-                m if m.contains("gpt-4o") => 128_000,
-                m if m.contains("gpt-4-turbo") => 128_000,
-                m if m.contains("gpt-4-32k") => 32_768,
-                m if m.contains("gpt-4") => 8_192,
-                m if m.contains("gpt-3.5-turbo") => 16_385,
-                m if m.contains("gemini-2.0") => 1_000_000,
-                m if m.contains("gemini-1.5-pro") => 2_000_000,
-                m if m.contains("gemini-1.5-flash") => 1_000_000,
-                _ => DEFAULT_CONTEXT_WINDOW,
-            }
-        });
+        let context_window =
+            config
+                .context_window
+                .unwrap_or_else(|| match model_name.to_lowercase().as_str() {
+                    m if m.contains("claude-3.7-sonnet") => 200_000,
+                    m if m.contains("claude-3.5-sonnet") => 200_000,
+                    m if m.contains("claude-3-opus") => 200_000,
+                    m if m.contains("claude-3-sonnet") => 200_000,
+                    m if m.contains("claude-3-haiku") => 200_000,
+                    m if m.contains("gpt-4o") => 128_000,
+                    m if m.contains("gpt-4-turbo") => 128_000,
+                    m if m.contains("gpt-4-32k") => 32_768,
+                    m if m.contains("gpt-4") => 8_192,
+                    m if m.contains("gpt-3.5-turbo") => 16_385,
+                    m if m.contains("gemini-2.0") => 1_000_000,
+                    m if m.contains("gemini-1.5-pro") => 2_000_000,
+                    m if m.contains("gemini-1.5-flash") => 1_000_000,
+                    _ => DEFAULT_CONTEXT_WINDOW,
+                });
 
         Self {
             config,
@@ -200,25 +201,30 @@ impl ContextManager {
             formatted
         );
 
-        let summary = model.summarize(&prompt).await
+        let summary = model
+            .summarize(&prompt)
+            .await
             .map_err(|e| anyhow::anyhow!("Compaction summarization failed: {}", e))?;
 
         Ok(CompactionPlan { summary, boundary })
     }
 
     /// How many messages would be compacted for a given plan
-    pub fn estimate_compaction(&self, messages: &[ChatMessage], boundary: usize) -> CompactionResult {
+    pub fn estimate_compaction(
+        &self,
+        messages: &[ChatMessage],
+        boundary: usize,
+    ) -> CompactionResult {
         let original_uncompacted = messages.iter().filter(|m| !m.compacted).count();
-        let would_compact = messages[..boundary]
-            .iter()
-            .filter(|m| !m.compacted)
-            .count();
+        let would_compact = messages[..boundary].iter().filter(|m| !m.compacted).count();
         // After compaction: 1 summary + (original_uncompacted - would_compact) kept
         let after = 1 + (original_uncompacted - would_compact);
         CompactionResult {
             original_count: original_uncompacted,
             compacted_count: after,
-            tokens_saved: would_compact.saturating_mul(TOKENS_PER_MESSAGE).saturating_sub(SUMMARY_TOKENS),
+            tokens_saved: would_compact
+                .saturating_mul(TOKENS_PER_MESSAGE)
+                .saturating_sub(SUMMARY_TOKENS),
             num_discarded: would_compact,
         }
     }
@@ -262,19 +268,13 @@ fn format_chat_messages_for_summary(messages: &[&ChatMessage]) -> String {
                 let args = msg.tool_args.as_deref().unwrap_or("{}");
                 // Truncate args to avoid blowing up the summary prompt
                 let args_short = truncate_str(args, 200);
-                output.push_str(&format!(
-                    "Assistant [called {}({})]\n\n",
-                    name, args_short
-                ));
+                output.push_str(&format!("Assistant [called {}({})]\n\n", name, args_short));
             }
             MessageRole::ToolResult => {
                 let name = msg.tool_name.as_deref().unwrap_or("unknown");
                 let result = msg.tool_result.as_deref().unwrap_or("");
                 let result_short = truncate_str(result, 500);
-                output.push_str(&format!(
-                    "Tool [{}] returned: {}\n\n",
-                    name, result_short
-                ));
+                output.push_str(&format!("Tool [{}] returned: {}\n\n", name, result_short));
             }
             MessageRole::Summary => {
                 output.push_str(&format!("Previous summary: {}\n\n", msg.content));
@@ -381,10 +381,15 @@ mod tests {
 
     #[test]
     fn test_format_chat_messages_includes_tool_calls() {
-        let messages = vec![
+        let messages = [
             ChatMessage::user("List my files".to_string()),
             ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("call_1".to_string())),
-            ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "file1.txt\nfile2.txt", Some("call_1".to_string())),
+            ChatMessage::tool_result(
+                "bash",
+                r#"{"command":"ls"}"#,
+                "file1.txt\nfile2.txt",
+                Some("call_1".to_string()),
+            ),
             ChatMessage::agent("Here are your files: file1.txt and file2.txt".to_string()),
         ];
 
@@ -400,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_format_chat_messages_includes_summary() {
-        let messages = vec![
+        let messages = [
             ChatMessage::summary("Previous work: set up the project".to_string()),
             ChatMessage::user("Continue from where we left off".to_string()),
         ];
@@ -417,7 +422,12 @@ mod tests {
         let messages = vec![
             ChatMessage::user("list files".to_string()),
             ChatMessage::tool_call("bash", r#"{"cmd":"ls"}"#, Some("call_1".to_string())),
-            ChatMessage::tool_result("bash", r#"{"cmd":"ls"}"#, "file1.txt", Some("call_1".to_string())),
+            ChatMessage::tool_result(
+                "bash",
+                r#"{"cmd":"ls"}"#,
+                "file1.txt",
+                Some("call_1".to_string()),
+            ),
             ChatMessage::agent("Here are your files".to_string()),
         ];
 

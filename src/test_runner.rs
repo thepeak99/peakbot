@@ -9,8 +9,8 @@
 //! - Compaction is owned by StateManager (same as production)
 //! - Simplified configuration for testing
 
-use crate::context_manager::ContextManager;
 use crate::config::ContextConfig;
+use crate::context_manager::ContextManager;
 use crate::hooks::SessionHook;
 use crate::providers::DynAgent;
 use crate::state::StateManager;
@@ -173,7 +173,10 @@ impl TestRunner {
         }
 
         // Call the agent with history
-        let result = self.agent.prompt_with_history(&current_msg, &mut history).await;
+        let result = self
+            .agent
+            .prompt_with_history(&current_msg, &mut history)
+            .await;
 
         // Process events from the session hook to update stats
         self.process_session_hook_events();

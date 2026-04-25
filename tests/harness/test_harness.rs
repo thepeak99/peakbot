@@ -219,6 +219,7 @@ impl TestHarness {
     }
 
     /// Get the number of messages tagged as compacted.
+    #[allow(dead_code)] // test utility kept for future scenarios
     pub fn compacted_message_count(&self) -> usize {
         self.state_manager
             .get_state()
@@ -317,13 +318,15 @@ impl TestHarness {
             last.num_discarded > 0,
             "Compaction event fired but num_discarded is 0 -- compaction was a no-op stub. \
              original_count: {}, compacted_count: {}",
-            last.original_count, last.compacted_count
+            last.original_count,
+            last.compacted_count
         );
         assert!(
             last.compacted_count <= last.original_count,
             "Compaction event fired but compacted_count ({}) > original_count ({}) -- \
              compaction somehow ADDED messages",
-            last.compacted_count, last.original_count
+            last.compacted_count,
+            last.original_count
         );
     }
 }

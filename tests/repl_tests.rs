@@ -78,7 +78,10 @@ mod tests {
         let paragraph = ReplUi::build_input_paragraph("abc\ndef", 5, false, None, None);
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
-        assert_snapshot!("input_area_multiline_cursor_on_second_line", lines.join("\n"));
+        assert_snapshot!(
+            "input_area_multiline_cursor_on_second_line",
+            lines.join("\n")
+        );
     }
 
     /// Cursor on first line of a two-line buffer.
@@ -88,7 +91,10 @@ mod tests {
         let paragraph = ReplUi::build_input_paragraph("abc\ndef", 1, false, None, None);
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
-        assert_snapshot!("input_area_multiline_cursor_on_first_line", lines.join("\n"));
+        assert_snapshot!(
+            "input_area_multiline_cursor_on_first_line",
+            lines.join("\n")
+        );
     }
 
     /// Cursor at the end of the first logical line (right before '\n').
@@ -98,7 +104,10 @@ mod tests {
         let paragraph = ReplUi::build_input_paragraph("abc\ndef", 3, false, None, None);
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
-        assert_snapshot!("input_area_multiline_cursor_at_end_of_first_line", lines.join("\n"));
+        assert_snapshot!(
+            "input_area_multiline_cursor_at_end_of_first_line",
+            lines.join("\n")
+        );
     }
 
     /// Buffer ending with a trailing newline; cursor at buffer end = empty
@@ -109,7 +118,10 @@ mod tests {
         let paragraph = ReplUi::build_input_paragraph("abc\n", 4, false, None, None);
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
-        assert_snapshot!("input_area_multiline_cursor_on_empty_trailing_line", lines.join("\n"));
+        assert_snapshot!(
+            "input_area_multiline_cursor_on_empty_trailing_line",
+            lines.join("\n")
+        );
     }
 
     /// Three lines, cursor in the middle line.
@@ -1141,9 +1153,8 @@ mod tests {
                 break;
             }
         }
-        let thumb_row = thumb_row.expect(
-            "scrollbar thumb (█) must be rendered somewhere in the scrollbar column",
-        );
+        let thumb_row = thumb_row
+            .expect("scrollbar thumb (█) must be rendered somewhere in the scrollbar column");
 
         // global_scroll = 500 / content_length = 1000 → thumb belongs in
         // the middle third of the 20-row column. Pre-fix the thumb sat
@@ -1151,7 +1162,7 @@ mod tests {
         // area.height - 2` = 3 + 18 = 21 out of 1000, pinning it at the
         // top.
         assert!(
-            thumb_row >= 5 && thumb_row <= 14,
+            (5..=14).contains(&thumb_row),
             "thumb at row {thumb_row} (global_scroll=500/1000); \
              expected middle of scrollbar column (rows 5..=14). \
              Pre-fix this lived at rows 0–2."

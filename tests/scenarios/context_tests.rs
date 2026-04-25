@@ -42,8 +42,8 @@ fn summarization_response() -> MockResponse {
 async fn compaction_triggers_with_small_window() {
     let context_config = ContextConfig {
         context_window: Some(500), // 500 tokens total
-        threshold: 0.5,             // 50% = 250 tokens threshold
-        keep_recent: 2,             // Keep last 2 messages
+        threshold: 0.5,            // 50% = 250 tokens threshold
+        keep_recent: 2,            // Keep last 2 messages
         enabled: true,
         compaction_model: None,
     };
@@ -106,7 +106,7 @@ async fn compaction_reduces_history() {
 
     // Build up conversation history
     harness.run_message("Message 1").await;
-    let count_after_1 = harness.get_chat_message_count();
+    let _count_after_1 = harness.get_chat_message_count();
 
     harness.run_message("Message 2").await;
     harness.run_message("Message 3").await;
@@ -131,7 +131,8 @@ async fn compaction_reduces_history() {
         assert!(
             event.compacted_count <= event.original_count,
             "Compacted count ({}) should not exceed original ({})",
-            event.compacted_count, event.original_count
+            event.compacted_count,
+            event.original_count
         );
     }
 
@@ -152,7 +153,8 @@ async fn compaction_reduces_history() {
     assert!(
         uncompacted < total,
         "Uncompacted count ({}) should be less than total ({})",
-        uncompacted, total
+        uncompacted,
+        total
     );
 }
 
@@ -161,8 +163,8 @@ async fn compaction_reduces_history() {
 async fn compaction_preserves_recent_messages() {
     let context_config = ContextConfig {
         context_window: Some(400),
-        threshold: 0.5,  // 50% = 200 tokens
-        keep_recent: 2,  // Keep last 2 messages
+        threshold: 0.5, // 50% = 200 tokens
+        keep_recent: 2, // Keep last 2 messages
         enabled: true,
         compaction_model: None,
     };
@@ -240,7 +242,7 @@ async fn compaction_skipped_when_disabled() {
 async fn multiple_compaction_events() {
     let context_config = ContextConfig {
         context_window: Some(200), // Very small window
-        threshold: 0.6,             // 60% = 120 tokens threshold
+        threshold: 0.6,            // 60% = 120 tokens threshold
         keep_recent: 1,            // Keep only last message
         enabled: true,
         compaction_model: None,
@@ -272,12 +274,14 @@ async fn multiple_compaction_events() {
     for (i, event) in events.iter().enumerate() {
         assert!(
             event.compacted_count <= event.original_count,
-            "Compaction event {} should not increase message count", i
+            "Compaction event {} should not increase message count",
+            i
         );
         // Every compaction that fires should actually discard something
         assert!(
             event.num_discarded > 0,
-            "Compaction event {} fired but discarded 0 messages -- no-op stub detected", i
+            "Compaction event {} fired but discarded 0 messages -- no-op stub detected",
+            i
         );
     }
 }
@@ -313,9 +317,11 @@ async fn messages_added_to_history() {
 
     // 3 user + 3 assistant = 6 new messages
     assert_eq!(
-        count_after - count_before, 6,
+        count_after - count_before,
+        6,
         "Should have 6 new messages (3 user + 3 assistant), before: {}, after: {}",
-        count_before, count_after
+        count_before,
+        count_after
     );
 }
 
@@ -335,7 +341,8 @@ async fn history_cleared() {
     harness.clear_chat_history();
 
     assert_eq!(
-        harness.get_chat_message_count(), 0,
+        harness.get_chat_message_count(),
+        0,
         "Should have empty history after clear"
     );
 }
@@ -382,7 +389,7 @@ async fn compaction_persists_to_state_manager() {
     harness.run_message("Message 1").await;
     harness.run_message("Message 2").await;
 
-    let count_before_compact_turn = harness.get_chat_message_count();
+    let _count_before_compact_turn = harness.get_chat_message_count();
     // Should be 4 (msg1_user, msg1_assistant, msg2_user, msg2_assistant)
 
     harness.run_message("Message 3").await;
@@ -409,7 +416,8 @@ async fn compaction_persists_to_state_manager() {
     assert!(
         uncompacted < total,
         "Uncompacted ({}) should be less than total ({}) after compaction",
-        uncompacted, total
+        uncompacted,
+        total
     );
 }
 
@@ -444,7 +452,8 @@ async fn no_compaction_under_threshold() {
 
     // All messages should be present
     assert_eq!(
-        harness.get_chat_message_count(), 10,
+        harness.get_chat_message_count(),
+        10,
         "All 10 messages (5 user + 5 assistant) should be present"
     );
 }

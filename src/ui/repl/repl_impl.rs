@@ -522,8 +522,8 @@ impl ReplUi {
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
-        let mut scroll_state = ScrollbarState::new(content_height as usize)
-            .position(global_scroll as usize);
+        let mut scroll_state =
+            ScrollbarState::new(content_height as usize).position(global_scroll as usize);
         f.render_stateful_widget(scrollbar, chunks[1], &mut scroll_state);
 
         let scrolled = paragraph.scroll((paragraph_scroll, 0));
@@ -728,7 +728,8 @@ impl ReplUi {
     /// the user can't miss it — the whole point of this row is to remind
     /// them they're in a non-default modal state and how to get out.
     pub fn render_select_mode_banner(f: &mut ratatui::Frame, area: Rect) {
-        let text = " 📋 SELECT MODE — drag to select · use your terminal's copy keys · F4 to resume ";
+        let text =
+            " 📋 SELECT MODE — drag to select · use your terminal's copy keys · F4 to resume ";
         let paragraph = Paragraph::new(text).style(
             Style::default()
                 .fg(Color::Black)
