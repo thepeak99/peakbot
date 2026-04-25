@@ -461,6 +461,22 @@ impl StateManager {
         format!("Cleared {} finished tasks (completed and cancelled)", cleared)
     }
 
+    /// Wipe the entire todo list and resync the UI view.
+    ///
+    /// Unlike `clear_completed_todos`, this drops *every* task regardless of
+    /// status — used by reset-style commands (e.g. `/new`) where the todo
+    /// list is conceptually scoped to the conversation that's about to be
+    /// retired. Replaces the inner `TodoList` outright so the id counter
+    /// also resets to 1, mirroring the "empty list ⇒ ids restart" contract
+    /// already provided by `TodoList::clear_completed`.
+    pub fn clear_all_todos(&self) {
+        {
+            let mut list = self.todo_list.lock().unwrap();
+            *list = TodoList::new();
+            self.sync_todo_to_ui(&list);
+        }
+    }
+
     /// Sync todo list to UI state
     fn sync_todo_to_ui(&self, list: &TodoList) {
         let items: Vec<TodoItem> = list.list().iter().map(TodoItem::from).collect();

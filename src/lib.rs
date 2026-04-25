@@ -757,14 +757,17 @@ impl AgentRunner {
                 // Create new conversation via StateManager (single source of truth).
                 //
                 // `create_conversation` alone only swaps the current-conversation
-                // slot; the derived views (chat.messages, session stats) are
-                // untouched. Without also clearing them the agent's next turn
-                // still sees the prior history via `get_agent_history()` and
-                // the token/cost counters keep accumulating — i.e. /new would
-                // lie about starting fresh. Clear both explicitly.
+                // slot; the derived views (chat.messages, session stats, todo
+                // list) are untouched. Without also clearing them the agent's
+                // next turn still sees the prior history via
+                // `get_agent_history()`, the token/cost counters keep
+                // accumulating, AND the previous conversation's todos linger
+                // in the side panel — i.e. /new would lie about starting
+                // fresh. Clear all three explicitly.
                 if let Some(sm) = state_manager {
                     sm.clear_chat();
                     sm.reset_stats();
+                    sm.clear_all_todos();
                     let name = format!(
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")
@@ -1326,6 +1329,37 @@ mod tests {
         assert_eq!(stats.total_output_tokens, 0, "/new must zero output tokens");
         assert_eq!(stats.total_api_calls, 0, "/new must zero api calls");
         assert_eq!(stats.total_cost, 0.0, "/new must zero cost");
+    }
+
+    #[tokio::test]
+    async fn new_command_clears_todo_list() {
+        // /new starts a fresh conversation, and the todo list is conceptually
+        // scoped to "the work the user is doing right now". Carrying todos
+        // from the previous conversation into a new one is the same class of
+        // bug as carrying chat history: stale state leaking across a
+        // user-initiated reset. See the docs above the /new handler.
+        let sm = StateManager::new_arc();
+        let config = Config::default();
+
+        // Seed the todo list with two tasks
+        sm.add_todo("write the docs".to_string());
+        sm.add_todo("ship the bug fix".to_string());
+        assert_eq!(sm.get_todo_list().list().len(), 2);
+
+        AgentRunner::process_command_internal("/new", &Some(sm.clone()), &config).await;
+
+        let todos = sm.get_todo_list();
+        assert!(
+            todos.list().is_empty(),
+            "/new must clear the todo list; got {:?}",
+            todos.list().iter().map(|t| &t.task).collect::<Vec<_>>()
+        );
+        // Also verify the UI-facing view was synced (otherwise the panel
+        // would keep displaying the dead tasks until the next state update).
+        assert!(
+            sm.get_state().todo.items.is_empty(),
+            "/new must sync the cleared todo list to the UI state"
+        );
     }
 
     #[tokio::test]

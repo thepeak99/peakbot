@@ -49,9 +49,12 @@ COPY src/ src/
 RUN touch src/main.rs && \
     cargo zigbuild --release --target ${TARGET}
 
-# Export only the binary. `ARG` works fine in scratch stages — it's resolved
-# at build time by BuildKit, so we can interpolate ${TARGET} directly into
-# the COPY path without an intermediate "extract" stage.
+# Export only the binary, named with the release/version + platform suffix so
+# the Makefile doesn't have to rename it post-build.
 FROM scratch
 ARG TARGET=universal2-apple-darwin
-COPY --from=builder /build/target/${TARGET}/release/peakbot /peakbot
+# VERSION is injected by `make release-build-macos` from .release-version.
+# Unset (default): artifact is `peakbot-macos-universal2`.
+# Set to e.g. 0.2.0: artifact is `peakbot-0.2.0-macos-universal2`.
+ARG VERSION=
+COPY --from=builder /build/target/${TARGET}/release/peakbot /peakbot${VERSION:+-${VERSION}}-macos-universal2

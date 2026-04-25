@@ -1,4 +1,4 @@
-.PHONY: all build build-linux build-macos clean test docker-build help \
+.PHONY: all build build-linux build-macos build-windows clean test docker-build help \
         release release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-publish
 
@@ -7,9 +7,11 @@ DOCKERFILE         := Dockerfile.windows
 DOCKERFILE_LINUX   := Dockerfile.linux
 DOCKERFILE_MACOS   := Dockerfile.macos
 OUTPUT_DIR         := output
-EXE_NAME           := peakbot.exe
-LINUX_BIN          := peakbot
-MACOS_BIN          := peakbot-macos
+# Default (unversioned) artifact names. Release builds bake the version into
+# the filename via --build-arg VERSION=$v from the .release-version stash.
+LINUX_BIN          := peakbot-linux-amd64
+WIN_BIN            := peakbot-windows-amd64.exe
+MACOS_BIN          := peakbot-macos-universal2
 CONTAINER_BUILDER ?= $(shell command -v podman 2>/dev/null || echo docker)
 
 # Release config — derived from `origin` remote so you only need GITEA_TOKEN
@@ -24,18 +26,21 @@ VERSION ?=
 # Default target
 all: build
 
-## build: Cross-compile to Windows exe
-build: $(OUTPUT_DIR)/$(EXE_NAME)
+## build: Cross-compile all three platforms (linux, windows, macos)
+build: build-linux build-windows build-macos
 
-$(OUTPUT_DIR)/$(EXE_NAME): Dockerfile.windows
+## build-windows: Cross-compile to Windows x86_64 .exe (via Dockerfile.windows)
+build-windows: $(OUTPUT_DIR)/$(WIN_BIN)
+
+$(OUTPUT_DIR)/$(WIN_BIN): Dockerfile.windows
 	@mkdir -p $(OUTPUT_DIR)
 	@echo "🔨 Cross-compiling peakbot for Windows..."
 	$(CONTAINER_BUILDER) build \
 		--output type=local,dest=$(OUTPUT_DIR) \
 		-f $(DOCKERFILE) \
 		.
-	@echo "✅ Built: $(OUTPUT_DIR)/$(EXE_NAME)"
-	@ls -lh $(OUTPUT_DIR)/$(EXE_NAME)
+	@echo "✅ Built: $(OUTPUT_DIR)/$(WIN_BIN)"
+	@ls -lh $(OUTPUT_DIR)/$(WIN_BIN)
 
 ## build-linux: Cross-compile to Linux x86_64 binary (via Dockerfile.linux)
 build-linux: $(OUTPUT_DIR)/$(LINUX_BIN)
@@ -61,8 +66,6 @@ $(OUTPUT_DIR)/$(MACOS_BIN): Dockerfile.macos
 		--output type=local,dest=$(OUTPUT_DIR) \
 		-f $(DOCKERFILE_MACOS) \
 		.
-	@# Dockerfile extracts as `peakbot`; rename so it doesn't shadow the linux artifact name
-	mv $(OUTPUT_DIR)/peakbot $(OUTPUT_DIR)/$(MACOS_BIN)
 	@chmod +x $(OUTPUT_DIR)/$(MACOS_BIN)
 	@echo "✅ Built: $(OUTPUT_DIR)/$(MACOS_BIN)"
 	@ls -lh $(OUTPUT_DIR)/$(MACOS_BIN)
@@ -131,31 +134,49 @@ release-tag:
 	git push origin "$$v"; \
 	echo "✅ Pushed $$v"
 
-## release-build-linux: Build linux/amd64 binary (via Dockerfile.linux)
-release-build-linux: build-linux
+## release-build-linux: Build linux/amd64 binary (via Dockerfile.linux) with the release version baked into the filename
+release-build-linux:
 	@set -eu; \
 	if [ ! -f .release-version ]; then echo "❌ run release-bump first"; exit 1; fi; \
 	v=$$(cat .release-version); \
-	cp $(OUTPUT_DIR)/$(LINUX_BIN) $(OUTPUT_DIR)/peakbot-$$v-linux-amd64; \
+	mkdir -p $(OUTPUT_DIR); \
+	echo "🐧 Building peakbot $$v for Linux..."; \
+	$(CONTAINER_BUILDER) build \
+		--build-arg VERSION=$$v \
+		--output type=local,dest=$(OUTPUT_DIR) \
+		-f $(DOCKERFILE_LINUX) \
+		.; \
 	chmod +x $(OUTPUT_DIR)/peakbot-$$v-linux-amd64; \
 	echo "✅ $(OUTPUT_DIR)/peakbot-$$v-linux-amd64"; \
 	ls -lh $(OUTPUT_DIR)/peakbot-$$v-linux-amd64
 
-## release-build-windows: Build windows/amd64 binary (via Dockerfile.windows)
-release-build-windows: build
+## release-build-windows: Build windows/amd64 binary (via Dockerfile.windows) with the release version baked into the filename
+release-build-windows:
 	@set -eu; \
 	if [ ! -f .release-version ]; then echo "❌ run release-bump first"; exit 1; fi; \
 	v=$$(cat .release-version); \
-	cp $(OUTPUT_DIR)/$(EXE_NAME) $(OUTPUT_DIR)/peakbot-$$v-windows-amd64.exe; \
+	mkdir -p $(OUTPUT_DIR); \
+	echo "🔨 Cross-compiling peakbot $$v for Windows..."; \
+	$(CONTAINER_BUILDER) build \
+		--build-arg VERSION=$$v \
+		--output type=local,dest=$(OUTPUT_DIR) \
+		-f $(DOCKERFILE) \
+		.; \
 	echo "✅ $(OUTPUT_DIR)/peakbot-$$v-windows-amd64.exe"; \
 	ls -lh $(OUTPUT_DIR)/peakbot-$$v-windows-amd64.exe
 
-## release-build-macos: Build macOS universal2 binary (via Dockerfile.macos)
-release-build-macos: build-macos
+## release-build-macos: Build macOS universal2 binary (via Dockerfile.macos) with the release version baked into the filename
+release-build-macos:
 	@set -eu; \
 	if [ ! -f .release-version ]; then echo "❌ run release-bump first"; exit 1; fi; \
 	v=$$(cat .release-version); \
-	cp $(OUTPUT_DIR)/$(MACOS_BIN) $(OUTPUT_DIR)/peakbot-$$v-macos-universal2; \
+	mkdir -p $(OUTPUT_DIR); \
+	echo "🍎 Cross-compiling peakbot $$v for macOS (universal2)..."; \
+	$(CONTAINER_BUILDER) build \
+		--build-arg VERSION=$$v \
+		--output type=local,dest=$(OUTPUT_DIR) \
+		-f $(DOCKERFILE_MACOS) \
+		.; \
 	chmod +x $(OUTPUT_DIR)/peakbot-$$v-macos-universal2; \
 	echo "✅ $(OUTPUT_DIR)/peakbot-$$v-macos-universal2"; \
 	ls -lh $(OUTPUT_DIR)/peakbot-$$v-macos-universal2
