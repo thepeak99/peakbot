@@ -154,8 +154,9 @@ impl SubAgentRegistry {
                     DynAgent::OpenRouter(agent),
                     ProviderInfo {
                         name: "openrouter".to_string(),
-                        model,
+                        model: model.clone(),
                         supports_pricing: true,
+                        supports_vision: crate::vision::model_supports_vision(&model),
                     },
                 ))
             }
@@ -186,8 +187,9 @@ impl SubAgentRegistry {
                     DynAgent::OpenAI(agent),
                     ProviderInfo {
                         name: "openai".to_string(),
-                        model,
+                        model: model.clone(),
                         supports_pricing: true,
+                        supports_vision: crate::vision::model_supports_vision(&model),
                     },
                 ))
             }
@@ -216,8 +218,9 @@ impl SubAgentRegistry {
                     DynAgent::LlamaCpp(agent),
                     ProviderInfo {
                         name: "llamacpp".to_string(),
-                        model,
+                        model: model.clone(),
                         supports_pricing: true,
+                        supports_vision: crate::vision::model_supports_vision(&model),
                     },
                 ))
             }
@@ -247,8 +250,9 @@ impl SubAgentRegistry {
                     DynAgent::Ollama(agent),
                     ProviderInfo {
                         name: "ollama".to_string(),
-                        model,
+                        model: model.clone(),
                         supports_pricing: false,
+                        supports_vision: crate::vision::model_supports_vision(&model),
                     },
                 ))
             }

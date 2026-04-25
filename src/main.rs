@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use peakbot::{
-    AgentRunner, Config, FileStorage, SubAgentRegistry, TodoTool, Ui, UiAction, build_system_prompt,
-    create_provider, load_default_skills, load_mcp_servers,
+    AgentRunner, Config, FileStorage, SubAgentRegistry, TodoTool, Ui, UiAction,
+    build_system_prompt, create_provider, load_default_skills, load_mcp_servers,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;

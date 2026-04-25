@@ -38,6 +38,13 @@ pub struct ProviderInfo {
     pub model: String,
     /// Whether this provider supports pricing/cost tracking
     pub supports_pricing: bool,
+    /// Whether this provider+model can accept image input.
+    ///
+    /// Detected conservatively from the model name via
+    /// [`crate::vision::model_supports_vision`]. Used by the dispatcher to
+    /// block `[img:…]` submissions when the active model cannot see — emits
+    /// a system error rather than silently dropping the images.
+    pub supports_vision: bool,
 }
 
 /// Tool-free completion model for compaction summarization.
@@ -93,17 +100,29 @@ impl DynAgent {
         }
     }
 
-    /// Prompt the agent with chat history
+    /// Prompt the agent with chat history.
+    ///
+    /// Accepts any `impl Into<Message>`. `&str` and `String` are text turns;
+    /// a full `Message::User` with mixed content drives a vision turn. The
+    /// same tool loop fires in both cases — rig's `PromptRequest` doesn't
+    /// distinguish.
     pub async fn prompt_with_history(
         &self,
-        prompt: &str,
+        prompt: impl Into<Message>,
         history: &mut Vec<Message>,
     ) -> Result<String, PromptError> {
+        // Own the Message once — then clone per match arm, since rig's
+        // `prompt()` takes `impl Into<Message>` by value.
+        let prompt: Message = prompt.into();
         match self {
-            DynAgent::OpenRouter(agent) => agent.prompt(prompt).with_history(history).await,
-            DynAgent::OpenAI(agent) => agent.prompt(prompt).with_history(history).await,
-            DynAgent::LlamaCpp(agent) => agent.prompt(prompt).with_history(history).await,
-            DynAgent::Ollama(agent) => agent.prompt(prompt).with_history(history).await,
+            DynAgent::OpenRouter(agent) => {
+                agent.prompt(prompt.clone()).with_history(history).await
+            }
+            DynAgent::OpenAI(agent) => agent.prompt(prompt.clone()).with_history(history).await,
+            DynAgent::LlamaCpp(agent) => {
+                agent.prompt(prompt.clone()).with_history(history).await
+            }
+            DynAgent::Ollama(agent) => agent.prompt(prompt.clone()).with_history(history).await,
             #[cfg(feature = "mock")]
             DynAgent::Mock(agent) => agent.prompt(prompt).with_history(history).await,
         }
@@ -433,8 +452,9 @@ fn create_openrouter_agent(
 
     let info = ProviderInfo {
         name: "openrouter".to_string(),
-        model,
+        model: model.clone(),
         supports_pricing: true,
+        supports_vision: crate::vision::model_supports_vision(&model),
     };
 
     Ok((agent, info, receiver, hook))
@@ -506,8 +526,9 @@ fn create_ollama_agent(
 
     let info = ProviderInfo {
         name: "ollama".to_string(),
-        model,
+        model: model.clone(),
         supports_pricing: false,
+        supports_vision: crate::vision::model_supports_vision(&model),
     };
 
     Ok((agent, info))
@@ -592,8 +613,9 @@ fn create_openai_agent(
 
     let info = ProviderInfo {
         name: "openai".to_string(),
-        model,
+        model: model.clone(),
         supports_pricing: true,
+        supports_vision: crate::vision::model_supports_vision(&model),
     };
 
     Ok((agent, info, receiver, hook))
@@ -677,8 +699,9 @@ fn create_llamacpp_agent(
 
     let info = ProviderInfo {
         name: "llamacpp".to_string(),
-        model,
+        model: model.clone(),
         supports_pricing: true,
+        supports_vision: crate::vision::model_supports_vision(&model),
     };
 
     Ok((agent, info, receiver, hook))
@@ -740,6 +763,9 @@ pub fn create_mock_agent(
         name: "mock".to_string(),
         model: "mock-model".to_string(),
         supports_pricing: true,
+        // Mock is used by integration tests — keep vision enabled so those
+        // tests can exercise both code paths.
+        supports_vision: true,
     };
 
     Ok((
@@ -749,4 +775,66 @@ pub fn create_mock_agent(
         Arc::new(hook),
         model_clone,
     ))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_info_supports_vision_pins_detection_for_known_patterns() {
+        // Pinning test for the `supports_vision` flag — this is the boundary
+        // where a vision-capable model must be recognised, and vice versa.
+        let vision_ok = ProviderInfo {
+            name: "openrouter".into(),
+            model: "anthropic/claude-3.5-sonnet".into(),
+            supports_pricing: true,
+            supports_vision: crate::vision::model_supports_vision(
+                "anthropic/claude-3.5-sonnet",
+            ),
+        };
+        let vision_no = ProviderInfo {
+            name: "openrouter".into(),
+            model: "qwen/qwq-32b".into(),
+            supports_pricing: true,
+            supports_vision: crate::vision::model_supports_vision("qwen/qwq-32b"),
+        };
+        assert!(vision_ok.supports_vision);
+        assert!(!vision_no.supports_vision);
+    }
+
+    #[test]
+    fn prompt_with_history_signature_accepts_string_and_message() {
+        // Compile-only pin: if this builds, both a `&str` and a
+        // `rig::Message::User` with multimodal content satisfy the
+        // `impl Into<Message>` bound on `prompt_with_history`. We don't
+        // invoke the call because it would require a real agent; the type
+        // bound is the contract we're pinning.
+        use rig::OneOrMany;
+        use rig::completion::message::{
+            DocumentSourceKind, Image, ImageMediaType, Message, Text, UserContent,
+        };
+
+        fn _takes_into_message<T: Into<Message>>(_t: T) {}
+
+        _takes_into_message("hello");
+        _takes_into_message(String::from("hello"));
+
+        let multimodal = Message::User {
+            content: OneOrMany::many([
+                UserContent::Image(Image {
+                    data: DocumentSourceKind::Base64("x".into()),
+                    media_type: Some(ImageMediaType::PNG),
+                    detail: None,
+                    additional_params: None,
+                }),
+                UserContent::Text(Text {
+                    text: "what is this?".into(),
+                }),
+            ])
+            .expect("non-empty"),
+        };
+        _takes_into_message(multimodal);
+    }
 }

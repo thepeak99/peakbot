@@ -15,6 +15,7 @@ pub mod storage;
 pub mod test_runner;
 mod tools;
 pub mod ui;
+pub mod vision;
 
 pub use config::{
     AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig,
@@ -77,24 +78,43 @@ enum QueueMessage {
 /// Regression guard: before this existed, every slash command (`/new`,
 /// `/help`, …) was appended as a user message and billed as an LLM turn.
 /// See `allehailmenu.md`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum SubmitKind {
     /// `/stop` — interrupts the running agent instead of queueing.
     StopCommand,
     /// Any other `/xxx` — routed to `process_command_internal`.
-    Command,
+    Command(String),
     /// Plain chat content — sent to the LLM.
-    UserMessage,
+    UserMessage(String),
+    /// User turn with one or more `[img:…]` attachments parsed from the
+    /// buffer. Capability-checked against `ProviderInfo::supports_vision`
+    /// before dispatch.
+    MultimodalMessage {
+        text: String,
+        attachments: Vec<crate::vision::ImageAttachment>,
+    },
+    /// `[img:…]` parsed but failed (missing file, too large, invalid token…).
+    /// Surfaces as a system error; does not reach the LLM.
+    InvalidAttachment(crate::vision::AttachmentError),
 }
 
 fn classify_submission(msg: &str) -> SubmitKind {
     let trimmed = msg.trim();
     if trimmed == "/stop" {
-        SubmitKind::StopCommand
-    } else if trimmed.starts_with('/') {
-        SubmitKind::Command
-    } else {
-        SubmitKind::UserMessage
+        return SubmitKind::StopCommand;
+    }
+    if trimmed.starts_with('/') {
+        return SubmitKind::Command(msg.to_string());
+    }
+    // Try inline image parsing FIRST — before deciding it's plain text.
+    // A buffer without `[img:` returns `(buf, [])` immediately (cheap).
+    match crate::vision::parse_attachments_inline(msg) {
+        Ok((text, attachments)) if !attachments.is_empty() => SubmitKind::MultimodalMessage {
+            text: text.trim().to_string(),
+            attachments,
+        },
+        Ok(_) => SubmitKind::UserMessage(msg.to_string()),
+        Err(e) => SubmitKind::InvalidAttachment(e),
     }
 }
 
@@ -220,7 +240,6 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
 pub struct AgentRunner {
     agent: Arc<DynAgent>,
     config: Config,
-    #[allow(unused)]
     provider_info: ProviderInfo,
     #[allow(unused)]
     skills: SkillRegistry,
@@ -312,6 +331,7 @@ impl AgentRunner {
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
         let event_receiver = self.event_receiver.take();
+        let provider_info = Arc::new(self.provider_info.clone());
 
         // Spawn event processor task (Phase 2: wire the event channel)
         let event_processor_handle = tokio::spawn({
@@ -341,6 +361,7 @@ impl AgentRunner {
                     state_manager,
                     session_hook,
                     config_model,
+                    provider_info,
                 )
                 .await;
             }
@@ -376,6 +397,7 @@ impl AgentRunner {
         state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
         config_model: String,
+        provider_info: Arc<ProviderInfo>,
     ) {
         // Initialize conversation in StateManager (single source of truth)
         if let Some(ref sm) = state_manager {
@@ -403,19 +425,51 @@ impl AgentRunner {
                                 }
                             }
                         }
-                        SubmitKind::Command => {
+                        SubmitKind::Command(cmd) => {
                             // Dispatched by agent_loop via process_command_internal.
-                            msg_tx.send(QueueMessage::Command(msg)).await.ok();
+                            msg_tx.send(QueueMessage::Command(cmd)).await.ok();
                         }
-                        SubmitKind::UserMessage => {
+                        SubmitKind::UserMessage(text) => {
                             if let Some(ref sm) = state_manager {
-                                sm.add_user_message(msg.clone());
+                                sm.add_user_message(text.clone());
                             }
                             // If agent is running, interrupt it first.
                             if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
                                 session_hook.request_stop();
                             }
-                            msg_tx.send(QueueMessage::UserMessage(msg)).await.ok();
+                            msg_tx.send(QueueMessage::UserMessage(text)).await.ok();
+                        }
+                        SubmitKind::MultimodalMessage { text, attachments } => {
+                            // Capability guardrail — fail loud rather than drop images silently.
+                            if !provider_info.supports_vision {
+                                if let Some(ref sm) = state_manager {
+                                    sm.add_system_message(format!(
+                                        "❌ Model `{}` does not support vision. Switch to a \
+                                         vision-capable model in config.yaml (e.g. \
+                                         `anthropic/claude-3.5-sonnet`, `gpt-4o`, \
+                                         `google/gemini-2.0-flash-001`).",
+                                        provider_info.model
+                                    ));
+                                }
+                                continue;
+                            }
+                            if let Some(ref sm) = state_manager {
+                                sm.add_user_message_with_attachments(text.clone(), attachments);
+                            }
+                            if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
+                                session_hook.request_stop();
+                            }
+                            // The String payload here is a display marker only —
+                            // `process_message_internal` rebuilds the current-turn
+                            // `Message` from `StateManager` state, so images are
+                            // preserved even though this channel carries text.
+                            msg_tx.send(QueueMessage::UserMessage(text)).await.ok();
+                        }
+                        SubmitKind::InvalidAttachment(e) => {
+                            if let Some(ref sm) = state_manager {
+                                sm.add_system_message(format!("❌ {e}"));
+                            }
+                            // Do not enqueue — the model is never called.
                         }
                     }
                 }
@@ -453,9 +507,25 @@ impl AgentRunner {
                         sm.set_running(true);
                     }
 
-                    let result =
-                        Self::process_message_internal(&content, &state_manager, &agent, &config)
-                            .await;
+                    // Build the current-turn `Message` — attachments (if any)
+                    // are read from state, so both text and vision turns use
+                    // the same dispatch path.
+                    let current_turn = state_manager
+                        .as_ref()
+                        .and_then(|sm| sm.build_current_turn_message())
+                        .unwrap_or_else(|| {
+                            // Fallback: no state manager (test-only paths) —
+                            // pass the String through as a text-only Message.
+                            rig::completion::message::Message::from(content.as_str())
+                        });
+
+                    let result = Self::process_message_internal(
+                        current_turn,
+                        &state_manager,
+                        &agent,
+                        &config,
+                    )
+                    .await;
 
                     // Mark as done — snapshot run_started_at BEFORE set_running(false) clears
                     // it, then emit a "worked for MM:SS" system message (reuses the spinner
@@ -554,15 +624,16 @@ impl AgentRunner {
         }
     }
 
-    /// Internal process_message - returns CompletionResult instead of handling directly
+    /// Internal process_message — takes the already-built current-turn `Message`
+    /// (text or multimodal) and history from `StateManager`, runs the agent,
+    /// writes the response back to state. Retries on transient errors.
     async fn process_message_internal(
-        msg: &str,
+        current_turn: rig::completion::message::Message,
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
     ) -> CompletionResult {
         let mut retry_count = 0;
-        let current_msg = msg.to_string();
 
         loop {
             // Compaction is handled automatically by StateManager when messages
@@ -576,7 +647,7 @@ impl AgentRunner {
                 .unwrap_or_default();
             let result = agent
                 .as_ref()
-                .prompt_with_history(&current_msg, &mut history)
+                .prompt_with_history(current_turn.clone(), &mut history)
                 .await;
 
             match result {
@@ -599,7 +670,7 @@ impl AgentRunner {
                     return CompletionResult::Error;
                 }
 
-                Err(_) => {
+                Err(e) => {
                     if retry_count == config.retry().max_retries {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
@@ -675,10 +746,7 @@ impl AgentRunner {
                     let mut msg = String::from("Available commands:\n");
                     for cmd in crate::ui::ui_trait::builtin_commands() {
                         let args = if cmd.takes_args { " <args>" } else { "" };
-                        msg.push_str(&format!(
-                            "  /{}{} — {}\n",
-                            cmd.name, args, cmd.description
-                        ));
+                        msg.push_str(&format!("  /{}{} — {}\n", cmd.name, args, cmd.description));
                     }
                     sm.add_system_message(msg);
                 } else {
@@ -786,7 +854,9 @@ impl AgentRunner {
                             Ok(id) => id,
                             Err(_) => {
                                 if let Some(sm) = state_manager {
-                                    sm.add_system_message("❌ Invalid conversation ID.".to_string());
+                                    sm.add_system_message(
+                                        "❌ Invalid conversation ID.".to_string(),
+                                    );
                                 }
                                 return;
                             }
@@ -817,10 +887,7 @@ impl AgentRunner {
                     if let Some(sm) = state_manager {
                         match sm.rename_conversation(name.to_string()) {
                             Ok(_) => {
-                                sm.add_system_message(format!(
-                                    "Conversation renamed to: {}",
-                                    name
-                                ));
+                                sm.add_system_message(format!("Conversation renamed to: {}", name));
                             }
                             Err(e) => {
                                 sm.add_system_message(format!("❌ Failed to rename: {}", e));
@@ -1021,8 +1088,7 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
     tracing::info!("Connecting to MCP server '{}' at {}", config.name, url);
 
     // Build the streamable-http config with optional bearer token + custom headers.
-    let mut transport_config =
-        StreamableHttpClientTransportConfig::with_uri(url.clone());
+    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.clone());
 
     if let Some(token) = config.auth_token.as_ref()
         && !token.is_empty()
@@ -1307,7 +1373,10 @@ mod tests {
         let stats_arc = sm.stats_arc();
         let stats = stats_arc.lock().unwrap();
         assert_eq!(stats.total_input_tokens, 0, "/reset must zero input tokens");
-        assert_eq!(stats.total_output_tokens, 0, "/reset must zero output tokens");
+        assert_eq!(
+            stats.total_output_tokens, 0,
+            "/reset must zero output tokens"
+        );
         assert_eq!(stats.total_api_calls, 0, "/reset must zero api calls");
         assert_eq!(stats.total_cost, 0.0, "/reset must zero cost");
     }
@@ -1433,61 +1502,113 @@ mod tests {
 
     #[test]
     fn classify_plain_text_is_user_message() {
-        assert_eq!(
+        assert!(matches!(
             classify_submission("hello world"),
-            SubmitKind::UserMessage
-        );
+            SubmitKind::UserMessage(s) if s == "hello world"
+        ));
     }
 
     #[test]
     fn classify_slash_new_is_command() {
         // THE bug: used to classify as UserMessage, got sent to the LLM.
-        assert_eq!(classify_submission("/new"), SubmitKind::Command);
+        assert!(matches!(
+            classify_submission("/new"),
+            SubmitKind::Command(s) if s == "/new"
+        ));
     }
 
     #[test]
     fn classify_slash_help_is_command() {
-        assert_eq!(classify_submission("/help"), SubmitKind::Command);
+        assert!(matches!(
+            classify_submission("/help"),
+            SubmitKind::Command(s) if s == "/help"
+        ));
     }
 
     #[test]
     fn classify_slash_with_args_is_command() {
         // Arg-taking commands (popup closes on space, user finishes typing).
-        assert_eq!(
+        assert!(matches!(
             classify_submission("/load 123e4567-e89b-12d3-a456-426614174000"),
-            SubmitKind::Command
-        );
+            SubmitKind::Command(_)
+        ));
     }
 
     #[test]
     fn classify_slash_stop_is_stop_command() {
         // /stop is special: it interrupts the running agent rather than
         // queueing another command behind the current run.
-        assert_eq!(classify_submission("/stop"), SubmitKind::StopCommand);
+        assert!(matches!(
+            classify_submission("/stop"),
+            SubmitKind::StopCommand
+        ));
     }
 
     #[test]
     fn classify_trims_whitespace_before_deciding() {
         // Trailing newline from the input buffer must not demote a command
         // back to UserMessage.
-        assert_eq!(classify_submission("/new\n"), SubmitKind::Command);
-        assert_eq!(classify_submission("  /stop  "), SubmitKind::StopCommand);
+        assert!(matches!(
+            classify_submission("/new\n"),
+            SubmitKind::Command(_)
+        ));
+        assert!(matches!(
+            classify_submission("  /stop  "),
+            SubmitKind::StopCommand
+        ));
     }
 
     #[test]
     fn classify_mid_sentence_slash_stays_user_message() {
         // A slash that isn't at the start (after trim) is chat content.
-        assert_eq!(
+        assert!(matches!(
             classify_submission("TODO: /foo or /bar?"),
-            SubmitKind::UserMessage
-        );
+            SubmitKind::UserMessage(_)
+        ));
     }
 
     #[test]
     fn classify_empty_is_user_message() {
         // The Enter handler already drops empty buffers; defensive default.
-        assert_eq!(classify_submission(""), SubmitKind::UserMessage);
-        assert_eq!(classify_submission("   "), SubmitKind::UserMessage);
+        assert!(matches!(
+            classify_submission(""),
+            SubmitKind::UserMessage(_)
+        ));
+        assert!(matches!(
+            classify_submission("   "),
+            SubmitKind::UserMessage(_)
+        ));
+    }
+
+    #[test]
+    fn classify_inline_image_path_is_multimodal() {
+        use std::io::Write;
+        // Create a real tempfile the classifier can resolve.
+        let path = std::env::temp_dir().join(format!(
+            "peakbot-classify-{}-{}.png",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(b"x").expect("write");
+        let input = format!("describe [img:{}]", path.display());
+        match classify_submission(&input) {
+            SubmitKind::MultimodalMessage { text, attachments } => {
+                assert_eq!(text, "describe");
+                assert_eq!(attachments.len(), 1);
+            }
+            other => panic!("expected MultimodalMessage, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn classify_inline_image_missing_is_invalid_attachment() {
+        let input = "look at [img:/does/not/exist-7f8a.png]";
+        assert!(matches!(
+            classify_submission(input),
+            SubmitKind::InvalidAttachment(_)
+        ));
     }
 
     // --- MCP tests (pre-existing) -------------------------------------------

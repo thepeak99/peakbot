@@ -133,6 +133,16 @@ pub struct ChatMessage {
     /// Display content (formatted for UI rendering)
     pub content: String,
 
+    /// Image attachments for user messages.
+    ///
+    /// Empty for all non-user messages and for text-only user messages.
+    /// Skipped from JSON when empty → zero size overhead for existing
+    /// conversations. Converted to `rig::UserContent::Image` at the wire
+    /// boundary in `StateManager::get_agent_history` /
+    /// `build_current_turn_message`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::vision::ImageAttachment>,
+
     /// Timestamp when message was created
     pub timestamp: DateTime<Local>,
 
@@ -170,6 +180,29 @@ impl ChatMessage {
         Self {
             role: MessageRole::User,
             content,
+            attachments: Vec::new(),
+            timestamp: Local::now(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            call_id: None,
+            compacted: false,
+        }
+    }
+
+    /// Create a user message with image attachments.
+    ///
+    /// Mirrors [`ChatMessage::user`] but carries images that will be
+    /// converted to `rig::UserContent::Image` at the wire boundary. Intended
+    /// for `[img:…]` inline syntax flowing through `SubmitKind::MultimodalMessage`.
+    pub fn user_with_attachments(
+        content: String,
+        attachments: Vec<crate::vision::ImageAttachment>,
+    ) -> Self {
+        Self {
+            role: MessageRole::User,
+            content,
+            attachments,
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -184,6 +217,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::Agent,
             content,
+            attachments: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -198,6 +232,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::System,
             content,
+            attachments: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -212,6 +247,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::Summary,
             content,
+            attachments: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -230,6 +266,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::ToolCall,
             content,
+            attachments: Vec::new(),
             timestamp: Local::now(),
             tool_name: Some(tool_name.to_string()),
             tool_args: Some(args.to_string()),
@@ -251,6 +288,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::ToolResult,
             content,
+            attachments: Vec::new(),
             timestamp: Local::now(),
             tool_name: Some(tool_name.to_string()),
             tool_args: Some(args.to_string()),
@@ -270,6 +308,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::System,
             content,
+            attachments: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -285,6 +324,7 @@ impl ChatMessage {
         Self {
             role,
             content,
+            attachments: Vec::new(),
             timestamp: NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
                 .unwrap()
                 .and_local_timezone(Local)
