@@ -10,4 +10,4 @@ expression: "lines.join(\"\\n\")"
 │                                                         │█
 │                                                         │█
 │                                                         │║
-└───────────────────────────── Ctrl+C exit · Ctrl+T tasks ┘▼
+└───────────────── Ctrl+C exit · Ctrl+T tasks · F4 select ┘▼

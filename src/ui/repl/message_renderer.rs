@@ -98,7 +98,7 @@ impl MessageRenderer for PlainRenderer {
                     Span::raw("["),
                     Span::styled(
                         timestamp.clone(),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ),
                     Span::raw("] "),
                     Span::styled(prefix.to_string(), Style::default().fg(color)),
@@ -118,7 +118,7 @@ impl MessageRenderer for PlainRenderer {
                     Span::raw("["),
                     Span::styled(
                         timestamp.clone(),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ),
                     Span::raw("] "),
                     Span::styled(prefix.to_string(), Style::default().fg(color)),

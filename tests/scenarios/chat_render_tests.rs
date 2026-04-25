@@ -56,7 +56,7 @@ fn build_history(n: usize) -> ChatState {
 /// does strictly more work than this function measures. Any slowdown
 /// here is a lower bound on the real per-frame cost.
 fn one_frame_of_work(chat: &ChatState, width: u16) -> usize {
-    let paragraph = ReplUi::build_chat_history_paragraph(chat);
+    let paragraph = ReplUi::build_chat_history_paragraph(chat, false);
     paragraph.line_count(width)
 }
 

@@ -2,7 +2,7 @@
 # Usage: podman build --output type=local,dest=./output .
 # (or: docker build --output type=local,dest=./output .)
 
-FROM rust:1.88-bookworm AS builder
+FROM ghcr.io/rust-lang/rust:1.91-bookworm AS builder
 
 # Install mingw-w64 for cross-compilation to Windows
 RUN apt-get update && apt-get install -y \
@@ -36,9 +36,12 @@ COPY src/ src/
 RUN touch src/main.rs && \
     cargo build --target ${TARGET} --release
 
-# Export only the .exe. `ARG` works fine in scratch stages — it's resolved
-# at build time by BuildKit, so we can interpolate ${TARGET} directly into
-# the COPY path without an intermediate "extract" stage.
+# Export only the .exe, named with the release/version + platform suffix so
+# the Makefile doesn't have to rename it post-build.
 FROM scratch
 ARG TARGET=x86_64-pc-windows-gnu
-COPY --from=builder /build/target/${TARGET}/release/peakbot.exe /peakbot.exe
+# VERSION is injected by `make release-build-windows` from .release-version.
+# Unset (default): artifact is `peakbot-windows-amd64.exe`.
+# Set to e.g. 0.2.0: artifact is `peakbot-0.2.0-windows-amd64.exe`.
+ARG VERSION=
+COPY --from=builder /build/target/${TARGET}/release/peakbot.exe /peakbot${VERSION:+-${VERSION}}-windows-amd64.exe

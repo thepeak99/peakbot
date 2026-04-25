@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn chat_welcome() {
         let chat = ChatState::new();
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -136,7 +136,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -151,7 +151,7 @@ mod tests {
             "Hello".to_string(),
             "2024-01-01 12:00:00",
         ));
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -161,7 +161,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -176,7 +176,7 @@ mod tests {
             "Hi there!".to_string(),
             "2024-01-01 12:00:00",
         ));
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -186,7 +186,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -201,7 +201,7 @@ mod tests {
             "This is a message\nwith a newline\nin it.".to_string(),
             "2024-01-01 12:00:00",
         ));
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -211,7 +211,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -226,7 +226,7 @@ mod tests {
             "Line one\nLine two\nLine three".to_string(),
             "2024-01-01 12:00:00",
         ));
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -236,7 +236,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -345,7 +345,7 @@ mod tests {
                 "2024-01-01 12:00:00",
             ));
         }
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -356,7 +356,7 @@ mod tests {
                 .split(f.area());
             // Scroll position 0 = showing top of content
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -374,7 +374,7 @@ mod tests {
                 "2024-01-01 12:00:00",
             ));
         }
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -385,7 +385,7 @@ mod tests {
                 .split(f.area());
             // Scroll position 5 = showing middle of content
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 5, 5, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 5, 5, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -403,7 +403,7 @@ mod tests {
                 "2024-01-01 12:00:00",
             ));
         }
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -414,7 +414,7 @@ mod tests {
                 .split(f.area());
             // Max scroll = 15 messages - 8 visible = 7 (show last messages)
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 8, 8, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 8, 8, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -455,7 +455,7 @@ mod tests {
             "I found some files in the directory.".to_string(),
             "2024-01-01 12:00:05",
         ));
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(70, 12);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -465,7 +465,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -491,7 +491,7 @@ mod tests {
             "Short".to_string(),
             "2024-01-01 12:00:02",
         ));
-        let paragraph = ReplUi::build_chat_history_paragraph(&chat);
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -501,7 +501,7 @@ mod tests {
                 .constraints([Constraint::Percentage(100), Constraint::Length(1)])
                 .split(f.area());
             let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
-            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height);
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height, false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -1123,6 +1123,7 @@ mod tests {
                     paragraph_scroll,
                     paragraph,
                     CONTENT_HEIGHT,
+                    false,
                 );
             })
             .unwrap();
@@ -1188,6 +1189,7 @@ mod tests {
                     /* paragraph_scroll*/ 0,
                     paragraph,
                     CONTENT_HEIGHT,
+                    false,
                 );
             })
             .unwrap();

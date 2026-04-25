@@ -21,7 +21,7 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -114,6 +114,13 @@ pub struct UiState {
     /// combines this with `StateManager::revision()` to decide whether a
     /// redraw is necessary. Reset to `false` after each successful render.
     pub local_dirty: bool,
+    /// "Select mode": when `true`, mouse capture is *off* and the user can
+    /// drag-select chat text using their terminal's native selection UI
+    /// (and copy with the terminal's native shortcut — Ctrl+Shift+C,
+    /// Cmd+C, right-click → Copy, etc.). Toggled with F4. While true,
+    /// mouse-wheel scroll stops working — keyboard scroll (PgUp/PgDn,
+    /// arrows) keeps working. See `copy-and-paste-me-baby.md`.
+    pub select_mode: bool,
 }
 
 impl UiState {
@@ -130,6 +137,7 @@ impl UiState {
             // Start dirty so the first frame always renders, even before any
             // mutation has happened on the StateManager.
             local_dirty: true,
+            select_mode: false,
         }
     }
 
@@ -382,10 +390,24 @@ impl ReplUi {
     /// bottom border via [`Self::chat_block`], not here — they're
     /// permanently visible once the transcript fills.
     fn welcome_lines() -> Vec<Line<'static>> {
-        vec![Line::from(Span::styled(
-            "Welcome to PeakBot! Start a conversation or use /help for commands.",
-            Style::default().fg(Color::DarkGray),
-        ))]
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "✨ PeakBot ",
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    concat!("v", env!("CARGO_PKG_VERSION")),
+                    Style::default().fg(Color::LightYellow),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "Start a conversation or use /help for commands.",
+                Style::default().fg(Color::Gray),
+            )),
+        ]
     }
 
     /// The bordered block that wraps the chat transcript.
@@ -395,10 +417,21 @@ impl ReplUi {
     /// hint — right-aligned so the top-left `" Chat Messages "` title
     /// stays the dominant label, and clipped gracefully on narrow
     /// terminals (ratatui truncates titles that don't fit).
-    fn chat_block() -> Block<'static> {
+    ///
+    /// When `select_mode` is `true`, the block returns *naked* — no
+    /// borders, no titles, no hint. The point is that with the
+    /// terminal's mouse capture disabled (see `toggle_select_mode`)
+    /// the user is about to drag-select chat text with their terminal's
+    /// own selection UI, and any `│`/`─`/title characters in the visible
+    /// buffer would contaminate the clipboard. Content (timestamps,
+    /// role prefixes) stays — it's content, not chrome.
+    fn chat_block(select_mode: bool) -> Block<'static> {
+        if select_mode {
+            return Block::default().borders(Borders::NONE);
+        }
         Block::default()
             .title(" Chat Messages ")
-            .title_bottom(Line::from(" Ctrl+C exit · Ctrl+T tasks ").right_aligned())
+            .title_bottom(Line::from(" Ctrl+C exit · Ctrl+T tasks · F4 select ").right_aligned())
             .borders(Borders::ALL)
     }
 
@@ -409,7 +442,13 @@ impl ReplUi {
     /// calls this — it goes through [`ChatRenderCache`] instead, which is
     /// what makes rendering independent of history size. See
     /// `slow-messages.md`.
-    pub fn build_chat_history_paragraph<'a>(chat: &'a ChatState) -> Paragraph<'a> {
+    ///
+    /// `select_mode` is forwarded to [`chat_block`]; pass `false` from
+    /// snapshot tests that want the chrome.
+    pub fn build_chat_history_paragraph<'a>(
+        chat: &'a ChatState,
+        select_mode: bool,
+    ) -> Paragraph<'a> {
         let mut message_lines: Vec<Line> = Vec::new();
 
         if chat.messages.is_empty() {
@@ -423,7 +462,7 @@ impl ReplUi {
         Paragraph::new(Text::from(message_lines))
             .style(Style::default().fg(Color::White))
             .wrap(Wrap { trim: true })
-            .block(Self::chat_block())
+            .block(Self::chat_block(select_mode))
     }
 
     /// Render a single chat message into owned `Line`s.
@@ -457,6 +496,10 @@ impl ReplUi {
     /// `content_height` is the total wrapped line count — same value
     /// the render loop feeds into `UiState.content_height`. Passed in
     /// so we don't re-run word-wrap here (see `slow-messages.md`).
+    ///
+    /// `select_mode` skips the scrollbar entirely and gives the
+    /// paragraph the full width; the `█`/`▼` glyphs would otherwise
+    /// land in the user's clipboard during a terminal-native drag-select.
     pub fn render_chat_history(
         f: &mut ratatui::Frame,
         area: Rect,
@@ -464,7 +507,14 @@ impl ReplUi {
         paragraph_scroll: u16,
         paragraph: Paragraph,
         content_height: u16,
+        select_mode: bool,
     ) {
+        if select_mode {
+            let scrolled = paragraph.scroll((paragraph_scroll, 0));
+            f.render_widget(scrolled, area);
+            return;
+        }
+
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(100), Constraint::Length(1)])
@@ -673,6 +723,21 @@ impl ReplUi {
         total.saturating_sub(2).max(1)
     }
 
+    /// Render the "select mode" banner. Replaces the status bar while
+    /// select mode is active. Single row, bright reverse-video style so
+    /// the user can't miss it — the whole point of this row is to remind
+    /// them they're in a non-default modal state and how to get out.
+    pub fn render_select_mode_banner(f: &mut ratatui::Frame, area: Rect) {
+        let text = " 📋 SELECT MODE — drag to select · use your terminal's copy keys · F4 to resume ";
+        let paragraph = Paragraph::new(text).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        );
+        f.render_widget(paragraph, area);
+    }
+
     /// Render the status bar
     pub fn render_status_bar(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         let stats = &state.stats;
@@ -798,7 +863,12 @@ impl ReplUi {
                 );
 
                 // Check if todo panel should be shown (based on terminal size and visibility state)
-                let show_todo = state.todo.visible && should_show_panel(size.width);
+                // In select mode we forcibly hide the side panel so the
+                // chat takes the full width — selection across the panel
+                // boundary would otherwise glue todo items into the copy.
+                let show_todo = !self.ui_state.select_mode
+                    && state.todo.visible
+                    && should_show_panel(size.width);
 
                 // Layout: either full width (no todo) or split horizontally (with todo)
                 let (main_area, todo_area) = if show_todo {
@@ -879,18 +949,24 @@ impl ReplUi {
                     // `window()` returns both the Lines covering the viewport
                     // AND the partial-line offset into the first visible
                     // message; we feed the offset straight into `Paragraph::scroll`.
+                    // In select mode we strip every piece of chrome from
+                    // the chat surface so the user's terminal-native copy
+                    // captures only message content. Chrome includes:
+                    // borders, the bordered block's titles + bottom-hint,
+                    // and the right-edge scrollbar column.
+                    let select_mode = self.ui_state.select_mode;
                     let view = self.chat_cache.window(scroll as u32, chunks[0].height);
                     let chat_history = if view.lines.is_empty() && state.chat.messages.is_empty() {
                         // Empty transcript — show the welcome banner.
                         Paragraph::new(Text::from(Self::welcome_lines()))
                             .style(Style::default().fg(Color::White))
                             .wrap(Wrap { trim: true })
-                            .block(Self::chat_block())
+                            .block(Self::chat_block(select_mode))
                     } else {
                         Paragraph::new(Text::from(view.lines))
                             .style(Style::default().fg(Color::White))
                             .wrap(Wrap { trim: true })
-                            .block(Self::chat_block())
+                            .block(Self::chat_block(select_mode))
                     };
 
                     Self::render_chat_history(
@@ -900,9 +976,28 @@ impl ReplUi {
                         /* paragraph_scroll */ view.inner_scroll,
                         chat_history,
                         self.ui_state.content_height,
+                        select_mode,
                     );
+                    // Input area: in select mode, swap its bordered block
+                    // for a borderless one so a vertical selection
+                    // through the input box doesn't pick up box chars
+                    // or the working-spinner title. The prompt marker
+                    // (`> `) and cursor block stay — they're content.
+                    let input = if select_mode {
+                        input.block(Block::default().borders(Borders::NONE))
+                    } else {
+                        input
+                    };
                     Self::render_input_area(f, chunks[1], input, self.ui_state.input_scroll);
-                    Self::render_status_bar(f, chunks[2], state);
+                    if select_mode {
+                        // Modal: replace the status bar with a banner that
+                        // tells the user (1) what's happening and (2) how
+                        // to leave. Mouse-wheel scroll is off; PgUp/PgDn
+                        // still work, and so does typing into the input.
+                        Self::render_select_mode_banner(f, chunks[2]);
+                    } else {
+                        Self::render_status_bar(f, chunks[2], state);
+                    }
 
                     // Render command popup ABOVE the input area if open.
                     // Drawn after the chat + input so it sits on top (via
@@ -931,6 +1026,24 @@ impl ReplUi {
         Ok(())
     }
 
+    /// Flip "select mode" on/off and emit the matching mouse-capture
+    /// escape sequence to the terminal. When `select_mode` becomes `true`,
+    /// we send `DisableMouseCapture` so the terminal can do its own
+    /// click-and-drag selection; when `false`, we re-enable capture so
+    /// mouse-wheel scroll works again. Errors writing to stdout are
+    /// swallowed — at worst the indicator and the underlying capture
+    /// state would briefly disagree, and the next toggle would resync.
+    fn toggle_select_mode(&mut self) {
+        self.ui_state.select_mode = !self.ui_state.select_mode;
+        self.ui_state.local_dirty = true;
+        let mut out = std::io::stdout();
+        let _ = if self.ui_state.select_mode {
+            execute!(out, DisableMouseCapture)
+        } else {
+            execute!(out, EnableMouseCapture)
+        };
+    }
+
     fn handle_keyboard_input(&mut self, key: KeyEvent) {
         match key.code {
             // Toggle todo panel with Ctrl+T
@@ -938,6 +1051,13 @@ impl ReplUi {
                 self.state_manager.toggle_todo_panel();
                 // Reset scroll position when toggling
                 self.ui_state.todo_scroll_position = 0;
+            }
+            // F4: toggle "select mode" — disables our mouse capture so the
+            // terminal's own click-and-drag selection (and native copy
+            // shortcut) work. F4 again restores mouse-wheel scroll.
+            // See `copy-and-paste-me-baby.md`.
+            KeyCode::F(4) => {
+                self.toggle_select_mode();
             }
             // Quit with Ctrl+C (opens confirmation dialog)
             KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1962,6 +2082,75 @@ mod command_popup_tests {
             ui.ui_state.input_buffer, "/s",
             "Esc dismisses popup but keeps what user typed"
         );
+    }
+
+    // ─── F4 select-mode toggle ───────────────────────────────────────────
+    //
+    // F4 lets the user step out of our mouse-capture mode so the terminal's
+    // own click-and-drag selection works. The toggle lives entirely in
+    // `UiState.select_mode`; the IO that emits `Disable/EnableMouseCapture`
+    // happens in a separate fn that requires a real terminal, so these tests
+    // pin only the bool flip and the keyboard binding.
+
+    #[test]
+    fn select_mode_default_is_false() {
+        let (ui, _rx) = harness();
+        assert!(
+            !ui.ui_state.select_mode,
+            "Mouse capture is on by default — select_mode must start false"
+        );
+    }
+
+    #[test]
+    fn f4_toggles_select_mode() {
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::F(4)));
+        assert!(ui.ui_state.select_mode, "F4 enters select mode");
+        ui.handle_keyboard_input(press(KeyCode::F(4)));
+        assert!(!ui.ui_state.select_mode, "F4 again exits select mode");
+    }
+
+    #[test]
+    fn f4_does_not_send_action() {
+        // F4 is purely view-local — no UiAction should hit the controller.
+        let (mut ui, mut rx) = harness();
+        ui.handle_keyboard_input(press(KeyCode::F(4)));
+        assert!(
+            rx.try_recv().is_err(),
+            "F4 must not emit a UiAction — it's view-local"
+        );
+    }
+
+    // The `chat_block(select_mode)` contract: when `select_mode` is true,
+    // the block must produce no glyphs at all (so a terminal-native copy
+    // doesn't pick up borders/titles/hints). Pinned by rendering the
+    // returned block into a buffer and asserting every cell is empty.
+
+    #[test]
+    fn chat_block_select_mode_has_no_borders() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Widget;
+        let b = ReplUi::chat_block(true);
+        let backend = TestBackend::new(10, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        let _ = term.draw(|f| {
+            b.render(f.area(), f.buffer_mut());
+        });
+        let buf = term.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                assert_eq!(
+                    cell.symbol(),
+                    " ",
+                    "select_mode chat block must have no glyphs (got {:?} at ({}, {}))",
+                    cell.symbol(),
+                    x,
+                    y
+                );
+            }
+        }
     }
 
     // ─── Direct CommandPopupState hooks (sanity) ─────────────────────────

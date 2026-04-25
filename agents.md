@@ -616,12 +616,15 @@ Run `make help` for the full list. Day-to-day:
 
 | Target | What it does |
 |--------|--------------|
-| `make` / `make build` | Cross-compile to `output/peakbot.exe` (Windows) |
-| `make build-linux` | Build `output/peakbot` (Linux x86_64) |
-| `make build-macos` | Build `output/peakbot-macos` (macOS universal2) |
+| `make` / `make build` | Build all three platforms in sequence (linux, windows, macos) |
+| `make build-linux` | Build `output/peakbot-linux-amd64` (Linux x86_64) |
+| `make build-windows` | Build `output/peakbot-windows-amd64.exe` (Windows x86_64) |
+| `make build-macos` | Build `output/peakbot-macos-universal2` (macOS universal2) |
 | `make clean` | `rm -rf output/` |
-| `make rebuild` | `clean` + `build` |
+| `make rebuild` | `clean` + `build` (rebuilds all three) |
 | `make help` | Print this table from `## ` doc comments in the Makefile |
+
+Non-release builds produce **unversioned** filenames (e.g. `peakbot-linux-amd64`). The release flow injects the semver via `--build-arg VERSION=$v`, which the Dockerfiles splice into the artifact name as `peakbot-<v>-<platform>`. With `VERSION` unset (the default), the conditional `${VERSION:+-${VERSION}}` substitution in each Dockerfile collapses to nothing — same `cargo build --release`, just a cleaner name.
 
 `CONTAINER_BUILDER` auto-detects `podman` (preferred) and falls back to `docker`. Override with `make build CONTAINER_BUILDER=docker`.
 
