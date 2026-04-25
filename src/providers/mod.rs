@@ -2,6 +2,13 @@
 //!
 //! This module provides a unified interface for different LLM providers
 //! (OpenRouter, Ollama, etc.) to make the codebase provider-independent.
+//!
+//! Clippy: provider constructors deliberately accept many configuration
+//! arguments and return tuples of complex Rig types — refactoring would
+//! force a builder pattern across the call sites for no real gain. Allow
+//! `too_many_arguments` and `type_complexity` at module scope.
+
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use crate::config::{
     BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig,
@@ -115,13 +122,9 @@ impl DynAgent {
         // `prompt()` takes `impl Into<Message>` by value.
         let prompt: Message = prompt.into();
         match self {
-            DynAgent::OpenRouter(agent) => {
-                agent.prompt(prompt.clone()).with_history(history).await
-            }
+            DynAgent::OpenRouter(agent) => agent.prompt(prompt.clone()).with_history(history).await,
             DynAgent::OpenAI(agent) => agent.prompt(prompt.clone()).with_history(history).await,
-            DynAgent::LlamaCpp(agent) => {
-                agent.prompt(prompt.clone()).with_history(history).await
-            }
+            DynAgent::LlamaCpp(agent) => agent.prompt(prompt.clone()).with_history(history).await,
             DynAgent::Ollama(agent) => agent.prompt(prompt.clone()).with_history(history).await,
             #[cfg(feature = "mock")]
             DynAgent::Mock(agent) => agent.prompt(prompt).with_history(history).await,
@@ -777,7 +780,6 @@ pub fn create_mock_agent(
     ))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,9 +792,7 @@ mod tests {
             name: "openrouter".into(),
             model: "anthropic/claude-3.5-sonnet".into(),
             supports_pricing: true,
-            supports_vision: crate::vision::model_supports_vision(
-                "anthropic/claude-3.5-sonnet",
-            ),
+            supports_vision: crate::vision::model_supports_vision("anthropic/claude-3.5-sonnet"),
         };
         let vision_no = ProviderInfo {
             name: "openrouter".into(),

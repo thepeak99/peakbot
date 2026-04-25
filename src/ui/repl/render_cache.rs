@@ -375,8 +375,9 @@ mod tests {
     #[test]
     fn window_scroll_zero_starts_at_top() {
         let mut c = cache();
-        let msgs: Vec<ChatMessage> =
-            (0..10).map(|i| ChatMessage::user(format!("m{i}"))).collect();
+        let msgs: Vec<ChatMessage> = (0..10)
+            .map(|i| ChatMessage::user(format!("m{i}")))
+            .collect();
         c.sync(&msgs, 80);
 
         let view = c.window(0, 5);
@@ -387,8 +388,9 @@ mod tests {
     #[test]
     fn window_scroll_past_end_clamps() {
         let mut c = cache();
-        let msgs: Vec<ChatMessage> =
-            (0..10).map(|i| ChatMessage::user(format!("m{i}"))).collect();
+        let msgs: Vec<ChatMessage> = (0..10)
+            .map(|i| ChatMessage::user(format!("m{i}")))
+            .collect();
         c.sync(&msgs, 80);
 
         // Ask for a viewport beyond total height.
@@ -401,15 +403,15 @@ mod tests {
         let mut c = cache();
         // One tall message followed by many short ones; scroll into the middle of the tall one.
         let big = "line\n".repeat(20).trim_end().to_string();
-        let msgs = vec![
-            ChatMessage::agent(big),
-            ChatMessage::user("short".into()),
-        ];
+        let msgs = vec![ChatMessage::agent(big), ChatMessage::user("short".into())];
         c.sync(&msgs, 80);
 
         // Scroll to line 5 — should still be inside the first message.
         let view = c.window(5, 3);
-        assert_eq!(view.inner_scroll, 5, "inner_scroll is offset into first visible msg");
+        assert_eq!(
+            view.inner_scroll, 5,
+            "inner_scroll is offset into first visible msg"
+        );
         assert!(!view.lines.is_empty());
     }
 
@@ -454,7 +456,8 @@ mod tests {
         for (i, &count) in c.wrapped_counts.iter().enumerate() {
             expected += count as u32;
             assert_eq!(
-                c.prefix_sums[i + 1], expected,
+                c.prefix_sums[i + 1],
+                expected,
                 "prefix_sums[{}] must equal cumulative wrapped_counts",
                 i + 1
             );
@@ -468,9 +471,11 @@ mod tests {
         // otherwise the scrollbar and viewport windowing drift apart.
         let mut c = cache();
         let msgs: Vec<ChatMessage> = (0..20)
-            .map(|i| ChatMessage::agent(format!(
-                "Message #{i} — lorem ipsum dolor sit amet consectetur adipiscing elit"
-            )))
+            .map(|i| {
+                ChatMessage::agent(format!(
+                    "Message #{i} — lorem ipsum dolor sit amet consectetur adipiscing elit"
+                ))
+            })
             .collect();
         let width = 50u16;
         c.sync(&msgs, width);

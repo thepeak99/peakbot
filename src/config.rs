@@ -1046,18 +1046,20 @@ mod tests {
 
     #[test]
     fn test_merge_mcp_servers_replacement() {
-        let mut master = Config::default();
-        master.mcp_servers = Some(vec![McpServerConfig {
-            name: "master-server".to_string(),
-            transport_type: McpTransportType::Stdio,
-            command: Some("npx".to_string()),
-            args: None,
-            env: None,
-            url: None,
-            auth_token: None,
-            headers: None,
-            enabled: true,
-        }]);
+        let mut master = Config {
+            mcp_servers: Some(vec![McpServerConfig {
+                name: "master-server".to_string(),
+                transport_type: McpTransportType::Stdio,
+                command: Some("npx".to_string()),
+                args: None,
+                env: None,
+                url: None,
+                auth_token: None,
+                headers: None,
+                enabled: true,
+            }]),
+            ..Config::default()
+        };
 
         let repo_config = Config {
             mcp_servers: Some(vec![McpServerConfig {

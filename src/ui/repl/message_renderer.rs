@@ -80,26 +80,20 @@ impl MessageRenderer for PlainRenderer {
         let timestamp = msg.timestamp.format("%H:%M:%S").to_string();
         let content_lines: Vec<&str> = msg.content.split('\n').collect();
 
-        let mut out =
-            Vec::with_capacity(content_lines.len().max(1) + msg.attachments.len());
+        let mut out = Vec::with_capacity(content_lines.len().max(1) + msg.attachments.len());
 
         // Attachment preamble: one dim-cyan line per attached image, rendered
         // *before* the content. The first attachment line carries the
         // role prefix so users can see "who said it"; subsequent lines are
         // indented continuation style. If there are no attachments, the
         // behaviour is bit-identical to the historical renderer.
-        let attach_style = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::DIM);
+        let attach_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
         for (i, att) in msg.attachments.iter().enumerate() {
             let line = format_attachment_line(att);
             let spans: Vec<Span<'static>> = if i == 0 {
                 vec![
                     Span::raw("["),
-                    Span::styled(
-                        timestamp.clone(),
-                        Style::default().fg(Color::Gray),
-                    ),
+                    Span::styled(timestamp.clone(), Style::default().fg(Color::Gray)),
                     Span::raw("] "),
                     Span::styled(prefix.to_string(), Style::default().fg(color)),
                     Span::raw(": "),
@@ -116,10 +110,7 @@ impl MessageRenderer for PlainRenderer {
             let line_content: Vec<Span<'static>> = if i == 0 && !attachments_present {
                 vec![
                     Span::raw("["),
-                    Span::styled(
-                        timestamp.clone(),
-                        Style::default().fg(Color::Gray),
-                    ),
+                    Span::styled(timestamp.clone(), Style::default().fg(Color::Gray)),
                     Span::raw("] "),
                     Span::styled(prefix.to_string(), Style::default().fg(color)),
                     Span::raw(": "),
@@ -198,7 +189,10 @@ mod tests {
     #[test]
     fn format_attachment_line_for_base64_image() {
         let a = base64_attachment("cat.png", 1234);
-        assert_eq!(format_attachment_line(&a), "[image: cat.png · PNG · 1.2 KB]");
+        assert_eq!(
+            format_attachment_line(&a),
+            "[image: cat.png · PNG · 1.2 KB]"
+        );
     }
 
     #[test]
@@ -221,11 +215,7 @@ mod tests {
             vec![base64_attachment("cat.png", 234 * 1024)],
         );
         let lines = PlainRenderer.render(&msg);
-        assert_eq!(
-            lines.len(),
-            2,
-            "one attachment line + one content line"
-        );
+        assert_eq!(lines.len(), 2, "one attachment line + one content line");
         // First line has the role prefix AND the attachment tag.
         let first = format!("{:?}", lines[0]);
         assert!(
@@ -244,10 +234,6 @@ mod tests {
             ],
         );
         let lines = PlainRenderer.render(&msg);
-        assert_eq!(
-            lines.len(),
-            3,
-            "two attachment lines + one content line"
-        );
+        assert_eq!(lines.len(), 3, "two attachment lines + one content line");
     }
 }

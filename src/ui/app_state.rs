@@ -150,7 +150,6 @@ pub struct ChatMessage {
     // These fields preserve the original data from rig so that
     // ChatMessage → Conversation::Message and ChatMessage → rig::Message
     // roundtrips are lossless.
-
     /// Tool name (for ToolCall and ToolResult roles)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -260,6 +259,7 @@ impl ChatMessage {
     /// Create a new tool call message with structured display:
     /// - Shows thought intent first
     /// - Shows key params (2-3 lines max)
+    ///
     /// Stores raw tool_name and args for lossless persistence.
     pub fn tool_call(tool_name: &str, args: &str, call_id: Option<String>) -> Self {
         let content = format_tool_call(tool_name, args);
@@ -278,12 +278,7 @@ impl ChatMessage {
 
     /// Create a new tool result message with truncation to top 2-3 lines.
     /// Stores raw tool_name, args, result, and call_id for lossless persistence.
-    pub fn tool_result(
-        tool_name: &str,
-        args: &str,
-        result: &str,
-        call_id: Option<String>,
-    ) -> Self {
+    pub fn tool_result(tool_name: &str, args: &str, result: &str, call_id: Option<String>) -> Self {
         let content = format_tool_result(tool_name, result);
         Self {
             role: MessageRole::ToolResult,
@@ -999,7 +994,7 @@ mod tests {
     fn test_truncate_str_bug_max_len_less_than_3() {
         // When max_len < 3, the output should NOT exceed max_len
         let s = "hello world";
-        
+
         // max_len = 2 should return at most 2 characters
         let result = truncate_str(s, 2);
         assert!(
@@ -1021,8 +1016,8 @@ mod tests {
         // max_len = 0 should return empty string
         let result = truncate_str(s, 0);
         assert!(
-            result.chars().count() <= 0,
-            "truncate_str(s, 0) returned '{}' with {} chars, expected <= 0",
+            result.chars().count() == 0,
+            "truncate_str(s, 0) returned '{}' with {} chars, expected 0",
             result,
             result.chars().count()
         );
@@ -1045,7 +1040,7 @@ mod tests {
     fn test_truncate_line_bug_max_len_less_than_3() {
         // Same bug should exist in truncate_line
         let s = "hello world";
-        
+
         let result = truncate_line(s, 2);
         assert!(
             result.chars().count() <= 2,

@@ -4,12 +4,12 @@
 //! It provides MockCompletionModel for testing the agent loop without real API calls.
 
 use crate::mock::response::MockResponse;
+use rig::completion::message::Message;
 use rig::completion::message::{Text, ToolCall, ToolFunction};
 use rig::completion::{
     AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
     GetTokenUsage, Usage as RigUsage,
 };
-use rig::completion::message::Message;
 use rig::one_or_many::OneOrMany;
 use rig::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
@@ -143,11 +143,14 @@ impl CompletionModel for MockCompletionModel {
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         // Record the request for test inspection
-        self.recorded_requests.lock().unwrap().push(RecordedRequest {
-            preamble: request.preamble.clone(),
-            chat_history: request.chat_history.iter().cloned().collect(),
-            tool_count: request.tools.len(),
-        });
+        self.recorded_requests
+            .lock()
+            .unwrap()
+            .push(RecordedRequest {
+                preamble: request.preamble.clone(),
+                chat_history: request.chat_history.iter().cloned().collect(),
+                tool_count: request.tools.len(),
+            });
 
         let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             CompletionError::ProviderError("MockCompletionModel: no responses queued".to_string())

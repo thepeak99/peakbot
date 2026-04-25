@@ -19,11 +19,10 @@ use crate::hooks::session_hook::SessionStats;
 use crate::storage::{ConversationStorage, ConversationSummary};
 use crate::tools::todo::{TodoList, TodoStatus};
 use crate::ui::app_state::{
-    AppState, ChatMessage, ChatState, ContextState, SessionState, TodoItem, TodoState,
-    WelcomeState,
+    AppState, ChatMessage, ChatState, ContextState, SessionState, TodoItem, TodoState, WelcomeState,
 };
-use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -141,21 +140,24 @@ impl StateManager {
             cm.clone()
         };
 
-        let sm = match self.self_ref.read().unwrap().as_ref().and_then(Weak::upgrade) {
+        let sm = match self
+            .self_ref
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
             Some(arc) => arc,
             None => return,
         };
 
         tokio::spawn(async move {
             sm.set_status(Some("Compacting context...".to_string()));
-            match sm.run_compaction(&cm_clone).await {
-                Some(result) => {
-                    sm.add_system_message(format!(
-                        "Context compacted: {} → {} messages, {} compacted",
-                        result.original_count, result.compacted_count, result.num_discarded
-                    ));
-                }
-                None => {}
+            if let Some(result) = sm.run_compaction(&cm_clone).await {
+                sm.add_system_message(format!(
+                    "Context compacted: {} → {} messages, {} compacted",
+                    result.original_count, result.compacted_count, result.num_discarded
+                ));
             }
             sm.set_status(None);
         });
@@ -223,9 +225,9 @@ impl StateManager {
                 .collect();
 
         // Tag messages before boundary as compacted, except needed tool calls
-        for i in 0..plan.boundary {
-            if !messages[i].compacted && !needed_tc.contains(&i) {
-                messages[i].compacted = true;
+        for (i, msg) in messages.iter_mut().enumerate().take(plan.boundary) {
+            if !msg.compacted && !needed_tc.contains(&i) {
+                msg.compacted = true;
             }
         }
 
@@ -458,7 +460,10 @@ impl StateManager {
             self.sync_todo_to_ui(&list);
             cleared
         };
-        format!("Cleared {} finished tasks (completed and cancelled)", cleared)
+        format!(
+            "Cleared {} finished tasks (completed and cancelled)",
+            cleared
+        )
     }
 
     /// Wipe the entire todo list and resync the UI view.
@@ -770,7 +775,7 @@ impl StateManager {
 
     /// Save the current conversation to storage
     pub fn save_conversation(&self) {
-        if let (Some(ref storage), Some(ref mut conv)) = (
+        if let (Some(storage), Some(conv)) = (
             self.storage.as_ref(),
             self.current_conversation.lock().unwrap().as_mut(),
         ) {
@@ -922,40 +927,38 @@ impl StateManager {
                 .chat
                 .messages
                 .iter()
-                .filter_map(|msg| {
-                    match msg.role {
-                        MessageRole::User => Some(ConvMsg::User {
-                            content: msg.content.clone(),
+                .filter_map(|msg| match msg.role {
+                    MessageRole::User => Some(ConvMsg::User {
+                        content: msg.content.clone(),
+                        timestamp: chrono::Utc::now(),
+                    }),
+                    MessageRole::Agent => Some(ConvMsg::Assistant {
+                        content: msg.content.clone(),
+                        timestamp: chrono::Utc::now(),
+                    }),
+                    MessageRole::ToolCall => {
+                        let tool_name = msg.tool_name.clone()?;
+                        let arguments = msg.tool_args.clone().unwrap_or_default();
+                        Some(ConvMsg::ToolCall {
+                            tool_name,
+                            arguments,
+                            call_id: msg.call_id.clone(),
                             timestamp: chrono::Utc::now(),
-                        }),
-                        MessageRole::Agent => Some(ConvMsg::Assistant {
-                            content: msg.content.clone(),
-                            timestamp: chrono::Utc::now(),
-                        }),
-                        MessageRole::ToolCall => {
-                            let tool_name = msg.tool_name.clone()?;
-                            let arguments = msg.tool_args.clone().unwrap_or_default();
-                            Some(ConvMsg::ToolCall {
-                                tool_name,
-                                arguments,
-                                call_id: msg.call_id.clone(),
-                                timestamp: chrono::Utc::now(),
-                            })
-                        }
-                        MessageRole::ToolResult => {
-                            let tool_name = msg.tool_name.clone()?;
-                            let arguments = msg.tool_args.clone().unwrap_or_default();
-                            let result = msg.tool_result.clone().unwrap_or_default();
-                            Some(ConvMsg::ToolResult {
-                                tool_name,
-                                arguments,
-                                result,
-                                call_id: msg.call_id.clone(),
-                                timestamp: chrono::Utc::now(),
-                            })
-                        }
-                        MessageRole::Summary | MessageRole::System => None,
+                        })
                     }
+                    MessageRole::ToolResult => {
+                        let tool_name = msg.tool_name.clone()?;
+                        let arguments = msg.tool_args.clone().unwrap_or_default();
+                        let result = msg.tool_result.clone().unwrap_or_default();
+                        Some(ConvMsg::ToolResult {
+                            tool_name,
+                            arguments,
+                            result,
+                            call_id: msg.call_id.clone(),
+                            timestamp: chrono::Utc::now(),
+                        })
+                    }
+                    MessageRole::Summary | MessageRole::System => None,
                 })
                 .collect();
             conv.metadata.message_count = conv.messages.len();
@@ -967,10 +970,10 @@ impl StateManager {
     fn persist_current(&self) -> anyhow::Result<()> {
         self.sync_to_conversation();
         let guard = self.current_conversation.lock().unwrap();
-        if let Some(ref conv) = *guard {
-            if let Some(ref storage) = self.storage {
-                storage.save(conv)?;
-            }
+        if let Some(conv) = guard.as_ref()
+            && let Some(storage) = self.storage.as_ref()
+        {
+            storage.save(conv)?;
         }
         Ok(())
     }
@@ -1037,6 +1040,7 @@ impl StateManager {
     /// - Agent → `Message::Assistant` with text content
     /// - ToolCall → `Message::Assistant` with `AssistantContent::ToolCall`
     /// - ToolResult → `Message::User` with `UserContent::ToolResult`
+    ///
     /// System messages are skipped.
     ///
     /// The trailing user message is excluded from the returned history because
@@ -1077,57 +1081,52 @@ impl StateManager {
             .filter(|(_, msg)| !msg.compacted)
             .filter(|(i, _)| Some(*i) != skip_last_idx)
             .map(|(_, msg)| msg)
-            .filter_map(|msg| {
-                match msg.role {
-                    MessageRole::User => Some(RigMessage::User {
-                        content: user_content_from_chat_message(msg),
-                    }),
-                    MessageRole::Agent => Some(RigMessage::Assistant {
+            .filter_map(|msg| match msg.role {
+                MessageRole::User => Some(RigMessage::User {
+                    content: user_content_from_chat_message(msg),
+                }),
+                MessageRole::Agent => Some(RigMessage::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::Text(Text {
+                        text: msg.content.clone(),
+                    })),
+                }),
+                MessageRole::ToolCall => {
+                    let tool_name = msg.tool_name.as_deref()?;
+                    let args_str = msg.tool_args.as_deref().unwrap_or("{}");
+                    let arguments = serde_json::from_str(args_str)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    let call_id = msg.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+
+                    Some(RigMessage::Assistant {
                         id: None,
-                        content: OneOrMany::one(AssistantContent::Text(Text {
-                            text: msg.content.clone(),
-                        })),
-                    }),
-                    MessageRole::ToolCall => {
-                        let tool_name = msg.tool_name.as_deref()?;
-                        let args_str = msg.tool_args.as_deref().unwrap_or("{}");
-                        let arguments = serde_json::from_str(args_str)
-                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                        let call_id =
-                            msg.call_id.clone().unwrap_or_else(|| tool_name.to_string());
-
-                        Some(RigMessage::Assistant {
-                            id: None,
-                            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
-                                call_id,
-                                ToolFunction::new(tool_name.to_string(), arguments),
-                            ))),
-                        })
-                    }
-                    MessageRole::ToolResult => {
-                        let tool_name = msg.tool_name.as_deref()?;
-                        let result_text =
-                            msg.tool_result.as_deref().unwrap_or("");
-                        let call_id =
-                            msg.call_id.clone().unwrap_or_else(|| tool_name.to_string());
-
-                        Some(RigMessage::User {
-                            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                                id: call_id,
-                                call_id: None,
-                                content: OneOrMany::one(ToolResultContent::Text(Text {
-                                    text: result_text.to_string(),
-                                })),
-                            })),
-                        })
-                    }
-                    MessageRole::Summary => Some(RigMessage::User {
-                        content: OneOrMany::one(UserContent::Text(Text {
-                            text: format!("[Conversation summary] {}", msg.content),
-                        })),
-                    }),
-                    MessageRole::System => None,
+                        content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                            call_id,
+                            ToolFunction::new(tool_name.to_string(), arguments),
+                        ))),
+                    })
                 }
+                MessageRole::ToolResult => {
+                    let tool_name = msg.tool_name.as_deref()?;
+                    let result_text = msg.tool_result.as_deref().unwrap_or("");
+                    let call_id = msg.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+
+                    Some(RigMessage::User {
+                        content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                            id: call_id,
+                            call_id: None,
+                            content: OneOrMany::one(ToolResultContent::Text(Text {
+                                text: result_text.to_string(),
+                            })),
+                        })),
+                    })
+                }
+                MessageRole::Summary => Some(RigMessage::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: format!("[Conversation summary] {}", msg.content),
+                    })),
+                }),
+                MessageRole::System => None,
             })
             .collect()
     }
@@ -1206,9 +1205,9 @@ fn user_content_from_attachment(
     att: &crate::vision::ImageAttachment,
 ) -> rig::completion::message::UserContent {
     use crate::vision::ImageSource;
-    use rig::completion::message::{DocumentSourceKind, Image, ImageDetail, UserContent};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use rig::completion::message::{DocumentSourceKind, Image, ImageDetail, UserContent};
 
     let detail = Some(att.detail.clone().unwrap_or(ImageDetail::Auto));
 
@@ -1371,14 +1370,24 @@ mod tests {
 
         // Add a realistic conversation with tool calls
         sm.add_user_message("List the files".to_string());
-        sm.add_tool_call("bash".to_string(), r#"{"command":"ls"}"#.to_string(), Some("call_1".to_string()));
-        sm.add_tool_result("bash".to_string(), r#"{"command":"ls"}"#.to_string(), "file1.txt\nfile2.txt".to_string(), Some("call_1".to_string()));
+        sm.add_tool_call(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            Some("call_1".to_string()),
+        );
+        sm.add_tool_result(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            "file1.txt\nfile2.txt".to_string(),
+            Some("call_1".to_string()),
+        );
         sm.add_assistant_message("Here are the files: file1.txt and file2.txt".to_string());
 
         // StateManager should have 4 messages in its chat state
         let state = sm.get_state();
         assert_eq!(
-            state.chat.messages.len(), 4,
+            state.chat.messages.len(),
+            4,
             "StateManager should have 4 chat messages (user, tool_call, tool_result, assistant)"
         );
 
@@ -1387,7 +1396,8 @@ mod tests {
         // ToolCall messages to preserve tool call/result integrity.
         let history = sm.get_agent_history();
         assert_eq!(
-            history.len(), 4,
+            history.len(),
+            4,
             "get_agent_history() should return all 4 messages including tool messages. \
              Got {} -- tool messages are being silently dropped.",
             history.len()
@@ -1571,7 +1581,11 @@ mod tests {
 
         // Convert to rig messages (the path used by convert_conversation_to_rig_messages)
         let rig_messages = crate::convert_conversation_to_rig_messages(&loaded);
-        assert_eq!(rig_messages.len(), 4, "All 4 messages should convert to rig messages");
+        assert_eq!(
+            rig_messages.len(),
+            4,
+            "All 4 messages should convert to rig messages"
+        );
 
         // Verify rig tool call is structured
         match &rig_messages[1] {
@@ -1625,7 +1639,8 @@ mod tests {
 
         let state = sm.get_state();
         assert_eq!(
-            state.chat.messages.len(), 3,
+            state.chat.messages.len(),
+            3,
             "Should have 3 messages after replace (summary + 2 recent)"
         );
         assert!(
@@ -1640,7 +1655,10 @@ mod tests {
     fn set_running_true_stamps_run_started_at() {
         let sm = StateManager::new();
         let before = sm.get_state();
-        assert!(before.run_started_at.is_none(), "idle state has no start time");
+        assert!(
+            before.run_started_at.is_none(),
+            "idle state has no start time"
+        );
         assert!(!before.is_running);
 
         sm.set_running(true);
@@ -1687,7 +1705,10 @@ mod tests {
 
         sm.set_running(false);
         sm.set_running(true);
-        let second = sm.get_state().run_started_at.expect("re-stamped on restart");
+        let second = sm
+            .get_state()
+            .run_started_at
+            .expect("re-stamped on restart");
 
         assert!(
             second > first,
@@ -1869,10 +1890,7 @@ mod tests {
     #[test]
     fn get_agent_history_still_excludes_trailing_user_even_with_attachments() {
         let sm = StateManager::new();
-        sm.add_user_message_with_attachments(
-            "hi".to_string(),
-            vec![sample_attachment("cat.png")],
-        );
+        sm.add_user_message_with_attachments("hi".to_string(), vec![sample_attachment("cat.png")]);
         // Trailing user with attachments → excluded (matches existing behaviour).
         let history = sm.get_agent_history();
         assert!(history.is_empty());

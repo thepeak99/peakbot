@@ -8,9 +8,7 @@
 use std::time::Instant;
 
 /// 10-frame braille spinner.
-const FRAMES: [&str; 10] = [
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-];
+const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Which spinner frame to show for a run that started at `started`.
 ///

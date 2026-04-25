@@ -75,10 +75,7 @@ async fn conversation_metadata_preserved() {
 
     // Verify chat state has been updated
     let state = harness.get_state();
-    assert!(
-        !state.chat.messages.is_empty(),
-        "Chat should have messages"
-    );
+    assert!(!state.chat.messages.is_empty(), "Chat should have messages");
 }
 
 /// Test that tool calls are recorded in conversation

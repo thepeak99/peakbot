@@ -71,6 +71,14 @@ async fn bash_child_reading_stdin_returns_promptly() {
 #[tokio::test]
 async fn bash_echo_still_works() {
     let out = run_bash("echo hello", 5).await;
-    assert!(out.contains("Exit code: 0"), "expected exit 0, got:\n{}", out);
-    assert!(out.contains("hello"), "expected `hello` in output, got:\n{}", out);
+    assert!(
+        out.contains("Exit code: 0"),
+        "expected exit 0, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("hello"),
+        "expected `hello` in output, got:\n{}",
+        out
+    );
 }

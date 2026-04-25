@@ -84,10 +84,7 @@ fn chat_render_scales_reasonably() {
         let chat = build_history(n);
         let elapsed = time_frames(&chat, WIDTH, FRAMES);
         let per_frame = elapsed / FRAMES as u32;
-        println!(
-            "  {:>4}  |  {:>7.2?}  |  {:>8.2?}",
-            n, elapsed, per_frame
-        );
+        println!("  {:>4}  |  {:>7.2?}  |  {:>8.2?}", n, elapsed, per_frame);
     }
 
     println!("\n=== cached path: sync + window via ChatRenderCache ===");

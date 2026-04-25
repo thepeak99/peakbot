@@ -594,6 +594,65 @@ let harness = TestHarness::new()
     .build();
 ```
 
+## Commit Procedure
+
+**Every commit must pass clean `cargo fmt` and `cargo clippy` before it lands.**
+This is non-negotiable — the build pipeline treats clippy warnings as
+real signals, the release flow rebuilds three platforms, and stale
+warnings hide real ones. Run the gate locally so CI doesn't have to
+catch you.
+
+### Pre-commit gate
+
+Run these three commands in order from the repo root before *any*
+`git commit`:
+
+```bash
+cargo fmt --all                                       # 1. format
+cargo clippy --all-targets --all-features -- -D warnings   # 2. lint, no warnings allowed
+cargo test                                            # 3. tests still pass
+```
+
+If clippy fires, **fix it** rather than allow it. The two acceptable
+escape hatches are:
+
+1. A scoped `#[allow(clippy::lint_name)]` on the offending item with a
+   one-line comment explaining *why* the lint is wrong here. Example
+   in `src/providers/mod.rs`: provider constructors deliberately have
+   many args + complex return types — refactoring to a builder gains
+   nothing, so the module carries `#![allow(clippy::too_many_arguments,
+   clippy::type_complexity)]` with a doc-comment explaining the choice.
+2. A `#[allow(dead_code)]` on test utilities kept for future scenarios,
+   with a comment naming the future use.
+
+Never blanket-allow at crate level. Never silence warnings without a
+comment. If you can't justify the silence in one line, fix the code.
+
+### Snapshot tests
+
+`tests/repl_tests.rs` uses `insta` for golden-file rendering tests.
+After a version bump or any deliberate UI change, snapshots will fail
+with `.snap.new` files written next to the originals. Review the diff,
+then either:
+
+- `cargo insta review` (interactive, recommended) — accept/reject each
+- `mv tests/snapshots/<name>.snap.new tests/snapshots/<name>.snap` —
+  manual accept of a single snapshot when you've already eyeballed it
+
+Never commit `.snap.new` files; they'll fail CI.
+
+### Why this matters
+
+- The release flow (`make release`) compiles three platforms from
+  scratch. A warning that compiles fine on Linux can be a hard error on
+  Windows or macOS.
+- The `-D warnings` gate means *any* new warning blocks the commit.
+  This forces the warning to be either fixed or explicitly allowed at
+  the moment it's introduced — not three releases later when nobody
+  remembers the context.
+- `cargo fmt` keeps diffs minimal and reviewable. Unformatted commits
+  fight against every future `git blame`.
+
 ## Build & Release
 
 PeakBot ships as a single static binary for **Linux x86_64**, **Windows x86_64**, and **macOS universal2** (Intel + Apple Silicon in one fat binary). All three are produced from Linux via container builds — no native macOS/Windows host required. The driver is a top-level `Makefile`; cross-compilation is handled by three sibling Dockerfiles.
