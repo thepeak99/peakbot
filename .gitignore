@@ -3,3 +3,4 @@
 *.md.bak
 output
 *.md
+.release-version

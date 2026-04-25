@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const MAX_TIMEOUT_SECS: u64 = 600;
+const MAX_TIMEOUT_SECS: u64 = 7200; // 2 hours
 const TEMP_DIR_NAME: &str = "peakbot";
 
 /// Session-unique counter for generating output filenames
@@ -198,7 +198,7 @@ impl Tool for BashTool {
                     },
                     "timeout_seconds": {
                         "type": "integer",
-                        "description": "Optional timeout in seconds (default: 30, max: 120)"
+                        "description": "Optional timeout in seconds (default: 30, max: 7200 = 2 hours)"
                     },
                     "head": {
                         "type": "integer",
