@@ -47,11 +47,16 @@ use crate::ui::repl::message_renderer::MessageRenderer;
 ///
 /// `compacted` is included because compaction changes what the renderer
 /// outputs even when role + length don't.
+///
+/// `attachments_len` invalidates the cache when an image is added or
+/// removed — the renderer emits one extra line per attachment, so row
+/// counts change even if `content` doesn't.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Fingerprint {
     role: MessageRole,
     content_len: usize,
     compacted: bool,
+    attachments_len: usize,
 }
 
 impl Fingerprint {
@@ -60,6 +65,7 @@ impl Fingerprint {
             role: msg.role,
             content_len: msg.content.len(),
             compacted: msg.compacted,
+            attachments_len: msg.attachments.len(),
         }
     }
 }
@@ -485,6 +491,33 @@ mod tests {
             c.total_height(),
             naive_height,
             "cache total must match naïve paragraph wrap"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_attachments_are_added() {
+        use crate::vision::{ImageAttachment, ImageSource};
+        use rig::completion::message::ImageMediaType;
+
+        let text_only = ChatMessage::user("same text".to_string());
+        let with_image = ChatMessage::user_with_attachments(
+            "same text".to_string(),
+            vec![ImageAttachment {
+                display_name: "cat.png".into(),
+                source: ImageSource::Base64 {
+                    bytes: vec![1, 2, 3],
+                    media_type: ImageMediaType::PNG,
+                },
+                detail: None,
+            }],
+        );
+
+        // Content bytes are identical, but the attachment flips the
+        // fingerprint — without this, adding an image wouldn't invalidate
+        // the cache and the `[image: …]` line would never appear.
+        assert!(
+            Fingerprint::of(&text_only) != Fingerprint::of(&with_image),
+            "adding an attachment must change the fingerprint"
         );
     }
 }

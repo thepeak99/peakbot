@@ -594,3 +594,71 @@ let harness = TestHarness::new()
     .build();
 ```
 
+
+## Vision (image input)
+
+PeakBot accepts image attachments on user turns. Images flow through the same
+prompt path as text — tool calls fire normally on vision turns, and provider
+compatibility is checked before the model is called.
+
+### Syntax
+
+Attach images inline with `[img:TOKEN]` tokens in your message:
+
+```
+what's in [img:~/pictures/cat.png]?
+compare [img:/tmp/a.png] and [img:/tmp/b.png]
+describe [img:https://example.com/photo.jpg]
+```
+
+Token resolution:
+- Starts with `/`, `~`, or `./` → filesystem path (`~` expands to `$HOME`)
+- Contains `://` → URL (OpenAI accepts; Anthropic refuses URLs)
+- Anything else → rejected with `InvalidToken` error
+
+Limits (`src/vision.rs`):
+- Max 10 MB per image (checked via `fs::metadata` before reading)
+- Max 8 images per turn
+- Supported extensions: `.png`, `.jpg`/`.jpeg`, `.gif`, `.webp` (case-insensitive)
+
+Failures surface as system messages in the chat log, never silently:
+- `❌ file not found: /path/to/missing.png` — bad path
+- `❌ file too large: ... (12 MB, max 10 MB)` — over cap
+- `❌ Model `qwen/qwq-32b` does not support vision.` — wrong model
+
+### Supported models
+
+Detection is conservative (substring match on model name). Known-vision models:
+
+- **OpenAI**: `gpt-4o`, `gpt-4-turbo`, `gpt-4.1`, `gpt-5`, `o1`, `o3`, `o4`
+- **Anthropic**: `claude-3*`, `claude-opus*`, `claude-sonnet*`, `claude-haiku*`, `claude-4*`
+- **Google**: `gemini-1.5*`, `gemini-2*`, `gemini-pro-vision`
+- **Open models**: `pixtral*`, `llama-3.2-vision*`, `llava*`, `qwen2-vl*`, `qwen2.5-vl*`
+
+Unknown model names default to `supports_vision = false` — attach an image
+against an unrecognised model and PeakBot emits a system error instead of
+shipping bytes that will be rejected downstream.
+
+### Provider quirks
+
+- **Anthropic** requires base64; URL attachments are refused (raise a provider
+  error at the wire level). Use a filesystem path instead.
+- **OpenAI** accepts both base64 and URLs.
+- **Mistral** is known to panic on `UserContent::Image` in *assistant* messages
+  during multi-turn sessions. Report an issue if you hit this; we can
+  blocklist Mistral in `model_supports_vision` if it becomes a problem.
+
+### Persistence
+
+Images are stored **inline** as base64 in the conversation JSON (not as
+sidecar files). A 5 MB PNG balloons the conversation JSON to ~7 MB. Acceptable
+for v1; sidecar storage is a speculative Phase 2 (see `one-vision.md`).
+
+### Internals
+
+- Entry: `src/vision.rs::parse_attachments_inline` (buffer → text + attachments)
+- Wire conversion: `src/state/state_manager.rs::user_content_from_attachment`
+- Capability flag: `ProviderInfo::supports_vision` set by
+  `vision::model_supports_vision(&model)` in every provider constructor
+- Dispatch path: `SubmitKind::MultimodalMessage` → `add_user_message_with_attachments`
+  → `build_current_turn_message` → `prompt_with_history` (identical path to text turns)

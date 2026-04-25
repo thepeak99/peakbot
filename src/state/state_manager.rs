@@ -969,6 +969,22 @@ impl StateManager {
         self.maybe_compact();
     }
 
+    /// Add a user message carrying image attachments.
+    ///
+    /// Same persistence and compaction behaviour as [`add_user_message`], but
+    /// the `ChatMessage` carries `attachments` that downstream code converts
+    /// to `rig::UserContent::Image` at the wire boundary.
+    pub fn add_user_message_with_attachments(
+        &self,
+        content: String,
+        attachments: Vec<crate::vision::ImageAttachment>,
+    ) {
+        let msg = ChatMessage::user_with_attachments(content, attachments);
+        self.update_chat(msg);
+        self.persist_current().ok();
+        self.maybe_compact();
+    }
+
     /// Add an assistant message to chat, persist, and trigger compaction if needed.
     pub fn add_assistant_message(&self, content: String) {
         let msg = ChatMessage::agent(content);
@@ -1048,9 +1064,7 @@ impl StateManager {
             .filter_map(|msg| {
                 match msg.role {
                     MessageRole::User => Some(RigMessage::User {
-                        content: OneOrMany::one(UserContent::Text(Text {
-                            text: msg.content.clone(),
-                        })),
+                        content: user_content_from_chat_message(msg),
                     }),
                     MessageRole::Agent => Some(RigMessage::Assistant {
                         id: None,
@@ -1100,6 +1114,103 @@ impl StateManager {
                 }
             })
             .collect()
+    }
+
+    /// Build the `rig::Message` representing the current user turn — the one
+    /// that gets passed as the `prompt` argument to
+    /// `DynAgent::prompt_with_history`, alongside the history returned by
+    /// [`get_agent_history`].
+    ///
+    /// Uses the last non-compacted user message as the source:
+    /// - text only → plain `Message::User` with a single text part
+    /// - attachments present → multimodal `Message::User` with
+    ///   `OneOrMany::many([Image*, Text])`
+    ///
+    /// Returns `None` only if there is no user message in the chat history —
+    /// which shouldn't happen in the production dispatch flow, where
+    /// `add_user_message(_with_attachments)` is called before this.
+    pub fn build_current_turn_message(&self) -> Option<rig::completion::message::Message> {
+        use crate::ui::app_state::MessageRole;
+        use rig::completion::message::Message as RigMessage;
+
+        let state = self.state.read().unwrap();
+        let last_user = state
+            .chat
+            .messages
+            .iter()
+            .rev()
+            .find(|m| !m.compacted && m.role == MessageRole::User)?;
+
+        Some(RigMessage::User {
+            content: user_content_from_chat_message(last_user),
+        })
+    }
+}
+
+/// Build a `OneOrMany<UserContent>` from a `ChatMessage` (User role).
+///
+/// Order is `[Image*, Text]` — matches rig's sample message and provider
+/// expectations. A text-only message collapses to `OneOrMany::one(Text)`;
+/// otherwise attachments come first, then the caption.
+fn user_content_from_chat_message(
+    msg: &crate::ui::app_state::ChatMessage,
+) -> rig::one_or_many::OneOrMany<rig::completion::message::UserContent> {
+    use rig::completion::message::{Text, UserContent};
+    use rig::one_or_many::OneOrMany;
+
+    if msg.attachments.is_empty() {
+        return OneOrMany::one(UserContent::Text(Text {
+            text: msg.content.clone(),
+        }));
+    }
+
+    let mut parts: Vec<UserContent> = msg
+        .attachments
+        .iter()
+        .map(user_content_from_attachment)
+        .collect();
+    parts.push(UserContent::Text(Text {
+        text: msg.content.clone(),
+    }));
+
+    // `OneOrMany::many` errors on empty input; we always have ≥2 parts here.
+    OneOrMany::many(parts).expect("attachments present → non-empty parts")
+}
+
+/// Adapter at the wire boundary — converts a UI-level `ImageAttachment` into
+/// a `rig::UserContent::Image`.
+///
+/// **Detail defaulting (load-bearing):** rig-core's OpenAI provider rejects
+/// base64 images with `detail: None` (`"OpenAI image URI must have image
+/// detail"`). URL-shaped images get `unwrap_or_default()` → `Auto` for free
+/// inside rig, but base64 does not. We default to `Auto` here for both
+/// sources so the contract is uniform regardless of provider or source kind.
+/// Explicit user-set details (Low/High) are preserved.
+fn user_content_from_attachment(
+    att: &crate::vision::ImageAttachment,
+) -> rig::completion::message::UserContent {
+    use crate::vision::ImageSource;
+    use rig::completion::message::{DocumentSourceKind, Image, ImageDetail, UserContent};
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let detail = Some(att.detail.clone().unwrap_or(ImageDetail::Auto));
+
+    match &att.source {
+        ImageSource::Base64 { bytes, media_type } => UserContent::Image(Image {
+            // rig stores Base64 as a string; encode at the boundary so we
+            // keep our in-memory representation honest (raw bytes).
+            data: DocumentSourceKind::Base64(STANDARD.encode(bytes)),
+            media_type: Some(media_type.clone()),
+            detail: detail.clone(),
+            additional_params: None,
+        }),
+        ImageSource::Url(url) => UserContent::Image(Image {
+            data: DocumentSourceKind::Url(url.clone()),
+            media_type: None,
+            detail,
+            additional_params: None,
+        }),
     }
 }
 
@@ -1673,5 +1784,197 @@ mod tests {
         sm.add_request(100_000, 2_000, 0.0);
         let state = sm.get_state();
         assert_eq!(state.context.current_usage, 100_000);
+    }
+
+    // ── Vision / multimodal history ───────────────────────────────────────
+
+    fn sample_attachment(name: &str) -> crate::vision::ImageAttachment {
+        use crate::vision::{ImageAttachment, ImageSource};
+        use rig::completion::message::ImageMediaType;
+        ImageAttachment {
+            display_name: name.to_string(),
+            source: ImageSource::Base64 {
+                bytes: vec![1, 2, 3, 4],
+                media_type: ImageMediaType::PNG,
+            },
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn get_agent_history_emits_text_only_user_when_no_attachments() {
+        use rig::completion::message::{Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+        sm.add_user_message("first".to_string());
+        sm.add_assistant_message("reply".to_string());
+        sm.add_user_message("second".to_string());
+
+        // Trailing user is excluded; only the first User + Assistant show up.
+        let history = sm.get_agent_history();
+        assert_eq!(history.len(), 2);
+        match &history[0] {
+            RigMessage::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                assert_eq!(parts.len(), 1);
+                assert!(matches!(parts[0], UserContent::Text(_)));
+            }
+            _ => panic!("expected User message at index 0"),
+        }
+    }
+
+    #[test]
+    fn get_agent_history_emits_image_then_text_order_when_attachments_present() {
+        use rig::completion::message::{Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+        sm.add_user_message_with_attachments(
+            "what's this?".to_string(),
+            vec![sample_attachment("a.png"), sample_attachment("b.png")],
+        );
+        sm.add_assistant_message("a cat".to_string());
+        // Add a trailing text user to push the multimodal message *into* history.
+        sm.add_user_message("follow-up".to_string());
+
+        let history = sm.get_agent_history();
+        assert_eq!(history.len(), 2, "trailing user must be excluded");
+        match &history[0] {
+            RigMessage::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                assert_eq!(parts.len(), 3, "expected [Image, Image, Text]");
+                assert!(matches!(parts[0], UserContent::Image(_)));
+                assert!(matches!(parts[1], UserContent::Image(_)));
+                assert!(matches!(parts[2], UserContent::Text(_)));
+            }
+            other => panic!("expected User message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_agent_history_still_excludes_trailing_user_even_with_attachments() {
+        let sm = StateManager::new();
+        sm.add_user_message_with_attachments(
+            "hi".to_string(),
+            vec![sample_attachment("cat.png")],
+        );
+        // Trailing user with attachments → excluded (matches existing behaviour).
+        let history = sm.get_agent_history();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn build_current_turn_message_returns_multimodal_when_attachments_present() {
+        use rig::completion::message::{Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+        sm.add_user_message_with_attachments(
+            "explain".to_string(),
+            vec![sample_attachment("x.png")],
+        );
+
+        let msg = sm.build_current_turn_message().expect("user msg exists");
+        match msg {
+            RigMessage::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(parts[0], UserContent::Image(_)));
+                assert!(matches!(parts[1], UserContent::Text(_)));
+            }
+            _ => panic!("expected User message"),
+        }
+    }
+
+    /// Regression: rig-core's OpenAI provider rejects base64 images that don't
+    /// carry an `ImageDetail` (`"OpenAI image URI must have image detail"`).
+    /// PeakBot constructs attachments with `detail: None`, so the wire-boundary
+    /// adapter MUST default to `ImageDetail::Auto` to keep OpenAI happy and
+    /// match the behaviour rig already gives URL-shaped images.
+    #[test]
+    fn user_content_from_attachment_defaults_base64_detail_to_auto() {
+        use rig::completion::message::{ImageDetail, UserContent};
+
+        let att = sample_attachment("cat.png");
+        assert!(att.detail.is_none(), "fixture must start with no detail");
+
+        match user_content_from_attachment(&att) {
+            UserContent::Image(img) => {
+                assert_eq!(
+                    img.detail,
+                    Some(ImageDetail::Auto),
+                    "base64 attachments must carry a detail at the wire boundary"
+                );
+            }
+            other => panic!("expected Image content, got {other:?}"),
+        }
+    }
+
+    /// Same defaulting must apply to URL attachments — keeps the contract
+    /// uniform across `ImageSource` variants. (rig's OpenAI provider already
+    /// `unwrap_or_default()`s URLs, but we shouldn't rely on that asymmetry.)
+    #[test]
+    fn user_content_from_attachment_defaults_url_detail_to_auto() {
+        use crate::vision::{ImageAttachment, ImageSource};
+        use rig::completion::message::{ImageDetail, UserContent};
+
+        let att = ImageAttachment {
+            display_name: "https://example.com/x.png".to_string(),
+            source: ImageSource::Url("https://example.com/x.png".to_string()),
+            detail: None,
+        };
+
+        match user_content_from_attachment(&att) {
+            UserContent::Image(img) => {
+                assert_eq!(img.detail, Some(ImageDetail::Auto));
+            }
+            other => panic!("expected Image content, got {other:?}"),
+        }
+    }
+
+    /// An explicitly-set detail must NOT be overwritten by the default.
+    #[test]
+    fn user_content_from_attachment_preserves_explicit_detail() {
+        use crate::vision::{ImageAttachment, ImageSource};
+        use rig::completion::message::{ImageDetail, ImageMediaType, UserContent};
+
+        let att = ImageAttachment {
+            display_name: "x.png".to_string(),
+            source: ImageSource::Base64 {
+                bytes: vec![1, 2, 3],
+                media_type: ImageMediaType::PNG,
+            },
+            detail: Some(ImageDetail::High),
+        };
+
+        match user_content_from_attachment(&att) {
+            UserContent::Image(img) => assert_eq!(img.detail, Some(ImageDetail::High)),
+            other => panic!("expected Image content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_current_turn_message_returns_text_only_when_no_attachments() {
+        use rig::completion::message::{Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+        sm.add_user_message("hello".to_string());
+
+        let msg = sm.build_current_turn_message().expect("user msg exists");
+        match msg {
+            RigMessage::User { content } => {
+                let parts: Vec<_> = content.iter().collect();
+                assert_eq!(parts.len(), 1);
+                assert!(matches!(parts[0], UserContent::Text(_)));
+            }
+            _ => panic!("expected User message"),
+        }
+    }
+
+    #[test]
+    fn build_current_turn_message_returns_none_when_no_user_messages() {
+        let sm = StateManager::new();
+        sm.add_system_message("startup banner".to_string());
+        sm.add_assistant_message("hi, how can I help?".to_string());
+
+        assert!(sm.build_current_turn_message().is_none());
     }
 }
