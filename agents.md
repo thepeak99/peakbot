@@ -722,6 +722,38 @@ make release VERSION=0.2.0 ALLOW_DIRTY=1     # bypass clean-tree check
 - `curl`, `jq` — used by `release-publish` to talk to Gitea
 - `awk` — portable invocation only (no PCRE lazy quantifiers); works under gawk / mawk / busybox awk
 
+#### Release notes
+
+The Gitea release body and the annotated tag message are populated from a
+Markdown file, resolved in this order:
+
+1. `NOTES=<path>` on the make CLI (e.g. `make release VERSION=0.2.0 NOTES=/tmp/notes.md`)
+2. `release-notes/<v>.md` in the repo (the default convention — version-controlled, PR-reviewable)
+3. The literal string `Release <v>` if neither exists
+
+Notes are optional — a release with no notes still ships; you'll see an
+`ℹ️  No release-notes file …` message and the default body is used. To
+ship notes, drop a file at `release-notes/<v>.md` *before* running
+`make release`. The same content is used for both the Gitea release page
+and `git show <v>`.
+
+The notes file is read via `jq --rawfile`, so any Markdown content is
+safe (newlines, backticks, quotes, `$`) — no shell escaping required.
+
+```bash
+# Conventional flow (recommended)
+$EDITOR release-notes/0.3.0.md
+git add release-notes/0.3.0.md
+git commit -m "docs: 0.3.0 release notes"
+make release VERSION=0.3.0          # picks up release-notes/0.3.0.md automatically
+
+# Ad-hoc override
+make release VERSION=0.3.0 NOTES=/tmp/generated-notes.md
+
+# Hotfix without notes — pipeline still ships, body falls back to "Release 0.3.1"
+make release VERSION=0.3.1
+```
+
 #### Resuming a partial failure
 
 If `release-publish` dies mid-upload, `.release-version` still exists, the tag is already pushed, and the binaries are already in `output/`. Re-run just the failing phase:

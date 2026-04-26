@@ -23,6 +23,10 @@ REPO       ?= $(shell basename -s .git $(ORIGIN_URL) 2>/dev/null)
 # VERSION may be passed on the CLI (make release VERSION=0.2.0) or prompted.
 VERSION ?=
 
+# NOTES may point to a markdown file used as the release body + tag message.
+# Default resolution (in release-tag and release-publish): release-notes/<v>.md.
+NOTES ?=
+
 # Default target
 all: build
 
@@ -128,7 +132,14 @@ release-tag:
 	v=$$(cat .release-version); \
 	branch=$$(git rev-parse --abbrev-ref HEAD); \
 	echo "🏷️  Tagging $$v on branch '$$branch'..."; \
-	git tag -a "$$v" -m "Release $$v"; \
+	notes="$${NOTES:-release-notes/$$v.md}"; \
+	if [ -f "$$notes" ]; then \
+	  echo "📝 Using release notes from $$notes"; \
+	  git tag -a "$$v" -F "$$notes"; \
+	else \
+	  echo "ℹ️  No release-notes file (looked for $$notes); using default tag message"; \
+	  git tag -a "$$v" -m "Release $$v"; \
+	fi; \
 	echo "📤 Pushing branch and tag..."; \
 	git push origin "$$branch"; \
 	git push origin "$$v"; \
@@ -199,8 +210,16 @@ release-publish:
 	[ -f "$$macos_asset" ] || { echo "❌ Missing $$macos_asset"; exit 1; }; \
 	api="$(GITEA_URL)/api/v1/repos/$(OWNER)/$(REPO)"; \
 	echo "🚀 Creating Gitea release $$v at $$api/releases ..."; \
-	body=$$(jq -nc --arg tag "$$v" --arg name "Release $$v" \
-	  '{tag_name:$$tag, target_commitish:"", name:$$name, body:"Automated release.", draft:false, prerelease:false}'); \
+	notes="$${NOTES:-release-notes/$$v.md}"; \
+	if [ -f "$$notes" ]; then \
+	  echo "📝 Using release notes from $$notes"; \
+	  body=$$(jq -nc --arg tag "$$v" --arg name "Release $$v" --rawfile bd "$$notes" \
+	    '{tag_name:$$tag, target_commitish:"", name:$$name, body:$$bd, draft:false, prerelease:false}'); \
+	else \
+	  echo "ℹ️  No release-notes file (looked for $$notes); using default body"; \
+	  body=$$(jq -nc --arg tag "$$v" --arg name "Release $$v" --arg bd "Release $$v" \
+	    '{tag_name:$$tag, target_commitish:"", name:$$name, body:$$bd, draft:false, prerelease:false}'); \
+	fi; \
 	resp=$$(curl -sS -X POST "$$api/releases" \
 	  -H "Authorization: token $$GITEA_TOKEN" \
 	  -H "Content-Type: application/json" \
@@ -240,8 +259,15 @@ help:
 	@echo "  make release                                # prompts for version"
 	@echo "  make release VERSION=0.2.0                  # non-interactive"
 	@echo "  make release VERSION=0.2.0 ALLOW_DIRTY=1    # bypass clean tree check"
+	@echo "  make release VERSION=0.2.0 NOTES=path/to/notes.md  # custom notes file"
+	@echo ""
+	@echo "Release notes:"
+	@echo "  Default: release-notes/<v>.md (if present) is used as the Gitea body + git tag message."
+	@echo "  Override: pass NOTES=<path> to use any markdown file."
+	@echo "  Missing:  pipeline still ships, body falls back to \"Release <v>\"."
 	@echo ""
 	@echo "Environment:"
 	@echo "  CONTAINER_BUILDER  Container runtime (default: podman or docker)"
 	@echo "  GITEA_TOKEN        Gitea personal access token (required for release)"
 	@echo "  GITEA_URL/OWNER/REPO  Auto-derived from origin remote — override if needed"
+	@echo "  NOTES              Path to a markdown release-notes file (default: release-notes/<v>.md)"
