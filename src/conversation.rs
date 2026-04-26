@@ -5,10 +5,27 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Metadata about a conversation (stats, etc.)
+///
+/// Token + cost fields use `#[serde(default)]` so conversations saved before
+/// stats persistence existed (only `message_count`) still deserialize cleanly
+/// — they just come back with zeros, which is the right answer for them.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConversationMetadata {
     /// Number of messages in the conversation
     pub message_count: usize,
+    /// Input tokens from the last request (mirrors SessionStats — overwritten,
+    /// not accumulated; doubles as the live context-size indicator on resume)
+    #[serde(default)]
+    pub total_input_tokens: u64,
+    /// Output tokens from the last request (mirrors SessionStats — overwritten)
+    #[serde(default)]
+    pub total_output_tokens: u64,
+    /// Cumulative number of API calls across the conversation
+    #[serde(default)]
+    pub total_api_calls: u64,
+    /// Cumulative cost in USD across the conversation
+    #[serde(default)]
+    pub total_cost: f64,
 }
 
 /// A message in the conversation history
