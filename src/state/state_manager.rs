@@ -285,21 +285,45 @@ impl StateManager {
     }
 
     /// Sync stats to AppState (internal method)
+    ///
+    /// **Lock order — load-bearing:** snapshot the values from `stats` and
+    /// release the guard *before* acquiring `state.write`. Holding `stats`
+    /// across `state.write` would invert the order used by
+    /// `sync_to_conversation` (`state.read` → `current_conversation` →
+    /// `stats`) and produce a deadlock when the agent loop persists an
+    /// assistant message at the same instant the event-processor task
+    /// dispatches the matching `CompletionResponse` event. That race is
+    /// most reliably triggered by `/new` → first prompt → first LLM
+    /// response on a fresh session — see the
+    /// `add_request_and_persist_current_do_not_deadlock` regression test
+    /// for the reproduction.
     fn sync_stats_to_ui(&self) {
-        let stats = self.stats.lock().unwrap();
-        // Snapshot the live context-token count while no locks on `state` are held.
-        // `last_input_tokens()` returns the most recent request's input tokens —
-        // that IS the current context size (not cumulative).
-        let last_input = stats.last_input_tokens().unwrap_or(0);
+        // Snapshot under the stats lock, then release it before touching
+        // `state` to keep the global lock order acyclic.
+        let (input, output, calls, cost, last_input) = {
+            let stats = self.stats.lock().unwrap();
+            (
+                stats.total_input_tokens,
+                stats.total_output_tokens,
+                stats.total_api_calls,
+                stats.total_cost,
+                // `last_input_tokens()` returns the most recent request's
+                // input tokens — that IS the current context size (not
+                // cumulative).
+                stats.last_input_tokens().unwrap_or(0),
+            )
+        };
 
         let mut state = self.state.write().unwrap();
-        state.stats.total_input_tokens = stats.total_input_tokens;
-        state.stats.total_output_tokens = stats.total_output_tokens;
-        state.stats.total_api_calls = stats.total_api_calls;
-        state.stats.total_cost = stats.total_cost;
+        state.stats.total_input_tokens = input;
+        state.stats.total_output_tokens = output;
+        state.stats.total_api_calls = calls;
+        state.stats.total_cost = cost;
         state.context.current_usage = last_input;
-        drop(state);
-        self.notify_update(&self.state.read().unwrap());
+        // Notify *while still holding* `state.write` — matches the pattern
+        // used by every other sync_*_to_ui helper. The guard derefs to
+        // `&AppState` for `notify_update`'s signature.
+        self.notify_update(&state);
     }
 
     // ── Todo Operations ────────────────────────────────────────────────────────
@@ -2085,5 +2109,136 @@ mod tests {
         sm.add_assistant_message("hi, how can I help?".to_string());
 
         assert!(sm.build_current_turn_message().is_none());
+    }
+
+    /// Regression: `/new` → first prompt → first LLM response used to hang
+    /// because two paths grabbed `state` and `stats` in opposite orders:
+    ///
+    /// - `sync_to_conversation` (called from `add_assistant_message` →
+    ///   `persist_current` on the agent loop) takes `state.read` →
+    ///   `current_conversation.lock` → `stats.lock`.
+    /// - `sync_stats_to_ui` (called from `add_request` on the event-processor
+    ///   task when `CompletionResponse` arrives) used to take `stats.lock` →
+    ///   `state.write`.
+    ///
+    /// Cross those two on a multi-threaded runtime and `state.write` blocks
+    /// behind the held `state.read`, while `stats.lock` blocks the
+    /// reader-side path that's waiting for it — classic A→B vs B→A
+    /// deadlock. The fix is to drop `stats.lock` before acquiring
+    /// `state.write` in `sync_stats_to_ui`. This test reproduces the race
+    /// by hammering both entry points from two threads at once. With the
+    /// bug present it deadlocks; with the fix it completes in
+    /// milliseconds.
+    ///
+    /// Implementation note: the watchdog must NOT touch any of the locks
+    /// involved (state / stats / current_conversation). A lock-touching
+    /// watchdog would itself block on the deadlock and never get to fire
+    /// its panic. Progress is observed via two `AtomicU64` counters that
+    /// the producers bump after each successful round-trip — if either
+    /// counter stops advancing for the watchdog window, we declare a
+    /// deadlock.
+    #[test]
+    fn add_request_and_persist_current_do_not_deadlock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let sm = Arc::new(StateManager::new());
+        // Seed a current conversation so persist_current actually walks the
+        // state.read → current_conv.lock → stats.lock chain.
+        sm.create_conversation("deadlock-probe".to_string(), "test-model".to_string());
+        // Seed at least one user/assistant message so sync_to_conversation
+        // has something non-trivial to copy under the locks.
+        sm.add_user_message("hello".to_string());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let count_a = Arc::new(AtomicU64::new(0));
+        let count_b = Arc::new(AtomicU64::new(0));
+
+        // Producer A: simulates the event-processor task calling
+        // `add_request` for every completion response.
+        let sm_a = sm.clone();
+        let stop_a = stop.clone();
+        let count_a_t = count_a.clone();
+        let t_a = thread::spawn(move || {
+            while !stop_a.load(Ordering::Relaxed) {
+                sm_a.add_request(100, 50, 0.001);
+                count_a_t.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Producer B: simulates the agent-loop task calling
+        // `add_assistant_message` (which fans out to persist_current →
+        // sync_to_conversation, the inverted-order path).
+        let sm_b = sm.clone();
+        let stop_b = stop.clone();
+        let count_b_t = count_b.clone();
+        let t_b = thread::spawn(move || {
+            while !stop_b.load(Ordering::Relaxed) {
+                sm_b.add_assistant_message("reply".to_string());
+                count_b_t.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Watchdog thread: pure atomic polling, never touches any of the
+        // locks held by the producers. If both counters stop advancing for
+        // the watchdog window, kill the process — the test runner will
+        // surface that as a failure rather than hanging the suite.
+        //
+        // We can't `panic!` from this thread to fail the test cleanly: a
+        // panic here unwinds only the watchdog thread, the producers stay
+        // stuck on the deadlock, and the main thread still hangs in `join`.
+        // `std::process::exit(101)` is the standard "test failed" code,
+        // matching what `panic!` would produce on the main thread.
+        let stop_w = stop.clone();
+        let count_a_w = count_a.clone();
+        let count_b_w = count_b.clone();
+        let _watchdog = thread::spawn(move || {
+            let mut last_a = 0u64;
+            let mut last_b = 0u64;
+            let mut stuck_since: Option<Instant> = None;
+            while !stop_w.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(50));
+                let now_a = count_a_w.load(Ordering::Relaxed);
+                let now_b = count_b_w.load(Ordering::Relaxed);
+                if now_a == last_a && now_b == last_b {
+                    let since = stuck_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(2) {
+                        // `process::abort` (SIGABRT) rather than `process::exit`
+                        // because libtest's stdio capture has been observed to
+                        // jam mid-test; abort dies regardless of stdio state and
+                        // CI surfaces it as a clear failure.
+                        eprintln!(
+                            "deadlock detected: counters frozen at A={now_a}, B={now_b} for >2s"
+                        );
+                        std::process::abort();
+                    }
+                } else {
+                    stuck_since = None;
+                    last_a = now_a;
+                    last_b = now_b;
+                }
+            }
+        });
+
+        // Run the workload for a fixed budget. With the fix in place both
+        // producers happily make tens of thousands of iterations a second.
+        thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        t_a.join().expect("producer A must not panic");
+        t_b.join().expect("producer B must not panic");
+
+        // Sanity: both producers must have made forward progress. If either
+        // counter is zero something else is wrong and we shouldn't pretend
+        // the test exercised the race.
+        assert!(
+            count_a.load(Ordering::Relaxed) > 0,
+            "producer A made no progress"
+        );
+        assert!(
+            count_b.load(Ordering::Relaxed) > 0,
+            "producer B made no progress"
+        );
     }
 }

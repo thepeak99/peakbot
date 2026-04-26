@@ -4,7 +4,7 @@ assertion_line: 155
 expression: "lines.join(\"\\n\")"
 ---
 ┌ Chat Messages ──────────────────────────────────────────┐▲
-│✨  PeakBot v0.1.2                                        │█
+│✨  PeakBot v0.2.0                                        │█
 │Start a conversation or use /help for commands.          │█
 │                                                         │█
 │                                                         │█
