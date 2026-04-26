@@ -120,6 +120,30 @@ impl SessionStats {
         self.requests.clear();
     }
 
+    /// Restore stats from a persisted snapshot (e.g. after `/load`).
+    ///
+    /// Replaces the current stats wholesale with the supplied values and seeds
+    /// `requests` with a single synthetic entry so that `last_input_tokens()`
+    /// — which the status bar uses as the live context-size indicator —
+    /// returns the loaded conversation's last input count instead of `None`.
+    pub fn restore(&mut self, input: u64, output: u64, api_calls: u64, cost: f64) {
+        self.total_input_tokens = input;
+        self.total_output_tokens = output;
+        self.total_api_calls = api_calls;
+        self.total_cost = cost;
+        self.requests.clear();
+        // Seed exactly one synthetic request so `last_input_tokens()` returns
+        // the persisted value. We don't reconstruct full per-request history
+        // (that detail isn't persisted) — just enough for the status bar.
+        if api_calls > 0 || input > 0 || output > 0 {
+            self.requests.push(RequestStats {
+                input_tokens: input,
+                output_tokens: output,
+                cost,
+            });
+        }
+    }
+
     /// Get the last request's stats
     pub fn last_request(&self) -> Option<RequestStats> {
         self.requests.last().cloned()

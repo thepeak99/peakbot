@@ -773,17 +773,23 @@ impl StateManager {
         *self.current_conversation.lock().unwrap() = None;
     }
 
-    /// Save the current conversation to storage
+    /// Save the current conversation to storage.
+    ///
+    /// Implementation note: must NOT hold `current_conversation.lock()`
+    /// while calling `sync_to_conversation()`, because `sync_to_conversation`
+    /// re-locks the same `Mutex` and `std::sync::Mutex` is non-reentrant
+    /// (the previous `if let (Some(storage), Some(conv)) = (..., self.current_conversation.lock().unwrap().as_mut())`
+    /// pattern held the guard across the entire if-let body and deadlocked
+    /// on the inner sync call). Sync first, then lock to bump timestamp +
+    /// hand the borrow to storage.
     pub fn save_conversation(&self) {
+        // Sync chat + stats into the conversation BEFORE taking the lock.
+        self.sync_to_conversation();
         if let (Some(storage), Some(conv)) = (
             self.storage.as_ref(),
             self.current_conversation.lock().unwrap().as_mut(),
         ) {
-            // Sync chat state to conversation before saving
-            self.sync_to_conversation();
-            // Update timestamp
             conv.updated_at = chrono::Utc::now();
-            // Save to storage
             let _ = storage.save(conv);
         }
     }
@@ -909,10 +915,22 @@ impl StateManager {
                 })
                 .collect();
 
+            // Restore persisted session stats *before* dropping the conv guard
+            // so we don't race with a concurrent save.
+            self.stats.lock().unwrap().restore(
+                conv.metadata.total_input_tokens,
+                conv.metadata.total_output_tokens,
+                conv.metadata.total_api_calls,
+                conv.metadata.total_cost,
+            );
+
             let mut state = self.state.write().unwrap();
             state.chat.messages = messages;
             drop(state);
-            self.notify_update(&self.state.read().unwrap());
+            drop(conv_guard);
+            // Push the restored stats into AppState so the status bar reflects
+            // the loaded conversation instead of the previous session's totals.
+            self.sync_stats_to_ui();
         }
     }
 
@@ -962,6 +980,14 @@ impl StateManager {
                 })
                 .collect();
             conv.metadata.message_count = conv.messages.len();
+            // Snapshot live SessionStats into metadata so /load on a future
+            // session can hydrate the status bar from the saved JSON.
+            let stats = self.stats.lock().unwrap();
+            conv.metadata.total_input_tokens = stats.total_input_tokens;
+            conv.metadata.total_output_tokens = stats.total_output_tokens;
+            conv.metadata.total_api_calls = stats.total_api_calls;
+            conv.metadata.total_cost = stats.total_cost;
+            drop(stats);
             conv.updated_at = chrono::Utc::now();
         }
     }
@@ -1292,6 +1318,55 @@ mod tests {
         assert_eq!(state.stats.total_output_tokens, 0);
         assert_eq!(state.stats.total_api_calls, 0);
         assert!((state.stats.total_cost - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// Regression test for the `/load` stats bug: a saved conversation must
+    /// round-trip its session stats so that loading it later repopulates the
+    /// status bar with that conversation's tokens / API calls / cost — not
+    /// the previous session's stale values.
+    #[test]
+    fn test_load_conversation_restores_stats() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage);
+
+        // Session A: create, accumulate stats, save.
+        sm.create_conversation("Session A".into(), "test-model".into());
+        sm.add_request(1234, 567, 0.42);
+        sm.add_request(2000, 800, 0.10); // cost accumulates → 0.52
+        let conv_a_id = sm.get_current_conversation_id().expect("convo A id");
+        sm.save_conversation();
+
+        // Switch to a fresh session and pile up unrelated stats — these are
+        // what the buggy /load would leave behind in the status bar.
+        sm.clear_history();
+        sm.reset_stats();
+        sm.create_conversation("Session B".into(), "test-model".into());
+        sm.add_request(99, 99, 9.99);
+
+        // Load A back. Its stats should override the session-B stats.
+        sm.load_conversation(conv_a_id).expect("load A");
+        let state = sm.get_state();
+        assert_eq!(state.stats.total_input_tokens, 2000, "last input restored");
+        assert_eq!(state.stats.total_output_tokens, 800, "last output restored");
+        assert_eq!(state.stats.total_api_calls, 2, "api calls restored");
+        assert!(
+            (state.stats.total_cost - 0.52).abs() < 1e-9,
+            "cost restored, got {}",
+            state.stats.total_cost
+        );
+        // Status bar's live context-size indicator reads `last_input_tokens`,
+        // which must also be hydrated (not None) after restore.
+        assert_eq!(
+            sm.get_stats().last_input_tokens(),
+            Some(2000),
+            "last_input_tokens must reflect loaded conversation"
+        );
+        assert_eq!(
+            state.context.current_usage, 2000,
+            "AppState.context.current_usage must follow last_input_tokens"
+        );
     }
 
     #[test]
