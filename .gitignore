@@ -3,4 +3,5 @@
 *.md.bak
 output
 *.md
+!release-notes/**/*.md
 .release-version
