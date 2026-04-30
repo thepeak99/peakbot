@@ -99,6 +99,10 @@ fn table_border_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+fn list_marker_style() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
 // ─── Agent prefix line ────────────────────────────────────────────────
 
 /// Build the timestamp + role prefix as a standalone `Line`. Matches the
@@ -127,6 +131,7 @@ fn render_agent_markdown(msg: &ChatMessage, width: u16) -> Vec<Line<'static>> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
 
     let parser = Parser::new_ext(&msg.content, opts);
     let mut state = MarkdownState::new(width);
@@ -153,6 +158,19 @@ enum Mode {
     },
 }
 
+/// One frame on the list-nesting stack.
+///
+/// `next_number` is `Some(n)` for ordered lists (next item shows `n.`,
+/// then increments) and `None` for unordered (renders `•`). Depth is
+/// `list_stack.len()`; indentation in cells is depth × `LIST_INDENT_STEP`
+/// (2 cells per nesting level — same convention as most markdown
+/// renderers and what the parser implies via tight-list spacing).
+struct ListContext {
+    next_number: Option<u64>,
+}
+
+const LIST_INDENT_STEP: usize = 2;
+
 struct MarkdownState {
     width: u16,
     lines: Vec<Line<'static>>,
@@ -163,6 +181,9 @@ struct MarkdownState {
     /// fully-styled frame instead.
     style_stack: Vec<Style>,
     mode: Mode,
+    /// Active list nesting (outermost at index 0). Empty when not inside
+    /// any list. Pushed on `Start(List)`, popped on `End(List)`.
+    list_stack: Vec<ListContext>,
 }
 
 impl MarkdownState {
@@ -173,6 +194,7 @@ impl MarkdownState {
             current_spans: Vec::new(),
             style_stack: Vec::new(),
             mode: Mode::Body,
+            list_stack: Vec::new(),
         }
     }
 
@@ -272,7 +294,15 @@ impl MarkdownState {
             // HTML, footnotes, math etc. — render the raw text so users
             // at least see what the model produced.
             Event::Html(t) | Event::InlineHtml(t) => self.push_text(&t),
-            Event::FootnoteReference(_) | Event::TaskListMarker(_) => {}
+            Event::FootnoteReference(_) => {}
+            Event::TaskListMarker(checked) => {
+                // GFM task lists: `- [x] done`. Render the checkbox
+                // inline; the surrounding list machinery has already
+                // emitted the bullet + indent, so we just append.
+                let glyph = if checked { "[x] " } else { "[ ] " };
+                let style = list_marker_style();
+                self.push_span(glyph.to_string(), style);
+            }
             Event::InlineMath(t) | Event::DisplayMath(t) => self.push_text(&t),
         }
     }
@@ -317,6 +347,43 @@ impl MarkdownState {
             Tag::Link { .. } => self
                 .style_stack
                 .push(Style::default().add_modifier(Modifier::UNDERLINED)),
+            Tag::List(start) => {
+                // Closing any in-progress paragraph line BEFORE pushing
+                // the list frame keeps `Start(Item)` from glueing its
+                // marker onto the previous paragraph's last span.
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+                self.list_stack.push(ListContext { next_number: start });
+            }
+            Tag::Item => {
+                // New item → fresh line. Indent + marker get pushed as
+                // their own spans so subsequent inline events (text,
+                // emphasis, code) accumulate to the right of them.
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+                let depth = self.list_stack.len().saturating_sub(1);
+                let indent = " ".repeat(depth * LIST_INDENT_STEP);
+                let marker = if let Some(top) = self.list_stack.last_mut() {
+                    if let Some(n) = top.next_number {
+                        top.next_number = Some(n + 1);
+                        format!("{n}. ")
+                    } else {
+                        "• ".to_string()
+                    }
+                } else {
+                    // Defensive: a stray `Item` outside any list. Fall
+                    // back to the unordered bullet so the content still
+                    // renders sensibly.
+                    "• ".to_string()
+                };
+                if !indent.is_empty() {
+                    self.current_spans.push(Span::raw(indent));
+                }
+                self.current_spans
+                    .push(Span::styled(marker, list_marker_style()));
+            }
             // Tags we deliberately don't style in v1 (lists, blockquotes,
             // images, etc.). Their inner Text events still fire and become
             // plain spans, so users see the content rather than nothing.
@@ -326,7 +393,18 @@ impl MarkdownState {
 
     fn handle_end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph => self.paragraph_break(),
+            TagEnd::Paragraph => {
+                // Inside a list item we don't want the blank-line gap
+                // `paragraph_break()` emits — items should sit on
+                // consecutive rows. Just close the line.
+                if !self.list_stack.is_empty() {
+                    if !self.current_spans.is_empty() {
+                        self.finish_line();
+                    }
+                } else {
+                    self.paragraph_break();
+                }
+            }
             TagEnd::Heading(_) => {
                 if !self.current_spans.is_empty() {
                     self.finish_line();
@@ -337,6 +415,28 @@ impl MarkdownState {
             }
             TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
                 self.style_stack.pop();
+            }
+            TagEnd::Item => {
+                // Trailing content of the item (may be empty if the item
+                // contained only a nested list — in which case we already
+                // finished the line at nested-list start).
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+            }
+            TagEnd::List(_) => {
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+                self.list_stack.pop();
+                // Only emit the trailing blank when the OUTERMOST list
+                // closes — nested lists shouldn't insert vertical gaps
+                // mid-list.
+                if self.list_stack.is_empty()
+                    && !matches!(self.lines.last(), Some(l) if l.spans.is_empty())
+                {
+                    self.lines.push(Line::from(""));
+                }
             }
             // CodeBlock / Table ends are handled in their dedicated
             // handlers (we're never in body-mode when those fire).
@@ -968,11 +1068,14 @@ mod tests {
         let md = "| n |\n|---:|\n| 7 |";
         let text = render_to_text(md, 80);
         // The "7" should be right-aligned: spaces before it, then "7", then trailing space + border.
-        // Cell layout: │␣<padding>7␣│. Find the body line.
+        // Cell layout: │␣<padding>7␣│. Find the body line — anchor on `│`
+        // (table-row-only character) AND `7`, NOT on `'7'` alone: the
+        // agent-prefix line carries a live timestamp like
+        // `[16:35:37] 🤖 Agent:` and matched the previous selector at
+        // any sec/min/hour ending in 7 (flaky, time-dependent).
         let body_line = text
             .lines()
-            .find(|l| l.contains('7') && !l.contains("7 "))
-            .or_else(|| text.lines().find(|l| l.contains('7')))
+            .find(|l| l.starts_with('│') && l.contains('7'))
             .expect("body line with 7");
         // For right alignment the '7' should have at least one ' ' before it inside the cell.
         assert!(
@@ -1112,5 +1215,187 @@ mod tests {
                 box_lines[i]
             );
         }
+    }
+
+    // ─── Lists ────────────────────────────────────────────────────────
+    //
+    // These pin the v2 list-rendering work (2026-04-30): bullets for
+    // unordered, numbered markers for ordered (honouring the start
+    // number), 2-space-per-depth indentation for nesting, and inline
+    // styling preserved for content inside items.
+
+    /// Pull just the body lines (skip the agent-prefix line and any
+    /// trailing blank), as plain strings, for compact assertions.
+    fn body_lines(content: &str, width: u16) -> Vec<String> {
+        render(content, width)
+            .iter()
+            .skip(1) // prefix line
+            .map(line_text)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn unordered_list_emits_bullet_per_item() {
+        let lines = body_lines("- one\n- two\n- three", 80);
+        assert_eq!(
+            lines,
+            vec![
+                "• one".to_string(),
+                "• two".to_string(),
+                "• three".to_string()
+            ],
+            "unordered list should render one bullet per item"
+        );
+    }
+
+    #[test]
+    fn ordered_list_uses_sequential_numbers() {
+        let lines = body_lines("1. alpha\n2. beta\n3. gamma", 80);
+        assert_eq!(
+            lines,
+            vec![
+                "1. alpha".to_string(),
+                "2. beta".to_string(),
+                "3. gamma".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_list_honours_start_number() {
+        // Markdown `5. foo / 6. bar` — pulldown-cmark passes `5` as the
+        // list start; subsequent items count up from there even if the
+        // user wrote `1.` for every line (CommonMark rule).
+        let lines = body_lines("5. foo\n1. bar\n1. baz", 80);
+        assert_eq!(
+            lines,
+            vec![
+                "5. foo".to_string(),
+                "6. bar".to_string(),
+                "7. baz".to_string()
+            ],
+            "ordered list must continue from the declared start number"
+        );
+    }
+
+    #[test]
+    fn nested_unordered_list_indents_by_two_cells_per_level() {
+        let md = "- top\n  - mid\n    - deep\n- back";
+        let lines = body_lines(md, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "• top".to_string(),
+                "  • mid".to_string(),
+                "    • deep".to_string(),
+                "• back".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_mixed_lists_preserve_marker_kind_per_level() {
+        // Outer ordered, inner unordered — the inner level shouldn't
+        // bleed numbering, and the outer level shouldn't lose count
+        // when the inner list closes.
+        let md = "1. first\n   - sub a\n   - sub b\n2. second";
+        let lines = body_lines(md, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "1. first".to_string(),
+                "  • sub a".to_string(),
+                "  • sub b".to_string(),
+                "2. second".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_item_preserves_inline_emphasis() {
+        let lines = render("- this is **bold** here", 80);
+        // Find the body line that contains "bold".
+        let item_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("bold"))
+            .expect("item line");
+        let bold_span = item_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().contains("bold"))
+            .expect("bold span");
+        assert!(
+            bold_span.style.add_modifier.contains(Modifier::BOLD),
+            "**bold** inside a list item must keep its BOLD modifier"
+        );
+    }
+
+    #[test]
+    fn list_item_preserves_inline_code() {
+        let text = body_lines("- call `foo()` to start", 80).join("\n");
+        assert!(text.contains("foo()"), "inline code text preserved: {text}");
+        assert!(!text.contains('`'), "backticks stripped: {text}");
+    }
+
+    #[test]
+    fn list_marker_is_styled() {
+        // The bullet should carry the list-marker style (cyan fg) so it
+        // visually pops out of the body text.
+        let lines = render("- item", 80);
+        let item_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("item"))
+            .expect("item line");
+        let marker_span = item_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().contains('•'))
+            .expect("bullet span");
+        assert_eq!(
+            marker_span.style.fg,
+            Some(Color::Cyan),
+            "bullet must use list_marker_style"
+        );
+    }
+
+    #[test]
+    fn paragraph_then_list_then_paragraph_separated_by_blanks() {
+        // The list should sit between the two paragraphs with at least
+        // one blank line on each side, but the items themselves must NOT
+        // be separated by blank lines.
+        let md = "before\n\n- a\n- b\n\nafter";
+        let rendered = render(md, 80);
+        let texts: Vec<String> = rendered.iter().skip(1).map(line_text).collect();
+        let pos_before = texts.iter().position(|t| t == "before").expect("before");
+        let pos_a = texts.iter().position(|t| t == "• a").expect("a");
+        let pos_b = texts.iter().position(|t| t == "• b").expect("b");
+        let pos_after = texts.iter().position(|t| t == "after").expect("after");
+        assert!(pos_before < pos_a && pos_a < pos_b && pos_b < pos_after);
+        // No blank line between consecutive items.
+        assert_eq!(
+            pos_b,
+            pos_a + 1,
+            "items must sit on consecutive rows: {texts:?}"
+        );
+        // At least one blank between paragraphs and list.
+        assert!(
+            pos_a > pos_before + 1,
+            "blank line between paragraph and list start: {texts:?}"
+        );
+        assert!(
+            pos_after > pos_b + 1,
+            "blank line between list end and paragraph: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn task_list_renders_checkbox_glyphs() {
+        let lines = body_lines("- [ ] todo\n- [x] done", 80);
+        assert_eq!(
+            lines,
+            vec!["• [ ] todo".to_string(), "• [x] done".to_string()],
+            "GFM task list should render the bullet then the checkbox"
+        );
     }
 }
