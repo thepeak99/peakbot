@@ -36,6 +36,7 @@ use tokio::time;
 use crate::state::StateManager;
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState};
+use crate::ui::repl::markdown::MarkdownRenderer;
 use crate::ui::repl::message_renderer::{MessageRenderer, PlainRenderer};
 use crate::ui::repl::render_cache::ChatRenderCache;
 use crate::ui::repl::spinner;
@@ -82,6 +83,34 @@ pub fn compute_input_scroll(cursor_line: u16, current_scroll: u16, visible_lines
         cursor_line.saturating_add(1).saturating_sub(visible_lines)
     } else {
         current_scroll
+    }
+}
+
+/// Display-cell width available for chat content, given the full chat
+/// pane width and whether select mode is engaged.
+///
+/// Normal mode draws:
+/// - the chat block (left + right border = 2 cells), and
+/// - a vertical scrollbar in the rightmost column (1 cell, see
+///   [`ReplUi::render_chat_history`]).
+///
+/// So `main.width - 3` is what's actually drawable.
+///
+/// Select mode strips ALL chrome — no block, no scrollbar — so the
+/// full `main.width` is drawable.
+///
+/// This number is fed into [`crate::ui::repl::ChatRenderCache::sync`]
+/// and through the renderer pipeline; width-sensitive renderers (e.g.
+/// [`crate::ui::repl::MarkdownRenderer`] for tables and fenced code
+/// rules) lay out to fit exactly. Pre-fix this returned `main.width - 2`
+/// in normal mode, causing code-block bottom rules to overflow into the
+/// scrollbar column — visible only as the closing `┘` glyph being eaten.
+/// Pinned by `chat_pane_content_width_subtracts_borders_and_scrollbar`.
+pub fn chat_pane_content_width(main_width: u16, select_mode: bool) -> u16 {
+    if select_mode {
+        main_width
+    } else {
+        main_width.saturating_sub(3)
     }
 }
 
@@ -354,7 +383,14 @@ pub struct ReplUi {
 
 impl ReplUi {
     pub fn new(state_manager: Arc<StateManager>, action_sender: UnboundedSender<UiAction>) -> Self {
-        Self::with_renderer(state_manager, action_sender, Box::new(PlainRenderer))
+        // Live REPL gets the markdown renderer; agent replies are
+        // formatted, user/system/tool roles fall through to PlainRenderer
+        // verbatim. See `markdown-render.md`.
+        Self::with_renderer(
+            state_manager,
+            action_sender,
+            Box::new(MarkdownRenderer::default()),
+        )
     }
 
     /// Construct a `ReplUi` with a custom [`MessageRenderer`] — the seam
@@ -470,8 +506,12 @@ impl ReplUi {
     /// Thin wrapper over [`PlainRenderer`] preserved for the existing
     /// snapshot tests. Prefer calling the renderer (or the cache) in new
     /// code.
+    ///
+    /// Width is passed as `0` because [`PlainRenderer`] is width-
+    /// oblivious. If the snapshot path is ever pointed at a width-
+    /// sensitive renderer, this needs a real value.
     pub fn build_chat_message_lines(msg: &ChatMessage) -> Vec<Line<'static>> {
-        PlainRenderer.render(msg)
+        PlainRenderer.render(msg, 0)
     }
 
     /// Render the chat history area with scrollbar.
@@ -922,8 +962,24 @@ impl ReplUi {
                         ])
                         .split(main);
 
-                    // Width inside the chat block borders is (main.width - 2).
-                    let chat_wrap_width = main.width.saturating_sub(2);
+                    // Width available for chat content depends on the
+                    // chrome the chat pane currently draws. In normal
+                    // mode the block has left+right borders (2 cells)
+                    // AND `render_chat_history` carves a 1-cell scrollbar
+                    // off the right edge — so true content width is
+                    // `main.width - 3`. In select mode there's no block
+                    // *and* no scrollbar (early-return in
+                    // `render_chat_history`) so we get `main.width`.
+                    //
+                    // The renderer is told this exact number; width-
+                    // sensitive content (markdown tables, fenced code
+                    // rules) sizes itself to fit inside the visible area
+                    // instead of overflowing the right edge.
+                    //
+                    // Pinned by `chat_pane_content_width` below; do not
+                    // inline this math without updating that test.
+                    let select_mode = self.ui_state.select_mode;
+                    let chat_wrap_width = chat_pane_content_width(main.width, select_mode);
 
                     // Sync per-message cache against current messages at
                     // current width. Only mutated rows are re-rendered;
@@ -954,8 +1010,9 @@ impl ReplUi {
                     // the chat surface so the user's terminal-native copy
                     // captures only message content. Chrome includes:
                     // borders, the bordered block's titles + bottom-hint,
-                    // and the right-edge scrollbar column.
-                    let select_mode = self.ui_state.select_mode;
+                    // and the right-edge scrollbar column. `select_mode`
+                    // is already in scope (used above for
+                    // `chat_pane_content_width`); reuse it here.
                     let view = self.chat_cache.window(scroll as u32, chunks[0].height);
                     let chat_history = if view.lines.is_empty() && state.chat.messages.is_empty() {
                         // Empty transcript — show the welcome banner.
@@ -2152,6 +2209,42 @@ mod command_popup_tests {
                 );
             }
         }
+    }
+
+    // ─── Chat-pane width accounting (chrome subtraction) ──────────────
+    //
+    // Pre-fix bug: `chat_wrap_width = main.width - 2` accounted for the
+    // chat block's two borders but missed the right-edge scrollbar, so
+    // the renderer thought it had 1 more cell than it actually did. In
+    // select mode there's no scrollbar AND no block, so the bug was
+    // invisible there — exactly the symptom the user reported ("code
+    // blocks render properly only in F4"). The fix lives in
+    // `chat_pane_content_width`; this test pins it.
+
+    #[test]
+    fn chat_pane_content_width_subtracts_borders_and_scrollbar() {
+        // Normal mode: 2 (block borders) + 1 (scrollbar) = 3 cells of
+        // chrome. Anything else and code-block rules overflow.
+        assert_eq!(chat_pane_content_width(80, false), 77);
+        assert_eq!(chat_pane_content_width(120, false), 117);
+    }
+
+    #[test]
+    fn chat_pane_content_width_select_mode_uses_full_width() {
+        // Select mode strips chrome entirely (no block, no scrollbar);
+        // markdown content can use the full pane.
+        assert_eq!(chat_pane_content_width(80, true), 80);
+        assert_eq!(chat_pane_content_width(120, true), 120);
+    }
+
+    #[test]
+    fn chat_pane_content_width_saturates_on_tiny_terminal() {
+        // Pathologically narrow terminal (≤3 cells in normal mode):
+        // the helper must not underflow. Renderer downstream handles
+        // 0-width as "no usable space".
+        assert_eq!(chat_pane_content_width(3, false), 0);
+        assert_eq!(chat_pane_content_width(2, false), 0);
+        assert_eq!(chat_pane_content_width(0, false), 0);
     }
 
     // ─── Direct CommandPopupState hooks (sanity) ─────────────────────────

@@ -24,16 +24,28 @@ use ratatui::text::{Line, Span};
 use crate::ui::app_state::{ChatMessage, MessageRole};
 use crate::vision::{ImageAttachment, ImageSource};
 
-/// Convert a [`ChatMessage`] into styled [`Line`]s, width-independent.
+/// Convert a [`ChatMessage`] into styled [`Line`]s.
+///
+/// `width` is the terminal width (in cells) the renderer can lay out
+/// against. Most renderers ignore it (`PlainRenderer` does); width-
+/// sensitive renderers (e.g. `MarkdownRenderer` for tables) consume
+/// it to size their output to the available pane.
+///
+/// `width` is hashed into the cache fingerprint
+/// ([`crate::ui::repl::render_cache::ChatRenderCache`]), so a resize
+/// invalidates rendered Lines automatically — renderers MUST be
+/// deterministic in `(msg, width)`.
 pub trait MessageRenderer: Send + Sync {
-    /// Render a single message. Implementations must return owned
-    /// (`'static`) lines suitable for caching across frames.
-    fn render(&self, msg: &ChatMessage) -> Vec<Line<'static>>;
+    /// Render a single message at the given pane width. Implementations
+    /// must return owned (`'static`) lines suitable for caching across
+    /// frames.
+    fn render(&self, msg: &ChatMessage, width: u16) -> Vec<Line<'static>>;
 }
 
 /// The historical renderer: role prefix on the first line, remaining
 /// `\n`-separated lines indented beneath. Bit-for-bit equivalent to the
 /// previous `ReplUi::build_chat_message_lines` implementation.
+#[derive(Default)]
 pub struct PlainRenderer;
 
 /// Format one attachment as a single-line bracket annotation, e.g.
@@ -67,7 +79,7 @@ fn fmt_bytes(n: usize) -> String {
 }
 
 impl MessageRenderer for PlainRenderer {
-    fn render(&self, msg: &ChatMessage) -> Vec<Line<'static>> {
+    fn render(&self, msg: &ChatMessage, _width: u16) -> Vec<Line<'static>> {
         let (prefix, color) = match msg.role {
             MessageRole::User => ("👤 User", Color::LightGreen),
             MessageRole::Agent => ("🤖 Agent", Color::LightMagenta),
@@ -136,14 +148,14 @@ mod tests {
     #[test]
     fn plain_renderer_single_line_user_message() {
         let msg = ChatMessage::user("hello".to_string());
-        let lines = PlainRenderer.render(&msg);
+        let lines = PlainRenderer.render(&msg, 80);
         assert_eq!(lines.len(), 1, "single-line content yields one Line");
     }
 
     #[test]
     fn plain_renderer_multiline_content_splits_on_newlines() {
         let msg = ChatMessage::agent("one\ntwo\nthree".to_string());
-        let lines = PlainRenderer.render(&msg);
+        let lines = PlainRenderer.render(&msg, 80);
         assert_eq!(lines.len(), 3, "three content lines yield three Lines");
     }
 
@@ -152,7 +164,7 @@ mod tests {
         // `"".split('\n')` yields one empty segment — we keep that as the
         // header-bearing line so an empty message still shows its prefix.
         let msg = ChatMessage::user(String::new());
-        let lines = PlainRenderer.render(&msg);
+        let lines = PlainRenderer.render(&msg, 80);
         assert_eq!(lines.len(), 1);
     }
 
@@ -168,7 +180,7 @@ mod tests {
         ] {
             let mut msg = ChatMessage::user("body".to_string());
             msg.role = role;
-            let _ = PlainRenderer.render(&msg);
+            let _ = PlainRenderer.render(&msg, 80);
         }
     }
 
@@ -214,7 +226,7 @@ mod tests {
             "what's this?".to_string(),
             vec![base64_attachment("cat.png", 234 * 1024)],
         );
-        let lines = PlainRenderer.render(&msg);
+        let lines = PlainRenderer.render(&msg, 80);
         assert_eq!(lines.len(), 2, "one attachment line + one content line");
         // First line has the role prefix AND the attachment tag.
         let first = format!("{:?}", lines[0]);
@@ -233,7 +245,7 @@ mod tests {
                 base64_attachment("b.png", 200),
             ],
         );
-        let lines = PlainRenderer.render(&msg);
+        let lines = PlainRenderer.render(&msg, 80);
         assert_eq!(lines.len(), 3, "two attachment lines + one content line");
     }
 }

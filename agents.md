@@ -496,7 +496,8 @@ src/
 │   ├── ui_trait.rs         # Ui trait + UiAction enum
 │   └── repl/
 │       ├── mod.rs              # REPL module exports
-│       ├── message_renderer.rs # MessageRenderer, PlainRenderer
+│       ├── markdown.rs        # MarkdownRenderer (agent replies → headers/bold/italic/code/tables)
+│       ├── message_renderer.rs # MessageRenderer trait, PlainRenderer
 │       ├── render_cache.rs     # ChatRenderCache, WindowView
 │       ├── repl_impl.rs        # ReplUi View (ratatui) + render loop
 │       ├── spinner.rs          # Working-indicator spinner frames + elapsed formatter

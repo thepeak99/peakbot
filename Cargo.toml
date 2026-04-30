@@ -30,6 +30,12 @@ dirs = "6"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
+# Already pulled in transitively by ratatui; declare it directly so we can
+# rely on `.width()` / `.width_cjk()` for terminal-cell-accurate sizing
+# in the markdown renderer (emojis, CJK, combining chars). Pinning to
+# the same major as ratatui's transitive use keeps deduping clean.
+unicode-width = "0.2"
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
