@@ -51,21 +51,32 @@ use crate::ui::repl::message_renderer::MessageRenderer;
 /// `attachments_len` invalidates the cache when an image is added or
 /// removed — the renderer emits one extra line per attachment, so row
 /// counts change even if `content` doesn't.
+///
+/// `width` is included because width-sensitive renderers (e.g. the
+/// markdown renderer's table layout) emit different `Line`s at
+/// different terminal widths. `PlainRenderer` is width-oblivious so a
+/// pure-plain transcript never re-renders on resize *because of width*
+/// — but the fingerprint flips anyway, then `wrap_height` yields the
+/// same number, so the prefix sums settle and `dirty` is reported
+/// correctly. Cost is one cheap re-render per message per resize, which
+/// is acceptable per the markdown-render plan.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Fingerprint {
     role: MessageRole,
     content_len: usize,
     compacted: bool,
     attachments_len: usize,
+    width: u16,
 }
 
 impl Fingerprint {
-    fn of(msg: &ChatMessage) -> Self {
+    fn of(msg: &ChatMessage, width: u16) -> Self {
         Self {
             role: msg.role,
             content_len: msg.content.len(),
             compacted: msg.compacted,
             attachments_len: msg.attachments.len(),
+            width,
         }
     }
 }
@@ -152,11 +163,11 @@ impl ChatRenderCache {
         //    case (new user/agent message), so this is O(1) per frame
         //    in steady state.
         for (i, msg) in messages.iter().enumerate() {
-            let fp = Fingerprint::of(msg);
+            let fp = Fingerprint::of(msg, width);
             let needs_render = self.fingerprints.get(i).is_none_or(|old| *old != fp);
 
             if needs_render {
-                let lines = self.renderer.render(msg);
+                let lines = self.renderer.render(msg, width);
                 let rendered = RenderedMessage {
                     lines: Arc::new(lines),
                 };
@@ -483,7 +494,7 @@ mod tests {
         // Build the naïve paragraph the old path would have produced.
         let mut all_lines: Vec<Line<'static>> = Vec::new();
         for msg in &msgs {
-            all_lines.extend(PlainRenderer.render(msg));
+            all_lines.extend(PlainRenderer.render(msg, width));
         }
         let naive = Paragraph::new(Text::from(all_lines)).wrap(Wrap { trim: true });
         let naive_height = naive.line_count(width) as u32;
@@ -521,8 +532,21 @@ mod tests {
         // fingerprint — without this, adding an image wouldn't invalidate
         // the cache and the `[image: …]` line would never appear.
         assert!(
-            Fingerprint::of(&text_only) != Fingerprint::of(&with_image),
+            Fingerprint::of(&text_only, 80) != Fingerprint::of(&with_image, 80),
             "adding an attachment must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_width_changes() {
+        // Width is part of the fingerprint so width-sensitive renderers
+        // (e.g. tables that adapt to pane width) get re-run on resize.
+        // Pin this here so removing `width` from `Fingerprint` becomes a
+        // loud failure, not a silent regression.
+        let msg = ChatMessage::user("same content".to_string());
+        assert!(
+            Fingerprint::of(&msg, 80) != Fingerprint::of(&msg, 120),
+            "width must be part of the fingerprint"
         );
     }
 }
