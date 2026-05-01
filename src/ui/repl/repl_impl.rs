@@ -574,8 +574,10 @@ impl ReplUi {
     /// agent is running.
     ///
     /// When `run_started_at` is `Some`, the block title becomes
-    /// `" ⠹ Working · 00:07 · <status> · esc to stop "` (see `workin-baby.md`
-    /// §5.3). Otherwise it's the plain `" Input "` title.
+    /// `" ⠹ Working · 00:07 · <status> · ⏳ N queued · esc to stop "` —
+    /// the queued segment only appears when `pending_input > 0`. The hint
+    /// sits in the working title (not the status bar) because that's where
+    /// the user's eye is during a busy turn.
     ///
     /// Multiline behaviour: the buffer is split on `\n` into logical lines.
     /// The prompt marker (`> ` or the placeholder) only appears on line 0.
@@ -587,6 +589,7 @@ impl ReplUi {
         is_running: bool,
         run_started_at: Option<std::time::Instant>,
         status_message: Option<&str>,
+        pending_input: usize,
     ) -> Paragraph<'a> {
         let (prompt_text, prompt_color) = if input.is_empty() {
             ("💬 Message...", Color::DarkGray)
@@ -644,11 +647,17 @@ impl ReplUi {
                 } else {
                     phase_full.to_string()
                 };
+                let queued = if pending_input > 0 {
+                    format!(" · ⏳ {pending_input} queued")
+                } else {
+                    String::new()
+                };
                 format!(
-                    " {} Working · {} · {} · esc to stop ",
+                    " {} Working · {} · {}{} · esc to stop ",
                     spinner::frame_for(t),
                     spinner::fmt_elapsed(t),
                     phase,
+                    queued,
                 )
             }
             _ => " Input ".to_string(),
@@ -789,21 +798,14 @@ impl ReplUi {
         let cost_str = stats.format_cost();
         let context_pct = context.usage_percentage();
 
-        let mut status_text = format!(
+        // The `⏳ N queued` hint lives in the working title of the input
+        // block (see `build_input_paragraph`), not here — that's where the
+        // user's eye is during a busy turn. Status bar stays for tokens /
+        // cost / model / context only.
+        let status_text = format!(
             "Tokens: {} │ Calls: {} │ Cost: ${} │ Context: {:.1}% │ Model: {}",
             tokens_str, stats.total_api_calls, cost_str, context_pct, stats.model,
         );
-
-        // Queued-input hint — driven by the channel between event_loop and
-        // agent_loop. See `make-flow-great-again.md`. We deliberately do NOT
-        // show queued messages in the chat transcript: insertion position
-        // would be ambiguous (would the queued line render where it was
-        // typed, or where it will eventually land?). Status-bar count keeps
-        // the position unambiguous: typed messages appear in the transcript
-        // exactly when the agent_loop dequeues them, in queue order.
-        if state.pending_input_count > 0 {
-            status_text.push_str(&format!(" │ ⏳ {} queued", state.pending_input_count));
-        }
 
         let paragraph = Paragraph::new(status_text)
             .style(Style::default().fg(Color::LightCyan))
@@ -912,6 +914,7 @@ impl ReplUi {
                     state.is_running,
                     state.run_started_at,
                     state.status_message.as_deref(),
+                    state.pending_input_count,
                 );
 
                 // Check if todo panel should be shown (based on terminal size and visibility state)
@@ -1757,15 +1760,15 @@ mod multiline_input_tests {
     /// changes upstream, this test catches it.
     #[test]
     fn real_paragraph_line_count_includes_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None);
+        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0);
         // 1 content line (placeholder) + 2 border rows = 3.
         assert_eq!(empty.line_count(120), 3);
 
-        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None);
+        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0);
         // 2 content lines + 2 border rows = 4.
         assert_eq!(one_newline.line_count(120), 4);
 
-        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None);
+        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0);
         // 3 content lines + 2 border rows = 5.
         assert_eq!(two_newlines.line_count(120), 5);
     }
@@ -1777,13 +1780,13 @@ mod multiline_input_tests {
     /// `Constraint::Length(input_height)` math in `ReplUi::render`.
     #[test]
     fn paragraph_content_rows_strips_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None);
+        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0);
         assert_eq!(ReplUi::paragraph_content_rows(&empty, 120), 1);
 
-        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None);
+        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0);
         assert_eq!(ReplUi::paragraph_content_rows(&one_newline, 120), 2);
 
-        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None);
+        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0);
         assert_eq!(ReplUi::paragraph_content_rows(&two_newlines, 120), 3);
     }
 
@@ -1834,6 +1837,63 @@ mod multiline_input_tests {
         // either 0 or 1 is acceptable; pin down the "end of previous row"
         // reading which is what ratatui's line_count returns.
         assert_eq!(ReplUi::cursor_visual_row(&long, 10, 10), 0);
+    }
+
+    /// The `⏳ N queued` segment appears in the working title only when the
+    /// agent is busy AND there are queued user messages. This is the visible
+    /// surface for `make-flow-great-again.md`'s pending-input counter — if a
+    /// future change drops it from `build_input_paragraph`, the user loses
+    /// the only signal that their typed-during-busy keystrokes landed.
+    #[test]
+    fn working_title_shows_queued_count_when_pending_and_busy() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let started = std::time::Instant::now();
+        let para =
+            ReplUi::build_input_paragraph("hello", 5, true, Some(started), Some("thinking"), 3);
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (0..buffer.area().height)
+            .flat_map(|y| {
+                (0..buffer.area().width)
+                    .map(move |x| buffer[(x, y)].symbol().to_string())
+                    .chain(std::iter::once("\n".to_string()))
+            })
+            .collect();
+        // The hourglass `⏳` is a double-width glyph; ratatui pads it to two
+        // display cells, so the rendered substring is `⏳  3 queued` (two
+        // spaces between glyph and count). Match the count + label so we
+        // don't pin the spacing the terminal chose.
+        assert!(
+            rendered.contains("3 queued") && rendered.contains('⏳'),
+            "working title must show the queued count; rendered:\n{rendered}",
+        );
+    }
+
+    /// Negative pin: when the agent is busy but no input is queued, no
+    /// queued segment should appear (avoids `⏳ 0 queued` noise).
+    #[test]
+    fn working_title_omits_queued_segment_when_count_is_zero() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let started = std::time::Instant::now();
+        let para =
+            ReplUi::build_input_paragraph("hello", 5, true, Some(started), Some("thinking"), 0);
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (0..buffer.area().height)
+            .flat_map(|y| {
+                (0..buffer.area().width)
+                    .map(move |x| buffer[(x, y)].symbol().to_string())
+                    .chain(std::iter::once("\n".to_string()))
+            })
+            .collect();
+        assert!(
+            !rendered.contains("queued"),
+            "working title must not show queued hint when count == 0; rendered:\n{rendered}",
+        );
     }
 }
 
