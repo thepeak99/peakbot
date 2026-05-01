@@ -1105,9 +1105,18 @@ impl ReplUi {
     /// mouse-wheel scroll works again. Errors writing to stdout are
     /// swallowed — at worst the indicator and the underlying capture
     /// state would briefly disagree, and the next toggle would resync.
+    ///
+    /// The IO is gated on `self.terminal.is_some()` so unit tests (which
+    /// build a `ReplUi` via the test harness without calling `init()`)
+    /// can exercise the F4 binding without scribbling raw escape bytes
+    /// onto the developer's live terminal under `cargo test`. Pinned by
+    /// `f4_does_not_emit_mouse_escapes_without_a_terminal`.
     fn toggle_select_mode(&mut self) {
         self.ui_state.select_mode = !self.ui_state.select_mode;
         self.ui_state.local_dirty = true;
+        if self.terminal.is_none() {
+            return;
+        }
         let mut out = std::io::stdout();
         let _ = if self.ui_state.select_mode {
             execute!(out, DisableMouseCapture)
@@ -1500,6 +1509,34 @@ impl Ui for ReplUi {
         self.terminal = None;
         self.running = false;
         Ok(())
+    }
+}
+
+/// Best-effort terminal-state restorer. The async `shutdown()` is the
+/// happy-path teardown; this Drop is the safety net for *unhappy* paths:
+/// a panic mid-render, an `Err(?)` short-circuit before `shutdown()` runs,
+/// or any future caller that forgets to await `shutdown()`. Without this,
+/// a panic strands the user's terminal in raw mode + alt screen + mouse
+/// capture, producing the `35;43;18M`-style spam on every cursor move
+/// until they `reset`.
+///
+/// We gate on `self.terminal.is_some()` so the guard is a no-op when:
+///   - `init()` was never called (unit tests), or
+///   - `shutdown()` already ran successfully (it sets `terminal = None`).
+///
+/// All errors are swallowed — Drop must not panic, and there is nothing
+/// useful to do with an `Err` here anyway. The escape sequences are
+/// emitted in the *reverse* order of `init()` to mirror the well-formed
+/// teardown in `shutdown()`.
+impl Drop for ReplUi {
+    fn drop(&mut self) {
+        if self.terminal.is_none() {
+            return;
+        }
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
 }
 
@@ -2248,6 +2285,55 @@ mod command_popup_tests {
             rx.try_recv().is_err(),
             "F4 must not emit a UiAction — it's view-local"
         );
+    }
+
+    #[test]
+    fn f4_does_not_emit_mouse_escapes_without_a_terminal() {
+        // Regression: previously `toggle_select_mode` unconditionally ran
+        // `execute!(stdout(), EnableMouseCapture)`. Under `cargo test` the
+        // harness never calls `init()` (no alt screen, no shutdown), so
+        // those bytes leaked onto the developer's live terminal, leaving
+        // mouse-reporting enabled and spamming the prompt with sequences
+        // like `35;43;18M`. The contract: when no real terminal is
+        // attached (`self.terminal.is_none()`), the toggle must flip
+        // state but emit zero IO. The precondition assertion below is
+        // the structural guard — if the harness ever starts attaching a
+        // terminal, this test must be revisited.
+        let (mut ui, _rx) = harness();
+        assert!(
+            ui.terminal.is_none(),
+            "harness must not attach a real terminal"
+        );
+        ui.handle_keyboard_input(press(KeyCode::F(4)));
+        assert!(ui.ui_state.select_mode);
+        ui.handle_keyboard_input(press(KeyCode::F(4)));
+        assert!(!ui.ui_state.select_mode, "two F4 presses cancel out");
+    }
+
+    #[test]
+    fn drop_without_init_is_a_safe_noop() {
+        // Drop guard contract: when `init()` was never called
+        // (`self.terminal.is_none()`), Drop must do nothing and must not
+        // panic. The harness builds a ReplUi via `ReplUi::new` without
+        // calling `init()`, which is exactly the "agent crashed before
+        // attaching a terminal" / "test fixture goes out of scope" path.
+        //
+        // We cannot directly test the *attached* Drop branch in unit
+        // tests because emitting `DisableMouseCapture` to real stdout
+        // is precisely the leak we're guarding against — the test
+        // itself would graffiti the developer's tty. The structural
+        // floor pinned here is: dropping any test-built ReplUi never
+        // explodes. If Drop ever starts panicking (eg. someone adds an
+        // `unwrap`), this test will fail with `panic in Drop` and
+        // surface the regression. The remaining "attached" branch is
+        // four lines of `let _ = ...` (all errors swallowed) and is
+        // verified by inspection; if it grows, extract a pure helper.
+        let (ui, _rx) = harness();
+        assert!(
+            ui.terminal.is_none(),
+            "harness must not attach a real terminal — Drop branch under test is the unattached one"
+        );
+        drop(ui);
     }
 
     // The `chat_block(select_mode)` contract: when `select_mode` is true,
