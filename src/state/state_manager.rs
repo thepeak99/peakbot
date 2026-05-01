@@ -701,6 +701,33 @@ impl StateManager {
         self.notify_update(&state);
     }
 
+    /// Increment the queued-input counter (event loop, on enqueue).
+    ///
+    /// Drives the `⏳ N queued` status-bar hint. See `make-flow-great-again.md`.
+    pub fn increment_pending_input(&self) {
+        let mut state = self.state.write().unwrap();
+        state.pending_input_count = state.pending_input_count.saturating_add(1);
+        self.notify_update(&state);
+    }
+
+    /// Decrement the queued-input counter (agent loop, on dequeue).
+    pub fn decrement_pending_input(&self) {
+        let mut state = self.state.write().unwrap();
+        state.pending_input_count = state.pending_input_count.saturating_sub(1);
+        self.notify_update(&state);
+    }
+
+    /// Force the queued-input counter to a given value.
+    ///
+    /// Used by the event loop on `/stop` to zero the count immediately so the
+    /// status bar updates the moment the user requests the stop, even though
+    /// the agent loop will dispose of the queued items shortly after.
+    pub fn set_pending_input_count(&self, n: usize) {
+        let mut state = self.state.write().unwrap();
+        state.pending_input_count = n;
+        self.notify_update(&state);
+    }
+
     /// Add a system message to the chat
     pub fn add_system_message(&self, content: String) {
         let msg = ChatMessage::system(content);
@@ -1573,6 +1600,15 @@ mod tests {
         }
     }
 
+    // The historical "user_message_during_tool_execution_does_not_corrupt_history"
+    // test pinned the bug *shape* at the StateManager layer. It was always
+    // going to stay red because StateManager has no opinion on call ordering
+    // — the fix lives at the call-site layer (`src/lib.rs::event_loop` no
+    // longer writes user input; `agent_loop` is the sole writer). The new
+    // regression guards live next to the actual fix; see the
+    // `single_writer_user_input` and `stop_drains_queue` modules below and
+    // the `tests/scenarios/queued_input_tests.rs` integration tests.
+
     /// ChatMessage structured fields are correctly populated for tool messages
     #[test]
     fn test_chat_message_structured_fields() {
@@ -2240,5 +2276,52 @@ mod tests {
             count_b.load(Ordering::Relaxed) > 0,
             "producer B made no progress"
         );
+    }
+
+    // ── Pending-input counter ──────────────────────────────────────────────
+    //
+    // Drives the `⏳ N queued` status-bar hint introduced in
+    // `make-flow-great-again.md`. The increment happens on enqueue (event
+    // loop), the decrement on dequeue (agent loop), and `set_pending_input_count(0)`
+    // is called by the event loop on /stop to zero the count immediately.
+    // These are tiny but load-bearing — pin them.
+
+    #[test]
+    fn pending_input_starts_at_zero() {
+        let sm = StateManager::new();
+        assert_eq!(sm.get_state().pending_input_count, 0);
+    }
+
+    #[test]
+    fn increment_pending_input_bumps_state_and_broadcasts() {
+        let sm = StateManager::new();
+        let mut rx = sm.subscribe();
+        sm.increment_pending_input();
+        assert_eq!(sm.get_state().pending_input_count, 1);
+        // At least one broadcast landed (we don't assert exact count because
+        // earlier mutators in this test may have queued a value too).
+        assert!(rx.try_recv().is_ok(), "expected broadcast on increment");
+    }
+
+    #[test]
+    fn decrement_pending_input_saturates_at_zero() {
+        let sm = StateManager::new();
+        sm.decrement_pending_input(); // underflow guard
+        assert_eq!(sm.get_state().pending_input_count, 0);
+        sm.increment_pending_input();
+        sm.increment_pending_input();
+        sm.decrement_pending_input();
+        assert_eq!(sm.get_state().pending_input_count, 1);
+    }
+
+    #[test]
+    fn set_pending_input_count_clears_to_zero() {
+        let sm = StateManager::new();
+        sm.increment_pending_input();
+        sm.increment_pending_input();
+        sm.increment_pending_input();
+        assert_eq!(sm.get_state().pending_input_count, 3);
+        sm.set_pending_input_count(0);
+        assert_eq!(sm.get_state().pending_input_count, 0);
     }
 }

@@ -146,13 +146,25 @@ impl TestRunner {
         }
     }
 
-    /// Internal message processing
+    /// Internal message processing.
+    ///
+    /// Mirrors the production agent_loop order (see
+    /// `make-flow-great-again.md`): the user message is appended to chat
+    /// **before** `prompt_with_history`, so any tool calls/results emitted
+    /// during the turn land *after* it — never wedged between the user
+    /// message and a future tool result.
     async fn process_message_internal(
         &mut self,
         msg: &str,
         mut history: Vec<Message>,
     ) -> ProcessResult {
         let current_msg = msg.to_string();
+
+        // Single-writer-for-user-input invariant: append BEFORE the prompt,
+        // mirroring agent_loop in production. The legacy ordering (append
+        // after) is what allowed user-text to wedge between an in-flight
+        // ToolCall and its ToolResult.
+        self.state_manager.add_user_message(current_msg.clone());
 
         // Mark as running
         self.state_manager.set_running(true);
@@ -181,8 +193,8 @@ impl TestRunner {
         // Process events from the session hook to update stats
         self.process_session_hook_events();
 
-        // Add messages to StateManager (single source of truth)
-        self.state_manager.add_user_message(current_msg.clone());
+        // Append the assistant response (if any). The user message was
+        // appended at the top of this fn — see invariant above.
         if let Ok(response) = &result {
             self.state_manager.add_assistant_message(response.clone());
         }
