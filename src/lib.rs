@@ -60,9 +60,20 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-/// Message types for internal queue between event loop and agent loop
+/// Message types for internal queue between event loop and agent loop.
+///
+/// **Single-writer invariant** (see `make-flow-great-again.md`):
+/// `UserMessage` carries the buffered text + attachments forward through
+/// the channel. The `add_user_message{,_with_attachments}` write into
+/// `StateManager` happens in the **agent loop** at dequeue time — never in
+/// the event loop. This is what guarantees user-typed text only ever
+/// lands between agent turns, never inside one (specifically, never
+/// between an in-flight `ToolCall` and its `ToolResult`).
 enum QueueMessage {
-    UserMessage(String),
+    UserMessage {
+        text: String,
+        attachments: Vec<crate::vision::ImageAttachment>,
+    },
     Command(String),
     StopMarker, // Signals that stop was requested
 }
@@ -319,6 +330,12 @@ impl AgentRunner {
         // Channel between event loop and agent loop
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<QueueMessage>(32);
 
+        // Drain flag — set by event loop on /stop, consumed by agent loop to
+        // discard any queued UserMessage/Command between the dropped turn and
+        // the matching StopMarker. See `make-flow-great-again.md`: /stop ==
+        // stop, queued follow-ups are discarded along with the in-flight turn.
+        let drain_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Completion notifications back to event loop
         let (completion_tx, _completion_rx) =
             tokio::sync::broadcast::channel::<CompletionResult>(8);
@@ -352,6 +369,7 @@ impl AgentRunner {
         let event_handle = tokio::spawn({
             let msg_tx = msg_tx.clone();
             let completion_tx = completion_tx.clone();
+            let drain_requested = drain_requested.clone();
 
             async move {
                 Self::event_loop(
@@ -362,6 +380,7 @@ impl AgentRunner {
                     session_hook,
                     config_model,
                     provider_info,
+                    drain_requested,
                 )
                 .await;
             }
@@ -370,6 +389,7 @@ impl AgentRunner {
         let agent_handle = tokio::spawn({
             let msg_rx = tokio::sync::Mutex::new(msg_rx);
             let completion_tx = completion_tx.clone();
+            let drain_requested = drain_requested.clone();
 
             async move {
                 Self::agent_loop(
@@ -378,6 +398,7 @@ impl AgentRunner {
                     state_manager_for_agent,
                     agent,
                     config_for_agent,
+                    drain_requested,
                 )
                 .await;
             }
@@ -389,7 +410,20 @@ impl AgentRunner {
         agent_handle.abort();
     }
 
-    /// Event loop - receives UiActions from View, queues messages for agent loop
+    /// Event loop - receives UiActions from View, queues messages for agent loop.
+    ///
+    /// **Single-writer invariant** (see `make-flow-great-again.md`): this loop
+    /// **never** calls `add_user_message{,_with_attachments}`. User-typed text
+    /// only enters `state.chat.messages` from the agent loop, at dequeue time,
+    /// immediately before its turn fires. That structurally prevents user-text
+    /// from wedging between an in-flight `ToolCall` and its `ToolResult`.
+    ///
+    /// Typing during a busy turn is therefore a queued **follow-up**, not an
+    /// interrupt. The explicit interrupt is `/stop` (or `Esc` →
+    /// `UiAction::RequestStop`), which sets the drain flag, sends a
+    /// `StopMarker`, and the agent loop discards every queued message until
+    /// the marker is seen. /stop means stop.
+    #[allow(clippy::too_many_arguments)] // event_loop coordinates many handles; refactoring loses clarity
     async fn event_loop(
         mut action_receiver: mpsc::UnboundedReceiver<UiAction>,
         msg_tx: tokio::sync::mpsc::Sender<QueueMessage>,
@@ -398,7 +432,35 @@ impl AgentRunner {
         session_hook: Arc<SessionHook>,
         config_model: String,
         provider_info: Arc<ProviderInfo>,
+        drain_requested: Arc<std::sync::atomic::AtomicBool>,
     ) {
+        use std::sync::atomic::Ordering;
+
+        // Helper: trigger a full /stop. Sets the drain flag, signals the
+        // running agent to cancel, sends StopMarker, and zeroes the queued
+        // counter so the status bar updates immediately.
+        let request_stop_and_drain =
+            |state_manager: &Option<Arc<StateManager>>,
+             session_hook: &Arc<SessionHook>,
+             msg_tx: &tokio::sync::mpsc::Sender<QueueMessage>,
+             drain_requested: &Arc<std::sync::atomic::AtomicBool>| {
+                let sm = state_manager.clone();
+                let session_hook = session_hook.clone();
+                let msg_tx = msg_tx.clone();
+                let drain_requested = drain_requested.clone();
+                async move {
+                    if !sm.as_ref().is_some_and(|sm| sm.is_running()) {
+                        return;
+                    }
+                    drain_requested.store(true, Ordering::Release);
+                    session_hook.request_stop();
+                    if let Some(ref sm) = sm {
+                        sm.set_pending_input_count(0);
+                        sm.set_status(Some("Stop requested...".to_string()));
+                    }
+                    msg_tx.send(QueueMessage::StopMarker).await.ok();
+                }
+            };
         // Initialize conversation in StateManager (single source of truth)
         if let Some(ref sm) = state_manager {
             let name = format!(
@@ -417,27 +479,34 @@ impl AgentRunner {
                     // output. See `classify_submission` docs.
                     match classify_submission(&msg) {
                         SubmitKind::StopCommand => {
-                            if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
-                                session_hook.request_stop();
-                                msg_tx.send(QueueMessage::StopMarker).await.ok();
-                                if let Some(ref sm) = state_manager {
-                                    sm.set_status(Some("Stop requested...".to_string()));
-                                }
-                            }
+                            request_stop_and_drain(
+                                &state_manager,
+                                &session_hook,
+                                &msg_tx,
+                                &drain_requested,
+                            )
+                            .await;
                         }
                         SubmitKind::Command(cmd) => {
                             // Dispatched by agent_loop via process_command_internal.
                             msg_tx.send(QueueMessage::Command(cmd)).await.ok();
                         }
                         SubmitKind::UserMessage(text) => {
+                            // Single-writer invariant: do NOT call
+                            // add_user_message here. The agent loop appends
+                            // user input to chat at dequeue time, between
+                            // turns, where it can never wedge between a
+                            // ToolCall and its ToolResult.
                             if let Some(ref sm) = state_manager {
-                                sm.add_user_message(text.clone());
+                                sm.increment_pending_input();
                             }
-                            // If agent is running, interrupt it first.
-                            if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
-                                session_hook.request_stop();
-                            }
-                            msg_tx.send(QueueMessage::UserMessage(text)).await.ok();
+                            msg_tx
+                                .send(QueueMessage::UserMessage {
+                                    text,
+                                    attachments: Vec::new(),
+                                })
+                                .await
+                                .ok();
                         }
                         SubmitKind::MultimodalMessage { text, attachments } => {
                             // Capability guardrail — fail loud rather than drop images silently.
@@ -453,17 +522,16 @@ impl AgentRunner {
                                 }
                                 continue;
                             }
+                            // Single-writer invariant: attachments travel
+                            // through the channel; the agent loop is the
+                            // sole writer of `add_user_message_with_attachments`.
                             if let Some(ref sm) = state_manager {
-                                sm.add_user_message_with_attachments(text.clone(), attachments);
+                                sm.increment_pending_input();
                             }
-                            if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
-                                session_hook.request_stop();
-                            }
-                            // The String payload here is a display marker only —
-                            // `process_message_internal` rebuilds the current-turn
-                            // `Message` from `StateManager` state, so images are
-                            // preserved even though this channel carries text.
-                            msg_tx.send(QueueMessage::UserMessage(text)).await.ok();
+                            msg_tx
+                                .send(QueueMessage::UserMessage { text, attachments })
+                                .await
+                                .ok();
                         }
                         SubmitKind::InvalidAttachment(e) => {
                             if let Some(ref sm) = state_manager {
@@ -475,35 +543,81 @@ impl AgentRunner {
                 }
 
                 UiAction::RequestStop => {
-                    // Only stop if agent is actually running
-                    if state_manager.as_ref().is_some_and(|sm| sm.is_running()) {
-                        session_hook.request_stop();
-                        msg_tx.send(QueueMessage::StopMarker).await.ok();
-                        if let Some(ref sm) = state_manager {
-                            sm.set_status(Some("Stop requested...".to_string()));
-                        }
-                    }
+                    // Esc key — same shape as /stop. Stop means stop, queue is dropped.
+                    request_stop_and_drain(
+                        &state_manager,
+                        &session_hook,
+                        &msg_tx,
+                        &drain_requested,
+                    )
+                    .await;
                 }
             }
         }
     }
 
-    /// Agent loop - processes messages from event loop, sends completions back
+    /// Agent loop - processes messages from event loop, sends completions back.
+    ///
+    /// **Single-writer for user input.** This loop is the *only* place that
+    /// calls `add_user_message{,_with_attachments}` — see
+    /// `make-flow-great-again.md`. The write happens at dequeue time, before
+    /// the turn is built and sent to the model, so the message lands strictly
+    /// between agent turns. This makes it structurally impossible for
+    /// user-typed text to wedge between an in-flight `ToolCall` and its
+    /// `ToolResult`.
+    ///
+    /// **Drain on /stop.** When `drain_requested` is set, all queued
+    /// `UserMessage`/`Command` items are discarded until the matching
+    /// `StopMarker` is consumed; the flag is then cleared. /stop = stop,
+    /// queued follow-ups are dropped along with the in-flight turn.
     async fn agent_loop(
         msg_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<QueueMessage>>,
         completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
         state_manager: Option<Arc<StateManager>>,
         agent: Arc<DynAgent>,
         config: Config,
+        drain_requested: Arc<std::sync::atomic::AtomicBool>,
     ) {
+        use std::sync::atomic::Ordering;
+
         loop {
             // Wait for a message
             let msg = msg_rx.lock().await.recv().await;
 
+            // Drain mode: discard everything that isn't the StopMarker. The
+            // event loop has already zeroed the pending counter and signalled
+            // the running prompt to cancel; our job is just to throw out the
+            // queue contents until the marker arrives.
+            if drain_requested.load(Ordering::Acquire) {
+                match msg {
+                    Some(QueueMessage::StopMarker) => {
+                        drain_requested.store(false, Ordering::Release);
+                        if let Some(ref sm) = state_manager {
+                            sm.set_status(None);
+                            sm.add_system_message("Agent stopped by user".to_string());
+                        }
+                        completion_tx.send(CompletionResult::Stopped).ok();
+                        continue;
+                    }
+                    Some(QueueMessage::UserMessage { .. }) | Some(QueueMessage::Command(_)) => {
+                        // Discarded — pending counter was already zeroed by
+                        // the event loop's drain trigger.
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
             match msg {
-                Some(QueueMessage::UserMessage(content)) => {
-                    // Mark as running via StateManager (broadcasts to all UIs)
+                Some(QueueMessage::UserMessage { text, attachments }) => {
+                    // Single-writer point: append to chat *now*, between turns.
                     if let Some(ref sm) = state_manager {
+                        if attachments.is_empty() {
+                            sm.add_user_message(text.clone());
+                        } else {
+                            sm.add_user_message_with_attachments(text.clone(), attachments);
+                        }
+                        sm.decrement_pending_input();
                         sm.set_running(true);
                     }
 
@@ -516,7 +630,7 @@ impl AgentRunner {
                         .unwrap_or_else(|| {
                             // Fallback: no state manager (test-only paths) —
                             // pass the String through as a text-only Message.
-                            rig::completion::message::Message::from(content.as_str())
+                            rig::completion::message::Message::from(text.as_str())
                         });
 
                     let result = Self::process_message_internal(
@@ -557,8 +671,9 @@ impl AgentRunner {
                 }
 
                 Some(QueueMessage::StopMarker) => {
-                    // This is just an acknowledgment that stop was requested
-                    // The actual stopping happened in process_message_internal
+                    // StopMarker outside drain mode — defensive: shouldn't
+                    // happen because the event loop always sets drain_requested
+                    // before sending. Treat as a benign acknowledgement.
                     if let Some(ref sm) = state_manager {
                         sm.set_status(None);
                         sm.add_system_message("Agent stopped by user".to_string());

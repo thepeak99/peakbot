@@ -77,6 +77,18 @@ pub struct AppState {
     /// user asked for an exit, they get an exit.
     #[serde(default)]
     pub exit_requested: bool,
+
+    /// How many user-typed messages are currently waiting in the
+    /// agent_loop queue (typed during a busy turn, not yet dequeued).
+    ///
+    /// Status-bar hint only — the View renders `⏳ N queued` when this
+    /// is non-zero so the user knows their typed lines landed in the
+    /// queue even though the transcript has not yet shown them.
+    /// Incremented by the event loop on send, decremented by the agent
+    /// loop on dequeue, zeroed by the event loop on /stop drain. See
+    /// `make-flow-great-again.md`.
+    #[serde(default)]
+    pub pending_input_count: usize,
 }
 
 impl AppState {

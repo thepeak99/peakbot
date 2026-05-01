@@ -11,5 +11,6 @@ mod e2e_tests;
 mod event_tests;
 mod message_roundtrip;
 mod persistence_tests;
+mod queued_input_tests;
 mod stats_tests;
 mod stop_tests;

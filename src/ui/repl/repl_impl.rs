@@ -789,10 +789,21 @@ impl ReplUi {
         let cost_str = stats.format_cost();
         let context_pct = context.usage_percentage();
 
-        let status_text = format!(
+        let mut status_text = format!(
             "Tokens: {} │ Calls: {} │ Cost: ${} │ Context: {:.1}% │ Model: {}",
             tokens_str, stats.total_api_calls, cost_str, context_pct, stats.model,
         );
+
+        // Queued-input hint — driven by the channel between event_loop and
+        // agent_loop. See `make-flow-great-again.md`. We deliberately do NOT
+        // show queued messages in the chat transcript: insertion position
+        // would be ambiguous (would the queued line render where it was
+        // typed, or where it will eventually land?). Status-bar count keeps
+        // the position unambiguous: typed messages appear in the transcript
+        // exactly when the agent_loop dequeues them, in queue order.
+        if state.pending_input_count > 0 {
+            status_text.push_str(&format!(" │ ⏳ {} queued", state.pending_input_count));
+        }
 
         let paragraph = Paragraph::new(status_text)
             .style(Style::default().fg(Color::LightCyan))

@@ -39,16 +39,18 @@ fn summarization_response_with(text: &str) -> MockResponse {
 
 /// 1.1 — The summarization request must contain the old messages, not the recent ones.
 ///
-/// Setup: 500-token window, 50% threshold (250 tokens), keep_recent=2.
-/// Send 3 messages with 300 input_tokens each.
-/// Compaction triggers on turn 3 (sees turn 2's 300 > 250, history has 4 msgs > 2).
+/// Setup: 500-token window, 50% threshold (250 tokens), keep_recent=3.
+/// Send 3 messages with 300 input_tokens each. Under the agent_loop ordering
+/// (user-msg appended *before* compaction check; see make-flow-great-again.md)
+/// compaction triggers on turn 3: the check sees 5 msgs (turns 1+2 closed +
+/// turn 3 user), 5 > keep_recent=3, and turn 2's 300 tokens > 250.
 /// The summarization request should contain "OLD_MSG_1" but NOT "RECENT_MSG".
 #[tokio::test]
 async fn summarization_request_contains_old_messages() {
     let config = ContextConfig {
         context_window: Some(500),
         threshold: 0.5, // 250 tokens
-        keep_recent: 2,
+        keep_recent: 3,
         enabled: true,
         compaction_model: None,
     };
@@ -101,7 +103,7 @@ async fn summarization_request_excludes_recent_messages() {
     let config = ContextConfig {
         context_window: Some(500),
         threshold: 0.5,
-        keep_recent: 2,
+        keep_recent: 3,
         enabled: true,
         compaction_model: None,
     };
@@ -123,20 +125,19 @@ async fn summarization_request_excludes_recent_messages() {
 
     let prompt_text = TestHarness::extract_summarization_prompt(&summ_requests[0]).unwrap();
 
-    // keep_recent=2 means the last 2 messages (user+assistant pairs) before
-    // compaction are kept. The compaction runs at the START of turn 3, so
-    // the history has 4 messages (turns 1+2). keep_start = 4 - 2 = 2.
-    // Messages 0,1 (turn 1: user+assistant) get summarized.
-    // Messages 2,3 (turn 2: user+assistant) are kept.
-    //
-    // So the summarization prompt should contain turn 1 content but NOT turn 2.
+    // Under the agent_loop ordering (user-msg appended *before* compaction
+    // check; see make-flow-great-again.md), turn 3 begins with 5 msgs:
+    // [user A, asst A, user B, asst B, user C]. keep_recent=3 means the last
+    // 3 (asst B, user C — wait, that's only 2; with keep_recent=3 we keep
+    // [user B, asst B, user C]). keep_start = 5 - 3 = 2. Messages 0,1 (turn 1
+    // user+assistant) are summarized; msg 2 onward are kept.
     assert!(
         prompt_text.contains("MSG_ALPHA") || prompt_text.contains("REPLY_ALPHA"),
         "Summarization should include old messages (turn 1)"
     );
 
-    // MSG_GAMMA is the new message in turn 3 — it hasn't been added to history yet
-    // when compaction runs (compaction runs BEFORE prompt_with_history).
+    // MSG_GAMMA is the turn-3 user message; it is in the kept tail, not the
+    // summarized window.
     assert!(
         !prompt_text.contains("MSG_GAMMA"),
         "Summarization must not contain the current turn's message"
@@ -201,7 +202,7 @@ async fn llm_call_count_matches_expectations() {
     let config = ContextConfig {
         context_window: Some(500),
         threshold: 0.5,
-        keep_recent: 2,
+        keep_recent: 3,
         enabled: true,
         compaction_model: None,
     };
@@ -501,26 +502,30 @@ async fn summarization_failure_is_graceful() {
 ///
 /// Threshold math:
 ///   context_window=500, threshold=0.5 -> 250 tokens
-///   keep_recent=2
+///   keep_recent=3
 ///   Each response: 300 input_tokens (> 250)
 ///
-/// Flow:
+/// Flow (single-writer ordering — see make-flow-great-again.md: user-msg
+/// is appended to chat *before* compaction check, mirroring agent_loop):
 ///   Turn 1: process_message_internal runs.
-///     - compact_if_needed: history is empty (messages added AFTER prompt), skip.
-///     - prompt_with_history, then add user+assistant to StateManager (2 msgs).
-///   Turn 2: process_message_internal runs.
+///     - add_user_message("M1"): history=1 msg.
+///     - compact_if_needed: 1 <= keep_recent=3, skip.
+///     - prompt + add_assistant: history=2 msgs, last_input_tokens=300.
+///   Turn 2:
+///     - add_user_message("M2"): history=3 msgs.
 ///     - process_session_hook_events: syncs turn 1's stats (300 tokens).
-///     - compact_if_needed: history=2 msgs, keep_recent=2. 2 <= 2, skip.
-///     - prompt, add msgs (4 total).
-///   Turn 3: process_message_internal runs.
+///     - compact_if_needed: 3 <= 3, skip.
+///     - prompt + add_assistant: history=4 msgs.
+///   Turn 3:
+///     - add_user_message("M3"): history=5 msgs.
 ///     - process_session_hook_events: syncs turn 2's stats (300 tokens).
-///     - compact_if_needed: history=4 msgs > 2, tokens=300 > 250. COMPACT!
+///     - compact_if_needed: 5 > 3, tokens=300 > 250. COMPACT!
 #[tokio::test]
 async fn compaction_triggers_at_exact_turn() {
     let config = ContextConfig {
         context_window: Some(500),
         threshold: 0.5,
-        keep_recent: 2,
+        keep_recent: 3,
         enabled: true,
         compaction_model: None,
     };
@@ -533,23 +538,23 @@ async fn compaction_triggers_at_exact_turn() {
     harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 300));
 
-    // Turn 1: no compaction
+    // Turn 1: no compaction (1 msg at check time)
     harness.run_message("M1").await;
     assert_eq!(
         harness.get_compaction_events().len(),
         0,
-        "Turn 1: no compaction (history empty at check time)"
+        "Turn 1: no compaction (1 msg <= keep_recent=3)"
     );
 
-    // Turn 2: no compaction (msgs <= keep_recent)
+    // Turn 2: no compaction (3 msgs <= keep_recent=3)
     harness.run_message("M2").await;
     assert_eq!(
         harness.get_compaction_events().len(),
         0,
-        "Turn 2: no compaction (2 msgs <= keep_recent=2)"
+        "Turn 2: no compaction (3 msgs <= keep_recent=3)"
     );
 
-    // Turn 3: compaction fires
+    // Turn 3: compaction fires (5 msgs > 3, tokens > 250)
     harness.run_message("M3").await;
     assert_eq!(
         harness.get_compaction_events().len(),
@@ -1031,7 +1036,7 @@ async fn compaction_must_preserve_recent_messages() {
     let config = ContextConfig {
         context_window: Some(400),
         threshold: 0.5,
-        keep_recent: 2,
+        keep_recent: 3,
         enabled: true,
         compaction_model: None,
     };

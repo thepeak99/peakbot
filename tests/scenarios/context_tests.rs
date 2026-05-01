@@ -164,7 +164,7 @@ async fn compaction_preserves_recent_messages() {
     let context_config = ContextConfig {
         context_window: Some(400),
         threshold: 0.5, // 50% = 200 tokens
-        keep_recent: 2, // Keep last 2 messages
+        keep_recent: 3, // Keep last 3 messages — see make-flow-great-again.md
         enabled: true,
         compaction_model: None,
     };
