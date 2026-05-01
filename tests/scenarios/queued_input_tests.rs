@@ -173,3 +173,115 @@ async fn pending_input_counter_lifecycles_correctly() {
     sm.decrement_pending_input();
     assert_eq!(sm.get_state().pending_input_count, 0);
 }
+
+/// Pins that queued user messages are dispatched as separate turns, NOT
+/// concatenated. See full rationale in the doc-comment on
+/// `queued_messages_are_sent_as_separate_turns_not_glued` below.
+#[tokio::test]
+async fn queued_messages_are_sent_as_separate_turns_not_glued() {
+    use rig::completion::message::{Message as RigMessage, UserContent};
+
+    let mut harness = TestHarness::new();
+    harness.add_response(MockResponse::text("ack 1"));
+    harness.add_response(MockResponse::text("ack 2"));
+    harness.add_response(MockResponse::text("ack 3"));
+
+    // Three queued messages (e.g. user typed three follow-ups while a
+    // tool was running). TestRunner::run_message mirrors agent_loop's
+    // per-message dequeue path, so calling it three times back-to-back
+    // is the closest faithful repro of three QueueMessage::UserMessage
+    // items dequeued in order.
+    harness.run_message("first message").await;
+    harness.run_message("second message").await;
+    harness.run_message("third message").await;
+
+    // 1) One LLM request per queued message - no batching.
+    let requests = harness.get_recorded_requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected exactly 3 LLM requests (one per queued message); got {} \
+         - if this is < 3, queued messages were batched into a single prompt",
+        requests.len(),
+    );
+
+    // 2) Each request's own prompt is exactly the one message text -
+    // never a glued concatenation. The prompt is the last message in
+    // chat_history.
+    let expected_prompts = ["first message", "second message", "third message"];
+    for (i, expected) in expected_prompts.iter().enumerate() {
+        let last = requests[i]
+            .chat_history
+            .last()
+            .unwrap_or_else(|| panic!("request {i} has empty chat_history"));
+        let RigMessage::User { content } = last else {
+            panic!("request {i}'s last message is not a User message: {last:?}");
+        };
+        let text = content
+            .iter()
+            .find_map(|c| {
+                if let UserContent::Text(t) = c {
+                    Some(t.text.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("request {i}'s User message has no Text content"));
+
+        assert_eq!(
+            text, *expected,
+            "request {i}: prompt text should be exactly {expected:?} (the one queued \
+             message), not a glued/concatenated blob. Got {text:?}.",
+        );
+
+        // Defence-in-depth: if the equality above ever loosens, these
+        // explicit negative assertions still catch the specific gluing
+        // shapes worried about ("a b c", "a\nb\nc", "abc", etc).
+        assert!(
+            !text.contains("first message") || i == 0,
+            "request {i}: prompt unexpectedly contains 'first message' (glued?). text = {text:?}",
+        );
+        assert!(
+            !text.contains("second message") || i == 1,
+            "request {i}: prompt unexpectedly contains 'second message' (glued?). text = {text:?}",
+        );
+        assert!(
+            !text.contains("third message") || i == 2,
+            "request {i}: prompt unexpectedly contains 'third message' (glued?). text = {text:?}",
+        );
+    }
+
+    // 3) By the third turn, chat_history visible to the model contains
+    // all three user messages as DISTINCT User entries, in order - not
+    // collapsed into one. A glued history would yield a single entry
+    // like "first message\nsecond message\nthird message".
+    let third = &requests[2];
+    let user_entries: Vec<String> = third
+        .chat_history
+        .iter()
+        .filter_map(|msg| {
+            if let RigMessage::User { content } = msg {
+                content.iter().find_map(|c| {
+                    if let UserContent::Text(t) = c {
+                        Some(t.text.clone())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        user_entries,
+        vec![
+            "first message".to_string(),
+            "second message".to_string(),
+            "third message".to_string(),
+        ],
+        "third request's chat_history should contain three separate User entries in order, \
+         one per queued message. A single glued entry would prove batching.",
+    );
+}
