@@ -1226,4 +1226,33 @@ mod tests {
             "at global_scroll=0 thumb must sit near top (row ≤ 3), got row {thumb_row}"
         );
     }
+
+    // === Input-area VS16 stripping ===
+    //
+    // When the user types or pastes VS16-bearing emoji into the input
+    // box, `build_input_paragraph` constructs `Span::raw` directly
+    // from the buffer contents — bypassing the renderer normaliser.
+    // Every byte the user typed flows through to the terminal, including
+    // U+FE0F. On Linux/kitty this drifts the cursor by 1 column. Pin
+    // the contract: VS16 must be stripped from rendered input cells.
+    // See `garbled.md` (Class A bypass).
+
+    #[test]
+    fn input_area_strips_vs16_from_user_input() {
+        // Simulate user typing/pasting "⚠️ help me" (warn emoji + VS16).
+        let input = "\u{26A0}\u{FE0F} help me";
+        let paragraph = ReplUi::build_input_paragraph(input, input.len(), false, None, None, 0);
+        let terminal = render_widget(paragraph, 60, 3);
+        let lines = buffer_to_lines(terminal.backend());
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains('\u{FE0F}'),
+            "VS16 must not survive into rendered input cells: {joined:?}"
+        );
+        // The base symbol should still be there.
+        assert!(
+            joined.contains('\u{26A0}'),
+            "base symbol must survive: {joined:?}"
+        );
+    }
 }

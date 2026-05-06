@@ -619,18 +619,38 @@ impl ReplUi {
                 .split('\n')
                 .enumerate()
                 .map(|(i, line_text)| {
+                    // Normalise per-logical-line: strips VS16 / ZWJ from
+                    // user-typed or pasted input so the input area
+                    // doesn't drift the cursor on Linux/kitty.
+                    // See `garbled.md` Class A bypass.
+                    let safe_line = crate::ui::emoji_normalize::normalize_for_terminal(line_text);
+                    // Recompute split position in the *normalised* string
+                    // when the cursor lives on this line. Since stripped
+                    // codepoints are zero-width, the byte offset only
+                    // shifts when stripped bytes precede the cursor —
+                    // which is rare, but worth handling correctly.
                     let mut spans: Vec<Span<'a>> = Vec::new();
                     if i == 0 {
                         spans.push(prompt_span.clone());
                     }
                     if i == cursor_line_idx {
-                        // Cursor lives on this line.
-                        let (pre, post) = line_text.split_at(col_bytes.min(line_text.len()));
-                        spans.push(Span::raw(pre.to_string()));
+                        // Cursor lives on this logical line. Compute the
+                        // pre/post split in the *original* line_text bytes
+                        // (which the cursor was tracking), then normalise
+                        // each half independently. This keeps the cursor
+                        // visually positioned where the user expects, even
+                        // if VS16 was sitting between cursor and content.
+                        let split_at = col_bytes.min(line_text.len());
+                        let (pre_raw, post_raw) = line_text.split_at(split_at);
+                        let pre = crate::ui::emoji_normalize::normalize_for_terminal(pre_raw)
+                            .into_owned();
+                        let post = crate::ui::emoji_normalize::normalize_for_terminal(post_raw)
+                            .into_owned();
+                        spans.push(Span::raw(pre));
                         spans.push(cursor_span.clone());
-                        spans.push(Span::raw(post.to_string()));
+                        spans.push(Span::raw(post));
                     } else {
-                        spans.push(Span::raw(line_text.to_string()));
+                        spans.push(Span::raw(safe_line.into_owned()));
                     }
                     Line::from(spans)
                 })
@@ -640,12 +660,16 @@ impl ReplUi {
         let title = match (is_running, run_started_at) {
             (true, Some(t)) => {
                 // Truncate the phase label to ~24 chars to keep the title
-                // readable on narrow terminals.
-                let phase_full = status_message.unwrap_or("thinking");
+                // readable on narrow terminals. Normalise first so any
+                // VS16 / ZWJ in agent-controlled status text doesn't
+                // drift the title border. See `garbled.md` Class A.
+                let phase_full = crate::ui::emoji_normalize::normalize_for_terminal(
+                    status_message.unwrap_or("thinking"),
+                );
                 let phase: String = if phase_full.chars().count() > 24 {
                     phase_full.chars().take(23).collect::<String>() + "…"
                 } else {
-                    phase_full.to_string()
+                    phase_full.into_owned()
                 };
                 let queued = if pending_input > 0 {
                     format!(" · ⏳ {pending_input} queued")
@@ -851,8 +875,11 @@ impl ReplUi {
             (NO_BTN, unselected_style)
         };
 
-        // Centered warning text (⚠️ = 2 visual chars, total = 30 visual)
-        let warning = "              ⚠️  WAIT! DON'T LEAVE!  ⚠️";
+        // Centered warning text. VS16 stripped from `⚠` (was `⚠️`) so
+        // `unicode-width` and the terminal agree on 1 cell each. Total
+        // visual width: 14 leading spaces + 1 + 2 + "WAIT! DON'T LEAVE!"
+        // (18) + 2 + 1 = 38. See `garbled.md` Class A.
+        let warning = "              ⚠  WAIT! DON'T LEAVE!  ⚠";
         // Centered question (36 chars, centered = 7 spaces)
         let question = "       Are you sure you want to quit PeakBot?";
         // Centered hint text

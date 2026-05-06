@@ -54,9 +54,12 @@ pub fn render_todo_panel(
         .wrap(Wrap { trim: true })
         .scroll((scroll as u16, 0));
 
-    // Render with block
+    // Render with block. Title uses ASCII `+` (was `✓`, U+2713) — see
+    // `garbled.md` Class B: `✓` is East-Asian Narrow per unicode-width
+    // but kitty emoji-presentation can render it at 2 cells, drifting
+    // the title across the top border on scroll-redraw.
     let block = Block::default()
-        .title(" ✓ TODO ")
+        .title(" + TODO ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -76,11 +79,18 @@ pub fn render_todo_panel(
 
 /// Render a single todo item as a styled line
 fn render_todo_item(item: &TodoItem) -> Line<'static> {
+    // Glyph palette: ASCII-only on the kitty-risky positions.
+    // `✓` (U+2713) and `✗` (U+2717) are East-Asian Narrow per
+    // `unicode-width` (1 cell) but kitty's emoji-presentation can
+    // render them at 2 cells → +1 col drift / "stuff gets stuck"
+    // on scroll. ASCII is bulletproof. Geometric-shape glyphs
+    // (○ ◐ ●) are stable across terminals — kept as-is for visual
+    // contrast. See `garbled.md` Class B.
     let (icon, color, strike) = match item.status {
         crate::TodoStatus::Pending => ("○", Color::DarkGray, false),
         crate::TodoStatus::InProgress => ("◐", Color::Yellow, false),
         crate::TodoStatus::Completed => ("●", Color::Green, true),
-        crate::TodoStatus::Cancelled => ("✗", Color::Red, false),
+        crate::TodoStatus::Cancelled => ("x", Color::Red, false),
     };
 
     let text_style = if strike {

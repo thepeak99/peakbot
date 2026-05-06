@@ -13,6 +13,7 @@
 //!   View ──UiAction──► Controller ──writes──► Model ──broadcasts──► View
 
 pub mod app_state;
+pub mod emoji_normalize;
 pub mod ui_trait;
 
 // REPL UI

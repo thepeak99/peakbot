@@ -1,14 +1,15 @@
 ---
 source: tests/repl_tests.rs
+assertion_line: 900
 expression: "lines.join(\"\\n\")"
 ---
-┌ ✓ TODO ────────────────────▲
+┌ + TODO ────────────────────▲
 │● #1 Task number 1          █
 │◐ #2 Task number 2          █
 │○ #3 Task number 3          █
-│✗ #4 Task number 4          ║
+│x #4 Task number 4          ║
 │● #5 Task number 5          ║
 │◐ #6 Task number 6          ║
 │○ #7 Task number 7          ║
-│✗ #8 Task number 8          ║
+│x #8 Task number 8          ║
 └────────────────────────────▼

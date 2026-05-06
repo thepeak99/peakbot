@@ -83,7 +83,11 @@ impl MessageRenderer for PlainRenderer {
         let (prefix, color) = match msg.role {
             MessageRole::User => ("👤 User", Color::LightGreen),
             MessageRole::Agent => ("🤖 Agent", Color::LightMagenta),
-            MessageRole::System => ("⚙️ System", Color::LightYellow),
+            // VS16 stripped from "⚙️" → "⚙" — the base symbol U+2699 alone
+            // matches what `unicode-width` reports (1 cell) AND what every
+            // terminal advances by, so the column drift is gone.
+            // See `garbled.md` Class A.
+            MessageRole::System => ("⚙ System", Color::LightYellow),
             MessageRole::ToolCall => ("🔧 Tool", Color::Cyan),
             MessageRole::ToolResult => ("📋 Result", Color::Blue),
             MessageRole::Summary => ("📝 Summary", Color::DarkGray),
@@ -119,6 +123,12 @@ impl MessageRenderer for PlainRenderer {
 
         let attachments_present = !msg.attachments.is_empty();
         for (i, content_line) in content_lines.iter().enumerate() {
+            // Normalise at the renderer boundary: strip VS16 and friends
+            // from any text that flows in from outside our codebase
+            // (LLM output, tool results, user input). See
+            // `crate::ui::emoji_normalize` and `garbled.md`. Internal
+            // role prefixes are normalised at the literal site, not here.
+            let safe_content = crate::ui::emoji_normalize::normalize_for_terminal(content_line);
             let line_content: Vec<Span<'static>> = if i == 0 && !attachments_present {
                 vec![
                     Span::raw("["),
@@ -126,14 +136,14 @@ impl MessageRenderer for PlainRenderer {
                     Span::raw("] "),
                     Span::styled(prefix.to_string(), Style::default().fg(color)),
                     Span::raw(": "),
-                    Span::raw(content_line.to_string()),
+                    Span::raw(safe_content.into_owned()),
                 ]
             } else {
                 // Either:
                 // - attachments already emitted the prefix line, so all
                 //   content lines are continuation style; or
                 // - this is the 2nd+ content line of a text-only message.
-                vec![Span::raw(content_line.to_string())]
+                vec![Span::raw(safe_content.into_owned())]
             };
             out.push(Line::from(line_content));
         }
