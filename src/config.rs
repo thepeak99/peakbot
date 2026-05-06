@@ -91,6 +91,11 @@ pub struct LlamaCppConfig {
     /// Maximum tokens for responses
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
+    /// Extra JSON parameters merged (flattened) into every chat-completions
+    /// request body. Useful for proxy-specific flags like `{"no-log": true}`
+    /// (LiteLLM) or vendor extensions that aren't in the OpenAI schema.
+    #[serde(default)]
+    pub extra_params: Option<serde_json::Value>,
 }
 
 fn default_ollama_url() -> String {
@@ -153,6 +158,7 @@ impl Default for LlamaCppConfig {
             base_url: default_llamacpp_url(),
             model: "llama3".to_string(),
             max_tokens: default_max_tokens(),
+            extra_params: None,
         }
     }
 }
