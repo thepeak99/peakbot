@@ -379,6 +379,11 @@ pub struct ReplUi {
     /// is view-only, mirrors the `show_quit_confirm` precedent rather than
     /// going through `StateManager`).
     pub(crate) command_popup: Option<CommandPopupState>,
+    /// **Multiline compose mode.** When `true`, plain `Enter` inserts a
+    /// newline instead of submitting; `Ctrl+G` toggles the mode (or
+    /// submits + exits when already on). View-only ephemeral state —
+    /// see `multiline-mode.md`.
+    pub(crate) multiline_mode: bool,
 }
 
 impl ReplUi {
@@ -413,6 +418,7 @@ impl ReplUi {
             last_size: (0, 0),
             chat_cache: ChatRenderCache::new(renderer),
             command_popup: None,
+            multiline_mode: false,
         }
     }
 
@@ -467,7 +473,10 @@ impl ReplUi {
         }
         Block::default()
             .title(" Chat Messages ")
-            .title_bottom(Line::from(" Ctrl+C exit · Ctrl+T tasks · F4 select ").right_aligned())
+            .title_bottom(
+                Line::from(" Ctrl+C exit · Ctrl+T tasks · F4 select · Ctrl+G multi ")
+                    .right_aligned(),
+            )
             .borders(Borders::ALL)
     }
 
@@ -590,6 +599,7 @@ impl ReplUi {
         run_started_at: Option<std::time::Instant>,
         status_message: Option<&str>,
         pending_input: usize,
+        multiline: bool,
     ) -> Paragraph<'a> {
         let (prompt_text, prompt_color) = if input.is_empty() {
             ("💬 Message...", Color::DarkGray)
@@ -684,13 +694,26 @@ impl ReplUi {
                     queued,
                 )
             }
+            // Multiline compose mode (idle): the title doubles as the
+            // affordance — what to press to send, what to press to cancel.
+            // No emoji with VS16 — `✎` (U+270E) is a single-cell glyph
+            // safe across kitty/vte/iTerm. See memory.md Class-B policy.
+            _ if multiline => " ✎ Multiline · Ctrl+G to send · Esc to cancel ".to_string(),
             _ => " Input ".to_string(),
         };
 
         // Bottom-border hint about newline vs submit. Keybinding hints
-        // belong on borders, not content (memory 2026-04-24).
+        // belong on borders, not content (memory 2026-04-24). Discoverability
+        // for Ctrl+G lives on the *chat* block's bottom hint (alongside
+        // Ctrl+C / Ctrl+T / F4) so the input hint stays short enough to
+        // fit on narrow terminals (snapshot tests use width=60).
+        let hint_text = if multiline {
+            " Enter: newline · Ctrl+G: send "
+        } else {
+            " Shift/Alt+Enter: newline · Enter: send "
+        };
         let hint = Line::from(vec![Span::styled(
-            " Shift/Alt+Enter: newline · Enter: send ",
+            hint_text,
             Style::default().fg(Color::White),
         )])
         .right_aligned();
@@ -942,6 +965,7 @@ impl ReplUi {
                     state.run_started_at,
                     state.status_message.as_deref(),
                     state.pending_input_count,
+                    self.multiline_mode,
                 );
 
                 // Check if todo panel should be shown (based on terminal size and visibility state)
@@ -1172,6 +1196,34 @@ impl ReplUi {
                 self.show_quit_confirm = true;
                 self.confirm_yes_selected = false; // Default to "No"
             }
+            // Toggle multiline compose mode with Ctrl+G ("Go multi"). When
+            // OFF, first tap turns it ON and Enter starts inserting newlines
+            // instead of submitting. When ON, second tap submits the buffer
+            // (if non-empty) and exits the mode. Gated off while quit-confirm
+            // or command popup is open so those modal surfaces win.
+            //
+            // Why Ctrl+G specifically: byte 0x07 (BEL) is detectable on every
+            // terminal as `Char('g') + CONTROL`, has no Enter/Tab/Backspace
+            // collision, and unlike Ctrl+L carries no decades-old "clear
+            // screen" muscle memory from shells. See `multiline-mode.md`.
+            KeyCode::Char('g' | 'G')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !self.show_quit_confirm
+                    && self.command_popup.is_none() =>
+            {
+                if self.multiline_mode {
+                    // Second tap → submit + exit (mirrors plain-Enter submit).
+                    let msg = self.ui_state.input_buffer.clone();
+                    self.multiline_mode = false;
+                    if !msg.trim().is_empty() {
+                        let _ = self.action_sender.send(UiAction::SendMessage(msg));
+                    }
+                    self.ui_state.clear_input();
+                } else {
+                    // First tap → enter mode. Buffer untouched.
+                    self.multiline_mode = true;
+                }
+            }
             // Scroll todo panel with Ctrl+Up/Down when panel is visible
             KeyCode::Up
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1191,6 +1243,13 @@ impl ReplUi {
             KeyCode::Esc if self.show_quit_confirm => {
                 // ESC while dialog is open = cancel (close dialog)
                 self.show_quit_confirm = false;
+            }
+            // Esc while in multiline compose mode = cancel mode without
+            // submitting. Buffer is preserved (the user may still want
+            // their draft); they can tap Ctrl+G again to re-enter, or
+            // Backspace it down. See `multiline-mode.md` §5.3.
+            KeyCode::Esc if self.multiline_mode => {
+                self.multiline_mode = false;
             }
             KeyCode::Enter if self.show_quit_confirm => {
                 if self.confirm_yes_selected {
@@ -1292,12 +1351,22 @@ impl ReplUi {
             {
                 self.ui_state.insert_newline();
             }
+            // While in multiline compose mode, plain Enter inserts a
+            // newline. Submit lives on Ctrl+G (the same key that opened
+            // the mode). See `multiline-mode.md` §5.2. This arm MUST
+            // come before the bare `KeyCode::Enter` submit arm below.
+            KeyCode::Enter if self.multiline_mode => {
+                self.ui_state.insert_newline();
+            }
             KeyCode::Enter => {
                 let msg = self.ui_state.input_buffer.clone();
                 if !msg.trim().is_empty() {
                     let _ = self.action_sender.send(UiAction::SendMessage(msg));
                 }
                 self.ui_state.clear_input();
+                // A composition just ended; ensure multiline mode is off
+                // so the next message follows the default contract.
+                self.multiline_mode = false;
             }
             // Up/Down navigate between logical lines within the input.
             // Command history is not useful for an agent (each turn is a
@@ -1405,6 +1474,11 @@ impl ReplUi {
                 .action_sender
                 .send(UiAction::SendMessage(completed.clone()));
             self.ui_state.clear_input();
+            // Slash command submitted = composition ended; exit multiline
+            // mode so the next free-text message has predictable Enter
+            // behaviour. See `multiline-mode.md` §5.4 / test
+            // `accept_command_clears_multiline_mode`.
+            self.multiline_mode = false;
         } else {
             // Tab, or Enter on an arg-taking command: just fill the buffer.
             self.ui_state.input_buffer = completed.clone();
@@ -1842,15 +1916,15 @@ mod multiline_input_tests {
     /// changes upstream, this test catches it.
     #[test]
     fn real_paragraph_line_count_includes_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0);
+        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, false);
         // 1 content line (placeholder) + 2 border rows = 3.
         assert_eq!(empty.line_count(120), 3);
 
-        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0);
+        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, false);
         // 2 content lines + 2 border rows = 4.
         assert_eq!(one_newline.line_count(120), 4);
 
-        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0);
+        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, false);
         // 3 content lines + 2 border rows = 5.
         assert_eq!(two_newlines.line_count(120), 5);
     }
@@ -1862,13 +1936,13 @@ mod multiline_input_tests {
     /// `Constraint::Length(input_height)` math in `ReplUi::render`.
     #[test]
     fn paragraph_content_rows_strips_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0);
+        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, false);
         assert_eq!(ReplUi::paragraph_content_rows(&empty, 120), 1);
 
-        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0);
+        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, false);
         assert_eq!(ReplUi::paragraph_content_rows(&one_newline, 120), 2);
 
-        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0);
+        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, false);
         assert_eq!(ReplUi::paragraph_content_rows(&two_newlines, 120), 3);
     }
 
@@ -1931,8 +2005,15 @@ mod multiline_input_tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let started = std::time::Instant::now();
-        let para =
-            ReplUi::build_input_paragraph("hello", 5, true, Some(started), Some("thinking"), 3);
+        let para = ReplUi::build_input_paragraph(
+            "hello",
+            5,
+            true,
+            Some(started),
+            Some("thinking"),
+            3,
+            false,
+        );
         let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
         terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
         let buffer = terminal.backend().buffer();
@@ -1960,8 +2041,15 @@ mod multiline_input_tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let started = std::time::Instant::now();
-        let para =
-            ReplUi::build_input_paragraph("hello", 5, true, Some(started), Some("thinking"), 0);
+        let para = ReplUi::build_input_paragraph(
+            "hello",
+            5,
+            true,
+            Some(started),
+            Some("thinking"),
+            0,
+            false,
+        );
         let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
         terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
         let buffer = terminal.backend().buffer();
@@ -2534,5 +2622,264 @@ mod command_popup_tests {
         let p = CommandPopupState::new(String::new());
         assert_eq!(p.selected_index, 0);
         assert_eq!(p.scroll_offset, 0);
+    }
+}
+
+#[cfg(test)]
+mod multiline_mode_tests {
+    //! Test-first specs for **multiline compose mode** (Ctrl+G toggle).
+    //! See `multiline-mode.md`.
+    //!
+    //! Contract:
+    //!   - Ctrl+G with mode=off → enter mode, buffer untouched, no send.
+    //!   - Ctrl+G with mode=on  → submit (if non-empty) + clear buffer + exit mode.
+    //!   - Enter while mode=on  → insert `\n` (NOT submit).
+    //!   - Esc  while mode=on   → exit mode, buffer preserved (cancel verb).
+    //!   - Mode is gated off while quit-confirm or command popup is open.
+    //!   - Shift/Alt+Enter still inserts newline regardless of mode.
+    //!   - After accept_command (popup → SendMessage), mode is reset.
+    use super::*;
+    use crate::state::StateManager;
+    use crate::ui::ui_trait::UiAction;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    fn harness() -> (ReplUi, UnboundedReceiver<UiAction>) {
+        let sm = StateManager::new_arc();
+        let (tx, rx) = unbounded_channel();
+        (ReplUi::new(sm, tx), rx)
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn shift_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    }
+
+    // ─── Initial state ────────────────────────────────────────────────────
+
+    #[test]
+    fn multiline_mode_starts_off() {
+        let (ui, _rx) = harness();
+        assert!(!ui.multiline_mode, "fresh ReplUi must default mode=off");
+    }
+
+    // ─── Toggle on / toggle off ───────────────────────────────────────────
+
+    #[test]
+    fn ctrl_g_with_empty_buffer_enters_mode_no_send() {
+        let (mut ui, mut rx) = harness();
+        ui.handle_keyboard_input(ctrl(KeyCode::Char('g')));
+        assert!(ui.multiline_mode, "first Ctrl+G must turn mode on");
+        assert_eq!(
+            ui.ui_state.input_buffer, "",
+            "buffer must remain untouched on toggle-on"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no UiAction must be sent on toggle-on"
+        );
+    }
+
+    #[test]
+    fn ctrl_g_uppercase_also_toggles() {
+        // Some terminals emit the shifted form for Ctrl+letter; both
+        // 'g' and 'G' must work or the binding will mysteriously fail
+        // when CapsLock is on.
+        let (mut ui, _rx) = harness();
+        ui.handle_keyboard_input(ctrl(KeyCode::Char('G')));
+        assert!(ui.multiline_mode);
+    }
+
+    #[test]
+    fn ctrl_g_in_mode_with_text_submits_and_exits() {
+        let (mut ui, mut rx) = harness();
+        ui.multiline_mode = true;
+        ui.ui_state.input_buffer = "hello\nworld".to_string();
+        ui.ui_state.cursor_pos = 11;
+
+        ui.handle_keyboard_input(ctrl(KeyCode::Char('g')));
+
+        assert!(!ui.multiline_mode, "second Ctrl+G must turn mode off");
+        assert_eq!(ui.ui_state.input_buffer, "", "buffer must be cleared");
+        match rx.try_recv() {
+            Ok(UiAction::SendMessage(m)) => assert_eq!(m, "hello\nworld"),
+            other => panic!("expected SendMessage(\"hello\\nworld\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_g_in_mode_with_empty_buffer_just_exits_no_send() {
+        let (mut ui, mut rx) = harness();
+        ui.multiline_mode = true;
+
+        ui.handle_keyboard_input(ctrl(KeyCode::Char('g')));
+
+        assert!(!ui.multiline_mode);
+        assert_eq!(ui.ui_state.input_buffer, "");
+        assert!(rx.try_recv().is_err(), "empty submit must not send");
+    }
+
+    #[test]
+    fn ctrl_g_in_mode_with_whitespace_only_does_not_send() {
+        let (mut ui, mut rx) = harness();
+        ui.multiline_mode = true;
+        ui.ui_state.input_buffer = "   \n  ".to_string();
+        ui.ui_state.cursor_pos = 6;
+
+        ui.handle_keyboard_input(ctrl(KeyCode::Char('g')));
+
+        assert!(!ui.multiline_mode, "mode must still exit on whitespace");
+        assert_eq!(ui.ui_state.input_buffer, "");
+        assert!(
+            rx.try_recv().is_err(),
+            "whitespace-only buffer must not send"
+        );
+    }
+
+    // ─── Enter behaviour while in mode ────────────────────────────────────
+
+    #[test]
+    fn enter_in_mode_inserts_newline_not_submit() {
+        let (mut ui, mut rx) = harness();
+        ui.multiline_mode = true;
+        ui.ui_state.input_buffer = "abc".to_string();
+        ui.ui_state.cursor_pos = 3;
+
+        ui.handle_keyboard_input(press(KeyCode::Enter));
+
+        assert!(ui.multiline_mode, "Enter must not exit the mode");
+        assert_eq!(
+            ui.ui_state.input_buffer, "abc\n",
+            "Enter in mode must insert \\n at cursor"
+        );
+        assert!(rx.try_recv().is_err(), "Enter in mode must not send");
+    }
+
+    #[test]
+    fn enter_outside_mode_still_submits_as_before() {
+        let (mut ui, mut rx) = harness();
+        // mode=off (default)
+        ui.ui_state.input_buffer = "hello".to_string();
+        ui.ui_state.cursor_pos = 5;
+
+        ui.handle_keyboard_input(press(KeyCode::Enter));
+
+        match rx.try_recv() {
+            Ok(UiAction::SendMessage(m)) => assert_eq!(m, "hello"),
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+        assert_eq!(ui.ui_state.input_buffer, "");
+    }
+
+    #[test]
+    fn shift_enter_still_inserts_newline_in_mode() {
+        // Muscle-memory path stays alive — Shift+Enter is a portable
+        // newline regardless of mode.
+        let (mut ui, _rx) = harness();
+        ui.multiline_mode = true;
+        ui.ui_state.input_buffer = "abc".to_string();
+        ui.ui_state.cursor_pos = 3;
+
+        ui.handle_keyboard_input(shift_enter());
+
+        assert_eq!(ui.ui_state.input_buffer, "abc\n");
+        assert!(ui.multiline_mode);
+    }
+
+    // ─── Esc cancel ───────────────────────────────────────────────────────
+
+    #[test]
+    fn esc_in_mode_exits_without_submitting() {
+        let (mut ui, mut rx) = harness();
+        ui.multiline_mode = true;
+        ui.ui_state.input_buffer = "draft".to_string();
+        ui.ui_state.cursor_pos = 5;
+
+        ui.handle_keyboard_input(press(KeyCode::Esc));
+
+        assert!(!ui.multiline_mode, "Esc must exit multiline mode");
+        assert_eq!(
+            ui.ui_state.input_buffer, "draft",
+            "Esc must preserve the buffer"
+        );
+        assert!(rx.try_recv().is_err(), "Esc must not send");
+    }
+
+    // ─── Gating ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn ctrl_g_is_gated_off_while_quit_confirm_is_open() {
+        let (mut ui, _rx) = harness();
+        ui.show_quit_confirm = true;
+
+        ui.handle_keyboard_input(ctrl(KeyCode::Char('g')));
+
+        assert!(
+            !ui.multiline_mode,
+            "Ctrl+G must be a no-op while quit confirm is open"
+        );
+    }
+
+    #[test]
+    fn ctrl_g_is_gated_off_while_command_popup_is_open() {
+        let (mut ui, _rx) = harness();
+        // Open the popup the natural way (slash on empty buffer).
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        assert!(ui.command_popup.is_some(), "precondition: popup is open");
+
+        ui.handle_keyboard_input(ctrl(KeyCode::Char('g')));
+
+        assert!(
+            !ui.multiline_mode,
+            "Ctrl+G must not toggle mode while popup is open"
+        );
+    }
+
+    // ─── Reset on slash-command submission ────────────────────────────────
+
+    #[test]
+    fn accept_command_clears_multiline_mode() {
+        // Edge case: user hits Ctrl+G on an empty buffer, then types `/`,
+        // then runs a command via popup Enter. The composition is over —
+        // mode must auto-exit so the next message isn't surprising.
+        let (mut ui, mut rx) = harness();
+        ui.multiline_mode = true;
+
+        // Open popup, navigate to a no-args command, run it.
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        ui.handle_keyboard_input(press(KeyCode::Char('s')));
+        ui.handle_keyboard_input(press(KeyCode::Char('t')));
+        ui.handle_keyboard_input(press(KeyCode::Char('a')));
+        ui.handle_keyboard_input(press(KeyCode::Char('t')));
+        ui.handle_keyboard_input(press(KeyCode::Char('s')));
+        ui.handle_keyboard_input(press(KeyCode::Enter));
+
+        // Sanity: the slash command was submitted.
+        match rx.try_recv() {
+            Ok(UiAction::SendMessage(m)) => assert_eq!(m, "/stats"),
+            other => panic!("expected SendMessage(\"/stats\"), got {other:?}"),
+        }
+
+        assert!(
+            !ui.multiline_mode,
+            "running a slash command must clear multiline_mode"
+        );
+    }
+
+    // ─── Title / chrome wiring ────────────────────────────────────────────
+
+    #[test]
+    fn build_input_paragraph_accepts_multiline_flag() {
+        // Just a compile-time pin: the signature must accept the new
+        // bool. The visual diff is owned by snapshot tests.
+        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, true);
+        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, false);
     }
 }
