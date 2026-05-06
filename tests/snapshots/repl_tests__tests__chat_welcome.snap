@@ -1,14 +1,14 @@
 ---
 source: tests/repl_tests.rs
-assertion_line: 157
+assertion_line: 158
 expression: "lines.join(\"\\n\")"
 ---
 ┌ Chat Messages ──────────────────────────────────────────┐▲
-│✨  PeakBot v0.3.1                                        │█
+│✨  PeakBot v0.3.2                                        │█
 │Start a conversation or use /help for commands.          │█
 │                                                         │█
 │                                                         │█
 │                                                         │█
 │                                                         │║
 │                                                         │║
-└───────────────── Ctrl+C exit · Ctrl+T tasks · F4 select ┘▼
+└── Ctrl+C exit · Ctrl+T tasks · F4 select · Ctrl+G multi ┘▼
