@@ -1,8 +1,9 @@
 ---
 source: tests/repl_tests.rs
+assertion_line: 926
 expression: "lines.join(\"\\n\")"
 ---
-┌ ✓ TODO ────────────────────┐
+┌ + TODO ────────────────────┐
 │○ #1 This is a very long    │
 │task description that should│
 │definitely be truncated when│

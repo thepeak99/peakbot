@@ -1,9 +1,10 @@
 ---
 source: tests/repl_tests.rs
+assertion_line: 824
 expression: "lines.join(\"\\n\")"
 ---
-┌ ✓ TODO ────────────────────┐
-│✗ #4 Deprecated feature     │
+┌ + TODO ────────────────────┐
+│x #4 Deprecated feature     │
 │                            │
 │                            │
 │                            │

@@ -219,11 +219,20 @@ impl MarkdownState {
     }
 
     /// Push a styled span onto the in-progress line.
+    ///
+    /// Text passes through `normalize_for_terminal` here — the central
+    /// body funnel — so any VS16 / ZWJ smuggled in by the agent's
+    /// markdown gets stripped before ratatui measures it. See
+    /// `crate::ui::emoji_normalize` and `garbled.md`.
     fn push_span(&mut self, text: String, style: Style) {
         if text.is_empty() {
             return;
         }
-        self.current_spans.push(Span::styled(text, style));
+        let safe = crate::ui::emoji_normalize::normalize_for_terminal(&text).into_owned();
+        if safe.is_empty() {
+            return;
+        }
+        self.current_spans.push(Span::styled(safe, style));
     }
 
     fn push_text(&mut self, text: &str) {
@@ -452,12 +461,21 @@ impl MarkdownState {
                 // pulldown-cmark may deliver the whole block as one Text
                 // or as multiple chunks. Either way, split on '\n' and
                 // emit one Line per code line, styled uniformly.
+                //
+                // This path bypasses `push_span` (the body funnel), so
+                // it has its own normalisation step. Without this, an
+                // agent emitting VS16 sequences inside a fenced code
+                // block ships `⚠️` to the renderer with VS16 attached
+                // → +1 col drift on Linux/kitty. See `garbled.md`.
                 let style = code_block_style();
                 let mut chunks = t.split('\n').peekable();
                 while let Some(seg) = chunks.next() {
                     if !seg.is_empty() {
-                        self.current_spans
-                            .push(Span::styled(seg.to_string(), style));
+                        let safe =
+                            crate::ui::emoji_normalize::normalize_for_terminal(seg).into_owned();
+                        if !safe.is_empty() {
+                            self.current_spans.push(Span::styled(safe, style));
+                        }
                     }
                     // Every '\n' boundary closes the current line. The
                     // trailing-newline chunk produces an empty seg + no
@@ -711,10 +729,16 @@ fn align_cell(text: &str, width: usize, align: Alignment) -> String {
 /// rudimentary word-wrap; falls back to char-wrap when a single word is
 /// wider than the column. All accounting is cell-based so wide chars
 /// don't burst out of their column.
+///
+/// Input is normalised through `normalize_for_terminal` so VS16 / ZWJ
+/// stripped before the cell-width math runs — guarantees the column
+/// budget we compute matches what the terminal actually advances by.
 fn wrap_cell(text: &str, width: usize) -> Vec<String> {
     if width == 0 || text.is_empty() {
         return vec![String::new()];
     }
+    let normalised = crate::ui::emoji_normalize::normalize_for_terminal(text);
+    let text: &str = &normalised;
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
@@ -1396,6 +1420,41 @@ mod tests {
             lines,
             vec!["• [ ] todo".to_string(), "• [x] done".to_string()],
             "GFM task list should render the bullet then the checkbox"
+        );
+    }
+
+    // ─── Code block VS16 stripping ────────────────────────────────────
+    //
+    // The code-block emit path bypasses `push_span` (the body funnel)
+    // and constructs `Span::styled` directly. If an agent emits VS16
+    // sequences inside a fenced code block (e.g. an LLM showing emoji
+    // in a `python` snippet), the bypass means the warning emoji
+    // ships with VS16 still attached → +1 column drift on Linux/kitty.
+    // See `garbled.md` — this is the leftover Class A bypass found
+    // when "still happening" was reported.
+
+    #[test]
+    fn code_block_strips_vs16() {
+        // Fenced code block containing ⚠️ (U+26A0 U+FE0F). The rendered
+        // text must contain the base symbol but NOT the VS16 selector.
+        let text = render_to_text("```\n\u{26A0}\u{FE0F} danger\n```", 40);
+        assert!(
+            text.contains('\u{26A0}'),
+            "base symbol must survive: {text}"
+        );
+        assert!(
+            !text.contains('\u{FE0F}'),
+            "VS16 must be stripped from code blocks: {text}"
+        );
+    }
+
+    #[test]
+    fn code_block_strips_zwj() {
+        // ZWJ inside code must also be stripped — same width-drift class.
+        let text = render_to_text("```\nfoo\u{200D}bar\n```", 40);
+        assert!(
+            !text.contains('\u{200D}'),
+            "ZWJ must be stripped from code blocks: {text}"
         );
     }
 }

@@ -456,11 +456,16 @@ impl StateManager {
         output.push_str("## Todo List\n\n");
 
         for item in tasks {
+            // Glyph palette mirrors `ui::repl::todo_panel`: `✗` (U+2717)
+            // replaced with ASCII `x` because kitty may render it at
+            // 2 cells while unicode-width says 1, drifting the column
+            // alignment in the rendered todo list. See `garbled.md`
+            // Class B.
             let status_icon = match item.status {
                 TodoStatus::Pending => "○",
                 TodoStatus::InProgress => "◐",
                 TodoStatus::Completed => "●",
-                TodoStatus::Cancelled => "✗",
+                TodoStatus::Cancelled => "x",
             };
             output.push_str(&format!(
                 "{} #{} [{}] {}\n",

@@ -1,5 +1,6 @@
 ---
 source: tests/repl_tests.rs
+assertion_line: 640
 expression: "lines.join(\"\\n\")"
 ---
                                                                                 
@@ -11,7 +12,7 @@ expression: "lines.join(\"\\n\")"
                                                                                 
                ┌────────────────────────────────────────────────┐               
                │                                                │               
-               │              ⚠️   WAIT! DON'T LEAVE!  ⚠️         │               
+               │              ⚠  WAIT! DON'T LEAVE!  ⚠          │               
                │                                                │               
                │       Are you sure you want to quit PeakBot?   │               
                │                                                │               
