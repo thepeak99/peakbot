@@ -1415,7 +1415,25 @@ impl ReplUi {
     /// Handle input events
     fn handle_input(&mut self, event: Event) {
         match event {
-            Event::Key(key_event) => self.handle_keyboard_input(key_event),
+            // Filter on `KeyEventKind` BEFORE dispatching. On Windows,
+            // crossterm's `ReadConsoleInputW` always reports both press
+            // AND release records, so an unfiltered dispatcher fires
+            // `handle_keyboard_input` twice per keystroke (typing `a`
+            // becomes `aa`, one Backspace deletes two cells). On Linux/
+            // macOS only `Press` is delivered (we never push
+            // `KeyboardEnhancementFlags::REPORT_EVENT_TYPES`), so this
+            // filter is a no-op there. `Repeat` is the autorepeat
+            // firing — it represents a real keystroke from the user's
+            // POV, so we forward it. See ratatui FAQ "Why am I getting
+            // duplicate key events on Windows?" and crossterm 0.29
+            // `event.rs::KeyEvent::kind` doc.
+            Event::Key(key_event)
+                if key_event.kind == crossterm::event::KeyEventKind::Press
+                    || key_event.kind == crossterm::event::KeyEventKind::Repeat =>
+            {
+                self.handle_keyboard_input(key_event)
+            }
+            Event::Key(_) => { /* Release: ignore */ }
             // Mouse wheel scrolling
             Event::Mouse(mouse_event) => match mouse_event.kind {
                 MouseEventKind::ScrollUp => {
@@ -2335,6 +2353,84 @@ mod command_popup_tests {
         assert!(ui.ui_state.select_mode);
         ui.handle_keyboard_input(press(KeyCode::F(4)));
         assert!(!ui.ui_state.select_mode, "two F4 presses cancel out");
+    }
+
+    // ─── Windows duplicate-key regression ──────────────────────────────
+    //
+    // On Windows, crossterm's underlying `ReadConsoleInputW` always
+    // reports BOTH press and release records, so `KeyEvent.kind` cycles
+    // through `Press`, then `Release` for every keystroke. On Linux/macOS
+    // (without `KeyboardEnhancementFlags::REPORT_EVENT_TYPES` pushed —
+    // which we don't push) only `Press` is delivered. If `handle_input`
+    // does not filter on `kind`, every keystroke fires the handler twice
+    // on Windows: typing `a` produces `aa`, Backspace deletes two chars,
+    // and so on. See crossterm 0.29 `event.rs::KeyEvent::kind` doc and
+    // ratatui FAQ "Why am I getting duplicate key events on Windows?".
+    //
+    // Contract pinned by the tests below: `handle_input` must dispatch
+    // ONLY for `Press` and `Repeat` (autorepeat); `Release` is a no-op.
+
+    fn key_with_kind(code: KeyCode, kind: crossterm::event::KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
+    }
+
+    #[test]
+    fn key_release_is_dropped_at_dispatch_boundary() {
+        // Windows-shape sequence: Press 'a', Release 'a'. If the
+        // dispatcher passes Release through to `handle_keyboard_input`,
+        // the buffer ends up "aa". Correct behaviour: "a".
+        let (mut ui, _rx) = harness();
+        ui.handle_input(Event::Key(key_with_kind(
+            KeyCode::Char('a'),
+            crossterm::event::KeyEventKind::Press,
+        )));
+        ui.handle_input(Event::Key(key_with_kind(
+            KeyCode::Char('a'),
+            crossterm::event::KeyEventKind::Release,
+        )));
+        assert_eq!(
+            ui.ui_state.input_buffer, "a",
+            "Release event must not re-fire the keystroke"
+        );
+    }
+
+    #[test]
+    fn key_repeat_is_treated_as_a_press() {
+        // Autorepeat (holding a key) arrives as `Repeat` on Windows /
+        // kitty-protocol terminals. Each Repeat event is a real
+        // keystroke from the user's POV.
+        let (mut ui, _rx) = harness();
+        ui.handle_input(Event::Key(key_with_kind(
+            KeyCode::Char('a'),
+            crossterm::event::KeyEventKind::Press,
+        )));
+        ui.handle_input(Event::Key(key_with_kind(
+            KeyCode::Char('a'),
+            crossterm::event::KeyEventKind::Repeat,
+        )));
+        assert_eq!(ui.ui_state.input_buffer, "aa");
+    }
+
+    #[test]
+    fn backspace_release_does_not_double_delete() {
+        // Reported symptom on Windows: pressing Backspace once removed
+        // two characters because the Release event hit
+        // `handle_keyboard_input` a second time.
+        let (mut ui, _rx) = harness();
+        ui.ui_state.input_buffer = "ab".to_string();
+        ui.ui_state.cursor_pos = 2;
+        ui.handle_input(Event::Key(key_with_kind(
+            KeyCode::Backspace,
+            crossterm::event::KeyEventKind::Press,
+        )));
+        ui.handle_input(Event::Key(key_with_kind(
+            KeyCode::Backspace,
+            crossterm::event::KeyEventKind::Release,
+        )));
+        assert_eq!(
+            ui.ui_state.input_buffer, "a",
+            "one Backspace press must delete exactly one char"
+        );
     }
 
     #[test]
