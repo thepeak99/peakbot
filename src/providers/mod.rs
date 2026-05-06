@@ -677,12 +677,19 @@ fn create_llamacpp_agent(
     );
 
     // Build agent with system prompt, hook, and built-in tools
-    let agent_builder = client
+    let mut agent_builder = client
         .agent(&model)
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)
         .hook(hook.clone());
+
+    // Merge user-supplied extra params (e.g. {"no-log": true} for LiteLLM
+    // proxies). rig flattens this JSON into every chat-completions request
+    // body, so any vendor-specific top-level field passes through unchanged.
+    if let Some(extra) = config.extra_params.clone() {
+        agent_builder = agent_builder.additional_params(extra);
+    }
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let agent_builder = add_builtin_tools(
