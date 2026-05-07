@@ -9,9 +9,19 @@ use uuid::Uuid;
 /// Token + cost fields use `#[serde(default)]` so conversations saved before
 /// stats persistence existed (only `message_count`) still deserialize cleanly
 /// — they just come back with zeros, which is the right answer for them.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// `model_alias` carries the user-facing handle of the model that was
+/// active when this conversation ran. It is required for `/load` to
+/// re-activate the right model. Pre-v4 files (which never wrote this
+/// field) load with the reserved sentinel
+/// [`crate::config::RESERVED_UNAVAILABLE_ALIAS`] (`"unknown"`), which
+/// `/load` then rejects with the canonical `Model 'unknown' not
+/// available.` message — an honest answer, not a silent guess.
+/// *(persisted artifacts must carry every field needed to be re-activated)*
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationMetadata {
     /// Number of messages in the conversation
+    #[serde(default)]
     pub message_count: usize,
     /// Input tokens from the last request (mirrors SessionStats — overwritten,
     /// not accumulated; doubles as the live context-size indicator on resume)
@@ -26,6 +36,34 @@ pub struct ConversationMetadata {
     /// Cumulative cost in USD across the conversation
     #[serde(default)]
     pub total_cost: f64,
+    /// User-facing alias of the model active when this conversation
+    /// was last updated. Defaults to the reserved `unknown` sentinel
+    /// for pre-v4 files. See struct-level doc comment.
+    #[serde(default = "default_unknown_alias")]
+    pub model_alias: String,
+}
+
+/// Sentinel-default for [`ConversationMetadata::model_alias`] on
+/// pre-v4 conversation files. Returns the same literal as
+/// [`crate::config::RESERVED_UNAVAILABLE_ALIAS`] but kept inline here
+/// so this module doesn't need to import the config module just to
+/// pin a default. The two MUST stay equal — pinned by
+/// `pre_v4_default_matches_reserved_unavailable_alias`.
+fn default_unknown_alias() -> String {
+    "unknown".to_string()
+}
+
+impl Default for ConversationMetadata {
+    fn default() -> Self {
+        Self {
+            message_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_api_calls: 0,
+            total_cost: 0.0,
+            model_alias: default_unknown_alias(),
+        }
+    }
 }
 
 /// A message in the conversation history
@@ -148,9 +186,27 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    /// Create a new conversation with the given name and model
+    /// Create a new conversation with the given name and model wire id.
+    ///
+    /// **Sets `model_alias` to the sentinel `"unknown"`** — call sites
+    /// that know the alias should use [`Conversation::new_with_alias`]
+    /// (which stamps the right value) or set
+    /// `metadata.model_alias` immediately after construction. Tests
+    /// that don't care about alias-driven `/load` may use this directly.
     pub fn new(name: String, model: String) -> Self {
+        Self::new_with_alias(name, model, default_unknown_alias())
+    }
+
+    /// Create a new conversation, stamping the user-facing model alias
+    /// into the metadata. This is the production constructor — callers
+    /// in the boot path, `/new` handler, and `/model` switch must use
+    /// this so `/load` can later reactivate the right model.
+    pub fn new_with_alias(name: String, model: String, model_alias: String) -> Self {
         let now = Utc::now();
+        let metadata = ConversationMetadata {
+            model_alias,
+            ..ConversationMetadata::default()
+        };
         Conversation {
             id: Uuid::new_v4(),
             name,
@@ -158,7 +214,7 @@ impl Conversation {
             updated_at: now,
             messages: Vec::new(),
             model,
-            metadata: ConversationMetadata::default(),
+            metadata,
         }
     }
 
@@ -218,8 +274,18 @@ pub struct ConversationSummary {
     pub updated_at: DateTime<Utc>,
     /// Number of messages
     pub message_count: usize,
-    /// Model used
+    /// Model wire id used (e.g. `anthropic/claude-3.7-sonnet`).
     pub model: String,
+    /// User-facing model alias (the handle from
+    /// [`crate::config::ModelRegistry`]). Pre-v4 files default to
+    /// `"unknown"`. Used by `/conversations` to mark unavailable
+    /// rows and by `/load` to validate before activation.
+    #[serde(default = "default_summary_alias")]
+    pub model_alias: String,
+}
+
+fn default_summary_alias() -> String {
+    "unknown".to_string()
 }
 
 impl From<&Conversation> for ConversationSummary {
@@ -231,6 +297,7 @@ impl From<&Conversation> for ConversationSummary {
             updated_at: conv.updated_at,
             message_count: conv.metadata.message_count,
             model: conv.model.clone(),
+            model_alias: conv.metadata.model_alias.clone(),
         }
     }
 }
@@ -371,5 +438,62 @@ mod tests {
             Message::ToolResult { call_id, .. } => assert!(call_id.is_none()),
             other => panic!("Expected ToolResult, got {:?}", other),
         }
+    }
+
+    // === v4: model_alias persistence + pre-v4 fallback ===============
+
+    /// Pre-v4 conversation files don't have `model_alias` in their
+    /// metadata. Loading them must default to the reserved `"unknown"`
+    /// sentinel — `/load` then rejects with the canonical error rather
+    /// than guessing a model.
+    #[test]
+    fn pre_v4_metadata_loads_with_unknown_alias() {
+        let json = r#"{
+            "id": "10da8b9d-f242-4786-9c75-c3fbc2530f1f",
+            "name": "Old convo",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "messages": [],
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {"message_count": 0}
+        }"#;
+        let conv: Conversation = serde_json::from_str(json).unwrap();
+        assert_eq!(conv.metadata.model_alias, "unknown");
+    }
+
+    /// The `serde(default)` literal MUST equal the
+    /// [`crate::config::RESERVED_UNAVAILABLE_ALIAS`] constant. If
+    /// either drifts, pre-v4 files would deserialize to a sentinel
+    /// `/load` doesn't recognise, breaking the locked failure path.
+    #[test]
+    fn pre_v4_default_matches_reserved_unavailable_alias() {
+        assert_eq!(
+            super::default_unknown_alias(),
+            crate::config::RESERVED_UNAVAILABLE_ALIAS
+        );
+    }
+
+    /// New conversations stamped via `new_with_alias` round-trip the
+    /// alias through serde without loss.
+    #[test]
+    fn new_with_alias_roundtrips_through_serde() {
+        let conv = Conversation::new_with_alias(
+            "Test".into(),
+            "anthropic/claude-3.7-sonnet".into(),
+            "sonnet".into(),
+        );
+        let json = serde_json::to_string(&conv).unwrap();
+        let parsed: Conversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.metadata.model_alias, "sonnet");
+        assert_eq!(parsed.model, "anthropic/claude-3.7-sonnet");
+    }
+
+    /// Default constructor stamps the unknown sentinel — keeps test
+    /// helpers compatible without forcing every site through
+    /// `new_with_alias`.
+    #[test]
+    fn legacy_new_constructor_stamps_unknown_alias() {
+        let conv = Conversation::new("Test".into(), "test-model".into());
+        assert_eq!(conv.metadata.model_alias, "unknown");
     }
 }

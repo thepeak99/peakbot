@@ -692,6 +692,20 @@ impl StateManager {
         self.notify_update(&state);
     }
 
+    /// Set the active model alias (the user-facing handle).
+    /// Called at boot and on `/model` switch — paired with `set_model`
+    /// (alias + wire id are stamped together).
+    pub fn set_model_alias(&self, alias: String) {
+        let mut state = self.state.write().unwrap();
+        state.stats.model_alias = alias;
+        self.notify_update(&state);
+    }
+
+    /// Get the current model alias (empty string if unset).
+    pub fn get_model_alias(&self) -> String {
+        self.state.read().unwrap().stats.model_alias.clone()
+    }
+
     /// Update context state
     pub fn update_context(&self, context_state: ContextState) {
         let mut state = self.state.write().unwrap();
@@ -790,6 +804,15 @@ impl StateManager {
         *self.current_conversation.lock().unwrap() = Some(conv);
     }
 
+    /// Create a new conversation that records the model alias on its
+    /// metadata. Production constructor — call from boot, `/new`, and
+    /// `/model` switch so the saved file later round-trips to the
+    /// right model on `/load`. See `multi-model.md`.
+    pub fn create_conversation_with_alias(&self, name: String, model: String, model_alias: String) {
+        let conv = Conversation::new_with_alias(name, model, model_alias);
+        *self.current_conversation.lock().unwrap() = Some(conv);
+    }
+
     /// List all saved conversations
     pub fn list_conversations(&self) -> Option<Vec<ConversationSummary>> {
         self.storage.as_ref().and_then(|s| s.list().ok())
@@ -803,6 +826,22 @@ impl StateManager {
             self.sync_from_conversation();
         }
         Ok(())
+    }
+
+    /// Peek at a saved conversation's `model_alias` without loading
+    /// it into the current slot. Used by `/load` for the pre-flight
+    /// availability check — the current conversation must survive a
+    /// rejected load with no partial-state teardown. Returns the
+    /// reserved sentinel `"unknown"` for pre-v4 files (the
+    /// `#[serde(default)]` on `ConversationMetadata.model_alias`
+    /// makes that automatic).
+    pub fn peek_conversation_alias(&self, id: Uuid) -> anyhow::Result<String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
+        let conv = storage.load(id)?;
+        Ok(conv.metadata.model_alias)
     }
 
     /// Get the current conversation ID

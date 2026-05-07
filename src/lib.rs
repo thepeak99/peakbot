@@ -19,8 +19,9 @@ pub mod vision;
 
 pub use config::{
     AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig,
-    McpTransportType, OllamaConfig, OpenRouterConfig, PipelineConfig, ProviderConfig, ProviderType,
-    RetryConfig, SearXngConfig,
+    McpTransportType, ModelEntry, ModelRegistry, OllamaConfig, OpenRouterConfig, PipelineConfig,
+    ProviderConfig, ProviderEntry, ProviderType, RESERVED_UNAVAILABLE_ALIAS, RegistryError,
+    ResolvedModel, RetryConfig, SearXngConfig,
 };
 pub use context_manager::CompactionResult;
 use context_manager::ContextManager;
@@ -76,6 +77,11 @@ enum QueueMessage {
     },
     Command(String),
     StopMarker, // Signals that stop was requested
+    /// Switch the active model and restart on a fresh conversation.
+    /// Carries the validated alias (validation happens in the View
+    /// before the action is sent). The agent loop dequeues this between
+    /// turns and runs `rebuild_agent_for_alias`.
+    SwitchModel(String),
 }
 
 /// How should a submitted input buffer be routed by the event loop?
@@ -244,6 +250,40 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
     messages
 }
 
+/// Bundle of construction deps the agent loop needs to rebuild
+/// `DynAgent` on a `/model` switch. All fields are model-agnostic and
+/// stay alive for the entire process lifetime — only the agent itself
+/// is replaced. `mcp_handles` is kept around explicitly so MCP
+/// subprocesses survive a switch (rebuilt tool list, same processes).
+///
+/// `None` for any field means "don't try to switch models" (the
+/// `/model` command will be inert because no registry is attached, or
+/// agent-loop will surface an error if the user somehow gets a
+/// `SwitchModel` action through). Production boot in `main.rs` always
+/// populates this.
+pub struct RebuildContext {
+    pub registry: Arc<crate::config::ModelRegistry>,
+    pub system_prompt: String,
+    pub mcp_handles: Arc<Vec<McpServerHandle>>,
+    pub searxng_config: Option<crate::config::SearXngConfig>,
+    pub max_turns: usize,
+    pub todo_tool: Option<crate::tools::TodoTool>,
+    pub bash_config: crate::config::BashConfig,
+    pub pipeline_registry: Option<Arc<crate::pipeline::SubAgentRegistry>>,
+}
+
+/// Shared cell holding the *currently active* SessionHook. Replaced
+/// in-place by the agent loop on `/model` rebuild; the event loop's
+/// `/stop` path reads through the cell so it always cancels the
+/// active prompt's hook, never a stale predecessor. Reads clone the
+/// inner Arc immediately so the guard never spans an await point.
+pub type SharedSessionHook = Arc<std::sync::RwLock<Arc<SessionHook>>>;
+
+/// Shared cell holding the *currently active* `ProviderInfo`. Same
+/// shape and reasoning as [`SharedSessionHook`] — needed for the
+/// vision-capability gate in the multimodal arm of `event_loop`.
+pub type SharedProviderInfo = Arc<std::sync::RwLock<Arc<ProviderInfo>>>;
+
 /// AgentRunner — the Controller in MVC.
 ///
 /// Receives input (UiAction) from Views, calls the agent, writes results to
@@ -259,6 +299,10 @@ pub struct AgentRunner {
     session_hook: Arc<SessionHook>,
     // Retained for streaming output handler (view concern, set up by main.rs)
     event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    /// Optional rebuild deps for `/model` switching. Set by
+    /// [`AgentRunner::with_rebuild_context`] from `main.rs` after
+    /// construction. When `None`, `/model` is a no-op.
+    rebuild_ctx: Option<RebuildContext>,
 }
 
 impl AgentRunner {
@@ -301,7 +345,16 @@ impl AgentRunner {
             state_manager,
             session_hook,
             event_receiver,
+            rebuild_ctx: None,
         }
+    }
+
+    /// Attach a [`RebuildContext`] so `/model` switches can rebuild
+    /// the agent in-place between turns. Builder-style — returns
+    /// `self` for chaining off `AgentRunner::new(…)`.
+    pub fn with_rebuild_context(mut self, ctx: RebuildContext) -> Self {
+        self.rebuild_ctx = Some(ctx);
+        self
     }
 
     /// Force context compaction
@@ -342,34 +395,38 @@ impl AgentRunner {
 
         // Extract fields we need to pass to spawned loops
         let state_manager = self.state_manager.clone();
-        let session_hook = self.session_hook.clone();
         let config_model = self.config.model().to_string();
         let agent = self.agent.clone();
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
         let event_receiver = self.event_receiver.take();
-        let provider_info = Arc::new(self.provider_info.clone());
+        // Shared cells for state that swaps on `/model` rebuild. The
+        // event loop reads through these so `/stop` always cancels the
+        // active prompt and the multimodal-vision gate always reflects
+        // the active model. See [`SharedSessionHook`] / [`SharedProviderInfo`].
+        let session_hook_cell: SharedSessionHook =
+            Arc::new(std::sync::RwLock::new(self.session_hook.clone()));
+        let provider_info_cell: SharedProviderInfo =
+            Arc::new(std::sync::RwLock::new(Arc::new(self.provider_info.clone())));
+        // The rebuild context is consumed once into the agent loop. If
+        // it's `None`, `/model` switches are inert (the loop emits a
+        // system-message error if a `SwitchModel` action somehow
+        // arrives).
+        let rebuild_ctx = self.rebuild_ctx.take();
 
-        // Spawn event processor task (Phase 2: wire the event channel)
-        let event_processor_handle = tokio::spawn({
-            let state_manager = state_manager.clone();
-
-            async move {
-                if let Some(mut receiver) = event_receiver {
-                    while let Some(event) = receiver.recv().await {
-                        // Process event and update StateManager — the Controller (AgentRunner)
-                        // decides how events affect state, not the Model (StateManager)
-                        Self::process_event_for_ui(&state_manager, event);
-                    }
-                }
-            }
-        });
-
-        // Spawn the two loops
+        // Spawn the two loops.
+        //
+        // Note: the per-event processor task used to live here (it
+        // consumed `event_receiver` and forwarded events to the
+        // `StateManager`). It now runs *inside* the agent loop so it
+        // can be torn down and respawned with the fresh receiver
+        // produced by a `/model` rebuild. See `agent_loop`.
         let event_handle = tokio::spawn({
             let msg_tx = msg_tx.clone();
             let completion_tx = completion_tx.clone();
             let drain_requested = drain_requested.clone();
+            let session_hook_cell = session_hook_cell.clone();
+            let provider_info_cell = provider_info_cell.clone();
 
             async move {
                 Self::event_loop(
@@ -377,9 +434,9 @@ impl AgentRunner {
                     msg_tx,
                     completion_tx,
                     state_manager,
-                    session_hook,
+                    session_hook_cell,
                     config_model,
-                    provider_info,
+                    provider_info_cell,
                     drain_requested,
                 )
                 .await;
@@ -390,6 +447,8 @@ impl AgentRunner {
             let msg_rx = tokio::sync::Mutex::new(msg_rx);
             let completion_tx = completion_tx.clone();
             let drain_requested = drain_requested.clone();
+            let session_hook_cell = session_hook_cell.clone();
+            let provider_info_cell = provider_info_cell.clone();
 
             async move {
                 Self::agent_loop(
@@ -399,6 +458,10 @@ impl AgentRunner {
                     agent,
                     config_for_agent,
                     drain_requested,
+                    event_receiver,
+                    session_hook_cell,
+                    provider_info_cell,
+                    rebuild_ctx,
                 )
                 .await;
             }
@@ -406,7 +469,6 @@ impl AgentRunner {
 
         // Wait for event loop to exit (View closed)
         event_handle.await.ok();
-        event_processor_handle.abort();
         agent_handle.abort();
     }
 
@@ -429,23 +491,28 @@ impl AgentRunner {
         msg_tx: tokio::sync::mpsc::Sender<QueueMessage>,
         _completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
         state_manager: Option<Arc<StateManager>>,
-        session_hook: Arc<SessionHook>,
+        session_hook_cell: SharedSessionHook,
         config_model: String,
-        provider_info: Arc<ProviderInfo>,
+        provider_info_cell: SharedProviderInfo,
         drain_requested: Arc<std::sync::atomic::AtomicBool>,
     ) {
         use std::sync::atomic::Ordering;
 
         // Helper: trigger a full /stop. Sets the drain flag, signals the
         // running agent to cancel, sends StopMarker, and zeroes the queued
-        // counter so the status bar updates immediately.
+        // counter so the status bar updates immediately. Reads the
+        // *currently active* SessionHook through the shared cell so it
+        // always cancels the live prompt — not a stale predecessor from
+        // before a `/model` switch.
         let request_stop_and_drain =
             |state_manager: &Option<Arc<StateManager>>,
-             session_hook: &Arc<SessionHook>,
+             session_hook_cell: &SharedSessionHook,
              msg_tx: &tokio::sync::mpsc::Sender<QueueMessage>,
              drain_requested: &Arc<std::sync::atomic::AtomicBool>| {
                 let sm = state_manager.clone();
-                let session_hook = session_hook.clone();
+                // Clone the inner Arc out of the read guard before any
+                // await — we never want the guard to span an await point.
+                let session_hook = session_hook_cell.read().unwrap().clone();
                 let msg_tx = msg_tx.clone();
                 let drain_requested = drain_requested.clone();
                 async move {
@@ -481,7 +548,7 @@ impl AgentRunner {
                         SubmitKind::StopCommand => {
                             request_stop_and_drain(
                                 &state_manager,
-                                &session_hook,
+                                &session_hook_cell,
                                 &msg_tx,
                                 &drain_requested,
                             )
@@ -510,14 +577,19 @@ impl AgentRunner {
                         }
                         SubmitKind::MultimodalMessage { text, attachments } => {
                             // Capability guardrail — fail loud rather than drop images silently.
-                            if !provider_info.supports_vision {
+                            // Read the active provider_info through the
+                            // shared cell so a `/model` switch to a
+                            // vision-capable model takes effect
+                            // immediately without process restart.
+                            let pi = provider_info_cell.read().unwrap().clone();
+                            if !pi.supports_vision {
                                 if let Some(ref sm) = state_manager {
                                     sm.add_system_message(format!(
                                         "❌ Model `{}` does not support vision. Switch to a \
                                          vision-capable model in config.yaml (e.g. \
                                          `anthropic/claude-3.5-sonnet`, `gpt-4o`, \
                                          `google/gemini-2.0-flash-001`).",
-                                        provider_info.model
+                                        pi.model
                                     ));
                                 }
                                 continue;
@@ -546,11 +618,24 @@ impl AgentRunner {
                     // Esc key — same shape as /stop. Stop means stop, queue is dropped.
                     request_stop_and_drain(
                         &state_manager,
-                        &session_hook,
+                        &session_hook_cell,
                         &msg_tx,
                         &drain_requested,
                     )
                     .await;
+                }
+
+                UiAction::SwitchModel(alias) => {
+                    // Forward the validated alias to the agent loop. The
+                    // agent loop is the single owner of the agent handle,
+                    // so the rebuild has to happen there. Counts as a
+                    // pending input so the status bar shows activity until
+                    // the new agent is up. (`decrement_pending_input` is
+                    // called after the rebuild completes.)
+                    if let Some(ref sm) = state_manager {
+                        sm.increment_pending_input();
+                    }
+                    msg_tx.send(QueueMessage::SwitchModel(alias)).await.ok();
                 }
             }
         }
@@ -570,15 +655,42 @@ impl AgentRunner {
     /// `UserMessage`/`Command` items are discarded until the matching
     /// `StopMarker` is consumed; the flag is then cleared. /stop = stop,
     /// queued follow-ups are dropped along with the in-flight turn.
+    #[allow(clippy::too_many_arguments)] // agent_loop owns rebuild + event-processor lifecycle
     async fn agent_loop(
         msg_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<QueueMessage>>,
         completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
         state_manager: Option<Arc<StateManager>>,
-        agent: Arc<DynAgent>,
-        config: Config,
+        initial_agent: Arc<DynAgent>,
+        mut config: Config,
         drain_requested: Arc<std::sync::atomic::AtomicBool>,
+        initial_event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+        session_hook_cell: SharedSessionHook,
+        provider_info_cell: SharedProviderInfo,
+        rebuild_ctx: Option<RebuildContext>,
     ) {
         use std::sync::atomic::Ordering;
+
+        // The agent reference is `mut` here — `/model` rebuilds it
+        // in-place between turns. `provider_info_cell` and
+        // `session_hook_cell` are mirrored into the live event_loop.
+        let mut agent = initial_agent;
+
+        // The event-processor task pulls AgentEvents off the
+        // receiver and forwards them into StateManager. It used to
+        // live in `run_loop` but now lives here so we can tear it
+        // down and respawn it whenever a `/model` rebuild produces a
+        // fresh receiver. The handle is `Some` while a processor is
+        // active.
+        let mut event_processor: Option<tokio::task::JoinHandle<()>> =
+            initial_event_receiver.map(|rx| {
+                let sm = state_manager.clone();
+                tokio::spawn(async move {
+                    let mut rx = rx;
+                    while let Some(event) = rx.recv().await {
+                        Self::process_event_for_ui(&sm, event);
+                    }
+                })
+            });
 
         loop {
             // Wait for a message
@@ -599,9 +711,13 @@ impl AgentRunner {
                         completion_tx.send(CompletionResult::Stopped).ok();
                         continue;
                     }
-                    Some(QueueMessage::UserMessage { .. }) | Some(QueueMessage::Command(_)) => {
+                    Some(QueueMessage::UserMessage { .. })
+                    | Some(QueueMessage::Command(_))
+                    | Some(QueueMessage::SwitchModel(_)) => {
                         // Discarded — pending counter was already zeroed by
-                        // the event loop's drain trigger.
+                        // the event loop's drain trigger. (SwitchModel is
+                        // included for safety; in practice the View only
+                        // emits it between turns when nothing is running.)
                         continue;
                     }
                     None => break,
@@ -681,12 +797,221 @@ impl AgentRunner {
                     completion_tx.send(CompletionResult::Stopped).ok();
                 }
 
+                Some(QueueMessage::SwitchModel(alias)) => {
+                    // Per the locked plan in `multi-model.md`: `/model`
+                    // is `/new` + boot the agent against a different
+                    // ProviderConfig. The View has already validated
+                    // the alias before sending the `UiAction`, so we
+                    // trust it here — but we still re-resolve in case
+                    // the config has been hot-reloaded under us, and
+                    // emit a clean error if so.
+                    if let Some(ref sm) = state_manager {
+                        sm.set_running(true);
+                    }
+                    let outcome = Self::handle_switch_model(
+                        &alias,
+                        &mut agent,
+                        &mut config,
+                        &state_manager,
+                        &session_hook_cell,
+                        &provider_info_cell,
+                        &mut event_processor,
+                        rebuild_ctx.as_ref(),
+                    )
+                    .await;
+                    if let Some(ref sm) = state_manager {
+                        sm.decrement_pending_input();
+                        sm.set_running(false);
+                    }
+                    match outcome {
+                        Ok(()) => {
+                            completion_tx.send(CompletionResult::CommandDone).ok();
+                        }
+                        Err(msg) => {
+                            if let Some(ref sm) = state_manager {
+                                sm.add_system_message(format!("❌ /model: {msg}"));
+                            }
+                            completion_tx.send(CompletionResult::CommandDone).ok();
+                        }
+                    }
+                }
+
                 None => {
                     // Channel closed, exit
+                    if let Some(handle) = event_processor.take() {
+                        handle.abort();
+                    }
                     break;
                 }
             }
         }
+    }
+
+    /// Rebuild the live `DynAgent` for a new model alias. Runs the
+    /// same conversation-reset semantics as `/new`, then constructs a
+    /// fresh `DynAgent` against the resolved provider config and
+    /// publishes the new ProviderInfo + SessionHook through their
+    /// shared cells. Restarts the event-processor task to consume
+    /// from the new event channel.
+    ///
+    /// On error (unknown alias, build failure), returns a string
+    /// describing the failure for the caller to surface as a system
+    /// message; the previous agent is left intact.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_switch_model(
+        alias: &str,
+        agent_slot: &mut Arc<DynAgent>,
+        config: &mut Config,
+        state_manager: &Option<Arc<StateManager>>,
+        session_hook_cell: &SharedSessionHook,
+        provider_info_cell: &SharedProviderInfo,
+        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
+        rebuild_ctx: Option<&RebuildContext>,
+    ) -> Result<(), String> {
+        let Some(ctx) = rebuild_ctx else {
+            return Err(
+                "model registry not configured (legacy single-provider boot — restart with a \
+                 `providers:` block to enable model switching)"
+                    .to_string(),
+            );
+        };
+        let Some(resolved) = ctx.registry.resolve(alias) else {
+            let available = ctx.registry.aliases_sorted().join(", ");
+            return Err(format!("unknown alias `{alias}`. Available: {available}"));
+        };
+
+        // Rebuild MCP tool list from the long-lived handles. McpTool
+        // implements Clone (rig 0.33), so we get a fresh Vec without
+        // restarting any subprocess. See agents.md / multi-model.md.
+        let mcp_tools: Option<Vec<Box<dyn rig::tool::ToolDyn>>> = if ctx.mcp_handles.is_empty() {
+            None
+        } else {
+            let mut all = Vec::new();
+            for h in ctx.mcp_handles.iter() {
+                for t in h.tools().iter().cloned() {
+                    all.push(Box::new(t) as Box<dyn rig::tool::ToolDyn>);
+                }
+            }
+            Some(all)
+        };
+
+        // Compute context window from the new model name.
+        let new_model = resolved.model_name.clone();
+        let context_window = resolved.context_window_override.unwrap_or_else(|| {
+            match new_model.to_lowercase().as_str() {
+                m if m.contains("claude-3.7-sonnet") => 200_000,
+                m if m.contains("claude-3.5-sonnet") => 200_000,
+                m if m.contains("claude-3-opus") => 200_000,
+                m if m.contains("claude-3-sonnet") => 200_000,
+                m if m.contains("claude-3-haiku") => 200_000,
+                m if m.contains("gpt-4o") => 128_000,
+                m if m.contains("gpt-4-turbo") => 128_000,
+                m if m.contains("gpt-4-32k") => 32_768,
+                m if m.contains("gpt-4") => 8_192,
+                m if m.contains("gpt-3.5-turbo") => 16_385,
+                m if m.contains("gemini-2.0") => 1_000_000,
+                m if m.contains("gemini-1.5-pro") => 2_000_000,
+                m if m.contains("gemini-1.5-flash") => 1_000_000,
+                _ => 128_000,
+            }
+        });
+
+        let sm_for_provider = state_manager
+            .clone()
+            .ok_or_else(|| "state manager required for /model".to_string())?;
+
+        let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
+            &resolved.provider_config,
+            &config.context,
+            context_window,
+            mcp_tools,
+            &ctx.system_prompt,
+            ctx.searxng_config.as_ref(),
+            ctx.max_turns,
+            ctx.todo_tool.clone(),
+            &ctx.bash_config,
+            ctx.pipeline_registry.as_deref(),
+            sm_for_provider.clone(),
+        )
+        .map_err(|e| format!("failed to build agent for `{alias}`: {e}"))?;
+
+        // Publish through the shared cells *first* so the event_loop's
+        // /stop and vision-gate paths immediately see the new state.
+        {
+            let mut hook_guard = session_hook_cell.write().unwrap();
+            *hook_guard = new_hook;
+        }
+        {
+            let mut pi_guard = provider_info_cell.write().unwrap();
+            *pi_guard = Arc::new(new_info.clone());
+        }
+        *agent_slot = Arc::new(new_agent);
+
+        // Update Config so subsequent reads of provider/model see the
+        // new values. We swap the active provider; everything else
+        // (mcp_servers, searxng, context, retry, …) stays put.
+        config.provider = resolved.provider_config.clone();
+
+        // Reset conversation-scoped state — same path as /new. Stamps
+        // the new alias on the metadata so /load on the freshly-reset
+        // convo (after the next prompt) restores the right model.
+        sm_for_provider.clear_chat();
+        sm_for_provider.reset_stats();
+        sm_for_provider.clear_all_todos();
+        let convo_name = format!(
+            "Conversation {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M")
+        );
+        sm_for_provider.create_conversation_with_alias(
+            convo_name,
+            new_model.clone(),
+            resolved.alias.clone(),
+        );
+        sm_for_provider.set_model(new_model.clone());
+        sm_for_provider.set_model_alias(resolved.alias.clone());
+
+        // Re-init the context manager against the new model name so
+        // compaction thresholds match the new context window.
+        let compaction_model = crate::providers::create_compaction_model(
+            &resolved.provider_config,
+            config.context.compaction_model.as_deref(),
+        )
+        .ok()
+        .map(Arc::new);
+        let cm = ContextManager::new(
+            config.context.clone(),
+            new_model.as_str(),
+            sm_for_provider.clone(),
+            compaction_model,
+        );
+        sm_for_provider.init_context_manager(cm, ctx.system_prompt.clone());
+
+        // Restart the event-processor task on the new receiver. The
+        // receiver is `Option` because not every provider supports
+        // event hooks (Ollama returns `None`); skip the spawn in that
+        // case and we'll just have no event-driven UI updates.
+        if let Some(handle) = event_processor.take() {
+            handle.abort();
+        }
+        if let Some(rx) = new_receiver {
+            let sm_for_processor = state_manager.clone();
+            *event_processor = Some(tokio::spawn(async move {
+                let mut rx = rx;
+                while let Some(event) = rx.recv().await {
+                    Self::process_event_for_ui(&sm_for_processor, event);
+                }
+            }));
+        }
+
+        // Announce the swap with a short banner so the user sees it
+        // happened. Format mirrors the listing format from
+        // process_command_internal::"/model".
+        sm_for_provider.add_system_message(format!(
+            "🔁 New conversation on {} ({} · {})",
+            resolved.alias, resolved.provider_name, resolved.model_name
+        ));
+
+        Ok(())
     }
 
     /// Process an AgentEvent and update StateManager accordingly.
@@ -895,6 +1220,14 @@ impl AgentRunner {
                         Some(mut list) => {
                             list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                             let current_id = sm.get_current_conversation_id();
+                            // Build the registry once for the whole listing
+                            // so each row's availability tag is a cheap
+                            // hash lookup. If no providers list is
+                            // declared, registry is empty and *every*
+                            // saved alias is treated as unknown — which
+                            // is correct: legacy single-provider boot
+                            // can't reactivate any specific saved model.
+                            let registry = config.build_model_registry().ok();
                             let mut msg = format!("Saved conversations ({}):\n", list.len());
                             for (idx, c) in list.iter().enumerate() {
                                 let n = idx + 1;
@@ -902,6 +1235,20 @@ impl AgentRunner {
                                     "▶ "
                                 } else {
                                     "   "
+                                };
+                                let alias_tag = match &registry {
+                                    Some(reg) if reg.contains(&c.model_alias) => {
+                                        c.model_alias.clone()
+                                    }
+                                    Some(_) => format!(
+                                        "{} ⚠ unavailable",
+                                        if c.model_alias == "unknown" {
+                                            "(pre-v4)".to_string()
+                                        } else {
+                                            c.model_alias.clone()
+                                        }
+                                    ),
+                                    None => c.model_alias.clone(),
                                 };
                                 msg.push_str(&format!(
                                     "{}{:>3}  {}  {} msgs  {}  {}\n",
@@ -912,7 +1259,7 @@ impl AgentRunner {
                                     c.updated_at
                                         .with_timezone(&chrono::Local)
                                         .format("%Y-%m-%d %H:%M"),
-                                    c.model,
+                                    alias_tag,
                                 ));
                             }
                             msg.push_str(
@@ -1009,6 +1356,29 @@ impl AgentRunner {
                             return;
                         }
                     };
+
+                    // Pre-flight model alias check: peek at the saved
+                    // file's `model_alias` BEFORE any teardown so the
+                    // current conversation survives a failed load. If
+                    // the alias is `unknown` (pre-v4 file) or no
+                    // longer present in the registry, fail clean.
+                    // *(make illegal states unrepresentable at the
+                    // operation level)*
+                    let saved_alias = match sm.peek_conversation_alias(id) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            sm.add_system_message(format!("❌ Failed to read conversation: {e}"));
+                            return;
+                        }
+                    };
+                    if let Ok(registry) = config.build_model_registry()
+                        && !registry.is_empty()
+                        && !registry.contains(&saved_alias)
+                    {
+                        sm.add_system_message(format!("❌ Model '{saved_alias}' not available."));
+                        return;
+                    }
+
                     match sm.load_conversation(id) {
                         Ok(()) => {
                             if let Some(conv) = sm.get_current_conversation() {
@@ -1092,6 +1462,61 @@ impl AgentRunner {
                     } else {
                         tracing::warn!("State manager not available for /rename command");
                     }
+                }
+            }
+            // `/model` — list available models (with the active one
+            // marked). Switching is intercepted in the View *before*
+            // this point: see `ReplUi::try_intercept_model_command`.
+            // This handler only runs for the bare `/model` (no arg)
+            // case, so the listing path is the canonical fall-through.
+            "/model" => {
+                let Some(sm) = state_manager else {
+                    tracing::warn!("State manager not available for /model command");
+                    return;
+                };
+                let registry = match config.build_model_registry() {
+                    Ok(reg) => reg,
+                    Err(e) => {
+                        sm.add_system_message(format!(
+                            "❌ /model: model registry not configured: {e}"
+                        ));
+                        return;
+                    }
+                };
+                let aliases = registry.aliases_sorted();
+                if aliases.is_empty() {
+                    sm.add_system_message(
+                        "No models declared. Add a `providers:` block to config.yaml. See `multi-model.md`."
+                            .to_string(),
+                    );
+                    return;
+                }
+                let current = sm.get_model_alias();
+                let mut msg = String::from("Available models:\n");
+                for alias in &aliases {
+                    let arrow = if &current == alias { "→ " } else { "  " };
+                    if let Some(resolved) = registry.resolve(alias) {
+                        msg.push_str(&format!(
+                            "{arrow}{alias}  ({} · {})\n",
+                            resolved.provider_name, resolved.model_name
+                        ));
+                    }
+                }
+                msg.push_str("\nUse /model <alias> to switch (starts a new conversation).");
+                sm.add_system_message(msg);
+            }
+            _ if cmd_lower.starts_with("/model ") => {
+                // The View should have intercepted this before it
+                // reached us. If we get here, the View has no
+                // registry attached (legacy single-provider boot or
+                // test harness) — emit a helpful diagnostic instead
+                // of silent inertness.
+                if let Some(sm) = state_manager {
+                    sm.add_system_message(
+                        "❌ /model: not available in this build. Configure a `providers:` \
+                         block in config.yaml and restart. See `multi-model.md`."
+                            .to_string(),
+                    );
                 }
             }
             _ => {
@@ -1495,7 +1920,15 @@ mod tests {
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
         let mut out = Vec::new();
         for (name, hours_ago) in specs {
-            let mut conv = Conversation::new((*name).to_string(), "test-model".to_string());
+            // Seed with `default` alias so the post-v4 `/load` pre-flight
+            // alias check (which validates against the legacy synthesised
+            // registry) accepts these fixtures. The legacy `provider:`
+            // path produces a one-entry registry with alias `default`.
+            let mut conv = Conversation::new_with_alias(
+                (*name).to_string(),
+                "test-model".to_string(),
+                "default".to_string(),
+            );
             conv.updated_at = Utc::now() - chrono::Duration::hours(*hours_ago);
             storage.save(&conv).expect("seed save");
             out.push((name.to_string(), conv.id));
@@ -1690,6 +2123,80 @@ mod tests {
             body.contains("Invalid argument"),
             "expected resolver's invalid-argument message, got:\n{}",
             body
+        );
+    }
+
+    /// `/load` of a saved conversation whose model_alias is no longer
+    /// in the registry must reject the load with the canonical
+    /// `Model 'xyz' not available.` error AND leave the previously
+    /// active conversation untouched. Locked plan v4 §"/load
+    /// model-aware activation". Pinned by
+    /// `load_with_unavailable_alias_returns_clean_error_and_does_not_teardown`.
+    #[tokio::test]
+    async fn load_with_unavailable_alias_returns_clean_error_and_does_not_teardown() {
+        use crate::conversation::Conversation;
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        // Seed one convo with an alias the legacy registry doesn't have.
+        let mut conv = Conversation::new_with_alias(
+            "Stranger".to_string(),
+            "test-model".to_string(),
+            "ghost".to_string(),
+        );
+        conv.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        storage.save(&conv).expect("seed save");
+        let saved_id = conv.id;
+        let sm = StateManager::new_arc_with_storage(storage);
+
+        // Pre-state: no current conversation loaded.
+        assert!(sm.get_current_conversation_id().is_none());
+
+        let config = Config::default();
+        let cmd = format!("/load {saved_id}");
+        AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
+
+        let body = last_system_msg(&sm);
+        assert!(
+            body.contains("Model 'ghost' not available."),
+            "expected canonical unavailable-model error, got:\n{body}"
+        );
+        // Critical: the failed load must NOT have torn down whatever
+        // was previously current. Since pre-state was None, current
+        // must still be None.
+        assert!(
+            sm.get_current_conversation_id().is_none(),
+            "failed /load must leave current conversation untouched"
+        );
+    }
+
+    /// Pre-v4 conversations on disk default to alias `unknown`; that
+    /// sentinel is reserved at config-load time so it can never appear
+    /// in a registry. `/load` therefore rejects them with the canonical
+    /// error (the user is expected to retire them or reattach the right
+    /// alias by hand).
+    #[tokio::test]
+    async fn load_pre_v4_file_treated_as_unavailable() {
+        use crate::conversation::Conversation;
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        // Seed a "pre-v4" file by stamping the unknown sentinel.
+        let mut conv = Conversation::new("Old".to_string(), "test-model".to_string());
+        conv.updated_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        assert_eq!(conv.metadata.model_alias, "unknown");
+        storage.save(&conv).expect("seed save");
+        let saved_id = conv.id;
+        let sm = StateManager::new_arc_with_storage(storage);
+
+        let config = Config::default();
+        let cmd = format!("/load {saved_id}");
+        AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
+
+        let body = last_system_msg(&sm);
+        assert!(
+            body.contains("Model 'unknown' not available."),
+            "expected canonical unavailable-model error for pre-v4 file, got:\n{body}"
         );
     }
 

@@ -21,19 +21,39 @@ async fn main() -> Result<()> {
     let skills_count = skills.len(); // Keep count before moving skills
     let system_prompt = build_system_prompt(&skills);
 
+    // Build the model registry. Two paths:
+    // - `providers:` list declared → multi-model, `/model` enabled.
+    // - Legacy `provider:` block → synthesised one-entry registry
+    //   with alias `default`. `/model default` is a no-op; the user
+    //   gets a "no other models declared" message if they try to
+    //   switch. See `multi-model.md`.
+    let model_registry = match config.build_model_registry() {
+        Ok(reg) => Arc::new(reg),
+        Err(e) => {
+            anyhow::bail!("Invalid model configuration: {e}");
+        }
+    };
+
     // Load MCP servers
     let mcp_handles = load_mcp_servers(&config).await?;
     let mcp_tools_count = mcp_handles.len(); // Keep count before moving handles
-    let mcp_tools = if mcp_handles.is_empty() {
+    // Wrap the handles in an Arc so the AgentRunner's RebuildContext
+    // can re-derive the tools list across `/model` switches without
+    // restarting the underlying subprocesses. McpTool: Clone (rig 0.33)
+    // makes the per-build tool list cheap.
+    let mcp_handles_arc = Arc::new(mcp_handles);
+    let mcp_tools = if mcp_handles_arc.is_empty() {
         None
     } else {
         let mut all_tools = Vec::new();
-        for handle in mcp_handles {
+        for handle in mcp_handles_arc.iter() {
             use rig::tool::ToolDyn;
-            // into_tools consumes the handle and returns tools, but the underlying
-            // MCP service connection will be properly closed when this handle is dropped.
-            // We use into_tools() since we don't need to explicitly control the service lifetime.
-            let tools: Vec<Box<dyn ToolDyn>> = handle.into_tools();
+            let tools: Vec<Box<dyn ToolDyn>> = handle
+                .tools()
+                .iter()
+                .cloned()
+                .map(|t| Box::new(t) as Box<dyn ToolDyn>)
+                .collect();
             all_tools.extend(tools);
         }
         Some(all_tools)
@@ -122,7 +142,7 @@ async fn main() -> Result<()> {
         &system_prompt,
         searxng_config,
         config.agent_max_turns,
-        Some(todo_tool),
+        Some(todo_tool.clone()),
         &config.bash,
         pipeline_registry.as_ref(),
         state_manager.clone(),
@@ -134,11 +154,33 @@ async fn main() -> Result<()> {
         provider_info.model
     );
 
-    // StateManager is already created above and shared with TodoTool
+    // StateManager is already created above and shared with TodoTool.
+    // Stamp both the wire id (`set_model`) and the alias (the active
+    // entry from the registry) so `/model` / `/load` / status bar all
+    // see consistent values from boot.
     state_manager.set_model(provider_info.model.clone());
+    let boot_alias = model_registry
+        .default_alias()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    state_manager.set_model_alias(boot_alias.clone());
 
     // Channel: View → Controller
     let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
+
+    // Build the rebuild context so /model can rebuild between turns
+    // without restarting the process. MCP handles, system prompt,
+    // builtins config, and the registry are all kept alive here.
+    let rebuild_ctx = peakbot::RebuildContext {
+        registry: model_registry.clone(),
+        system_prompt: system_prompt.clone(),
+        mcp_handles: mcp_handles_arc.clone(),
+        searxng_config: config.searxng.clone(),
+        max_turns: config.agent_max_turns,
+        todo_tool: Some(todo_tool),
+        bash_config: config.bash.clone(),
+        pipeline_registry: pipeline_registry.clone().map(Arc::new),
+    };
 
     // Create AgentRunner (Controller)
     let mut runner = AgentRunner::new(
@@ -149,7 +191,8 @@ async fn main() -> Result<()> {
         event_receiver,
         Some(state_manager.clone()),
         session_hook,
-    );
+    )
+    .with_rebuild_context(rebuild_ctx);
 
     // Set up welcome banner state
     state_manager.set_welcome(peakbot::ui::app_state::WelcomeState {
@@ -177,8 +220,11 @@ async fn main() -> Result<()> {
         runner.run_loop(action_receiver).await;
     });
 
-    // Run REPL View (blocking)
-    let mut ui = ReplUi::new(state_manager.clone(), action_sender);
+    // Run REPL View (blocking). Pass the model registry through so
+    // `/model <alias>` is intercepted, validated, and confirmed in
+    // the View before any UiAction is dispatched.
+    let mut ui =
+        ReplUi::new_with_registry(state_manager.clone(), action_sender, model_registry.clone());
     ui.init().await?;
     ui.run().await?;
     ui.shutdown().await?;

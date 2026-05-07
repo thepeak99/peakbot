@@ -35,6 +35,19 @@ pub enum UiAction {
 
     /// Request the agent to stop (Esc key).
     RequestStop,
+
+    /// Switch the active model and start a fresh conversation. Sent by
+    /// the View after the user confirms the `/model <alias>` dialog
+    /// (or directly, with no dialog, when the current conversation is
+    /// empty). The alias is already validated against the active
+    /// `ModelRegistry` before this action is emitted.
+    ///
+    /// This is the *only* code path that triggers a model switch — the
+    /// agent loop dequeues this action between turns, tears down the
+    /// existing `DynAgent`, runs the same reset semantics as `/new`,
+    /// and rebuilds with the chosen alias's `ProviderConfig`. See
+    /// `multi-model.md` and `process_command_internal::"/model"`.
+    SwitchModel(String),
 }
 
 /// Actions that can be performed on a TODO item (used by TodoState in app_state)
@@ -95,6 +108,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("delete", "Delete a conversation by id", true),
         SlashCommand::new("export", "Export a conversation (json|markdown)", true),
         SlashCommand::new("rename", "Rename the current conversation", true),
+        SlashCommand::new("model", "List models, or switch with /model <alias>", true),
         SlashCommand::new("stop", "Stop the agent (interrupt current task)", false),
         SlashCommand::new("exit", "Quit PeakBot (no confirmation)", false),
     ]
@@ -197,6 +211,7 @@ mod tests {
                 "delete",
                 "export",
                 "rename",
+                "model",
                 "stop",
                 "exit",
             ],

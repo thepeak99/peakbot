@@ -817,8 +817,16 @@ pub struct SessionState {
     /// Total cost in USD
     pub total_cost: f64,
 
-    /// Current model name
+    /// Current model name (wire id).
     pub model: String,
+
+    /// Current model alias (the user-facing handle from the
+    /// [`crate::config::ModelRegistry`]). May be empty in tests or in
+    /// the rare boot path where the legacy `provider:` block hasn't
+    /// been promoted yet — never trust this is non-empty without
+    /// checking. Production boot stamps this from the resolved model.
+    #[serde(default)]
+    pub model_alias: String,
 }
 
 impl SessionState {
