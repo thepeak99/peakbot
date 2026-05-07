@@ -14,8 +14,10 @@ pub enum FetchUrlError {
 
 #[derive(Deserialize)]
 pub struct FetchUrlArgs {
+    /// Optional reasoning narration. See `FileEditArgs.thought`.
+    #[serde(default)]
     #[allow(dead_code)]
-    thought: String,
+    thought: Option<String>,
     url: String,
 }
 
@@ -40,14 +42,14 @@ impl Tool for FetchUrlTool {
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
+                        "description": "Optional: briefly explain what you're about to do and why, for the user's logs. Safe to omit on long payloads."
                     },
                     "url": {
                         "type": "string",
                         "description": "The URL to fetch"
                     }
                 },
-                "required": ["thought", "url"]
+                "required": ["url"]
             }),
         }
     }
