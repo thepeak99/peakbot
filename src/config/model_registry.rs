@@ -57,9 +57,11 @@ pub struct ModelEntry {
     /// The wire id sent to the API (e.g. `gpt-4o`,
     /// `anthropic/claude-3.7-sonnet`, `qwen2.5-coder:14b`). No munging.
     pub name: String,
-    /// User-facing handle for `/model` and `/load`. Optional —
-    /// defaults to `name` if absent. Globally unique across all
-    /// providers; must match `^[A-Za-z0-9_./:-]+$`.
+    /// User-facing handle for `/model` and `/load`. **Optional — when
+    /// absent, the model is addressable only as
+    /// `<provider_name>/<model_name>` (the FULL qualified handle).
+    /// The bare model leaf alone is never accepted.** Globally unique
+    /// across all providers; must match `^[A-Za-z0-9_./:-]+$`.
     #[serde(default)]
     pub alias: Option<String>,
     /// Optional max-tokens override for this model.
@@ -171,17 +173,19 @@ impl ModelRegistry {
             for model in &prov.models {
                 // Canonical handle:
                 //   • alias if declared,
-                //   • else `<provider.name>/<leaf(model.name)>` — where
-                //     `leaf` is the segment after the last `/` of the
-                //     wire id (or the whole id if no `/` is present).
-                // This gives every unaliased model a provider-scoped
-                // handle without double-namespacing wire ids that
-                // already carry an org prefix
-                // (`minimax/MiniMax-M2.7` → `<prov>/MiniMax-M2.7`).
+                //   • else `<provider.name>/<model.name>` — the FULL
+                //     wire id, not a leaf-stripped form. This keeps
+                //     the auto-generated handle predictable from the
+                //     config alone (the user can construct the
+                //     `default_model:` value without reading source)
+                //     and preserves any namespace prefix the wire id
+                //     carries (`minimax/MiniMax-M2.7` →
+                //     `<prov>/minimax/MiniMax-M2.7`). *(principle of
+                //     least astonishment)*
                 let alias = model
                     .alias
                     .clone()
-                    .unwrap_or_else(|| format!("{}/{}", prov.name, leaf(&model.name)));
+                    .unwrap_or_else(|| format!("{}/{}", prov.name, model.name));
 
                 if alias == RESERVED_UNAVAILABLE_ALIAS {
                     return Err(RegistryError::ReservedAlias(alias));
@@ -308,18 +312,6 @@ fn is_valid_alias(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':'))
-}
-
-/// Extract the substring after the last `/` of a wire id, or the whole
-/// id if no `/` is present. Used to build the canonical handle for an
-/// unaliased model: `<provider.name>/<leaf(model.name)>`. Examples:
-///
-/// - `"minimax/MiniMax-M2.7"` → `"MiniMax-M2.7"`
-/// - `"gpt-4o"` → `"gpt-4o"`
-/// - `"qwen2.5-coder:14b"` → `"qwen2.5-coder:14b"` (no `/`, returned as-is)
-/// - `"mistralai/Mistral-7B-Instruct-v0.3"` → `"Mistral-7B-Instruct-v0.3"`
-fn leaf(s: &str) -> &str {
-    s.rsplit_once('/').map(|(_, leaf)| leaf).unwrap_or(s)
 }
 
 /// Translate a (provider entry, model entry) pair into the
@@ -473,6 +465,39 @@ mod tests {
         assert!(!reg.contains("o3"));
     }
 
+    /// Regression for the case where the wire id itself contains
+    /// slashes (e.g. `minimax/MiniMax-M2.7`). The user's reported
+    /// config used `default_model: patchnotes/minimax/MiniMax-M2.7`
+    /// and PeakBot must resolve it via the
+    /// `<provider_name>/<model_name>` rule — concatenation, not
+    /// "split by slash". The bare wire id (with its own slash)
+    /// must NOT be addressable. *(principle of least astonishment)*
+    #[test]
+    fn unaliased_wire_id_with_slash_keeps_provider_prefix() {
+        let prov = ProviderEntry {
+            name: "patchnotes".into(),
+            kind: ProviderType::LlamaCpp,
+            api_key: Some("sk-test".into()),
+            base_url: Some("https://ai.patchnotes.com/v1".into()),
+            models: vec![ModelEntry {
+                name: "minimax/MiniMax-M2.7".into(),
+                alias: None,
+                max_tokens: None,
+                temperature: None,
+                num_ctx: None,
+                extra_params: None,
+                context_window: None,
+            }],
+        };
+        let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
+            .expect("should build");
+        assert!(reg.contains("patchnotes/minimax/MiniMax-M2.7"));
+        // Without the provider prefix the model is invisible.
+        assert!(!reg.contains("minimax/MiniMax-M2.7"));
+        // And the unqualified leaf alone is also invisible.
+        assert!(!reg.contains("MiniMax-M2.7"));
+    }
+
     #[test]
     fn duplicate_alias_across_providers_is_rejected() {
         let mut a = or_provider();
@@ -568,10 +593,10 @@ mod tests {
     /// (OpenRouter `minimax/MiniMax-M2.7`, Ollama `qwen2.5-coder:14b`,
     /// HF `mistralai/Mistral-7B-Instruct-v0.3`). When the user omits
     /// an explicit `alias:`, the canonical handle becomes
-    /// `<provider.name>/<leaf(model.name)>` — the leaf strips any
-    /// pre-existing namespace prefix (`minimax/`) so the handle stays
-    /// readable. *(reject spaces and shell metacharacters, not
-    /// punctuation that real ids actually use)*
+    /// `<provider.name>/<model.name>` — the FULL wire id, namespace
+    /// and all, so the handle is predictable from the config alone.
+    /// *(reject spaces and shell metacharacters, not punctuation that
+    /// real ids actually use)*
     #[test]
     fn unaliased_model_with_slash_dot_and_uppercase_is_accepted() {
         let prov = ProviderEntry {
@@ -589,16 +614,17 @@ mod tests {
                 context_window: None,
             }],
         };
-        let reg = ModelRegistry::build(&[prov], Some("patchnotes/MiniMax-M2.7"))
-            .expect("qualified handle <prov>/<leaf> should be valid");
-        let resolved = reg.resolve("patchnotes/MiniMax-M2.7").unwrap();
-        assert_eq!(resolved.alias, "patchnotes/MiniMax-M2.7");
-        // The wire id is still the raw model name — not the leaf.
+        let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
+            .expect("qualified handle <prov>/<full wire id> should be valid");
+        let resolved = reg.resolve("patchnotes/minimax/MiniMax-M2.7").unwrap();
+        assert_eq!(resolved.alias, "patchnotes/minimax/MiniMax-M2.7");
+        // The wire id is still the raw model name.
         assert_eq!(resolved.model_name, "minimax/MiniMax-M2.7");
     }
 
-    /// Ollama tags use `:` (e.g. `qwen2.5-coder:14b`) and have no `/`,
-    /// so leaf == whole wire id. Handle becomes `ollama/<wire-id>`.
+    /// Ollama tags use `:` (e.g. `qwen2.5-coder:14b`) and have no `/`.
+    /// Handle becomes `ollama/<wire-id>` — same shape as everywhere
+    /// else: `<provider.name>/<full model.name>`.
     #[test]
     fn unaliased_ollama_tag_with_colon_is_accepted() {
         let prov = ProviderEntry {
@@ -656,6 +682,52 @@ mod tests {
         let reg = ModelRegistry::build(&[prov], Some("sonnet")).unwrap();
         assert_eq!(reg.resolve("sonnet").unwrap().context_window, 200_000);
         assert_eq!(reg.resolve("custom").unwrap().context_window, 42);
+    }
+
+    /// Regression for the user-reported bug: with a config like
+    /// ```yaml
+    /// providers:
+    ///   - name: patchnotes
+    ///     models:
+    ///       - name: minimax/MiniMax-M2.7
+    /// default_model: patchnotes/minimax/MiniMax-M2.7
+    /// ```
+    /// the auto-generated alias for an unaliased model must be
+    /// `<provider.name>/<full model.name>`, not the leaf-stripped form.
+    /// The leaf strategy silently dropped the `minimax/` namespace and
+    /// produced `patchnotes/MiniMax-M2.7`, which is unpredictable from
+    /// the config alone — the user can't construct the handle they need
+    /// to put in `default_model:` without reading the source. The full
+    /// wire id is the obvious, predictable choice. *(principle of least
+    /// astonishment)*
+    #[test]
+    fn unaliased_model_handle_uses_full_wire_id_not_leaf() {
+        let prov = ProviderEntry {
+            name: "patchnotes".into(),
+            kind: ProviderType::LlamaCpp,
+            api_key: Some("sk".into()),
+            base_url: None,
+            models: vec![ModelEntry {
+                name: "minimax/MiniMax-M2.7".into(),
+                alias: None,
+                max_tokens: None,
+                temperature: None,
+                num_ctx: None,
+                extra_params: None,
+                context_window: None,
+            }],
+        };
+        let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
+            .expect("default referencing <provider>/<full wire id> must resolve");
+        assert!(
+            reg.contains("patchnotes/minimax/MiniMax-M2.7"),
+            "auto-generated alias must preserve the full wire id, got: {:?}",
+            reg.aliases_sorted()
+        );
+        assert!(
+            !reg.contains("patchnotes/MiniMax-M2.7"),
+            "leaf-stripped handle must NOT exist (it loses the namespace)"
+        );
     }
 
     /// The legacy field name `context_window_override:` must still

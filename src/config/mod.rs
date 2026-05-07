@@ -832,24 +832,39 @@ fn get_config_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Load configuration from YAML file in the platform config directory
-fn load_yaml_config() -> Option<Config> {
-    let config_dir = get_config_dir()?;
+/// Load master configuration from `~/.config/peakbot/config.yaml`.
+///
+/// Returns:
+/// - `Ok(None)` if the file doesn't exist (legitimate — env vars may
+///   carry the whole config).
+/// - `Ok(Some(config))` on a clean parse.
+/// - `Err(_)` if the file exists but is unreadable or malformed. We
+///   refuse to silently fall back to defaults: a typo'd YAML used to
+///   mask itself as "no API key configured" and made the boot path
+///   inscrutable. Better to fail loud at the source. *(principle of
+///   least astonishment)*
+fn load_yaml_config() -> anyhow::Result<Option<Config>> {
+    let Some(config_dir) = get_config_dir() else {
+        return Ok(None);
+    };
     let config_path = config_dir.join("config.yaml");
 
     tracing::debug!("Looking for config at: {}", config_path.display());
 
     if !config_path.exists() {
         tracing::debug!("No YAML config found at {}", config_path.display());
-        return None;
+        return Ok(None);
     }
 
-    let content = std::fs::read_to_string(&config_path).ok()?;
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", config_path.display()))?;
     tracing::debug!("Config file content: {}", content);
 
-    let config: Config = serde_yaml::from_str(&content).ok()?;
+    let config: Config = serde_yaml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {} as YAML: {e}", config_path.display()))?;
 
     tracing::info!("Loaded YAML config from {}", config_path.display());
-    Some(config)
+    Ok(Some(config))
 }
 
 /// Load per-repository configuration from `.peakbot/config.yaml` in the current working directory.
@@ -895,8 +910,9 @@ impl Config {
         // Step 1: Start with defaults
         let mut config = Config::default();
 
-        // Step 2: Load and apply master config if present
-        if let Some(master) = load_yaml_config() {
+        // Step 2: Load and apply master config if present. A malformed
+        // master config is fatal — see `load_yaml_config` for rationale.
+        if let Some(master) = load_yaml_config()? {
             config = master;
             tracing::debug!("Config after master load: provider = {:?}", config.provider);
         }
