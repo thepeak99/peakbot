@@ -1449,9 +1449,14 @@ impl AgentRunner {
             // `/model` — list available models (with the active one
             // marked). Switching is intercepted in the View *before*
             // this point: see `ReplUi::try_intercept_model_command`.
-            // This handler only runs for the bare `/model` (no arg)
-            // case, so the listing path is the canonical fall-through.
-            "/model" => {
+            // This handler runs for the bare `/model` (no arg) case,
+            // which includes `/model` followed only by trailing
+            // whitespace — the slash-command popup completes `/model`
+            // to `/model ` (trailing space, since the command is
+            // declared with `takes_args = true`), so a user who hits
+            // Enter without typing an alias must still land on the
+            // listing path. See `tests::model_with_trailing_whitespace_lists_available_models`.
+            _ if cmd_lower.trim_end() == "/model" => {
                 let Some(sm) = state_manager else {
                     tracing::warn!("State manager not available for /model command");
                     return;
@@ -2322,6 +2327,101 @@ mod tests {
             .get_current_conversation_id()
             .expect("/new must create a current conversation");
         assert_ne!(new_id, old_id, "/new must produce a fresh conversation id");
+    }
+
+    // --- /model listing handler tests --------------------------------------
+    //
+    // Regression guard for "bare `/model` falls through the View interceptor
+    // and into the controller's `/model ` (with-args) arm because the slash-
+    // command popup completes `/model` to `/model ` (trailing space, since
+    // `takes_args = true`). The user submits `/model ` and gets the
+    // "not available in this build" diagnostic instead of the listing.
+    // See memory.md episodic entry 2026-05-07.
+
+    fn config_with_two_aliases() -> Config {
+        use crate::config::{ModelEntry, ProviderEntry, ProviderType};
+        Config {
+            providers: vec![ProviderEntry {
+                name: "openrouter".into(),
+                kind: ProviderType::OpenRouter,
+                api_key: Some("sk-test".into()),
+                base_url: None,
+                models: vec![
+                    ModelEntry {
+                        name: "anthropic/claude-3.7-sonnet".into(),
+                        alias: Some("sonnet".into()),
+                        max_tokens: None,
+                        temperature: None,
+                        num_ctx: None,
+                        extra_params: None,
+                        context_window: None,
+                    },
+                    ModelEntry {
+                        name: "openai/gpt-4o".into(),
+                        alias: Some("gpt4o".into()),
+                        max_tokens: None,
+                        temperature: None,
+                        num_ctx: None,
+                        extra_params: None,
+                        context_window: None,
+                    },
+                ],
+            }],
+            default_model: Some("sonnet".into()),
+            ..Config::default()
+        }
+    }
+
+    fn last_system_message(sm: &Arc<StateManager>) -> String {
+        sm.get_state()
+            .chat
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::ui::app_state::MessageRole::System))
+            .map(|m| m.content.clone())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn bare_model_command_lists_available_models() {
+        let sm = StateManager::new_arc();
+        let config = config_with_two_aliases();
+
+        AgentRunner::process_command_internal("/model", &Some(sm.clone()), &config).await;
+
+        let msg = last_system_message(&sm);
+        assert!(
+            msg.contains("Available models:"),
+            "bare /model must show the listing, got: {msg}"
+        );
+        assert!(msg.contains("sonnet"), "listing must include 'sonnet'");
+        assert!(msg.contains("gpt4o"), "listing must include 'gpt4o'");
+    }
+
+    #[tokio::test]
+    async fn model_with_trailing_whitespace_lists_available_models() {
+        // Repro: slash-command popup completion fills the input with
+        // "/model " (trailing space) because `takes_args = true`. If the
+        // user hits Enter without typing an alias, the submission is
+        // "/model " — which used to fall into the with-args arm and emit
+        // the misleading "not available in this build" diagnostic. The
+        // controller must treat this as the bare-listing case.
+        let sm = StateManager::new_arc();
+        let config = config_with_two_aliases();
+
+        AgentRunner::process_command_internal("/model ", &Some(sm.clone()), &config).await;
+
+        let msg = last_system_message(&sm);
+        assert!(
+            msg.contains("Available models:"),
+            "/model with trailing space must show the listing, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not available in this build"),
+            "must NOT emit the legacy-build diagnostic for trailing-whitespace bare /model, \
+             got: {msg}"
+        );
     }
 
     // --- /reset handler tests -----------------------------------------------
