@@ -7,7 +7,7 @@
 //! See `allehailmenu.md` §6 for the visual contract and §5 for when it's
 //! shown.
 
-use crate::ui::ui_trait::{CommandPopupState, SlashCommand};
+use crate::ui::ui_trait::{CommandPopupState, CompletionItem, PopupMode};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -38,7 +38,7 @@ const MAX_POPUP_WIDTH: u16 = 60;
 /// - Horizontal position: left-aligned with `input_area.x`.
 /// - Vertical: sits with its bottom edge at `input_area.y`.
 pub fn render_command_popup(f: &mut Frame, input_area: Rect, popup: &CommandPopupState) {
-    let filtered = popup.filtered_commands();
+    let filtered = popup.filtered_items();
     let row_count = filtered.len().max(1) as u16; // at least 1 for "no matches"
     let desired_content_rows = row_count.min(MAX_VISIBLE_ROWS);
 
@@ -65,27 +65,39 @@ pub fn render_command_popup(f: &mut Frame, input_area: Rect, popup: &CommandPopu
     let visible_from = popup.scroll_offset.min(filtered.len().saturating_sub(1));
     let visible_to = (visible_from + content_rows as usize).min(filtered.len());
 
+    let no_match_text = match &popup.mode {
+        PopupMode::SlashCommand => "  (no matching commands)",
+        PopupMode::Argument { .. } => "  (no matching values)",
+    };
+
     let content: Vec<Line<'static>> = if filtered.is_empty() {
         vec![Line::from(Span::styled(
-            "  (no matching commands)",
+            no_match_text,
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
         filtered[visible_from..visible_to]
             .iter()
             .enumerate()
-            .map(|(offset, cmd)| {
+            .map(|(offset, item)| {
                 let absolute_idx = visible_from + offset;
                 let is_selected = absolute_idx == popup.selected_index;
-                render_command_row(cmd, is_selected, width)
+                render_item_row(item, is_selected, width, &popup.mode)
             })
             .collect()
+    };
+
+    // Title flips by mode so the user knows what they're picking. Keep
+    // the bottom hint identical — same keybindings across modes.
+    let title = match &popup.mode {
+        PopupMode::SlashCommand => " Commands ".to_string(),
+        PopupMode::Argument { command } => format!(" {} ", title_for_argument(command)),
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightCyan))
-        .title(" Commands ")
+        .title(title)
         .title_bottom(Line::from(" ↑/↓ · Tab complete · Enter run · Esc cancel ").right_aligned());
 
     let paragraph = Paragraph::new(content)
@@ -95,21 +107,50 @@ pub fn render_command_popup(f: &mut Frame, input_area: Rect, popup: &CommandPopu
     f.render_widget(paragraph, popup_area);
 }
 
-/// Render one command row:  `/<name>[ <args>]   description`
+/// Map an `Argument { command }` mode to a human title for the popup.
+/// Centralised here so adding a new arg-completing command later is a
+/// one-arm match-extension, not a renderer rewrite.
+fn title_for_argument(command: &str) -> &'static str {
+    match command {
+        "model" => "Models",
+        _ => "Values",
+    }
+}
+
+/// Render one popup row.
+///
+/// **SlashCommand mode**: `  /<name>[ <args>]   <description>`
+/// **Argument mode**:     `  <value>           <description>` (with the
+/// active selection prefixed by `→ ` in the description column when
+/// `is_current` is set, e.g. the currently-active model alias).
 ///
 /// The selected row fills the interior width with a highlight background
 /// so it reads as a solid bar rather than a short strip. `popup_width`
 /// includes the block borders; interior is `popup_width - 2`.
-fn render_command_row(cmd: &SlashCommand, is_selected: bool, popup_width: u16) -> Line<'static> {
+fn render_item_row(
+    item: &CompletionItem,
+    is_selected: bool,
+    popup_width: u16,
+    mode: &PopupMode,
+) -> Line<'static> {
     let interior_width = popup_width.saturating_sub(2) as usize;
 
-    let name = format!("/{}", cmd.name);
-    let args_hint = if cmd.takes_args { " <args>" } else { "" };
-    let left = format!("  {}{}", name, args_hint);
+    // Left column: command name (with optional <args> hint) or bare value.
+    let left = match mode {
+        PopupMode::SlashCommand => {
+            let args_hint = if item.takes_args { " <args>" } else { "" };
+            format!("  /{}{}", item.value, args_hint)
+        }
+        PopupMode::Argument { .. } => format!("  {}", item.value),
+    };
+
+    // Right column: description, prefixed with → for the active item in
+    // Argument mode (e.g. the currently-active model alias).
+    let desc_prefix = if item.is_current { "→ " } else { "" };
+    let desc = format!("{}{}", desc_prefix, item.description);
 
     // Column-layout: command on the left, description after a gap, padded
     // to fill the interior so the selection bar extends fully.
-    let desc = &cmd.description;
     let gap = 2;
     let left_len = left.chars().count();
 

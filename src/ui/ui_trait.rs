@@ -114,11 +114,68 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
     ]
 }
 
+/// What the popup is currently picking. Same chrome and keybindings
+/// across modes — only the source of rows differs.
+///
+/// See `allehailmenu.md` §3 for the original SlashCommand-only design.
+/// Argument-completion (currently only `/model <alias>`) reuses the popup
+/// per the proposal in `glorious-popup.md`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub enum PopupMode {
+    /// Top-level slash-command picker. Items are derived from
+    /// [`builtin_commands`].
+    #[default]
+    SlashCommand,
+    /// Argument completion for a known command. The command name is
+    /// carried so callers can route accept-actions correctly.
+    Argument { command: String },
+}
+
+/// One row in the popup. Generic enough for both slash-commands and
+/// command arguments — the same renderer draws both.
+///
+/// `takes_args` is meaningful only in `PopupMode::SlashCommand` (controls
+/// the `<args>` hint and accept-on-Enter behaviour). For argument items
+/// it's always `false`.
+///
+/// `is_current` highlights the active selection (e.g. the currently-active
+/// model alias gets a `→` marker). For slash commands it's always `false`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompletionItem {
+    pub value: String,
+    pub description: String,
+    pub is_current: bool,
+    pub takes_args: bool,
+}
+
+impl CompletionItem {
+    /// Build an item from a `SlashCommand` (used at popup-open time in
+    /// `PopupMode::SlashCommand`).
+    pub fn from_slash_command(cmd: SlashCommand) -> Self {
+        Self {
+            value: cmd.name,
+            description: cmd.description,
+            is_current: false,
+            takes_args: cmd.takes_args,
+        }
+    }
+}
+
 /// State for a command popup
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommandPopupState {
-    /// The prefix being typed (e.g., "/stat")
+    /// What kind of items this popup is showing.
+    pub mode: PopupMode,
+
+    /// The prefix being typed.
+    /// - `SlashCommand` mode: the part after the leading `/` (e.g. "stat")
+    /// - `Argument` mode: the alias prefix being typed after the command
+    ///   (e.g. "son" for `/model son`)
     pub prefix: String,
+
+    /// All candidate items, resolved at popup-open time. Filtering is
+    /// done lazily via [`filtered_items`](Self::filtered_items).
+    pub all_items: Vec<CompletionItem>,
 
     /// Currently selected index in the filtered list
     pub selected_index: usize,
@@ -128,38 +185,81 @@ pub struct CommandPopupState {
 }
 
 impl CommandPopupState {
-    /// Create a new command popup with the given prefix
+    /// Create a top-level slash-command popup. Items are pulled from
+    /// [`builtin_commands`] — the canonical source of truth.
     pub fn new(prefix: String) -> Self {
+        let all_items = builtin_commands()
+            .into_iter()
+            .map(CompletionItem::from_slash_command)
+            .collect();
         Self {
+            mode: PopupMode::SlashCommand,
             prefix,
+            all_items,
             selected_index: 0,
             scroll_offset: 0,
         }
     }
 
-    /// Get filtered commands that match the prefix
-    pub fn filtered_commands(&self) -> Vec<SlashCommand> {
+    /// Create an argument-completion popup for a known command. Caller
+    /// resolves `items` (typically from a registry) before construction.
+    pub fn new_argument(command: String, prefix: String, items: Vec<CompletionItem>) -> Self {
+        Self {
+            mode: PopupMode::Argument { command },
+            prefix,
+            all_items: items,
+            selected_index: 0,
+            scroll_offset: 0,
+        }
+    }
+
+    /// Filter items by the current prefix (`starts_with` match on `value`).
+    pub fn filtered_items(&self) -> Vec<&CompletionItem> {
         if self.prefix.is_empty() {
-            builtin_commands()
+            self.all_items.iter().collect()
         } else {
-            builtin_commands()
-                .into_iter()
-                .filter(|cmd| cmd.name.starts_with(&self.prefix))
+            self.all_items
+                .iter()
+                .filter(|i| i.value.starts_with(&self.prefix))
                 .collect()
         }
     }
 
-    /// Get the currently selected command
-    pub fn selected_command(&self) -> Option<SlashCommand> {
-        let filtered = self.filtered_commands();
+    /// Currently selected item, if any. Clamps `selected_index` to the
+    /// filtered range.
+    pub fn selected_item(&self) -> Option<&CompletionItem> {
+        let filtered = self.filtered_items();
         filtered
             .get(self.selected_index.min(filtered.len().saturating_sub(1)))
-            .cloned()
+            .copied()
+    }
+
+    /// BC shim: filtered items projected back to `SlashCommand` shape.
+    /// Existing callers (tests, the controller-side help text) that only
+    /// ever observe SlashCommand-mode popups are unaffected.
+    pub fn filtered_commands(&self) -> Vec<SlashCommand> {
+        self.filtered_items()
+            .into_iter()
+            .map(|i| SlashCommand {
+                name: i.value.clone(),
+                description: i.description.clone(),
+                takes_args: i.takes_args,
+            })
+            .collect()
+    }
+
+    /// BC shim — see [`filtered_commands`](Self::filtered_commands).
+    pub fn selected_command(&self) -> Option<SlashCommand> {
+        self.selected_item().map(|i| SlashCommand {
+            name: i.value.clone(),
+            description: i.description.clone(),
+            takes_args: i.takes_args,
+        })
     }
 
     /// Navigate up in the list
     pub fn navigate_up(&mut self) {
-        let count = self.filtered_commands().len();
+        let count = self.filtered_items().len();
         if count > 0 {
             self.selected_index = self.selected_index.saturating_sub(1);
             if self.selected_index < self.scroll_offset {
@@ -170,8 +270,7 @@ impl CommandPopupState {
 
     /// Navigate down in the list
     pub fn navigate_down(&mut self) {
-        let filtered = self.filtered_commands();
-        let count = filtered.len();
+        let count = self.filtered_items().len();
         if count > 0 {
             self.selected_index = (self.selected_index + 1) % count;
             let visible_height = 8;

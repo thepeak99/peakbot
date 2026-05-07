@@ -42,7 +42,7 @@ use crate::ui::repl::message_renderer::{MessageRenderer, PlainRenderer};
 use crate::ui::repl::render_cache::ChatRenderCache;
 use crate::ui::repl::spinner;
 use crate::ui::repl::todo_panel::{DEFAULT_PANEL_PERCENT, render_todo_panel, should_show_panel};
-use crate::ui::ui_trait::{CommandPopupState, Ui, UiAction};
+use crate::ui::ui_trait::{CommandPopupState, CompletionItem, PopupMode, Ui, UiAction};
 
 /// Minimum terminal height
 const MIN_TERMINAL_HEIGHT: u16 = 10;
@@ -1461,76 +1461,215 @@ impl ReplUi {
         self.sync_popup();
     }
 
-    /// Sync the command popup's filter prefix from the input buffer, and
-    /// close the popup when the buffer no longer represents a command-name
-    /// prefix.
+    /// Sync the command popup with the buffer. **Refreshes / transitions
+    /// / closes only — never auto-opens from `None`.** Opening is the job
+    /// of explicit triggers:
+    /// - `KeyCode::Char('/')` arm → opens `SlashCommand` mode.
+    /// - `accept_command` Tab on a takes-args command → opens
+    ///   `Argument` mode (via `open_or_sync_argument_popup`).
+    /// - SlashCommand→Argument *transition* when the user types past the
+    ///   command name into a known arg-completing command (handled here).
     ///
-    /// Rules:
-    /// - popup closed → no-op.
-    /// - buffer doesn't start with `/` → close.
-    /// - buffer contains whitespace or newline → close (args region).
-    /// - otherwise → `popup.prefix = buffer[1..]`.
+    /// This split is what keeps `Tab → fill buffer → close popup`
+    /// behaviour consistent across both modes (sync_popup never reopens
+    /// what `accept_command` just closed).
     fn sync_popup(&mut self) {
+        let buf = self.ui_state.input_buffer.clone();
         let Some(popup) = self.command_popup.as_mut() else {
             return;
         };
-        let buf = &self.ui_state.input_buffer;
-        if !buf.starts_with('/') || buf.chars().any(|c| c.is_whitespace()) {
-            self.command_popup = None;
-            return;
-        }
-        popup.prefix = buf[1..].to_string();
-        // Clamp selection in case filter shrank.
-        let count = popup.filtered_commands().len();
-        if count == 0 {
-            popup.selected_index = 0;
-        } else if popup.selected_index >= count {
-            popup.selected_index = count - 1;
+
+        match popup.mode.clone() {
+            PopupMode::Argument { command } => {
+                let trigger = format!("/{} ", command);
+                if let Some(rest) = buf.strip_prefix(&trigger)
+                    && !rest.contains(char::is_whitespace)
+                {
+                    // Still in `/<command> <prefix>` — refresh prefix and
+                    // is_current flags through the helper.
+                    let cmd = command.clone();
+                    let rest_owned = rest.to_string();
+                    self.open_or_sync_argument_popup(&cmd, &rest_owned);
+                } else if buf.starts_with('/') && !buf.contains(char::is_whitespace) {
+                    // Backspaced out into the command-name region.
+                    // Transition back to a SlashCommand-mode popup.
+                    *popup = CommandPopupState::new(buf[1..].to_string());
+                } else {
+                    self.command_popup = None;
+                }
+            }
+            PopupMode::SlashCommand => {
+                // Transition into Argument mode if buffer matches a known
+                // arg-completing command (currently only `/model `).
+                if let Some(rest) = buf.strip_prefix("/model ")
+                    && !rest.contains(char::is_whitespace)
+                {
+                    self.open_or_sync_argument_popup("model", rest);
+                    return;
+                }
+                // Close conditions: buffer no longer represents a
+                // command-name prefix.
+                if !buf.starts_with('/') || buf.chars().any(|c| c.is_whitespace()) {
+                    self.command_popup = None;
+                    return;
+                }
+                // Plain prefix sync.
+                popup.prefix = buf[1..].to_string();
+                let count = popup.filtered_items().len();
+                if count == 0 {
+                    popup.selected_index = 0;
+                } else if popup.selected_index >= count {
+                    popup.selected_index = count - 1;
+                }
+            }
         }
     }
 
-    /// Accept the currently-selected command in the popup.
+    /// Open or refresh the argument-completion popup for `command`.
+    /// Currently `model` is the only command with structured arg
+    /// completion; pass through any other command name as a no-op.
     ///
-    /// - Writes `/<name>` (plus a trailing space for arg-taking commands)
-    ///   into the buffer and moves the cursor to the end.
-    /// - If `submit == true` AND the command takes no args, sends a
-    ///   `UiAction::SendMessage("/<name>")` and clears the input — this is
-    ///   the Enter-on-no-args behaviour.
-    /// - Closes the popup in every case.
-    /// - No-op when the popup's filter is empty (no selected command).
-    ///
-    /// See `allehailmenu.md` §5.2 (Tab/Enter semantics).
-    fn accept_command(&mut self, submit: bool) {
-        let Some(popup) = self.command_popup.as_ref() else {
+    /// Items are rebuilt from the [`ModelRegistry`] each call (cheap —
+    /// handful of models), with `is_current` set on the active alias so
+    /// the renderer can mark it. If no registry is attached (legacy
+    /// single-provider boot or test harness without
+    /// `new_with_registry`), the popup stays closed.
+    fn open_or_sync_argument_popup(&mut self, command: &str, prefix: &str) {
+        if command != "model" {
             return;
-        };
-        let Some(cmd) = popup.selected_command() else {
-            // Empty filter — pressing Tab/Enter is a no-op; just close.
+        }
+        let Some(registry) = self.model_registry.clone() else {
+            // No registry — legacy single-provider boot. Don't open the
+            // popup; bare `/model` still falls through to the
+            // controller's listing handler.
             self.command_popup = None;
             return;
         };
-        let completed = if cmd.takes_args {
-            format!("/{} ", cmd.name)
-        } else {
-            format!("/{}", cmd.name)
-        };
-        self.command_popup = None;
+        let current_alias = self.state_manager.get_model_alias();
+        let items: Vec<CompletionItem> = registry
+            .iter_sorted()
+            .into_iter()
+            .map(|(alias, resolved)| CompletionItem {
+                value: alias.to_string(),
+                description: format!("{} · {}", resolved.provider_name, resolved.model_name),
+                is_current: alias == current_alias,
+                takes_args: false,
+            })
+            .collect();
 
-        if submit && !cmd.takes_args {
-            // Enter on a no-args command: fire and clear.
-            let _ = self
-                .action_sender
-                .send(UiAction::SendMessage(completed.clone()));
-            self.ui_state.clear_input();
-            // Slash command submitted = composition ended; exit multiline
-            // mode so the next free-text message has predictable Enter
-            // behaviour. See `multiline-mode.md` §5.4 / test
-            // `accept_command_clears_multiline_mode`.
-            self.multiline_mode = false;
+        // Are we already in the right Argument-mode popup? If so just
+        // refresh prefix (and is_current flags, defensive against
+        // mid-popup model swaps which don't happen today but might).
+        let already_arg_mode = matches!(
+            self.command_popup.as_ref().map(|p| &p.mode),
+            Some(PopupMode::Argument { command: c }) if c == command
+        );
+
+        if already_arg_mode {
+            if let Some(popup) = self.command_popup.as_mut() {
+                popup.prefix = prefix.to_string();
+                for it in popup.all_items.iter_mut() {
+                    it.is_current = it.value == current_alias;
+                }
+                let count = popup.filtered_items().len();
+                if count == 0 {
+                    popup.selected_index = 0;
+                } else if popup.selected_index >= count {
+                    popup.selected_index = count - 1;
+                }
+            }
         } else {
-            // Tab, or Enter on an arg-taking command: just fill the buffer.
-            self.ui_state.input_buffer = completed.clone();
-            self.ui_state.cursor_pos = completed.len();
+            self.command_popup = Some(CommandPopupState::new_argument(
+                command.to_string(),
+                prefix.to_string(),
+                items,
+            ));
+        }
+    }
+
+    /// Accept the currently-selected popup item.
+    ///
+    /// - **SlashCommand mode**: writes `/<name>` (plus a trailing space
+    ///   for arg-taking commands) into the buffer; if `submit && !takes_args`,
+    ///   sends `UiAction::SendMessage("/<name>")` and clears the input.
+    /// - **Argument mode**: writes `/<command> <value>` into the buffer;
+    ///   if `submit`, routes through `try_intercept_model_command` (so
+    ///   the confirm-dialog flow + canonical diagnostics keep firing
+    ///   from a single place) and clears the input.
+    /// - Closes the popup in every case.
+    /// - No-op when the popup's filter is empty (no selected item).
+    ///
+    /// See `allehailmenu.md` §5.2 (Tab/Enter semantics) and the
+    /// glorious-popup proposal for the Argument-mode shape.
+    fn accept_command(&mut self, submit: bool) {
+        // Capture the item + mode without holding a borrow on self that
+        // would block the `command_popup = None` write below.
+        let captured: Option<(CompletionItem, PopupMode)> = self
+            .command_popup
+            .as_ref()
+            .and_then(|p| p.selected_item().cloned().map(|i| (i, p.mode.clone())));
+        self.command_popup = None;
+        let Some((item, mode)) = captured else {
+            return;
+        };
+
+        match mode {
+            PopupMode::SlashCommand => {
+                let completed = if item.takes_args {
+                    format!("/{} ", item.value)
+                } else {
+                    format!("/{}", item.value)
+                };
+                if submit && !item.takes_args {
+                    let _ = self
+                        .action_sender
+                        .send(UiAction::SendMessage(completed.clone()));
+                    self.ui_state.clear_input();
+                    // Slash command submitted = composition ended; exit
+                    // multiline mode. See test
+                    // `accept_command_clears_multiline_mode`.
+                    self.multiline_mode = false;
+                } else {
+                    self.ui_state.input_buffer = completed.clone();
+                    self.ui_state.cursor_pos = completed.len();
+                    // If the command we just completed has structured
+                    // argument completion (currently only `/model`),
+                    // open the Argument popup straight away — saves the
+                    // user one round-trip ("type the space, see the
+                    // list"). The helper bails on commands without
+                    // arg completion, so this is a safe blanket call.
+                    if item.takes_args {
+                        let cmd_name = item.value.clone();
+                        self.open_or_sync_argument_popup(&cmd_name, "");
+                    }
+                }
+            }
+            PopupMode::Argument { command } => {
+                let completed = format!("/{} {}", command, item.value);
+                if submit {
+                    // Route through the View-side interceptor — single
+                    // source of truth for `/model <alias>` semantics
+                    // (confirm dialog on non-empty chat, "Already on X"
+                    // on same alias, etc).
+                    let intercepted = self.try_intercept_model_command(&completed);
+                    if !intercepted {
+                        // Defensive fallthrough: registry was attached
+                        // when the popup was built, so this path isn't
+                        // expected to fire. Still, be conservative.
+                        let _ = self
+                            .action_sender
+                            .send(UiAction::SendMessage(completed.clone()));
+                    }
+                    self.ui_state.clear_input();
+                    self.multiline_mode = false;
+                } else {
+                    // Tab in arg mode: fill the buffer with the chosen
+                    // value and place cursor at the end. The user can
+                    // then review or hit Enter.
+                    self.ui_state.input_buffer = completed.clone();
+                    self.ui_state.cursor_pos = completed.len();
+                }
+            }
         }
     }
 
@@ -2929,5 +3068,232 @@ mod multiline_mode_tests {
         // bool. The visual diff is owned by snapshot tests.
         let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, true);
         let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, false);
+    }
+}
+
+#[cfg(test)]
+mod model_popup_tests {
+    //! Test-first specs for the `/model <alias>` argument-completion
+    //! popup.
+    //!
+    //! These pin down:
+    //!   - typing `/model ` opens the popup in `Argument` mode with the
+    //!     registry's aliases as items
+    //!   - typing more characters filters by alias prefix
+    //!   - the active alias is marked `is_current` so the renderer can
+    //!     prefix it with `→`
+    //!   - Enter on a chosen alias routes through
+    //!     `try_intercept_model_command` (so the confirm-dialog flow
+    //!     fires for non-empty chats)
+    //!   - Tab on a chosen alias fills the buffer to `/model <alias>`
+    //!     and closes the popup
+    //!   - without a registry (legacy single-provider boot) the popup
+    //!     never opens in `Argument` mode
+    //!
+    //! See proposal `glorious-popup.md` and the architecture note in
+    //! memory.md (2026-05-07).
+    use super::*;
+    use crate::ProviderType;
+    use crate::config::ModelRegistry;
+    use crate::config::model_registry::{ModelEntry, ProviderEntry};
+    use crate::state::StateManager;
+    use crate::ui::ui_trait::{PopupMode, UiAction};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::Arc;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Build a two-alias registry: `sonnet` (default) and `opus`. Same
+    /// shape used by the multi-model tests in `model_registry.rs`.
+    fn two_alias_registry() -> Arc<ModelRegistry> {
+        let prov = ProviderEntry {
+            name: "openrouter".into(),
+            kind: ProviderType::OpenRouter,
+            api_key: Some("sk-or-test".into()),
+            base_url: None,
+            models: vec![
+                ModelEntry {
+                    name: "anthropic/claude-3.7-sonnet".into(),
+                    alias: Some("sonnet".into()),
+                    max_tokens: Some(8192),
+                    temperature: None,
+                    num_ctx: None,
+                    extra_params: None,
+                    context_window: None,
+                },
+                ModelEntry {
+                    name: "anthropic/claude-opus-4".into(),
+                    alias: Some("opus".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    num_ctx: None,
+                    extra_params: None,
+                    context_window: None,
+                },
+            ],
+        };
+        Arc::new(ModelRegistry::build(&[prov], Some("sonnet")).expect("registry should build"))
+    }
+
+    fn harness_with_registry() -> (ReplUi, UnboundedReceiver<UiAction>) {
+        let sm = StateManager::new_arc();
+        // Mark the active alias so `is_current` flags can light up.
+        sm.set_model_alias("sonnet".to_string());
+        let (tx, rx) = unbounded_channel();
+        let ui = ReplUi::new_with_registry(sm, tx, two_alias_registry());
+        (ui, rx)
+    }
+
+    fn harness_no_registry() -> (ReplUi, UnboundedReceiver<UiAction>) {
+        let sm = StateManager::new_arc();
+        let (tx, rx) = unbounded_channel();
+        (ReplUi::new(sm, tx), rx)
+    }
+
+    /// Type a string literally via `handle_keyboard_input` so each
+    /// keystroke goes through the full sync_popup path.
+    fn type_str(ui: &mut ReplUi, s: &str) {
+        for c in s.chars() {
+            ui.handle_keyboard_input(press(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn model_space_opens_arg_popup_with_aliases() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/model ");
+        let popup = ui
+            .command_popup
+            .as_ref()
+            .expect("popup should open after `/model <space>`");
+        assert!(matches!(
+            &popup.mode,
+            PopupMode::Argument { command } if command == "model"
+        ));
+        // Both aliases present; alphabetical (opus, sonnet).
+        let values: Vec<&str> = popup.all_items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(values, vec!["opus", "sonnet"]);
+        // Active alias gets the marker.
+        let sonnet = popup
+            .all_items
+            .iter()
+            .find(|i| i.value == "sonnet")
+            .unwrap();
+        assert!(sonnet.is_current, "active alias should be marked");
+        let opus = popup.all_items.iter().find(|i| i.value == "opus").unwrap();
+        assert!(!opus.is_current);
+    }
+
+    #[test]
+    fn model_arg_popup_filters_by_alias_prefix() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/model son");
+        let popup = ui.command_popup.as_ref().unwrap();
+        let filtered: Vec<&str> = popup
+            .filtered_items()
+            .iter()
+            .map(|i| i.value.as_str())
+            .collect();
+        assert_eq!(filtered, vec!["sonnet"], "prefix `son` only matches sonnet");
+    }
+
+    #[test]
+    fn enter_on_model_alias_routes_through_interceptor() {
+        // Non-empty chat → Enter on a chosen alias should open the
+        // confirm dialog rather than dispatch a raw SwitchModel action.
+        let (mut ui, mut rx) = harness_with_registry();
+        // Make chat non-empty so the interceptor routes via the dialog.
+        ui.state_manager
+            .add_user_message("a previous turn".to_string());
+        type_str(&mut ui, "/model opus");
+        // Make sure the popup is on the `opus` row.
+        let popup = ui.command_popup.as_ref().unwrap();
+        assert_eq!(popup.selected_item().unwrap().value, "opus");
+        // Enter while popup open → accept_command(submit=true).
+        ui.handle_keyboard_input(press(KeyCode::Enter));
+        // Expect: confirm dialog open, NO SwitchModel action emitted.
+        assert!(
+            ui.confirm_dialog.is_some(),
+            "confirm dialog must open when chat is non-empty"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no UiAction should be sent yet — must wait for confirmation"
+        );
+        // And the input buffer is cleared.
+        assert_eq!(ui.ui_state.input_buffer, "");
+        assert!(ui.command_popup.is_none(), "popup closed after accept");
+    }
+
+    #[test]
+    fn enter_on_model_alias_with_empty_chat_dispatches_switch_directly() {
+        let (mut ui, mut rx) = harness_with_registry();
+        // Empty chat — interceptor sends SwitchModel directly, no dialog.
+        type_str(&mut ui, "/model opus");
+        ui.handle_keyboard_input(press(KeyCode::Enter));
+        assert!(
+            ui.confirm_dialog.is_none(),
+            "no dialog expected on empty chat"
+        );
+        let action = rx.try_recv().expect("a UiAction should be sent");
+        assert_eq!(action, UiAction::SwitchModel("opus".to_string()));
+    }
+
+    #[test]
+    fn tab_on_model_alias_fills_buffer_and_closes_popup() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/model op");
+        // Sanity: opus is the only filtered item.
+        assert_eq!(
+            ui.command_popup
+                .as_ref()
+                .unwrap()
+                .selected_item()
+                .unwrap()
+                .value,
+            "opus"
+        );
+        ui.handle_keyboard_input(press(KeyCode::Tab));
+        assert_eq!(ui.ui_state.input_buffer, "/model opus");
+        assert_eq!(ui.ui_state.cursor_pos, "/model opus".len());
+        // Tab in arg mode closes the popup (consistent with SlashCommand
+        // mode Tab semantics).
+        assert!(ui.command_popup.is_none(), "Tab closes the popup");
+    }
+
+    #[test]
+    fn arg_popup_does_not_open_without_registry() {
+        let (mut ui, _rx) = harness_no_registry();
+        type_str(&mut ui, "/model ");
+        // Buffer ends in a whitespace and no registry to populate Arg
+        // items → popup must stay closed (legacy single-provider boot
+        // behaviour).
+        assert!(
+            ui.command_popup.is_none(),
+            "no registry → no arg-mode popup"
+        );
+    }
+
+    #[test]
+    fn backspace_from_argument_mode_returns_to_slashcommand_mode() {
+        // Type `/model ` → Argument mode. Backspace once → buffer
+        // becomes `/model` → should transition back to SlashCommand
+        // mode (so the user sees the slash-command list again).
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/model ");
+        assert!(matches!(
+            ui.command_popup.as_ref().unwrap().mode,
+            PopupMode::Argument { .. }
+        ));
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        let popup = ui
+            .command_popup
+            .as_ref()
+            .expect("popup should remain open after backspace into command name");
+        assert!(matches!(popup.mode, PopupMode::SlashCommand));
+        assert_eq!(popup.prefix, "model");
     }
 }
