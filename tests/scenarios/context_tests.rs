@@ -41,15 +41,17 @@ fn summarization_response() -> MockResponse {
 #[tokio::test]
 async fn compaction_triggers_with_small_window() {
     let context_config = ContextConfig {
-        context_window: Some(500), // 500 tokens total
-        threshold: 0.5,            // 50% = 250 tokens threshold
-        keep_recent: 2,            // Keep last 2 messages
+        threshold: 0.5, // 50% = 250 tokens threshold
+        keep_recent: 2, // Keep last 2 messages
         enabled: true,
         compaction_model: None,
     };
 
-    let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+    let mut harness = TestHarness::with_system_prompt_and_context(
+        "You are a helpful assistant.",
+        context_config,
+        500,
+    );
 
     // Queue agent responses + extra for summarization calls.
     // compact() calls agent.prompt() for summarization, consuming one response.
@@ -87,15 +89,17 @@ async fn compaction_triggers_with_small_window() {
 #[tokio::test]
 async fn compaction_reduces_history() {
     let context_config = ContextConfig {
-        context_window: Some(300), // Very small window
-        threshold: 0.5,            // 50% = 150 tokens threshold
-        keep_recent: 1,            // Keep only last message
+        threshold: 0.5, // 50% = 150 tokens threshold
+        keep_recent: 1, // Keep only last message
         enabled: true,
         compaction_model: None,
     };
 
-    let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+    let mut harness = TestHarness::with_system_prompt_and_context(
+        "You are a helpful assistant.",
+        context_config,
+        300,
+    );
 
     // Queue responses: agent responses + summarization responses consumed by compact()
     harness.add_response(agent_response("Response 1", 200));
@@ -162,15 +166,17 @@ async fn compaction_reduces_history() {
 #[tokio::test]
 async fn compaction_preserves_recent_messages() {
     let context_config = ContextConfig {
-        context_window: Some(400),
         threshold: 0.5, // 50% = 200 tokens
         keep_recent: 3, // Keep last 3 messages — see make-flow-great-again.md
         enabled: true,
         compaction_model: None,
     };
 
-    let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+    let mut harness = TestHarness::with_system_prompt_and_context(
+        "You are a helpful assistant.",
+        context_config,
+        400,
+    );
 
     harness.add_response(agent_response("Response 1", 250));
     harness.add_response(agent_response("Response 2", 250));
@@ -200,15 +206,17 @@ async fn compaction_preserves_recent_messages() {
 #[tokio::test]
 async fn compaction_skipped_when_disabled() {
     let context_config = ContextConfig {
-        context_window: Some(100), // Tiny window
         threshold: 0.5,
         keep_recent: 2,
         enabled: false, // DISABLED
         compaction_model: None,
     };
 
-    let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+    let mut harness = TestHarness::with_system_prompt_and_context(
+        "You are a helpful assistant.",
+        context_config,
+        100,
+    );
 
     harness.add_responses(vec![
         agent_response("Response 1", 50),
@@ -241,15 +249,17 @@ async fn compaction_skipped_when_disabled() {
 #[tokio::test]
 async fn multiple_compaction_events() {
     let context_config = ContextConfig {
-        context_window: Some(200), // Very small window
-        threshold: 0.6,            // 60% = 120 tokens threshold
-        keep_recent: 1,            // Keep only last message
+        threshold: 0.6, // 60% = 120 tokens threshold
+        keep_recent: 1, // Keep only last message
         enabled: true,
         compaction_model: None,
     };
 
-    let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+    let mut harness = TestHarness::with_system_prompt_and_context(
+        "You are a helpful assistant.",
+        context_config,
+        200,
+    );
 
     // Queue enough responses for 6 messages plus summarization calls.
     // With keep_recent=1 and 150 > 120 threshold, compaction fires frequently.
@@ -369,15 +379,17 @@ async fn conversation_continues_after_many_messages() {
 #[tokio::test]
 async fn compaction_persists_to_state_manager() {
     let context_config = ContextConfig {
-        context_window: Some(300),
         threshold: 0.5, // 150 tokens
         keep_recent: 1,
         enabled: true,
         compaction_model: None,
     };
 
-    let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+    let mut harness = TestHarness::with_system_prompt_and_context(
+        "You are a helpful assistant.",
+        context_config,
+        300,
+    );
 
     // 3 messages: builds up chat entries. Each compaction consumes a summarization response.
     harness.add_response(agent_response("Response 1", 200));
@@ -426,15 +438,17 @@ async fn compaction_persists_to_state_manager() {
 #[tokio::test]
 async fn no_compaction_under_threshold() {
     let context_config = ContextConfig {
-        context_window: Some(1000),
         threshold: 0.8, // 800 tokens
         keep_recent: 2,
         enabled: true,
         compaction_model: None,
     };
 
-    let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+    let mut harness = TestHarness::with_system_prompt_and_context(
+        "You are a helpful assistant.",
+        context_config,
+        1000,
+    );
 
     // 100 tokens per request, well under 800 threshold
     for _ in 0..5 {

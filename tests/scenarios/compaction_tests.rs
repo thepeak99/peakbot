@@ -48,7 +48,6 @@ fn summarization_response_with(text: &str) -> MockResponse {
 #[tokio::test]
 async fn summarization_request_contains_old_messages() {
     let config = ContextConfig {
-        context_window: Some(500),
         threshold: 0.5, // 250 tokens
         keep_recent: 3,
         enabled: true,
@@ -56,7 +55,7 @@ async fn summarization_request_contains_old_messages() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
 
     // Turn 1: user="OLD_MSG_1", response has 300 tokens
     harness.add_response(agent_response("OLD_REPLY_1", 300));
@@ -101,7 +100,6 @@ async fn summarization_request_contains_old_messages() {
 #[tokio::test]
 async fn summarization_request_excludes_recent_messages() {
     let config = ContextConfig {
-        context_window: Some(500),
         threshold: 0.5,
         keep_recent: 3,
         enabled: true,
@@ -109,7 +107,7 @@ async fn summarization_request_excludes_recent_messages() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
 
     harness.add_response(agent_response("REPLY_ALPHA", 300));
     harness.add_response(agent_response("REPLY_BETA", 300));
@@ -151,7 +149,6 @@ async fn summarization_request_excludes_recent_messages() {
 #[tokio::test]
 async fn summarization_excludes_tool_messages_from_prompt() {
     let config = ContextConfig {
-        context_window: Some(500),
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
@@ -159,7 +156,7 @@ async fn summarization_excludes_tool_messages_from_prompt() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
 
     // Turn 1: tool call — produces tool_call + tool_result + follow-up in history
     harness.add_response(MockResponse::tool_call_with_follow_up(
@@ -200,7 +197,6 @@ async fn summarization_excludes_tool_messages_from_prompt() {
 #[tokio::test]
 async fn llm_call_count_matches_expectations() {
     let config = ContextConfig {
-        context_window: Some(500),
         threshold: 0.5,
         keep_recent: 3,
         enabled: true,
@@ -208,7 +204,7 @@ async fn llm_call_count_matches_expectations() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
@@ -247,7 +243,6 @@ async fn llm_call_count_matches_expectations() {
 #[tokio::test]
 async fn post_compaction_request_has_compacted_history() {
     let config = ContextConfig {
-        context_window: Some(500),
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
@@ -255,7 +250,7 @@ async fn post_compaction_request_has_compacted_history() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
@@ -308,7 +303,6 @@ async fn post_compaction_request_has_compacted_history() {
 #[tokio::test]
 async fn summary_text_appears_in_history() {
     let config = ContextConfig {
-        context_window: Some(300),
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
@@ -316,7 +310,7 @@ async fn summary_text_appears_in_history() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
 
     harness.add_response(agent_response("R1", 200));
     harness.add_compaction_response(summarization_response_with("THE_CUSTOM_SUMMARY_TEXT"));
@@ -362,7 +356,6 @@ async fn summary_text_appears_in_history() {
 #[tokio::test]
 async fn post_compaction_history_structure() {
     let config = ContextConfig {
-        context_window: Some(300),
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
@@ -370,7 +363,7 @@ async fn post_compaction_history_structure() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
 
     harness.add_response(agent_response("R1", 200));
     harness.add_compaction_response(summarization_response());
@@ -416,7 +409,6 @@ async fn post_compaction_history_structure() {
 #[tokio::test]
 async fn summary_persists_to_state_manager() {
     let config = ContextConfig {
-        context_window: Some(300),
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
@@ -424,7 +416,7 @@ async fn summary_persists_to_state_manager() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
 
     harness.add_response(agent_response("R1", 200));
     harness.add_compaction_response(summarization_response_with("PERSISTED_SUMMARY"));
@@ -460,7 +452,6 @@ async fn summary_persists_to_state_manager() {
 #[tokio::test]
 async fn summarization_failure_is_graceful() {
     let config = ContextConfig {
-        context_window: Some(300),
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
@@ -468,7 +459,7 @@ async fn summarization_failure_is_graceful() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
 
     // Turn 1: normal
     harness.add_response(agent_response("R1", 200));
@@ -523,7 +514,6 @@ async fn summarization_failure_is_graceful() {
 #[tokio::test]
 async fn compaction_triggers_at_exact_turn() {
     let config = ContextConfig {
-        context_window: Some(500),
         threshold: 0.5,
         keep_recent: 3,
         enabled: true,
@@ -531,7 +521,7 @@ async fn compaction_triggers_at_exact_turn() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
@@ -569,7 +559,6 @@ async fn compaction_triggers_at_exact_turn() {
 #[tokio::test]
 async fn no_compaction_below_threshold_verified_by_request_count() {
     let config = ContextConfig {
-        context_window: Some(1000),
         threshold: 0.8, // 800 tokens
         keep_recent: 2,
         enabled: true,
@@ -577,7 +566,7 @@ async fn no_compaction_below_threshold_verified_by_request_count() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 1000);
 
     // 100 tokens per request — well under 800
     for _ in 0..5 {
@@ -605,7 +594,6 @@ async fn no_compaction_below_threshold_verified_by_request_count() {
 #[tokio::test]
 async fn no_compaction_when_msgs_lte_keep_recent() {
     let config = ContextConfig {
-        context_window: Some(400),
         threshold: 0.5,  // 200 tokens
         keep_recent: 10, // Very high — 3 turns = 6 msgs < 10
         enabled: true,
@@ -613,7 +601,7 @@ async fn no_compaction_when_msgs_lte_keep_recent() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 400);
 
     // 500 tokens per request — way above threshold
     for _ in 0..3 {
@@ -639,7 +627,6 @@ async fn no_compaction_when_msgs_lte_keep_recent() {
 #[tokio::test]
 async fn token_stats_pipeline_ordering() {
     let config = ContextConfig {
-        context_window: Some(600),
         threshold: 0.5, // 300 tokens
         keep_recent: 2,
         enabled: true,
@@ -647,7 +634,7 @@ async fn token_stats_pipeline_ordering() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 600);
 
     // Turn 1: 100 tokens (below 300 threshold)
     harness.add_response(agent_response("R1", 100));
@@ -689,7 +676,6 @@ async fn token_stats_pipeline_ordering() {
 #[tokio::test]
 async fn compaction_turn_consumes_two_responses() {
     let config = ContextConfig {
-        context_window: Some(500),
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
@@ -697,7 +683,7 @@ async fn compaction_turn_consumes_two_responses() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
@@ -729,7 +715,6 @@ async fn compaction_turn_consumes_two_responses() {
 #[tokio::test]
 async fn non_compaction_turn_consumes_one_response() {
     let config = ContextConfig {
-        context_window: Some(1000),
         threshold: 0.8, // high threshold, won't trigger
         keep_recent: 2,
         enabled: true,
@@ -737,7 +722,7 @@ async fn non_compaction_turn_consumes_one_response() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 1000);
 
     harness.add_response(agent_response("R1", 100));
     harness.add_response(agent_response("R2", 100));
@@ -761,7 +746,6 @@ async fn non_compaction_turn_consumes_one_response() {
 #[tokio::test]
 async fn queue_consumption_pattern_across_turns() {
     let config = ContextConfig {
-        context_window: Some(500),
         threshold: 0.5,
         keep_recent: 2,
         enabled: true,
@@ -769,7 +753,7 @@ async fn queue_consumption_pattern_across_turns() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
@@ -807,7 +791,6 @@ async fn queue_consumption_pattern_across_turns() {
 #[tokio::test]
 async fn multiple_compactions_stack_summaries() {
     let config = ContextConfig {
-        context_window: Some(300),
         threshold: 0.5, // 150 tokens
         keep_recent: 1,
         enabled: true,
@@ -815,7 +798,7 @@ async fn multiple_compactions_stack_summaries() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
 
     // Turn 1: normal
     harness.add_response(agent_response("R1", 200));
@@ -858,7 +841,6 @@ async fn multiple_compactions_stack_summaries() {
 #[tokio::test]
 async fn tool_calls_crossing_boundary_preserved() {
     let config = ContextConfig {
-        context_window: Some(500),
         threshold: 0.5, // 250 tokens
         keep_recent: 3, // Keep last 3 messages
         enabled: true,
@@ -866,7 +848,7 @@ async fn tool_calls_crossing_boundary_preserved() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
 
     // Turn 1: a tool call (creates ToolCall + ToolResult + follow-up in history)
     harness.add_response(MockResponse::tool_call_with_follow_up(
@@ -905,7 +887,6 @@ async fn tool_calls_crossing_boundary_preserved() {
 #[tokio::test]
 async fn message_count_fallback_triggers_compaction() {
     let config = ContextConfig {
-        context_window: Some(1000),
         threshold: 0.8,
         keep_recent: 3,
         enabled: true,
@@ -914,7 +895,7 @@ async fn message_count_fallback_triggers_compaction() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 1000);
 
     // No usage data — forces message-count fallback
     // 10 messages threshold means we need > 10 messages in history.
@@ -959,7 +940,6 @@ async fn message_count_fallback_triggers_compaction() {
 #[tokio::test]
 async fn compaction_handles_empty_messages() {
     let config = ContextConfig {
-        context_window: Some(300),
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
@@ -967,7 +947,7 @@ async fn compaction_handles_empty_messages() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
 
     harness.add_response(agent_response("", 200)); // empty response
     harness.add_compaction_response(summarization_response());
@@ -984,7 +964,6 @@ async fn compaction_handles_empty_messages() {
 #[tokio::test]
 async fn keep_recent_zero_summarizes_everything() {
     let config = ContextConfig {
-        context_window: Some(300),
         threshold: 0.5,
         keep_recent: 0,
         enabled: true,
@@ -992,7 +971,7 @@ async fn keep_recent_zero_summarizes_everything() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
 
     harness.add_response(agent_response("R1", 200));
     harness.add_compaction_response(summarization_response_with("TOTAL_SUMMARY"));
@@ -1034,7 +1013,6 @@ async fn keep_recent_zero_summarizes_everything() {
 #[tokio::test]
 async fn compaction_must_preserve_recent_messages() {
     let config = ContextConfig {
-        context_window: Some(400),
         threshold: 0.5,
         keep_recent: 3,
         enabled: true,
@@ -1042,7 +1020,7 @@ async fn compaction_must_preserve_recent_messages() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 400);
 
     harness.add_response(agent_response("R1", 250));
     harness.add_response(agent_response("R2", 250));
@@ -1072,7 +1050,6 @@ async fn compaction_must_preserve_recent_messages() {
 #[tokio::test]
 async fn compaction_reduces_history_exact_count() {
     let config = ContextConfig {
-        context_window: Some(300),
         threshold: 0.5,
         keep_recent: 1,
         enabled: true,
@@ -1080,7 +1057,7 @@ async fn compaction_reduces_history_exact_count() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
 
     harness.add_response(agent_response("R1", 200));
     harness.add_compaction_response(summarization_response());
@@ -1122,7 +1099,6 @@ async fn compaction_reduces_history_exact_count() {
 #[tokio::test]
 async fn multiple_compaction_events_verified() {
     let config = ContextConfig {
-        context_window: Some(200),
         threshold: 0.6, // 120 tokens
         keep_recent: 1,
         enabled: true,
@@ -1130,7 +1106,7 @@ async fn multiple_compaction_events_verified() {
     };
 
     let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config);
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 200);
 
     // Queue enough for 5 turns with possible compactions after each
     for _ in 0..5 {

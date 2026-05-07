@@ -425,7 +425,7 @@ impl Config {
                     temperature,
                     num_ctx,
                     extra_params: extra,
-                    context_window_override: None,
+                    context_window: None,
                 }],
             };
             return ModelRegistry::build(
@@ -615,10 +615,6 @@ pub struct ContextConfig {
     /// Enable/disable compaction (default: true)
     #[serde(default = "default_context_enabled")]
     pub enabled: bool,
-    /// Model context window size (0 or None = auto-detect from API)
-    /// Common values: 128k, 200k, etc.
-    #[serde(default)]
-    pub context_window: Option<usize>,
     /// Optional model override for compaction summarization.
     /// When set, uses this model (via the same provider) for summarization.
     /// When None, uses the main model. Either way, the call is tool-free.
@@ -820,7 +816,6 @@ impl Default for Config {
                 threshold: default_threshold(),
                 keep_recent: default_keep_recent(),
                 enabled: default_context_enabled(),
-                context_window: None,
                 compaction_model: None,
             },
             conversation: None,
@@ -1064,11 +1059,15 @@ impl Config {
             config.context.keep_recent = keep_recent;
         }
 
-        // CONTEXT_WINDOW
-        if let Ok(window) = std::env::var("CONTEXT_WINDOW")
-            && let Ok(window) = window.parse()
-        {
-            config.context.context_window = Some(window);
+        // CONTEXT_WINDOW: removed in the per-model registry refactor.
+        // The active model's window is now resolved from `ModelEntry.context_window`
+        // (or auto-detected from the wire id) — there is no longer a global
+        // override here. See `context_manager::auto_detect_context_window`.
+        if std::env::var("CONTEXT_WINDOW").is_ok() {
+            tracing::warn!(
+                "CONTEXT_WINDOW env var is no longer honoured. Set `context_window:` on the active \
+                 model under `providers:` instead, or rely on auto-detection from the wire id."
+            );
         }
 
         // Conversation persistence config via environment variables
@@ -1242,7 +1241,6 @@ mod tests {
                 threshold: 0.5,
                 keep_recent: 10,
                 enabled: true,
-                context_window: Some(128000),
                 compaction_model: None,
             },
             ..Config::default()
@@ -1253,7 +1251,6 @@ mod tests {
 
         assert_eq!(merged.context.threshold, 0.5);
         assert_eq!(merged.context.keep_recent, 10);
-        assert_eq!(merged.context.context_window, Some(128000));
     }
 
     // === build_model_registry: locked-plan v4 §"Legacy synthesis" ====
@@ -1287,7 +1284,7 @@ mod tests {
                     temperature: None,
                     num_ctx: None,
                     extra_params: None,
-                    context_window_override: None,
+                    context_window: None,
                 }],
             }],
             default_model: Some("sonnet".into()),
@@ -1316,7 +1313,7 @@ mod tests {
                     temperature: None,
                     num_ctx: None,
                     extra_params: None,
-                    context_window_override: None,
+                    context_window: None,
                 }],
             }],
             default_model: Some("ghost".into()), // intentionally wrong

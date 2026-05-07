@@ -152,8 +152,6 @@ impl DynAgent {
 /// Stats are managed by the provided StateManager.
 pub fn create_provider(
     config: &ProviderConfig,
-    context_config: &crate::config::ContextConfig,
-    context_window: usize,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
@@ -172,8 +170,6 @@ pub fn create_provider(
         ProviderConfig::OpenRouter(c) => {
             let (agent, info, receiver, hook) = create_openrouter_agent(
                 c,
-                context_config,
-                context_window,
                 mcp_tools,
                 system_prompt,
                 searxng_config,
@@ -193,8 +189,6 @@ pub fn create_provider(
         ProviderConfig::OpenAI(c) => {
             let (agent, info, receiver, hook) = create_openai_agent(
                 c,
-                context_config,
-                context_window,
                 mcp_tools,
                 system_prompt,
                 searxng_config,
@@ -214,8 +208,6 @@ pub fn create_provider(
         ProviderConfig::LlamaCpp(c) => {
             let (agent, info, receiver, hook) = create_llamacpp_agent(
                 c,
-                context_config,
-                context_window,
                 mcp_tools,
                 system_prompt,
                 searxng_config,
@@ -381,8 +373,6 @@ where
 /// Create OpenRouter agent and info
 fn create_openrouter_agent(
     config: &OpenRouterConfig,
-    context_config: &crate::config::ContextConfig,
-    context_window: usize,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
@@ -420,14 +410,9 @@ fn create_openrouter_agent(
     // Get session stats from StateManager for context tracking
     let session_stats = state_manager.stats_arc();
 
-    // Create session hook with context tracking
+    // Create session hook with stats tracking
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(
-        Some(sender),
-        session_stats,
-        context_window as u64,
-        context_config.threshold,
-    );
+    let hook = SessionHook::with_context_tracking(Some(sender), session_stats);
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -540,8 +525,6 @@ fn create_ollama_agent(
 /// Create OpenAI agent and info
 fn create_openai_agent(
     config: &OpenAIConfig,
-    context_config: &crate::config::ContextConfig,
-    context_window: usize,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
@@ -581,14 +564,9 @@ fn create_openai_agent(
     // Get session stats from StateManager for context tracking
     let session_stats = state_manager.stats_arc();
 
-    // Create session hook with context tracking
+    // Create session hook with stats tracking
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(
-        Some(sender),
-        session_stats,
-        context_window as u64,
-        context_config.threshold,
-    );
+    let hook = SessionHook::with_context_tracking(Some(sender), session_stats);
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -627,8 +605,6 @@ fn create_openai_agent(
 /// Create LlamaCpp agent and info (uses completions API for compatibility)
 fn create_llamacpp_agent(
     config: &LlamaCppConfig,
-    context_config: &crate::config::ContextConfig,
-    context_window: usize,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
     searxng_config: Option<&SearXngConfig>,
@@ -667,14 +643,9 @@ fn create_llamacpp_agent(
     // Get session stats from StateManager for context tracking
     let session_stats = state_manager.stats_arc();
 
-    // Create session hook with context tracking
+    // Create session hook with stats tracking
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(
-        Some(sender),
-        session_stats,
-        context_window as u64,
-        context_config.threshold,
-    );
+    let hook = SessionHook::with_context_tracking(Some(sender), session_stats);
 
     // Build agent with system prompt, hook, and built-in tools
     let mut agent_builder = client
@@ -741,12 +712,7 @@ pub fn create_mock_agent(
     // Create session hook with stats tracking (using context_tracking for full functionality)
     let session_stats = state_manager.stats_arc();
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(
-        Some(sender),
-        session_stats,
-        128_000, // context_window
-        0.8,     // threshold
-    );
+    let hook = SessionHook::with_context_tracking(Some(sender), session_stats);
 
     // Build agent with mock model, session hook, and built-in tools
     let agent_builder = AgentBuilder::new(mock_model)

@@ -49,15 +49,25 @@ impl TestHarness {
 
     /// Create a new TestHarness with a custom system prompt
     pub fn with_system_prompt(preamble: &str) -> Self {
-        Self::with_system_prompt_and_context(preamble, ContextConfig::default())
+        Self::with_system_prompt_and_context(
+            preamble,
+            ContextConfig::default(),
+            TestRunner::DEFAULT_CONTEXT_WINDOW,
+        )
     }
 
-    /// Create a new TestHarness with custom system prompt and context configuration.
+    /// Create a new TestHarness with custom system prompt, context configuration,
+    /// and an explicit context window.
     ///
-    /// This allows tests to configure a small context window to trigger compaction
-    /// with fewer messages. For example, with a 500-token context window and 80%
-    /// threshold, compaction triggers at ~400 tokens.
-    pub fn with_system_prompt_and_context(preamble: &str, context_config: ContextConfig) -> Self {
+    /// `context_window` is the resolved usize that drives compaction (tests pin
+    /// this directly rather than threading a wire-id through `auto_detect_*`).
+    /// For example, with a 500-token window and 80% threshold compaction
+    /// triggers at ~400 tokens.
+    pub fn with_system_prompt_and_context(
+        preamble: &str,
+        context_config: ContextConfig,
+        context_window: usize,
+    ) -> Self {
         let mock_model = MockCompletionModel::new();
         let mock_model_clone = mock_model.clone();
         let state_manager = Arc::new(StateManager::new());
@@ -91,6 +101,7 @@ impl TestHarness {
             session_hook_arc,
             preamble.to_string(),
             context_config,
+            context_window,
         );
 
         Self {

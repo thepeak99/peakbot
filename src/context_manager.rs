@@ -14,11 +14,37 @@ use anyhow::{Context as AnyhowContext, Result};
 use std::sync::Arc;
 
 /// Default context window size (128k tokens)
-const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+pub(crate) const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 /// Estimated tokens per message for fallback calculations
 const TOKENS_PER_MESSAGE: usize = 50;
 /// Estimated tokens for a conversation summary
 const SUMMARY_TOKENS: usize = 75;
+
+/// Single source of truth for the model-name → context-window mapping.
+///
+/// Used by both the legacy single-provider boot path (`main.rs`) and
+/// the multi-model registry build (`config::model_registry`). Until
+/// this helper existed, the same `match` block was duplicated in three
+/// places — drift between them was a real correctness liability.
+/// *(necessarily same — they really are the same lookup table)*
+pub fn auto_detect_context_window(model_name: &str) -> usize {
+    match model_name.to_lowercase().as_str() {
+        m if m.contains("claude-3.7-sonnet") => 200_000,
+        m if m.contains("claude-3.5-sonnet") => 200_000,
+        m if m.contains("claude-3-opus") => 200_000,
+        m if m.contains("claude-3-sonnet") => 200_000,
+        m if m.contains("claude-3-haiku") => 200_000,
+        m if m.contains("gpt-4o") => 128_000,
+        m if m.contains("gpt-4-turbo") => 128_000,
+        m if m.contains("gpt-4-32k") => 32_768,
+        m if m.contains("gpt-4") => 8_192,
+        m if m.contains("gpt-3.5-turbo") => 16_385,
+        m if m.contains("gemini-2.0") => 1_000_000,
+        m if m.contains("gemini-1.5-pro") => 2_000_000,
+        m if m.contains("gemini-1.5-flash") => 1_000_000,
+        _ => DEFAULT_CONTEXT_WINDOW,
+    }
+}
 
 /// Result of a context compaction operation
 #[derive(Debug, Clone)]
@@ -58,34 +84,18 @@ pub(crate) struct ContextManager {
 }
 
 impl ContextManager {
-    /// Create a new ContextManager with the given configuration.
-    /// If context_window is 0 or None, attempts to auto-detect from model name.
+    /// Create a new ContextManager with a pre-resolved context window.
+    ///
+    /// Resolution (per-model override OR auto-detect against the wire id)
+    /// happens upstream at the active-model boundary — this constructor
+    /// is the single consumer and stores the value verbatim. See
+    /// `auto_detect_context_window` for the shared lookup helper.
     pub fn new(
         config: ContextConfig,
-        model_name: &str,
+        context_window: usize,
         state_manager: Arc<StateManager>,
         compaction_model: Option<Arc<CompactionModel>>,
     ) -> Self {
-        let context_window =
-            config
-                .context_window
-                .unwrap_or_else(|| match model_name.to_lowercase().as_str() {
-                    m if m.contains("claude-3.7-sonnet") => 200_000,
-                    m if m.contains("claude-3.5-sonnet") => 200_000,
-                    m if m.contains("claude-3-opus") => 200_000,
-                    m if m.contains("claude-3-sonnet") => 200_000,
-                    m if m.contains("claude-3-haiku") => 200_000,
-                    m if m.contains("gpt-4o") => 128_000,
-                    m if m.contains("gpt-4-turbo") => 128_000,
-                    m if m.contains("gpt-4-32k") => 32_768,
-                    m if m.contains("gpt-4") => 8_192,
-                    m if m.contains("gpt-3.5-turbo") => 16_385,
-                    m if m.contains("gemini-2.0") => 1_000_000,
-                    m if m.contains("gemini-1.5-pro") => 2_000_000,
-                    m if m.contains("gemini-1.5-flash") => 1_000_000,
-                    _ => DEFAULT_CONTEXT_WINDOW,
-                });
-
         Self {
             config,
             context_window,
@@ -338,7 +348,6 @@ impl Default for ContextConfig {
             threshold: 0.8,
             keep_recent: 5,
             enabled: true,
-            context_window: None,
             compaction_model: None,
         }
     }
@@ -355,7 +364,6 @@ mod tests {
         assert_eq!(config.threshold, 0.8);
         assert_eq!(config.keep_recent, 5);
         assert!(config.enabled);
-        assert!(config.context_window.is_none());
         assert!(config.compaction_model.is_none());
     }
 
@@ -520,5 +528,29 @@ mod tests {
         assert_eq!(msg.role, MessageRole::Summary);
         assert_eq!(msg.content, "Test summary content");
         assert!(!msg.compacted);
+    }
+
+    /// Regression pin for the cancelled-Step-4 fukup
+    /// (see `context-fukup.md`).
+    ///
+    /// `ContextManager::new` must store the `context_window: usize` it
+    /// receives verbatim, with no fallback / auto-detect / global-config
+    /// override path. Resolution is the caller's job; the manager is
+    /// the single consumer. If this test fails, somebody re-introduced
+    /// a per-model-vs-global tug-of-war upstream.
+    #[test]
+    fn context_window_is_stored_verbatim_and_drives_threshold() {
+        use crate::state::StateManager;
+        let sm = Arc::new(StateManager::new());
+        let cfg = ContextConfig {
+            threshold: 0.8,
+            keep_recent: 5,
+            enabled: true,
+            compaction_model: None,
+        };
+        let cm = ContextManager::new(cfg, 50_000, sm, None);
+        assert_eq!(cm.context_window(), 50_000);
+        // 50_000 × 0.8 = 40_000
+        assert_eq!(cm.threshold(), 40_000);
     }
 }
