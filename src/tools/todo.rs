@@ -303,7 +303,7 @@ impl Tool for TodoTool {
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
+                        "description": "Optional: briefly explain what you're about to do and why, for the user's logs. Safe to omit on long payloads."
                     },
                     "action": {
                         "type": "string",
@@ -325,7 +325,7 @@ impl Tool for TodoTool {
                         "description": "Task ID (required for update and remove actions)"
                     }
                 },
-                "required": ["thought", "action"]
+                "required": ["action"]
             }),
         }
     }

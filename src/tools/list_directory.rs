@@ -14,8 +14,10 @@ pub enum ListDirectoryError {
 
 #[derive(Deserialize)]
 pub struct ListDirectoryArgs {
+    /// Optional reasoning narration. See `FileEditArgs.thought`.
+    #[serde(default)]
     #[allow(dead_code)]
-    thought: String,
+    thought: Option<String>,
     path: String,
     recursive: Option<bool>,
 }
@@ -41,7 +43,7 @@ impl Tool for ListDirectoryTool {
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
+                        "description": "Optional: briefly explain what you're about to do and why, for the user's logs. Safe to omit on long payloads."
                     },
                     "path": {
                         "type": "string",
@@ -52,7 +54,7 @@ impl Tool for ListDirectoryTool {
                         "description": "If true, recurse into subdirectories (max depth 3). Default: false."
                     }
                 },
-                "required": ["thought", "path"]
+                "required": ["path"]
             }),
         }
     }

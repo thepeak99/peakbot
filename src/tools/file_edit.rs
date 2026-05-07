@@ -54,8 +54,13 @@ pub enum FileEditError {
 
 #[derive(Deserialize)]
 pub struct FileEditArgs {
+    /// Optional reasoning narration for logs/UI. Never gates execution —
+    /// see conversation cc2a6efa for the bug this prevented (model dropped
+    /// `thought` on a long tool-call payload, the parse failed, and the
+    /// model fell back to bash).
+    #[serde(default)]
     #[allow(dead_code)]
-    thought: String,
+    thought: Option<String>,
     command: String,
     path: String,
     file_text: Option<String>,
@@ -68,8 +73,11 @@ pub struct FileEditArgs {
 
 #[derive(Serialize, Deserialize)]
 pub struct FileEditTool {
+    /// Per-path undo stack. Each entry is the **pre-edit** snapshot:
+    /// - `Some(content)` — the file existed with this content before the edit
+    /// - `None` — the file did not exist (used by `create`, so undo deletes)
     #[serde(skip)]
-    file_history: Mutex<HashMap<PathBuf, Vec<String>>>,
+    file_history: Mutex<HashMap<PathBuf, Vec<Option<String>>>>,
 }
 
 impl Default for FileEditTool {
@@ -102,6 +110,7 @@ Commands:\n\
 - `create`: Create a new file (fails if file already exists)\n\
 - `str_replace`: Replace text in a file (use replace_all:true for global replacement)\n\
 - `insert`: Insert text at a specific line number\n\
+- `undo_edit`: Revert the most recent file_edit on a path (per-session undo stack)\n\
 \n\
 If editing fails, read the file first to get exact content, then retry."
                 .to_string(),
@@ -110,11 +119,11 @@ If editing fails, read the file first to get exact content, then retry."
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
+                        "description": "Optional: briefly explain what you're about to do and why, for the user's logs. Safe to omit on long payloads — execution will not be blocked."
                     },
                     "command": {
                         "type": "string",
-                        "enum": ["create", "str_replace", "insert"],
+                        "enum": ["create", "str_replace", "insert", "undo_edit"],
                         "description": "The editing command to execute"
                     },
                     "path": {
@@ -123,7 +132,7 @@ If editing fails, read the file first to get exact content, then retry."
                     },
                     "file_text": {
                         "type": "string",
-                        "description": "Required for 'create': the full content of the new file"
+                        "description": "REQUIRED for `create`: the full content of the new file. Must be a non-empty string. Pass the entire file body in this single string — do NOT call `create` and then plan to fill the file later."
                     },
                     "old_str": {
                         "type": "string",
@@ -146,7 +155,7 @@ If editing fails, read the file first to get exact content, then retry."
                         "description": "Optional for 'str_replace': if true, replace all occurrences instead of just the first one. Default: false (single match only)."
                     }
                 },
-                "required": ["thought", "command", "path"]
+                "required": ["command", "path"]
             }),
         }
     }
@@ -166,8 +175,9 @@ If editing fails, read the file first to get exact content, then retry."
             "create" => self.cmd_create(&args),
             "str_replace" => self.cmd_str_replace(&args),
             "insert" => self.cmd_insert(&args),
+            "undo_edit" => self.cmd_undo_edit(&args),
             other => Err(FileEditError::Validation(format!(
-                "Unknown command '{}'. Valid commands: create, str_replace, insert",
+                "Unknown command '{}'. Valid commands: create, str_replace, insert, undo_edit",
                 other
             ))),
         };
@@ -212,9 +222,26 @@ impl FileEditTool {
             )));
         }
 
-        let file_text = args.file_text.as_deref().ok_or_else(|| {
-            FileEditError::Validation("'file_text' is required for create command".into())
-        })?;
+        let file_text = match args.file_text.as_deref() {
+            None => {
+                return Err(FileEditError::Validation(
+                    "'file_text' is required for the 'create' command. \
+                     Re-issue the call with `file_text` set to the full \
+                     contents of the new file (a single non-empty string)."
+                        .into(),
+                ));
+            }
+            Some("") => {
+                return Err(FileEditError::Validation(
+                    "'file_text' is empty. The 'create' command writes the \
+                     entire file contents in one call — pass the full file \
+                     body as a non-empty string in `file_text`. If you \
+                     genuinely want an empty file, write a single newline."
+                        .into(),
+                ));
+            }
+            Some(text) => text,
+        };
 
         if path.exists() {
             return Err(FileEditError::Validation(format!(
@@ -234,8 +261,8 @@ impl FileEditTool {
 
         self.write_file(path, file_text)?;
 
-        // Store in history
-        self.push_history(path, file_text);
+        // Record pre-edit state ("file did not exist") so undo deletes it.
+        self.push_history_none(path);
 
         Ok(format!("File created successfully at: {}", path.display()))
     }
@@ -421,6 +448,51 @@ Tip: For global replacements, use replace_all: true",
             path.display(),
             snippet
         ))
+    }
+
+    // ── undo_edit ────────────────────────────────────────
+
+    fn cmd_undo_edit(&self, args: &FileEditArgs) -> Result<String, FileEditError> {
+        let path = Path::new(&args.path);
+
+        if !path.is_absolute() {
+            return Err(FileEditError::Validation(format!(
+                "Path '{}' is not absolute. Use an absolute path starting with '/'.",
+                path.display()
+            )));
+        }
+
+        let snapshot = self.pop_history(path).ok_or_else(|| {
+            FileEditError::Validation(format!(
+                "Nothing to undo for '{}'. The undo stack is empty — only edits made by file_edit in this session can be undone.",
+                path.display()
+            ))
+        })?;
+
+        match snapshot {
+            // File existed before the edit — restore its prior content.
+            Some(prior) => {
+                self.write_file(path, &prior)?;
+                Ok(format!(
+                    "✅ Undo successful: restored prior content of {} ({} bytes).",
+                    path.display(),
+                    prior.len()
+                ))
+            }
+            // File did not exist before the edit — undo means delete it.
+            None => {
+                if path.exists() {
+                    std::fs::remove_file(path).map_err(|e| FileEditError::Io {
+                        path: path.to_path_buf(),
+                        source: e,
+                    })?;
+                }
+                Ok(format!(
+                    "✅ Undo successful: removed {} (it did not exist before the create).",
+                    path.display()
+                ))
+            }
+        }
     }
 
     // ── Matching Functions ────────────────────────────────────────
@@ -636,7 +708,19 @@ Tip: For global replacements, use replace_all: true",
         history
             .entry(path.to_path_buf())
             .or_default()
-            .push(content.to_string());
+            .push(Some(content.to_string()));
+    }
+
+    /// Record that the file did not exist before this edit (used by `create`).
+    /// Undoing such an entry means deleting the file.
+    fn push_history_none(&self, path: &Path) {
+        let mut history = self.file_history.lock().unwrap_or_else(|e| e.into_inner());
+        history.entry(path.to_path_buf()).or_default().push(None);
+    }
+
+    fn pop_history(&self, path: &Path) -> Option<Option<String>> {
+        let mut history = self.file_history.lock().unwrap_or_else(|e| e.into_inner());
+        history.get_mut(path).and_then(|stack| stack.pop())
     }
 }
 
@@ -647,4 +731,359 @@ fn format_lines_numbered(lines: &[&str], start_num: usize) -> String {
         .map(|(i, line)| format!("{:>6}\t{}", start_num + i, line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Builder for `FileEditArgs` in tests — every field defaults to `None` /
+    /// empty so each test only sets what it cares about.
+    fn args(command: &str, path: &str) -> FileEditArgs {
+        FileEditArgs {
+            thought: Some("test".into()),
+            command: command.into(),
+            path: path.into(),
+            file_text: None,
+            old_str: None,
+            new_str: None,
+            insert_line: None,
+            insert_text: None,
+            replace_all: None,
+        }
+    }
+
+    // ── create ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn create_happy_path_writes_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        let tool = FileEditTool::default();
+
+        let mut a = args("create", path.to_str().unwrap());
+        a.file_text = Some("hello world\n".into());
+
+        let out = tool.cmd_create(&a).expect("create should succeed");
+        assert!(out.contains("File created successfully"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world\n");
+    }
+
+    #[test]
+    fn create_rejects_relative_path() {
+        let tool = FileEditTool::default();
+        let mut a = args("create", "relative.txt");
+        a.file_text = Some("x".into());
+
+        let err = tool.cmd_create(&a).unwrap_err();
+        assert!(
+            matches!(err, FileEditError::Validation(ref msg) if msg.contains("not absolute")),
+            "expected validation error about absolute path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_rejects_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("exists.txt");
+        std::fs::write(&path, "original").unwrap();
+
+        let tool = FileEditTool::default();
+        let mut a = args("create", path.to_str().unwrap());
+        a.file_text = Some("new content".into());
+
+        let err = tool.cmd_create(&a).unwrap_err();
+        assert!(
+            matches!(err, FileEditError::Validation(ref msg) if msg.contains("already exists")),
+            "expected validation error about existing file, got: {err}"
+        );
+        // Original content untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[test]
+    fn create_requires_file_text() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing-text.txt");
+        let tool = FileEditTool::default();
+        let a = args("create", path.to_str().unwrap()); // no file_text
+
+        let err = tool.cmd_create(&a).unwrap_err();
+        assert!(
+            matches!(err, FileEditError::Validation(ref msg) if msg.contains("file_text")),
+            "expected validation error about file_text, got: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "file should not be created on validation failure"
+        );
+    }
+
+    #[test]
+    fn create_makes_missing_parent_dirs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a/b/c/deep.txt");
+        let tool = FileEditTool::default();
+
+        let mut a = args("create", path.to_str().unwrap());
+        a.file_text = Some("deep".into());
+
+        tool.cmd_create(&a)
+            .expect("create should auto-create parents");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "deep");
+    }
+
+    // NOTE: a previous test `create_allows_empty_file_text` pinned the
+    // *opposite* behaviour (empty `file_text` was silently accepted).
+    // That test was removed in the same change that introduced the
+    // coaching error — see `create_with_empty_file_text_returns_coaching_error`
+    // below for the new contract.
+
+    // ── str_replace ────────────────────────────────────────────────────
+
+    #[test]
+    fn str_replace_basic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("r.txt");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+
+        let tool = FileEditTool::default();
+        let mut a = args("str_replace", path.to_str().unwrap());
+        a.old_str = Some("beta".into());
+        a.new_str = Some("BETA".into());
+
+        tool.cmd_str_replace(&a).expect("replace should succeed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha BETA gamma");
+    }
+
+    #[test]
+    fn str_replace_multiple_without_replace_all_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dup.txt");
+        std::fs::write(&path, "x x x").unwrap();
+
+        let tool = FileEditTool::default();
+        let mut a = args("str_replace", path.to_str().unwrap());
+        a.old_str = Some("x".into());
+        a.new_str = Some("y".into());
+
+        let err = tool.cmd_str_replace(&a).unwrap_err();
+        assert!(matches!(err, FileEditError::Validation(_)));
+        // File untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x x x");
+    }
+
+    // ── insert ────────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_at_beginning() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("i.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+
+        let tool = FileEditTool::default();
+        let mut a = args("insert", path.to_str().unwrap());
+        a.insert_line = Some(0);
+        a.insert_text = Some("zero".into());
+
+        tool.cmd_insert(&a).expect("insert should succeed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "zero\none\ntwo\n");
+    }
+
+    // ── undo_edit ─────────────────────────────────────────────────────
+
+    #[test]
+    fn undo_after_create_deletes_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("born.txt");
+        let tool = FileEditTool::default();
+
+        let mut create = args("create", path.to_str().unwrap());
+        create.file_text = Some("hello".into());
+        tool.cmd_create(&create).unwrap();
+        assert!(path.exists());
+
+        let undo = args("undo_edit", path.to_str().unwrap());
+        let out = tool.cmd_undo_edit(&undo).expect("undo should succeed");
+        assert!(out.contains("removed"));
+        assert!(!path.exists(), "undo of create must delete the file");
+    }
+
+    #[test]
+    fn undo_after_str_replace_restores_original() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("doc.txt");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+
+        let tool = FileEditTool::default();
+        let mut sr = args("str_replace", path.to_str().unwrap());
+        sr.old_str = Some("beta".into());
+        sr.new_str = Some("BETA".into());
+        tool.cmd_str_replace(&sr).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha BETA gamma");
+
+        let undo = args("undo_edit", path.to_str().unwrap());
+        let out = tool.cmd_undo_edit(&undo).expect("undo should succeed");
+        assert!(out.contains("restored"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha beta gamma");
+    }
+
+    #[test]
+    fn undo_after_insert_restores_original() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ins.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+
+        let tool = FileEditTool::default();
+        let mut ins = args("insert", path.to_str().unwrap());
+        ins.insert_line = Some(1);
+        ins.insert_text = Some("MIDDLE".into());
+        tool.cmd_insert(&ins).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "one\nMIDDLE\ntwo\n"
+        );
+
+        let undo = args("undo_edit", path.to_str().unwrap());
+        tool.cmd_undo_edit(&undo).expect("undo should succeed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn undo_with_empty_history_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("never-touched.txt");
+        std::fs::write(&path, "untouched").unwrap();
+
+        let tool = FileEditTool::default();
+        let undo = args("undo_edit", path.to_str().unwrap());
+        let err = tool.cmd_undo_edit(&undo).unwrap_err();
+        assert!(
+            matches!(err, FileEditError::Validation(ref msg) if msg.contains("Nothing to undo")),
+            "expected 'Nothing to undo' error, got: {err}"
+        );
+        // File untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn undo_rejects_relative_path() {
+        let tool = FileEditTool::default();
+        let undo = args("undo_edit", "rel.txt");
+        let err = tool.cmd_undo_edit(&undo).unwrap_err();
+        assert!(
+            matches!(err, FileEditError::Validation(ref msg) if msg.contains("not absolute")),
+            "expected absolute-path error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn undo_is_lifo_across_multiple_edits() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stack.txt");
+        std::fs::write(&path, "v0").unwrap();
+
+        let tool = FileEditTool::default();
+        let p = path.to_str().unwrap();
+
+        // Edit 1: v0 → v1
+        let mut e1 = args("str_replace", p);
+        e1.old_str = Some("v0".into());
+        e1.new_str = Some("v1".into());
+        tool.cmd_str_replace(&e1).unwrap();
+        // Edit 2: v1 → v2
+        let mut e2 = args("str_replace", p);
+        e2.old_str = Some("v1".into());
+        e2.new_str = Some("v2".into());
+        tool.cmd_str_replace(&e2).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
+
+        // First undo → back to v1
+        let undo = args("undo_edit", p);
+        tool.cmd_undo_edit(&undo).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1");
+
+        // Second undo → back to v0
+        tool.cmd_undo_edit(&undo).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v0");
+
+        // Third undo → empty stack, error.
+        let err = tool.cmd_undo_edit(&undo).unwrap_err();
+        assert!(matches!(err, FileEditError::Validation(_)));
+    }
+
+    // ── thought-is-optional regression tests ────────────────────────────
+    //
+    // Repro of conversation cc2a6efa: a model produced a valid
+    // `file_edit create` JSON with a long `file_text` body but
+    // omitted the `thought` field. Serde rejected the call with
+    // `missing field 'thought'` *before* our tool ran. The
+    // `thought` field is metadata for logs — never block execution.
+
+    #[test]
+    fn args_deserialize_succeeds_when_thought_is_omitted() {
+        let json = r#"{"command":"create","path":"/tmp/x.txt","file_text":"hi"}"#;
+        let parsed: FileEditArgs = serde_json::from_str(json)
+            .expect("FileEditArgs must deserialize without a `thought` field");
+        assert_eq!(parsed.command, "create");
+        assert_eq!(parsed.path, "/tmp/x.txt");
+        assert_eq!(parsed.file_text.as_deref(), Some("hi"));
+        assert!(parsed.thought.is_none(), "thought must be Option<String>");
+    }
+
+    #[test]
+    fn args_deserialize_still_accepts_thought_when_present() {
+        let json = r#"{"thought":"why","command":"str_replace","path":"/tmp/x.txt","old_str":"a","new_str":"b"}"#;
+        let parsed: FileEditArgs =
+            serde_json::from_str(json).expect("FileEditArgs must accept a `thought` field");
+        assert_eq!(parsed.thought.as_deref(), Some("why"));
+    }
+
+    // ── empty file_text guidance for the model ──────────────────────────
+    //
+    // When `create` is invoked with `file_text: ""` (or omitted) we
+    // must return a *coaching* error — the message is the only signal
+    // the model gets, so spell out exactly what went wrong.
+
+    #[test]
+    fn create_with_empty_file_text_returns_coaching_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        let tool = FileEditTool::default();
+
+        let mut a = args("create", path.to_str().unwrap());
+        a.file_text = Some(String::new()); // empty, not missing
+
+        let err = tool.cmd_create(&a).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("file_text"),
+            "error must mention `file_text`, got: {msg}"
+        );
+        let lower = msg.to_lowercase();
+        assert!(
+            lower.contains("empty") || lower.contains("non-empty") || lower.contains("content"),
+            "error must nag about emptiness/content, got: {msg}"
+        );
+        assert!(
+            !path.exists(),
+            "file must not be created when file_text is empty"
+        );
+    }
+
+    #[test]
+    fn create_missing_file_text_error_mentions_required_field() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nope.txt");
+        let tool = FileEditTool::default();
+        let a = args("create", path.to_str().unwrap()); // no file_text
+
+        let err = tool.cmd_create(&a).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("file_text") && msg.to_lowercase().contains("required"),
+            "error must say `file_text` is required, got: {msg}"
+        );
+    }
 }

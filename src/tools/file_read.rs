@@ -18,8 +18,10 @@ pub enum FileReadError {
 
 #[derive(Deserialize)]
 pub struct FileReadArgs {
+    /// Optional reasoning narration. See `FileEditArgs.thought`.
+    #[serde(default)]
     #[allow(dead_code)]
-    thought: String,
+    thought: Option<String>,
     path: String,
     start_line: Option<usize>,
     end_line: Option<usize>,
@@ -44,7 +46,7 @@ impl Tool for FileReadTool {
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
+                        "description": "Optional: briefly explain what you're about to do and why, for the user's logs. Safe to omit on long payloads."
                     },
                     "path": {
                         "type": "string",
@@ -59,7 +61,7 @@ impl Tool for FileReadTool {
                         "description": "Optional: stop reading at this line (1-indexed, inclusive)"
                     }
                 },
-                "required": ["thought", "path"]
+                "required": ["path"]
             }),
         }
     }
