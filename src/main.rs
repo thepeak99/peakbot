@@ -115,29 +115,12 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Create provider
-    // Compute context window from model name (same logic as ContextManager)
-    let context_window = match config.model().to_lowercase().as_str() {
-        m if m.contains("claude-3.7-sonnet") => 200_000,
-        m if m.contains("claude-3.5-sonnet") => 200_000,
-        m if m.contains("claude-3-opus") => 200_000,
-        m if m.contains("claude-3-sonnet") => 200_000,
-        m if m.contains("claude-3-haiku") => 200_000,
-        m if m.contains("gpt-4o") => 128_000,
-        m if m.contains("gpt-4-turbo") => 128_000,
-        m if m.contains("gpt-4-32k") => 32_768,
-        m if m.contains("gpt-4") => 8_192,
-        m if m.contains("gpt-3.5-turbo") => 16_385,
-        m if m.contains("gemini-2.0") => 1_000_000,
-        m if m.contains("gemini-1.5-pro") => 2_000_000,
-        m if m.contains("gemini-1.5-flash") => 1_000_000,
-        _ => 128_000, // default
-    };
-
+    // Create provider — context window resolution lives in the registry
+    // (per-model `context_window:` OR `auto_detect_context_window` against
+    // the wire id). The provider itself doesn't need to know the value;
+    // `ContextManager` is the single consumer downstream.
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
         &config.provider,
-        &config.context,
-        context_window,
         mcp_tools,
         &system_prompt,
         searxng_config,

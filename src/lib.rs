@@ -23,8 +23,8 @@ pub use config::{
     ProviderConfig, ProviderEntry, ProviderType, RESERVED_UNAVAILABLE_ALIAS, RegistryError,
     ResolvedModel, RetryConfig, SearXngConfig,
 };
-pub use context_manager::CompactionResult;
 use context_manager::ContextManager;
+pub use context_manager::{CompactionResult, auto_detect_context_window};
 pub use conversation::{
     Conversation, ConversationMetadata, ConversationSummary, Message as ConversationMessage,
 };
@@ -330,7 +330,7 @@ impl AgentRunner {
 
             let cm = ContextManager::new(
                 config.context.clone(),
-                provider_info.model.as_str(),
+                auto_detect_context_window(provider_info.model.as_str()),
                 sm.clone(),
                 compaction_model,
             );
@@ -895,26 +895,10 @@ impl AgentRunner {
             Some(all)
         };
 
-        // Compute context window from the new model name.
+        // Context window was eagerly resolved at registry-build time
+        // (alias OR auto-detect). Single source of truth.
         let new_model = resolved.model_name.clone();
-        let context_window = resolved.context_window_override.unwrap_or_else(|| {
-            match new_model.to_lowercase().as_str() {
-                m if m.contains("claude-3.7-sonnet") => 200_000,
-                m if m.contains("claude-3.5-sonnet") => 200_000,
-                m if m.contains("claude-3-opus") => 200_000,
-                m if m.contains("claude-3-sonnet") => 200_000,
-                m if m.contains("claude-3-haiku") => 200_000,
-                m if m.contains("gpt-4o") => 128_000,
-                m if m.contains("gpt-4-turbo") => 128_000,
-                m if m.contains("gpt-4-32k") => 32_768,
-                m if m.contains("gpt-4") => 8_192,
-                m if m.contains("gpt-3.5-turbo") => 16_385,
-                m if m.contains("gemini-2.0") => 1_000_000,
-                m if m.contains("gemini-1.5-pro") => 2_000_000,
-                m if m.contains("gemini-1.5-flash") => 1_000_000,
-                _ => 128_000,
-            }
-        });
+        let context_window = resolved.context_window;
 
         let sm_for_provider = state_manager
             .clone()
@@ -922,8 +906,6 @@ impl AgentRunner {
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
             &resolved.provider_config,
-            &config.context,
-            context_window,
             mcp_tools,
             &ctx.system_prompt,
             ctx.searxng_config.as_ref(),
@@ -980,7 +962,7 @@ impl AgentRunner {
         .map(Arc::new);
         let cm = ContextManager::new(
             config.context.clone(),
-            new_model.as_str(),
+            context_window,
             sm_for_provider.clone(),
             compaction_model,
         );

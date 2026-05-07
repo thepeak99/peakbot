@@ -375,8 +375,6 @@ impl SessionHook {
     pub fn with_context_tracking(
         event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
         stats: Arc<Mutex<SessionStats>>,
-        _context_window: u64,
-        _threshold: f64,
     ) -> Self {
         Self {
             event_sender,

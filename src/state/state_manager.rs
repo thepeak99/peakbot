@@ -1945,11 +1945,10 @@ mod tests {
             threshold: 0.8,
             keep_recent: 5,
             enabled: true,
-            context_window: Some(window),
             compaction_model: None,
         };
         // No compaction model — we're not exercising compact() here.
-        let cm = ContextManager::new(cfg, "mock-model", sm.clone(), None);
+        let cm = ContextManager::new(cfg, window, sm.clone(), None);
         sm.init_context_manager(cm, String::new());
         sm
     }

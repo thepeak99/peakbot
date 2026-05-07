@@ -61,6 +61,10 @@ pub struct TestRunner {
 }
 
 impl TestRunner {
+    /// Default context window size for tests that don't care about it.
+    /// Pinned here so test fixtures can rely on a stable threshold.
+    pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+
     /// Create a new TestRunner with default context configuration
     pub fn new(
         agent: DynAgent,
@@ -74,6 +78,7 @@ impl TestRunner {
             session_hook,
             system_prompt,
             ContextConfig::default(),
+            Self::DEFAULT_CONTEXT_WINDOW,
         )
     }
 
@@ -90,18 +95,22 @@ impl TestRunner {
             session_hook,
             system_prompt,
             ContextConfig::default(),
+            Self::DEFAULT_CONTEXT_WINDOW,
         )
     }
 
     /// Create a TestRunner with custom context configuration.
     ///
     /// Initializes the ContextManager inside StateManager (same as production).
+    /// `context_window` is the resolved usize that drives compaction; tests
+    /// pin it directly rather than going through registry resolution.
     pub fn new_with_context(
         agent: DynAgent,
         state_manager: Arc<StateManager>,
         session_hook: Arc<SessionHook>,
         system_prompt: String,
         context_config: ContextConfig,
+        context_window: usize,
     ) -> Self {
         let agent = Arc::new(agent);
 
@@ -117,7 +126,7 @@ impl TestRunner {
 
         let cm = ContextManager::new(
             context_config,
-            "mock-model",
+            context_window,
             state_manager.clone(),
             compaction_model,
         );

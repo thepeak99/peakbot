@@ -6,7 +6,7 @@
 //! - `providers:` is a YAML *list*, each entry owns its `models:` list.
 //! - Provider `name` is informational only (no cross-references).
 //! - Model `alias` is optional; falls back to `name`.
-//! - Aliases are globally unique and must match `^[a-z0-9_-]+$`.
+//! - Aliases are globally unique and must match `^[A-Za-z0-9_./:-]+$`.
 //! - The literal alias `unknown` is reserved (used as the sentinel for
 //!   pre-v4 conversations whose model wasn't recorded).
 //! - `default_model` is required iff any models are declared.
@@ -59,7 +59,7 @@ pub struct ModelEntry {
     pub name: String,
     /// User-facing handle for `/model` and `/load`. Optional —
     /// defaults to `name` if absent. Globally unique across all
-    /// providers; must match `^[a-z0-9_-]+$`.
+    /// providers; must match `^[A-Za-z0-9_./:-]+$`.
     #[serde(default)]
     pub alias: Option<String>,
     /// Optional max-tokens override for this model.
@@ -74,10 +74,14 @@ pub struct ModelEntry {
     /// Optional pass-through extra params for LlamaCpp.
     #[serde(default)]
     pub extra_params: Option<serde_json::Value>,
-    /// Optional context-window override (overrides auto-detection from
-    /// model name in `ContextManager`).
-    #[serde(default)]
-    pub context_window_override: Option<usize>,
+    /// Per-model context window in tokens. When `None`, resolved at
+    /// registry-build time via
+    /// [`crate::context_manager::auto_detect_context_window`].
+    ///
+    /// Accepts the legacy field name `context_window_override` for one
+    /// release; new configs should use `context_window`.
+    #[serde(default, alias = "context_window_override")]
+    pub context_window: Option<usize>,
 }
 
 /// A model resolved against a provider — alias canonicalised, full
@@ -95,8 +99,11 @@ pub struct ResolvedModel {
     pub provider_kind: ProviderType,
     /// Existing-shape provider config that `create_provider` consumes.
     pub provider_config: ProviderConfig,
-    /// Optional context-window override carried from the model entry.
-    pub context_window_override: Option<usize>,
+    /// Resolved context-window in tokens. Eagerly computed at
+    /// registry-build time as `model.context_window` if set, otherwise
+    /// via [`crate::context_manager::auto_detect_context_window`].
+    /// Downstream consumers read this directly — no Option dance.
+    pub context_window: usize,
 }
 
 /// Errors raised while validating a `ModelRegistry` from a config.
@@ -117,7 +124,7 @@ pub enum RegistryError {
     ReservedAlias(String),
 
     #[error(
-        "alias `{alias}` on `{provider}/{model}` does not match required pattern `[a-z0-9_-]+`"
+        "alias `{alias}` on `{provider}/{model}` does not match required pattern `[A-Za-z0-9_./:-]+`"
     )]
     InvalidAlias {
         alias: String,
@@ -149,7 +156,7 @@ impl ModelRegistry {
     /// # Errors
     /// - duplicate aliases across the whole tree,
     /// - any alias matching the reserved literal `unknown`,
-    /// - any alias not matching `^[a-z0-9_-]+$`,
+    /// - any alias not matching `^[A-Za-z0-9_./:-]+$`,
     /// - `default_model` referencing a non-existent alias,
     /// - `default_model` missing when models are declared.
     pub fn build(
@@ -162,7 +169,19 @@ impl ModelRegistry {
 
         for prov in providers {
             for model in &prov.models {
-                let alias = model.alias.clone().unwrap_or_else(|| model.name.clone());
+                // Canonical handle:
+                //   • alias if declared,
+                //   • else `<provider.name>/<leaf(model.name)>` — where
+                //     `leaf` is the segment after the last `/` of the
+                //     wire id (or the whole id if no `/` is present).
+                // This gives every unaliased model a provider-scoped
+                // handle without double-namespacing wire ids that
+                // already carry an org prefix
+                // (`minimax/MiniMax-M2.7` → `<prov>/MiniMax-M2.7`).
+                let alias = model
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| format!("{}/{}", prov.name, leaf(&model.name)));
 
                 if alias == RESERVED_UNAVAILABLE_ALIAS {
                     return Err(RegistryError::ReservedAlias(alias));
@@ -186,6 +205,9 @@ impl ModelRegistry {
                 origins.insert(alias.clone(), (prov.name.clone(), model.name.clone()));
 
                 let provider_config = build_provider_config(prov, model);
+                let context_window = model.context_window.unwrap_or_else(|| {
+                    crate::context_manager::auto_detect_context_window(&model.name)
+                });
                 by_alias.insert(
                     alias.clone(),
                     ResolvedModel {
@@ -194,7 +216,7 @@ impl ModelRegistry {
                         provider_name: prov.name.clone(),
                         provider_kind: prov.kind.clone(),
                         provider_config,
-                        context_window_override: model.context_window_override,
+                        context_window,
                     },
                 );
             }
@@ -275,13 +297,29 @@ impl ModelRegistry {
     }
 }
 
-/// `^[a-z0-9_-]+$` — the alias pattern. Kept as a hand-rolled check
-/// instead of pulling in `regex` for a five-character grammar. *(don't
-/// be too clever)*
+/// `^[A-Za-z0-9_./:-]+$` — the alias pattern. Permits the punctuation
+/// real model wire ids actually carry (`/` for OpenRouter/HF namespaces,
+/// `.` for version numbers, `:` for Ollama tags, `-` and `_` for
+/// everything else) plus uppercase letters. Rejects spaces and shell
+/// metacharacters — which is the actual safety boundary. Kept as a
+/// hand-rolled check instead of pulling in `regex` for a small grammar.
+/// *(don't be too clever)*
 fn is_valid_alias(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':'))
+}
+
+/// Extract the substring after the last `/` of a wire id, or the whole
+/// id if no `/` is present. Used to build the canonical handle for an
+/// unaliased model: `<provider.name>/<leaf(model.name)>`. Examples:
+///
+/// - `"minimax/MiniMax-M2.7"` → `"MiniMax-M2.7"`
+/// - `"gpt-4o"` → `"gpt-4o"`
+/// - `"qwen2.5-coder:14b"` → `"qwen2.5-coder:14b"` (no `/`, returned as-is)
+/// - `"mistralai/Mistral-7B-Instruct-v0.3"` → `"Mistral-7B-Instruct-v0.3"`
+fn leaf(s: &str) -> &str {
+    s.rsplit_once('/').map(|(_, leaf)| leaf).unwrap_or(s)
 }
 
 /// Translate a (provider entry, model entry) pair into the
@@ -361,7 +399,7 @@ mod tests {
                     temperature: None,
                     num_ctx: None,
                     extra_params: None,
-                    context_window_override: None,
+                    context_window: None,
                 },
                 ModelEntry {
                     name: "anthropic/claude-opus-4".into(),
@@ -370,7 +408,7 @@ mod tests {
                     temperature: None,
                     num_ctx: None,
                     extra_params: None,
-                    context_window_override: None,
+                    context_window: None,
                 },
             ],
         }
@@ -390,7 +428,7 @@ mod tests {
                     temperature: None,
                     num_ctx: None,
                     extra_params: None,
-                    context_window_override: None,
+                    context_window: None,
                 },
                 ModelEntry {
                     name: "o3".into(), // no alias — addressable by name
@@ -399,7 +437,7 @@ mod tests {
                     temperature: None,
                     num_ctx: None,
                     extra_params: None,
-                    context_window_override: None,
+                    context_window: None,
                 },
             ],
         }
@@ -415,16 +453,24 @@ mod tests {
         assert!(reg.contains("sonnet"));
         assert!(reg.contains("opus"));
         assert!(reg.contains("oai-gpt4"));
-        assert!(reg.contains("o3"), "unaliased model addressable by name");
+        assert!(
+            reg.contains("openai/o3"),
+            "unaliased model addressable by qualified handle <provider>/<leaf>"
+        );
     }
 
     #[test]
-    fn unaliased_model_is_addressable_by_its_wire_name() {
+    fn unaliased_model_uses_provider_qualified_handle() {
         let providers = vec![oai_provider()];
-        let reg = ModelRegistry::build(&providers, Some("o3")).expect("should build");
-        let resolved = reg.resolve("o3").unwrap();
-        assert_eq!(resolved.alias, "o3");
-        assert_eq!(resolved.model_name, "o3");
+        let reg = ModelRegistry::build(&providers, Some("openai/o3")).expect("should build");
+        let resolved = reg.resolve("openai/o3").unwrap();
+        assert_eq!(resolved.alias, "openai/o3");
+        assert_eq!(
+            resolved.model_name, "o3",
+            "model_name is still the raw wire id"
+        );
+        // The bare wire id is no longer a registry handle.
+        assert!(!reg.contains("o3"));
     }
 
     #[test]
@@ -515,6 +561,117 @@ mod tests {
         let providers = vec![or_provider(), oai_provider()];
         let reg = ModelRegistry::build(&providers, Some("sonnet")).unwrap();
         let aliases = reg.aliases_sorted();
-        assert_eq!(aliases, vec!["o3", "oai-gpt4", "opus", "sonnet"]);
+        assert_eq!(aliases, vec!["oai-gpt4", "openai/o3", "opus", "sonnet"]);
+    }
+
+    /// Real-world wire ids carry `/`, `.`, `:`, and uppercase letters
+    /// (OpenRouter `minimax/MiniMax-M2.7`, Ollama `qwen2.5-coder:14b`,
+    /// HF `mistralai/Mistral-7B-Instruct-v0.3`). When the user omits
+    /// an explicit `alias:`, the canonical handle becomes
+    /// `<provider.name>/<leaf(model.name)>` — the leaf strips any
+    /// pre-existing namespace prefix (`minimax/`) so the handle stays
+    /// readable. *(reject spaces and shell metacharacters, not
+    /// punctuation that real ids actually use)*
+    #[test]
+    fn unaliased_model_with_slash_dot_and_uppercase_is_accepted() {
+        let prov = ProviderEntry {
+            name: "patchnotes".into(),
+            kind: ProviderType::OpenRouter,
+            api_key: Some("sk-or-test".into()),
+            base_url: None,
+            models: vec![ModelEntry {
+                name: "minimax/MiniMax-M2.7".into(),
+                alias: None,
+                max_tokens: None,
+                temperature: None,
+                num_ctx: None,
+                extra_params: None,
+                context_window: None,
+            }],
+        };
+        let reg = ModelRegistry::build(&[prov], Some("patchnotes/MiniMax-M2.7"))
+            .expect("qualified handle <prov>/<leaf> should be valid");
+        let resolved = reg.resolve("patchnotes/MiniMax-M2.7").unwrap();
+        assert_eq!(resolved.alias, "patchnotes/MiniMax-M2.7");
+        // The wire id is still the raw model name — not the leaf.
+        assert_eq!(resolved.model_name, "minimax/MiniMax-M2.7");
+    }
+
+    /// Ollama tags use `:` (e.g. `qwen2.5-coder:14b`) and have no `/`,
+    /// so leaf == whole wire id. Handle becomes `ollama/<wire-id>`.
+    #[test]
+    fn unaliased_ollama_tag_with_colon_is_accepted() {
+        let prov = ProviderEntry {
+            name: "ollama".into(),
+            kind: ProviderType::Ollama,
+            api_key: None,
+            base_url: None,
+            models: vec![ModelEntry {
+                name: "qwen2.5-coder:14b".into(),
+                alias: None,
+                max_tokens: None,
+                temperature: None,
+                num_ctx: None,
+                extra_params: None,
+                context_window: None,
+            }],
+        };
+        let reg = ModelRegistry::build(&[prov], Some("ollama/qwen2.5-coder:14b"))
+            .expect("colon-bearing Ollama tag with no `/` keeps full id as leaf");
+        assert!(reg.contains("ollama/qwen2.5-coder:14b"));
+    }
+
+    /// Per-model `context_window` is eagerly resolved into
+    /// `ResolvedModel.context_window`. With `None` we fall back to the
+    /// auto-detect helper (single source of truth shared with the
+    /// legacy boot path).
+    #[test]
+    fn context_window_resolved_eagerly_from_per_model_field() {
+        let prov = ProviderEntry {
+            name: "openrouter".into(),
+            kind: ProviderType::OpenRouter,
+            api_key: Some("sk".into()),
+            base_url: None,
+            models: vec![
+                ModelEntry {
+                    name: "anthropic/claude-3.7-sonnet".into(),
+                    alias: Some("sonnet".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    num_ctx: None,
+                    extra_params: None,
+                    context_window: None, // → auto-detect → 200_000
+                },
+                ModelEntry {
+                    name: "custom-model-no-table-entry".into(),
+                    alias: Some("custom".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    num_ctx: None,
+                    extra_params: None,
+                    context_window: Some(42), // explicit → 42
+                },
+            ],
+        };
+        let reg = ModelRegistry::build(&[prov], Some("sonnet")).unwrap();
+        assert_eq!(reg.resolve("sonnet").unwrap().context_window, 200_000);
+        assert_eq!(reg.resolve("custom").unwrap().context_window, 42);
+    }
+
+    /// The legacy field name `context_window_override:` must still
+    /// deserialise into the new `context_window` field for one release.
+    #[test]
+    fn legacy_context_window_override_field_name_still_parses() {
+        let yaml = "
+name: openrouter
+type: openrouter
+api_key: sk
+models:
+  - name: anthropic/claude-3.7-sonnet
+    alias: sonnet
+    context_window_override: 12345
+";
+        let prov: ProviderEntry = serde_yaml::from_str(yaml).expect("legacy field name parses");
+        assert_eq!(prov.models[0].context_window, Some(12345));
     }
 }

@@ -19,12 +19,14 @@ async fn test_compactor_uses_last_request_tokens() {
         threshold: 0.8,
         keep_recent: 2,
         enabled: true,
-        context_window: Some(500), // 500 token context = 400 token threshold
         compaction_model: None,
     };
 
-    let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+    let mut harness = TestHarness::with_system_prompt_and_context(
+        "You are a helpful assistant.",
+        context_config,
+        500,
+    );
 
     // 100 tokens per request (context stays constant ~100 tokens)
     let usage = Usage {
@@ -58,11 +60,10 @@ async fn test_compactor_threshold_calculation() {
         threshold: 0.8,
         keep_recent: 2,
         enabled: true,
-        context_window: Some(1000),
         compaction_model: None,
     };
 
-    let harness = TestHarness::with_system_prompt_and_context("Short prompt", context_config);
+    let harness = TestHarness::with_system_prompt_and_context("Short prompt", context_config, 1000);
 
     // Verify the state reflects the configured context window
     let state = harness.get_state();
@@ -82,12 +83,14 @@ async fn test_compactor_triggers_above_threshold() {
         threshold: 0.8,
         keep_recent: 1,
         enabled: true,
-        context_window: Some(500), // 500 * 0.8 = 400 token threshold
         compaction_model: None,
     };
 
-    let mut harness =
-        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", context_config);
+    let mut harness = TestHarness::with_system_prompt_and_context(
+        "You are a helpful assistant.",
+        context_config,
+        500,
+    );
 
     // 450 tokens per request (> 400 threshold), triggers compaction
     let usage = Usage {
