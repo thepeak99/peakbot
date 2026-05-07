@@ -119,8 +119,26 @@ async fn main() -> Result<()> {
     // (per-model `context_window:` OR `auto_detect_context_window` against
     // the wire id). The provider itself doesn't need to know the value;
     // `ContextManager` is the single consumer downstream.
+    //
+    // Boot path: when a multi-model `providers:` block was declared, the
+    // registry's default model owns the live credentials/wire id. The
+    // legacy `Config::provider` field is just `OpenRouterConfig::default()`
+    // in that case (api_key=None, model="anthropic/claude-3.7-sonnet"),
+    // so handing that to `create_provider` reliably surfaces a misleading
+    // "OpenRouter API key not configured" — the bug we just fixed.
+    // *(reuse the seam that already exists)*
+    let boot_provider_config: &peakbot::ProviderConfig = match model_registry.default_alias() {
+        Some(alias) => {
+            &model_registry
+                .resolve(alias)
+                .expect("default_alias is guaranteed to resolve by ModelRegistry::build")
+                .provider_config
+        }
+        None => &config.provider,
+    };
+
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
-        &config.provider,
+        boot_provider_config,
         mcp_tools,
         &system_prompt,
         searxng_config,

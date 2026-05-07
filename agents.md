@@ -303,7 +303,7 @@ default_model: sonnet
 ```
 
 Rules:
-- `alias` is optional; falls back to `name`. Globally unique. Pattern `^[a-z0-9_-]+$`.
+- `alias` is optional. **When omitted, the model is addressable only as `<provider_name>/<model_name>` — the full qualified handle.** It is *never* addressable by the bare model leaf alone. Aliases are globally unique and must match `^[A-Za-z0-9_./:-]+$`.
 - The literal alias `unknown` is reserved and rejected at config load (used as the sentinel for pre-v4 conversation files).
 - `default_model` is required iff any models are declared, and must reference one of the declared aliases.
 - `provider name` is informational — it's only used in `/conversations` and the `/model` listing, never cross-referenced.
