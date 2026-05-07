@@ -195,7 +195,7 @@ pub enum TodoError {
 
 /// The todo tool - a stateless controller that delegates to StateManager.
 /// All todo state lives in StateManager; this tool just updates it.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TodoTool {
     /// Reference to StateManager (single source of truth for todo state)
     state_manager: Option<std::sync::Arc<StateManager>>,

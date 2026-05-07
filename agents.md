@@ -264,9 +264,60 @@ Plus optional **MCP tools** from configured servers.
 
 PeakBot supports multiple LLM providers (OpenRouter, OpenAI, LlamaCpp, Ollama). Configuration is loaded from `config.yaml` in the platform config directory, with environment variables taking precedence.
 
-### Provider Configuration
+### Multi-model with `/model`
 
-The recommended config format uses the `provider` key:
+The recommended shape declares **a list of providers, each with its own list of models**, plus `default_model` to pick the boot alias. Use `/model` to list, `/model <alias>` to switch.
+
+```yaml
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-or-v1-xxx
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: sonnet
+        max_tokens: 8192
+      - name: anthropic/claude-opus-4
+        alias: opus
+      - name: google/gemini-2.0-flash-001
+        alias: flash
+
+  - name: openai
+    type: openai
+    api_key: sk-xxx
+    models:
+      - name: gpt-4o
+        alias: oai-gpt4
+        max_tokens: 4000
+      - name: o3                      # no alias → user types `/model o3`
+
+  - name: local
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: qwen2.5-coder:14b
+        alias: local
+        temperature: 0.4
+
+default_model: sonnet
+```
+
+Rules:
+- `alias` is optional; falls back to `name`. Globally unique. Pattern `^[a-z0-9_-]+$`.
+- The literal alias `unknown` is reserved and rejected at config load (used as the sentinel for pre-v4 conversation files).
+- `default_model` is required iff any models are declared, and must reference one of the declared aliases.
+- `provider name` is informational — it's only used in `/conversations` and the `/model` listing, never cross-referenced.
+- Per-model overrides: `max_tokens`, `temperature`, `num_ctx` (Ollama), `extra_params` (LlamaCpp), `context_window_override`.
+
+`/model` semantics:
+- `/model` (no arg) — lists every alias with the active one marked `→`.
+- `/model <alias>` — **starts a new conversation** on that model. Confirms with the same Ctrl+C-style overlay if the current chat has content; skips the prompt on an empty conversation.
+- `/model <unknown>` — emits `❌ /model: unknown alias \`x\`. Available: …`. No state change.
+- `/model <current>` — emits `Already on x.`. No destructive reset.
+- The active model alias is **bound to the conversation** in metadata. `/load <id>` re-activates the saved alias; if the alias is no longer in the registry (renamed/removed in config, or pre-v4 file with no alias), the load is rejected with `Model 'xyz' not available.` and the previous conversation stays intact. *(persisted artifacts must carry every field needed to be re-activated.)*
+- MCP servers persist across switches — only the agent handle is rebuilt; MCP subprocesses keep running.
+
+### Legacy single-provider config (still supported)
 
 ```yaml
 # OpenRouter example (100+ models)

@@ -36,6 +36,7 @@ use tokio::time;
 use crate::state::StateManager;
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState};
+use crate::ui::repl::confirm_dialog::{ConfirmAction, ConfirmDialog, render_confirm_dialog};
 use crate::ui::repl::markdown::MarkdownRenderer;
 use crate::ui::repl::message_renderer::{MessageRenderer, PlainRenderer};
 use crate::ui::repl::render_cache::ChatRenderCache;
@@ -360,10 +361,16 @@ pub struct ReplUi {
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
     /// UI state for rendering (input, scroll, viewport)
     ui_state: UiState,
-    /// Whether the quit confirmation dialog is visible
-    show_quit_confirm: bool,
-    /// Which button is selected: true = "Yes", false = "No" (default)
-    confirm_yes_selected: bool,
+    /// Active modal confirmation dialog. `None` when closed.
+    /// Generalised from the original `show_quit_confirm` +
+    /// `confirm_yes_selected` bool pair when `/model` became the
+    /// second consumer. See `confirm_dialog.rs`.
+    pub(crate) confirm_dialog: Option<ConfirmDialog>,
+    /// Optional model registry — when present, `/model <alias>`
+    /// submissions are intercepted and validated before any action is
+    /// dispatched. Tests + the legacy single-provider boot path leave
+    /// this `None` and `/model` falls through unchanged.
+    pub(crate) model_registry: Option<Arc<crate::config::ModelRegistry>>,
     /// Last state revision we successfully rendered. Used with `local_dirty`
     /// to skip idle-tick redraws. See `slow-messages.md` §4.4.
     last_rendered_revision: u64,
@@ -398,6 +405,21 @@ impl ReplUi {
         )
     }
 
+    /// Construct a `ReplUi` and attach a model registry. Production
+    /// boot uses this so `/model <alias>` is intercepted and validated
+    /// in the View before any action is sent. Tests / harnesses that
+    /// don't care about model switching can keep using
+    /// [`ReplUi::new`].
+    pub fn new_with_registry(
+        state_manager: Arc<StateManager>,
+        action_sender: UnboundedSender<UiAction>,
+        registry: Arc<crate::config::ModelRegistry>,
+    ) -> Self {
+        let mut ui = Self::new(state_manager, action_sender);
+        ui.model_registry = Some(registry);
+        ui
+    }
+
     /// Construct a `ReplUi` with a custom [`MessageRenderer`] — the seam
     /// through which a future markdown renderer slots in without touching
     /// anything else in this file. See `slow-messages.md` §4.2.
@@ -412,8 +434,8 @@ impl ReplUi {
             running: true,
             terminal: None,
             ui_state: UiState::new(),
-            show_quit_confirm: false,
-            confirm_yes_selected: false,
+            confirm_dialog: None,
+            model_registry: None,
             last_rendered_revision: 0,
             last_size: (0, 0),
             chat_cache: ChatRenderCache::new(renderer),
@@ -861,88 +883,16 @@ impl ReplUi {
         f.render_widget(paragraph, area);
     }
 
-    /// Render the quit confirmation dialog overlay
+    /// Backward-compat shim for the original `render_quit_confirm`
+    /// helper. Delegates to the new generic
+    /// [`render_confirm_dialog`] using a freshly-built
+    /// [`ConfirmDialog::quit`]. Kept on `ReplUi` so existing snapshot
+    /// tests (`tests/repl_tests.rs::quit_confirm_*`) call it
+    /// unchanged.
     pub fn render_quit_confirm(f: &mut ratatui::Frame, area: Rect, yes_selected: bool) {
-        // Calculate centered popup dimensions
-        let popup_width = 50;
-        let popup_height = 9;
-        let x = (area.width.saturating_sub(popup_width)) / 2;
-        let y = (area.height.saturating_sub(popup_height)) / 2;
-        let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-        // Clear the popup area
-        f.render_widget(Clear, popup_area);
-
-        // Fixed-width button labels for proper centering
-        // Both buttons are padded to 14 characters
-        const YES_BTN: &str = "  Yes, leave   ";
-        const NO_BTN: &str = "  No, stay     ";
-        const BTN_SEPARATOR: &str = "   ";
-        const BTN_TOTAL_WIDTH: usize = 14 + 3 + 14; // yes + separator + no
-
-        // Calculate centering offset for buttons
-        let btn_left_padding = (popup_width as usize).saturating_sub(BTN_TOTAL_WIDTH) / 2;
-
-        // Style for selected vs unselected
-        let selected_style = Style::default().fg(Color::Yellow).bg(Color::DarkGray);
-        let unselected_style = Style::default().fg(Color::White);
-
-        let (yes_btn, yes_style) = if yes_selected {
-            ("[ Yes, leave ]", selected_style)
-        } else {
-            (YES_BTN, unselected_style)
-        };
-        let (no_btn, no_style) = if !yes_selected {
-            ("[ No, stay ]", selected_style)
-        } else {
-            (NO_BTN, unselected_style)
-        };
-
-        // Centered warning text. VS16 stripped from `⚠` (was `⚠️`) so
-        // `unicode-width` and the terminal agree on 1 cell each. Total
-        // visual width: 14 leading spaces + 1 + 2 + "WAIT! DON'T LEAVE!"
-        // (18) + 2 + 1 = 38. See `garbled.md` Class A.
-        let warning = "              ⚠  WAIT! DON'T LEAVE!  ⚠";
-        // Centered question (36 chars, centered = 7 spaces)
-        let question = "       Are you sure you want to quit PeakBot?";
-        // Centered hint text
-        let hint = "      ←/→ to switch  ·  Enter to confirm  ·  Esc to cancel";
-
-        // Build padding strings
-        let btn_padding = " ".repeat(btn_left_padding);
-
-        let content = vec![
-            Line::from(vec![Span::raw("")]),
-            Line::from(vec![Span::styled(
-                warning,
-                Style::default().fg(Color::LightRed),
-            )]),
-            Line::from(vec![Span::raw("")]),
-            Line::from(vec![Span::raw(question)]),
-            Line::from(vec![Span::raw("")]),
-            Line::from(vec![
-                Span::raw(btn_padding),
-                Span::styled(yes_btn, yes_style),
-                Span::raw(BTN_SEPARATOR),
-                Span::styled(no_btn, no_style),
-            ]),
-            Line::from(vec![Span::raw("")]),
-            Line::from(vec![Span::styled(
-                hint,
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::raw("")]),
-        ];
-
-        let paragraph = Paragraph::new(content)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::LightCyan)),
-            );
-
-        f.render_widget(paragraph, popup_area);
+        let mut dialog = ConfirmDialog::quit();
+        dialog.yes_selected = yes_selected;
+        render_confirm_dialog(f, area, &dialog);
     }
 
     /// Main render function
@@ -1140,9 +1090,9 @@ impl ReplUi {
                     );
                 }
 
-                // Render quit confirmation dialog if visible
-                if self.show_quit_confirm {
-                    Self::render_quit_confirm(f, size, self.confirm_yes_selected);
+                // Render confirmation dialog overlay if any is open.
+                if let Some(ref dialog) = self.confirm_dialog {
+                    render_confirm_dialog(f, size, dialog);
                 }
             })?;
         }
@@ -1176,6 +1126,101 @@ impl ReplUi {
         };
     }
 
+    /// Resolve the open confirm dialog: dispatch its `ConfirmAction` if
+    /// the user picked Yes, then close the dialog regardless. Called
+    /// from the `Enter` arm in `handle_keyboard_input`.
+    ///
+    /// This is the *only* place `ConfirmAction` variants get matched —
+    /// any future variant added to the enum lights up here as a
+    /// non-exhaustive match (clippy: `match_same_arms` is OK because
+    /// each branch may grow). Add a new arm whenever you add a new
+    /// confirm-gated operation.
+    fn commit_confirm_dialog(&mut self) {
+        let Some(dialog) = self.confirm_dialog.take() else {
+            return;
+        };
+        if !dialog.yes_selected {
+            return;
+        }
+        match dialog.action {
+            ConfirmAction::Quit => {
+                self.running = false;
+            }
+            ConfirmAction::SwitchModel { alias, .. } => {
+                let _ = self.action_sender.send(UiAction::SwitchModel(alias));
+            }
+        }
+    }
+
+    /// Pre-submission interceptor for `/model <alias>`. Production
+    /// behaviour, gated on a non-`None` `model_registry`:
+    ///
+    /// - Bare `/model` (no arg) — falls through to the controller as a
+    ///   `Command`; `process_command_internal` lists the available
+    ///   models.
+    /// - `/model <alias>` with **invalid** alias — emits the canonical
+    ///   error system message; nothing further.
+    /// - `/model <alias>` matching the **current** alias — emits a
+    ///   "Already on X." system message; no destructive reset.
+    /// - Valid + new alias, **empty** chat — sends
+    ///   `UiAction::SwitchModel(alias)` directly. No confirmation
+    ///   needed (no content to lose).
+    /// - Valid + new alias, **non-empty** chat — opens a
+    ///   [`ConfirmDialog::switch_model`]. The eventual `UiAction` is
+    ///   dispatched by `commit_confirm_dialog` if the user confirms.
+    ///
+    /// Returns `true` if the submission was fully consumed (do not
+    /// dispatch `UiAction::SendMessage`); `false` if the caller should
+    /// fall through to the standard send path.
+    fn try_intercept_model_command(&mut self, msg: &str) -> bool {
+        let trimmed = msg.trim();
+        if trimmed.eq_ignore_ascii_case("/model") {
+            // No arg — defer to the controller's listing handler.
+            return false;
+        }
+        let Some(rest) = trimmed
+            .strip_prefix("/model ")
+            .or_else(|| trimmed.strip_prefix("/MODEL "))
+        else {
+            return false;
+        };
+        let alias = rest.trim();
+        if alias.is_empty() {
+            return false; // treat as bare `/model`
+        }
+        let Some(registry) = self.model_registry.clone() else {
+            // No registry attached — let the controller handle it.
+            return false;
+        };
+        let Some(resolved) = registry.resolve(alias) else {
+            // Unknown alias. Emit the canonical error system message and
+            // do not dispatch anything further.
+            let available = registry.aliases_sorted().join(", ");
+            self.state_manager.add_system_message(format!(
+                "❌ /model: unknown alias `{alias}`. Available: {available}",
+            ));
+            return true;
+        };
+        // Same as current?
+        let current = self.state_manager.get_model_alias();
+        if current == resolved.alias {
+            self.state_manager
+                .add_system_message(format!("Already on {}.", resolved.alias));
+            return true;
+        }
+        // Decide whether to confirm. Empty chat = skip confirm.
+        let chat_empty = self.state_manager.get_state().chat.messages.is_empty();
+        let descriptor = format!("{} · {}", resolved.provider_name, resolved.model_name);
+        if chat_empty {
+            let _ = self
+                .action_sender
+                .send(UiAction::SwitchModel(resolved.alias.clone()));
+        } else {
+            self.confirm_dialog = Some(ConfirmDialog::switch_model(&resolved.alias, &descriptor));
+        }
+        true
+    }
+
     fn handle_keyboard_input(&mut self, key: KeyEvent) {
         match key.code {
             // Toggle todo panel with Ctrl+T
@@ -1193,14 +1238,13 @@ impl ReplUi {
             }
             // Quit with Ctrl+C (opens confirmation dialog)
             KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.show_quit_confirm = true;
-                self.confirm_yes_selected = false; // Default to "No"
+                self.confirm_dialog = Some(ConfirmDialog::quit());
             }
             // Toggle multiline compose mode with Ctrl+G ("Go multi"). When
             // OFF, first tap turns it ON and Enter starts inserting newlines
             // instead of submitting. When ON, second tap submits the buffer
-            // (if non-empty) and exits the mode. Gated off while quit-confirm
-            // or command popup is open so those modal surfaces win.
+            // (if non-empty) and exits the mode. Gated off while a confirm
+            // dialog or command popup is open so those modal surfaces win.
             //
             // Why Ctrl+G specifically: byte 0x07 (BEL) is detectable on every
             // terminal as `Char('g') + CONTROL`, has no Enter/Tab/Backspace
@@ -1208,14 +1252,14 @@ impl ReplUi {
             // screen" muscle memory from shells. See `multiline-mode.md`.
             KeyCode::Char('g' | 'G')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !self.show_quit_confirm
+                    && self.confirm_dialog.is_none()
                     && self.command_popup.is_none() =>
             {
                 if self.multiline_mode {
                     // Second tap → submit + exit (mirrors plain-Enter submit).
                     let msg = self.ui_state.input_buffer.clone();
                     self.multiline_mode = false;
-                    if !msg.trim().is_empty() {
+                    if !msg.trim().is_empty() && !self.try_intercept_model_command(&msg) {
                         let _ = self.action_sender.send(UiAction::SendMessage(msg));
                     }
                     self.ui_state.clear_input();
@@ -1239,10 +1283,11 @@ impl ReplUi {
                 // Simple increment - will be clamped during render
                 self.ui_state.todo_scroll_position += 1;
             }
-            // Quit confirmation dialog handlers (must come before general handlers)
-            KeyCode::Esc if self.show_quit_confirm => {
+            // Confirmation dialog handlers (must come before general handlers).
+            // Routes to whatever ConfirmAction the open dialog carries.
+            KeyCode::Esc if self.confirm_dialog.is_some() => {
                 // ESC while dialog is open = cancel (close dialog)
-                self.show_quit_confirm = false;
+                self.confirm_dialog = None;
             }
             // Esc while in multiline compose mode = cancel mode without
             // submitting. Buffer is preserved (the user may still want
@@ -1251,20 +1296,23 @@ impl ReplUi {
             KeyCode::Esc if self.multiline_mode => {
                 self.multiline_mode = false;
             }
-            KeyCode::Enter if self.show_quit_confirm => {
-                if self.confirm_yes_selected {
-                    self.running = false;
+            KeyCode::Enter if self.confirm_dialog.is_some() => {
+                self.commit_confirm_dialog();
+            }
+            KeyCode::Char('y' | 'Y') if self.confirm_dialog.is_some() => {
+                if let Some(ref mut d) = self.confirm_dialog {
+                    d.yes_selected = true;
                 }
-                self.show_quit_confirm = false;
             }
-            KeyCode::Char('y' | 'Y') if self.show_quit_confirm => {
-                self.confirm_yes_selected = true;
+            KeyCode::Char('n' | 'N') if self.confirm_dialog.is_some() => {
+                if let Some(ref mut d) = self.confirm_dialog {
+                    d.yes_selected = false;
+                }
             }
-            KeyCode::Char('n' | 'N') if self.show_quit_confirm => {
-                self.confirm_yes_selected = false;
-            }
-            KeyCode::Left | KeyCode::Right if self.show_quit_confirm => {
-                self.confirm_yes_selected = !self.confirm_yes_selected;
+            KeyCode::Left | KeyCode::Right if self.confirm_dialog.is_some() => {
+                if let Some(ref mut d) = self.confirm_dialog {
+                    d.toggle_selection();
+                }
             }
             // ── Command popup handlers ─────────────────────────────────────
             // When the popup is open, Up/Down/Tab/Enter/Esc are diverted to
@@ -1309,7 +1357,7 @@ impl ReplUi {
             KeyCode::Char('/')
                 if self.ui_state.input_buffer.is_empty()
                     && self.command_popup.is_none()
-                    && !self.show_quit_confirm
+                    && self.confirm_dialog.is_none()
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
@@ -1360,7 +1408,7 @@ impl ReplUi {
             }
             KeyCode::Enter => {
                 let msg = self.ui_state.input_buffer.clone();
-                if !msg.trim().is_empty() {
+                if !msg.trim().is_empty() && !self.try_intercept_model_command(&msg) {
                     let _ = self.action_sender.send(UiAction::SendMessage(msg));
                 }
                 self.ui_state.clear_input();
@@ -2817,13 +2865,13 @@ mod multiline_mode_tests {
     #[test]
     fn ctrl_g_is_gated_off_while_quit_confirm_is_open() {
         let (mut ui, _rx) = harness();
-        ui.show_quit_confirm = true;
+        ui.confirm_dialog = Some(ConfirmDialog::quit());
 
         ui.handle_keyboard_input(ctrl(KeyCode::Char('g')));
 
         assert!(
             !ui.multiline_mode,
-            "Ctrl+G must be a no-op while quit confirm is open"
+            "Ctrl+G must be a no-op while a confirm dialog is open"
         );
     }
 

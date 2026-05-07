@@ -2,6 +2,12 @@
 // depending on build configuration. The enum variants are accessed via deserialization.
 #![allow(dead_code)]
 
+pub mod model_registry;
+pub use model_registry::{
+    ModelEntry, ModelRegistry, ProviderEntry, RESERVED_UNAVAILABLE_ALIAS, RegistryError,
+    ResolvedModel,
+};
+
 use directories_next::ProjectDirs;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -165,9 +171,22 @@ impl Default for LlamaCppConfig {
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct Config {
-    /// LLM Provider configuration (OpenRouter or Ollama)
+    /// LLM Provider configuration (legacy single-provider shape).
+    /// Used as the *fallback* when no `providers:` list is declared.
+    /// Always non-empty thanks to the `default_provider_config()` synth
+    /// path; `providers:` (when present) takes precedence at boot.
     #[serde(default)]
     pub provider: ProviderConfig,
+
+    /// Multi-model providers list. When non-empty, this is the source
+    /// of truth — `provider:` is ignored. Each entry owns its
+    /// `models:` list.
+    #[serde(default)]
+    pub providers: Vec<ProviderEntry>,
+
+    /// The alias to boot with. Required iff `providers:` is non-empty.
+    #[serde(default)]
+    pub default_model: Option<String>,
 
     /// DEPRECATED: Use provider.config.model instead
     /// Maximum tool turns per message
@@ -369,6 +388,114 @@ impl Config {
             .as_ref()
             .map(|p| p.enabled && !p.agents.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Build a [`ModelRegistry`] from the loaded config.
+    ///
+    /// Two paths:
+    ///
+    /// 1. **Multi-model** (`providers:` non-empty): validates the
+    ///    declared providers + models, returns the populated registry.
+    ///    Returns an error if validation fails.
+    ///
+    /// 2. **Legacy single-provider** (`providers:` empty): synthesises
+    ///    a one-entry registry whose alias is `default`. Internal
+    ///    contract: the legacy `provider:` block is wrapped without
+    ///    user-visible behaviour change. The synthesised alias is
+    ///    `default` and the default_model is `default`.
+    ///
+    /// *(necessarily same — they really are the same operation)*
+    pub fn build_model_registry(&self) -> Result<ModelRegistry, RegistryError> {
+        if self.providers.is_empty() {
+            // Legacy synthesis path. We construct a single-entry list
+            // whose ProviderEntry copies the legacy `provider:` shape.
+            // The wire id is read off the active legacy variant.
+            let (kind, api_key, base_url, model_name, max_tokens, temperature, num_ctx, extra) =
+                describe_legacy(&self.provider);
+            let synthetic_alias = "default".to_string();
+            let provider_entry = ProviderEntry {
+                name: kind.to_string(),
+                kind: kind.clone(),
+                api_key,
+                base_url,
+                models: vec![ModelEntry {
+                    name: model_name,
+                    alias: Some(synthetic_alias.clone()),
+                    max_tokens: Some(max_tokens),
+                    temperature,
+                    num_ctx,
+                    extra_params: extra,
+                    context_window_override: None,
+                }],
+            };
+            return ModelRegistry::build(
+                std::slice::from_ref(&provider_entry),
+                Some(&synthetic_alias),
+            );
+        }
+
+        ModelRegistry::build(&self.providers, self.default_model.as_deref())
+    }
+}
+
+/// Describe the legacy `provider:` block in a tuple shape that the
+/// synth path can splat into a `(ProviderEntry, ModelEntry)` pair.
+/// Tuple type is private to this module — small, local, single use.
+#[allow(clippy::type_complexity)]
+fn describe_legacy(
+    p: &ProviderConfig,
+) -> (
+    ProviderType,
+    Option<String>,
+    Option<String>,
+    String,
+    u64,
+    Option<f32>,
+    Option<usize>,
+    Option<serde_json::Value>,
+) {
+    match p {
+        ProviderConfig::OpenRouter(c) => (
+            ProviderType::OpenRouter,
+            c.api_key.clone(),
+            None,
+            c.model.clone(),
+            c.max_tokens,
+            None,
+            None,
+            None,
+        ),
+        ProviderConfig::OpenAI(c) => (
+            ProviderType::OpenAI,
+            c.api_key.clone(),
+            Some(c.base_url.clone()),
+            c.model.clone(),
+            c.max_tokens,
+            None,
+            None,
+            None,
+        ),
+        ProviderConfig::LlamaCpp(c) => (
+            ProviderType::LlamaCpp,
+            c.api_key.clone(),
+            Some(c.base_url.clone()),
+            c.model.clone(),
+            c.max_tokens,
+            None,
+            None,
+            c.extra_params.clone(),
+        ),
+        ProviderConfig::Ollama(c) => (
+            ProviderType::Ollama,
+            None,
+            Some(c.base_url.clone()),
+            c.model.clone(),
+            // Ollama has no max_tokens — use the default placeholder.
+            default_max_tokens(),
+            c.temperature,
+            c.num_ctx,
+            None,
+        ),
     }
 }
 
@@ -664,6 +791,18 @@ impl Config {
         if other.pipeline.is_some() {
             self.pipeline = other.pipeline;
         }
+
+        // providers list - override if non-empty (per-repo overrides
+        // the master providers list wholesale)
+        if !other.providers.is_empty() {
+            self.providers = other.providers;
+        }
+
+        // default_model - override if explicitly set (per-repo can pin
+        // a different boot model on top of the master's providers list)
+        if other.default_model.is_some() {
+            self.default_model = other.default_model;
+        }
     }
 }
 
@@ -671,6 +810,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             provider: ProviderConfig::default(),
+            providers: Vec::new(),
+            default_model: None,
             agent_max_turns: default_max_turns(),
             mcp_servers: None,
             searxng: None,
@@ -1113,5 +1254,75 @@ mod tests {
         assert_eq!(merged.context.threshold, 0.5);
         assert_eq!(merged.context.keep_recent, 10);
         assert_eq!(merged.context.context_window, Some(128000));
+    }
+
+    // === build_model_registry: locked-plan v4 §"Legacy synthesis" ====
+
+    #[test]
+    fn build_model_registry_legacy_provider_synthesises_default_alias() {
+        // Default config has the legacy `provider:` block (OpenRouter +
+        // default model) and an empty `providers:` list.
+        let config = Config::default();
+        let reg = config
+            .build_model_registry()
+            .expect("legacy synth should always succeed for default config");
+
+        assert_eq!(reg.default_alias(), Some("default"));
+        assert!(reg.contains("default"));
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn build_model_registry_uses_providers_list_when_present() {
+        let config = Config {
+            providers: vec![ProviderEntry {
+                name: "openrouter".into(),
+                kind: ProviderType::OpenRouter,
+                api_key: Some("sk".into()),
+                base_url: None,
+                models: vec![ModelEntry {
+                    name: "anthropic/claude-3.7-sonnet".into(),
+                    alias: Some("sonnet".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    num_ctx: None,
+                    extra_params: None,
+                    context_window_override: None,
+                }],
+            }],
+            default_model: Some("sonnet".into()),
+            ..Config::default()
+        };
+        let reg = config.build_model_registry().expect("should build");
+        assert_eq!(reg.default_alias(), Some("sonnet"));
+        assert!(reg.contains("sonnet"));
+        // Legacy `provider:` block is *not* synthesised when providers
+        // list is non-empty.
+        assert!(!reg.contains("default"));
+    }
+
+    #[test]
+    fn build_model_registry_propagates_validation_errors() {
+        let config = Config {
+            providers: vec![ProviderEntry {
+                name: "openrouter".into(),
+                kind: ProviderType::OpenRouter,
+                api_key: None,
+                base_url: None,
+                models: vec![ModelEntry {
+                    name: "anthropic/claude-3.7-sonnet".into(),
+                    alias: Some("sonnet".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    num_ctx: None,
+                    extra_params: None,
+                    context_window_override: None,
+                }],
+            }],
+            default_model: Some("ghost".into()), // intentionally wrong
+            ..Config::default()
+        };
+        let err = config.build_model_registry().unwrap_err();
+        assert!(matches!(err, RegistryError::UnknownDefault { .. }));
     }
 }
