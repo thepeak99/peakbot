@@ -74,7 +74,10 @@ impl TestHarness {
 
         // Create event channel - both TestHarness and TestRunner share the sender
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let session_hook = peakbot::SessionHook::new(Some(sender.clone()));
+        // Wire the hook to the StateManager so `on_completion_call` can
+        // gate in-loop compaction (production parity — see `mid-compaction.md`).
+        let session_hook =
+            peakbot::SessionHook::new(Some(sender.clone())).with_state_manager(&state_manager);
 
         // Build agent with mock model, session hook, and built-in tools
         let agent = rig::agent::AgentBuilder::new(mock_model_clone)

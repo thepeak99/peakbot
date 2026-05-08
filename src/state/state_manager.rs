@@ -123,46 +123,6 @@ impl StateManager {
         self.notify_update(&state);
     }
 
-    /// Check if compaction is needed and trigger it in the background.
-    /// Called internally after each message is added. Synchronous check,
-    /// spawns an async task if compaction is needed.
-    fn maybe_compact(&self) {
-        let cm_clone = {
-            let guard = self.context_manager.lock().unwrap();
-            let cm = match guard.as_ref() {
-                Some(cm) => cm,
-                None => return,
-            };
-            let uncompacted = self.uncompacted_message_count();
-            if !cm.needs_compaction(uncompacted) {
-                return;
-            }
-            cm.clone()
-        };
-
-        let sm = match self
-            .self_ref
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(Weak::upgrade)
-        {
-            Some(arc) => arc,
-            None => return,
-        };
-
-        tokio::spawn(async move {
-            sm.set_status(Some("Compacting context...".to_string()));
-            if let Some(result) = sm.run_compaction(&cm_clone).await {
-                sm.add_system_message(format!(
-                    "Context compacted: {} → {} messages, {} compacted",
-                    result.original_count, result.compacted_count, result.num_discarded
-                ));
-            }
-            sm.set_status(None);
-        });
-    }
-
     /// Run compaction: produce a plan, apply it, return the result.
     async fn run_compaction(&self, cm: &ContextManager) -> Option<CompactionResult> {
         let messages = self.get_chat_messages();
@@ -210,8 +170,47 @@ impl StateManager {
         self.run_compaction(&cm_clone).await
     }
 
+    /// Public threshold check. Returns `true` iff a compaction *would* fire
+    /// with the current chat state and `last_input_tokens` reading.
+    ///
+    /// This is the gate `SessionHook::on_completion_call` consults to decide
+    /// whether to terminate the agentic loop with reason `"compact"`. The
+    /// check is `&self`-pure: no spawn, no side effects. The hook holds a
+    /// `Weak<StateManager>` and reads this on every completion-call boundary.
+    ///
+    /// Returns `false` when no `ContextManager` is initialized — typical for
+    /// short-lived test harnesses without a context window.
+    pub fn needs_compaction(&self) -> bool {
+        let guard = self.context_manager.lock().unwrap();
+        let Some(cm) = guard.as_ref() else {
+            return false;
+        };
+        cm.needs_compaction(self.uncompacted_message_count())
+    }
+
+    /// Clear the live `last_input_tokens` signal without touching cumulative
+    /// stats. Used by the in-loop compaction handler when `force_compact()`
+    /// can't make progress: clearing the stat breaks the
+    /// terminate-and-restart loop (the gate stops firing) and lets the
+    /// already-too-big request go to the wire for honest failure handling.
+    ///
+    /// Cumulative `total_input_tokens` / `total_cost` / `total_api_calls`
+    /// are unchanged, so `/stats` stays accurate.
+    pub fn clear_last_input_tokens(&self) {
+        self.stats.lock().unwrap().clear_last_input_tokens();
+        self.sync_stats_to_ui();
+    }
+
     /// Apply a CompactionPlan: tag old messages as compacted, insert the summary.
     /// Preserves tool calls that are referenced by tool results in the kept region.
+    ///
+    /// Also clears `last_input_tokens` on `SessionStats` so the
+    /// post-compaction `needs_compaction()` reading is honest. Without this,
+    /// the in-loop `terminate("compact")` → `force_compact` → resume cycle
+    /// would infinite-loop because the threshold check still sees the
+    /// pre-compaction wire size. This is THE loop guard — see
+    /// `mid-compaction.md` § 3 Step 2 and the pin
+    /// `force_compact_makes_needs_compaction_return_false`.
     fn apply_compaction(&self, plan: &crate::context_manager::CompactionPlan) {
         use crate::context_manager::find_needed_tool_calls_chat;
 
@@ -236,6 +235,22 @@ impl StateManager {
         messages.insert(plan.boundary, summary);
 
         self.notify_update(&state);
+        // Lock order discipline: drop `state` write guard via end-of-scope
+        // before grabbing `stats`. (state → stats is the documented order;
+        // doing both writes simultaneously would be fine here, but keeping
+        // them in separate scopes makes the discipline visible.)
+        drop(state);
+
+        // Loop-guard: post-compaction the wire size has dropped, but
+        // `last_input_tokens` still reflects the pre-compaction request.
+        // Clear it so the next `needs_compaction()` falls through to the
+        // message-count fallback (which now reads ~`keep_recent + 1` ≪
+        // threshold). The next real `on_completion_response` overwrites
+        // with honest data.
+        self.stats.lock().unwrap().clear_last_input_tokens();
+        // Sync state.context.current_usage so the status bar reflects the
+        // post-compaction wire-size estimate (it self-heals on next response).
+        self.sync_stats_to_ui();
     }
 
     /// Count of messages that are not compacted (what the LLM would see).
@@ -1121,19 +1136,22 @@ impl StateManager {
 
     // ── Message Methods with Persistence ───────────────────────────────────────
 
-    /// Add a user message to chat, persist, and trigger compaction if needed.
+    /// Add a user message to chat and persist.
+    ///
+    /// Compaction is **NOT** triggered here. The `SessionHook::on_completion_call`
+    /// gate (mid-loop) is the right boundary — it fires immediately before
+    /// every wire request, including the first one of a new prompt, so this
+    /// site doesn't need its own check. See `mid-compaction.md` § 3 Step 4.
     pub fn add_user_message(&self, content: String) {
         let msg = ChatMessage::user(content);
         self.update_chat(msg);
         self.persist_current().ok();
-        self.maybe_compact();
     }
 
     /// Add a user message carrying image attachments.
     ///
-    /// Same persistence and compaction behaviour as [`add_user_message`], but
-    /// the `ChatMessage` carries `attachments` that downstream code converts
-    /// to `rig::UserContent::Image` at the wire boundary.
+    /// Same persistence behaviour as [`add_user_message`]; compaction is not
+    /// triggered here (handled at the wire boundary by `SessionHook`).
     pub fn add_user_message_with_attachments(
         &self,
         content: String,
@@ -1142,15 +1160,15 @@ impl StateManager {
         let msg = ChatMessage::user_with_attachments(content, attachments);
         self.update_chat(msg);
         self.persist_current().ok();
-        self.maybe_compact();
     }
 
-    /// Add an assistant message to chat, persist, and trigger compaction if needed.
+    /// Add an assistant message to chat and persist.
+    ///
+    /// Compaction is **NOT** triggered here — see [`add_user_message`].
     pub fn add_assistant_message(&self, content: String) {
         let msg = ChatMessage::agent(content);
         self.update_chat(msg);
         self.persist_current().ok();
-        self.maybe_compact();
     }
 
     /// Add a tool call message to chat and persist immediately
@@ -2025,6 +2043,113 @@ mod tests {
         assert_eq!(state.context.current_usage, 100_000);
     }
 
+    /// `StateManager::needs_compaction()` is the new public accessor used by
+    /// `SessionHook::on_completion_call` to gate in-loop compaction. It must
+    /// reflect the same answer the internal trigger sites already use.
+    ///
+    /// Pinned by the in-loop compaction plan (`mid-compaction.md` § 3 Step 1).
+    #[test]
+    fn needs_compaction_accessor_matches_trigger_logic() {
+        let sm = sm_with_context_window(1_000);
+
+        // Empty conversation — never compact.
+        assert!(!sm.needs_compaction());
+
+        // Push some traffic but stay under the message-count fallback (keep_recent*3 = 15).
+        for i in 0..3 {
+            sm.add_user_message(format!("u{i}"));
+            sm.add_assistant_message(format!("a{i}"));
+        }
+        assert!(
+            !sm.needs_compaction(),
+            "below message-count threshold and no token signal — must not compact"
+        );
+
+        // Drive last_input_tokens past 80% of 1_000 = 800.
+        sm.add_request(900, 50, 0.0);
+        assert!(
+            sm.needs_compaction(),
+            "token branch must fire when last_input_tokens > threshold"
+        );
+    }
+
+    /// **The actual loop guard for in-loop compaction.** After
+    /// `apply_compaction` (via `force_compact`) runs, the next
+    /// `needs_compaction()` MUST return false even though no API call has
+    /// happened yet — otherwise terminate-and-restart from
+    /// `on_completion_call` infinite-loops (the `compactfuck.md` regression).
+    ///
+    /// Mechanism: `apply_compaction` calls `clear_last_input_tokens()` so the
+    /// stale pre-compaction wire-size estimate stops driving the threshold,
+    /// and the message-count fallback (which dropped to ~`keep_recent` after
+    /// compaction) takes over.
+    ///
+    /// Pinned by `mid-compaction.md` § 3 Step 2.
+    #[tokio::test]
+    async fn force_compact_makes_needs_compaction_return_false() {
+        use crate::config::ContextConfig;
+        use crate::context_manager::ContextManager;
+
+        // Build a SM with a real compaction model so `force_compact` does work.
+        // We don't actually need to run an LLM — we just need enough messages
+        // queued that compaction has something to summarize. Use the mock
+        // compaction model from providers.
+        let sm = StateManager::new_arc();
+        let cfg = ContextConfig {
+            threshold: 0.5, // 500 tokens of a 1000 window
+            keep_recent: 3,
+            enabled: true,
+            compaction_model: None,
+        };
+
+        #[cfg(feature = "mock")]
+        let compaction_model = {
+            let (model, mock) = crate::providers::create_mock_compaction_model();
+            mock.add_response(crate::mock::MockResponse::text("Summary."));
+            Some(std::sync::Arc::new(model))
+        };
+        #[cfg(not(feature = "mock"))]
+        let compaction_model = None;
+
+        let cm = ContextManager::new(cfg, 1_000, sm.clone(), compaction_model);
+        sm.init_context_manager(cm, String::new());
+
+        // Pile up enough messages to give compaction something to do.
+        // (No fire-and-forget compaction fires from message-adds anymore —
+        // `add_user_message` is now compaction-free; the hook gates it instead.)
+        for i in 0..10 {
+            sm.add_user_message(format!("user msg {i}"));
+            sm.add_assistant_message(format!("assistant reply {i}"));
+        }
+
+        // Push last_input_tokens above the threshold (600 > 500).
+        sm.add_request(600, 50, 0.0);
+        assert!(
+            sm.needs_compaction(),
+            "precondition: needs_compaction must be true before we compact"
+        );
+
+        // Run compaction synchronously (the path the new 'compact' cancellation handler uses).
+        #[cfg(feature = "mock")]
+        {
+            let result = sm.force_compact().await;
+            assert!(
+                result.is_some(),
+                "force_compact must produce a result with mock summarizer queued"
+            );
+
+            // The whole point: post-compaction, needs_compaction must read false
+            // even though no fresh API call has refreshed last_input_tokens yet.
+            assert!(
+                !sm.needs_compaction(),
+                "needs_compaction must return false post-compaction (loop guard)"
+            );
+        }
+        // Without the mock feature this test can't drive compaction; skip silently.
+        #[cfg(not(feature = "mock"))]
+        let _ = compaction_model;
+    }
+
     // ── Vision / multimodal history ───────────────────────────────────────
 
     fn sample_attachment(name: &str) -> crate::vision::ImageAttachment {
@@ -2212,6 +2337,54 @@ mod tests {
         sm.add_assistant_message("hi, how can I help?".to_string());
 
         assert!(sm.build_current_turn_message().is_none());
+    }
+
+    /// `build_current_turn_message` skips compacted messages, so when the
+    /// in-loop compaction handler rebuilds `current_turn` after `force_compact`,
+    /// it correctly picks up the latest non-compacted user message.
+    ///
+    /// Pinned by `mid-compaction.md` § 5 test 4.
+    #[test]
+    fn build_current_turn_message_skips_compacted_users() {
+        use crate::ui::app_state::ChatMessage;
+        use rig::completion::message::{Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+
+        // Insert messages directly so we can mark some as compacted without
+        // running the full compaction pipeline.
+        let mut old_user = ChatMessage::user("ancient turn".to_string());
+        old_user.compacted = true;
+        sm.update_chat(old_user);
+
+        let summary = ChatMessage::summary("[summary of ancient turn]".to_string());
+        sm.update_chat(summary);
+
+        sm.add_user_message("recent turn".to_string());
+
+        let msg = sm
+            .build_current_turn_message()
+            .expect("a non-compacted user must exist");
+        match msg {
+            RigMessage::User { content } => {
+                let texts: Vec<String> = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    texts.iter().any(|t| t.contains("recent turn")),
+                    "rebuilt turn must point at the latest *non-compacted* user, got {texts:?}"
+                );
+                assert!(
+                    !texts.iter().any(|t| t.contains("ancient turn")),
+                    "rebuilt turn must NOT include the compacted user, got {texts:?}"
+                );
+            }
+            _ => panic!("expected User message"),
+        }
     }
 
     /// Regression: `/new` → first prompt → first LLM response used to hang

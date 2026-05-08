@@ -11,7 +11,7 @@ use rig::completion::{CompletionModel, CompletionResponse, message::Message};
 use rig::one_or_many::OneOrMany;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 
 use crate::hooks::events::AgentEvent;
@@ -182,6 +182,32 @@ impl SessionStats {
     pub fn last_input_tokens(&self) -> Option<u64> {
         self.requests.last().map(|r| r.input_tokens)
     }
+
+    /// Reset the "live context size" signal to 0 *without* touching cumulative
+    /// `total_*` bookkeeping or the API-call counter.
+    ///
+    /// Called from `StateManager::apply_compaction` so the next
+    /// `last_input_tokens()` reads `Some(0)`, which makes
+    /// `ContextManager::needs_compaction` skip its token-based branch and
+    /// fall through to the message-count fallback. Without this clear, a
+    /// terminate-and-restart cycle in `SessionHook::on_completion_call`
+    /// reads the *pre-compaction* wire size from the last real request,
+    /// re-fires the threshold, and infinite-loops — see `compactfuck.md`
+    /// (Bug #2/#3) and the regression pin
+    /// `force_compact_makes_needs_compaction_return_false`.
+    ///
+    /// Implementation: pushes a synthetic zero-token entry rather than
+    /// popping/clearing real history. Symmetric with the seed trick in
+    /// `restore()`: same one-extra-Vec-entry cost, no behaviour difference
+    /// for `total_input_tokens` / `total_cost` / `total_api_calls` because
+    /// none of those increment via direct `requests.push`.
+    pub fn clear_last_input_tokens(&mut self) {
+        self.requests.push(RequestStats {
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: 0.0,
+        });
+    }
 }
 
 // Manual implementation of Send + Sync for SessionStats since Mutex guards are not Send
@@ -348,6 +374,46 @@ mod tests {
         assert_eq!(pricing.input_per_token, 0.000003);
         assert_eq!(pricing.output_per_token, 0.000015);
     }
+
+    /// `clear_last_input_tokens` makes `last_input_tokens()` return Some(0)
+    /// so `ContextManager::needs_compaction` skips its token-based branch
+    /// and falls through to the message-count fallback. Cumulative
+    /// `total_*` fields and `total_api_calls` MUST be untouched —
+    /// `/stats` stays honest across compactions.
+    ///
+    /// Pinned by the in-loop compaction plan: the previous attempt
+    /// (`compactfuck.md`) infinite-looped because nothing reset the stale
+    /// `last_input_tokens` between terminate-and-restart cycles. This is
+    /// the loop guard.
+    #[test]
+    fn clear_last_input_tokens_zeroes_last_without_touching_cumulative() {
+        let mut stats = SessionStats::new();
+        stats.add_request(500, 200, 0.05);
+        stats.add_request(800, 300, 0.08);
+
+        // Sanity: pre-clear, last_input_tokens reflects the most recent request.
+        assert_eq!(stats.last_input_tokens(), Some(800));
+        assert_eq!(stats.total_input_tokens, 800);
+        assert_eq!(stats.total_api_calls, 2);
+        let cost_before = stats.total_cost;
+
+        stats.clear_last_input_tokens();
+
+        // last_input_tokens now reads 0 (or None) — the token branch in
+        // needs_compaction skips and the message-count fallback takes over.
+        assert!(
+            stats.last_input_tokens().unwrap_or(0) == 0,
+            "last_input_tokens must read 0 after clear, got {:?}",
+            stats.last_input_tokens()
+        );
+
+        // Cumulative bookkeeping is preserved: /stats keeps reporting honestly.
+        assert_eq!(stats.total_api_calls, 2, "api call count must not change");
+        assert!(
+            (stats.total_cost - cost_before).abs() < f64::EPSILON,
+            "total cost must not change"
+        );
+    }
 }
 
 #[derive(Clone)] // NOTE: Clone only shallow-copies the Arc handles
@@ -359,6 +425,12 @@ pub struct SessionHook {
     stats: Arc<Mutex<SessionStats>>,
     /// User requested stop
     stop_requested: Arc<AtomicBool>,
+    /// Weak reference to the `StateManager`, used by `on_completion_call` to
+    /// gate in-loop compaction (see `mid-compaction.md` § 3 Step 1). Weak so
+    /// the hook never extends the manager's lifetime — the agent owns the
+    /// hook, and the manager owns the agent indirectly via the registry, so
+    /// an `Arc` here would cycle.
+    state_manager: Option<Weak<crate::state::StateManager>>,
 }
 
 impl SessionHook {
@@ -368,6 +440,7 @@ impl SessionHook {
             event_sender,
             stats: Arc::new(Mutex::new(SessionStats::new())),
             stop_requested: Arc::new(AtomicBool::new(false)),
+            state_manager: None,
         }
     }
 
@@ -380,7 +453,18 @@ impl SessionHook {
             event_sender,
             stats,
             stop_requested: Arc::new(AtomicBool::new(false)),
+            state_manager: None,
         }
+    }
+
+    /// Wire this hook to a `StateManager` so it can gate in-loop compaction
+    /// from `on_completion_call`. Builder-style; returns `self` for chaining.
+    ///
+    /// The hook stores a `Weak`, so passing a fresh `Arc` is safe — the hook
+    /// will silently no-op if the manager has been dropped.
+    pub fn with_state_manager(mut self, sm: &Arc<crate::state::StateManager>) -> Self {
+        self.state_manager = Some(Arc::downgrade(sm));
+        self
     }
 
     /// Request the agent to stop
@@ -401,6 +485,7 @@ impl SessionHook {
                 event_sender: Some(sender),
                 stats: Arc::new(Mutex::new(SessionStats::new())),
                 stop_requested: Arc::new(AtomicBool::new(false)),
+                state_manager: None,
             },
             receiver,
         )
@@ -464,7 +549,20 @@ fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (Strin
 }
 
 impl<M: CompletionModel> PromptHook<M> for SessionHook {
-    /// Called before the prompt is sent - just emit an event
+    /// Called before the prompt is sent. Two responsibilities:
+    /// 1. Emit a `CompletionRequest` event for observers (cost tracker, UI).
+    /// 2. **Gate in-loop compaction**: if the wired `StateManager` says
+    ///    `needs_compaction()`, terminate the agentic loop with reason
+    ///    `"compact"`. The caller (`process_message_internal`) catches this,
+    ///    runs `force_compact().await` synchronously, and re-enters
+    ///    `prompt_with_history` with the compacted state.
+    ///
+    /// This is the right boundary because `on_completion_call` fires
+    /// *immediately before each wire request* — the request that's about to
+    /// blow the context. The loop guard against infinite terminate-restart
+    /// cycles lives in `apply_compaction` (which clears
+    /// `last_input_tokens`), not here. See `mid-compaction.md` for the full
+    /// design.
     async fn on_completion_call(&self, _prompt: &Message, history: &[Message]) -> HookAction {
         if let Some(ref sender) = self.event_sender {
             let event = AgentEvent::CompletionRequest {
@@ -474,6 +572,16 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             };
             let _ = sender.send(event);
         }
+
+        // In-loop compaction gate. Only fires when a StateManager is wired.
+        if let Some(weak) = self.state_manager.as_ref()
+            && let Some(sm) = weak.upgrade()
+            && sm.needs_compaction()
+        {
+            tracing::info!("Compaction threshold crossed mid-loop, terminating to compact");
+            return HookAction::terminate("compact");
+        }
+
         HookAction::Continue
     }
 

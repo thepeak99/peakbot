@@ -400,9 +400,10 @@ fn create_openrouter_agent(
     // Get session stats from StateManager for context tracking
     let session_stats = state_manager.stats_arc();
 
-    // Create session hook with stats tracking
+    // Create session hook with stats tracking + compaction gate
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(Some(sender), session_stats);
+    let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
+        .with_state_manager(&state_manager);
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -546,9 +547,10 @@ fn create_openai_agent(
     // Get session stats from StateManager for context tracking
     let session_stats = state_manager.stats_arc();
 
-    // Create session hook with stats tracking
+    // Create session hook with stats tracking + compaction gate
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(Some(sender), session_stats);
+    let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
+        .with_state_manager(&state_manager);
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -621,9 +623,10 @@ fn create_llamacpp_agent(
     // Get session stats from StateManager for context tracking
     let session_stats = state_manager.stats_arc();
 
-    // Create session hook with stats tracking
+    // Create session hook with stats tracking + compaction gate
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(Some(sender), session_stats);
+    let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
+        .with_state_manager(&state_manager);
 
     // Build agent with system prompt, hook, and built-in tools
     let mut agent_builder = client
@@ -687,10 +690,11 @@ pub fn create_mock_agent(
     let mock_model = MockCompletionModel::new();
     let model_clone = mock_model.clone();
 
-    // Create session hook with stats tracking (using context_tracking for full functionality)
+    // Create session hook with stats tracking + compaction gate (using context_tracking for full functionality)
     let session_stats = state_manager.stats_arc();
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(Some(sender), session_stats);
+    let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
+        .with_state_manager(&state_manager);
 
     // Build agent with mock model, session hook, and built-in tools
     let agent_builder = AgentBuilder::new(mock_model)
