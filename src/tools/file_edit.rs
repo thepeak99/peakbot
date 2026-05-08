@@ -127,7 +127,7 @@ If editing fails, read the file first to get exact content, then retry."
                     },
                     "file_text": {
                         "type": "string",
-                        "description": "REQUIRED for `create`: the full content of the new file. Must be a non-empty string. Pass the entire file body in this single string — do NOT call `create` and then plan to fill the file later."
+                        "description": "Optional for `create`: the full content of the new file. If omitted or empty, an empty file is created. Recommended: provide content upfront to avoid creating an empty file and editing it later."
                     },
                     "old_str": {
                         "type": "string",
@@ -217,25 +217,10 @@ impl FileEditTool {
             )));
         }
 
-        let file_text = match args.file_text.as_deref() {
-            None => {
-                return Err(FileEditError::Validation(
-                    "'file_text' is required for the 'create' command. \
-                     Re-issue the call with `file_text` set to the full \
-                     contents of the new file (a single non-empty string)."
-                        .into(),
-                ));
-            }
-            Some("") => {
-                return Err(FileEditError::Validation(
-                    "'file_text' is empty. The 'create' command writes the \
-                     entire file contents in one call — pass the full file \
-                     body as a non-empty string in `file_text`. If you \
-                     genuinely want an empty file, write a single newline."
-                        .into(),
-                ));
-            }
-            Some(text) => text,
+        let (file_text, recommendation) = match args.file_text.as_deref() {
+            None => (String::new(), true),
+            Some("") => (String::new(), true),
+            Some(text) => (text.to_string(), false),
         };
 
         if path.exists() {
@@ -254,12 +239,20 @@ impl FileEditTool {
             })?;
         }
 
-        self.write_file(path, file_text)?;
+        self.write_file(path, &file_text)?;
 
         // Record pre-edit state ("file did not exist") so undo deletes it.
         self.push_history_none(path);
 
-        Ok(format!("File created successfully at: {}", path.display()))
+        let mut msg = format!("File created successfully at: {}", path.display());
+        if recommendation {
+            msg.push_str(
+                "\n\n💡 Tip: Consider providing the file content upfront with the `file_text` \
+                 parameter instead of creating an empty file and editing it later.",
+            );
+        }
+
+        Ok(msg)
     }
 
     fn cmd_str_replace(&self, args: &FileEditArgs) -> Result<String, FileEditError> {
@@ -798,21 +791,23 @@ mod tests {
     }
 
     #[test]
-    fn create_requires_file_text() {
+    fn create_without_file_text_creates_empty_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("missing-text.txt");
         let tool = FileEditTool::default();
         let a = args("create", path.to_str().unwrap()); // no file_text
 
-        let err = tool.cmd_create(&a).unwrap_err();
+        let out = tool.cmd_create(&a).expect("create should succeed without file_text");
         assert!(
-            matches!(err, FileEditError::Validation(ref msg) if msg.contains("file_text")),
-            "expected validation error about file_text, got: {err}"
+            out.contains("File created successfully"),
+            "should report success, got: {out}"
         );
         assert!(
-            !path.exists(),
-            "file should not be created on validation failure"
+            out.contains("💡 Tip"),
+            "should include recommendation tip, got: {out}"
         );
+        assert!(path.exists(), "empty file should be created");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
     }
 
     #[test]
@@ -829,11 +824,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "deep");
     }
 
-    // NOTE: a previous test `create_allows_empty_file_text` pinned the
-    // *opposite* behaviour (empty `file_text` was silently accepted).
-    // That test was removed in the same change that introduced the
-    // coaching error — see `create_with_empty_file_text_returns_coaching_error`
-    // below for the new contract.
+    // NOTE: The `create` command now allows omitted/empty `file_text`,
+    // creating an empty file with a soft recommendation to provide content
+    // upfront. See `create_without_file_text_creates_empty_file` and
+    // `create_with_empty_file_text_creates_empty_file` for the current contract.
 
     // ── str_replace ────────────────────────────────────────────────────
 
@@ -1011,11 +1005,11 @@ mod tests {
     // ── empty file_text guidance for the model ──────────────────────────
     //
     // When `create` is invoked with `file_text: ""` (or omitted) we
-    // must return a *coaching* error — the message is the only signal
-    // the model gets, so spell out exactly what went wrong.
+    // create an empty file and include a soft recommendation in the
+    // output suggesting the model provide content upfront.
 
     #[test]
-    fn create_with_empty_file_text_returns_coaching_error() {
+    fn create_with_empty_file_text_creates_empty_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty.txt");
         let tool = FileEditTool::default();
@@ -1023,35 +1017,31 @@ mod tests {
         let mut a = args("create", path.to_str().unwrap());
         a.file_text = Some(String::new()); // empty, not missing
 
-        let err = tool.cmd_create(&a).unwrap_err();
-        let msg = format!("{err}");
+        let out = tool.cmd_create(&a).expect("create should succeed with empty file_text");
         assert!(
-            msg.contains("file_text"),
-            "error must mention `file_text`, got: {msg}"
-        );
-        let lower = msg.to_lowercase();
-        assert!(
-            lower.contains("empty") || lower.contains("non-empty") || lower.contains("content"),
-            "error must nag about emptiness/content, got: {msg}"
+            out.contains("File created successfully"),
+            "should report success, got: {out}"
         );
         assert!(
-            !path.exists(),
-            "file must not be created when file_text is empty"
+            out.contains("💡 Tip"),
+            "should include recommendation tip, got: {out}"
         );
+        assert!(path.exists(), "empty file should be created");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
     }
 
     #[test]
-    fn create_missing_file_text_error_mentions_required_field() {
+    fn create_with_content_no_tip() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("nope.txt");
+        let path = dir.path().join("content.txt");
         let tool = FileEditTool::default();
-        let a = args("create", path.to_str().unwrap()); // no file_text
 
-        let err = tool.cmd_create(&a).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("file_text") && msg.to_lowercase().contains("required"),
-            "error must say `file_text` is required, got: {msg}"
-        );
+        let mut a = args("create", path.to_str().unwrap());
+        a.file_text = Some("hello world\n".into());
+
+        let out = tool.cmd_create(&a).expect("create should succeed");
+        assert!(out.contains("File created successfully"));
+        assert!(!out.contains("💡 Tip"), "no tip when content is provided");
     }
+
 }
