@@ -24,7 +24,7 @@ pub use config::{
     SearXngConfig,
 };
 use context_manager::ContextManager;
-pub use context_manager::{CompactionResult, auto_detect_context_window};
+pub use context_manager::{CompactionResult, auto_detect_context_size};
 pub use conversation::{
     Conversation, ConversationMetadata, ConversationSummary, Message as ConversationMessage,
 };
@@ -330,7 +330,7 @@ impl AgentRunner {
 
             let cm = ContextManager::new(
                 config.context.clone(),
-                auto_detect_context_window(provider_info.model.as_str()),
+                auto_detect_context_size(provider_info.model.as_str()),
                 sm.clone(),
                 compaction_model,
             );
@@ -1010,7 +1010,7 @@ impl AgentRunner {
             Some(all)
         };
 
-        let context_window = resolved.context_window;
+        let context_size = resolved.context_size;
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
             &resolved.provider_config,
@@ -1052,7 +1052,7 @@ impl AgentRunner {
         .map(Arc::new);
         let cm = ContextManager::new(
             config.context.clone(),
-            context_window,
+            context_size,
             sm_for_provider.clone(),
             compaction_model,
         );
@@ -2668,7 +2668,7 @@ mod tests {
                         max_tokens: None,
                         temperature: None,
                         extra_params: None,
-                        context_window: None,
+                        context_size: None,
                     },
                     ModelEntry {
                         name: "openai/gpt-4o".into(),
@@ -2676,7 +2676,7 @@ mod tests {
                         max_tokens: None,
                         temperature: None,
                         extra_params: None,
-                        context_window: None,
+                        context_size: None,
                     },
                 ],
             }],

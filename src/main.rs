@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
     };
 
     // Create provider — context window resolution lives in the registry
-    // (per-model `context_window:` OR `auto_detect_context_window` against
+    // (per-model `context_size:` OR `auto_detect_context_size` against
     // the wire id). The provider itself doesn't need to know the value;
     // `ContextManager` is the single consumer downstream.
     //

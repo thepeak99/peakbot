@@ -13,8 +13,8 @@ use crate::ui::app_state::ChatMessage;
 use anyhow::{Context as AnyhowContext, Result};
 use std::sync::Arc;
 
-/// Default context window size (128k tokens)
-pub(crate) const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+/// Default context size (128k tokens)
+pub(crate) const DEFAULT_CONTEXT_SIZE: usize = 128_000;
 /// Estimated tokens per message for fallback calculations
 const TOKENS_PER_MESSAGE: usize = 50;
 /// Estimated tokens for a conversation summary
@@ -27,7 +27,7 @@ const SUMMARY_TOKENS: usize = 75;
 /// this helper existed, the same `match` block was duplicated in three
 /// places — drift between them was a real correctness liability.
 /// *(necessarily same — they really are the same lookup table)*
-pub fn auto_detect_context_window(model_name: &str) -> usize {
+pub fn auto_detect_context_size(model_name: &str) -> usize {
     match model_name.to_lowercase().as_str() {
         m if m.contains("claude-3.7-sonnet") => 200_000,
         m if m.contains("claude-3.5-sonnet") => 200_000,
@@ -42,7 +42,7 @@ pub fn auto_detect_context_window(model_name: &str) -> usize {
         m if m.contains("gemini-2.0") => 1_000_000,
         m if m.contains("gemini-1.5-pro") => 2_000_000,
         m if m.contains("gemini-1.5-flash") => 1_000_000,
-        _ => DEFAULT_CONTEXT_WINDOW,
+        _ => DEFAULT_CONTEXT_SIZE,
     }
 }
 
@@ -71,12 +71,12 @@ pub struct CompactionPlan {
     pub boundary: usize,
 }
 
-/// Manages context window usage and performs compaction when needed.
+/// Manages context size usage and performs compaction when needed.
 /// Uses actual token counts from StateManager.
 #[derive(Clone)]
 pub(crate) struct ContextManager {
     config: ContextConfig,
-    context_window: usize,
+    context_size: usize,
     /// Reference to StateManager for stats
     state_manager: Arc<StateManager>,
     /// Tool-free model for summarization (independent call, no tools)
@@ -84,30 +84,30 @@ pub(crate) struct ContextManager {
 }
 
 impl ContextManager {
-    /// Create a new ContextManager with a pre-resolved context window.
+    /// Create a new ContextManager with a pre-resolved context size.
     ///
     /// Resolution (per-model override OR auto-detect against the wire id)
     /// happens upstream at the active-model boundary — this constructor
     /// is the single consumer and stores the value verbatim. See
-    /// `auto_detect_context_window` for the shared lookup helper.
+    /// `auto_detect_context_size` for the shared lookup helper.
     pub fn new(
         config: ContextConfig,
-        context_window: usize,
+        context_size: usize,
         state_manager: Arc<StateManager>,
         compaction_model: Option<Arc<CompactionModel>>,
     ) -> Self {
         Self {
             config,
-            context_window,
+            context_size,
             state_manager,
             compaction_model,
         }
     }
 
-    /// Get the context window size
+    /// Get the context size
     #[allow(dead_code)]
-    pub(crate) fn context_window(&self) -> usize {
-        self.context_window
+    pub(crate) fn context_size(&self) -> usize {
+        self.context_size
     }
 
     /// Whether automatic compaction is enabled
@@ -122,7 +122,7 @@ impl ContextManager {
 
     /// Get the compaction threshold (in tokens)
     pub fn threshold(&self) -> usize {
-        ((self.context_window as f64) * self.config.threshold) as usize
+        ((self.context_size as f64) * self.config.threshold) as usize
     }
 
     /// Get current total tokens from actual API response.
@@ -161,7 +161,7 @@ impl ContextManager {
         if total == 0 {
             return 0.0;
         }
-        total as f64 / self.context_window as f64
+        total as f64 / self.context_size as f64
     }
 
     /// Produce a CompactionPlan by summarizing older messages.
@@ -248,7 +248,7 @@ impl ContextManager {
         format!(
             "Context: {} / {} tokens ({:.1}%)\nCompaction threshold: {}% ({})\nEnabled: {}",
             total_tokens,
-            self.context_window,
+            self.context_size,
             usage_pct * 100.0,
             (self.config.threshold * 100.0) as usize,
             self.threshold(),
@@ -533,13 +533,13 @@ mod tests {
     /// Regression pin for the cancelled-Step-4 fukup
     /// (see `context-fukup.md`).
     ///
-    /// `ContextManager::new` must store the `context_window: usize` it
+    /// `ContextManager::new` must store the `context_size: usize` it
     /// receives verbatim, with no fallback / auto-detect / global-config
     /// override path. Resolution is the caller's job; the manager is
     /// the single consumer. If this test fails, somebody re-introduced
     /// a per-model-vs-global tug-of-war upstream.
     #[test]
-    fn context_window_is_stored_verbatim_and_drives_threshold() {
+    fn context_size_is_stored_verbatim_and_drives_threshold() {
         use crate::state::StateManager;
         let sm = Arc::new(StateManager::new());
         let cfg = ContextConfig {
@@ -549,7 +549,7 @@ mod tests {
             compaction_model: None,
         };
         let cm = ContextManager::new(cfg, 50_000, sm, None);
-        assert_eq!(cm.context_window(), 50_000);
+        assert_eq!(cm.context_size(), 50_000);
         // 50_000 × 0.8 = 40_000
         assert_eq!(cm.threshold(), 40_000);
     }
