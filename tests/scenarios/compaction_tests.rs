@@ -1147,3 +1147,102 @@ async fn multiple_compaction_events_verified() {
         events.len()
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 7: Mid-loop compaction (`mid-compaction.md`)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 7.1 — In-loop compaction triggers from the SessionHook gate.
+///
+/// Setup: pile up multiple turns where every response reports
+/// `input_tokens > threshold`. Once the message count exceeds
+/// `keep_recent`, the threshold check stops short-circuiting and the
+/// token branch fires. The `on_completion_call` hook (or the
+/// pre-prompt `compact_if_needed`) terminates the loop with reason
+/// `"compact"`, the handler runs `force_compact`, and the run resumes.
+///
+/// Pinned by `mid-compaction.md` § 5 test 1.
+#[tokio::test]
+async fn in_loop_compaction_terminates_and_resumes() {
+    let config = ContextConfig {
+        threshold: 0.5, // 250 of a 500-token window
+        keep_recent: 3,
+        enabled: true,
+        compaction_model: None,
+    };
+
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
+
+    // Five turns with 400 input tokens each — well over the 250 threshold.
+    // After turn 4 the conversation is 8 messages (>keep_recent=3), so the
+    // threshold check stops short-circuiting and starts firing on tokens.
+    for _ in 0..5 {
+        harness.add_response(agent_response("OVER_BUDGET", 400));
+    }
+    // Plenty of compaction summaries — at least one will be consumed.
+    for _ in 0..3 {
+        harness.add_compaction_response(summarization_response_with("Periodic summary."));
+    }
+
+    for i in 0..5 {
+        harness.run_message(&format!("turn {i}")).await;
+    }
+
+    assert!(
+        harness.has_compaction_occurred(),
+        "Compaction must fire when token threshold is consistently breached"
+    );
+
+    let events = harness.get_compaction_events();
+    assert!(
+        events.iter().any(|e| e.num_discarded > 0),
+        "At least one compaction event must actually discard messages"
+    );
+}
+
+/// 7.2 — `terminate("compact")` does not infinite-loop when compaction
+/// cannot make progress.
+///
+/// Setup: queue an over-budget response that primes
+/// `last_input_tokens > threshold`, but **don't queue any compaction
+/// summaries**. On the next turn the hook will fire `terminate("compact")`.
+/// `force_compact()` returns `None`. The handler clears
+/// `last_input_tokens` manually (loop guard), the gate stops firing,
+/// and the run completes without recursing.
+///
+/// Pinned by `mid-compaction.md` § 5 test 2.
+#[tokio::test]
+async fn terminate_compact_with_no_progress_does_not_loop_forever() {
+    let config = ContextConfig {
+        threshold: 0.5,
+        keep_recent: 3,
+        enabled: true,
+        compaction_model: None,
+    };
+
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
+
+    // Turn 1: over-threshold response. No compaction summary queued.
+    harness.add_response(agent_response("OVER_BUDGET", 400));
+    // Turn 2: a normal response — the test asserts we *get* this response,
+    // proving the loop terminated and the agent ran.
+    harness.add_response(agent_response("RECOVERY_REPLY", 100));
+
+    let _ = harness.run_message("turn 1").await;
+    let response = harness.run_message("turn 2").await;
+
+    // The critical behaviour: we got back to the user. The exact response
+    // depends on whether compaction was requested (and gracefully bypassed)
+    // or not — either way, the test *terminates* and the second response
+    // is consumed.
+    assert!(
+        !response.is_empty(),
+        "must receive a response even when compaction can't make progress"
+    );
+    assert!(
+        !response.starts_with("Error"),
+        "response must not be an error: {response}"
+    );
+}

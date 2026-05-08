@@ -162,6 +162,12 @@ impl TestRunner {
     /// **before** `prompt_with_history`, so any tool calls/results emitted
     /// during the turn land *after* it — never wedged between the user
     /// message and a future tool result.
+    ///
+    /// **In-loop compaction.** When the hook terminates with reason
+    /// `"compact"`, this fn runs `force_compact().await` synchronously
+    /// and re-enters `prompt_with_history` with the post-compaction
+    /// state. Mirrors the production handler in `lib.rs`. See
+    /// `mid-compaction.md`.
     async fn process_message_internal(
         &mut self,
         msg: &str,
@@ -182,45 +188,74 @@ impl TestRunner {
         // needs_compaction sees the latest token counts from previous turns.
         self.process_session_hook_events();
 
-        // Context compaction — same as production, but synchronous so tests can verify
-        if let Some(result) = self.state_manager.compact_if_needed().await {
-            self.compaction_events.lock().unwrap().push(CompactionInfo {
-                original_count: result.original_count,
-                compacted_count: result.compacted_count,
-                num_discarded: result.num_discarded,
-            });
-            // Re-read history after compaction
-            history = self.state_manager.get_agent_history();
-        }
+        loop {
+            // Pre-prompt compaction check (synchronous so tests can verify
+            // events). The hook also gates mid-loop, but this front-loads
+            // the very first request when it's already over budget from
+            // history alone.
+            if let Some(result) = self.state_manager.compact_if_needed().await {
+                self.compaction_events.lock().unwrap().push(CompactionInfo {
+                    original_count: result.original_count,
+                    compacted_count: result.compacted_count,
+                    num_discarded: result.num_discarded,
+                });
+                // Re-read history after compaction
+                history = self.state_manager.get_agent_history();
+            }
 
-        // Call the agent with history
-        let result = self
-            .agent
-            .prompt_with_history(&current_msg, &mut history)
-            .await;
+            // Call the agent with history
+            let result = self
+                .agent
+                .prompt_with_history(&current_msg, &mut history)
+                .await;
 
-        // Process events from the session hook to update stats
-        self.process_session_hook_events();
+            // Process events from the session hook to update stats
+            self.process_session_hook_events();
 
-        // Append the assistant response (if any). The user message was
-        // appended at the top of this fn — see invariant above.
-        if let Ok(response) = &result {
-            self.state_manager.add_assistant_message(response.clone());
-        }
-
-        // Mark as done
-        self.state_manager.set_running(false);
-
-        match result {
-            Ok(response) => ProcessResult::Success(response),
-            Err(PromptError::PromptCancelled { reason, .. }) => {
-                if reason == "stop" {
-                    ProcessResult::Stopped
-                } else {
-                    ProcessResult::Error
+            match result {
+                Ok(response) => {
+                    // Append the assistant response. The user message was
+                    // appended at the top of this fn — see invariant above.
+                    self.state_manager.add_assistant_message(response.clone());
+                    self.state_manager.set_running(false);
+                    return ProcessResult::Success(response);
+                }
+                Err(PromptError::PromptCancelled { reason, .. }) if reason == "compact" => {
+                    // Mid-loop compaction request from the hook: compact
+                    // synchronously, then re-enter the loop. The loop guard
+                    // (cleared last_input_tokens in apply_compaction)
+                    // prevents the hook from re-terminating immediately.
+                    let compacted = self.state_manager.force_compact().await;
+                    if let Some(result) = compacted {
+                        self.compaction_events.lock().unwrap().push(CompactionInfo {
+                            original_count: result.original_count,
+                            compacted_count: result.compacted_count,
+                            num_discarded: result.num_discarded,
+                        });
+                    } else {
+                        // Compaction couldn't make progress (e.g. no
+                        // summarizer responses queued in the test, or
+                        // empty body). Manually clear the staleness signal
+                        // so the gate stops firing — break the loop and
+                        // let the request go to the wire. Mirrors the
+                        // production handler in `lib.rs`.
+                        self.state_manager.clear_last_input_tokens();
+                    }
+                    history = self.state_manager.get_agent_history();
+                    continue;
+                }
+                Err(PromptError::PromptCancelled { reason, .. }) => {
+                    self.state_manager.set_running(false);
+                    if reason == "stop" {
+                        return ProcessResult::Stopped;
+                    }
+                    return ProcessResult::Error;
+                }
+                Err(_) => {
+                    self.state_manager.set_running(false);
+                    return ProcessResult::Error;
                 }
             }
-            Err(_) => ProcessResult::Error,
         }
     }
 

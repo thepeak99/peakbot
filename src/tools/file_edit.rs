@@ -797,7 +797,9 @@ mod tests {
         let tool = FileEditTool::default();
         let a = args("create", path.to_str().unwrap()); // no file_text
 
-        let out = tool.cmd_create(&a).expect("create should succeed without file_text");
+        let out = tool
+            .cmd_create(&a)
+            .expect("create should succeed without file_text");
         assert!(
             out.contains("File created successfully"),
             "should report success, got: {out}"
@@ -1017,7 +1019,9 @@ mod tests {
         let mut a = args("create", path.to_str().unwrap());
         a.file_text = Some(String::new()); // empty, not missing
 
-        let out = tool.cmd_create(&a).expect("create should succeed with empty file_text");
+        let out = tool
+            .cmd_create(&a)
+            .expect("create should succeed with empty file_text");
         assert!(
             out.contains("File created successfully"),
             "should report success, got: {out}"
@@ -1043,5 +1047,4 @@ mod tests {
         assert!(out.contains("File created successfully"));
         assert!(!out.contains("💡 Tip"), "no tip when content is provided");
     }
-
 }

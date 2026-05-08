@@ -1193,8 +1193,17 @@ impl AgentRunner {
     /// Internal process_message — takes the already-built current-turn `Message`
     /// (text or multimodal) and history from `StateManager`, runs the agent,
     /// writes the response back to state. Retries on transient errors.
+    ///
+    /// **In-loop compaction (`mid-compaction.md`).** When the wired
+    /// `SessionHook` detects that the imminent wire payload would breach
+    /// the context-window threshold, it terminates rig's agentic loop with
+    /// reason `"compact"`. We catch that here, run `force_compact().await`
+    /// synchronously, rebuild the `current_turn` from the (now compacted)
+    /// `StateManager`, and re-enter `prompt_with_history`. The loop guard
+    /// against infinite terminate-restart cycles is in
+    /// `apply_compaction` — see that fn's doc and `SessionStats::clear_last_input_tokens`.
     async fn process_message_internal(
-        current_turn: rig::completion::message::Message,
+        mut current_turn: rig::completion::message::Message,
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
@@ -1202,9 +1211,9 @@ impl AgentRunner {
         let mut retry_count = 0;
 
         loop {
-            // Compaction is handled automatically by StateManager when messages
-            // are added (add_user_message / add_assistant_message). No explicit
-            // check needed here.
+            // Compaction is handled at the wire boundary by SessionHook
+            // (gate in `on_completion_call`). The handler below catches
+            // the resulting Terminate("compact") and rebuilds state.
 
             // Call the agent with history from StateManager (single source of truth)
             let mut history = state_manager
@@ -1227,10 +1236,61 @@ impl AgentRunner {
                     return CompletionResult::Success;
                 }
 
-                Err(PromptError::PromptCancelled { reason, .. }) => {
-                    if reason == "stop" {
-                        return CompletionResult::Stopped;
+                Err(PromptError::PromptCancelled { reason, .. }) if reason == "stop" => {
+                    return CompletionResult::Stopped;
+                }
+
+                Err(PromptError::PromptCancelled { reason, .. }) if reason == "compact" => {
+                    // The hook decided the imminent wire payload is over budget.
+                    // Run compaction synchronously, rebuild the current turn from
+                    // the post-compaction StateManager, and re-enter the loop.
+                    let Some(sm) = state_manager.as_ref() else {
+                        // No StateManager — we can't compact. This shouldn't
+                        // happen in production (the hook's gate only fires
+                        // when one is wired), but bail loudly if it does.
+                        return CompletionResult::Error;
+                    };
+
+                    sm.set_status(Some("Compacting context...".to_string()));
+                    let compacted = sm.force_compact().await;
+                    sm.set_status(None);
+
+                    if let Some(result) = compacted {
+                        sm.add_system_message(format!(
+                            "Context compacted: {} → {} messages, {} compacted",
+                            result.original_count, result.compacted_count, result.num_discarded
+                        ));
+                    } else {
+                        // Compaction couldn't make progress (no summarizer
+                        // model, or empty body). Manually clear the
+                        // staleness signal so the gate stops firing — break
+                        // the loop and let the (possibly still-too-big)
+                        // request go to the wire. Provider errors there are
+                        // honest and propagate through the existing retry
+                        // path.
+                        tracing::warn!(
+                            "Compaction requested but force_compact returned None; clearing staleness and retrying"
+                        );
+                        sm.clear_last_input_tokens();
                     }
+
+                    // Rebuild the current turn from the source of truth.
+                    // The latest user message lives in keep_recent so this is
+                    // a no-op in practice, but rebuilding from StateManager
+                    // removes a class of subtle "stale current_turn" bugs.
+                    if let Some(turn) = sm.build_current_turn_message() {
+                        current_turn = turn;
+                    }
+
+                    // Loop. The next prompt_with_history call sees the
+                    // compacted history. The hook's needs_compaction() now
+                    // reads false (apply_compaction cleared last_input_tokens,
+                    // OR our explicit clear above did), so it does NOT
+                    // re-terminate.
+                    continue;
+                }
+
+                Err(PromptError::PromptCancelled { .. }) => {
                     // Any other cancellation reason — return error instead of
                     // silently looping (which previously caused an infinite loop).
                     return CompletionResult::Error;

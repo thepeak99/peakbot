@@ -73,8 +73,8 @@ pub struct ModelEntry {
     /// [`crate::context_manager::auto_detect_context_window`].
     ///
     /// Accepts the legacy field name `context_window_override` for one
-    /// release; new configs should use `context_window`.
-    #[serde(default, alias = "context_window_override")]
+    /// release, and the alternative name `context_size`.
+    #[serde(default, alias = "context_window_override", alias = "context_size")]
     pub context_window: Option<usize>,
 }
 
@@ -728,6 +728,23 @@ models:
 ";
         let prov: ProviderEntry = serde_yaml::from_str(yaml).expect("legacy field name parses");
         assert_eq!(prov.models[0].context_window, Some(12345));
+    }
+
+    /// The alternative field name `context_size:` must also deserialise
+    /// into `context_window` (aliases are additive, not exclusive).
+    #[test]
+    fn context_size_field_name_also_parses() {
+        let yaml = "
+name: openrouter
+type: openrouter
+api_key: sk
+models:
+  - name: minimax/MiniMax-M2.7
+    alias: minimax
+    context_size: 204000
+";
+        let prov: ProviderEntry = serde_yaml::from_str(yaml).expect("context_size field parses");
+        assert_eq!(prov.models[0].context_window, Some(204000));
     }
 
     // ── find_by_wire_id ──────────────────────────────────────────────────
