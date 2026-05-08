@@ -54,13 +54,8 @@ pub enum FileEditError {
 
 #[derive(Deserialize)]
 pub struct FileEditArgs {
-    /// Optional reasoning narration for logs/UI. Never gates execution —
-    /// see conversation cc2a6efa for the bug this prevented (model dropped
-    /// `thought` on a long tool-call payload, the parse failed, and the
-    /// model fell back to bash).
-    #[serde(default)]
     #[allow(dead_code)]
-    thought: Option<String>,
+    thought: String,
     command: String,
     path: String,
     file_text: Option<String>,
@@ -119,7 +114,7 @@ If editing fails, read the file first to get exact content, then retry."
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "Optional: briefly explain what you're about to do and why, for the user's logs. Safe to omit on long payloads — execution will not be blocked."
+                        "description": "Briefly explain what you're about to do and why, before acting."
                     },
                     "command": {
                         "type": "string",
@@ -155,7 +150,7 @@ If editing fails, read the file first to get exact content, then retry."
                         "description": "Optional for 'str_replace': if true, replace all occurrences instead of just the first one. Default: false (single match only)."
                     }
                 },
-                "required": ["command", "path"]
+                "required": ["thought", "command", "path"]
             }),
         }
     }
@@ -742,7 +737,7 @@ mod tests {
     /// empty so each test only sets what it cares about.
     fn args(command: &str, path: &str) -> FileEditArgs {
         FileEditArgs {
-            thought: Some("test".into()),
+            thought: "test".into(),
             command: command.into(),
             path: path.into(),
             file_text: None,
@@ -1011,33 +1006,6 @@ mod tests {
         // Third undo → empty stack, error.
         let err = tool.cmd_undo_edit(&undo).unwrap_err();
         assert!(matches!(err, FileEditError::Validation(_)));
-    }
-
-    // ── thought-is-optional regression tests ────────────────────────────
-    //
-    // Repro of conversation cc2a6efa: a model produced a valid
-    // `file_edit create` JSON with a long `file_text` body but
-    // omitted the `thought` field. Serde rejected the call with
-    // `missing field 'thought'` *before* our tool ran. The
-    // `thought` field is metadata for logs — never block execution.
-
-    #[test]
-    fn args_deserialize_succeeds_when_thought_is_omitted() {
-        let json = r#"{"command":"create","path":"/tmp/x.txt","file_text":"hi"}"#;
-        let parsed: FileEditArgs = serde_json::from_str(json)
-            .expect("FileEditArgs must deserialize without a `thought` field");
-        assert_eq!(parsed.command, "create");
-        assert_eq!(parsed.path, "/tmp/x.txt");
-        assert_eq!(parsed.file_text.as_deref(), Some("hi"));
-        assert!(parsed.thought.is_none(), "thought must be Option<String>");
-    }
-
-    #[test]
-    fn args_deserialize_still_accepts_thought_when_present() {
-        let json = r#"{"thought":"why","command":"str_replace","path":"/tmp/x.txt","old_str":"a","new_str":"b"}"#;
-        let parsed: FileEditArgs =
-            serde_json::from_str(json).expect("FileEditArgs must accept a `thought` field");
-        assert_eq!(parsed.thought.as_deref(), Some("why"));
     }
 
     // ── empty file_text guidance for the model ──────────────────────────

@@ -76,7 +76,11 @@ mod tests {
     fn test_save_and_load() {
         let storage = InMemoryStorage::new();
 
-        let conv = Conversation::new("Test".to_string(), "mock-model".to_string());
+        let conv = Conversation::new(
+            "Test".to_string(),
+            "mock-prov".to_string(),
+            "mock-model".to_string(),
+        );
         storage.save(&conv).unwrap();
 
         let loaded = storage.load(conv.id).unwrap();
@@ -95,8 +99,8 @@ mod tests {
     fn test_list() {
         let storage = InMemoryStorage::new();
 
-        let conv1 = Conversation::new("First".to_string(), "model".to_string());
-        let conv2 = Conversation::new("Second".to_string(), "model".to_string());
+        let conv1 = Conversation::new("First".to_string(), "p".to_string(), "model".to_string());
+        let conv2 = Conversation::new("Second".to_string(), "p".to_string(), "model".to_string());
 
         storage.save(&conv1).unwrap();
         storage.save(&conv2).unwrap();
@@ -109,7 +113,7 @@ mod tests {
     fn test_delete() {
         let storage = InMemoryStorage::new();
 
-        let conv = Conversation::new("Test".to_string(), "model".to_string());
+        let conv = Conversation::new("Test".to_string(), "p".to_string(), "model".to_string());
         storage.save(&conv).unwrap();
 
         assert!(storage.exists(conv.id));

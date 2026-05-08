@@ -91,26 +91,8 @@ async fn main() -> Result<()> {
     // Pipeline
     let pipeline_registry = if config.pipeline_enabled() {
         let pipeline_config = config.pipeline().unwrap();
-        let openrouter_key = match &config.provider {
-            peakbot::ProviderConfig::OpenRouter(c) => c.api_key.clone(),
-            _ => std::env::var("OPENROUTER_API_KEY").ok(),
-        };
-        let openai_key = match &config.provider {
-            peakbot::ProviderConfig::OpenAI(c) => c.api_key.clone(),
-            _ => std::env::var("OPENAI_API_KEY").ok(),
-        };
-        let llamacpp_key = std::env::var("LLAMACPP_API_KEY").ok();
-        let llamacpp_url = std::env::var("LLAMACPP_BASE_URL").ok();
-        let ollama_url = std::env::var("OLLAMA_BASE_URL").ok();
 
-        Some(SubAgentRegistry::new(
-            pipeline_config,
-            openrouter_key,
-            openai_key,
-            llamacpp_key,
-            llamacpp_url,
-            ollama_url,
-        ))
+        Some(SubAgentRegistry::new(pipeline_config))
     } else {
         None
     };
@@ -156,14 +138,19 @@ async fn main() -> Result<()> {
     );
 
     // StateManager is already created above and shared with TodoTool.
-    // Stamp both the wire id (`set_model`) and the alias (the active
-    // entry from the registry) so `/model` / `/load` / status bar all
-    // see consistent values from boot.
+    // Stamp the wire identity `(provider_name, model)` and the alias
+    // (the active entry from the registry) so `/model` / `/load` /
+    // status bar all see consistent values from boot. The wire id is
+    // what gets persisted on conversations; the alias is display-only.
     state_manager.set_model(provider_info.model.clone());
-    let boot_alias = model_registry
-        .default_alias()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+    let (boot_provider_name, boot_alias) = match model_registry.default_alias() {
+        Some(a) => match model_registry.resolve(a) {
+            Some(rm) => (rm.provider_name.clone(), rm.alias.clone()),
+            None => (String::new(), a.to_string()),
+        },
+        None => (String::new(), "default".to_string()),
+    };
+    state_manager.set_provider_name(boot_provider_name);
     state_manager.set_model_alias(boot_alias.clone());
 
     // Channel: View → Controller

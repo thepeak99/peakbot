@@ -9,15 +9,6 @@ use uuid::Uuid;
 /// Token + cost fields use `#[serde(default)]` so conversations saved before
 /// stats persistence existed (only `message_count`) still deserialize cleanly
 /// — they just come back with zeros, which is the right answer for them.
-///
-/// `model_alias` carries the user-facing handle of the model that was
-/// active when this conversation ran. It is required for `/load` to
-/// re-activate the right model. Pre-v4 files (which never wrote this
-/// field) load with the reserved sentinel
-/// [`crate::config::RESERVED_UNAVAILABLE_ALIAS`] (`"unknown"`), which
-/// `/load` then rejects with the canonical `Model 'unknown' not
-/// available.` message — an honest answer, not a silent guess.
-/// *(persisted artifacts must carry every field needed to be re-activated)*
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationMetadata {
     /// Number of messages in the conversation
@@ -36,21 +27,6 @@ pub struct ConversationMetadata {
     /// Cumulative cost in USD across the conversation
     #[serde(default)]
     pub total_cost: f64,
-    /// User-facing alias of the model active when this conversation
-    /// was last updated. Defaults to the reserved `unknown` sentinel
-    /// for pre-v4 files. See struct-level doc comment.
-    #[serde(default = "default_unknown_alias")]
-    pub model_alias: String,
-}
-
-/// Sentinel-default for [`ConversationMetadata::model_alias`] on
-/// pre-v4 conversation files. Returns the same literal as
-/// [`crate::config::RESERVED_UNAVAILABLE_ALIAS`] but kept inline here
-/// so this module doesn't need to import the config module just to
-/// pin a default. The two MUST stay equal — pinned by
-/// `pre_v4_default_matches_reserved_unavailable_alias`.
-fn default_unknown_alias() -> String {
-    "unknown".to_string()
 }
 
 impl Default for ConversationMetadata {
@@ -61,7 +37,6 @@ impl Default for ConversationMetadata {
             total_output_tokens: 0,
             total_api_calls: 0,
             total_cost: 0.0,
-            model_alias: default_unknown_alias(),
         }
     }
 }
@@ -166,7 +141,13 @@ impl Message {
     }
 }
 
-/// A complete conversation with metadata
+/// A complete conversation with metadata.
+///
+/// **Stable identity:** `(provider_name, model)` is the persisted
+/// re-activation key for `/load`. Aliases are mutable user handles in
+/// `config.yaml` and are deliberately NOT stored — the wire identity
+/// is what was actually sent to the API and is what survives config
+/// renames. See [`crate::config::ModelRegistry::find_by_wire_id`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     /// Unique identifier for this conversation
@@ -179,42 +160,38 @@ pub struct Conversation {
     pub updated_at: DateTime<Utc>,
     /// Message history
     pub messages: Vec<Message>,
-    /// Model used for this conversation
+    /// Provider name (informational handle from the providers list,
+    /// e.g. `"openrouter"`, `"patchnotes"`). Together with `model`,
+    /// forms the wire-id pair used by `/load` to re-activate the
+    /// model. Defaults to empty for pre-v5 files; those then fail
+    /// `find_by_wire_id` and surface as `⚠ unavailable`.
+    #[serde(default)]
+    pub provider_name: String,
+    /// Wire id of the model used (e.g. `anthropic/claude-3.7-sonnet`).
     pub model: String,
     /// Additional metadata (token count, cost, etc.)
     pub metadata: ConversationMetadata,
 }
 
 impl Conversation {
-    /// Create a new conversation with the given name and model wire id.
+    /// Create a new conversation with the given name and the active
+    /// model's full wire identity.
     ///
-    /// **Sets `model_alias` to the sentinel `"unknown"`** — call sites
-    /// that know the alias should use [`Conversation::new_with_alias`]
-    /// (which stamps the right value) or set
-    /// `metadata.model_alias` immediately after construction. Tests
-    /// that don't care about alias-driven `/load` may use this directly.
-    pub fn new(name: String, model: String) -> Self {
-        Self::new_with_alias(name, model, default_unknown_alias())
-    }
-
-    /// Create a new conversation, stamping the user-facing model alias
-    /// into the metadata. This is the production constructor — callers
-    /// in the boot path, `/new` handler, and `/model` switch must use
-    /// this so `/load` can later reactivate the right model.
-    pub fn new_with_alias(name: String, model: String, model_alias: String) -> Self {
+    /// Both `provider_name` and `model` are required: together they form
+    /// the stable key `/load` uses to re-activate the right model. The
+    /// alias the user sees is *not* persisted — it's UI sugar that can
+    /// be renamed in `config.yaml` without breaking saved conversations.
+    pub fn new(name: String, provider_name: String, model: String) -> Self {
         let now = Utc::now();
-        let metadata = ConversationMetadata {
-            model_alias,
-            ..ConversationMetadata::default()
-        };
         Conversation {
             id: Uuid::new_v4(),
             name,
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            provider_name,
             model,
-            metadata,
+            metadata: ConversationMetadata::default(),
         }
     }
 
@@ -274,18 +251,13 @@ pub struct ConversationSummary {
     pub updated_at: DateTime<Utc>,
     /// Number of messages
     pub message_count: usize,
-    /// Model wire id used (e.g. `anthropic/claude-3.7-sonnet`).
+    /// Provider name (informational handle, e.g. `"openrouter"`).
+    /// Pre-v5 files default to empty; rendered as `(unknown)` in
+    /// `/conversations` listings.
+    #[serde(default)]
+    pub provider_name: String,
+    /// Wire id of the model used (e.g. `anthropic/claude-3.7-sonnet`).
     pub model: String,
-    /// User-facing model alias (the handle from
-    /// [`crate::config::ModelRegistry`]). Pre-v4 files default to
-    /// `"unknown"`. Used by `/conversations` to mark unavailable
-    /// rows and by `/load` to validate before activation.
-    #[serde(default = "default_summary_alias")]
-    pub model_alias: String,
-}
-
-fn default_summary_alias() -> String {
-    "unknown".to_string()
 }
 
 impl From<&Conversation> for ConversationSummary {
@@ -296,8 +268,8 @@ impl From<&Conversation> for ConversationSummary {
             created_at: conv.created_at,
             updated_at: conv.updated_at,
             message_count: conv.metadata.message_count,
+            provider_name: conv.provider_name.clone(),
             model: conv.model.clone(),
-            model_alias: conv.metadata.model_alias.clone(),
         }
     }
 }
@@ -308,15 +280,24 @@ mod tests {
 
     #[test]
     fn test_conversation_creation() {
-        let conv = Conversation::new("Test".to_string(), "claude-3".to_string());
+        let conv = Conversation::new(
+            "Test".to_string(),
+            "openrouter".to_string(),
+            "claude-3".to_string(),
+        );
         assert_eq!(conv.name, "Test");
+        assert_eq!(conv.provider_name, "openrouter");
         assert_eq!(conv.model, "claude-3");
         assert!(conv.messages.is_empty());
     }
 
     #[test]
     fn test_add_messages() {
-        let mut conv = Conversation::new("Test".to_string(), "claude-3".to_string());
+        let mut conv = Conversation::new(
+            "Test".to_string(),
+            "openrouter".to_string(),
+            "claude-3".to_string(),
+        );
 
         conv.add_user_message("Hello".to_string());
         assert_eq!(conv.messages.len(), 1);
@@ -344,7 +325,11 @@ mod tests {
 
     #[test]
     fn test_serialization() {
-        let mut conv = Conversation::new("Test".to_string(), "claude-3".to_string());
+        let mut conv = Conversation::new(
+            "Test".to_string(),
+            "openrouter".to_string(),
+            "claude-3".to_string(),
+        );
         conv.add_user_message("Hello".to_string());
         conv.add_assistant_message("Hi!".to_string());
 
@@ -353,12 +338,17 @@ mod tests {
 
         assert_eq!(loaded.id, conv.id);
         assert_eq!(loaded.name, conv.name);
+        assert_eq!(loaded.provider_name, "openrouter");
         assert_eq!(loaded.messages.len(), 2);
     }
 
     #[test]
     fn test_serialization_with_tool_calls() {
-        let mut conv = Conversation::new("Test".to_string(), "claude-3".to_string());
+        let mut conv = Conversation::new(
+            "Test".to_string(),
+            "openrouter".to_string(),
+            "claude-3".to_string(),
+        );
         conv.add_user_message("List files".to_string());
         conv.add_tool_call(
             "bash".to_string(),
@@ -440,14 +430,15 @@ mod tests {
         }
     }
 
-    // === v4: model_alias persistence + pre-v4 fallback ===============
+    // === v5: wire-id (provider_name, model) persistence ===============
 
-    /// Pre-v4 conversation files don't have `model_alias` in their
-    /// metadata. Loading them must default to the reserved `"unknown"`
-    /// sentinel — `/load` then rejects with the canonical error rather
+    /// Pre-v5 conversation files don't have `provider_name` in their
+    /// top-level fields. Loading them must default `provider_name` to
+    /// the empty string — `/load` then fails the wire-id lookup with
+    /// the canonical `Model 'x/y' not available.` diagnostic rather
     /// than guessing a model.
     #[test]
-    fn pre_v4_metadata_loads_with_unknown_alias() {
+    fn pre_v5_file_without_provider_name_loads_with_empty_provider() {
         let json = r#"{
             "id": "10da8b9d-f242-4786-9c75-c3fbc2530f1f",
             "name": "Old convo",
@@ -458,42 +449,40 @@ mod tests {
             "metadata": {"message_count": 0}
         }"#;
         let conv: Conversation = serde_json::from_str(json).unwrap();
-        assert_eq!(conv.metadata.model_alias, "unknown");
+        assert_eq!(conv.provider_name, "");
+        assert_eq!(conv.model, "anthropic/claude-3.7-sonnet");
     }
 
-    /// The `serde(default)` literal MUST equal the
-    /// [`crate::config::RESERVED_UNAVAILABLE_ALIAS`] constant. If
-    /// either drifts, pre-v4 files would deserialize to a sentinel
-    /// `/load` doesn't recognise, breaking the locked failure path.
+    /// New conversations carry both `provider_name` and `model` —
+    /// the wire-id pair `/load` uses for re-activation. Round-trip
+    /// through serde without loss.
     #[test]
-    fn pre_v4_default_matches_reserved_unavailable_alias() {
-        assert_eq!(
-            super::default_unknown_alias(),
-            crate::config::RESERVED_UNAVAILABLE_ALIAS
-        );
-    }
-
-    /// New conversations stamped via `new_with_alias` round-trip the
-    /// alias through serde without loss.
-    #[test]
-    fn new_with_alias_roundtrips_through_serde() {
-        let conv = Conversation::new_with_alias(
+    fn new_conversation_persists_provider_name_and_model() {
+        let conv = Conversation::new(
             "Test".into(),
+            "openrouter".into(),
             "anthropic/claude-3.7-sonnet".into(),
-            "sonnet".into(),
         );
         let json = serde_json::to_string(&conv).unwrap();
         let parsed: Conversation = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.metadata.model_alias, "sonnet");
+        assert_eq!(parsed.provider_name, "openrouter");
         assert_eq!(parsed.model, "anthropic/claude-3.7-sonnet");
     }
 
-    /// Default constructor stamps the unknown sentinel — keeps test
-    /// helpers compatible without forcing every site through
-    /// `new_with_alias`.
+    /// The serialized JSON must NOT contain a `model_alias` field —
+    /// aliases are mutable and don't belong on disk. Negative test
+    /// guarding against accidental re-introduction.
     #[test]
-    fn legacy_new_constructor_stamps_unknown_alias() {
-        let conv = Conversation::new("Test".into(), "test-model".into());
-        assert_eq!(conv.metadata.model_alias, "unknown");
+    fn serialized_metadata_has_no_model_alias_field() {
+        let conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "anthropic/claude-3.7-sonnet".into(),
+        );
+        let json = serde_json::to_string(&conv).unwrap();
+        assert!(
+            !json.contains("model_alias"),
+            "alias must not be persisted; got: {json}"
+        );
     }
 }

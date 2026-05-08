@@ -16,96 +16,18 @@ use std::collections::HashMap;
 pub struct SubAgentRegistry {
     /// Agent definitions
     agents: HashMap<String, AgentDefinition>,
-    /// API keys for different providers
-    api_keys: HashMap<String, Option<String>>,
-    /// Default configs for each provider type
-    default_configs: HashMap<String, DefaultProviderConfig>,
-}
-
-/// Default configuration for each provider type
-#[derive(Clone)]
-struct DefaultProviderConfig {
-    model: String,
-    max_tokens: u64,
-    base_url: Option<String>,
 }
 
 impl SubAgentRegistry {
     /// Create a new registry from pipeline configuration
-    pub fn new(
-        pipeline_config: &PipelineConfig,
-        openrouter_api_key: Option<String>,
-        openai_api_key: Option<String>,
-        llamacpp_api_key: Option<String>,
-        llamacpp_base_url: Option<String>,
-        ollama_base_url: Option<String>,
-    ) -> Self {
-        let mut agents = HashMap::new();
-        let mut api_keys = HashMap::new();
-        let mut default_configs = HashMap::new();
+    pub fn new(pipeline_config: &PipelineConfig) -> Self {
+        let agents = pipeline_config
+            .agents
+            .iter()
+            .map(|(name, def)| (name.clone(), def.clone()))
+            .collect();
 
-        // Store API keys for each provider type
-        api_keys.insert(
-            "openrouter".to_string(),
-            openrouter_api_key.filter(|k| !k.is_empty()),
-        );
-        api_keys.insert(
-            "openai".to_string(),
-            openai_api_key.filter(|k| !k.is_empty()),
-        );
-        api_keys.insert("llamacpp".to_string(), llamacpp_api_key);
-        api_keys.insert("ollama".to_string(), None);
-
-        // Default configs for OpenRouter
-        default_configs.insert(
-            "openrouter".to_string(),
-            DefaultProviderConfig {
-                model: "anthropic/claude-3.7-sonnet".to_string(),
-                max_tokens: 4096,
-                base_url: None,
-            },
-        );
-
-        // Default configs for OpenAI
-        default_configs.insert(
-            "openai".to_string(),
-            DefaultProviderConfig {
-                model: "gpt-4o".to_string(),
-                max_tokens: 4096,
-                base_url: Some("https://api.openai.com/v1".to_string()),
-            },
-        );
-
-        // Default configs for LlamaCpp
-        default_configs.insert(
-            "llamacpp".to_string(),
-            DefaultProviderConfig {
-                model: "llama3".to_string(),
-                max_tokens: 4096,
-                base_url: llamacpp_base_url.or(Some("http://localhost:8080".to_string())),
-            },
-        );
-
-        // Default configs for Ollama
-        default_configs.insert(
-            "ollama".to_string(),
-            DefaultProviderConfig {
-                model: "llama3".to_string(),
-                max_tokens: 4096,
-                base_url: ollama_base_url.or(Some("http://localhost:11434".to_string())),
-            },
-        );
-
-        // Copy agent definitions
-        for (name, def) in &pipeline_config.agents {
-            agents.insert(name.clone(), def.clone());
-        }
-
-        Self {
-            agents,
-            api_keys,
-            default_configs,
-        }
+        Self { agents }
     }
 
     /// Create a new agent instance from a definition
@@ -115,23 +37,20 @@ impl SubAgentRegistry {
             .get(name)
             .ok_or_else(|| SubAgentError::UnknownAgent(name.to_string()))?;
 
-        let provider_name = def.agent_type.to_string();
-        let api_key = self.api_keys.get(&provider_name).cloned().flatten();
-        let default_config = self
-            .default_configs
-            .get(&provider_name)
-            .ok_or_else(|| SubAgentError::UnsupportedProvider(provider_name.clone()))?;
-
-        let model = def
-            .model
-            .clone()
-            .unwrap_or_else(|| default_config.model.clone());
-        let max_tokens = def.max_tokens.unwrap_or(default_config.max_tokens);
-        let base_url = default_config.base_url.clone();
+        let model = def.model.clone().unwrap_or_else(|| match def.agent_type {
+            crate::config::ProviderType::OpenRouter => "anthropic/claude-3.7-sonnet".to_string(),
+            crate::config::ProviderType::OpenAI => "gpt-4o".to_string(),
+            crate::config::ProviderType::LlamaCpp => "llama3".to_string(),
+            crate::config::ProviderType::Ollama => "llama3".to_string(),
+        });
+        let max_tokens = def.max_tokens.unwrap_or(4096);
+        let base_url = def.base_url.clone();
 
         match def.agent_type {
             crate::config::ProviderType::OpenRouter => {
-                let api_key = api_key
+                let api_key = def
+                    .api_key
+                    .clone()
                     .context("OpenRouter API key required for openrouter agents")
                     .map_err(|e| SubAgentError::Configuration(e.to_string()))?;
 
@@ -161,7 +80,9 @@ impl SubAgentRegistry {
                 ))
             }
             crate::config::ProviderType::OpenAI => {
-                let api_key = api_key
+                let api_key = def
+                    .api_key
+                    .clone()
                     .context("OpenAI API key required for openai agents")
                     .map_err(|e| SubAgentError::Configuration(e.to_string()))?;
 
@@ -194,7 +115,7 @@ impl SubAgentRegistry {
                 ))
             }
             crate::config::ProviderType::LlamaCpp => {
-                let api_key = api_key.unwrap_or_default();
+                let api_key = def.api_key.clone().unwrap_or_default();
                 let base = base_url.unwrap_or_else(|| "http://localhost:8080".to_string());
 
                 let client = rig::providers::openai::Client::builder()

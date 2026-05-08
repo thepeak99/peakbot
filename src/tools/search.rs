@@ -94,10 +94,8 @@ struct SearXngResult {
 /// Arguments for the search tool
 #[derive(Debug, Deserialize)]
 pub struct SearchArgs {
-    /// Optional reasoning narration. See `FileEditArgs.thought`.
-    #[serde(default)]
     #[allow(dead_code)]
-    thought: Option<String>,
+    thought: String,
     /// The search query (plain text, no special syntax required)
     query: String,
 
@@ -157,7 +155,7 @@ impl Tool for SearchTool {
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "Optional: briefly explain what you're about to do and why, for the user's logs. Safe to omit on long payloads."
+                        "description": "Briefly explain what you're about to do and why, before acting."
                     },
                     "query": {
                         "type": "string",
@@ -183,7 +181,7 @@ impl Tool for SearchTool {
                         "enum": ["day", "month", "year"]
                     }
                 },
-                "required": ["query"]
+                "required": ["thought", "query"]
             }),
         }
     }
