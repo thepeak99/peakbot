@@ -488,13 +488,6 @@ fn create_ollama_agent(
     if let Some(temp) = config.temperature {
         agent_builder = agent_builder.temperature(temp as f64);
     }
-    if let Some(num_ctx) = config.num_ctx {
-        // Set num_ctx via additional_params for Ollama
-        let params = serde_json::json!({
-            "num_ctx": num_ctx
-        });
-        agent_builder = agent_builder.additional_params(params);
-    }
 
     // Add built-in tools (including optional SearchTool and TodoTool)
     let agent_builder = add_builtin_tools(

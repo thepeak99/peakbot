@@ -60,9 +60,6 @@ pub struct OllamaConfig {
     /// Temperature setting (optional)
     #[serde(default)]
     pub temperature: Option<f32>,
-    /// Number of context tokens (optional, defaults to 2048 for most models)
-    #[serde(default)]
-    pub num_ctx: Option<usize>,
 }
 
 /// Configuration for OpenAI provider
@@ -410,7 +407,7 @@ impl Config {
             // Legacy synthesis path. We construct a single-entry list
             // whose ProviderEntry copies the legacy `provider:` shape.
             // The wire id is read off the active legacy variant.
-            let (kind, api_key, base_url, model_name, max_tokens, temperature, num_ctx, extra) =
+            let (kind, api_key, base_url, model_name, max_tokens, temperature, extra) =
                 describe_legacy(&self.provider);
             let synthetic_alias = "default".to_string();
             let provider_entry = ProviderEntry {
@@ -423,7 +420,6 @@ impl Config {
                     alias: Some(synthetic_alias.clone()),
                     max_tokens: Some(max_tokens),
                     temperature,
-                    num_ctx,
                     extra_params: extra,
                     context_window: None,
                 }],
@@ -451,7 +447,6 @@ fn describe_legacy(
     String,
     u64,
     Option<f32>,
-    Option<usize>,
     Option<serde_json::Value>,
 ) {
     match p {
@@ -463,7 +458,6 @@ fn describe_legacy(
             c.max_tokens,
             None,
             None,
-            None,
         ),
         ProviderConfig::OpenAI(c) => (
             ProviderType::OpenAI,
@@ -473,7 +467,6 @@ fn describe_legacy(
             c.max_tokens,
             None,
             None,
-            None,
         ),
         ProviderConfig::LlamaCpp(c) => (
             ProviderType::LlamaCpp,
@@ -481,7 +474,6 @@ fn describe_legacy(
             Some(c.base_url.clone()),
             c.model.clone(),
             c.max_tokens,
-            None,
             None,
             c.extra_params.clone(),
         ),
@@ -493,7 +485,6 @@ fn describe_legacy(
             // Ollama has no max_tokens — use the default placeholder.
             default_max_tokens(),
             c.temperature,
-            c.num_ctx,
             None,
         ),
     }
@@ -950,15 +941,11 @@ impl Config {
                 let temperature = std::env::var("OLLAMA_TEMPERATURE")
                     .ok()
                     .and_then(|t| t.parse().ok());
-                let num_ctx = std::env::var("OLLAMA_NUM_CTX")
-                    .ok()
-                    .and_then(|c| c.parse().ok());
 
                 config.provider = ProviderConfig::Ollama(OllamaConfig {
                     base_url,
                     model,
                     temperature,
-                    num_ctx,
                 });
             } else {
                 // OpenRouter config via legacy env vars
@@ -1298,7 +1285,6 @@ mod tests {
                     alias: Some("sonnet".into()),
                     max_tokens: None,
                     temperature: None,
-                    num_ctx: None,
                     extra_params: None,
                     context_window: None,
                 }],
@@ -1327,7 +1313,6 @@ mod tests {
                     alias: Some("sonnet".into()),
                     max_tokens: None,
                     temperature: None,
-                    num_ctx: None,
                     extra_params: None,
                     context_window: None,
                 }],

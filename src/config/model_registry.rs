@@ -70,9 +70,6 @@ pub struct ModelEntry {
     /// Optional temperature override (Ollama, OpenAI compatible).
     #[serde(default)]
     pub temperature: Option<f32>,
-    /// Optional context-size override for Ollama.
-    #[serde(default)]
-    pub num_ctx: Option<usize>,
     /// Optional pass-through extra params for LlamaCpp.
     #[serde(default)]
     pub extra_params: Option<serde_json::Value>,
@@ -351,7 +348,6 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
                 .unwrap_or_else(default_ollama_base_url),
             model: model.name.clone(),
             temperature: model.temperature,
-            num_ctx: model.num_ctx,
         }),
     }
 }
@@ -389,7 +385,6 @@ mod tests {
                     alias: Some("sonnet".into()),
                     max_tokens: Some(8192),
                     temperature: None,
-                    num_ctx: None,
                     extra_params: None,
                     context_window: None,
                 },
@@ -398,7 +393,6 @@ mod tests {
                     alias: Some("opus".into()),
                     max_tokens: None,
                     temperature: None,
-                    num_ctx: None,
                     extra_params: None,
                     context_window: None,
                 },
@@ -418,7 +412,6 @@ mod tests {
                     alias: Some("oai-gpt4".into()),
                     max_tokens: Some(4000),
                     temperature: None,
-                    num_ctx: None,
                     extra_params: None,
                     context_window: None,
                 },
@@ -427,7 +420,6 @@ mod tests {
                     alias: None,
                     max_tokens: None,
                     temperature: None,
-                    num_ctx: None,
                     extra_params: None,
                     context_window: None,
                 },
@@ -484,7 +476,6 @@ mod tests {
                 alias: None,
                 max_tokens: None,
                 temperature: None,
-                num_ctx: None,
                 extra_params: None,
                 context_window: None,
             }],
@@ -609,7 +600,6 @@ mod tests {
                 alias: None,
                 max_tokens: None,
                 temperature: None,
-                num_ctx: None,
                 extra_params: None,
                 context_window: None,
             }],
@@ -637,7 +627,6 @@ mod tests {
                 alias: None,
                 max_tokens: None,
                 temperature: None,
-                num_ctx: None,
                 extra_params: None,
                 context_window: None,
             }],
@@ -664,7 +653,6 @@ mod tests {
                     alias: Some("sonnet".into()),
                     max_tokens: None,
                     temperature: None,
-                    num_ctx: None,
                     extra_params: None,
                     context_window: None, // → auto-detect → 200_000
                 },
@@ -673,7 +661,6 @@ mod tests {
                     alias: Some("custom".into()),
                     max_tokens: None,
                     temperature: None,
-                    num_ctx: None,
                     extra_params: None,
                     context_window: Some(42), // explicit → 42
                 },
@@ -712,7 +699,6 @@ mod tests {
                 alias: None,
                 max_tokens: None,
                 temperature: None,
-                num_ctx: None,
                 extra_params: None,
                 context_window: None,
             }],
