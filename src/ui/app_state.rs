@@ -820,11 +820,22 @@ pub struct SessionState {
     /// Current model name (wire id).
     pub model: String,
 
+    /// Current provider name (informational handle from the providers
+    /// list, e.g. `"openrouter"`, `"patchnotes"`). Together with
+    /// `model`, forms the wire-id pair persisted on conversations and
+    /// used by `/load` to re-activate the model. Empty in the rare
+    /// boot path where the legacy `provider:` block hasn't been
+    /// promoted yet.
+    #[serde(default)]
+    pub provider_name: String,
+
     /// Current model alias (the user-facing handle from the
     /// [`crate::config::ModelRegistry`]). May be empty in tests or in
     /// the rare boot path where the legacy `provider:` block hasn't
     /// been promoted yet — never trust this is non-empty without
     /// checking. Production boot stamps this from the resolved model.
+    /// **Display only — not persisted on disk.** Conversations carry
+    /// `provider_name + model` for re-activation.
     #[serde(default)]
     pub model_alias: String,
 }

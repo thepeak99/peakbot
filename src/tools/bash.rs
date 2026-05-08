@@ -25,11 +25,8 @@ pub enum BashError {
 
 #[derive(Deserialize)]
 pub struct BashArgs {
-    /// Optional reasoning narration. See `FileEditArgs.thought` for the
-    /// rationale (don't block execution on a metadata field).
-    #[serde(default)]
     #[allow(dead_code)]
-    thought: Option<String>,
+    thought: String,
     command: String,
     timeout_seconds: Option<u64>,
     /// Show first N lines of output (optional)
@@ -193,7 +190,7 @@ impl Tool for BashTool {
                 "properties": {
                     "thought": {
                         "type": "string",
-                        "description": "Optional: briefly explain what you're about to do and why, for the user's logs. Safe to omit on long payloads."
+                        "description": "Briefly explain what you're about to do and why, before acting."
                     },
                     "command": {
                         "type": "string",
@@ -212,7 +209,7 @@ impl Tool for BashTool {
                         "description": "Show last N lines of output (default: 100, use 0 for all)"
                     }
                 },
-                "required": ["command"]
+                "required": ["thought", "command"]
             }),
         }
     }

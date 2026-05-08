@@ -7,9 +7,11 @@
 //! - Provider `name` is informational only (no cross-references).
 //! - Model `alias` is optional; falls back to `name`.
 //! - Aliases are globally unique and must match `^[A-Za-z0-9_./:-]+$`.
-//! - The literal alias `unknown` is reserved (used as the sentinel for
-//!   pre-v4 conversations whose model wasn't recorded).
 //! - `default_model` is required iff any models are declared.
+//!
+//! Conversations persist `(provider_name, model_name)` — never the alias.
+//! Aliases are UI sugar; the wire identity is the re-activation key. See
+//! [`ModelRegistry::find_by_wire_id`].
 //!
 //! The registry's only job is *alias → existing-shape*. Everything
 //! downstream (`create_provider`, `ProviderInfo`, the agent itself)
@@ -20,13 +22,6 @@ use crate::config::{
 };
 use serde::Deserialize;
 use std::collections::HashMap;
-
-/// Reserved alias used as the model_alias for pre-v4 conversations on
-/// disk that didn't yet carry the field. Always rejected at config load
-/// (an explicit user-declared alias `unknown` is a config error) and
-/// always fails activation in `/load` with the canonical
-/// `Model 'unknown' not available.` error.
-pub const RESERVED_UNAVAILABLE_ALIAS: &str = "unknown";
 
 /// One entry in the top-level `providers:` list. Owns its credentials
 /// and its `models:` list.
@@ -119,9 +114,6 @@ pub enum RegistryError {
         second_model: String,
     },
 
-    #[error("alias `{0}` is reserved (used internally for pre-v4 conversations)")]
-    ReservedAlias(String),
-
     #[error(
         "alias `{alias}` on `{provider}/{model}` does not match required pattern `[A-Za-z0-9_./:-]+`"
     )]
@@ -184,9 +176,6 @@ impl ModelRegistry {
                     .clone()
                     .unwrap_or_else(|| format!("{}/{}", prov.name, model.name));
 
-                if alias == RESERVED_UNAVAILABLE_ALIAS {
-                    return Err(RegistryError::ReservedAlias(alias));
-                }
                 if !is_valid_alias(&alias) {
                     return Err(RegistryError::InvalidAlias {
                         alias,
@@ -278,6 +267,22 @@ impl ModelRegistry {
     /// Whether the registry contains a given alias.
     pub fn contains(&self, alias: &str) -> bool {
         self.by_alias.contains_key(alias)
+    }
+
+    /// Look up a model by its persisted wire identity
+    /// `(provider_name, model_name)`. This is the **stable** re-activation
+    /// key for `/load` — aliases are mutable user handles in `config.yaml`,
+    /// the wire identity is what was actually sent to the API.
+    ///
+    /// Returns `None` if no provider in the current registry exposes
+    /// that exact `(provider_name, model_name)` pair. Callers in `/load`
+    /// surface the canonical
+    /// `❌ Model '<provider>/<model>' not available.` diagnostic in
+    /// that case and leave the current conversation untouched.
+    pub fn find_by_wire_id(&self, provider_name: &str, model_name: &str) -> Option<&ResolvedModel> {
+        self.by_alias
+            .values()
+            .find(|m| m.provider_name == provider_name && m.model_name == model_name)
     }
 
     /// All declared aliases sorted alphabetically — for `/model` listing
@@ -504,14 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn reserved_alias_unknown_is_rejected_at_config_load() {
-        let mut p = or_provider();
-        p.models[0].alias = Some(RESERVED_UNAVAILABLE_ALIAS.into());
-        let err = ModelRegistry::build(&[p], Some(RESERVED_UNAVAILABLE_ALIAS)).unwrap_err();
-        assert!(matches!(err, RegistryError::ReservedAlias(_)));
-    }
-
-    #[test]
     fn invalid_alias_is_rejected() {
         let mut p = or_provider();
         p.models[0].alias = Some("Bad Alias!".into());
@@ -731,5 +728,61 @@ models:
 ";
         let prov: ProviderEntry = serde_yaml::from_str(yaml).expect("legacy field name parses");
         assert_eq!(prov.models[0].context_window, Some(12345));
+    }
+
+    // ── find_by_wire_id ──────────────────────────────────────────────────
+
+    /// `find_by_wire_id` resolves on `(provider_name, model_name)` —
+    /// the stable persistence key. This is the seam that lets `/load`
+    /// re-activate a saved conversation even after the user has
+    /// renamed the alias in `config.yaml`.
+    #[test]
+    fn find_by_wire_id_returns_resolved_match() {
+        let prov = or_provider();
+        let reg = ModelRegistry::build(&[prov], Some("opus")).expect("build");
+
+        let resolved = reg
+            .find_by_wire_id("openrouter", "anthropic/claude-opus-4")
+            .expect("must resolve by wire id");
+        assert_eq!(resolved.alias, "opus");
+        assert_eq!(resolved.model_name, "anthropic/claude-opus-4");
+        assert_eq!(resolved.provider_name, "openrouter");
+    }
+
+    /// Rename the alias in config — re-building the registry assigns
+    /// a different alias, but the wire-id lookup is unchanged.
+    #[test]
+    fn find_by_wire_id_is_stable_across_alias_rename() {
+        let mut prov = or_provider();
+        prov.models[0].alias = Some("the-old-name".into());
+        let reg_before = ModelRegistry::build(&[prov.clone()], Some("the-old-name")).unwrap();
+
+        prov.models[0].alias = Some("the-new-name".into());
+        let reg_after = ModelRegistry::build(&[prov], Some("the-new-name")).unwrap();
+
+        let before = reg_before
+            .find_by_wire_id("openrouter", "anthropic/claude-3.7-sonnet")
+            .unwrap();
+        let after = reg_after
+            .find_by_wire_id("openrouter", "anthropic/claude-3.7-sonnet")
+            .unwrap();
+        assert_eq!(before.model_name, after.model_name);
+        assert_eq!(before.provider_name, after.provider_name);
+        assert_eq!(before.alias, "the-old-name");
+        assert_eq!(after.alias, "the-new-name");
+    }
+
+    /// Unknown `(provider, model)` tuple → `None`. `/load` surfaces this
+    /// as the canonical `Model 'x/y' not available.` diagnostic.
+    #[test]
+    fn find_by_wire_id_misses_cleanly_on_unknown_tuple() {
+        let prov = or_provider();
+        let reg = ModelRegistry::build(&[prov], Some("opus")).expect("build");
+
+        assert!(reg.find_by_wire_id("openrouter", "no-such-model").is_none());
+        assert!(
+            reg.find_by_wire_id("no-such-provider", "anthropic/claude-opus-4")
+                .is_none()
+        );
     }
 }

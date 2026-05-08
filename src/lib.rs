@@ -20,8 +20,8 @@ pub mod vision;
 pub use config::{
     AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig,
     McpTransportType, ModelEntry, ModelRegistry, OllamaConfig, OpenRouterConfig, PipelineConfig,
-    ProviderConfig, ProviderEntry, ProviderType, RESERVED_UNAVAILABLE_ALIAS, RegistryError,
-    ResolvedModel, RetryConfig, SearXngConfig,
+    ProviderConfig, ProviderEntry, ProviderType, RegistryError, ResolvedModel, RetryConfig,
+    SearXngConfig,
 };
 use context_manager::ContextManager;
 pub use context_manager::{CompactionResult, auto_detect_context_window};
@@ -528,13 +528,28 @@ impl AgentRunner {
                     msg_tx.send(QueueMessage::StopMarker).await.ok();
                 }
             };
-        // Initialize conversation in StateManager (single source of truth)
+        // Initialize conversation in StateManager (single source of truth).
+        // The active wire identity (provider_name + model) was stamped by
+        // `main.rs` on the StateManager just before run_loop fired; we
+        // read it back here so saved conversations carry the right
+        // re-activation key. Falls back to the legacy `config_model`
+        // wire id with empty provider_name if the state hasn't been
+        // primed (test harnesses, mostly).
         if let Some(ref sm) = state_manager {
             let name = format!(
                 "Conversation {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M")
             );
-            sm.create_conversation(name, config_model);
+            let provider_name = sm.get_provider_name();
+            let model = {
+                let m = sm.get_model();
+                if m.is_empty() {
+                    config_model.clone()
+                } else {
+                    m
+                }
+            };
+            sm.create_conversation(name, provider_name, model);
         }
 
         while let Some(action) = action_receiver.recv().await {
@@ -780,6 +795,26 @@ impl AgentRunner {
                         sm.set_running(true);
                     }
                     Self::process_command_internal(&cmd, &state_manager, &config).await;
+
+                    // `/load <arg>` may have just swapped the active
+                    // conversation to one saved against a different
+                    // wire identity. Rebuild the agent if so — same
+                    // path `/model <alias>` uses. Falls through
+                    // (no-op) when the wire id matches the running
+                    // agent or `/load` failed validation.
+                    let lcmd = cmd.trim().to_ascii_lowercase();
+                    if lcmd.starts_with("/load ") {
+                        Self::maybe_rebuild_after_load(
+                            &mut agent,
+                            &mut config,
+                            &state_manager,
+                            &session_hook_cell,
+                            &provider_info_cell,
+                            &mut event_processor,
+                            rebuild_ctx.as_ref(),
+                        )
+                        .await;
+                    }
                     if let Some(ref sm) = state_manager {
                         sm.set_running(false);
                     }
@@ -879,7 +914,87 @@ impl AgentRunner {
             let available = ctx.registry.aliases_sorted().join(", ");
             return Err(format!("unknown alias `{alias}`. Available: {available}"));
         };
+        let resolved = resolved.clone();
 
+        let sm_for_provider = state_manager
+            .clone()
+            .ok_or_else(|| "state manager required for /model".to_string())?;
+
+        // Rebuild the agent + publish new provider info — shared with
+        // `/load` (which re-activates a saved wire identity).
+        Self::rebuild_agent_for_resolved(
+            &resolved,
+            agent_slot,
+            config,
+            &sm_for_provider,
+            session_hook_cell,
+            provider_info_cell,
+            event_processor,
+            state_manager,
+            ctx,
+        )
+        .await?;
+
+        // Reset conversation-scoped state — same path as /new. Stamps
+        // the new wire identity (provider_name + model) on the
+        // metadata so /load on the freshly-reset convo (after the next
+        // prompt) restores the right model. The alias is *also* set on
+        // AppState for status-bar display, but is NOT persisted.
+        sm_for_provider.clear_chat();
+        sm_for_provider.reset_stats();
+        sm_for_provider.clear_all_todos();
+        let convo_name = format!(
+            "Conversation {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M")
+        );
+        sm_for_provider.create_conversation(
+            convo_name,
+            resolved.provider_name.clone(),
+            resolved.model_name.clone(),
+        );
+        sm_for_provider.set_model(resolved.model_name.clone());
+        sm_for_provider.set_provider_name(resolved.provider_name.clone());
+        sm_for_provider.set_model_alias(resolved.alias.clone());
+
+        // Announce the swap with a short banner so the user sees it
+        // happened. Format mirrors the listing format from
+        // process_command_internal::"/model".
+        sm_for_provider.add_system_message(format!(
+            "🔁 New conversation on {} ({} · {})",
+            resolved.alias, resolved.provider_name, resolved.model_name
+        ));
+
+        Ok(())
+    }
+
+    /// Rebuild the live `DynAgent` against a `ResolvedModel` — the
+    /// **shared seam** between `/model <alias>` and `/load`. Builds
+    /// the agent, publishes the new `ProviderInfo` + `SessionHook`
+    /// through their shared cells, swaps the active config provider,
+    /// re-inits the context manager, and restarts the event-processor
+    /// task on the new receiver.
+    ///
+    /// Does NOT reset the conversation (chat/stats/todos) and does NOT
+    /// emit a system banner — those are caller-specific:
+    /// - `/model` calls `create_conversation(...)` afterwards (fresh
+    ///   chat) and emits `🔁 New conversation on ...`.
+    /// - `/load` calls `load_conversation(...)` afterwards (restore
+    ///   saved chat) and emits `Loaded conversation: '...'`.
+    ///
+    /// *(simplicity is the key — switching models is one operation
+    /// regardless of trigger)*
+    #[allow(clippy::too_many_arguments)]
+    async fn rebuild_agent_for_resolved(
+        resolved: &ResolvedModel,
+        agent_slot: &mut Arc<DynAgent>,
+        config: &mut Config,
+        sm_for_provider: &Arc<StateManager>,
+        session_hook_cell: &SharedSessionHook,
+        provider_info_cell: &SharedProviderInfo,
+        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
+        state_manager: &Option<Arc<StateManager>>,
+        ctx: &RebuildContext,
+    ) -> Result<(), String> {
         // Rebuild MCP tool list from the long-lived handles. McpTool
         // implements Clone (rig 0.33), so we get a fresh Vec without
         // restarting any subprocess. See agents.md / multi-model.md.
@@ -895,14 +1010,7 @@ impl AgentRunner {
             Some(all)
         };
 
-        // Context window was eagerly resolved at registry-build time
-        // (alias OR auto-detect). Single source of truth.
-        let new_model = resolved.model_name.clone();
         let context_window = resolved.context_window;
-
-        let sm_for_provider = state_manager
-            .clone()
-            .ok_or_else(|| "state manager required for /model".to_string())?;
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
             &resolved.provider_config,
@@ -915,7 +1023,7 @@ impl AgentRunner {
             ctx.pipeline_registry.as_deref(),
             sm_for_provider.clone(),
         )
-        .map_err(|e| format!("failed to build agent for `{alias}`: {e}"))?;
+        .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 
         // Publish through the shared cells *first* so the event_loop's
         // /stop and vision-gate paths immediately see the new state.
@@ -933,24 +1041,6 @@ impl AgentRunner {
         // new values. We swap the active provider; everything else
         // (mcp_servers, searxng, context, retry, …) stays put.
         config.provider = resolved.provider_config.clone();
-
-        // Reset conversation-scoped state — same path as /new. Stamps
-        // the new alias on the metadata so /load on the freshly-reset
-        // convo (after the next prompt) restores the right model.
-        sm_for_provider.clear_chat();
-        sm_for_provider.reset_stats();
-        sm_for_provider.clear_all_todos();
-        let convo_name = format!(
-            "Conversation {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M")
-        );
-        sm_for_provider.create_conversation_with_alias(
-            convo_name,
-            new_model.clone(),
-            resolved.alias.clone(),
-        );
-        sm_for_provider.set_model(new_model.clone());
-        sm_for_provider.set_model_alias(resolved.alias.clone());
 
         // Re-init the context manager against the new model name so
         // compaction thresholds match the new context window.
@@ -985,17 +1075,71 @@ impl AgentRunner {
             }));
         }
 
-        // Announce the swap with a short banner so the user sees it
-        // happened. Format mirrors the listing format from
-        // process_command_internal::"/model".
-        sm_for_provider.add_system_message(format!(
-            "🔁 New conversation on {} ({} · {})",
-            resolved.alias, resolved.provider_name, resolved.model_name
-        ));
-
         Ok(())
     }
 
+    /// After `/load` has potentially swapped the active conversation
+    /// to one saved against a different wire identity, rebuild the
+    /// agent so the next prompt actually goes to the saved model.
+    /// No-op when:
+    /// - the running agent is already on the loaded conversation's
+    ///   wire id (alias may differ — that's fine),
+    /// - the registry isn't available,
+    /// - the loaded conversation's wire id isn't in the registry.
+    ///
+    /// The error path doesn't emit a system message: `/load` itself
+    /// has already either rejected unavailability or accepted the load,
+    /// and a no-op rebuild is the silent normal case.
+    #[allow(clippy::too_many_arguments)]
+    async fn maybe_rebuild_after_load(
+        agent_slot: &mut Arc<DynAgent>,
+        config: &mut Config,
+        state_manager: &Option<Arc<StateManager>>,
+        session_hook_cell: &SharedSessionHook,
+        provider_info_cell: &SharedProviderInfo,
+        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
+        rebuild_ctx: Option<&RebuildContext>,
+    ) {
+        let Some(sm) = state_manager else { return };
+        let Some(ctx) = rebuild_ctx else { return };
+
+        let Some(conv) = sm.get_current_conversation() else {
+            return;
+        };
+        let saved_provider = conv.provider_name.clone();
+        let saved_model = conv.model.clone();
+        // No-op if the running agent is already on this wire id.
+        if sm.get_provider_name() == saved_provider && sm.get_model() == saved_model {
+            return;
+        }
+        let Some(resolved) = ctx.registry.find_by_wire_id(&saved_provider, &saved_model) else {
+            // /load already emitted the unavailability error — and yet
+            // somehow the slot got swapped. Defensive: do nothing.
+            return;
+        };
+        let resolved = resolved.clone();
+        let sm_for_provider = sm.clone();
+        if let Err(e) = Self::rebuild_agent_for_resolved(
+            &resolved,
+            agent_slot,
+            config,
+            &sm_for_provider,
+            session_hook_cell,
+            provider_info_cell,
+            event_processor,
+            state_manager,
+            ctx,
+        )
+        .await
+        {
+            sm.add_system_message(format!("❌ /load: failed to rebuild agent: {e}"));
+            return;
+        }
+        // Stamp display state to match the freshly-rebuilt agent.
+        sm.set_provider_name(resolved.provider_name);
+        sm.set_model(resolved.model_name);
+        sm.set_model_alias(resolved.alias);
+    }
     /// Process an AgentEvent and update StateManager accordingly.
     ///
     /// This is the Controller's responsibility — it decides how domain events
@@ -1218,19 +1362,44 @@ impl AgentRunner {
                                 } else {
                                     "   "
                                 };
-                                let alias_tag = match &registry {
-                                    Some(reg) if reg.contains(&c.model_alias) => {
-                                        c.model_alias.clone()
+                                // Availability check resolves on the
+                                // wire identity `(provider_name, model)`
+                                // — the stable persistence key.
+                                // Aliases are NOT consulted (they're
+                                // mutable user handles).
+                                let resolved = registry
+                                    .as_ref()
+                                    .and_then(|r| r.find_by_wire_id(&c.provider_name, &c.model));
+                                let model_tag = match (resolved, &registry) {
+                                    (Some(r), _) => {
+                                        // Show the current alias as a
+                                        // hint next to the wire id —
+                                        // helps the user spot which
+                                        // entry in their config will
+                                        // re-activate.
+                                        format!("{} · {}/{}", r.alias, c.provider_name, c.model)
                                     }
-                                    Some(_) => format!(
-                                        "{} ⚠ unavailable",
-                                        if c.model_alias == "unknown" {
-                                            "(pre-v4)".to_string()
+                                    (None, Some(_)) => {
+                                        let display_id = if c.provider_name.is_empty() {
+                                            // Pre-v5 file with no
+                                            // provider_name on disk.
+                                            format!("(pre-v5) {}", c.model)
                                         } else {
-                                            c.model_alias.clone()
+                                            format!("{}/{}", c.provider_name, c.model)
+                                        };
+                                        format!("{display_id} ⚠ unavailable")
+                                    }
+                                    (None, None) => {
+                                        // No registry attached at all
+                                        // (legacy single-provider
+                                        // boot). Show the wire id as
+                                        // the only honest handle.
+                                        if c.provider_name.is_empty() {
+                                            c.model.clone()
+                                        } else {
+                                            format!("{}/{}", c.provider_name, c.model)
                                         }
-                                    ),
-                                    None => c.model_alias.clone(),
+                                    }
                                 };
                                 msg.push_str(&format!(
                                     "{}{:>3}  {}  {} msgs  {}  {}\n",
@@ -1241,7 +1410,7 @@ impl AgentRunner {
                                     c.updated_at
                                         .with_timezone(&chrono::Local)
                                         .format("%Y-%m-%d %H:%M"),
-                                    alias_tag,
+                                    model_tag,
                                 ));
                             }
                             msg.push_str(
@@ -1308,7 +1477,21 @@ impl AgentRunner {
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")
                     );
-                    sm.create_conversation(name, config.model().to_string());
+                    // Read the active wire identity from AppState — set
+                    // at boot and refreshed on every `/model` switch, so
+                    // it always matches the running agent. Falls back to
+                    // the config wire id with empty provider for legacy
+                    // single-provider boots that never stamped state.
+                    let provider_name = sm.get_provider_name();
+                    let model = {
+                        let m = sm.get_model();
+                        if m.is_empty() {
+                            config.model().to_string()
+                        } else {
+                            m
+                        }
+                    };
+                    sm.create_conversation(name, provider_name, model);
                     sm.add_system_message("Started a new conversation.".to_string());
                 } else {
                     tracing::warn!("State manager not available for /new command");
@@ -1339,30 +1522,47 @@ impl AgentRunner {
                         }
                     };
 
-                    // Pre-flight model alias check: peek at the saved
-                    // file's `model_alias` BEFORE any teardown so the
-                    // current conversation survives a failed load. If
-                    // the alias is `unknown` (pre-v4 file) or no
-                    // longer present in the registry, fail clean.
-                    // *(make illegal states unrepresentable at the
-                    // operation level)*
-                    let saved_alias = match sm.peek_conversation_alias(id) {
-                        Ok(a) => a,
+                    // Pre-flight wire-id check: peek at the saved
+                    // file's `(provider_name, model)` BEFORE any
+                    // teardown so the current conversation survives a
+                    // failed load. The wire id is the **stable**
+                    // re-activation key — aliases are mutable user
+                    // handles in `config.yaml` and are NEVER consulted
+                    // here. *(persisted artifacts must carry every
+                    // field needed to be re-activated)*
+                    let (saved_provider, saved_model) = match sm.peek_conversation_wire_id(id) {
+                        Ok(t) => t,
                         Err(e) => {
                             sm.add_system_message(format!("❌ Failed to read conversation: {e}"));
                             return;
                         }
                     };
-                    if let Ok(registry) = config.build_model_registry()
-                        && !registry.is_empty()
-                        && !registry.contains(&saved_alias)
-                    {
-                        sm.add_system_message(format!("❌ Model '{saved_alias}' not available."));
+                    let registry = config.build_model_registry().ok();
+                    let resolved = registry
+                        .as_ref()
+                        .and_then(|r| r.find_by_wire_id(&saved_provider, &saved_model))
+                        .cloned();
+                    let Some(resolved) = resolved else {
+                        let display_id = if saved_provider.is_empty() {
+                            saved_model.clone()
+                        } else {
+                            format!("{saved_provider}/{saved_model}")
+                        };
+                        sm.add_system_message(format!("❌ Model '{display_id}' not available."));
                         return;
-                    }
+                    };
 
                     match sm.load_conversation(id) {
                         Ok(()) => {
+                            // Stamp display state to match the saved
+                            // model so the status bar reflects what
+                            // the conversation will resume on. The
+                            // agent itself is rebuilt by
+                            // `agent_loop::maybe_rebuild_after_load`
+                            // immediately after this returns.
+                            sm.set_provider_name(resolved.provider_name);
+                            sm.set_model(resolved.model_name);
+                            sm.set_model_alias(resolved.alias);
                             if let Some(conv) = sm.get_current_conversation() {
                                 sm.add_system_message(format!(
                                     "Loaded conversation: '{}'",
@@ -1371,7 +1571,7 @@ impl AgentRunner {
                             }
                         }
                         Err(e) => {
-                            sm.add_system_message(format!("❌ Failed to load conversation: {}", e));
+                            sm.add_system_message(format!("❌ Failed to load conversation: {e}"));
                         }
                     }
                 }
@@ -1906,15 +2106,18 @@ mod tests {
 
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
         let mut out = Vec::new();
+        // Seed with the wire identity that matches the legacy
+        // synthesised registry: provider_name = "openrouter" (the
+        // ProviderType::OpenRouter display value used by the synth
+        // path) and model = the Config default. This way the post-v5
+        // `/load` wire-id check accepts these fixtures.
+        let provider_name = "openrouter".to_string();
+        let model_wire_id = Config::default().model().to_string();
         for (name, hours_ago) in specs {
-            // Seed with `default` alias so the post-v4 `/load` pre-flight
-            // alias check (which validates against the legacy synthesised
-            // registry) accepts these fixtures. The legacy `provider:`
-            // path produces a one-entry registry with alias `default`.
-            let mut conv = Conversation::new_with_alias(
+            let mut conv = Conversation::new(
                 (*name).to_string(),
-                "test-model".to_string(),
-                "default".to_string(),
+                provider_name.clone(),
+                model_wire_id.clone(),
             );
             conv.updated_at = Utc::now() - chrono::Duration::hours(*hours_ago);
             storage.save(&conv).expect("seed save");
@@ -2113,23 +2316,27 @@ mod tests {
         );
     }
 
-    /// `/load` of a saved conversation whose model_alias is no longer
-    /// in the registry must reject the load with the canonical
-    /// `Model 'xyz' not available.` error AND leave the previously
-    /// active conversation untouched. Locked plan v4 §"/load
-    /// model-aware activation". Pinned by
-    /// `load_with_unavailable_alias_returns_clean_error_and_does_not_teardown`.
+    /// `/load` of a saved conversation whose wire identity
+    /// `(provider_name, model)` is no longer in the registry must
+    /// reject the load with the canonical
+    /// `Model 'provider/model' not available.` error AND leave the
+    /// previously active conversation untouched. v5 contract:
+    /// aliases are NOT consulted; only the wire identity is the
+    /// stable re-activation key. *(persisted artifacts must carry
+    /// every field needed to be re-activated)*
     #[tokio::test]
-    async fn load_with_unavailable_alias_returns_clean_error_and_does_not_teardown() {
+    async fn load_with_unavailable_wire_id_returns_clean_error_and_does_not_teardown() {
         use crate::conversation::Conversation;
         use crate::storage::{ConversationStorage, InMemoryStorage};
 
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
-        // Seed one convo with an alias the legacy registry doesn't have.
-        let mut conv = Conversation::new_with_alias(
+        // Seed one convo whose wire id won't be in the legacy synth
+        // registry (provider name "ghost" doesn't match the synth's
+        // "openrouter").
+        let mut conv = Conversation::new(
             "Stranger".to_string(),
-            "test-model".to_string(),
-            "ghost".to_string(),
+            "ghost-provider".to_string(),
+            "ghost-model".to_string(),
         );
         conv.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
         storage.save(&conv).expect("seed save");
@@ -2145,7 +2352,7 @@ mod tests {
 
         let body = last_system_msg(&sm);
         assert!(
-            body.contains("Model 'ghost' not available."),
+            body.contains("Model 'ghost-provider/ghost-model' not available."),
             "expected canonical unavailable-model error, got:\n{body}"
         );
         // Critical: the failed load must NOT have torn down whatever
@@ -2157,33 +2364,77 @@ mod tests {
         );
     }
 
-    /// Pre-v4 conversations on disk default to alias `unknown`; that
-    /// sentinel is reserved at config-load time so it can never appear
-    /// in a registry. `/load` therefore rejects them with the canonical
-    /// error (the user is expected to retire them or reattach the right
-    /// alias by hand).
+    /// Pre-v5 conversations on disk default `provider_name` to the
+    /// empty string. The wire-id lookup misses cleanly and `/load`
+    /// rejects with the canonical error (the user is expected to
+    /// retire them or re-save under v5).
     #[tokio::test]
-    async fn load_pre_v4_file_treated_as_unavailable() {
-        use crate::conversation::Conversation;
+    async fn load_pre_v5_file_treated_as_unavailable() {
         use crate::storage::{ConversationStorage, InMemoryStorage};
 
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
-        // Seed a "pre-v4" file by stamping the unknown sentinel.
-        let mut conv = Conversation::new("Old".to_string(), "test-model".to_string());
-        conv.updated_at = chrono::Utc::now() - chrono::Duration::hours(2);
-        assert_eq!(conv.metadata.model_alias, "unknown");
+        // Hand-craft a pre-v5 JSON (no `provider_name` field). Round-
+        // trip via serde_json so deserialization populates the
+        // `#[serde(default)]` empty string for `provider_name`.
+        let id = uuid::Uuid::new_v4();
+        let json = format!(
+            r#"{{
+                "id": "{id}",
+                "name": "Old",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "messages": [],
+                "model": "anthropic/claude-3.7-sonnet",
+                "metadata": {{"message_count": 0}}
+            }}"#
+        );
+        let conv: crate::conversation::Conversation =
+            serde_json::from_str(&json).expect("parse pre-v5 fixture");
+        assert_eq!(conv.provider_name, "");
         storage.save(&conv).expect("seed save");
-        let saved_id = conv.id;
         let sm = StateManager::new_arc_with_storage(storage);
 
         let config = Config::default();
-        let cmd = format!("/load {saved_id}");
+        let cmd = format!("/load {id}");
         AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
 
         let body = last_system_msg(&sm);
         assert!(
-            body.contains("Model 'unknown' not available."),
-            "expected canonical unavailable-model error for pre-v4 file, got:\n{body}"
+            body.contains("not available"),
+            "expected unavailable-model error for pre-v5 file, got:\n{body}"
+        );
+    }
+
+    /// `/load` of a conversation whose wire id resolves under a
+    /// renamed alias must succeed: the alias change in `config.yaml`
+    /// is invisible to persistence. v5 contract.
+    #[tokio::test]
+    async fn load_succeeds_when_alias_is_renamed_but_wire_id_is_stable() {
+        use crate::conversation::Conversation;
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        let model = Config::default().model().to_string();
+        // Save under the legacy synth identity (provider "openrouter",
+        // default model). The alias was "default" at save time —
+        // but we don't even care, we never wrote it.
+        let mut conv = Conversation::new("Saved".to_string(), "openrouter".to_string(), model);
+        conv.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        storage.save(&conv).expect("seed save");
+        let saved_id = conv.id;
+        let sm = StateManager::new_arc_with_storage(storage);
+
+        // Use a fresh Config — the alias may have been rebuilt under
+        // any name in config.yaml; doesn't matter, the wire-id
+        // lookup is alias-blind.
+        let config = Config::default();
+        let cmd = format!("/load {saved_id}");
+        AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
+
+        assert_eq!(
+            sm.get_current_conversation_id(),
+            Some(saved_id),
+            "/load should resolve by wire id regardless of alias rename"
         );
     }
 
@@ -2316,7 +2567,11 @@ mod tests {
         let sm = StateManager::new_arc();
         let config = Config::default();
 
-        sm.create_conversation("old one".to_string(), "test-model".to_string());
+        sm.create_conversation(
+            "old one".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+        );
         let old_id = sm
             .get_current_conversation_id()
             .expect("seeded conversation");

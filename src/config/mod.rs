@@ -3,10 +3,7 @@
 #![allow(dead_code)]
 
 pub mod model_registry;
-pub use model_registry::{
-    ModelEntry, ModelRegistry, ProviderEntry, RESERVED_UNAVAILABLE_ALIAS, RegistryError,
-    ResolvedModel,
-};
+pub use model_registry::{ModelEntry, ModelRegistry, ProviderEntry, RegistryError, ResolvedModel};
 
 use directories_next::ProjectDirs;
 use serde::Deserialize;
@@ -249,6 +246,14 @@ pub struct AgentDefinition {
     /// Optional: temperature override (uses provider default if not specified)
     #[serde(default)]
     pub temperature: Option<f32>,
+
+    /// Optional: API key (uses main provider key if not specified)
+    #[serde(default)]
+    pub api_key: Option<String>,
+
+    /// Optional: base URL override
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 impl PipelineConfig {
@@ -896,7 +901,6 @@ impl Config {
     /// 1. Defaults (lowest priority)
     /// 2. Master config (~/.config/peakbot/peakbot/config.yaml)
     /// 3. Per-repo config (.peakbot/config.yaml in cwd) - top-level key override
-    /// 4. Environment variables (highest priority)
     pub fn load() -> anyhow::Result<Self> {
         // Step 1: Start with defaults
         let mut config = Config::default();
@@ -915,215 +919,6 @@ impl Config {
                 "Config after per-repo merge: provider = {:?}",
                 config.provider
             );
-        }
-
-        // Load environment variables and merge (env vars override YAML/defaults)
-        // Check for new PROVIDER JSON config first
-        if let Ok(provider_json) = std::env::var("PROVIDER")
-            && !provider_json.is_empty()
-        {
-            // Parse JSON provider config
-            match serde_json::from_str::<ProviderConfig>(&provider_json) {
-                Ok(provider_config) => config.provider = provider_config,
-                Err(e) => tracing::warn!("Failed to parse PROVIDER JSON: {}", e),
-            }
-        } else {
-            // Fall back to legacy OpenRouter environment variables
-            // This maintains backward compatibility
-
-            // Check if OLLAMA_MODEL is set to switch to Ollama
-            if let Ok(model) = std::env::var("OLLAMA_MODEL")
-                && !model.is_empty()
-            {
-                // Using Ollama via legacy env var
-                let base_url = std::env::var("OLLAMA_BASE_URL")
-                    .unwrap_or_else(|_| "http://localhost:11434".to_string());
-                let temperature = std::env::var("OLLAMA_TEMPERATURE")
-                    .ok()
-                    .and_then(|t| t.parse().ok());
-
-                config.provider = ProviderConfig::Ollama(OllamaConfig {
-                    base_url,
-                    model,
-                    temperature,
-                });
-            } else {
-                // OpenRouter config via legacy env vars
-                if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY")
-                    && !api_key.is_empty()
-                    && let ProviderConfig::OpenRouter(ref mut c) = config.provider
-                {
-                    c.api_key = Some(api_key);
-                }
-
-                if let Ok(model) = std::env::var("OPENROUTER_MODEL")
-                    && !model.is_empty()
-                    && let ProviderConfig::OpenRouter(ref mut c) = config.provider
-                {
-                    c.model = model;
-                }
-
-                if let Ok(tokens) = std::env::var("OPENROUTER_MAX_TOKENS")
-                    && let Ok(tokens) = tokens.parse()
-                    && let ProviderConfig::OpenRouter(ref mut c) = config.provider
-                {
-                    c.max_tokens = tokens;
-                }
-            }
-        }
-
-        if let Ok(turns) = std::env::var("AGENT_MAX_TURNS")
-            && let Ok(turns) = turns.parse()
-        {
-            config.agent_max_turns = turns;
-        }
-
-        if let Ok(mcp) = std::env::var("MCP_SERVERS")
-            && !mcp.is_empty()
-        {
-            // Parse JSON string into Vec<McpServerConfig>
-            match serde_json::from_str::<Vec<McpServerConfig>>(&mcp) {
-                Ok(servers) => config.mcp_servers = Some(servers),
-                Err(e) => tracing::warn!("Failed to parse MCP_SERVERS JSON: {}", e),
-            }
-        }
-
-        tracing::debug!("Final config: provider = {:?}", config.provider);
-
-        // SEARXNG_BASE_URL
-        if let Ok(url) = std::env::var("SEARXNG_BASE_URL")
-            && !url.is_empty()
-        {
-            let searxng = config.searxng.get_or_insert_with(|| SearXngConfig {
-                base_url: String::new(),
-                enabled: true,
-                timeout_seconds: 30,
-                max_results: 10,
-            });
-            searxng.base_url = url;
-        }
-
-        // SEARXNG_ENABLED
-        if let Ok(enabled) = std::env::var("SEARXNG_ENABLED")
-            && let Ok(enabled) = enabled.parse()
-        {
-            let searxng = config.searxng.get_or_insert_with(|| SearXngConfig {
-                base_url: String::new(),
-                enabled: true,
-                timeout_seconds: 30,
-                max_results: 10,
-            });
-            searxng.enabled = enabled;
-        }
-
-        // SEARXNG_TIMEOUT
-        if let Ok(timeout) = std::env::var("SEARXNG_TIMEOUT")
-            && let Ok(timeout) = timeout.parse()
-            && let Some(searxng) = config.searxng.as_mut()
-        {
-            searxng.timeout_seconds = timeout;
-        }
-
-        // SEARXNG_MAX_RESULTS
-        if let Ok(max) = std::env::var("SEARXNG_MAX_RESULTS")
-            && let Ok(max) = max.parse()
-            && let Some(searxng) = config.searxng.as_mut()
-        {
-            searxng.max_results = max;
-        }
-
-        // COST_TRACKING
-        if let Ok(enabled) = std::env::var("COST_TRACKING")
-            && let Ok(enabled) = enabled.parse()
-        {
-            config.cost_tracking = enabled;
-        }
-
-        // Context compaction config via environment variables
-        // CONTEXT_ENABLED
-        if let Ok(enabled) = std::env::var("CONTEXT_ENABLED")
-            && let Ok(enabled) = enabled.parse()
-        {
-            config.context.enabled = enabled;
-        }
-
-        // CONTEXT_THRESHOLD
-        if let Ok(threshold) = std::env::var("CONTEXT_THRESHOLD")
-            && let Ok(threshold) = threshold.parse::<f64>()
-            && (0.0..=1.0).contains(&threshold)
-        {
-            config.context.threshold = threshold;
-        }
-
-        // CONTEXT_KEEP_RECENT
-        if let Ok(keep_recent) = std::env::var("CONTEXT_KEEP_RECENT")
-            && let Ok(keep_recent) = keep_recent.parse()
-        {
-            config.context.keep_recent = keep_recent;
-        }
-
-        // CONTEXT_WINDOW: removed in the per-model registry refactor.
-        // The active model's window is now resolved from `ModelEntry.context_window`
-        // (or auto-detected from the wire id) — there is no longer a global
-        // override here. See `context_manager::auto_detect_context_window`.
-        if std::env::var("CONTEXT_WINDOW").is_ok() {
-            tracing::warn!(
-                "CONTEXT_WINDOW env var is no longer honoured. Set `context_window:` on the active \
-                 model under `providers:` instead, or rely on auto-detection from the wire id."
-            );
-        }
-
-        // Conversation persistence config via environment variables
-        // CONVERSATION_AUTO_SAVE
-        if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_SAVE")
-            && let Ok(enabled) = enabled.parse()
-        {
-            let conv = config.conversation.get_or_insert(ConversationConfig {
-                auto_save: true,
-                storage_dir: None,
-                max_conversations: 50,
-                auto_resume: true,
-            });
-            conv.auto_save = enabled;
-        }
-
-        // CONVERSATION_STORAGE_DIR
-        if let Ok(dir) = std::env::var("CONVERSATION_STORAGE_DIR")
-            && !dir.is_empty()
-        {
-            let conv = config.conversation.get_or_insert(ConversationConfig {
-                auto_save: true,
-                storage_dir: None,
-                max_conversations: 50,
-                auto_resume: true,
-            });
-            conv.storage_dir = Some(std::path::PathBuf::from(dir));
-        }
-
-        // CONVERSATION_MAX_CONVERSATIONS
-        if let Ok(max) = std::env::var("CONVERSATION_MAX_CONVERSATIONS")
-            && let Ok(max) = max.parse()
-        {
-            let conv = config.conversation.get_or_insert(ConversationConfig {
-                auto_save: true,
-                storage_dir: None,
-                max_conversations: 50,
-                auto_resume: true,
-            });
-            conv.max_conversations = max;
-        }
-
-        // CONVERSATION_AUTO_RESUME
-        if let Ok(enabled) = std::env::var("CONVERSATION_AUTO_RESUME")
-            && let Ok(enabled) = enabled.parse()
-        {
-            let conv = config.conversation.get_or_insert(ConversationConfig {
-                auto_save: true,
-                storage_dir: None,
-                max_conversations: 50,
-                auto_resume: true,
-            });
-            conv.auto_resume = enabled;
         }
 
         Ok(config)

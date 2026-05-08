@@ -692,16 +692,38 @@ impl StateManager {
         self.notify_update(&state);
     }
 
-    /// Set the active model alias (the user-facing handle).
-    /// Called at boot and on `/model` switch — paired with `set_model`
-    /// (alias + wire id are stamped together).
+    /// Set the active provider name (informational handle from the
+    /// providers list — `"openrouter"`, `"patchnotes"`, etc.).
+    /// Together with `set_model`, stamps the wire-id pair onto
+    /// AppState. Used at boot and on `/model` switch.
+    pub fn set_provider_name(&self, provider_name: String) {
+        let mut state = self.state.write().unwrap();
+        state.stats.provider_name = provider_name;
+        self.notify_update(&state);
+    }
+
+    /// Get the current provider name (empty string if unset).
+    pub fn get_provider_name(&self) -> String {
+        self.state.read().unwrap().stats.provider_name.clone()
+    }
+
+    /// Get the current model wire id (empty string if unset).
+    pub fn get_model(&self) -> String {
+        self.state.read().unwrap().stats.model.clone()
+    }
+
+    /// Set the active model alias (display-only — the user-facing
+    /// handle from [`crate::config::ModelRegistry`]). Status bar reads
+    /// this; persistence does NOT — saved conversations carry
+    /// `(provider_name, model)` instead. Updating the alias has zero
+    /// effect on what gets written to disk.
     pub fn set_model_alias(&self, alias: String) {
         let mut state = self.state.write().unwrap();
         state.stats.model_alias = alias;
         self.notify_update(&state);
     }
 
-    /// Get the current model alias (empty string if unset).
+    /// Get the current display alias (empty string if unset).
     pub fn get_model_alias(&self) -> String {
         self.state.read().unwrap().stats.model_alias.clone()
     }
@@ -798,18 +820,15 @@ impl StateManager {
 
     // ── Conversation Management ────────────────────────────────────────────────
 
-    /// Create a new conversation and set it as current
-    pub fn create_conversation(&self, name: String, model: String) {
-        let conv = Conversation::new(name, model);
-        *self.current_conversation.lock().unwrap() = Some(conv);
-    }
-
-    /// Create a new conversation that records the model alias on its
-    /// metadata. Production constructor — call from boot, `/new`, and
-    /// `/model` switch so the saved file later round-trips to the
-    /// right model on `/load`. See `multi-model.md`.
-    pub fn create_conversation_with_alias(&self, name: String, model: String, model_alias: String) {
-        let conv = Conversation::new_with_alias(name, model, model_alias);
+    /// Create a new conversation with the active model's full wire
+    /// identity, and set it as current.
+    ///
+    /// `(provider_name, model)` is the persisted re-activation key for
+    /// `/load` — see [`Conversation::new`]. Boot, `/new`, and `/model`
+    /// switch all funnel through here so saved files always carry the
+    /// stable wire id.
+    pub fn create_conversation(&self, name: String, provider_name: String, model: String) {
+        let conv = Conversation::new(name, provider_name, model);
         *self.current_conversation.lock().unwrap() = Some(conv);
     }
 
@@ -828,20 +847,21 @@ impl StateManager {
         Ok(())
     }
 
-    /// Peek at a saved conversation's `model_alias` without loading
-    /// it into the current slot. Used by `/load` for the pre-flight
-    /// availability check — the current conversation must survive a
-    /// rejected load with no partial-state teardown. Returns the
-    /// reserved sentinel `"unknown"` for pre-v4 files (the
-    /// `#[serde(default)]` on `ConversationMetadata.model_alias`
-    /// makes that automatic).
-    pub fn peek_conversation_alias(&self, id: Uuid) -> anyhow::Result<String> {
+    /// Peek at a saved conversation's wire identity
+    /// `(provider_name, model)` without loading it into the current
+    /// slot. Used by `/load` for the pre-flight availability check —
+    /// the current conversation must survive a rejected load with no
+    /// partial-state teardown. Pre-v5 files (which never wrote
+    /// `provider_name`) return `("", model)`; the wire-id lookup
+    /// then misses cleanly and `/load` emits the canonical
+    /// `Model 'x/y' not available.` diagnostic.
+    pub fn peek_conversation_wire_id(&self, id: Uuid) -> anyhow::Result<(String, String)> {
         let storage = self
             .storage
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
         let conv = storage.load(id)?;
-        Ok(conv.metadata.model_alias)
+        Ok((conv.provider_name, conv.model))
     }
 
     /// Get the current conversation ID
@@ -1427,7 +1447,7 @@ mod tests {
         let sm = StateManager::new_arc_with_storage(storage);
 
         // Session A: create, accumulate stats, save.
-        sm.create_conversation("Session A".into(), "test-model".into());
+        sm.create_conversation("Session A".into(), "test-prov".into(), "test-model".into());
         sm.add_request(1234, 567, 0.42);
         sm.add_request(2000, 800, 0.10); // cost accumulates → 0.52
         let conv_a_id = sm.get_current_conversation_id().expect("convo A id");
@@ -1437,7 +1457,7 @@ mod tests {
         // what the buggy /load would leave behind in the status bar.
         sm.clear_history();
         sm.reset_stats();
-        sm.create_conversation("Session B".into(), "test-model".into());
+        sm.create_conversation("Session B".into(), "test-prov".into(), "test-model".into());
         sm.add_request(99, 99, 9.99);
 
         // Load A back. Its stats should override the session-B stats.
@@ -1706,7 +1726,11 @@ mod tests {
         };
 
         // Simulate loading a conversation from JSON
-        let mut conv = Conversation::new("test".to_string(), "test-model".to_string());
+        let mut conv = Conversation::new(
+            "test".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+        );
         conv.add_user_message("List files".to_string());
         conv.add_tool_call(
             "bash".to_string(),
@@ -2226,7 +2250,11 @@ mod tests {
         let sm = Arc::new(StateManager::new());
         // Seed a current conversation so persist_current actually walks the
         // state.read → current_conv.lock → stats.lock chain.
-        sm.create_conversation("deadlock-probe".to_string(), "test-model".to_string());
+        sm.create_conversation(
+            "deadlock-probe".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+        );
         // Seed at least one user/assistant message so sync_to_conversation
         // has something non-trivial to copy under the locks.
         sm.add_user_message("hello".to_string());

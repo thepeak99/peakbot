@@ -262,7 +262,6 @@ pub fn create_compaction_model(
             let api_key = c
                 .api_key
                 .clone()
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                 .context("OpenRouter API key not configured")?;
             let client = openrouter::Client::builder()
                 .api_key(&api_key)
@@ -273,11 +272,7 @@ pub fn create_compaction_model(
             Ok(CompactionModel::OpenRouter(agent))
         }
         ProviderConfig::OpenAI(c) => {
-            let api_key = c
-                .api_key
-                .clone()
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                .context("OpenAI API key not configured")?;
+            let api_key = c.api_key.clone().context("OpenAI API key not configured")?;
             let client = openai::Client::builder()
                 .api_key(&api_key)
                 .base_url(&c.base_url)
@@ -288,11 +283,7 @@ pub fn create_compaction_model(
             Ok(CompactionModel::OpenAI(agent))
         }
         ProviderConfig::LlamaCpp(c) => {
-            let api_key = c
-                .api_key
-                .clone()
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                .unwrap_or_default();
+            let api_key = c.api_key.clone().unwrap_or_default();
             let client = openai::Client::builder()
                 .api_key(&api_key)
                 .base_url(&c.base_url)
@@ -390,7 +381,6 @@ fn create_openrouter_agent(
     let api_key = config
         .api_key
         .clone()
-        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
         .context("OpenRouter API key not configured")?;
 
     if api_key.is_empty() {
@@ -535,7 +525,6 @@ fn create_openai_agent(
     let api_key = config
         .api_key
         .clone()
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .context("OpenAI API key not configured")?;
 
     if api_key.is_empty() {
@@ -613,11 +602,7 @@ fn create_llamacpp_agent(
     SessionHook,
 )> {
     // API key is optional for local llama.cpp instances
-    let api_key = config
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .unwrap_or_default();
+    let api_key = config.api_key.clone().unwrap_or_default();
 
     if config.model.is_empty() {
         anyhow::bail!("LlamaCpp model not specified");

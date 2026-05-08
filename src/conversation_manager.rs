@@ -41,13 +41,18 @@ impl<S: ConversationStorage> ConversationManager<S> {
     }
 
     /// Create a new conversation
-    pub fn create_new(&mut self, name: String, model: String) -> Result<&Conversation> {
+    pub fn create_new(
+        &mut self,
+        name: String,
+        provider_name: String,
+        model: String,
+    ) -> Result<&Conversation> {
         // Enforce max conversations limit BEFORE adding the new one
         if self.config.max_conversations > 0 {
             self.enforce_max_conversations()?;
         }
 
-        let conv = Conversation::new(name, model);
+        let conv = Conversation::new(name, provider_name, model);
 
         self.current_conversation = Some(conv);
 
