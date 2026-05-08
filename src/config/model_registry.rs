@@ -68,14 +68,14 @@ pub struct ModelEntry {
     /// Optional pass-through extra params for LlamaCpp.
     #[serde(default)]
     pub extra_params: Option<serde_json::Value>,
-    /// Per-model context window in tokens. When `None`, resolved at
+    /// Per-model context size in tokens. When `None`, resolved at
     /// registry-build time via
-    /// [`crate::context_manager::auto_detect_context_window`].
+    /// [`crate::context_manager::auto_detect_context_size`].
     ///
-    /// Accepts the legacy field name `context_window_override` for one
-    /// release, and the alternative name `context_size`.
-    #[serde(default, alias = "context_window_override", alias = "context_size")]
-    pub context_window: Option<usize>,
+    /// Accepts the legacy field name `context_window_override` for
+    /// backward compatibility.
+    #[serde(default, alias = "context_window_override", alias = "context_window")]
+    pub context_size: Option<usize>,
 }
 
 /// A model resolved against a provider — alias canonicalised, full
@@ -93,11 +93,11 @@ pub struct ResolvedModel {
     pub provider_kind: ProviderType,
     /// Existing-shape provider config that `create_provider` consumes.
     pub provider_config: ProviderConfig,
-    /// Resolved context-window in tokens. Eagerly computed at
-    /// registry-build time as `model.context_window` if set, otherwise
-    /// via [`crate::context_manager::auto_detect_context_window`].
+    /// Resolved context size in tokens. Eagerly computed at
+    /// registry-build time as `model.context_size` if set, otherwise
+    /// via [`crate::context_manager::auto_detect_context_size`].
     /// Downstream consumers read this directly — no Option dance.
-    pub context_window: usize,
+    pub context_size: usize,
 }
 
 /// Errors raised while validating a `ModelRegistry` from a config.
@@ -195,8 +195,8 @@ impl ModelRegistry {
                 origins.insert(alias.clone(), (prov.name.clone(), model.name.clone()));
 
                 let provider_config = build_provider_config(prov, model);
-                let context_window = model.context_window.unwrap_or_else(|| {
-                    crate::context_manager::auto_detect_context_window(&model.name)
+                let context_size = model.context_size.unwrap_or_else(|| {
+                    crate::context_manager::auto_detect_context_size(&model.name)
                 });
                 by_alias.insert(
                     alias.clone(),
@@ -206,7 +206,7 @@ impl ModelRegistry {
                         provider_name: prov.name.clone(),
                         provider_kind: prov.kind.clone(),
                         provider_config,
-                        context_window,
+                        context_size,
                     },
                 );
             }
@@ -391,7 +391,7 @@ mod tests {
                     max_tokens: Some(8192),
                     temperature: None,
                     extra_params: None,
-                    context_window: None,
+                    context_size: None,
                 },
                 ModelEntry {
                     name: "anthropic/claude-opus-4".into(),
@@ -399,7 +399,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
-                    context_window: None,
+                    context_size: None,
                 },
             ],
         }
@@ -418,7 +418,7 @@ mod tests {
                     max_tokens: Some(4000),
                     temperature: None,
                     extra_params: None,
-                    context_window: None,
+                    context_size: None,
                 },
                 ModelEntry {
                     name: "o3".into(), // no alias — addressable by name
@@ -426,7 +426,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
-                    context_window: None,
+                    context_size: None,
                 },
             ],
         }
@@ -482,7 +482,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 extra_params: None,
-                context_window: None,
+                context_size: None,
             }],
         };
         let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
@@ -598,7 +598,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 extra_params: None,
-                context_window: None,
+                context_size: None,
             }],
         };
         let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
@@ -625,7 +625,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 extra_params: None,
-                context_window: None,
+                context_size: None,
             }],
         };
         let reg = ModelRegistry::build(&[prov], Some("ollama/qwen2.5-coder:14b"))
@@ -633,12 +633,12 @@ mod tests {
         assert!(reg.contains("ollama/qwen2.5-coder:14b"));
     }
 
-    /// Per-model `context_window` is eagerly resolved into
-    /// `ResolvedModel.context_window`. With `None` we fall back to the
+    /// Per-model `context_size` is eagerly resolved into
+    /// `ResolvedModel.context_size`. With `None` we fall back to the
     /// auto-detect helper (single source of truth shared with the
     /// legacy boot path).
     #[test]
-    fn context_window_resolved_eagerly_from_per_model_field() {
+    fn context_size_resolved_eagerly_from_per_model_field() {
         let prov = ProviderEntry {
             name: "openrouter".into(),
             kind: ProviderType::OpenRouter,
@@ -651,7 +651,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
-                    context_window: None, // → auto-detect → 200_000
+                    context_size: None, // → auto-detect → 200_000
                 },
                 ModelEntry {
                     name: "custom-model-no-table-entry".into(),
@@ -659,13 +659,13 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
-                    context_window: Some(42), // explicit → 42
+                    context_size: Some(42), // explicit → 42
                 },
             ],
         };
         let reg = ModelRegistry::build(&[prov], Some("sonnet")).unwrap();
-        assert_eq!(reg.resolve("sonnet").unwrap().context_window, 200_000);
-        assert_eq!(reg.resolve("custom").unwrap().context_window, 42);
+        assert_eq!(reg.resolve("sonnet").unwrap().context_size, 200_000);
+        assert_eq!(reg.resolve("custom").unwrap().context_size, 42);
     }
 
     /// Regression for the user-reported bug: with a config like
@@ -697,7 +697,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 extra_params: None,
-                context_window: None,
+                context_size: None,
             }],
         };
         let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
@@ -714,7 +714,7 @@ mod tests {
     }
 
     /// The legacy field name `context_window_override:` must still
-    /// deserialise into the new `context_window` field for one release.
+    /// deserialise into the `context_size` field.
     #[test]
     fn legacy_context_window_override_field_name_still_parses() {
         let yaml = "
@@ -727,11 +727,11 @@ models:
     context_window_override: 12345
 ";
         let prov: ProviderEntry = serde_yaml::from_str(yaml).expect("legacy field name parses");
-        assert_eq!(prov.models[0].context_window, Some(12345));
+        assert_eq!(prov.models[0].context_size, Some(12345));
     }
 
     /// The alternative field name `context_size:` must also deserialise
-    /// into `context_window` (aliases are additive, not exclusive).
+    /// into `context_size` (aliases are additive, not exclusive).
     #[test]
     fn context_size_field_name_also_parses() {
         let yaml = "
@@ -744,7 +744,7 @@ models:
     context_size: 204000
 ";
         let prov: ProviderEntry = serde_yaml::from_str(yaml).expect("context_size field parses");
-        assert_eq!(prov.models[0].context_window, Some(204000));
+        assert_eq!(prov.models[0].context_size, Some(204000));
     }
 
     // ── find_by_wire_id ──────────────────────────────────────────────────

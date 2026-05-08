@@ -3121,7 +3121,7 @@ mod model_popup_tests {
                     max_tokens: Some(8192),
                     temperature: None,
                     extra_params: None,
-                    context_window: None,
+                    context_size: None,
                 },
                 ModelEntry {
                     name: "anthropic/claude-opus-4".into(),
@@ -3129,7 +3129,7 @@ mod model_popup_tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
-                    context_window: None,
+                    context_size: None,
                 },
             ],
         };

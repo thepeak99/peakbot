@@ -102,7 +102,7 @@ impl TestRunner {
     /// Create a TestRunner with custom context configuration.
     ///
     /// Initializes the ContextManager inside StateManager (same as production).
-    /// `context_window` is the resolved usize that drives compaction; tests
+    /// `context_size` is the resolved usize that drives compaction; tests
     /// pin it directly rather than going through registry resolution.
     pub fn new_with_context(
         agent: DynAgent,
@@ -110,7 +110,7 @@ impl TestRunner {
         session_hook: Arc<SessionHook>,
         system_prompt: String,
         context_config: ContextConfig,
-        context_window: usize,
+        context_size: usize,
     ) -> Self {
         let agent = Arc::new(agent);
 
@@ -126,7 +126,7 @@ impl TestRunner {
 
         let cm = ContextManager::new(
             context_config,
-            context_window,
+            context_size,
             state_manager.clone(),
             compaction_model,
         );

@@ -426,7 +426,7 @@ impl Config {
                     max_tokens: Some(max_tokens),
                     temperature,
                     extra_params: extra,
-                    context_window: None,
+                    context_size: None,
                 }],
             };
             return ModelRegistry::build(
@@ -1081,7 +1081,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
-                    context_window: None,
+                    context_size: None,
                 }],
             }],
             default_model: Some("sonnet".into()),
@@ -1109,7 +1109,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
-                    context_window: None,
+                    context_size: None,
                 }],
             }],
             default_model: Some("ghost".into()), // intentionally wrong

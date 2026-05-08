@@ -111,7 +111,7 @@ impl StateManager {
         // first request lands and `sync_stats_to_ui` refreshes it.
         {
             let mut state = self.state.write().unwrap();
-            state.context.window_size = cm.context_window() as u64;
+            state.context.window_size = cm.context_size() as u64;
             state.context.compaction_enabled = cm.is_enabled();
             state.context.compaction_threshold = cm.threshold_fraction();
         }
@@ -1980,7 +1980,7 @@ mod tests {
     // those fields the indicator is stuck at 0% forever — which is exactly
     // what users saw before these tests existed.
 
-    fn sm_with_context_window(window: usize) -> Arc<StateManager> {
+    fn sm_with_context_size(window: usize) -> Arc<StateManager> {
         use crate::config::ContextConfig;
         let sm = StateManager::new_arc();
         let cfg = ContextConfig {
@@ -1996,8 +1996,8 @@ mod tests {
     }
 
     #[test]
-    fn context_window_populated_after_init_context_manager() {
-        let sm = sm_with_context_window(128_000);
+    fn context_size_populated_after_init_context_manager() {
+        let sm = sm_with_context_size(128_000);
         let state = sm.get_state();
         assert_eq!(
             state.context.window_size, 128_000,
@@ -2015,7 +2015,7 @@ mod tests {
 
     #[test]
     fn context_current_usage_tracks_last_input_tokens() {
-        let sm = sm_with_context_window(200_000);
+        let sm = sm_with_context_size(200_000);
 
         // Before any request: usage is 0 but window is non-zero.
         let state = sm.get_state();
@@ -2050,7 +2050,7 @@ mod tests {
     /// Pinned by the in-loop compaction plan (`mid-compaction.md` § 3 Step 1).
     #[test]
     fn needs_compaction_accessor_matches_trigger_logic() {
-        let sm = sm_with_context_window(1_000);
+        let sm = sm_with_context_size(1_000);
 
         // Empty conversation — never compact.
         assert!(!sm.needs_compaction());
