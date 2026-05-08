@@ -306,6 +306,9 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
+    /// `context_size` drives ContextManager compaction thresholds and must
+    /// come from the resolved model (config `context_size:` or auto-detect).
+    #[allow(clippy::too_many_arguments)] // context_size is the new mandatory parameter; callers supply resolved value
     pub fn new(
         agent: DynAgent,
         config: Config,
@@ -314,6 +317,7 @@ impl AgentRunner {
         event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
         state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
+        context_size: usize,
     ) -> Self {
         let agent = Arc::new(agent);
         let system_prompt = build_system_prompt(&skills);
@@ -330,7 +334,7 @@ impl AgentRunner {
 
             let cm = ContextManager::new(
                 config.context.clone(),
-                auto_detect_context_size(provider_info.model.as_str()),
+                context_size,
                 sm.clone(),
                 compaction_model,
             );

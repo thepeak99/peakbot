@@ -170,6 +170,17 @@ async fn main() -> Result<()> {
         pipeline_registry: pipeline_registry.clone().map(Arc::new),
     };
 
+    // Resolve the boot model's context_size (from config or auto-detected).
+    // This value drives ContextManager compaction thresholds.
+    let boot_context_size = model_registry
+        .default_alias()
+        .and_then(|a| model_registry.resolve(a))
+        .map(|rm| rm.context_size)
+        .unwrap_or_else(|| {
+            tracing::warn!("No default model in registry, using auto-detect for context_size");
+            peakbot::auto_detect_context_size(provider_info.model.as_str())
+        });
+
     // Create AgentRunner (Controller)
     let mut runner = AgentRunner::new(
         agent,
@@ -179,6 +190,7 @@ async fn main() -> Result<()> {
         event_receiver,
         Some(state_manager.clone()),
         session_hook,
+        boot_context_size,
     )
     .with_rebuild_context(rebuild_ctx);
 
