@@ -120,7 +120,13 @@ impl DynAgent {
     ) -> Result<String, PromptError> {
         // Own the Message once — then clone per match arm, since rig's
         // `prompt()` takes `impl Into<Message>` by value.
+        //
+        // rig 0.36 changed `with_history` to take `IntoIterator<Item: Into<Message>>`.
+        // `&mut Vec<Message>` iterates as `&mut Message`, which doesn't impl
+        // `Into<Message>`. Reborrow as `&Vec<Message>` (yields `&Message`,
+        // which DOES impl `Into<Message>` via blanket clone).
         let prompt: Message = prompt.into();
+        let history: &Vec<Message> = &*history;
         match self {
             DynAgent::OpenRouter(agent) => agent.prompt(prompt.clone()).with_history(history).await,
             DynAgent::OpenAI(agent) => agent.prompt(prompt.clone()).with_history(history).await,

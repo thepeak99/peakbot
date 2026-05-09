@@ -75,6 +75,7 @@ impl MockCompletionModel {
             output_tokens: output,
             total_tokens: input + output,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         };
     }
 
@@ -125,6 +126,7 @@ impl GetTokenUsage for MockModelResponse {
             output_tokens: 50,
             total_tokens: 150,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         })
     }
 }
@@ -164,6 +166,7 @@ impl CompletionModel for MockCompletionModel {
                         output_tokens: u.output_tokens,
                         total_tokens: u.input_tokens + u.output_tokens,
                         cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
                     })
                     .unwrap_or(self.default_usage);
 
@@ -205,6 +208,7 @@ impl CompletionModel for MockCompletionModel {
                         output_tokens: u.output_tokens,
                         total_tokens: u.input_tokens + u.output_tokens,
                         cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
                     })
                     .unwrap_or(self.default_usage);
 
