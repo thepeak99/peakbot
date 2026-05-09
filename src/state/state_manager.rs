@@ -1,17 +1,7 @@
 //! State Manager
 //!
-//! This module provides centralized state management for the application.
-//! It serves as the single source of truth for all state (stats, todos, chat, etc.).
-//!
-//! ## MVC Model
-//!
-//! StateManager is the Model. It holds `AppState` and broadcasts changes to
-//! all subscribed Views. Controller writes to it, Views read from it.
-//!
-//! ## Async Stream Subscription
-//!
-//! The `subscribe()` method returns an async stream (`mpsc::Receiver<AppState>`)
-//! that can be used directly with `tokio::select!` or iterated with `while let`.
+//! Single source of truth for app state (chat, todos, stats, context).
+//! Broadcasts changes to UI subscribers via async channels.
 
 use crate::context_manager::{CompactionResult, ContextManager};
 use crate::conversation::Conversation;
@@ -26,45 +16,33 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Channel buffer size for state subscribers.
+const STATE_SUBSCRIBER_BUFFER: usize = 64;
+
 /// Manages AppState and distributes updates to subscribed Views.
-///
-/// Owns the ContextManager internally. Compaction is triggered automatically
-/// when messages are added — callers never touch ContextManager directly.
+/// Owns ContextManager internally; compaction triggers automatically.
 pub struct StateManager {
     state: Arc<RwLock<AppState>>,
-    /// Todo list (single source of truth for todo state)
     todo_list: Arc<Mutex<TodoList>>,
-    /// Persistent subscribers that receive every state update
     subscribers: Arc<RwLock<Vec<mpsc::Sender<AppState>>>>,
-    /// Session statistics (tokens, cost, API calls) - single source of truth
     stats: Arc<Mutex<SessionStats>>,
 
     // ── Context Compaction ───────────────────────────────────────────────────
-    /// Context manager for automatic compaction (private, not exposed)
     context_manager: Mutex<Option<ContextManager>>,
-    /// System prompt needed for summarization during compaction
     system_prompt: RwLock<String>,
-    /// Weak self-reference for spawning async compaction tasks from sync methods
-    self_ref: RwLock<Option<Weak<Self>>>,
+    self_ref: RwLock<Option<Weak<Self>>>, // For spawning async compaction tasks
 
-    // ── Conversation Persistence (Single Source of Truth) ─────────────────────
-    /// Storage backend for conversations
+    // ── Conversation Persistence ──────────────────────────────────────────────
     storage: Option<Arc<dyn ConversationStorage>>,
-    /// Current conversation being edited
     current_conversation: Arc<Mutex<Option<Conversation>>>,
 
     // ── Rendering Coalescence ─────────────────────────────────────────────────
-    /// Monotonic counter bumped on every state mutation.
-    ///
-    /// Views (e.g. `ReplUi`) cache the revision they last rendered and skip
-    /// their render pass when nothing has changed, turning an idle REPL from
-    /// `20 draws/sec × O(N)` into a no-op. See `slow-messages.md` §4.4.
+    /// Monotonic counter for render coalescence — see `slow-messages.md` §4.4.
     revision: AtomicU64,
 }
 
 impl StateManager {
     /// Create a new StateManager wrapped in Arc.
-    /// The Arc is required so StateManager can spawn async compaction tasks.
     pub fn new_arc() -> Arc<Self> {
         let sm = Arc::new(Self::new_inner(None));
         *sm.self_ref.write().unwrap() = Some(Arc::downgrade(&sm));
@@ -79,7 +57,6 @@ impl StateManager {
     }
 
     /// Create a bare StateManager (no Arc, no auto-compaction).
-    /// Use `new_arc()` in production for automatic compaction support.
     pub fn new() -> Self {
         Self::new_inner(None)
     }
@@ -102,13 +79,8 @@ impl StateManager {
     // ── Context Compaction ──────────────────────────────────────────────────────
 
     /// Initialize the context manager for automatic compaction.
-    /// Must be called once after construction with the agent, config, and system prompt.
-    /// After this, compaction triggers automatically when messages are added.
     pub(crate) fn init_context_manager(&self, cm: ContextManager, system_prompt: String) {
-        // Seed AppState.context with the static parts (window size + policy) so
-        // the status bar can render a real percentage immediately, before any
-        // API call has reported token usage. `current_usage` stays 0 until the
-        // first request lands and `sync_stats_to_ui` refreshes it.
+        // Seed AppState.context so the status bar can render immediately.
         {
             let mut state = self.state.write().unwrap();
             state.context.window_size = cm.context_size() as u64;
@@ -131,7 +103,9 @@ impl StateManager {
                 let result = cm.estimate_compaction(&messages, plan.boundary);
                 if result.num_discarded > 0 {
                     self.apply_compaction(&plan);
-                    self.persist_current().ok();
+                    if let Err(e) = self.persist_current() {
+                        tracing::error!("Failed to persist after compaction: {}", e);
+                    }
                     Some(result)
                 } else {
                     None
@@ -145,7 +119,6 @@ impl StateManager {
     }
 
     /// Check if compaction is needed and run it (async).
-    /// Used by TestRunner and force_compact. Returns the result if compaction ran.
     pub async fn compact_if_needed(&self) -> Option<CompactionResult> {
         let cm_clone = {
             let guard = self.context_manager.lock().unwrap();
@@ -170,16 +143,9 @@ impl StateManager {
         self.run_compaction(&cm_clone).await
     }
 
-    /// Public threshold check. Returns `true` iff a compaction *would* fire
-    /// with the current chat state and `last_input_tokens` reading.
-    ///
-    /// This is the gate `SessionHook::on_completion_call` consults to decide
-    /// whether to terminate the agentic loop with reason `"compact"`. The
-    /// check is `&self`-pure: no spawn, no side effects. The hook holds a
-    /// `Weak<StateManager>` and reads this on every completion-call boundary.
-    ///
-    /// Returns `false` when no `ContextManager` is initialized — typical for
-    /// short-lived test harnesses without a context window.
+    /// Returns `true` iff a compaction *would* fire. The gate
+    /// `SessionHook::on_completion_call` consults to terminate the agentic loop.
+    /// Returns `false` when no `ContextManager` is initialized.
     pub fn needs_compaction(&self) -> bool {
         let guard = self.context_manager.lock().unwrap();
         let Some(cm) = guard.as_ref() else {
@@ -188,29 +154,15 @@ impl StateManager {
         cm.needs_compaction(self.uncompacted_message_count())
     }
 
-    /// Clear the live `last_input_tokens` signal without touching cumulative
-    /// stats. Used by the in-loop compaction handler when `force_compact()`
-    /// can't make progress: clearing the stat breaks the
-    /// terminate-and-restart loop (the gate stops firing) and lets the
-    /// already-too-big request go to the wire for honest failure handling.
-    ///
-    /// Cumulative `total_input_tokens` / `total_cost` / `total_api_calls`
-    /// are unchanged, so `/stats` stays accurate.
+    /// Clear the live `last_input_tokens` signal without touching cumulative stats.
     pub fn clear_last_input_tokens(&self) {
         self.stats.lock().unwrap().clear_last_input_tokens();
         self.sync_stats_to_ui();
     }
 
     /// Apply a CompactionPlan: tag old messages as compacted, insert the summary.
-    /// Preserves tool calls that are referenced by tool results in the kept region.
-    ///
-    /// Also clears `last_input_tokens` on `SessionStats` so the
-    /// post-compaction `needs_compaction()` reading is honest. Without this,
-    /// the in-loop `terminate("compact")` → `force_compact` → resume cycle
-    /// would infinite-loop because the threshold check still sees the
-    /// pre-compaction wire size. This is THE loop guard — see
-    /// `mid-compaction.md` § 3 Step 2 and the pin
-    /// `force_compact_makes_needs_compaction_return_false`.
+    /// Preserves tool calls referenced by tool results in the kept region.
+    /// Also clears `last_input_tokens` (loop-guard) — see `mid-compaction.md` § 3.
     fn apply_compaction(&self, plan: &crate::context_manager::CompactionPlan) {
         use crate::context_manager::find_needed_tool_calls_chat;
 
@@ -235,17 +187,11 @@ impl StateManager {
         messages.insert(plan.boundary, summary);
 
         self.notify_update(&state);
-        // Lock order discipline: drop `state` write guard via end-of-scope
-        // before grabbing `stats`. (state → stats is the documented order;
-        // doing both writes simultaneously would be fine here, but keeping
-        // them in separate scopes makes the discipline visible.)
+        // Lock order: state → stats. Drop state guard before acquiring stats.
         drop(state);
 
-        // Loop-guard: post-compaction the wire size has dropped, but
-        // `last_input_tokens` still reflects the pre-compaction request.
-        // Clear it so the next `needs_compaction()` falls through to the
-        // message-count fallback (which now reads ~`keep_recent + 1` ≪
-        // threshold). The next real `on_completion_response` overwrites
+        // Loop-guard: clear last_input_tokens so needs_compaction() falls through
+        // to the message-count fallback. Next on_completion_response overwrites
         // with honest data.
         self.stats.lock().unwrap().clear_last_input_tokens();
         // Sync state.context.current_usage so the status bar reflects the
@@ -299,22 +245,10 @@ impl StateManager {
         self.sync_stats_to_ui();
     }
 
-    /// Sync stats to AppState (internal method)
-    ///
-    /// **Lock order — load-bearing:** snapshot the values from `stats` and
-    /// release the guard *before* acquiring `state.write`. Holding `stats`
-    /// across `state.write` would invert the order used by
-    /// `sync_to_conversation` (`state.read` → `current_conversation` →
-    /// `stats`) and produce a deadlock when the agent loop persists an
-    /// assistant message at the same instant the event-processor task
-    /// dispatches the matching `CompletionResponse` event. That race is
-    /// most reliably triggered by `/new` → first prompt → first LLM
-    /// response on a fresh session — see the
-    /// `add_request_and_persist_current_do_not_deadlock` regression test
-    /// for the reproduction.
+    /// Sync stats to AppState. Lock order: stats → state (load-bearing — see
+    /// `add_request_and_persist_current_do_not_deadlock` regression test).
     fn sync_stats_to_ui(&self) {
-        // Snapshot under the stats lock, then release it before touching
-        // `state` to keep the global lock order acyclic.
+        // Snapshot under stats lock, release before acquiring state.write.
         let (input, output, calls, cost, last_input) = {
             let stats = self.stats.lock().unwrap();
             (
@@ -322,9 +256,7 @@ impl StateManager {
                 stats.total_output_tokens,
                 stats.total_api_calls,
                 stats.total_cost,
-                // `last_input_tokens()` returns the most recent request's
-                // input tokens — that IS the current context size (not
-                // cumulative).
+                // last_input_tokens is the current context size (not cumulative)
                 stats.last_input_tokens().unwrap_or(0),
             )
         };
@@ -335,9 +267,6 @@ impl StateManager {
         state.stats.total_api_calls = calls;
         state.stats.total_cost = cost;
         state.context.current_usage = last_input;
-        // Notify *while still holding* `state.write` — matches the pattern
-        // used by every other sync_*_to_ui helper. The guard derefs to
-        // `&AppState` for `notify_update`'s signature.
         self.notify_update(&state);
     }
 
@@ -596,7 +525,7 @@ impl StateManager {
     /// }
     /// ```
     pub fn subscribe(&self) -> mpsc::Receiver<AppState> {
-        let (sender, receiver) = mpsc::channel(64);
+        let (sender, receiver) = mpsc::channel(STATE_SUBSCRIBER_BUFFER);
         // Send current state immediately so subscriber is up-to-date
         let current = self.state.read().unwrap().clone();
         let _ = sender.try_send(current);
@@ -920,7 +849,9 @@ impl StateManager {
             self.current_conversation.lock().unwrap().as_mut(),
         ) {
             conv.updated_at = chrono::Utc::now();
-            let _ = storage.save(conv);
+            if let Err(e) = storage.save(conv) {
+                tracing::error!("Failed to save conversation: {}", e);
+            }
         }
     }
 
@@ -1145,7 +1076,9 @@ impl StateManager {
     pub fn add_user_message(&self, content: String) {
         let msg = ChatMessage::user(content);
         self.update_chat(msg);
-        self.persist_current().ok();
+        if let Err(e) = self.persist_current() {
+            tracing::error!("Failed to persist user message: {}", e);
+        }
     }
 
     /// Add a user message carrying image attachments.
@@ -1159,7 +1092,9 @@ impl StateManager {
     ) {
         let msg = ChatMessage::user_with_attachments(content, attachments);
         self.update_chat(msg);
-        self.persist_current().ok();
+        if let Err(e) = self.persist_current() {
+            tracing::error!("Failed to persist user message with attachments: {}", e);
+        }
     }
 
     /// Add an assistant message to chat and persist.
@@ -1168,14 +1103,18 @@ impl StateManager {
     pub fn add_assistant_message(&self, content: String) {
         let msg = ChatMessage::agent(content);
         self.update_chat(msg);
-        self.persist_current().ok();
+        if let Err(e) = self.persist_current() {
+            tracing::error!("Failed to persist assistant message: {}", e);
+        }
     }
 
     /// Add a tool call message to chat and persist immediately
     pub fn add_tool_call(&self, tool_name: String, args: String, call_id: Option<String>) {
         let msg = ChatMessage::tool_call(&tool_name, &args, call_id);
         self.update_chat(msg);
-        self.persist_current().ok();
+        if let Err(e) = self.persist_current() {
+            tracing::error!("Failed to persist tool call: {}", e);
+        }
     }
 
     /// Add a tool result message to chat and persist immediately
@@ -1188,7 +1127,9 @@ impl StateManager {
     ) {
         let msg = ChatMessage::tool_result(&tool_name, &args, &result, call_id);
         self.update_chat(msg);
-        self.persist_current().ok();
+        if let Err(e) = self.persist_current() {
+            tracing::error!("Failed to persist tool result: {}", e);
+        }
     }
 
     // ── History Conversion for Agent ───────────────────────────────────────────
@@ -1318,6 +1259,167 @@ impl StateManager {
         Some(RigMessage::User {
             content: user_content_from_chat_message(last_user),
         })
+    }
+
+    /// Build the resumption prompt and history for resuming after compaction.
+    ///
+    /// This is distinct from `build_current_turn_message` + `get_agent_history`
+    /// because those methods are designed for **initial dispatch** (fresh user
+    /// turns), where the trailing User is always the current turn.
+    ///
+    /// After mid-action compaction, the state looks like:
+    ///
+    /// ```text
+    /// [User, Agent, ToolCall, ToolResult]  ← compaction fires here
+    /// ```
+    ///
+    /// The resumption prompt should be the **last non-compacted message** (e.g.
+    /// the ToolResult), and history should be everything before it
+    /// ([User, Agent, ToolCall]).
+    ///
+    /// Returns `None` when there is no resumption needed — empty conversation
+    /// or fresh turn. In that case the caller falls back to the normal
+    /// `build_current_turn_message` / `get_agent_history` path.
+    pub fn build_resumption_for_compaction(
+        &self,
+    ) -> Option<(
+        rig::completion::message::Message,
+        Vec<rig::completion::message::Message>,
+    )> {
+        use crate::ui::app_state::MessageRole;
+        use rig::completion::message::{
+            AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
+            ToolResultContent, UserContent,
+        };
+        use rig::one_or_many::OneOrMany;
+
+        let state = self.state.read().unwrap();
+        let messages = &state.chat.messages;
+
+        // Find the last non-compacted message (whatever its role)
+        let last_non_compacted = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, m)| !m.compacted);
+
+        let (last_idx, last_msg) = last_non_compacted?;
+
+        // If there's only one message, it's a fresh turn — not a mid-action
+        // resumption. Return None so the caller uses the normal path.
+        if last_idx == 0 {
+            return None;
+        }
+
+        // ── Build history: everything before the last message ──────────────
+        let history: Vec<_> = messages[..last_idx]
+            .iter()
+            .filter(|m| !m.compacted)
+            .filter_map(|msg| match msg.role {
+                MessageRole::User => Some(RigMessage::User {
+                    content: user_content_from_chat_message(msg),
+                }),
+                MessageRole::Agent => Some(RigMessage::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::Text(Text {
+                        text: msg.content.clone(),
+                    })),
+                }),
+                MessageRole::ToolCall => {
+                    let tool_name = msg.tool_name.as_deref()?;
+                    let args_str = msg.tool_args.as_deref().unwrap_or("{}");
+                    let arguments = serde_json::from_str(args_str)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    let call_id = msg.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+
+                    Some(RigMessage::Assistant {
+                        id: None,
+                        content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                            call_id,
+                            ToolFunction::new(tool_name.to_string(), arguments),
+                        ))),
+                    })
+                }
+                MessageRole::ToolResult => {
+                    let tool_name = msg.tool_name.as_deref()?;
+                    let result_text = msg.tool_result.as_deref().unwrap_or("");
+                    let call_id = msg.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+
+                    Some(RigMessage::User {
+                        content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                            id: call_id,
+                            call_id: None,
+                            content: OneOrMany::one(ToolResultContent::Text(Text {
+                                text: result_text.to_string(),
+                            })),
+                        })),
+                    })
+                }
+                MessageRole::Summary => Some(RigMessage::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: format!("[Conversation summary] {}", msg.content),
+                    })),
+                }),
+                MessageRole::System => None,
+            })
+            .collect();
+
+        // ── Build prompt: the last message converted to a rig Message ───────
+        let prompt = match last_msg.role {
+            MessageRole::User => RigMessage::User {
+                content: user_content_from_chat_message(last_msg),
+            },
+            MessageRole::Agent => RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::Text(Text {
+                    text: last_msg.content.clone(),
+                })),
+            },
+            MessageRole::ToolCall => {
+                let tool_name = last_msg.tool_name.as_deref()?;
+                let args_str = last_msg.tool_args.as_deref().unwrap_or("{}");
+                let arguments = serde_json::from_str(args_str)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                let call_id = last_msg
+                    .call_id
+                    .clone()
+                    .unwrap_or_else(|| tool_name.to_string());
+
+                RigMessage::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                        call_id,
+                        ToolFunction::new(tool_name.to_string(), arguments),
+                    ))),
+                }
+            }
+            MessageRole::ToolResult => {
+                let tool_name = last_msg.tool_name.as_deref()?;
+                let result_text = last_msg.tool_result.as_deref().unwrap_or("");
+                let call_id = last_msg
+                    .call_id
+                    .clone()
+                    .unwrap_or_else(|| tool_name.to_string());
+
+                RigMessage::User {
+                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                        id: call_id,
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::Text(Text {
+                            text: result_text.to_string(),
+                        })),
+                    })),
+                }
+            }
+            MessageRole::Summary => RigMessage::User {
+                content: OneOrMany::one(UserContent::Text(Text {
+                    text: format!("[Conversation summary] {}", last_msg.content),
+                })),
+            },
+            MessageRole::System => return None,
+        };
+
+        Some((prompt, history))
     }
 }
 
@@ -1682,14 +1784,9 @@ mod tests {
         }
     }
 
-    // The historical "user_message_during_tool_execution_does_not_corrupt_history"
-    // test pinned the bug *shape* at the StateManager layer. It was always
-    // going to stay red because StateManager has no opinion on call ordering
-    // — the fix lives at the call-site layer (`src/lib.rs::event_loop` no
-    // longer writes user input; `agent_loop` is the sole writer). The new
-    // regression guards live next to the actual fix; see the
-    // `single_writer_user_input` and `stop_drains_queue` modules below and
-    // the `tests/scenarios/queued_input_tests.rs` integration tests.
+    // Historical note: the old StateManager-level regression test was removed
+    // because the fix lives at the call-site layer — see
+    // `tests/scenarios/queued_input_tests.rs`.
 
     /// ChatMessage structured fields are correctly populated for tool messages
     #[test]
@@ -1921,7 +2018,6 @@ mod tests {
         sm.set_running(true);
         let first = sm.get_state().run_started_at.expect("stamped on start");
 
-        // Sleep a hair so the second stamp is observably later than the first.
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         sm.set_running(false);
@@ -1931,10 +2027,7 @@ mod tests {
             .run_started_at
             .expect("re-stamped on restart");
 
-        assert!(
-            second > first,
-            "second run start must be strictly after the first"
-        );
+        assert!(second > first);
     }
 
     // ─── /exit command: StateManager-side signal ─────────────────────────
@@ -2384,6 +2477,141 @@ mod tests {
                 );
             }
             _ => panic!("expected User message"),
+        }
+    }
+
+    /// `build_resumption_for_compaction` returns the last non-compacted message
+    /// (whatever its role) as the prompt, with everything before it as history.
+    ///
+    /// This is the load-bearing regression pin for the "crazy loop" bug: when
+    /// compaction fires mid-action (after a ToolResult but before the next
+    /// model response), the resumption prompt must be the ToolResult, not the
+    /// stale User that `build_current_turn_message` always returns.
+    #[test]
+    fn build_resumption_for_compaction_does_not_duplicate_user_prompt() {
+        let sm = StateManager::new();
+
+        // Simulate mid-action state: User → Agent → ToolCall → ToolResult
+        // Compaction fires after the ToolResult. The resumption prompt
+        // should be the ToolResult, and history should be [User, Agent, ToolCall].
+        sm.add_user_message("list files".to_string());
+        sm.add_assistant_message("I'll run ls for you".to_string());
+        sm.add_tool_call(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            Some("call_1".to_string()),
+        );
+        sm.add_tool_result(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            "file1.txt\nfile2.txt".to_string(),
+            Some("call_1".to_string()),
+        );
+
+        let (prompt, history) = sm
+            .build_resumption_for_compaction()
+            .expect("non-empty conversation must produce resumption");
+
+        // The prompt must be the ToolResult — NOT the User message.
+        // If it's the User, the model sees a duplicate on the wire and
+        // re-runs the same tool call, blowing context again → infinite loop.
+        let prompt_text = extract_resumption_text(&prompt);
+        assert!(
+            prompt_text.contains("file1.txt") || prompt_text.contains("ls"),
+            "prompt must be the ToolResult, got: {prompt_text}"
+        );
+
+        // History must contain the User message (it's part of conversation history).
+        // The bug was that User appeared BOTH in history AND as the prompt (duplicate).
+        // With the fix, User is ONLY in history, not as a separate prompt.
+        let history_text = format!("{:?}", history);
+        assert!(
+            history_text.contains("list files"),
+            "User must appear in history, got: {history_text}"
+        );
+    }
+
+    /// Defensive boundary: empty state must return None, not panic.
+    #[test]
+    fn build_resumption_for_compaction_returns_none_on_empty_state() {
+        let sm = StateManager::new();
+        assert!(
+            sm.build_resumption_for_compaction().is_none(),
+            "empty state must return None"
+        );
+    }
+
+    /// No-regression for fresh-turn compaction (compaction fires before any
+    /// tool round-trip). In this case the last message IS a User, so both
+    /// `build_resumption_for_compaction` and `build_current_turn_message` should
+    /// agree on the User.
+    #[test]
+    fn build_resumption_for_compaction_handles_trailing_user() {
+        let sm = StateManager::new();
+        sm.add_user_message("a fresh turn".to_string());
+        sm.add_assistant_message("hi".to_string());
+
+        let (prompt, history) = sm
+            .build_resumption_for_compaction()
+            .expect("non-empty conversation must produce resumption");
+
+        // The prompt should be the Assistant message ("hi"), not the User.
+        // History should be [User].
+        let prompt_text = extract_resumption_text(&prompt);
+        assert!(
+            prompt_text.contains("hi"),
+            "prompt must be the Assistant, got: {prompt_text}"
+        );
+
+        let history_text = format!("{:?}", history);
+        assert!(
+            history_text.contains("a fresh turn"),
+            "history must contain the User message, got: {history_text}"
+        );
+    }
+
+    /// Extract text from a rig Message for test assertions.
+    fn extract_resumption_text(msg: &rig::completion::message::Message) -> String {
+        use rig::completion::message::{AssistantContent, ToolResultContent, UserContent};
+
+        match msg {
+            rig::completion::message::Message::User { content } => {
+                // OneOrMany has first + rest fields, not enum variants.
+                // Check for ToolResult content first (from build_resumption_for_compaction).
+                let first = content.first_ref();
+                if let UserContent::ToolResult(tr) = first {
+                    // ToolResult wraps ToolResultContent::Text
+                    let first_content = tr.content.first_ref();
+                    if let ToolResultContent::Text(t) = first_content {
+                        return t.text.clone();
+                    }
+                }
+                // Fall back to text content
+                let mut texts = Vec::new();
+                if let UserContent::Text(t) = first {
+                    texts.push(t.text.clone());
+                }
+                for item in content.rest() {
+                    if let UserContent::Text(t) = item {
+                        texts.push(t.text.clone());
+                    }
+                }
+                texts.join(" ")
+            }
+            rig::completion::message::Message::Assistant { content, .. } => {
+                // OneOrMany has first + rest fields, not enum variants.
+                let mut texts = Vec::new();
+                if let AssistantContent::Text(t) = content.first_ref() {
+                    texts.push(t.text.clone());
+                }
+                for item in content.rest() {
+                    if let AssistantContent::Text(t) = item {
+                        texts.push(t.text.clone());
+                    }
+                }
+                texts.join(" ")
+            }
+            _ => String::new(),
         }
     }
 
