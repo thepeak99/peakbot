@@ -1213,17 +1213,28 @@ impl AgentRunner {
         config: &Config,
     ) -> CompletionResult {
         let mut retry_count = 0;
+        // One-shot override for the post-compaction iteration. The compact
+        // arm fills this with the resumption-shape history returned by
+        // `build_resumption_for_compaction()`; the loop top consumes it
+        // via `.take()` on the very next iteration so the resumption
+        // payload reaches the wire intact. Without this override, the
+        // top-of-loop `get_agent_history()` re-derives history from
+        // StateManager and DUPLICATES the resumption message (which is
+        // also `current_turn`), breaking Anthropic / OpenAI conversation
+        // invariants. See the data-layer pin
+        // `production_resumption_payload_must_not_duplicate_toolresult`.
+        let mut history_override: Option<Vec<rig::completion::message::Message>> = None;
 
         loop {
             // Compaction is handled at the wire boundary by SessionHook
             // (gate in `on_completion_call`). The handler below catches
             // the resulting Terminate("compact") and rebuilds state.
 
-            // Call the agent with history from StateManager (single source of truth)
-            let mut history = state_manager
-                .as_ref()
-                .map(|sm| sm.get_agent_history())
-                .unwrap_or_default();
+            // Call the agent with history from StateManager (single source
+            // of truth), unless the previous iteration set a one-shot
+            // override (the post-compaction case — see `history_override`
+            // above).
+            let mut history = derive_history_for_iteration(&mut history_override, state_manager);
             let result = agent
                 .as_ref()
                 .prompt_with_history(current_turn.clone(), &mut history)
@@ -1291,11 +1302,15 @@ impl AgentRunner {
                     // to the normal initial-dispatch path for safety.
                     if let Some((p, h)) = sm.build_resumption_for_compaction() {
                         current_turn = p;
-                        // Override history with the resumption shape.
-                        // The loop below uses this `history` instead of calling
-                        // `get_agent_history()` again.
-                        history.clear();
-                        history.extend(h);
+                        // Stash the resumption-shape history in the loop-local
+                        // one-shot override. The next iteration's top-of-loop
+                        // will consume it via `.take()` instead of calling
+                        // `get_agent_history()`. This is the load-bearing
+                        // line — without it, the trailing non-User message
+                        // (typically a ToolResult after a tool round-trip)
+                        // would be duplicated on the wire because
+                        // `get_agent_history()` only strips trailing User.
+                        history_override = Some(h);
                     } else if let Some(turn) = sm.build_current_turn_message() {
                         current_turn = turn;
                     }
@@ -1790,6 +1805,43 @@ impl AgentRunner {
                 // The agent will respond via StateManager
             }
         }
+    }
+}
+
+/// Derive the chat history that the next `prompt_with_history` call will
+/// receive, honouring a one-shot override.
+///
+/// Two callers in the loop:
+///
+/// 1. **Normal turn**: `override_` is `None` → returns `get_agent_history()`
+///    from `StateManager` (the source of truth, single trailing-User strip).
+/// 2. **Post-compaction iteration**: `override_` was filled by the compact
+///    arm with the resumption-shape history from
+///    `StateManager::build_resumption_for_compaction()`. We `.take()` it so
+///    the next iteration falls back to the normal path.
+///
+/// **Why this exists as a separate function:** the production bug fixed
+/// in the 2026-05-09 cleanup pass was that the compact arm wrote the
+/// resumption history to a loop-body-local `history` variable that was
+/// shadowed and re-derived on the next iteration via
+/// `get_agent_history()`. The override was effectively a no-op and the
+/// resumption message ended up duplicated on the wire (once as the
+/// prompt, once as the trailing entry of history). Pulling the
+/// derivation out into a named function makes the override-vs-derivation
+/// contract explicit and unit-testable; without that, the only way to
+/// catch the regression would be a full mock-driven runtime test of the
+/// agent loop. See the regression pins
+/// `derive_history_for_iteration_*` in this module.
+fn derive_history_for_iteration(
+    override_: &mut Option<Vec<rig::completion::message::Message>>,
+    state_manager: &Option<Arc<StateManager>>,
+) -> Vec<rig::completion::message::Message> {
+    match override_.take() {
+        Some(h) => h,
+        None => state_manager
+            .as_ref()
+            .map(|sm| sm.get_agent_history())
+            .unwrap_or_default(),
     }
 }
 
@@ -3280,5 +3332,237 @@ headers:
             enabled: true,
         };
         assert!(config.validate().is_err());
+    }
+
+    // ─── Mid-action compaction: production wire-payload contract ────────────
+    //
+    // These tests pin the exact data shape that
+    // `AgentRunner::process_message_internal` constructs after the
+    // SessionHook fires `terminate("compact")`. The bug we're guarding
+    // against is subtle: `build_resumption_for_compaction` returns the
+    // correct `(prompt, history)` tuple, but if the loop discards the
+    // returned history and re-derives it via `get_agent_history()` on
+    // the next iteration, the resumption message ends up duplicated on
+    // the wire (once as the prompt, once at the tail of history). That
+    // breaks Anthropic / OpenAI conversation invariants and the model
+    // either re-runs the tool, produces garbage, or refuses.
+    //
+    // Pinned at the data layer because the runtime race is hard to
+    // reproduce deterministically (see procedural rule (c) in
+    // `memory.md`: "Pin races at the data layer, not the runtime layer").
+    //
+    // The fix is a one-shot `history_override: Option<Vec<Message>>`
+    // outside the loop body, consumed via `.take()` at the top of the
+    // next iteration to override the default `get_agent_history()` call.
+
+    /// Helper: extract every visible text fragment from a rig
+    /// `Message` for substring assertions. Walks User text, User
+    /// ToolResult text, and Assistant text + tool-call arguments.
+    fn message_texts(msg: &rig::completion::message::Message) -> Vec<String> {
+        use rig::completion::message::{
+            AssistantContent, Message as RigMessage, ToolResultContent, UserContent,
+        };
+        let mut out = Vec::new();
+        match msg {
+            RigMessage::User { content } => {
+                for c in std::iter::once(content.first_ref()).chain(content.rest().iter()) {
+                    match c {
+                        UserContent::Text(t) => out.push(t.text.clone()),
+                        UserContent::ToolResult(tr) => {
+                            for rc in std::iter::once(tr.content.first_ref())
+                                .chain(tr.content.rest().iter())
+                            {
+                                if let ToolResultContent::Text(t) = rc {
+                                    out.push(t.text.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            RigMessage::Assistant { content, .. } => {
+                for c in std::iter::once(content.first_ref()).chain(content.rest().iter()) {
+                    match c {
+                        AssistantContent::Text(t) => out.push(t.text.clone()),
+                        AssistantContent::ToolCall(tc) => {
+                            // Include tool-call arguments so substring
+                            // checks can verify ToolCall preservation.
+                            out.push(tc.function.arguments.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            RigMessage::System { .. } => {}
+        }
+        out
+    }
+
+    /// Count occurrences of `needle` across a slice of rig Messages.
+    fn count_occurrences(msgs: &[rig::completion::message::Message], needle: &str) -> usize {
+        msgs.iter()
+            .flat_map(message_texts)
+            .filter(|t| t.contains(needle))
+            .count()
+    }
+
+    /// **The bug.** After a tool round-trip the chat ends in a
+    /// `ToolResult`. When mid-action compaction fires, the production
+    /// loop must use the resumption tuple's history (returned alongside
+    /// the prompt by `build_resumption_for_compaction`) — NOT a fresh
+    /// `get_agent_history()` call, which still includes the trailing
+    /// ToolResult and would duplicate it on the wire.
+    ///
+    /// This test exercises [`derive_history_for_iteration`] — the same
+    /// function the production loop calls — with the post-compact-arm
+    /// state: `history_override = Some(resumption_history)` and a
+    /// `current_turn = ToolResult`. Asserts the resumption marker
+    /// appears exactly once across `(prompt + derived_history)`.
+    ///
+    /// **Without `derive_history_for_iteration` honouring the override**
+    /// (i.e. the regression introduced in `a1d705c`), this test fails:
+    /// the trailing ToolResult ends up duplicated.
+    ///
+    /// Pinned by [`memory.md` §"context fukup #2 (2026-05-09)"].
+    #[test]
+    fn derive_history_for_iteration_does_not_duplicate_toolresult_on_resume() {
+        let sm = Arc::new(StateManager::new());
+        // Simulate a tool round-trip: User → Agent → ToolCall → ToolResult.
+        // Compaction fires after the ToolResult lands.
+        sm.add_user_message("list files".to_string());
+        sm.add_assistant_message("I'll run ls for you".to_string());
+        sm.add_tool_call(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            Some("call_1".to_string()),
+        );
+        sm.add_tool_result(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            "UNIQUE_TOOLRESULT_MARKER_12345".to_string(),
+            Some("call_1".to_string()),
+        );
+
+        // The compact arm sets current_turn = prompt and stashes
+        // resumption_history into the one-shot override.
+        let (prompt, resumption_history) = sm
+            .build_resumption_for_compaction()
+            .expect("non-empty conversation must produce a resumption");
+        let mut history_override = Some(resumption_history);
+
+        // The loop top calls derive_history_for_iteration to get the
+        // history that goes on the wire. With the override Some, this
+        // MUST return the resumption history verbatim — NOT re-derive
+        // from StateManager (which would re-include the trailing
+        // ToolResult and duplicate it).
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let derived_history = derive_history_for_iteration(&mut history_override, &sm_opt);
+
+        // Assertion: the resumption marker must appear exactly ONCE
+        // across (prompt + derived_history).
+        let prompt_count = count_occurrences(
+            std::slice::from_ref(&prompt),
+            "UNIQUE_TOOLRESULT_MARKER_12345",
+        );
+        let history_count = count_occurrences(&derived_history, "UNIQUE_TOOLRESULT_MARKER_12345");
+        let total = prompt_count + history_count;
+
+        assert_eq!(
+            total,
+            1,
+            "Resumption ToolResult must appear exactly once across (prompt + history); \
+             got {prompt_count} in prompt + {history_count} in history = {total}. \
+             prompt={prompt:?}, history_len={}",
+            derived_history.len()
+        );
+
+        // The override must have been consumed (one-shot semantics).
+        // The next iteration would fall through to get_agent_history().
+        assert!(
+            history_override.is_none(),
+            "history_override must be cleared after .take() in derive_history_for_iteration"
+        );
+    }
+
+    /// No-regression: when there is no override, `derive_history_for_iteration`
+    /// must fall through to `StateManager::get_agent_history()`.
+    #[test]
+    fn derive_history_for_iteration_falls_through_to_state_manager_when_no_override() {
+        let sm = Arc::new(StateManager::new());
+        sm.add_user_message("hello".to_string());
+        sm.add_assistant_message("hi there".to_string());
+
+        let mut history_override: Option<Vec<rig::completion::message::Message>> = None;
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let derived = derive_history_for_iteration(&mut history_override, &sm_opt);
+
+        // Should match get_agent_history() exactly.
+        let expected = sm.get_agent_history();
+        assert_eq!(
+            derived.len(),
+            expected.len(),
+            "without override, must return get_agent_history() verbatim"
+        );
+    }
+
+    /// No-regression: empty `(None, None)` returns an empty Vec.
+    #[test]
+    fn derive_history_for_iteration_handles_no_state_manager() {
+        let mut history_override: Option<Vec<rig::completion::message::Message>> = None;
+        let sm_opt: Option<Arc<StateManager>> = None;
+        let derived = derive_history_for_iteration(&mut history_override, &sm_opt);
+        assert!(derived.is_empty());
+    }
+
+    /// **The bug.** This is the *original* data-shape pin, kept as a
+    /// no-regression for the underlying mismatch between
+    /// `build_resumption_for_compaction` (returns the full resumption
+    /// shape) and `get_agent_history` (only strips trailing User).
+    /// If anyone "fixes" `get_agent_history` to also strip trailing
+    /// ToolResult — masking the lib.rs bug instead of fixing the
+    /// wiring — this test stays meaningful: it documents the
+    /// asymmetry and the per-method contracts. The actual fix lives
+    /// at the wiring layer and is pinned by
+    /// `derive_history_for_iteration_does_not_duplicate_toolresult_on_resume`.
+    #[test]
+    fn naive_get_agent_history_after_resumption_demonstrates_the_bug() {
+        let sm = StateManager::new();
+        sm.add_user_message("list files".to_string());
+        sm.add_assistant_message("I'll run ls for you".to_string());
+        sm.add_tool_call(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            Some("call_1".to_string()),
+        );
+        sm.add_tool_result(
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            "UNIQUE_TOOLRESULT_MARKER_12345".to_string(),
+            Some("call_1".to_string()),
+        );
+
+        let (prompt, _) = sm
+            .build_resumption_for_compaction()
+            .expect("non-empty conversation must produce a resumption");
+        // This is the BROKEN pattern (re-derive history from state).
+        // get_agent_history() doesn't strip trailing non-User messages,
+        // so the ToolResult stays in history AND is the prompt.
+        let history_naive = sm.get_agent_history();
+
+        let prompt_count = count_occurrences(
+            std::slice::from_ref(&prompt),
+            "UNIQUE_TOOLRESULT_MARKER_12345",
+        );
+        let history_count = count_occurrences(&history_naive, "UNIQUE_TOOLRESULT_MARKER_12345");
+
+        // This documents the bug: the broken pattern produces a
+        // duplicate. The fix (use the resumption_history from the
+        // tuple, not re-derive) is pinned by the test above.
+        assert_eq!(prompt_count, 1, "prompt has the marker once");
+        assert_eq!(
+            history_count, 1,
+            "naive get_agent_history() ALSO has the marker (the source of the duplication)"
+        );
     }
 }
