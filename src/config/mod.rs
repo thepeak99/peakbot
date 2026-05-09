@@ -34,6 +34,7 @@ impl fmt::Display for ProviderType {
 
 /// Configuration for OpenRouter provider
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OpenRouterConfig {
     /// OpenRouter API key
     #[serde(default)]
@@ -48,6 +49,7 @@ pub struct OpenRouterConfig {
 
 /// Configuration for Ollama provider (local models)
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OllamaConfig {
     /// Base URL (default: http://localhost:11434)
     #[serde(default = "default_ollama_url")]
@@ -61,6 +63,7 @@ pub struct OllamaConfig {
 
 /// Configuration for OpenAI provider
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OpenAIConfig {
     /// OpenAI API key
     #[serde(default)]
@@ -79,6 +82,7 @@ pub struct OpenAIConfig {
 /// Configuration for LlamaCpp provider (uses OpenAI-compatible completions API)
 /// This is compatible with llama.cpp's server mode which provides an OpenAI-compatible API
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LlamaCppConfig {
     /// API key (optional for local llama.cpp instances)
     #[serde(default)]
@@ -112,7 +116,7 @@ fn default_llamacpp_url() -> String {
 
 /// Provider configuration - specifies which provider and its specific config
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(tag = "type", content = "config")]
+#[serde(tag = "type", content = "config", deny_unknown_fields)]
 pub enum ProviderConfig {
     #[serde(rename = "openrouter")]
     OpenRouter(OpenRouterConfig),
@@ -164,6 +168,7 @@ impl Default for LlamaCppConfig {
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// LLM Provider configuration (legacy single-provider shape).
     /// Used as the *fallback* when no `providers:` list is declared.
@@ -214,6 +219,7 @@ pub struct Config {
 
 /// Multi-agent pipeline configuration
 #[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     /// Whether multi-agent pipelines are enabled (default: false)
     #[serde(default)]
@@ -226,6 +232,7 @@ pub struct PipelineConfig {
 
 /// Definition of a sub-agent that can be delegated to
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentDefinition {
     /// Agent type (must match a provider type)
     #[serde(rename = "type")]
@@ -519,6 +526,7 @@ impl fmt::Display for McpTransportType {
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Unique name for this MCP server
     pub name: String,
@@ -584,6 +592,7 @@ impl McpServerConfig {
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SearXngConfig {
     /// Base URL of the SearXNG instance (e.g., "https://searx.example.com")
     pub base_url: String,
@@ -600,6 +609,7 @@ pub struct SearXngConfig {
 
 /// Configuration for context compaction
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ContextConfig {
     /// Compaction threshold (0.0-1.0), default 0.8
     /// When context usage exceeds this threshold, compaction is triggered
@@ -656,6 +666,7 @@ fn default_cost_tracking() -> bool {
 
 /// Configuration for conversation persistence
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ConversationConfig {
     /// Enable auto-save (default: true)
     #[serde(default = "default_true")]
@@ -673,6 +684,7 @@ pub struct ConversationConfig {
 
 /// Configuration for the bash tool
 #[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct BashConfig {
     /// Environment variables to set when running bash commands
     #[serde(default)]
@@ -681,6 +693,7 @@ pub struct BashConfig {
 
 /// Configuration for retry logic with exponential backoff
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts (default: 3)
     #[serde(default = "default_max_retries")]
@@ -1117,5 +1130,107 @@ mod tests {
         };
         let err = config.build_model_registry().unwrap_err();
         assert!(matches!(err, RegistryError::UnknownDefault { .. }));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // deny_unknown_fields pins
+    //
+    // Pre-fix, an unknown field at *any* level of the config silently
+    // parsed and got dropped on the floor — most painfully `max_tokens`
+    // placed at the provider level instead of per-model, which fell back
+    // to the 4096 default with no diagnostic. These pins lock in that
+    // unknown fields are now hard parse errors, naming the offending key.
+    //
+    // The pins exercise three load-bearing layers: the per-provider
+    // `LlamaCppConfig` (legacy block), the multi-model `ProviderEntry`
+    // (where the user actually hit it), and the top-level `Config` (so
+    // typos like `cost_traking:` scream too).
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_field_on_provider_entry_is_rejected() {
+        // The actual bug: `max_tokens:` placed at the provider level
+        // (where it doesn't belong) used to be silently dropped, and
+        // every model under it fell back to the 4096 default.
+        let yaml = r#"
+providers:
+  - name: local
+    type: llamacpp
+    base_url: http://localhost:8080
+    max_tokens: 8192   # WRONG LOCATION — belongs under the model entry
+    models:
+      - name: my-model
+        alias: local
+default_model: local
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .expect_err("unknown field at provider level must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_tokens"),
+            "error must name the offending key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_on_model_entry_is_rejected() {
+        let yaml = r#"
+providers:
+  - name: local
+    type: llamacpp
+    base_url: http://localhost:8080
+    models:
+      - name: my-model
+        alias: local
+        max_tokenz: 8192   # typo
+default_model: local
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .expect_err("unknown field on model entry must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_tokenz"),
+            "error must name the offending key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_at_top_level_is_rejected() {
+        let yaml = r#"
+cost_traking: false   # typo of cost_tracking
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .expect_err("unknown top-level key must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cost_traking"),
+            "error must name the offending key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn well_formed_multimodel_config_still_parses() {
+        // No-regression: locking down unknown fields must not break the
+        // happy path. A complete-looking multi-model config must still
+        // round-trip cleanly through serde.
+        let yaml = r#"
+providers:
+  - name: local
+    type: llamacpp
+    base_url: http://localhost:8080
+    api_key: optional
+    models:
+      - name: my-model
+        alias: local
+        max_tokens: 8192
+        temperature: 0.4
+default_model: local
+cost_tracking: false
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).expect("well-formed config must parse");
+        assert_eq!(cfg.default_model.as_deref(), Some("local"));
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers[0].models.len(), 1);
+        assert_eq!(cfg.providers[0].models[0].max_tokens, Some(8192));
     }
 }

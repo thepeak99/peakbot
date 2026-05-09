@@ -8,6 +8,7 @@ use crate::config::ProviderType;
 
 /// Multi-agent pipeline configuration
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     /// Whether multi-agent pipelines are enabled (default: false)
     #[serde(default)]
@@ -29,6 +30,7 @@ impl Default for PipelineConfig {
 
 /// Definition of a sub-agent that can be delegated to
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AgentDefinition {
     /// Agent type (must match a provider type)
     #[serde(rename = "type")]

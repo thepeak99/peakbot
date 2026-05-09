@@ -26,6 +26,7 @@ use std::collections::HashMap;
 /// One entry in the top-level `providers:` list. Owns its credentials
 /// and its `models:` list.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderEntry {
     /// Informational name (shown in `/conversations` and the `/model`
     /// listing as the parenthesised provider context). NOT referenced
@@ -48,6 +49,7 @@ pub struct ProviderEntry {
 
 /// One model declared inside a provider's `models:` list.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ModelEntry {
     /// The wire id sent to the API (e.g. `gpt-4o`,
     /// `anthropic/claude-3.7-sonnet`, `qwen2.5-coder:14b`). No munging.
