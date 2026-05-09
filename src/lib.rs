@@ -1636,7 +1636,13 @@ impl AgentRunner {
                         .as_ref()
                         .and_then(|r| r.find_by_wire_id(&saved_provider, &saved_model))
                         .cloned();
-                    let Some(resolved) = resolved else {
+                    // We only consult `resolved` as an availability
+                    // check here — the actual stamping of display
+                    // state happens inside
+                    // `agent_loop::maybe_rebuild_after_load` after a
+                    // successful agent rebuild. See the NOTE in the
+                    // success branch below.
+                    let Some(_resolved) = resolved else {
                         let display_id = if saved_provider.is_empty() {
                             saved_model.clone()
                         } else {
@@ -1648,15 +1654,25 @@ impl AgentRunner {
 
                     match sm.load_conversation(id) {
                         Ok(()) => {
-                            // Stamp display state to match the saved
-                            // model so the status bar reflects what
-                            // the conversation will resume on. The
-                            // agent itself is rebuilt by
-                            // `agent_loop::maybe_rebuild_after_load`
-                            // immediately after this returns.
-                            sm.set_provider_name(resolved.provider_name);
-                            sm.set_model(resolved.model_name);
-                            sm.set_model_alias(resolved.alias);
+                            // NOTE: do NOT pre-stamp display state
+                            // (`provider_name` / `model` / `model_alias`)
+                            // here. `agent_loop::maybe_rebuild_after_load`
+                            // runs immediately after this returns and
+                            // uses the still-boot-identity vs the
+                            // saved identity as its rebuild guard:
+                            //   if sm.get_provider_name() == saved_provider
+                            //   && sm.get_model() == saved_model { return; }
+                            // Pre-stamping here makes that guard
+                            // vacuously true on every load → the
+                            // rebuild silently no-ops → the agent
+                            // keeps its boot wire id and boot context
+                            // window → the user gets the wrong model
+                            // and the status bar lies. The display
+                            // state is correctly stamped *after* a
+                            // successful rebuild, inside
+                            // `maybe_rebuild_after_load`. Regression
+                            // pin: `tests::load_does_not_prestamp_display_identity`.
+                            // See `bugs-opus.md` §"Issue 3+4+5".
                             if let Some(conv) = sm.get_current_conversation() {
                                 sm.add_system_message(format!(
                                     "Loaded conversation: '{}'",
@@ -2533,6 +2549,72 @@ mod tests {
         assert!(
             body.contains("not available"),
             "expected unavailable-model error for pre-v5 file, got:\n{body}"
+        );
+    }
+
+    /// **Regression pin (issue #3+4+5 from `bugs-opus.md`).** `/load`
+    /// must NOT pre-stamp the StateManager's display identity
+    /// (`provider_name` / `model` / `model_alias`) with the loaded
+    /// conversation's saved identity. Stamping is the responsibility
+    /// of `agent_loop::maybe_rebuild_after_load`, which runs *after*
+    /// `/load` and uses the still-boot-identity as the rebuild guard
+    /// (`if sm.get_provider_name() == saved_provider && sm.get_model()
+    /// == saved_model { return; }`). When `/load` pre-stamps, that
+    /// guard becomes vacuously true on every load, the rebuild is
+    /// silently skipped, and the agent keeps its boot wire id and
+    /// boot context window — so the user gets the wrong model and
+    /// the status bar lies. See `bugs-opus.md` §"Issue 3+4+5".
+    #[tokio::test]
+    async fn load_does_not_prestamp_display_identity() {
+        use crate::conversation::Conversation;
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        // Seed a conv on the legacy synth identity that will resolve
+        // (`openrouter` + Config default model) so the wire-id check
+        // accepts it and `/load` reaches the success branch.
+        let model = Config::default().model().to_string();
+        let mut conv = Conversation::new("Saved".to_string(), "openrouter".to_string(), model);
+        conv.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        storage.save(&conv).expect("seed save");
+        let saved_id = conv.id;
+        let sm = StateManager::new_arc_with_storage(storage);
+
+        // Establish a *different* boot identity on the StateManager.
+        // The rebuild guard in `maybe_rebuild_after_load` compares
+        // these against the saved identity — they must remain distinct
+        // through `/load` so the rebuild fires.
+        sm.set_provider_name("boot-prov".to_string());
+        sm.set_model("boot-model".to_string());
+        sm.set_model_alias("boot-alias".to_string());
+
+        let config = Config::default();
+        let cmd = format!("/load {saved_id}");
+        AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
+
+        // The conversation swap itself must succeed.
+        assert_eq!(
+            sm.get_current_conversation_id(),
+            Some(saved_id),
+            "/load should swap the active conversation"
+        );
+        // …but the display identity must still be the boot identity,
+        // so `maybe_rebuild_after_load`'s guard sees a mismatch and
+        // actually rebuilds the agent. Pre-stamping here is the bug.
+        assert_eq!(
+            sm.get_provider_name(),
+            "boot-prov",
+            "/load must not pre-stamp provider_name — that's maybe_rebuild_after_load's job"
+        );
+        assert_eq!(
+            sm.get_model(),
+            "boot-model",
+            "/load must not pre-stamp model — that's maybe_rebuild_after_load's job"
+        );
+        assert_eq!(
+            sm.get_model_alias(),
+            "boot-alias",
+            "/load must not pre-stamp model_alias — that's maybe_rebuild_after_load's job"
         );
     }
 
