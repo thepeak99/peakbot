@@ -1278,16 +1278,31 @@ impl AgentRunner {
                         sm.clear_last_input_tokens();
                     }
 
-                    // Rebuild the current turn from the source of truth.
-                    // The latest user message lives in keep_recent so this is
-                    // a no-op in practice, but rebuilding from StateManager
-                    // removes a class of subtle "stale current_turn" bugs.
-                    if let Some(turn) = sm.build_current_turn_message() {
+                    // Build the resumption prompt and history from the post-compaction
+                    // StateManager. Unlike the initial dispatch path (which always
+                    // uses the last User as the prompt), mid-action resumption
+                    // must continue from whatever message the hook terminated
+                    // with — which may be a ToolResult or Agent response, not
+                    // necessarily a User. `build_resumption_for_compaction` handles
+                    // this correctly by finding the actual last non-compacted
+                    // message as the prompt and everything before it as history.
+                    //
+                    // If it returns None (empty state or fresh turn), fall back
+                    // to the normal initial-dispatch path for safety.
+                    if let Some((p, h)) = sm.build_resumption_for_compaction() {
+                        current_turn = p;
+                        // Override history with the resumption shape.
+                        // The loop below uses this `history` instead of calling
+                        // `get_agent_history()` again.
+                        history.clear();
+                        history.extend(h);
+                    } else if let Some(turn) = sm.build_current_turn_message() {
                         current_turn = turn;
                     }
 
                     // Loop. The next prompt_with_history call sees the
-                    // compacted history. The hook's needs_compaction() now
+                    // compacted history and the correct resumption prompt.
+                    // The hook's needs_compaction() now
                     // reads false (apply_compaction cleared last_input_tokens,
                     // OR our explicit clear above did), so it does NOT
                     // re-terminate.

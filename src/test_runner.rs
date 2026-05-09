@@ -225,6 +225,12 @@ impl TestRunner {
                     // synchronously, then re-enter the loop. The loop guard
                     // (cleared last_input_tokens in apply_compaction)
                     // prevents the hook from re-terminating immediately.
+                    //
+                    // Use build_resumption_for_compaction to get the correct
+                    // resumption prompt (whatever the last message is) and
+                    // history (everything before it). This handles mid-action
+                    // resumption correctly when the last message is not a User
+                    // (e.g., ToolResult from a previous tool call).
                     let compacted = self.state_manager.force_compact().await;
                     if let Some(result) = compacted {
                         self.compaction_events.lock().unwrap().push(CompactionInfo {
@@ -235,13 +241,57 @@ impl TestRunner {
                     } else {
                         // Compaction couldn't make progress (e.g. no
                         // summarizer responses queued in the test, or
-                        // empty body). Manually clear the staleness signal
-                        // so the gate stops firing — break the loop and
-                        // let the request go to the wire. Mirrors the
-                        // production handler in `lib.rs`.
+                        // empty body). The production handler clears the
+                        // staleness signal and lets the request go to the
+                        // wire. In tests, continue with the normal path so
+                        // the agent can still produce a response.
                         self.state_manager.clear_last_input_tokens();
+                        // Continue to re-enter the loop with the normal path.
+                        // This ensures the agent produces a response even
+                        // when compaction fails.
+                        continue;
                     }
-                    history = self.state_manager.get_agent_history();
+
+                    // Try resumption path first (handles mid-action correctly).
+                    // This consumes one response from the main agent queue.
+                    if let Some((prompt, h)) = self.state_manager.build_resumption_for_compaction()
+                    {
+                        // Re-enter the agent loop with the resumption prompt and history.
+                        // The mock agent's prompt_with_history takes `&str`, so
+                        // we need to extract the text content from the prompt.
+                        let prompt_text = extract_prompt_text(&prompt);
+                        let mut history = h;
+                        let result = self
+                            .agent
+                            .prompt_with_history(&prompt_text, &mut history)
+                            .await;
+                        // Process events and check result
+                        self.process_session_hook_events();
+                        match result {
+                            Ok(response) => {
+                                self.state_manager.add_assistant_message(response.clone());
+                                self.state_manager.set_running(false);
+                                return ProcessResult::Success(response);
+                            }
+                            Err(PromptError::PromptCancelled { reason, .. })
+                                if reason == "stop" =>
+                            {
+                                self.state_manager.set_running(false);
+                                return ProcessResult::Stopped;
+                            }
+                            Err(_) => {
+                                self.state_manager.set_running(false);
+                                return ProcessResult::Error;
+                            }
+                        }
+                    }
+
+                    // Fallback path: use continue to re-enter the loop with the normal
+                    // path (build_current_turn_message + get_agent_history). This means
+                    // the main loop will rebuild the prompt/history and call
+                    // prompt_with_history again, consuming a response from the queue.
+                    // The pre-prompt compaction check in the loop will handle any
+                    // edge cases before the next prompt.
                     continue;
                 }
                 Err(PromptError::PromptCancelled { reason, .. }) => {
@@ -305,6 +355,56 @@ impl TestRunner {
     /// Get stats
     pub fn get_stats(&self) -> crate::hooks::SessionStats {
         self.state_manager.get_stats()
+    }
+}
+
+/// Extract text content from a rig Message for the mock agent.
+///
+/// The mock agent's `prompt_with_history` takes `&str`, but after compaction
+/// we may need to resume with any message type (User, Agent, ToolResult).
+/// This helper extracts human-readable text from whichever variant is present.
+fn extract_prompt_text(msg: &rig::completion::message::Message) -> String {
+    use rig::completion::message::{AssistantContent, ToolResultContent, UserContent};
+
+    match msg {
+        rig::completion::message::Message::User { content } => {
+            // OneOrMany has first + rest fields, not enum variants.
+            // Check for ToolResult content first (from build_resumption_for_compaction).
+            let first = content.first_ref();
+            if let UserContent::ToolResult(tr) = first {
+                // ToolResult wraps ToolResultContent::Text
+                let first_content = tr.content.first_ref();
+                if let ToolResultContent::Text(t) = first_content {
+                    return t.text.clone();
+                }
+            }
+            // Fall back to text content
+            let mut texts = Vec::new();
+            if let UserContent::Text(t) = first {
+                texts.push(t.text.clone());
+            }
+            for item in content.rest() {
+                if let UserContent::Text(t) = item {
+                    texts.push(t.text.clone());
+                }
+            }
+            texts.join(" ")
+        }
+        rig::completion::message::Message::Assistant { content, .. } => {
+            // OneOrMany has first + rest fields, not enum variants.
+            let mut texts = Vec::new();
+            if let AssistantContent::Text(t) = content.first_ref() {
+                texts.push(t.text.clone());
+            }
+            for item in content.rest() {
+                if let AssistantContent::Text(t) = item {
+                    texts.push(t.text.clone());
+                }
+            }
+            texts.join(" ")
+        }
+        // System messages don't have text content in the same way
+        rig::completion::message::Message::System { .. } => String::new(),
     }
 }
 
