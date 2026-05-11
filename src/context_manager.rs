@@ -10,6 +10,7 @@ use crate::config::ContextConfig;
 use crate::providers::CompactionModel;
 use crate::state::StateManager;
 use crate::ui::app_state::ChatMessage;
+use crate::utils::truncate_to_char_boundary;
 use anyhow::{Context as AnyhowContext, Result};
 use std::sync::Arc;
 
@@ -276,14 +277,15 @@ fn format_chat_messages_for_summary(messages: &[&ChatMessage]) -> String {
             MessageRole::ToolCall => {
                 let name = msg.tool_name.as_deref().unwrap_or("unknown");
                 let args = msg.tool_args.as_deref().unwrap_or("{}");
-                // Truncate args to avoid blowing up the summary prompt
-                let args_short = truncate_str(args, 200);
+                // Truncate args to avoid blowing up the summary prompt.
+                // UTF-8 safe — see crate::utils::strings.
+                let args_short = truncate_to_char_boundary(args, 200);
                 output.push_str(&format!("Assistant [called {}({})]\n\n", name, args_short));
             }
             MessageRole::ToolResult => {
                 let name = msg.tool_name.as_deref().unwrap_or("unknown");
                 let result = msg.tool_result.as_deref().unwrap_or("");
-                let result_short = truncate_str(result, 500);
+                let result_short = truncate_to_char_boundary(result, 500);
                 output.push_str(&format!("Tool [{}] returned: {}\n\n", name, result_short));
             }
             MessageRole::Summary => {
@@ -294,19 +296,6 @@ fn format_chat_messages_for_summary(messages: &[&ChatMessage]) -> String {
     }
 
     output
-}
-
-/// Truncate a string to max_len, appending "..." if truncated.
-fn truncate_str(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
-        s
-    } else if max_len < 3 {
-        &s[..max_len]
-    } else {
-        // Find a valid char boundary
-        let end = s.floor_char_boundary(max_len.saturating_sub(3));
-        &s[..end]
-    }
 }
 
 /// Find indices of tool calls in messages[..boundary] that are needed by
@@ -500,11 +489,19 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_str() {
-        assert_eq!(truncate_str("hello", 10), "hello");
-        assert_eq!(truncate_str("hello world", 5), "he");
-        assert_eq!(truncate_str("hi", 1), "h");
-        assert_eq!(truncate_str("", 5), "");
+    fn test_truncate_at_call_sites() {
+        // The two call sites in `build_summary_prompt` rely on
+        // `crate::utils::truncate_to_char_boundary` to stay UTF-8 safe.
+        // Full behavioural tests live in `crate::utils::strings::tests`;
+        // this is just a smoke-pin that the helper resolves and the
+        // call-site budgets are sane.
+        assert_eq!(truncate_to_char_boundary("hello", 200), "hello");
+        assert_eq!(truncate_to_char_boundary("hello world", 5), "hello");
+        // Multi-byte content at the 200/500-byte cuts used in this file
+        // must never panic — regression for the same bug class as #9.
+        let multibyte = format!("a{}", "🦀".repeat(75)); // 301 bytes, boundary 297
+        let cut = truncate_to_char_boundary(&multibyte, 200);
+        assert!(multibyte.is_char_boundary(cut.len()));
     }
 
     #[test]

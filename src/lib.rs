@@ -15,6 +15,7 @@ pub mod storage;
 pub mod test_runner;
 mod tools;
 pub mod ui;
+pub mod utils;
 pub mod vision;
 
 pub use config::{
