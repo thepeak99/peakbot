@@ -7,6 +7,20 @@ use std::time::Duration;
 const MAX_RESPONSE_CHARS: usize = 50_000;
 const MAX_RESULTS_LIMIT: u32 = 20;
 
+/// Truncate `s` to at most `max_bytes` bytes, snapping back to the nearest
+/// UTF-8 character boundary. Returns the full slice if `s` is already short
+/// enough. Never panics on multi-byte content (unlike `&s[..max_bytes]`).
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     #[error("SearXNG is not configured. Set SEARXNG_BASE_URL in config.")]
@@ -335,9 +349,11 @@ impl Tool for SearchTool {
             output.push_str(&format!("   URL: {}\n", result.url));
 
             if let Some(ref content) = result.content {
-                // Truncate long snippets
+                // Truncate long snippets on a UTF-8 char boundary; a naive
+                // byte slice (`&content[..300]`) panics when byte 300 falls
+                // mid-codepoint. See gitea issue #9.
                 let snippet = if content.len() > 300 {
-                    format!("{}...", &content[..300])
+                    format!("{}...", truncate_at_char_boundary(content, 300))
                 } else {
                     content.clone()
                 };
@@ -351,9 +367,13 @@ impl Tool for SearchTool {
             output.push('\n');
         }
 
-        // Truncate if too long
+        // Truncate if too long (same UTF-8 hazard as the snippet truncation
+        // above — the output string contains user-derived content).
         let output = if output.len() > MAX_RESPONSE_CHARS {
-            format!("{}... [truncated]", &output[..MAX_RESPONSE_CHARS])
+            format!(
+                "{}... [truncated]",
+                truncate_at_char_boundary(&output, MAX_RESPONSE_CHARS)
+            )
         } else {
             output
         };
@@ -368,5 +388,65 @@ impl Tool for SearchTool {
         );
 
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_at_char_boundary;
+
+    /// Pin for gitea issue #9: truncating a string containing multi-byte
+    /// UTF-8 at a byte index that falls mid-codepoint must not panic.
+    ///
+    /// Before the fix this assertion was unreachable because the inline
+    /// `&content[..300]` slice in `SearchTool::call` panicked with
+    /// "byte index 300 is not a char boundary".
+    #[test]
+    fn truncate_does_not_panic_on_multibyte_boundary() {
+        // "🦀" is 4 bytes. One ASCII byte + 75 crabs = 1 + 300 = 301 bytes,
+        // with boundaries at 0, 1, 5, 9, …, 297, 301. Byte 300 lands inside
+        // the crab starting at byte 297 — perfectly mid-codepoint.
+        let s = format!("a{}", "🦀".repeat(75));
+        assert_eq!(s.len(), 301);
+        assert!(!s.is_char_boundary(300));
+
+        let out = truncate_at_char_boundary(&s, 300);
+        // Must snap down to the previous valid boundary (297) and never
+        // exceed the byte budget.
+        assert_eq!(out.len(), 297);
+        assert!(s.is_char_boundary(out.len()));
+        assert!(s.starts_with(out));
+    }
+
+    #[test]
+    fn truncate_passthrough_when_short_enough() {
+        assert_eq!(truncate_at_char_boundary("hello", 300), "hello");
+        assert_eq!(truncate_at_char_boundary("", 10), "");
+    }
+
+    #[test]
+    fn truncate_ascii_exact_cut() {
+        let s = "a".repeat(500);
+        let out = truncate_at_char_boundary(&s, 300);
+        assert_eq!(out.len(), 300);
+        assert!(out.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn truncate_zero_budget_returns_empty() {
+        assert_eq!(truncate_at_char_boundary("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_mixed_ascii_and_multibyte() {
+        // 250 ASCII + 50 × 4-byte emoji = 250 + 200 = 450 bytes.
+        // Byte 300 lands inside an emoji starting at byte 250 + 12*4 = 298.
+        let s = format!("{}{}", "a".repeat(250), "🦀".repeat(50));
+        assert!(s.len() > 300);
+        let out = truncate_at_char_boundary(&s, 300);
+        assert!(out.len() <= 300);
+        assert!(s.is_char_boundary(out.len()));
+        // Must be a valid prefix of the original.
+        assert!(s.starts_with(out));
     }
 }
