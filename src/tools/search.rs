@@ -1,4 +1,5 @@
 use crate::SearXngConfig;
+use crate::utils::strings::truncate_to_char_boundary;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -335,9 +336,11 @@ impl Tool for SearchTool {
             output.push_str(&format!("   URL: {}\n", result.url));
 
             if let Some(ref content) = result.content {
-                // Truncate long snippets
+                // Truncate long snippets on a UTF-8 char boundary; a naive
+                // byte slice (`&content[..300]`) panics when byte 300 falls
+                // mid-codepoint. See gitea issue #9.
                 let snippet = if content.len() > 300 {
-                    format!("{}...", &content[..300])
+                    format!("{}...", truncate_to_char_boundary(content, 300))
                 } else {
                     content.clone()
                 };
@@ -351,9 +354,13 @@ impl Tool for SearchTool {
             output.push('\n');
         }
 
-        // Truncate if too long
+        // Truncate if too long (same UTF-8 hazard as the snippet truncation
+        // above — the output string contains user-derived content).
         let output = if output.len() > MAX_RESPONSE_CHARS {
-            format!("{}... [truncated]", &output[..MAX_RESPONSE_CHARS])
+            format!(
+                "{}... [truncated]",
+                truncate_to_char_boundary(&output, MAX_RESPONSE_CHARS)
+            )
         } else {
             output
         };

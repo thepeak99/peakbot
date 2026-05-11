@@ -1,3 +1,4 @@
+use crate::utils::strings::truncate_with_suffix;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -144,7 +145,7 @@ impl Tool for FileReadTool {
 
 fn maybe_truncate(s: &str) -> String {
     if s.len() > MAX_OUTPUT_CHARS {
-        format!("{}{}", &s[..MAX_OUTPUT_CHARS], TRUNCATION_NOTICE)
+        truncate_with_suffix(s, MAX_OUTPUT_CHARS, TRUNCATION_NOTICE)
     } else {
         s.to_string()
     }
