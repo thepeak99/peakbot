@@ -1,3 +1,4 @@
+use crate::utils::strings::truncate_with_suffix;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -83,10 +84,11 @@ impl Tool for FetchUrlTool {
         let body = response.text().await?;
 
         let body = if body.len() > MAX_RESPONSE_CHARS {
-            format!(
-                "{}... [truncated, {} total chars]",
-                &body[..MAX_RESPONSE_CHARS],
-                body.len()
+            let total = body.len();
+            truncate_with_suffix(
+                &body,
+                MAX_RESPONSE_CHARS,
+                &format!("... [truncated, {total} total chars]"),
             )
         } else {
             body
