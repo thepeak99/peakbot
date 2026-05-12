@@ -444,6 +444,37 @@ impl Config {
 
         ModelRegistry::build(&self.providers, self.default_model.as_deref())
     }
+
+    /// Resolve the boot provider config from the registry and mirror it
+    /// into `self.provider`, returning a clone of the resolved value for
+    /// use with `create_provider`.
+    ///
+    /// In multi-model mode the legacy `self.provider` field defaults to
+    /// `OpenRouterConfig { api_key: None, … }` — leftover scaffolding
+    /// that downstream consumers like `AgentRunner::new`'s Layer 1
+    /// compaction-model construction still read. Without this mirror,
+    /// boot fails with a misleading "OpenRouter API key not configured"
+    /// even when the real credentials are sitting in the registry. The
+    /// `/model` switch path already maintains this invariant at
+    /// `lib.rs:1082`; boot must match.
+    ///
+    /// When no registry default alias exists (pure legacy single-
+    /// provider config), `self.provider` is already authoritative — this
+    /// is a no-op that returns its clone.
+    ///
+    /// *(simplicity is the key — one field tracks the active provider)*
+    pub fn resolve_and_mirror_boot_provider(&mut self, registry: &ModelRegistry) -> ProviderConfig {
+        let resolved = match registry.default_alias() {
+            Some(alias) => registry
+                .resolve(alias)
+                .expect("default_alias is guaranteed to resolve by ModelRegistry::build")
+                .provider_config
+                .clone(),
+            None => self.provider.clone(),
+        };
+        self.provider = resolved.clone();
+        resolved
+    }
 }
 
 /// Describe the legacy `provider:` block in a tuple shape that the
@@ -1130,6 +1161,122 @@ mod tests {
         };
         let err = config.build_model_registry().unwrap_err();
         assert!(matches!(err, RegistryError::UnknownDefault { .. }));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Boot-provider mirror pin (regression for the "compaction model
+    // construction failure under multi-model config" bug).
+    //
+    // Background: in multi-model mode (`providers:` + `default_model:`)
+    // the legacy `config.provider` field defaults to
+    // `OpenRouterConfig { api_key: None, … }` — leftover scaffolding.
+    // `AgentRunner::new` reads `config.provider` for Layer 1 boot-time
+    // compaction-model construction. Without explicit mirroring, that
+    // read sees the stale default and bails with "OpenRouter API key
+    // not configured" *even when* the registry's resolved default model
+    // has a real api_key.
+    //
+    // `resolve_and_mirror_boot_provider` is the single source of truth
+    // for "config.provider == active provider after boot". This pin
+    // locks the invariant for the regression case.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn boot_provider_mirror_propagates_credentials_from_registry() {
+        // Pre-fix shape: legacy `provider:` block is at its default
+        // (api_key: None), but the `providers:` list has the real key.
+        let mut config = Config {
+            providers: vec![ProviderEntry {
+                name: "openrouter".into(),
+                kind: ProviderType::OpenRouter,
+                api_key: Some("sk-or-real-key".into()),
+                base_url: None,
+                models: vec![ModelEntry {
+                    name: "anthropic/claude-3.7-sonnet".into(),
+                    alias: Some("sonnet".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    extra_params: None,
+                    context_size: None,
+                }],
+            }],
+            default_model: Some("sonnet".into()),
+            ..Config::default()
+        };
+
+        // Precondition: the stale default `config.provider` has no key.
+        match &config.provider {
+            ProviderConfig::OpenRouter(c) => {
+                assert!(
+                    c.api_key.is_none(),
+                    "test precondition: stale default config.provider has no api_key"
+                );
+            }
+            other => panic!("expected default OpenRouter, got {other:?}"),
+        }
+
+        let registry = config.build_model_registry().expect("registry builds");
+        let resolved = config.resolve_and_mirror_boot_provider(&registry);
+
+        // Invariant 1: the returned resolved config carries the real key.
+        match &resolved {
+            ProviderConfig::OpenRouter(c) => {
+                assert_eq!(
+                    c.api_key.as_deref(),
+                    Some("sk-or-real-key"),
+                    "resolved provider must carry registry credentials"
+                );
+            }
+            other => panic!("expected OpenRouter, got {other:?}"),
+        }
+
+        // Invariant 2 (load-bearing): `config.provider` was mirrored —
+        // this is the field `AgentRunner::new` reads for compaction.
+        match &config.provider {
+            ProviderConfig::OpenRouter(c) => {
+                assert_eq!(
+                    c.api_key.as_deref(),
+                    Some("sk-or-real-key"),
+                    "config.provider must mirror resolved credentials \
+                     so AgentRunner::new's Layer 1 compaction-model \
+                     construction sees the real api_key"
+                );
+            }
+            other => panic!("expected OpenRouter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boot_provider_mirror_legacy_config_is_noop() {
+        // Pure legacy single-provider config: no `providers:` block,
+        // `config.provider` is already authoritative. The mirror should
+        // not corrupt or empty it.
+        let mut config = Config {
+            provider: ProviderConfig::OpenRouter(OpenRouterConfig {
+                api_key: Some("sk-legacy".into()),
+                model: "anthropic/claude-3.5-sonnet".into(),
+                max_tokens: 4096,
+            }),
+            ..Config::default()
+        };
+        let registry = config.build_model_registry().expect("legacy synth builds");
+        let resolved = config.resolve_and_mirror_boot_provider(&registry);
+
+        match &resolved {
+            ProviderConfig::OpenRouter(c) => {
+                assert_eq!(c.api_key.as_deref(), Some("sk-legacy"));
+                assert_eq!(c.model, "anthropic/claude-3.5-sonnet");
+            }
+            other => panic!("expected OpenRouter, got {other:?}"),
+        }
+        // `config.provider` is unchanged in shape and credentials.
+        match &config.provider {
+            ProviderConfig::OpenRouter(c) => {
+                assert_eq!(c.api_key.as_deref(), Some("sk-legacy"));
+                assert_eq!(c.model, "anthropic/claude-3.5-sonnet");
+            }
+            other => panic!("expected OpenRouter, got {other:?}"),
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
