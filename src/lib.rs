@@ -334,8 +334,10 @@ impl AgentRunner {
                     config.context.compaction_model.as_deref(),
                 )
                 .with_context(|| {
-                    "Failed to construct compaction model — compaction is enabled in \
-                     context.enabled. Set context.enabled=false to start without it."
+                    "Failed to construct compaction model for the active provider. \
+                     The active provider config is what's read for compaction (same \
+                     credentials as the main model). To boot without compaction, set \
+                     `context.enabled: false` in config.yaml."
                 })?;
                 Some(Arc::new(model))
             } else {

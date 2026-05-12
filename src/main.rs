@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
         .init();
 
     // ── Shared setup ──────────────────────────────────────────────
-    let config = Config::load()?;
+    let mut config = Config::load()?;
     let skills = load_default_skills()?;
     let skills_count = skills.len(); // Keep count before moving skills
     let system_prompt = build_system_prompt(&skills);
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
 
     let searxng_config = config
         .searxng_enabled()
-        .then_some(config.searxng.as_ref())
+        .then_some(config.searxng.clone())
         .flatten();
 
     // Create conversation storage if enabled
@@ -102,28 +102,21 @@ async fn main() -> Result<()> {
     // the wire id). The provider itself doesn't need to know the value;
     // `ContextManager` is the single consumer downstream.
     //
-    // Boot path: when a multi-model `providers:` block was declared, the
-    // registry's default model owns the live credentials/wire id. The
-    // legacy `Config::provider` field is just `OpenRouterConfig::default()`
-    // in that case (api_key=None, model="anthropic/claude-3.7-sonnet"),
-    // so handing that to `create_provider` reliably surfaces a misleading
-    // "OpenRouter API key not configured" — the bug we just fixed.
-    // *(reuse the seam that already exists)*
-    let boot_provider_config: &peakbot::ProviderConfig = match model_registry.default_alias() {
-        Some(alias) => {
-            &model_registry
-                .resolve(alias)
-                .expect("default_alias is guaranteed to resolve by ModelRegistry::build")
-                .provider_config
-        }
-        None => &config.provider,
-    };
+    // Boot path: `resolve_and_mirror_boot_provider` looks up the active
+    // model in the registry, copies its provider config into
+    // `config.provider`, and hands back the resolved value. The mirror
+    // keeps the invariant that `config.provider` == active provider,
+    // matching the `/model` switch path at `lib.rs:1082`. Without it,
+    // `AgentRunner::new`'s compaction-model construction reads the
+    // stale `OpenRouterConfig::default()` (api_key=None) and falls over
+    // with a misleading "OpenRouter API key not configured" error.
+    let boot_provider_config = config.resolve_and_mirror_boot_provider(&model_registry);
 
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
-        boot_provider_config,
+        &boot_provider_config,
         mcp_tools,
         &system_prompt,
-        searxng_config,
+        searxng_config.as_ref(),
         config.agent_max_turns,
         Some(todo_tool.clone()),
         &config.bash,
