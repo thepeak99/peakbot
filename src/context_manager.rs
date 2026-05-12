@@ -8,7 +8,6 @@
 
 use crate::config::ContextConfig;
 use crate::providers::CompactionModel;
-use crate::state::StateManager;
 use crate::ui::app_state::ChatMessage;
 use crate::utils::truncate_to_char_boundary;
 use anyhow::{Context as AnyhowContext, Result};
@@ -73,13 +72,26 @@ pub struct CompactionPlan {
 }
 
 /// Manages context size usage and performs compaction when needed.
-/// Uses actual token counts from StateManager.
+///
+/// **Stateless by design.** The manager owns no back-reference to
+/// `StateManager` — every method that depends on runtime state (token
+/// counts, message lists) takes that state as an explicit argument.
+/// This is what kept the previous design honest:
+///
+/// 1. **No cyclic Arc.** `StateManager` owns `ContextManager` directly;
+///    `ContextManager` does not own `StateManager`. The previous
+///    `Arc<StateManager>` back-ref formed a strong-count cycle that
+///    leaked at shutdown.
+/// 2. **No deadlock.** Holding a lock on the StateManager-owned
+///    `ContextManager` slot across `.await` (as `force_compact` used
+///    to do) was a deadlock waiting to fire — the awaited future
+///    re-entered StateManager through the back-reference. With the
+///    back-ref gone, callers clone the manager out under a brief read
+///    guard, drop the guard, and `.await` on the clone.
 #[derive(Clone)]
 pub(crate) struct ContextManager {
     config: ContextConfig,
     context_size: usize,
-    /// Reference to StateManager for stats
-    state_manager: Arc<StateManager>,
     /// Tool-free model for summarization (independent call, no tools)
     compaction_model: Option<Arc<CompactionModel>>,
 }
@@ -94,13 +106,11 @@ impl ContextManager {
     pub fn new(
         config: ContextConfig,
         context_size: usize,
-        state_manager: Arc<StateManager>,
         compaction_model: Option<Arc<CompactionModel>>,
     ) -> Self {
         Self {
             config,
             context_size,
-            state_manager,
             compaction_model,
         }
     }
@@ -126,16 +136,12 @@ impl ContextManager {
         ((self.context_size as f64) * self.config.threshold) as usize
     }
 
-    /// Get current total tokens from actual API response.
-    /// Uses the LAST request's input tokens (actual context size), not cumulative sum.
-    pub fn get_current_tokens(&self) -> usize {
-        let stats_arc = self.state_manager.stats_arc();
-        let stats = stats_arc.lock().unwrap();
-        stats.last_input_tokens().unwrap_or(0) as usize
-    }
-
     /// Check if compaction is needed based on uncompacted message count and token usage.
-    pub fn needs_compaction(&self, uncompacted_count: usize) -> bool {
+    ///
+    /// `current_tokens` is the most recent API-reported input-token count.
+    /// Pass `0` when not yet available — the message-count fallback then
+    /// kicks in. Typically: `SessionStats::last_input_tokens().unwrap_or(0) as usize`.
+    pub fn needs_compaction(&self, uncompacted_count: usize, current_tokens: usize) -> bool {
         if !self.config.enabled {
             return false;
         }
@@ -144,10 +150,8 @@ impl ContextManager {
             return false;
         }
 
-        // Check actual token count if available
-        let tokens = self.get_current_tokens();
-        if tokens > 0 {
-            return tokens > self.threshold();
+        if current_tokens > 0 {
+            return current_tokens > self.threshold();
         }
 
         // Fallback: message count (when no token data is available yet)
@@ -155,14 +159,14 @@ impl ContextManager {
         uncompacted_count > threshold_messages
     }
 
-    /// Get current token usage as a percentage (0.0 - 1.0)
+    /// Get current token usage as a percentage (0.0 - 1.0).
+    /// Caller passes the live token count — see `needs_compaction`.
     #[allow(dead_code)]
-    pub(crate) fn usage_percentage(&self) -> f64 {
-        let total = self.get_current_tokens();
-        if total == 0 {
+    pub(crate) fn usage_percentage(&self, current_tokens: usize) -> f64 {
+        if current_tokens == 0 {
             return 0.0;
         }
-        total as f64 / self.context_size as f64
+        current_tokens as f64 / self.context_size as f64
     }
 
     /// Produce a CompactionPlan by summarizing older messages.
@@ -242,13 +246,12 @@ impl ContextManager {
 
     /// Format context status for display
     #[allow(dead_code)]
-    pub(crate) fn format_status(&self) -> String {
-        let total_tokens = self.get_current_tokens();
-        let usage_pct = self.usage_percentage();
+    pub(crate) fn format_status(&self, current_tokens: usize) -> String {
+        let usage_pct = self.usage_percentage(current_tokens);
 
         format!(
             "Context: {} / {} tokens ({:.1}%)\nCompaction threshold: {}% ({})\nEnabled: {}",
-            total_tokens,
+            current_tokens,
             self.context_size,
             usage_pct * 100.0,
             (self.config.threshold * 100.0) as usize,
@@ -537,15 +540,13 @@ mod tests {
     /// a per-model-vs-global tug-of-war upstream.
     #[test]
     fn context_size_is_stored_verbatim_and_drives_threshold() {
-        use crate::state::StateManager;
-        let sm = Arc::new(StateManager::new());
         let cfg = ContextConfig {
             threshold: 0.8,
             keep_recent: 5,
             enabled: true,
             compaction_model: None,
         };
-        let cm = ContextManager::new(cfg, 50_000, sm, None);
+        let cm = ContextManager::new(cfg, 50_000, None);
         assert_eq!(cm.context_size(), 50_000);
         // 50_000 × 0.8 = 40_000
         assert_eq!(cm.threshold(), 40_000);

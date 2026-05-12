@@ -798,4 +798,75 @@ mod tests {
         };
         _takes_into_message(multimodal);
     }
+
+    // -----------------------------------------------------------------
+    // Layer 1 — boot-time validation pins (see unfuck-compact.md).
+    //
+    // The boot path at `lib.rs:325` and the model-switch path at
+    // `lib.rs:1015` rely on `create_compaction_model` returning `Err`
+    // when the provider can't be constructed. These pins lock that
+    // contract for the providers where the failure mode is testable
+    // without a network round-trip (i.e. missing API key).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn create_compaction_model_fails_when_openai_api_key_missing() {
+        // OpenAI explicitly checks `api_key.is_some()` and returns
+        // `"OpenAI API key not configured"`. With Layer 1 in place, this
+        // error propagates up `lib.rs:339` (`?` after `with_context`) and
+        // aborts boot when `context.enabled == true`.
+        let cfg = ProviderConfig::OpenAI(crate::config::OpenAIConfig {
+            api_key: None,
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+        });
+        let result = create_compaction_model(&cfg, None);
+        assert!(
+            result.is_err(),
+            "missing api_key must surface as an error, not a silent default"
+        );
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("OpenAI API key not configured"),
+            "error chain should mention the missing key; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_compaction_model_fails_when_openrouter_api_key_missing() {
+        // Parallel pin for OpenRouter. Same boot-path contract.
+        let cfg = ProviderConfig::OpenRouter(crate::config::OpenRouterConfig {
+            api_key: None,
+            model: "anthropic/claude-3.5-sonnet".to_string(),
+            max_tokens: 1024,
+        });
+        let result = create_compaction_model(&cfg, None);
+        assert!(result.is_err(), "missing api_key must surface as an error");
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("OpenRouter API key not configured"),
+            "error chain should mention the missing key; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_compaction_model_honours_model_override() {
+        // Sanity pin: the `model_override` param is what `lib.rs` threads
+        // through as `config.context.compaction_model`. If it's silently
+        // ignored, the user's "use a cheaper model for compaction"
+        // contract breaks. We can't observe the wire payload here, but we
+        // can confirm the override path doesn't error on a well-formed
+        // Ollama config (no API key required → succeeds even offline).
+        let cfg = ProviderConfig::Ollama(crate::config::OllamaConfig {
+            base_url: "http://localhost:11434".to_string(),
+            model: "llama3".to_string(),
+            temperature: None,
+        });
+        let result = create_compaction_model(&cfg, Some("qwen2.5-coder:7b"));
+        assert!(
+            result.is_ok(),
+            "Ollama construction shouldn't fail on a well-formed config (offline)"
+        );
+    }
 }

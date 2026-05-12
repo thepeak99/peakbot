@@ -191,7 +191,7 @@ async fn main() -> Result<()> {
         Some(state_manager.clone()),
         session_hook,
         boot_context_size,
-    )
+    )?
     .with_rebuild_context(rebuild_ctx);
 
     // Set up welcome banner state

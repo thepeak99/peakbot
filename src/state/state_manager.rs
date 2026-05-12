@@ -26,10 +26,10 @@ pub struct StateManager {
     todo_list: Arc<Mutex<TodoList>>,
     subscribers: Arc<RwLock<Vec<mpsc::Sender<AppState>>>>,
     stats: Arc<Mutex<SessionStats>>,
-
-    // ── Context Compaction ───────────────────────────────────────────────────
-    context_manager: Mutex<Option<ContextManager>>,
-    system_prompt: RwLock<String>,
+    // `RwLock` because the slot is overwritten on `/model` switch (see
+    // `lib.rs` rebuild path). `ContextManager` itself is stateless; the lock
+    // protects the *slot*, not internal state.
+    context_manager: RwLock<Option<ContextManager>>,
     self_ref: RwLock<Option<Weak<Self>>>, // For spawning async compaction tasks
 
     // ── Conversation Persistence ──────────────────────────────────────────────
@@ -67,8 +67,7 @@ impl StateManager {
             todo_list: Arc::new(Mutex::new(TodoList::new())),
             subscribers: Arc::new(RwLock::new(Vec::new())),
             stats: Arc::new(Mutex::new(SessionStats::new())),
-            context_manager: Mutex::new(None),
-            system_prompt: RwLock::new(String::new()),
+            context_manager: RwLock::new(None),
             self_ref: RwLock::new(None),
             storage,
             current_conversation: Arc::new(Mutex::new(None)),
@@ -79,7 +78,7 @@ impl StateManager {
     // ── Context Compaction ──────────────────────────────────────────────────────
 
     /// Initialize the context manager for automatic compaction.
-    pub(crate) fn init_context_manager(&self, cm: ContextManager, system_prompt: String) {
+    pub(crate) fn init_context_manager(&self, cm: ContextManager) {
         // Seed AppState.context so the status bar can render immediately.
         {
             let mut state = self.state.write().unwrap();
@@ -88,8 +87,7 @@ impl StateManager {
             state.context.compaction_threshold = cm.threshold_fraction();
         }
 
-        *self.context_manager.lock().unwrap() = Some(cm);
-        *self.system_prompt.write().unwrap() = system_prompt;
+        *self.context_manager.write().unwrap() = Some(cm);
 
         let state = self.state.read().unwrap();
         self.notify_update(&state);
@@ -119,12 +117,17 @@ impl StateManager {
     }
 
     /// Check if compaction is needed and run it (async).
+    ///
+    /// Reads the `ContextManager` slot under a brief read guard, clones it
+    /// out, drops the guard, and awaits on the clone — the lock is **never**
+    /// live across `.await`. See the field-level comment on `context_manager`.
     pub async fn compact_if_needed(&self) -> Option<CompactionResult> {
         let cm_clone = {
-            let guard = self.context_manager.lock().unwrap();
+            let guard = self.context_manager.read().unwrap();
             let cm = guard.as_ref()?;
             let uncompacted = self.uncompacted_message_count();
-            if !cm.needs_compaction(uncompacted) {
+            let current_tokens = self.current_input_tokens();
+            if !cm.needs_compaction(uncompacted, current_tokens) {
                 return None;
             }
             cm.clone()
@@ -134,12 +137,14 @@ impl StateManager {
     }
 
     /// Force compaction regardless of threshold. Returns the result.
+    ///
+    /// Same lock discipline as `compact_if_needed`: clone the manager out
+    /// before any `.await`.
     pub async fn force_compact(&self) -> Option<CompactionResult> {
         let cm_clone = {
-            let guard = self.context_manager.lock().unwrap();
+            let guard = self.context_manager.read().unwrap();
             guard.as_ref()?.clone()
         };
-
         self.run_compaction(&cm_clone).await
     }
 
@@ -147,11 +152,21 @@ impl StateManager {
     /// `SessionHook::on_completion_call` consults to terminate the agentic loop.
     /// Returns `false` when no `ContextManager` is initialized.
     pub fn needs_compaction(&self) -> bool {
-        let guard = self.context_manager.lock().unwrap();
+        let guard = self.context_manager.read().unwrap();
         let Some(cm) = guard.as_ref() else {
             return false;
         };
-        cm.needs_compaction(self.uncompacted_message_count())
+        cm.needs_compaction(
+            self.uncompacted_message_count(),
+            self.current_input_tokens(),
+        )
+    }
+
+    /// Read the most recent API-reported input-token count.
+    /// Returns `0` when no API response has been seen yet — that signals
+    /// `ContextManager` to fall back to the message-count heuristic.
+    fn current_input_tokens(&self) -> usize {
+        self.stats.lock().unwrap().last_input_tokens().unwrap_or(0) as usize
     }
 
     /// Clear the live `last_input_tokens` signal without touching cumulative stats.
@@ -2083,8 +2098,8 @@ mod tests {
             compaction_model: None,
         };
         // No compaction model — we're not exercising compact() here.
-        let cm = ContextManager::new(cfg, window, sm.clone(), None);
-        sm.init_context_manager(cm, String::new());
+        let cm = ContextManager::new(cfg, window, None);
+        sm.init_context_manager(cm);
         sm
     }
 
@@ -2204,8 +2219,8 @@ mod tests {
         #[cfg(not(feature = "mock"))]
         let compaction_model = None;
 
-        let cm = ContextManager::new(cfg, 1_000, sm.clone(), compaction_model);
-        sm.init_context_manager(cm, String::new());
+        let cm = ContextManager::new(cfg, 1_000, compaction_model);
+        sm.init_context_manager(cm);
 
         // Pile up enough messages to give compaction something to do.
         // (No fire-and-forget compaction fires from message-adds anymore —

@@ -124,13 +124,8 @@ impl TestRunner {
         #[cfg(not(feature = "mock"))]
         let compaction_model = None;
 
-        let cm = ContextManager::new(
-            context_config,
-            context_size,
-            state_manager.clone(),
-            compaction_model,
-        );
-        state_manager.init_context_manager(cm, system_prompt.clone());
+        let cm = ContextManager::new(context_config, context_size, compaction_model);
+        state_manager.init_context_manager(cm);
 
         Self {
             agent,
@@ -232,25 +227,26 @@ impl TestRunner {
                     // resumption correctly when the last message is not a User
                     // (e.g., ToolResult from a previous tool call).
                     let compacted = self.state_manager.force_compact().await;
-                    if let Some(result) = compacted {
-                        self.compaction_events.lock().unwrap().push(CompactionInfo {
-                            original_count: result.original_count,
-                            compacted_count: result.compacted_count,
-                            num_discarded: result.num_discarded,
-                        });
-                    } else {
-                        // Compaction couldn't make progress (e.g. no
-                        // summarizer responses queued in the test, or
-                        // empty body). The production handler clears the
-                        // staleness signal and lets the request go to the
-                        // wire. In tests, continue with the normal path so
-                        // the agent can still produce a response.
-                        self.state_manager.clear_last_input_tokens();
-                        // Continue to re-enter the loop with the normal path.
-                        // This ensures the agent produces a response even
-                        // when compaction fails.
-                        continue;
-                    }
+                    let Some(result) = compacted else {
+                        // Compaction failed — abort the turn with an error.
+                        // No retry, no clear_last_input_tokens dance.
+                        // The next user turn gets a fresh attempt.
+                        // See unfuck-compact.md Layer 2.
+                        self.state_manager.add_system_message(
+                            "❌ Compaction failed — the conversation could not be summarised. \
+                             Aborting this turn. Try a new conversation, or check your \
+                             compaction model configuration."
+                                .to_string(),
+                        );
+                        self.state_manager.set_running(false);
+                        return ProcessResult::Error;
+                    };
+
+                    self.compaction_events.lock().unwrap().push(CompactionInfo {
+                        original_count: result.original_count,
+                        compacted_count: result.compacted_count,
+                        num_discarded: result.num_discarded,
+                    });
 
                     // Try resumption path first (handles mid-action correctly).
                     // This consumes one response from the main agent queue.
