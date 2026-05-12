@@ -445,14 +445,16 @@ async fn summary_persists_to_state_manager() {
     );
 }
 
-/// 2.4 — Summarization failure is gracefully handled.
+/// 2.4 — Compaction failure aborts the turn with an error.
 ///
 /// Queue no compaction response so the summarization call errors.
-/// Compaction should fail silently and the agent continues normally.
+/// After the unfuck-compact fix, compaction failure is a hard error:
+/// the turn aborts with ProcessResult::Error and a system message.
+/// "Honest failure is the right behaviour" — no silent degradation.
 #[tokio::test]
-async fn summarization_failure_is_graceful() {
+async fn compaction_failure_aborts_turn() {
     let config = ContextConfig {
-        threshold: 0.5,
+        threshold: 0.5, // 150 tokens
         keep_recent: 1,
         enabled: true,
         compaction_model: None,
@@ -465,20 +467,19 @@ async fn summarization_failure_is_graceful() {
     harness.add_response(agent_response("R1", 200));
     // Turn 2: compaction fires, tries to summarize via compaction model,
     // but no compaction response is queued — summarization fails.
-    // The agent should still respond normally.
-    harness.add_response(agent_response("R2", 200));
+    // The turn should abort with an error.
+    harness.add_response(agent_response("WONT_BE_SEEN", 200));
 
     harness.run_message("M1").await;
     let response = harness.run_message("M2").await;
 
-    // Agent should still respond (compaction failure doesn't crash the agent)
-    assert!(
-        !response.is_empty() && response != "Error occurred",
-        "Agent should still respond after summarization failure. Got: {}",
-        response
+    // Compaction failure is now a hard error — the turn aborts.
+    assert_eq!(
+        response, "Error occurred",
+        "Compaction failure must abort the turn with an error. Got: {response}"
     );
 
-    // No compaction should have occurred (summarization failed)
+    // No compaction should have succeeded
     assert!(
         !harness.has_compaction_occurred(),
         "Compaction should not have succeeded with no summarization response"
@@ -672,7 +673,12 @@ async fn token_stats_pipeline_ordering() {
 // Phase 4: Verify Queue Consumption
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// 4.1 — A compaction turn consumes exactly 2 responses (1 summarization + 1 regular).
+/// 4.1 — A turn with pre-prompt compaction consumes exactly 1 main-agent response.
+///
+/// With the independent compaction model, summarization goes to the separate
+/// compaction model. Pre-prompt compaction fires when the previous turn's
+/// token count exceeds the threshold. Each compaction turn consumes 1 main
+/// agent response (the summarization is transparent to the main queue).
 #[tokio::test]
 async fn compaction_turn_consumes_two_responses() {
     let config = ContextConfig {
@@ -687,6 +693,9 @@ async fn compaction_turn_consumes_two_responses() {
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
+    // Two compaction responses: M2's pre-prompt compaction consumes the
+    // first; M3's pre-prompt compaction consumes the second.
+    harness.add_compaction_response(summarization_response());
     harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 300));
 
@@ -742,7 +751,9 @@ async fn non_compaction_turn_consumes_one_response() {
 /// 4.3 — Queue consumption is consistent across all turns.
 ///
 /// Verify the per-turn consumption pattern for a multi-turn conversation
-/// where compaction triggers once.
+/// where pre-prompt compaction triggers on M2 and M3 (300 tokens > 250
+/// threshold) but not on M4 (100 tokens < threshold). Two compaction
+/// responses are queued: one for M2, one for M3.
 #[tokio::test]
 async fn queue_consumption_pattern_across_turns() {
     let config = ContextConfig {
@@ -757,6 +768,8 @@ async fn queue_consumption_pattern_across_turns() {
 
     harness.add_response(agent_response("R1", 300));
     harness.add_response(agent_response("R2", 300));
+    // M2's pre-prompt compaction consumes the first; M3's consumes the second.
+    harness.add_compaction_response(summarization_response());
     harness.add_compaction_response(summarization_response());
     harness.add_response(agent_response("R3", 100));
     harness.add_response(agent_response("R4", 100));
@@ -1244,5 +1257,146 @@ async fn terminate_compact_with_no_progress_does_not_loop_forever() {
     assert!(
         !response.starts_with("Error"),
         "response must not be an error: {response}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 8: Death-spiral regression (unfuck-compact.md)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 8.1 — **Load-bearing spiral pin**: force_compact returning None must
+/// abort the turn in one iteration, not loop forever.
+///
+/// Setup: keep_recent=1, threshold=0.5 (150 of 300). Build 12 messages
+/// (6 turns × 200-token responses) without queueing any compaction
+/// summaries. After 6 turns, the message-count fallback threshold
+/// max(1×3, 10) = 10 is exceeded. On turn 7:
+///
+/// 1. compact_if_needed fires → summarization fails → None
+/// 2. prompt fires → hook sees needs_compaction true → terminate("compact")
+/// 3. "compact" arm: force_compact → None
+/// 4. **Before fix**: clear_last_input_tokens + continue → infinite spiral
+///    (hook terminates before wire call, no mock response consumed)
+/// 5. **After fix**: return ProcessResult::Error immediately
+///
+/// The timeout catches the infinite spiral on the broken code.
+#[tokio::test]
+async fn force_compact_none_aborts_turn_in_one_iteration() {
+    let config = ContextConfig {
+        threshold: 0.5, // 150 tokens of 300
+        keep_recent: 1,
+        enabled: true,
+        compaction_model: None,
+    };
+
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
+
+    // Build 12 messages (6 turns). keep_recent=1, fallback threshold = max(3,10) = 10.
+    // 12 > 10 → message-count fallback triggers even after clear_last_input_tokens.
+    for _ in 0..6 {
+        harness.add_response(agent_response("HISTORY", 200));
+    }
+    // NO compaction responses — summarization will always fail.
+    // One extra response (won't be reached after the fix).
+    harness.add_response(agent_response("WONT_SEE_THIS", 200));
+
+    for i in 0..6 {
+        harness.run_message(&format!("M{i}")).await;
+    }
+
+    // Turn 7: triggers the death spiral on broken code.
+    // After fix: returns Error immediately.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        harness.run_message("TRIGGER"),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "Turn must complete within 5 seconds — no infinite spiral"
+    );
+    let response = result.unwrap();
+    assert_eq!(
+        response, "Error occurred",
+        "force_compact returning None must abort the turn. Got: {response}"
+    );
+
+    // History must be bounded — no clone amplification.
+    let history = harness.get_chat_history();
+    assert!(
+        history.len() < 30,
+        "History must not grow unboundedly during spiral. Got {} messages",
+        history.len()
+    );
+}
+
+/// 8.2 — Happy-path regression: compaction succeeds, turn completes normally.
+#[tokio::test]
+async fn force_compact_success_completes_turn() {
+    let config = ContextConfig {
+        threshold: 0.5, // 150 tokens of 300
+        keep_recent: 1,
+        enabled: true,
+        compaction_model: None,
+    };
+
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
+
+    harness.add_response(agent_response("R1", 200));
+    harness.add_compaction_response(summarization_response_with("GOOD_SUMMARY"));
+    harness.add_response(agent_response("R2", 200));
+
+    harness.run_message("M1").await;
+    let response = harness.run_message("M2").await;
+
+    // Compaction succeeds — turn completes normally.
+    assert!(
+        !response.is_empty() && !response.starts_with("Error"),
+        "Successful compaction must produce a normal response. Got: {response}"
+    );
+    assert!(
+        harness.has_compaction_occurred(),
+        "Compaction must have occurred"
+    );
+}
+
+/// 8.3 — Bail-once pin: compaction failure does not carry state across turns.
+///
+/// Two sequential prompts. First triggers compaction failure (bails).
+/// Second attempts compaction again — no carry-over "broken" state.
+#[tokio::test]
+async fn compaction_failure_does_not_carry_across_turns() {
+    let config = ContextConfig {
+        threshold: 0.5, // 150 tokens of 300
+        keep_recent: 1,
+        enabled: true,
+        compaction_model: None,
+    };
+
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 300);
+
+    // Build history first
+    harness.add_response(agent_response("R1", 200));
+    // Turn 2: compaction fails (no summary) → error
+    harness.add_response(agent_response("WONT_SEE", 200));
+    // Turn 3: compaction fails again (no summary) → error (fresh attempt)
+    harness.add_response(agent_response("WONT_SEE_EITHER", 200));
+
+    harness.run_message("M1").await;
+    let r2 = harness.run_message("M2").await;
+    let r3 = harness.run_message("M3").await;
+
+    // Both turns fail independently — no persistent "compaction broken" flag.
+    assert_eq!(
+        r2, "Error occurred",
+        "Turn 2 must abort on compaction failure"
+    );
+    assert_eq!(
+        r3, "Error occurred",
+        "Turn 3 must also abort (fresh attempt, no carry-over)"
     );
 }

@@ -55,7 +55,7 @@ pub use tools::{
 };
 pub use ui::{Ui, UiAction};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -319,30 +319,39 @@ impl AgentRunner {
         state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
         context_size: usize,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let agent = Arc::new(agent);
-        let system_prompt = build_system_prompt(&skills);
 
         // Initialize ContextManager inside StateManager (StateManager owns it)
         if let Some(ref sm) = state_manager {
-            // Create a tool-free compaction model from the same provider
-            let compaction_model = crate::providers::create_compaction_model(
-                &config.provider,
-                config.context.compaction_model.as_deref(),
-            )
-            .ok()
-            .map(Arc::new);
+            // Create a tool-free compaction model from the same provider.
+            // When compaction is enabled, a construction failure is fatal —
+            // refuse to boot rather than silently degrade into the death
+            // spiral.  See unfuck-compact.md Layer 1.
+            let compaction_model = if config.context.enabled {
+                let model = crate::providers::create_compaction_model(
+                    &config.provider,
+                    config.context.compaction_model.as_deref(),
+                )
+                .with_context(|| {
+                    "Failed to construct compaction model — compaction is enabled in \
+                     context.enabled. Set context.enabled=false to start without it."
+                })?;
+                Some(Arc::new(model))
+            } else {
+                crate::providers::create_compaction_model(
+                    &config.provider,
+                    config.context.compaction_model.as_deref(),
+                )
+                .ok()
+                .map(Arc::new)
+            };
 
-            let cm = ContextManager::new(
-                config.context.clone(),
-                context_size,
-                sm.clone(),
-                compaction_model,
-            );
-            sm.init_context_manager(cm, system_prompt.clone());
+            let cm = ContextManager::new(config.context.clone(), context_size, compaction_model);
+            sm.init_context_manager(cm);
         }
 
-        Self {
+        Ok(Self {
             agent,
             config,
             provider_info,
@@ -351,7 +360,7 @@ impl AgentRunner {
             session_hook,
             event_receiver,
             rebuild_ctx: None,
-        }
+        })
     }
 
     /// Attach a [`RebuildContext`] so `/model` switches can rebuild
@@ -1000,6 +1009,33 @@ impl AgentRunner {
         state_manager: &Option<Arc<StateManager>>,
         ctx: &RebuildContext,
     ) -> Result<(), String> {
+        // Validate compaction model *before* mutating any state. When
+        // compaction is enabled, a construction failure is fatal for the
+        // switch — bail early with an honest error rather than silently
+        // degrading.  See unfuck-compact.md Layer 1.
+        let context_size = resolved.context_size;
+        let compaction_model = if config.context.enabled {
+            let model = crate::providers::create_compaction_model(
+                &resolved.provider_config,
+                config.context.compaction_model.as_deref(),
+            )
+            .map_err(|e| {
+                format!(
+                    "compaction model unavailable for `{}`: {e} — \
+                     set context.enabled=false to switch without compaction",
+                    resolved.alias
+                )
+            })?;
+            Some(Arc::new(model))
+        } else {
+            crate::providers::create_compaction_model(
+                &resolved.provider_config,
+                config.context.compaction_model.as_deref(),
+            )
+            .ok()
+            .map(Arc::new)
+        };
+
         // Rebuild MCP tool list from the long-lived handles. McpTool
         // implements Clone (rig 0.33), so we get a fresh Vec without
         // restarting any subprocess. See agents.md / multi-model.md.
@@ -1014,8 +1050,6 @@ impl AgentRunner {
             }
             Some(all)
         };
-
-        let context_size = resolved.context_size;
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
             &resolved.provider_config,
@@ -1047,21 +1081,10 @@ impl AgentRunner {
         // (mcp_servers, searxng, context, retry, …) stays put.
         config.provider = resolved.provider_config.clone();
 
-        // Re-init the context manager against the new model name so
-        // compaction thresholds match the new context window.
-        let compaction_model = crate::providers::create_compaction_model(
-            &resolved.provider_config,
-            config.context.compaction_model.as_deref(),
-        )
-        .ok()
-        .map(Arc::new);
-        let cm = ContextManager::new(
-            config.context.clone(),
-            context_size,
-            sm_for_provider.clone(),
-            compaction_model,
-        );
-        sm_for_provider.init_context_manager(cm, ctx.system_prompt.clone());
+        // Re-init the context manager with the pre-validated compaction
+        // model so compaction thresholds match the new context window.
+        let cm = ContextManager::new(config.context.clone(), context_size, compaction_model);
+        sm_for_provider.init_context_manager(cm);
 
         // Restart the event-processor task on the new receiver. The
         // receiver is `Option` because not every provider supports
@@ -1271,24 +1294,25 @@ impl AgentRunner {
                     let compacted = sm.force_compact().await;
                     sm.set_status(None);
 
-                    if let Some(result) = compacted {
-                        sm.add_system_message(format!(
-                            "Context compacted: {} → {} messages, {} compacted",
-                            result.original_count, result.compacted_count, result.num_discarded
-                        ));
-                    } else {
-                        // Compaction couldn't make progress (no summarizer
-                        // model, or empty body). Manually clear the
-                        // staleness signal so the gate stops firing — break
-                        // the loop and let the (possibly still-too-big)
-                        // request go to the wire. Provider errors there are
-                        // honest and propagate through the existing retry
-                        // path.
-                        tracing::warn!(
-                            "Compaction requested but force_compact returned None; clearing staleness and retrying"
+                    let Some(result) = compacted else {
+                        // Compaction failed — abort the turn with an honest
+                        // error. No retry, no clear_last_input_tokens dance.
+                        // The next user turn gets a fresh attempt.
+                        // See unfuck-compact.md Layer 2.
+                        sm.add_system_message(
+                            "❌ Compaction failed — the conversation could not be summarised. \
+                             Aborting this turn. Try a new conversation, or check your \
+                             compaction model configuration."
+                                .to_string(),
                         );
-                        sm.clear_last_input_tokens();
-                    }
+                        sm.set_final_broadcast(true);
+                        return CompletionResult::Error;
+                    };
+
+                    sm.add_system_message(format!(
+                        "Context compacted: {} → {} messages, {} compacted",
+                        result.original_count, result.compacted_count, result.num_discarded
+                    ));
 
                     // Build the resumption prompt and history from the post-compaction
                     // StateManager. Unlike the initial dispatch path (which always
@@ -1417,10 +1441,29 @@ impl AgentRunner {
                     tracing::warn!("State manager not available for /reset command");
                 }
             }
-            "/stats" | "/context" | "/compact" => {
-                // /stats, /context, /compact are correctly silent: the data
-                // they expose is rendered ambiently in the status bar (see
+            "/stats" | "/context" => {
+                // /stats and /context are correctly silent: the data they
+                // expose is rendered ambiently in the status bar (see
                 // `ui::repl::repl_impl`). Nothing to do here.
+            }
+            "/compact" => {
+                // /compact is an ACTION, not a data-display command.
+                // It was mistakenly grouped with /stats and /context above.
+                if let Some(sm) = state_manager {
+                    match sm.force_compact().await {
+                        Some(result) => {
+                            sm.add_system_message(format!(
+                                "Context compacted: {} → {} messages, {} discarded",
+                                result.original_count, result.compacted_count, result.num_discarded
+                            ));
+                        }
+                        None => {
+                            sm.add_system_message("Nothing to compact.".to_string());
+                        }
+                    }
+                } else {
+                    tracing::warn!("State manager not available for /compact command");
+                }
             }
             "/conversations" => {
                 // List saved conversations as a system message, addressed by
