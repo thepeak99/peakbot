@@ -203,7 +203,6 @@ pub fn create_provider(
 **State Management**:
 - **Conversation memory**: `chat_history` in `AgentRunner` (Vec<Message>)
 - **Todo state**: Shared `Arc<Mutex<TodoList>>` accessible by the agent
-- **File edit history**: `FileEditTool.file_history` (undo stack, not yet exposed)
 - **Session stats**: `CostTracker` with `SessionStats` (Arc<Mutex<>>)
 - **Events**: Processed externally by `AgentRunner` from the channel
 
@@ -219,15 +218,17 @@ All tools live in `src/tools/` and implement `rig::tool::Tool`. Each tool define
 - `definition()` -- returns the JSON Schema the model uses to know what to send
 - `call()` -- executes the tool logic
 
-PeakBot includes **8 built-in tools**:
+PeakBot includes **10 built-in tools**:
 
 ### Tools Overview
 
-PeakBot includes **8 built-in tools** (all always available):
+PeakBot includes **10 built-in tools** (all always available):
 
 | Tool | File | Description |
 |------|------|-------------|
-| `file_edit` | `file_edit.rs` | Create, replace, insert text in files |
+| `file_create` | `file_edit/create.rs` | Create a new file (refuses to overwrite existing) |
+| `file_str_replace` | `file_edit/str_replace.rs` | Replace exact text in an existing file, with whitespace-flexible fallback matching |
+| `file_insert` | `file_edit/insert.rs` | Insert text at a specific line in an existing file |
 | `file_read` | `file_read.rs` | Read files with line ranges |
 | `list_directory` | `list_directory.rs` | List directory contents with recursion |
 | `bash` | `bash.rs` | Execute shell commands with timeout, truncate to last 50k chars, save full output to temp |
@@ -490,7 +491,9 @@ let main_agent = client
     .agent(CLAUDE_4_SONNET)
     .preamble("You are a coding agent. Use the researcher for broad codebase questions.")
     .tool(researcher)  // sub-agent as a tool
-    .tool(FileEditTool::default())
+    .tool(FileCreateTool)
+    .tool(FileStrReplaceTool)
+    .tool(FileInsertTool)
     .tool(BashTool)
     .build();
 ```
@@ -534,7 +537,11 @@ src/
     ├── mod.rs              # Re-exports: all built-in tools
     ├── bash.rs             # BashTool -- shell execution with timeout
     ├── fetch_url.rs        # FetchUrlTool -- HTTP GET requests
-    ├── file_edit.rs        # FileEditTool -- create/str_replace/insert
+    ├── file_edit/          # File-editing tool family (shared helpers in mod.rs)
+    │   ├── mod.rs              # MatchLevel, FileEditError, matching + IO helpers, tests
+    │   ├── create.rs           # FileCreateTool -- create new file
+    │   ├── str_replace.rs      # FileStrReplaceTool -- replace exact text
+    │   └── insert.rs           # FileInsertTool -- insert at line
     ├── file_read.rs        # FileReadTool -- read with line ranges
     ├── list_directory.rs   # ListDirectoryTool -- dir listing with recursion
     ├── search.rs           # SearchTool -- SearXNG web search

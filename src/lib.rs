@@ -50,8 +50,8 @@ pub use state::StateManager;
 pub use storage::{ConversationStorage, FileStorage};
 pub use test_runner::{CompactionInfo, TestRunner};
 pub use tools::{
-    BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
-    TodoArgs, TodoItem, TodoStatus, TodoTool,
+    BashTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool, FileStrReplaceTool,
+    ListDirectoryTool, SearchTool, ThinkTool, TodoArgs, TodoItem, TodoStatus, TodoTool,
 };
 pub use ui::{Ui, UiAction};
 
