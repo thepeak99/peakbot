@@ -871,21 +871,37 @@ fn get_config_dir() -> Option<std::path::PathBuf> {
     ProjectDirs::from("com", "peakbot", "peakbot").map(|dirs| dirs.config_dir().to_path_buf())
 }
 
-/// Load configuration from YAML file in the platform config directory
-/// Load master configuration from `~/.config/peakbot/config.yaml`.
+/// Get the platform-specific config file path.
+/// Returns the full path to config.yaml (e.g., ~/.config/peakbot/peakbot/config.yaml).
+/// Returns None if the platform doesn't provide a config directory.
+pub fn get_config_file_path() -> Option<std::path::PathBuf> {
+    get_config_dir().map(|dir| dir.join("config.yaml"))
+}
+
+/// Result of loading configuration, including metadata about what was loaded.
+pub struct LoadedConfig {
+    /// The loaded configuration
+    pub config: Config,
+    /// Whether the master config file was found (true if file existed and was parsed)
+    pub config_file_found: bool,
+    /// The path where the master config was found (None if not found)
+    pub config_file_path: Option<std::path::PathBuf>,
+}
+
+/// Load configuration from YAML file in the platform config directory.
 ///
 /// Returns:
-/// - `Ok(None)` if the file doesn't exist (legitimate — env vars may
-///   carry the whole config).
-/// - `Ok(Some(config))` on a clean parse.
+/// - `Ok((None, None))` if the config directory doesn't exist on this platform
+/// - `Ok((None, Some(path)))` if the config file doesn't exist (path = where it should be)
+/// - `Ok((Some(config), Some(path)))` on a clean parse
 /// - `Err(_)` if the file exists but is unreadable or malformed. We
 ///   refuse to silently fall back to defaults: a typo'd YAML used to
 ///   mask itself as "no API key configured" and made the boot path
 ///   inscrutable. Better to fail loud at the source. *(principle of
 ///   least astonishment)*
-fn load_yaml_config() -> anyhow::Result<Option<Config>> {
+fn load_yaml_config() -> anyhow::Result<(Option<Config>, Option<std::path::PathBuf>)> {
     let Some(config_dir) = get_config_dir() else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let config_path = config_dir.join("config.yaml");
 
@@ -893,7 +909,7 @@ fn load_yaml_config() -> anyhow::Result<Option<Config>> {
 
     if !config_path.exists() {
         tracing::debug!("No YAML config found at {}", config_path.display());
-        return Ok(None);
+        return Ok((None, Some(config_path)));
     }
 
     let content = std::fs::read_to_string(&config_path)
@@ -904,7 +920,7 @@ fn load_yaml_config() -> anyhow::Result<Option<Config>> {
         .map_err(|e| anyhow::anyhow!("Failed to parse {} as YAML: {e}", config_path.display()))?;
 
     tracing::info!("Loaded YAML config from {}", config_path.display());
-    Ok(Some(config))
+    Ok((Some(config), Some(config_path)))
 }
 
 /// Load per-repository configuration from `.peakbot/config.yaml` in the current working directory.
@@ -945,13 +961,17 @@ impl Config {
     /// 1. Defaults (lowest priority)
     /// 2. Master config (~/.config/peakbot/peakbot/config.yaml)
     /// 3. Per-repo config (.peakbot/config.yaml in cwd) - top-level key override
-    pub fn load() -> anyhow::Result<Self> {
+    ///
+    /// Returns `LoadedConfig` with the loaded config and metadata about what was found.
+    pub fn load() -> anyhow::Result<LoadedConfig> {
         // Step 1: Start with defaults
         let mut config = Config::default();
 
         // Step 2: Load and apply master config if present. A malformed
         // master config is fatal — see `load_yaml_config` for rationale.
-        if let Some(master) = load_yaml_config()? {
+        let (master, config_file_path) = load_yaml_config()?;
+        let config_file_found = master.is_some();
+        if let Some(master) = master {
             config = master;
             tracing::debug!("Config after master load: provider = {:?}", config.provider);
         }
@@ -965,7 +985,11 @@ impl Config {
             );
         }
 
-        Ok(config)
+        Ok(LoadedConfig {
+            config,
+            config_file_found,
+            config_file_path,
+        })
     }
 }
 

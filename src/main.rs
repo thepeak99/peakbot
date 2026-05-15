@@ -3,11 +3,62 @@
 use anyhow::Result;
 use peakbot::{
     AgentRunner, Config, FileStorage, SubAgentRegistry, TodoTool, Ui, UiAction,
-    build_system_prompt, create_provider, load_default_skills, load_mcp_servers,
+    build_system_prompt, create_provider, get_config_file_path, load_default_skills,
+    load_mcp_servers,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
+
+/// Check if the provider has an API key configured.
+/// Returns true if any API key is set (OpenRouter, OpenAI, or LlamaCpp).
+fn has_api_key(config: &Config) -> bool {
+    match &config.provider {
+        peakbot::ProviderConfig::OpenRouter(c) => c.api_key.is_some(),
+        peakbot::ProviderConfig::OpenAI(c) => c.api_key.is_some(),
+        peakbot::ProviderConfig::LlamaCpp(c) => c.api_key.is_some(),
+        peakbot::ProviderConfig::Ollama(_) => true, // Ollama uses no API key
+    }
+}
+
+/// Print a friendly "config not found" error with instructions.
+fn print_config_not_found_message(config_path: &std::path::Path) {
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║                    ⚠️  Config not found!                        ║");
+    eprintln!("╚══════════════════════════════════════════════════════════════╝");
+    eprintln!();
+    eprintln!("I couldn't find my config file at:");
+    eprintln!();
+    eprintln!("  {}", config_path.display());
+    eprintln!();
+    eprintln!("Create this file with content like:");
+    eprintln!();
+    eprintln!("  providers:");
+    eprintln!("    - name: openrouter");
+    eprintln!("      type: openrouter");
+    eprintln!("      api_key: sk-or-v1-your-key-here");
+    eprintln!("      models:");
+    eprintln!("        - name: anthropic/claude-3.7-sonnet");
+    eprintln!("          alias: sonnet");
+    eprintln!();
+    eprintln!("  default_model: sonnet");
+    eprintln!();
+    eprintln!("Find models at: https://openrouter.ai/models");
+    eprintln!();
+    eprintln!("For local models, use Ollama:");
+    eprintln!();
+    eprintln!("  providers:");
+    eprintln!("    - name: ollama");
+    eprintln!("      type: ollama");
+    eprintln!("      base_url: http://localhost:11434");
+    eprintln!("      models:");
+    eprintln!("        - name: llama3");
+    eprintln!("          alias: local");
+    eprintln!();
+    eprintln!("  default_model: local");
+    eprintln!();
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,7 +67,22 @@ async fn main() -> Result<()> {
         .init();
 
     // ── Shared setup ──────────────────────────────────────────────
-    let mut config = Config::load()?;
+
+    // Load configuration with metadata about what was found
+    let loaded = Config::load()?;
+
+    // Check if we have no config file and no API key configured
+    if !loaded.config_file_found && !has_api_key(&loaded.config) {
+        // Show friendly error message with config path
+        if let Some(config_path) = loaded.config_file_path {
+            print_config_not_found_message(&config_path);
+        } else if let Some(config_path) = get_config_file_path() {
+            print_config_not_found_message(&config_path);
+        }
+        anyhow::bail!("No config file found. See instructions above.");
+    }
+
+    let mut config = loaded.config;
     let skills = load_default_skills()?;
     let skills_count = skills.len(); // Keep count before moving skills
     let system_prompt = build_system_prompt(&skills);

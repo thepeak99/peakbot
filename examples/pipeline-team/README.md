@@ -26,12 +26,17 @@ User → orchestrator → pm (product spec)
 
 1. Copy the config to your PeakBot config directory:
    ```bash
-   cp examples/pipeline-team/config.yaml ~/.config/peakbot/config.yaml
+   cp examples/pipeline-team/config.yaml ~/.config/peakbot/peakbot/config.yaml
    ```
 
-2. Set your OpenRouter API key:
-   ```bash
-   export OPENROUTER_API_KEY=sk-or-v1-your-key-here
+2. Edit the config file to add your API key:
+   ```yaml
+   # In config.yaml
+   providers:
+     - name: openrouter
+       type: openrouter
+       api_key: sk-or-v1-your-key-here  # Add your key here
+       ...
    ```
 
 3. Run PeakBot:

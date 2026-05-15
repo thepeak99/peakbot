@@ -19,10 +19,10 @@ pub mod utils;
 pub mod vision;
 
 pub use config::{
-    AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, McpServerConfig,
-    McpTransportType, ModelEntry, ModelRegistry, OllamaConfig, OpenRouterConfig, PipelineConfig,
-    ProviderConfig, ProviderEntry, ProviderType, RegistryError, ResolvedModel, RetryConfig,
-    SearXngConfig,
+    AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, LoadedConfig,
+    McpServerConfig, McpTransportType, ModelEntry, ModelRegistry, OllamaConfig, OpenRouterConfig,
+    PipelineConfig, ProviderConfig, ProviderEntry, ProviderType, RegistryError, ResolvedModel,
+    RetryConfig, SearXngConfig, get_config_file_path,
 };
 use context_manager::ContextManager;
 pub use context_manager::{CompactionResult, auto_detect_context_size};
