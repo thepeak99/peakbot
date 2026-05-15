@@ -392,34 +392,11 @@ mcp_servers:
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
 ```
 
-### Legacy Configuration (Backward Compatible)
-
-The old format is still supported:
-
-```yaml
-# Legacy format (still works)
-openrouter_api_key: sk-or-v1-xxx
-openrouter_model: anthropic/claude-3.7-sonnet
-openrouter_max_tokens: 4096
-```
-
 ### Environment Variables
 
 | Environment Variable | Description |
 |---------------------|-------------|
 | `PROVIDER` | JSON provider config (new format) |
-| `OPENROUTER_API_KEY` | OpenRouter API key (legacy) |
-| `OPENROUTER_MODEL` | OpenRouter model (legacy) |
-| `OPENROUTER_MAX_TOKENS` | Max tokens for OpenRouter (legacy) |
-| `OPENAI_API_KEY` | OpenAI API key |
-| `OPENAI_BASE_URL` | OpenAI base URL (legacy) |
-| `LLAMACPP_API_KEY` | LlamaCpp API key (legacy) |
-| `LLAMACPP_BASE_URL` | LlamaCpp base URL (legacy) |
-| `LLAMACPP_MODEL` | LlamaCpp model name (legacy) |
-| `OLLAMA_MODEL` | Ollama model name (legacy) |
-| `OLLAMA_BASE_URL` | Ollama base URL (legacy) |
-| `OLLAMA_TEMPERATURE` | Ollama temperature (legacy) |
-| `OLLAMA_NUM_CTX` | Ollama context size (legacy) |
 | `AGENT_MAX_TURNS` | Max tool turns per message |
 | `MCP_SERVERS` | JSON array of MCP server configs |
 | `SEARXNG_BASE_URL` | SearXNG base URL |
