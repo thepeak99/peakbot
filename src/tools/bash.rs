@@ -55,40 +55,51 @@ impl BashTool {
 
         // Check for common file-editing bash patterns
         if command_lower.contains("sed -i") {
-            return Some(self.file_edit_warning("sed -i for in-place file editing"));
+            return Some(
+                self.file_edit_warning("sed -i for in-place file editing", "file_str_replace"),
+            );
         }
 
         // Check for awk with output redirection (awk ... > file)
         if command_lower.contains("awk") && command.contains(">") {
-            return Some(self.file_edit_warning("awk for file modification"));
+            return Some(self.file_edit_warning("awk for file modification", "file_str_replace"));
         }
 
         if command_lower.contains("perl -pi") {
-            return Some(self.file_edit_warning("perl for in-place file editing"));
+            return Some(
+                self.file_edit_warning("perl for in-place file editing", "file_str_replace"),
+            );
         }
 
         if command_lower.contains("ex +") && command.contains("%") {
-            return Some(self.file_edit_warning("vim/ex for file editing"));
+            return Some(self.file_edit_warning(
+                "vim/ex for file editing",
+                "the file editing tools (file_create / file_str_replace / file_insert)",
+            ));
         }
 
         if command_lower.contains("vi -c") {
-            return Some(self.file_edit_warning("vi for file editing"));
+            return Some(self.file_edit_warning(
+                "vi for file editing",
+                "the file editing tools (file_create / file_str_replace / file_insert)",
+            ));
         }
 
         None
     }
 
     /// Generate a standardized warning message for file-editing bash commands
-    fn file_edit_warning(&self, description: &str) -> String {
+    fn file_edit_warning(&self, description: &str, tool_suggestion: &str) -> String {
         format!(
-            "⚠️  Consider using file_edit tool instead of {} for file modifications.\n\
-            \nfile_edit provides:\n\
+            "⚠️  Consider using {tool} instead of {description} for file modifications.\n\
+            \nThe file editing tools provide:\n\
             - Safe diffs for review\n\
             - Cross-platform compatibility\n\
             - Automatic whitespace handling\n\
-            \nThis command will execute, but file_edit is recommended for file content modifications.\n\
+            \nThis command will execute, but {tool} is recommended for file content modifications.\n\
             Use bash ONLY for: file operations (mv/cp/rm), permissions, bulk operations on many files.",
-            description
+            tool = tool_suggestion,
+            description = description
         )
     }
 }

@@ -20,8 +20,8 @@ use crate::hooks::events::AgentEvent;
 use crate::mock::MockCompletionModel;
 use crate::state::StateManager;
 use crate::tools::{
-    BashTool, FetchUrlTool, FileEditTool, FileReadTool, ListDirectoryTool, SearchTool, ThinkTool,
-    TodoTool,
+    BashTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool, FileStrReplaceTool,
+    ListDirectoryTool, SearchTool, ThinkTool, TodoTool,
 };
 use anyhow::{Context, Result};
 use rig::agent::Agent;
@@ -345,7 +345,9 @@ where
     let bash_tool = BashTool::new(bash_config.env.clone());
 
     let mut builder = builder
-        .tool(FileEditTool::default())
+        .tool(FileCreateTool)
+        .tool(FileStrReplaceTool)
+        .tool(FileInsertTool)
         .tool(FileReadTool)
         .tool(bash_tool)
         .tool(ListDirectoryTool)
@@ -714,7 +716,9 @@ pub fn create_mock_agent(
     let todo = TodoTool::new(state_manager.clone());
 
     let agent = agent_builder
-        .tool(FileEditTool::default())
+        .tool(FileCreateTool)
+        .tool(FileStrReplaceTool)
+        .tool(FileInsertTool)
         .tool(FileReadTool)
         .tool(bash_tool)
         .tool(ListDirectoryTool)
