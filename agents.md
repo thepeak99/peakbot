@@ -375,6 +375,7 @@ searxng:
   enabled: true
   timeout_seconds: 30
   max_results: 10
+  bearer_token: "optional-token"   # optional: sent as `Authorization: Bearer …`
 
 # Context compaction settings
 context:
