@@ -636,6 +636,11 @@ pub struct SearXngConfig {
     /// Default maximum number of results to return (default: 10)
     #[serde(default = "default_max_results")]
     pub max_results: u32,
+    /// Optional bearer token sent as `Authorization: Bearer <token>`.
+    /// Use for SearXNG instances behind an auth proxy. Stored in plaintext
+    /// in config.yaml — do not commit the file to a public repo.
+    #[serde(default)]
+    pub bearer_token: Option<String>,
 }
 
 /// Configuration for context compaction

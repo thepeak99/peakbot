@@ -129,6 +129,8 @@ pub struct SearchTool {
     base_url: String,
     timeout_seconds: u64,
     default_max_results: u32,
+    #[serde(default)]
+    bearer_token: Option<String>,
 }
 
 impl SearchTool {
@@ -137,6 +139,7 @@ impl SearchTool {
             base_url: config.base_url.clone(),
             timeout_seconds: config.timeout_seconds,
             default_max_results: config.max_results,
+            bearer_token: config.bearer_token.clone(),
         }
     }
 }
@@ -255,11 +258,15 @@ impl Tool for SearchTool {
             .timeout(Duration::from_secs(self.timeout_seconds))
             .build()?;
 
-        let response = client
+        let mut request = client
             .get(url_obj.as_str())
-            .header("User-Agent", "PeakBot/1.0 (Web Search)")
-            .send()
-            .await?;
+            .header("User-Agent", "PeakBot/1.0 (Web Search)");
+
+        if let Some(ref token) = self.bearer_token {
+            request = request.bearer_auth(token);
+        }
+
+        let response = request.send().await?;
 
         let status = response.status();
 
