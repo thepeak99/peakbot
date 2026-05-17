@@ -121,7 +121,9 @@ fn classify_submission(msg: &str) -> SubmitKind {
     if trimmed == "/stop" {
         return SubmitKind::StopCommand;
     }
-    if trimmed.starts_with('/') {
+    // Preserve whitespace on commands — leading whitespace in "/ quit"
+    // should not be stripped before the command handler sees it.
+    if msg.starts_with('/') {
         return SubmitKind::Command(msg.to_string());
     }
     // Try inline image parsing FIRST — before deciding it's plain text.

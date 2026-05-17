@@ -281,7 +281,7 @@ fn wrap_height(lines: &[Line<'static>], width: u16) -> u16 {
     if width == 0 || lines.is_empty() {
         return lines.len() as u16;
     }
-    let p = Paragraph::new(Text::from(lines.to_vec())).wrap(Wrap { trim: true });
+    let p = Paragraph::new(Text::from(lines.to_vec())).wrap(Wrap { trim: false });
     // `line_count` returns usize; cap at u16::MAX to keep the arithmetic
     // in our prefix-sum domain safe. Pathological messages > 65k lines
     // are a non-issue in practice.
