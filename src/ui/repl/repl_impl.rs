@@ -528,7 +528,7 @@ impl ReplUi {
 
         Paragraph::new(Text::from(message_lines))
             .style(Style::default().fg(Color::White))
-            .wrap(Wrap { trim: true })
+            .wrap(Wrap { trim: false })
             .block(Self::chat_block(select_mode))
     }
 
@@ -1033,12 +1033,12 @@ impl ReplUi {
                         // Empty transcript — show the welcome banner.
                         Paragraph::new(Text::from(Self::welcome_lines()))
                             .style(Style::default().fg(Color::White))
-                            .wrap(Wrap { trim: true })
+                            .wrap(Wrap { trim: false })
                             .block(Self::chat_block(select_mode))
                     } else {
                         Paragraph::new(Text::from(view.lines))
                             .style(Style::default().fg(Color::White))
-                            .wrap(Wrap { trim: true })
+                            .wrap(Wrap { trim: false })
                             .block(Self::chat_block(select_mode))
                     };
 
