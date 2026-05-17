@@ -258,6 +258,47 @@ mod tests {
         assert_snapshot!("chat_single_agent_message_multiline", lines.join("\n"));
     }
 
+    /// Regression pin for issue #5: leading and inner whitespace in agent
+    /// replies must be preserved, not stripped by Wrap { trim: true }.
+    /// YAML is the canonical test case — indentation is semantically meaningful.
+    #[test]
+    fn chat_agent_yaml_preserves_whitespace() {
+        let mut chat = ChatState::new();
+        chat.add_message(ChatMessage::with_timestamp(
+            MessageRole::Agent,
+            "```yaml\nname: peakbot\nversion: 0.4.3\nfeatures:\n  - search\n  - files\n    - bash\n```"
+                .to_string(),
+            "2024-01-01 12:00:00",
+        ));
+        let paragraph = ReplUi::build_chat_history_paragraph(&chat, false);
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let _ = terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(100), Constraint::Length(1)])
+                .split(f.area());
+            let content_height = paragraph.line_count(chunks[0].width.saturating_sub(2)) as u16;
+            ReplUi::render_chat_history(f, chunks[0], 0, 0, paragraph, content_height, false);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        let joined = lines.join("\n");
+
+        // The "  - " line must start with two spaces before the dash.
+        // If trimming is on, leading spaces are stripped and the line starts
+        // with the dash directly. This assertion catches that regression.
+        assert!(
+            joined.contains("  - search"),
+            "leading spaces on YAML list items must be preserved"
+        );
+        assert!(
+            joined.contains("    - bash"),
+            "deeper indentation (4 spaces) must also be preserved"
+        );
+    }
+
     // === Status Bar Tests ===
 
     #[test]
