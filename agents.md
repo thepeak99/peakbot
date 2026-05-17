@@ -687,6 +687,13 @@ escape hatches are:
 Never blanket-allow at crate level. Never silence warnings without a
 comment. If you can't justify the silence in one line, fix the code.
 
+### Internal Documentation
+
+Analysis documents (plans, reviews, forensics, post-mortems, and similar
+working notes) are **internal only** and must not be committed to the repo or
+referenced in any public-facing content. They may exist on disk for working
+purposes, but the repository is not their home.
+
 ### Snapshot tests
 
 `tests/repl_tests.rs` uses `insta` for golden-file rendering tests.
