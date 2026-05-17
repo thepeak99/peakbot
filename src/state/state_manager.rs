@@ -567,6 +567,8 @@ impl StateManager {
     /// Used after context compaction to persist the compacted history back
     /// into StateManager (the single source of truth).
     pub fn replace_chat_messages(&self, messages: Vec<ChatMessage>) {
+        // Drop orphan tool messages; the rig wire layer assumes pair integrity.
+        let messages = crate::tool_use_validator::sanitize_tool_pairs(messages);
         let mut state = self.state.write().unwrap();
         state.chat.messages = messages;
         state.chat.auto_scroll = true;
@@ -990,6 +992,9 @@ impl StateManager {
                     } => ChatMessage::tool_result(tool_name, arguments, result, call_id.clone()),
                 })
                 .collect();
+
+            // Drop orphan tool messages; the rig wire layer assumes pair integrity.
+            let messages = crate::tool_use_validator::sanitize_tool_pairs(messages);
 
             // Restore persisted session stats *before* dropping the conv guard
             // so we don't race with a concurrent save.
@@ -1980,6 +1985,68 @@ mod tests {
             state.chat.messages[0].content.contains("Summary"),
             "First message should be the summary"
         );
+    }
+
+    // ─── tool-pair sanitization at the conversation boundary ─────────────
+    //
+    // See [`crate::tool_use_validator`] for the design + unit-level
+    // coverage. These two tests pin the call-site wiring at the two
+    // boundaries the proposal identifies: `replace_chat_messages`
+    // (compaction) and `sync_from_conversation` (load).
+
+    #[test]
+    fn replace_chat_messages_sanitizes_after_compaction() {
+        use crate::ui::app_state::MessageRole;
+        let sm = StateManager::new();
+
+        // Compaction emitted a ToolCall but lost its matching ToolResult.
+        let corrupt = vec![
+            ChatMessage::user("hi".into()),
+            ChatMessage::tool_call("bash", "{}", Some("call_1".into())),
+            // Orphan: no ToolResult follows.
+            ChatMessage::agent("done".into()),
+        ];
+
+        sm.replace_chat_messages(corrupt);
+
+        let state = sm.get_state();
+        assert_eq!(
+            state.chat.messages.len(),
+            2,
+            "orphan ToolCall must be dropped at the boundary"
+        );
+        assert_eq!(state.chat.messages[0].role, MessageRole::User);
+        assert_eq!(state.chat.messages[1].role, MessageRole::Agent);
+    }
+
+    #[test]
+    fn sync_from_conversation_sanitizes_orphan_call() {
+        use crate::conversation::Conversation;
+        use crate::ui::app_state::MessageRole;
+
+        let sm = StateManager::new();
+
+        // Build a conversation with an orphan ToolCall (no matching
+        // ToolResult). This simulates a file truncated mid-write or
+        // hand-edited.
+        let mut conv =
+            Conversation::new("test".into(), "test-provider".into(), "test-model".into());
+        conv.add_user_message("hello".into());
+        conv.add_tool_call("bash".into(), "{}".into(), Some("call_1".into()));
+        // No matching ToolResult!
+        conv.add_assistant_message("done".into());
+
+        *sm.current_conversation.lock().unwrap() = Some(conv);
+        sm.sync_from_conversation();
+
+        let state = sm.get_state();
+        assert_eq!(
+            state.chat.messages.len(),
+            2,
+            "orphan ToolCall must be dropped on load"
+        );
+        assert_eq!(state.chat.messages[0].role, MessageRole::User);
+        assert_eq!(state.chat.messages[1].role, MessageRole::Agent);
     }
 
     // ─── workin-baby: working-indicator state transitions ────────────────
