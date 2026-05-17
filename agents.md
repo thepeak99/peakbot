@@ -633,7 +633,29 @@ let harness = TestHarness::new()
 
 ## Commit Procedure
 
-**Every commit must pass clean `cargo fmt` and `cargo clippy` before it lands.**
+**IMPORTANT: All changes must be made through Pull Requests.**
+
+Every change to this codebase requires:
+1. A **Pull Request** — no direct commits to main/master
+2. **Changelog entry** in `release-notes/current.md`
+
+### Changelog Requirements
+
+Every PR must add an entry to `release-notes/current.md` describing what changed:
+
+```markdown
+## Changes
+
+- Added new feature X
+- Fixed bug Y
+- Updated documentation
+```
+
+The `current.md` file serves as a working draft for the next release. When a version is released, `current.md` is renamed to `<version>.md` (e.g., `0.3.0.md`) and a new empty `current.md` is created.
+
+**Never commit changes without updating `current.md`.** This ensures every release has complete, version-controlled release notes.
+
+### Pre-commit Gate
 This is non-negotiable — the build pipeline treats clippy warnings as
 real signals, the release flow rebuilds three platforms, and stale
 warnings hide real ones. Run the gate locally so CI doesn't have to
