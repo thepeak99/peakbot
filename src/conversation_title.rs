@@ -52,7 +52,11 @@ pub async fn generate_conversation_title(
     if title.len() > 60 {
         // Truncate at word boundary near 60 chars
         let truncated = &title[..60];
-        Ok(truncated.rsplit_once(' ').map(|(pre, _)| pre).unwrap_or(truncated).to_string())
+        Ok(truncated
+            .rsplit_once(' ')
+            .map(|(pre, _)| pre)
+            .unwrap_or(truncated)
+            .to_string())
     } else {
         Ok(title.to_string())
     }
@@ -77,7 +81,10 @@ mod tests {
         let long_title = "This is a very long conversation title that exceeds the sixty character limit by a lot";
         let truncated = if long_title.len() > 60 {
             let cut = &long_title[..60];
-            cut.rsplit_once(' ').map(|(pre, _)| pre).unwrap_or(cut).to_string()
+            cut.rsplit_once(' ')
+                .map(|(pre, _)| pre)
+                .unwrap_or(cut)
+                .to_string()
         } else {
             long_title.to_string()
         };
@@ -90,7 +97,10 @@ mod tests {
         let short_title = "Fix bug in auth flow";
         let result = if short_title.trim().len() > 60 {
             let cut = &short_title.trim()[..60];
-            cut.rsplit_once(' ').map(|(pre, _)| pre).unwrap_or(cut).to_string()
+            cut.rsplit_once(' ')
+                .map(|(pre, _)| pre)
+                .unwrap_or(cut)
+                .to_string()
         } else {
             short_title.trim().to_string()
         };
