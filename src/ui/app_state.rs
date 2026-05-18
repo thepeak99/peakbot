@@ -347,6 +347,11 @@ impl ChatMessage {
 
 /// Format tool call with structured output: thought intent first, then params
 pub(crate) fn format_tool_call(tool_name: &str, args: &str) -> String {
+    // Special-case the think tool: show "Thinking..." instead of verbose reasoning
+    if tool_name == "think" {
+        return "🤔 Thinking...".to_string();
+    }
+
     // Try to parse JSON args to extract thought and key params
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
         let mut lines = Vec::new();
