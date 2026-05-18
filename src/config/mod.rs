@@ -203,6 +203,9 @@ pub struct Config {
     /// Context compaction configuration (enabled by default when not specified)
     #[serde(default)]
     pub context: ContextConfig,
+    /// Memory.md automatic compaction configuration
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Conversation persistence configuration
     #[serde(default)]
     pub conversation: Option<ConversationConfig>,
@@ -677,6 +680,10 @@ fn default_context_enabled() -> bool {
 fn default_true() -> bool {
     true
 }
+
+fn default_memory_threshold() -> usize {
+    51_200 // 50 KiB
+}
 fn default_timeout() -> u64 {
     30
 }
@@ -698,6 +705,27 @@ fn default_max_turns() -> usize {
 
 fn default_cost_tracking() -> bool {
     true
+}
+
+/// Configuration for memory.md automatic compaction
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Enable automatic memory compaction at conversation start (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// File size threshold in bytes to trigger compaction (default: 51200 = 50KB)
+    #[serde(default = "default_memory_threshold")]
+    pub threshold_bytes: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_bytes: default_memory_threshold(),
+        }
+    }
 }
 
 /// Configuration for conversation persistence
@@ -813,6 +841,11 @@ impl Config {
             self.context = other.context;
         }
 
+        // memory - always override if other has non-default
+        if other.memory != MemoryConfig::default() {
+            self.memory = other.memory;
+        }
+
         // conversation - override if set
         if other.conversation.is_some() {
             self.conversation = other.conversation;
@@ -862,6 +895,10 @@ impl Default for Config {
                 keep_recent: default_keep_recent(),
                 enabled: default_context_enabled(),
                 compaction_model: None,
+            },
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: default_memory_threshold(),
             },
             conversation: None,
             bash: BashConfig::default(),

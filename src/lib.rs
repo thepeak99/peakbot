@@ -6,6 +6,7 @@ mod conversation;
 mod conversation_manager;
 mod conversation_title;
 mod hooks;
+mod memory_compaction;
 #[cfg(feature = "mock")]
 pub mod mock;
 mod pipeline;
@@ -308,6 +309,10 @@ pub struct AgentRunner {
     /// [`AgentRunner::with_rebuild_context`] from `main.rs` after
     /// construction. When `None`, `/model` is a no-op.
     rebuild_ctx: Option<RebuildContext>,
+    /// Tool-free compaction model shared with ContextManager.
+    /// Cloned at construction so memory compaction can use it
+    /// without reaching through StateManager.
+    compaction_model: Option<Arc<CompactionModel>>,
 }
 
 impl AgentRunner {
@@ -326,33 +331,33 @@ impl AgentRunner {
     ) -> anyhow::Result<Self> {
         let agent = Arc::new(agent);
 
+        // Create a tool-free compaction model from the same provider.
+        // When compaction is enabled, a construction failure is fatal —
+        // refuse to boot rather than silently degrade into the death
+        // spiral.  See unfuck-compact.md Layer 1.
+        let compaction_model = if config.context.enabled {
+            let model = crate::providers::create_compaction_model(
+                &config.provider,
+                config.context.compaction_model.as_deref(),
+            )
+            .with_context(|| {
+                "Failed to construct compaction model for the active provider. \
+                 The active provider config is what's read for compaction (same \
+                 credentials as the main model). To boot without compaction, set \
+                 `context.enabled: false` in config.yaml."
+            })?;
+            Some(Arc::new(model))
+        } else {
+            crate::providers::create_compaction_model(
+                &config.provider,
+                config.context.compaction_model.as_deref(),
+            )
+            .ok()
+            .map(Arc::new)
+        };
+
         // Initialize ContextManager inside StateManager (StateManager owns it)
         if let Some(ref sm) = state_manager {
-            // Create a tool-free compaction model from the same provider.
-            // When compaction is enabled, a construction failure is fatal —
-            // refuse to boot rather than silently degrade into the death
-            // spiral.  See unfuck-compact.md Layer 1.
-            let compaction_model = if config.context.enabled {
-                let model = crate::providers::create_compaction_model(
-                    &config.provider,
-                    config.context.compaction_model.as_deref(),
-                )
-                .with_context(|| {
-                    "Failed to construct compaction model for the active provider. \
-                     The active provider config is what's read for compaction (same \
-                     credentials as the main model). To boot without compaction, set \
-                     `context.enabled: false` in config.yaml."
-                })?;
-                Some(Arc::new(model))
-            } else {
-                crate::providers::create_compaction_model(
-                    &config.provider,
-                    config.context.compaction_model.as_deref(),
-                )
-                .ok()
-                .map(Arc::new)
-            };
-
             let cm = ContextManager::new(
                 config.context.clone(),
                 context_size,
@@ -360,7 +365,7 @@ impl AgentRunner {
             );
             sm.init_context_manager(cm);
             // The title model is the same as the compaction model — reuse the Arc
-            if let Some(model) = compaction_model {
+            if let Some(model) = compaction_model.clone() {
                 sm.init_title_model(model);
             }
         }
@@ -374,6 +379,7 @@ impl AgentRunner {
             session_hook,
             event_receiver,
             rebuild_ctx: None,
+            compaction_model,
         })
     }
 
@@ -428,6 +434,7 @@ impl AgentRunner {
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
         let event_receiver = self.event_receiver.take();
+        let compaction_model = self.compaction_model.clone();
         // Shared cells for state that swaps on `/model` rebuild. The
         // event loop reads through these so `/stop` always cancels the
         // active prompt and the multimodal-vision gate always reflects
@@ -490,6 +497,7 @@ impl AgentRunner {
                     session_hook_cell,
                     provider_info_cell,
                     rebuild_ctx,
+                    compaction_model,
                 )
                 .await;
             }
@@ -710,8 +718,45 @@ impl AgentRunner {
         session_hook_cell: SharedSessionHook,
         provider_info_cell: SharedProviderInfo,
         rebuild_ctx: Option<RebuildContext>,
+        compaction_model: Option<Arc<CompactionModel>>,
     ) {
         use std::sync::atomic::Ordering;
+
+        // Memory compaction: check once at conversation start, before
+        // any user messages are processed. This is infrastructure hygiene
+        // — the agent itself doesn't decide when to compact.
+        if let (Some(sm), Some(model)) = (state_manager.clone(), compaction_model.clone())
+            && config.memory.enabled
+        {
+            let path = std::path::Path::new("memory.md");
+            if let Some(content) =
+                crate::memory_compaction::read_if_oversized(path, config.memory.threshold_bytes)
+            {
+                let size_before = content.len();
+                match crate::memory_compaction::compact_memory(&content, &model).await {
+                    Ok(compacted) => {
+                        if let Err(e) = std::fs::write(path, compacted) {
+                            tracing::warn!("Failed to write compacted memory.md: {}", e);
+                        } else {
+                            sm.add_system_message(format!(
+                                "memory.md compacted (was {} bytes)",
+                                size_before
+                            ));
+                            tracing::info!(
+                                "memory.md compacted: {} -> {} bytes",
+                                size_before,
+                                std::fs::metadata(path)
+                                    .map(|m| m.len() as usize)
+                                    .unwrap_or(0)
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Memory compaction failed: {}", e);
+                    }
+                }
+            }
+        }
 
         // The agent reference is `mut` here — `/model` rebuilds it
         // in-place between turns. `provider_info_cell` and
