@@ -52,7 +52,7 @@ impl ConversationStorage for InMemoryStorage {
         let storage = self.conversations.lock().unwrap();
         let mut summaries: Vec<ConversationSummary> =
             storage.values().map(ConversationSummary::from).collect();
-        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        summaries.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         Ok(summaries)
     }
 

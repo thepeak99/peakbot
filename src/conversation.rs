@@ -152,8 +152,12 @@ impl Message {
 pub struct Conversation {
     /// Unique identifier for this conversation
     pub id: Uuid,
-    /// Human-readable name for the conversation
+    /// Human-readable name for the conversation (set at creation time)
     pub name: String,
+    /// Auto-generated short title for the conversation (set after first response).
+    /// Displayed in /conversations listing. `None` until generated.
+    #[serde(default)]
+    pub title: Option<String>,
     /// When the conversation was created
     pub created_at: DateTime<Utc>,
     /// When the conversation was last updated
@@ -186,6 +190,7 @@ impl Conversation {
         Conversation {
             id: Uuid::new_v4(),
             name,
+            title: None,
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
@@ -236,6 +241,25 @@ impl Conversation {
         self.name = name;
         self.updated_at = Utc::now();
     }
+
+    /// Set the auto-generated title (truncated to 80 chars).
+    /// Silently ignores titles longer than 80 chars.
+    /// Idempotent: calling with a new title when one already exists is a no-op.
+    pub fn set_title(&mut self, title: String) {
+        if self.title.is_some() {
+            // Title already generated — skip
+            return;
+        }
+        if title.len() <= 80 {
+            self.title = Some(title);
+            self.updated_at = Utc::now();
+        }
+    }
+
+    /// Whether the title has been generated (short-circuit check before LLM call).
+    pub fn has_title(&self) -> bool {
+        self.title.is_some()
+    }
 }
 
 /// Summary of a conversation (for listing)
@@ -243,9 +267,13 @@ impl Conversation {
 pub struct ConversationSummary {
     /// Unique identifier
     pub id: Uuid,
-    /// Human-readable name
+    /// Display name (title if generated, otherwise the creation timestamp name).
+    /// Used for rendering in /conversations listing.
     pub name: String,
-    /// When the conversation was created
+    /// Auto-generated short title. `None` until first response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// When the conversation was last updated
     pub updated_at: DateTime<Utc>,
@@ -264,7 +292,9 @@ impl From<&Conversation> for ConversationSummary {
     fn from(conv: &Conversation) -> Self {
         ConversationSummary {
             id: conv.id,
-            name: conv.name.clone(),
+            // Show title if generated, otherwise fall back to the creation name
+            name: conv.title.clone().unwrap_or_else(|| conv.name.clone()),
+            title: conv.title.clone(),
             created_at: conv.created_at,
             updated_at: conv.updated_at,
             message_count: conv.metadata.message_count,
@@ -484,5 +514,117 @@ mod tests {
             !json.contains("model_alias"),
             "alias must not be persisted; got: {json}"
         );
+    }
+
+    // === v5: conversation title ====================
+
+    /// Conversation starts with no title.
+    #[test]
+    fn new_conversation_has_no_title() {
+        let conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+        );
+        assert!(conv.title.is_none());
+        assert!(!conv.has_title());
+    }
+
+    /// set_title stores the title and updates updated_at.
+    #[test]
+    fn set_title_stores_title() {
+        let mut conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+        );
+        let before = conv.updated_at;
+        conv.set_title("Fix bug in auth".into());
+        assert_eq!(conv.title.as_deref(), Some("Fix bug in auth"));
+        assert!(conv.has_title());
+        assert!(conv.updated_at >= before);
+    }
+
+    /// set_title is idempotent — second call is a no-op.
+    #[test]
+    fn set_title_is_idempotent() {
+        let mut conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+        );
+        conv.set_title("First title".into());
+        conv.set_title("Second title".into());
+        assert_eq!(conv.title.as_deref(), Some("First title"));
+    }
+
+    /// set_title silently ignores titles longer than 80 chars.
+    #[test]
+    fn set_title_ignores_long_titles() {
+        let mut conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+        );
+        conv.set_title("A".repeat(200));
+        assert!(conv.title.is_none());
+    }
+
+    /// ConversationSummary.from uses title for name, falls back to conv.name.
+    #[test]
+    fn conversation_summary_shows_title_when_present() {
+        let mut conv = Conversation::new(
+            "Conversation 2026-05-18 10:00".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+        );
+        conv.set_title("Fix sudo bug".into());
+        let summary = ConversationSummary::from(&conv);
+        assert_eq!(summary.name, "Fix sudo bug");
+        assert_eq!(summary.title.as_deref(), Some("Fix sudo bug"));
+    }
+
+    /// ConversationSummary.from falls back to conv.name when title is absent.
+    #[test]
+    fn conversation_summary_falls_back_to_name() {
+        let conv = Conversation::new(
+            "Conversation 2026-05-18 10:00".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+        );
+        let summary = ConversationSummary::from(&conv);
+        assert_eq!(summary.name, "Conversation 2026-05-18 10:00");
+        assert!(summary.title.is_none());
+    }
+
+    /// Title round-trips through serde (new conversation → JSON → loaded).
+    #[test]
+    fn title_roundtrips_through_json() {
+        let mut conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+        );
+        conv.set_title("Rust async patterns".into());
+        let json = serde_json::to_string(&conv).unwrap();
+        let loaded: Conversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.title.as_deref(), Some("Rust async patterns"));
+    }
+
+    /// Pre-v5 conversation JSON (no title field) deserializes cleanly.
+    #[test]
+    fn pre_v5_conversation_without_title_deserializes() {
+        let json = r#"{
+            "id": "10da8b9d-f242-4786-9c75-c3fbc2530f1f",
+            "name": "Old convo",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "messages": [],
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {"message_count": 0}
+        }"#;
+        let conv: Conversation = serde_json::from_str(json).unwrap();
+        assert!(conv.title.is_none());
+        assert_eq!(conv.name, "Old convo");
     }
 }

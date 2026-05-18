@@ -256,7 +256,7 @@ impl<S: ConversationStorage> ConversationManager<S> {
         // This ensures we end up with at most max_conversations after adding the new one
         if conversations.len() >= self.config.max_conversations {
             // Sort by updated_at descending (newest first)
-            conversations.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            conversations.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
 
             // Delete oldest - we want to keep at most max-1 old ones so that after adding
             // the new one, we have at most max. Since sorted newest-first, delete from

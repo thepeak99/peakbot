@@ -55,7 +55,7 @@ pub struct ProviderInfo {
 }
 
 /// Tool-free completion model for compaction summarization.
-/// No tools, no hooks — just text in, text out.
+#[derive(Clone)]
 pub enum CompactionModel {
     OpenRouter(Agent<<openrouter::Client as CompletionClient>::CompletionModel, ()>),
     OpenAI(Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, ()>),
