@@ -351,11 +351,11 @@ pub(crate) fn format_tool_call(tool_name: &str, args: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
         let mut lines = Vec::new();
 
-        // Line 1: Thought intent (always first if present)
+        // Line 1: Thought intent (always first if present, never truncated)
         if let Some(thought) = parsed.get("thought").and_then(|v| v.as_str())
             && !thought.is_empty()
         {
-            lines.push(format!("💭 {}", truncate_str(thought, 100)));
+            lines.push(format!("💭 {}", thought));
         }
 
         // Line 2: Tool name with key params
@@ -401,7 +401,6 @@ pub(crate) fn format_tool_result(tool_name: &str, result: &str) -> String {
     }
 }
 
-/// Truncate a string to max_len chars, adding "..." if truncated
 pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
     let s_len = s.chars().count();
 
