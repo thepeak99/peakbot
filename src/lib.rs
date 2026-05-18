@@ -4,6 +4,7 @@ mod config;
 mod context_manager;
 mod conversation;
 mod conversation_manager;
+mod conversation_title;
 mod hooks;
 #[cfg(feature = "mock")]
 pub mod mock;
@@ -352,8 +353,16 @@ impl AgentRunner {
                 .map(Arc::new)
             };
 
-            let cm = ContextManager::new(config.context.clone(), context_size, compaction_model);
+            let cm = ContextManager::new(
+                config.context.clone(),
+                context_size,
+                compaction_model.clone(),
+            );
             sm.init_context_manager(cm);
+            // The title model is the same as the compaction model — reuse the Arc
+            if let Some(model) = compaction_model {
+                sm.init_title_model(model);
+            }
         }
 
         Ok(Self {
@@ -1088,8 +1097,16 @@ impl AgentRunner {
 
         // Re-init the context manager with the pre-validated compaction
         // model so compaction thresholds match the new context window.
-        let cm = ContextManager::new(config.context.clone(), context_size, compaction_model);
+        let cm = ContextManager::new(
+            config.context.clone(),
+            context_size,
+            compaction_model.clone(),
+        );
         sm_for_provider.init_context_manager(cm);
+        // The title model is the same as the compaction model — reuse the Arc
+        if let Some(model) = compaction_model {
+            sm_for_provider.init_title_model(model);
+        }
 
         // Restart the event-processor task on the new receiver. The
         // receiver is `Option` because not every provider supports
@@ -1275,6 +1292,8 @@ impl AgentRunner {
                     if let Some(sm) = state_manager.as_ref() {
                         sm.add_assistant_message(response.clone());
                         sm.set_final_broadcast(true);
+                        // Fire-and-forget: generate title after first reply
+                        sm.maybe_generate_title();
                     }
 
                     return CompletionResult::Success;
@@ -1404,7 +1423,7 @@ impl AgentRunner {
             let mut list = sm
                 .list_conversations()
                 .ok_or_else(|| "Conversation storage is not configured.".to_string())?;
-            list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            list.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
             return list.get(n - 1).map(|c| c.id).ok_or_else(|| {
                 format!(
                     "Index {} not found. /conversations shows {} saved conversation(s).",
@@ -1487,7 +1506,7 @@ impl AgentRunner {
                             sm.add_system_message("No saved conversations.".to_string())
                         }
                         Some(mut list) => {
-                            list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                            list.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
                             let current_id = sm.get_current_conversation_id();
                             // Build the registry once for the whole listing
                             // so each row's availability tag is a cheap

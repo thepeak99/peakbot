@@ -5,7 +5,9 @@
 
 use crate::context_manager::{CompactionResult, ContextManager};
 use crate::conversation::Conversation;
+use crate::conversation_title::generate_conversation_title;
 use crate::hooks::session_hook::SessionStats;
+use crate::providers::CompactionModel;
 use crate::storage::{ConversationStorage, ConversationSummary};
 use crate::tools::todo::{TodoList, TodoStatus};
 use crate::ui::app_state::{
@@ -30,6 +32,10 @@ pub struct StateManager {
     // `lib.rs` rebuild path). `ContextManager` itself is stateless; the lock
     // protects the *slot*, not internal state.
     context_manager: RwLock<Option<ContextManager>>,
+    /// Tool-free model for auto-generating conversation titles.
+    /// Shares the same provider config as the compaction model; set at
+    /// the same time as `init_context_manager`.
+    title_model: RwLock<Option<CompactionModel>>,
     self_ref: RwLock<Option<Weak<Self>>>, // For spawning async compaction tasks
 
     // ── Conversation Persistence ──────────────────────────────────────────────
@@ -68,6 +74,7 @@ impl StateManager {
             subscribers: Arc::new(RwLock::new(Vec::new())),
             stats: Arc::new(Mutex::new(SessionStats::new())),
             context_manager: RwLock::new(None),
+            title_model: RwLock::new(None),
             self_ref: RwLock::new(None),
             storage,
             current_conversation: Arc::new(Mutex::new(None)),
@@ -91,6 +98,104 @@ impl StateManager {
 
         let state = self.state.read().unwrap();
         self.notify_update(&state);
+    }
+
+    /// Initialize the tool-free model for auto-generating conversation titles.
+    /// Call this right after `init_context_manager` at boot and on `/model` switch.
+    pub(crate) fn init_title_model(&self, model: Arc<CompactionModel>) {
+        *self.title_model.write().unwrap() = Some((*model).clone());
+    }
+
+    /// Generate a conversation title after the first assistant response.
+    ///
+    /// Fires only when `message_count == 1` (the just-completed turn) and
+    /// the conversation has no title yet. Uses the same fire-and-forget
+    /// pattern as compaction: errors are logged and silently ignored.
+    ///
+    /// Call this *after* `add_assistant_message` (which increments the
+    /// message count and persists the response).
+    pub fn maybe_generate_title(&self) {
+        // Short-circuit: only generate on the first reply
+        let msg_count = {
+            let state = self.state.read().unwrap();
+            state.chat.messages.len()
+        };
+        if msg_count != 2 {
+            // msg_count == 2 means: 1 user + 1 assistant (just added).
+            // Any other value means we're past the first turn or in a
+            // tool-call sequence.
+            return;
+        }
+
+        // Check if we have a model and the conversation needs a title
+        let (model, messages) = {
+            let model_guard = self.title_model.read().unwrap();
+            let model = match model_guard.as_ref() {
+                Some(m) => m.clone(),
+                None => return,
+            };
+
+            // Check conversation-level guard (idempotency)
+            let has_title = {
+                let conv_guard = self.current_conversation.lock().unwrap();
+                conv_guard.as_ref().map(|c| c.has_title()).unwrap_or(false)
+            };
+            if has_title {
+                return;
+            }
+
+            // Capture messages for the LLM call
+            let state = self.state.read().unwrap();
+            let messages: Vec<(String, String)> = state
+                .chat
+                .messages
+                .iter()
+                .filter(|m| !m.compacted)
+                .map(|m| {
+                    let role = match m.role {
+                        crate::ui::app_state::MessageRole::User => "user",
+                        crate::ui::app_state::MessageRole::Agent => "assistant",
+                        _ => return ("skip".to_string(), m.content.clone()),
+                    };
+                    (role.to_string(), m.content.clone())
+                })
+                .filter(|(role, _)| role != "skip")
+                .collect();
+
+            (model.clone(), messages)
+        }; // drops model_guard, state guard
+
+        // Spawn async task — fire and forget, errors logged.
+        // Capture only the Arcs needed for title-set + persist (avoids
+        // needing StateManager to be Clone).
+        let conv_for_title = self.current_conversation.clone();
+        let storage_for_title = self.storage.clone();
+        tokio::spawn(async move {
+            let title = match generate_conversation_title(&messages, &model).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Failed to generate conversation title: {e}");
+                    return;
+                }
+            };
+
+            // Set title idempotently and persist
+            {
+                let mut guard = conv_for_title.lock().unwrap();
+                let Some(ref mut conv) = *guard else {
+                    return;
+                };
+                if conv.has_title() {
+                    return; // already set by a concurrent call
+                }
+                conv.set_title(title);
+                let conv_clone = conv.clone();
+                drop(guard);
+                if let Err(e) = storage_for_title.as_ref().map(|s| s.save(&conv_clone)).unwrap_or(Ok(())) {
+                    tracing::error!("Failed to persist conversation title: {e}");
+                }
+            }
+        });
     }
 
     /// Run compaction: produce a plan, apply it, return the result.
