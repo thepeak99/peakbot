@@ -425,13 +425,8 @@ impl MarkdownState {
             TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
                 self.style_stack.pop();
             }
-            TagEnd::Item => {
-                // Trailing content of the item (may be empty if the item
-                // contained only a nested list — in which case we already
-                // finished the line at nested-list start).
-                if !self.current_spans.is_empty() {
-                    self.finish_line();
-                }
+            TagEnd::Item | TagEnd::List(_) if !self.current_spans.is_empty() => {
+                self.finish_line();
             }
             TagEnd::List(_) => {
                 if !self.current_spans.is_empty() {
