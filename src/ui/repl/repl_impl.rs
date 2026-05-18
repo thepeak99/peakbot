@@ -1447,6 +1447,7 @@ impl ReplUi {
             KeyCode::Esc => {
                 // Esc interrupts the agent when it's running.
                 // When idle, Esc is a no-op — use Ctrl+C to quit.
+                #[allow(clippy::collapsible_match)]
                 if self.state_manager.is_running() {
                     let _ = self.action_sender.send(UiAction::RequestStop);
                 }
