@@ -722,46 +722,14 @@ impl AgentRunner {
     ) {
         use std::sync::atomic::Ordering;
 
-        // Memory compaction: check once at conversation start, before
-        // any user messages are processed. This is infrastructure hygiene
-        // — the agent itself doesn't decide when to compact.
-        if let (Some(sm), Some(model)) = (state_manager.clone(), compaction_model.clone())
-            && config.memory.enabled
-        {
-            let path = std::path::Path::new("memory.md");
-            if let Some(content) =
-                crate::memory_compaction::read_if_oversized(path, config.memory.threshold_bytes)
-            {
-                let size_before = content.len();
-                match crate::memory_compaction::compact_memory(&content, &model).await {
-                    Ok(compacted) => {
-                        if let Err(e) = std::fs::write(path, compacted) {
-                            tracing::warn!("Failed to write compacted memory.md: {}", e);
-                        } else {
-                            sm.add_system_message(format!(
-                                "memory.md compacted (was {} bytes)",
-                                size_before
-                            ));
-                            tracing::info!(
-                                "memory.md compacted: {} -> {} bytes",
-                                size_before,
-                                std::fs::metadata(path)
-                                    .map(|m| m.len() as usize)
-                                    .unwrap_or(0)
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Memory compaction failed: {}", e);
-                    }
-                }
-            }
-        }
-
         // The agent reference is `mut` here — `/model` rebuilds it
         // in-place between turns. `provider_info_cell` and
         // `session_hook_cell` are mirrored into the live event_loop.
         let mut agent = initial_agent;
+
+        // Memory compaction is deferred to the first user message so
+        // startup stays instant and the spinner provides visual feedback.
+        let mut memory_compaction_done = false;
 
         // The event-processor task pulls AgentEvents off the
         // receiver and forwards them into StateManager. It used to
@@ -823,6 +791,53 @@ impl AgentRunner {
                         }
                         sm.decrement_pending_input();
                         sm.set_running(true);
+                    }
+
+                    // Lazy memory compaction: run once on the first user
+                    // message so startup stays instant and the spinner gives
+                    // visual feedback while we work.
+                    if !memory_compaction_done && config.memory.enabled {
+                        memory_compaction_done = true;
+                        if let (Some(sm), Some(model)) =
+                            (state_manager.as_ref(), compaction_model.as_ref())
+                        {
+                            let path = std::path::Path::new("memory.md");
+                            if let Some(content) = crate::memory_compaction::read_if_oversized(
+                                path,
+                                config.memory.threshold_bytes,
+                            ) {
+                                sm.set_status(Some("Compacting memory.md...".to_string()));
+                                let size_before = content.len();
+                                match crate::memory_compaction::compact_memory(&content, model)
+                                    .await
+                                {
+                                    Ok(compacted) => {
+                                        if let Err(e) = std::fs::write(path, compacted) {
+                                            tracing::warn!(
+                                                "Failed to write compacted memory.md: {}",
+                                                e
+                                            );
+                                        } else {
+                                            sm.add_system_message(format!(
+                                                "memory.md compacted (was {} bytes)",
+                                                size_before
+                                            ));
+                                            tracing::info!(
+                                                "memory.md compacted: {} -> {} bytes",
+                                                size_before,
+                                                std::fs::metadata(path)
+                                                    .map(|m| m.len() as usize)
+                                                    .unwrap_or(0)
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Memory compaction failed: {}", e);
+                                    }
+                                }
+                                sm.set_status(None);
+                            }
+                        }
                     }
 
                     // Build the current-turn `Message` — attachments (if any)
