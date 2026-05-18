@@ -191,7 +191,11 @@ impl StateManager {
                 conv.set_title(title);
                 let conv_clone = conv.clone();
                 drop(guard);
-                if let Err(e) = storage_for_title.as_ref().map(|s| s.save(&conv_clone)).unwrap_or(Ok(())) {
+                if let Err(e) = storage_for_title
+                    .as_ref()
+                    .map(|s| s.save(&conv_clone))
+                    .unwrap_or(Ok(()))
+                {
                     tracing::error!("Failed to persist conversation title: {e}");
                 }
             }
