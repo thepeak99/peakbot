@@ -20,8 +20,8 @@ use crate::hooks::events::AgentEvent;
 use crate::mock::MockCompletionModel;
 use crate::state::StateManager;
 use crate::tools::{
-    BashTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool, FileStrReplaceTool,
-    ListDirectoryTool, SearchTool, ThinkTool, TodoTool,
+    BashBgTool, BashTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool,
+    FileStrReplaceTool, ListDirectoryTool, SearchTool, ThinkTool, TodoTool,
 };
 use anyhow::{Context, Result};
 use rig::agent::Agent;
@@ -333,6 +333,7 @@ fn add_builtin_tools<M, P>(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
+    state_manager: Option<Arc<StateManager>>,
 ) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
 where
     M: rig::completion::CompletionModel,
@@ -344,12 +345,25 @@ where
     // Create BashTool with configured environment variables
     let bash_tool = BashTool::new(bash_config.env.clone());
 
+    // `bash_bg` requires StateManager — it has no state of its own
+    // (registry lives on StateManager). When `state_manager` is `None`
+    // (test paths that exercise providers without a state manager),
+    // fall back to the `Default` impl, which returns
+    // `BashBgError::NoStateManager` on every call. The error is a
+    // coach message rather than a panic, matching `TodoTool`'s same-
+    // shape pattern.
+    let bash_bg_tool = match state_manager {
+        Some(sm) => BashBgTool::new_with_env(sm, bash_config.env.clone()),
+        None => BashBgTool::default(),
+    };
+
     let mut builder = builder
         .tool(FileCreateTool)
         .tool(FileStrReplaceTool)
         .tool(FileInsertTool)
         .tool(FileReadTool)
         .tool(bash_tool)
+        .tool(bash_bg_tool)
         .tool(ListDirectoryTool)
         .tool(FetchUrlTool)
         .tool(ThinkTool)
@@ -428,6 +442,7 @@ fn create_openrouter_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
+        Some(state_manager.clone()),
     );
 
     // Add MCP tools and build
@@ -457,7 +472,7 @@ fn create_ollama_agent(
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
-    _state_manager: Arc<StateManager>,
+    state_manager: Arc<StateManager>,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -495,6 +510,7 @@ fn create_ollama_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
+        Some(state_manager.clone()),
     );
 
     // Add MCP tools and build
@@ -575,6 +591,7 @@ fn create_openai_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
+        Some(state_manager.clone()),
     );
 
     // Add MCP tools and build
@@ -658,6 +675,7 @@ fn create_llamacpp_agent(
         todo_tool,
         bash_config,
         pipeline_registry,
+        Some(state_manager.clone()),
     );
 
     // Add MCP tools and build

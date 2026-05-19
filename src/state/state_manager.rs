@@ -3,6 +3,7 @@
 //! Single source of truth for app state (chat, todos, stats, context).
 //! Broadcasts changes to UI subscribers via async channels.
 
+use crate::bg_processes::{BgError, BgRegistry, BgStatus, DrainedBlock, StartParams};
 use crate::context_manager::{CompactionResult, ContextManager};
 use crate::conversation::Conversation;
 use crate::conversation_title::generate_conversation_title;
@@ -11,7 +12,8 @@ use crate::providers::CompactionModel;
 use crate::storage::{ConversationStorage, ConversationSummary};
 use crate::tools::todo::{TodoList, TodoStatus};
 use crate::ui::app_state::{
-    AppState, ChatMessage, ChatState, ContextState, SessionState, TodoItem, TodoState, WelcomeState,
+    AppState, BgState, BgSummary, ChatMessage, ChatState, ContextState, SessionState, TodoItem,
+    TodoState, WelcomeState,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -41,6 +43,20 @@ pub struct StateManager {
     // ── Conversation Persistence ──────────────────────────────────────────────
     storage: Option<Arc<dyn ConversationStorage>>,
     current_conversation: Arc<Mutex<Option<Conversation>>>,
+
+    // ── Background processes (`bash_bg` tool) ────────────────────────────────
+    /// Long-running PTY-attached processes spawned by the `bash_bg` tool.
+    /// Lock is held only synchronously — never across `.await`. See
+    /// `bg_processes.rs` for the lifecycle / drain semantics and
+    /// `bash-background.md` for the design.
+    bg: Arc<Mutex<BgRegistry>>,
+
+    /// Notification channel: per-process reader threads ping `()` here
+    /// whenever fresh output lands (debounced inside the reader). The
+    /// agent loop holds the receiving end and translates each ping into
+    /// a `QueueMessage::BackgroundOutputReady`. `None` ⇒ no agent loop
+    /// attached (e.g. unit tests that exercise `StateManager` directly).
+    bg_notify_tx: RwLock<Option<mpsc::UnboundedSender<()>>>,
 
     // ── Rendering Coalescence ─────────────────────────────────────────────────
     /// Monotonic counter for render coalescence — see `slow-messages.md` §4.4.
@@ -78,6 +94,8 @@ impl StateManager {
             self_ref: RwLock::new(None),
             storage,
             current_conversation: Arc::new(Mutex::new(None)),
+            bg: Arc::new(Mutex::new(BgRegistry::new())),
+            bg_notify_tx: RwLock::new(None),
             revision: AtomicU64::new(0),
         }
     }
@@ -913,6 +931,14 @@ impl StateManager {
             let conv = storage.load(id)?;
             *self.current_conversation.lock().unwrap() = Some(conv);
             self.sync_from_conversation();
+            // Background processes are scoped to the conversation they
+            // were spawned in. Loading a different conversation severs
+            // that context. See `bash-background.md` edge-case table.
+            {
+                let mut reg = self.bg.lock().unwrap();
+                reg.clear();
+            }
+            self.update_bg_state();
         }
         Ok(())
     }
@@ -1207,6 +1233,23 @@ impl StateManager {
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
             tracing::error!("Failed to persist user message: {}", e);
+        }
+    }
+
+    /// Add a synthetic user message produced by the `bash_bg` drain seam.
+    /// Persisted with `MessageSource::Background { proc_ids, any_unlimited }`
+    /// so the renderer can style the row (🛰 capped, 💬 unlimited) and the
+    /// transcript records which background processes contributed.
+    pub fn add_user_message_from_background(
+        &self,
+        content: String,
+        proc_ids: Vec<u32>,
+        any_unlimited: bool,
+    ) {
+        let msg = ChatMessage::user_from_background(content, proc_ids, any_unlimited);
+        self.update_chat(msg);
+        if let Err(e) = self.persist_current() {
+            tracing::error!("Failed to persist bg synthetic user message: {}", e);
         }
     }
 
@@ -1549,6 +1592,218 @@ impl StateManager {
         };
 
         Some((prompt, history))
+    }
+
+    // ── Background processes (`bash_bg`) ────────────────────────────────────
+
+    /// Attach a notification sender for background-process reader pings.
+    /// Called once by the agent loop at startup, and again after any
+    /// rebuild that spawns a fresh receiver (`/model`).
+    pub fn attach_bg_notify(&self, tx: mpsc::UnboundedSender<()>) {
+        *self.bg_notify_tx.write().unwrap() = Some(tx);
+    }
+
+    /// Detach the notification sender (used on shutdown — readers
+    /// outliving the agent loop must not push onto a closed channel).
+    pub fn detach_bg_notify(&self) {
+        *self.bg_notify_tx.write().unwrap() = None;
+    }
+
+    /// Spawn a new background process. Returns the [`BgListEntry`] for
+    /// the freshly-registered process (id, pid, etc.) so callers can
+    /// surface it to the model immediately.
+    pub fn start_bg(
+        &self,
+        params: StartParams,
+    ) -> Result<crate::bg_processes::BgListEntry, BgError> {
+        // Snapshot the sender out of the lock before crossing into the
+        // registry — registry::start drops a cloned sender into the
+        // reader thread.
+        let tx = {
+            let guard = self.bg_notify_tx.read().unwrap();
+            guard.clone()
+        };
+        let Some(tx) = tx else {
+            return Err(BgError::Spawn(
+                "bg notify channel not attached (agent loop not ready)".into(),
+            ));
+        };
+        let entry = {
+            let mut reg = self.bg.lock().unwrap();
+            reg.start(params, tx)?
+        };
+        self.update_bg_state();
+        Ok(entry)
+    }
+
+    /// Stop and remove a background process. Returns `(exit_code,
+    /// final_buffer_lines)` so the tool can surface the tail to the LLM
+    /// once.
+    pub fn stop_bg(&self, id: u32) -> Result<(i32, Vec<String>), BgError> {
+        let out = {
+            let mut reg = self.bg.lock().unwrap();
+            reg.stop(id)?
+        };
+        self.update_bg_state();
+        Ok(out)
+    }
+
+    /// Send a line of input to a running background process.
+    pub fn send_bg_line(&self, id: u32, line: String) -> Result<usize, BgError> {
+        let mut reg = self.bg.lock().unwrap();
+        reg.send_line(id, line)
+    }
+
+    /// Snapshot the registry for the `list` verb / `/bg` slash command.
+    pub fn list_bg(&self) -> Vec<crate::bg_processes::BgListEntry> {
+        let reg = self.bg.lock().unwrap();
+        reg.list()
+    }
+
+    /// Kill every background process (called on `/new`, `/model`, `/load`
+    /// rebuild paths). Idempotent — empty registry is a no-op.
+    pub fn clear_bg(&self) {
+        {
+            let mut reg = self.bg.lock().unwrap();
+            reg.clear();
+        }
+        self.update_bg_state();
+    }
+
+    /// Reset the capped-tier circuit-breaker counter. Called by the
+    /// agent loop whenever a real user message is dequeued, so
+    /// consecutive auto-injections that were paused can resume.
+    pub fn reset_bg_counter(&self) {
+        let mut reg = self.bg.lock().unwrap();
+        reg.reset_counter();
+    }
+
+    /// Drain every non-empty bg buffer into a single synthetic-turn
+    /// payload. Returns `None` when nothing was drained (all buffers
+    /// clean or capped-tier suppression is active).
+    ///
+    /// Side effects (inside the registry):
+    /// - touched ring buffers cleared,
+    /// - exited processes removed,
+    /// - circuit-breaker counter updated per tier contributions.
+    pub fn drain_bg_output_into_synthetic_turn(&self) -> Option<SyntheticTurn> {
+        let blocks = {
+            let mut reg = self.bg.lock().unwrap();
+            reg.drain_outputs()?
+        };
+        self.update_bg_state();
+        Some(SyntheticTurn::from_blocks(blocks))
+    }
+
+    /// Refresh the `bg` slice of `AppState`. Called after every registry
+    /// mutation so the TUI status counter `🛰 N bg` stays in sync.
+    pub fn update_bg_state(&self) {
+        let snapshot = {
+            let reg = self.bg.lock().unwrap();
+            let running_count = reg.running_count();
+            let recent: Vec<BgSummary> = reg
+                .list()
+                .into_iter()
+                .take(5)
+                .map(|e| BgSummary {
+                    id: e.id,
+                    command: e.command,
+                    label: e.label,
+                    status: match e.status {
+                        BgStatus::Running { .. } => "running".to_string(),
+                        BgStatus::Exited { .. } => "exited".to_string(),
+                    },
+                    exit_code: match e.status {
+                        BgStatus::Exited { code, .. } => Some(code),
+                        _ => None,
+                    },
+                    treat_as_user_input: e.treat_as_user_input,
+                })
+                .collect();
+            BgState {
+                running_count,
+                recent_summaries: recent,
+            }
+        };
+        {
+            let mut state = self.state.write().unwrap();
+            state.bg = snapshot;
+        }
+        let state = self.state.read().unwrap();
+        self.notify_update(&state);
+    }
+}
+
+/// Payload returned by `drain_bg_output_into_synthetic_turn`.
+///
+/// The caller appends this as a synthetic user turn and runs an agent
+/// turn. The `proc_ids` and `any_unlimited` fields are persisted on the
+/// resulting [`ChatMessage`] via [`crate::ui::app_state::MessageSource::Background`].
+#[derive(Debug, Clone)]
+pub struct SyntheticTurn {
+    /// Pre-rendered `[bg output]` block, ready to ship as a user-role
+    /// `Message::Text` at the wire boundary.
+    pub text: String,
+    /// Ids of processes whose output contributed to this turn.
+    pub proc_ids: Vec<u32>,
+    /// `true` iff at least one contributor was `treat_as_user_input`.
+    pub any_unlimited: bool,
+}
+
+impl SyntheticTurn {
+    fn from_blocks(blocks: Vec<DrainedBlock>) -> Self {
+        let mut text = String::from("[bg output]\n");
+        let mut proc_ids: Vec<u32> = Vec::with_capacity(blocks.len());
+        let mut any_unlimited = false;
+        for b in &blocks {
+            if b.treat_as_user_input {
+                any_unlimited = true;
+            }
+            proc_ids.push(b.id);
+            let label_part = b
+                .label
+                .as_ref()
+                .map(|l| format!(" [{l}]"))
+                .unwrap_or_default();
+            let header = match &b.status_after {
+                BgStatus::Exited { code, .. } => format!(
+                    "─── #{id} `{cmd}`{lbl} (exited, code {code}, {n} final lines{tier}) ───",
+                    id = b.id,
+                    cmd = b.command,
+                    lbl = label_part,
+                    code = code,
+                    n = b.lines.len(),
+                    tier = if b.treat_as_user_input {
+                        ", unlimited"
+                    } else {
+                        ""
+                    },
+                ),
+                BgStatus::Running { .. } => format!(
+                    "─── #{id} `{cmd}`{lbl} ({n} new lines{tier}) ───",
+                    id = b.id,
+                    cmd = b.command,
+                    lbl = label_part,
+                    n = b.lines.len(),
+                    tier = if b.treat_as_user_input {
+                        ", unlimited"
+                    } else {
+                        ""
+                    },
+                ),
+            };
+            text.push_str(&header);
+            text.push('\n');
+            for line in &b.lines {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        Self {
+            text,
+            proc_ids,
+            any_unlimited,
+        }
     }
 }
 

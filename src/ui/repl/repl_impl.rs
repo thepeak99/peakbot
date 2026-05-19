@@ -614,6 +614,7 @@ impl ReplUi {
     /// The prompt marker (`> ` or the placeholder) only appears on line 0.
     /// The cursor block (`█`) is rendered inline on whichever logical line
     /// the cursor sits on. See chat 2026-04-24.
+    #[allow(clippy::too_many_arguments)] // status-bar segments are unrelated; bundling them into a struct gains nothing
     pub fn build_input_paragraph<'a>(
         input: &str,
         cursor_pos: usize,
@@ -621,6 +622,7 @@ impl ReplUi {
         run_started_at: Option<std::time::Instant>,
         status_message: Option<&str>,
         pending_input: usize,
+        bg_running: usize,
         multiline: bool,
     ) -> Paragraph<'a> {
         let (prompt_text, prompt_color) = if input.is_empty() {
@@ -708,12 +710,18 @@ impl ReplUi {
                 } else {
                     String::new()
                 };
+                let bg_segment = if bg_running > 0 {
+                    format!(" · 🛰 {bg_running} bg")
+                } else {
+                    String::new()
+                };
                 format!(
-                    " {} Working · {} · {}{} · esc to stop ",
+                    " {} Working · {} · {}{}{} · esc to stop ",
                     spinner::frame_for(t),
                     spinner::fmt_elapsed(t),
                     phase,
                     queued,
+                    bg_segment,
                 )
             }
             // Multiline compose mode (idle): the title doubles as the
@@ -915,6 +923,7 @@ impl ReplUi {
                     state.run_started_at,
                     state.status_message.as_deref(),
                     state.pending_input_count,
+                    state.bg.running_count,
                     self.multiline_mode,
                 );
 
@@ -2104,15 +2113,15 @@ mod multiline_input_tests {
     /// changes upstream, this test catches it.
     #[test]
     fn real_paragraph_line_count_includes_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, false);
+        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false);
         // 1 content line (placeholder) + 2 border rows = 3.
         assert_eq!(empty.line_count(120), 3);
 
-        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, false);
+        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false);
         // 2 content lines + 2 border rows = 4.
         assert_eq!(one_newline.line_count(120), 4);
 
-        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, false);
+        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false);
         // 3 content lines + 2 border rows = 5.
         assert_eq!(two_newlines.line_count(120), 5);
     }
@@ -2124,13 +2133,13 @@ mod multiline_input_tests {
     /// `Constraint::Length(input_height)` math in `ReplUi::render`.
     #[test]
     fn paragraph_content_rows_strips_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, false);
+        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false);
         assert_eq!(ReplUi::paragraph_content_rows(&empty, 120), 1);
 
-        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, false);
+        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false);
         assert_eq!(ReplUi::paragraph_content_rows(&one_newline, 120), 2);
 
-        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, false);
+        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false);
         assert_eq!(ReplUi::paragraph_content_rows(&two_newlines, 120), 3);
     }
 
@@ -2200,6 +2209,7 @@ mod multiline_input_tests {
             Some(started),
             Some("thinking"),
             3,
+            0,
             false,
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
@@ -2235,6 +2245,7 @@ mod multiline_input_tests {
             true,
             Some(started),
             Some("thinking"),
+            0,
             0,
             false,
         );
@@ -3067,8 +3078,8 @@ mod multiline_mode_tests {
     fn build_input_paragraph_accepts_multiline_flag() {
         // Just a compile-time pin: the signature must accept the new
         // bool. The visual diff is owned by snapshot tests.
-        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, true);
-        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, false);
+        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, true);
+        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, false);
     }
 }
 
