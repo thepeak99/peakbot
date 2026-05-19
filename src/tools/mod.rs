@@ -1,4 +1,5 @@
 mod bash;
+mod bash_bg;
 mod fetch_url;
 pub mod file_edit;
 mod file_read;
@@ -8,6 +9,7 @@ mod think;
 pub mod todo;
 
 pub use bash::BashTool;
+pub use bash_bg::BashBgTool;
 pub use fetch_url::FetchUrlTool;
 pub use file_edit::{FileCreateTool, FileInsertTool, FileStrReplaceTool};
 pub use file_read::FileReadTool;

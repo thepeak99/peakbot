@@ -89,6 +89,12 @@ pub struct AppState {
     /// `make-flow-great-again.md`.
     #[serde(default)]
     pub pending_input_count: usize,
+
+    /// Live snapshot of running background processes for the TUI status
+    /// counter `🛰 N bg`. Populated by `StateManager::update_bg_state`
+    /// after each registry mutation. See `bash-background.md`.
+    #[serde(default)]
+    pub bg: BgState,
 }
 
 impl AppState {
@@ -183,6 +189,18 @@ pub struct ChatMessage {
     /// building the rig message array sent to the LLM.
     #[serde(default)]
     pub compacted: bool,
+
+    /// Where this message originated.
+    ///
+    /// Defaults to [`MessageSource::Human`] for backward compatibility;
+    /// pre-v6 conversation files (no `source` field) parse cleanly via
+    /// `#[serde(default)]`. Synthetic turns produced by the `bash_bg`
+    /// drain seam carry [`MessageSource::Background`] so the renderer
+    /// can style them distinctly (🛰 capped, 💬 unlimited) and so the
+    /// transcript records which background processes contributed.
+    /// See `bash-background.md` open Q6.
+    #[serde(default, skip_serializing_if = "MessageSource::is_human")]
+    pub source: MessageSource,
 }
 
 impl ChatMessage {
@@ -198,6 +216,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            source: MessageSource::Human,
         }
     }
 
@@ -220,6 +239,30 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            source: MessageSource::Human,
+        }
+    }
+
+    /// Create a synthetic user message representing background-process
+    /// output. Used by the `bash_bg` drain seam: the agent loop treats
+    /// these as ordinary user turns at the wire boundary, but the
+    /// renderer and the persisted transcript know the difference via
+    /// [`MessageSource::Background`].
+    pub fn user_from_background(content: String, proc_ids: Vec<u32>, any_unlimited: bool) -> Self {
+        Self {
+            role: MessageRole::User,
+            content,
+            attachments: Vec::new(),
+            timestamp: Local::now(),
+            tool_name: None,
+            tool_args: None,
+            tool_result: None,
+            call_id: None,
+            compacted: false,
+            source: MessageSource::Background {
+                proc_ids,
+                any_unlimited,
+            },
         }
     }
 
@@ -235,6 +278,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            source: MessageSource::Human,
         }
     }
 
@@ -250,6 +294,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            source: MessageSource::Human,
         }
     }
 
@@ -265,6 +310,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            source: MessageSource::Human,
         }
     }
 
@@ -285,6 +331,7 @@ impl ChatMessage {
             tool_result: None,
             call_id,
             compacted: false,
+            source: MessageSource::Human,
         }
     }
 
@@ -302,6 +349,7 @@ impl ChatMessage {
             tool_result: Some(result.to_string()),
             call_id,
             compacted: false,
+            source: MessageSource::Human,
         }
     }
 
@@ -322,6 +370,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            source: MessageSource::Human,
         }
     }
 
@@ -341,6 +390,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            source: MessageSource::Human,
         }
     }
 }
@@ -578,6 +628,36 @@ fn format_search_result(result: &str) -> String {
 fn format_generic_result(result: &str) -> String {
     // Generic truncation to 2-3 lines
     truncate_to_lines(result, 3)
+}
+
+/// Origin of a chat message.
+///
+/// Distinguishes background-process-driven synthetic turns from
+/// human-typed input so the renderer can style them and the persisted
+/// transcript records the source. See `bash-background.md` open Q6.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MessageSource {
+    /// Typed by the human OR a normal assistant/tool flow.
+    #[default]
+    Human,
+    /// Synthetic user turn produced by draining background process output.
+    /// Carries the ids of contributing processes and whether any of them
+    /// is on the unlimited (treat-as-user-input) tier.
+    Background {
+        /// Ids of processes that contributed to this synthetic turn.
+        proc_ids: Vec<u32>,
+        /// `true` ⇒ at least one contributor was `treat_as_user_input`.
+        /// Rendered with 💬, vs 🛰 for capped-only.
+        any_unlimited: bool,
+    },
+}
+
+impl MessageSource {
+    /// Borrow-cheap predicate for `skip_serializing_if`.
+    pub fn is_human(&self) -> bool {
+        matches!(self, MessageSource::Human)
+    }
 }
 
 /// Role of a message sender
@@ -944,6 +1024,34 @@ impl ConversationState {
             updated_at: Local::now(),
         }
     }
+}
+
+/// Live snapshot of background processes (the `bash_bg` registry mirrored
+/// for the TUI). Updated by `StateManager::update_bg_state` after each
+/// registry mutation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BgState {
+    /// Number of *running* background processes. Drives the `🛰 N bg`
+    /// status-bar counter; rendered only when non-zero.
+    pub running_count: usize,
+
+    /// Up to the 5 most recent entries for an optional `/bg` listing.
+    /// Kept tight — the canonical view is the `bash_bg list` tool call.
+    pub recent_summaries: Vec<BgSummary>,
+}
+
+/// One row in `BgState`, mirroring `bg_processes::BgListEntry` at the
+/// AppState boundary so the UI never has to depend on the bg module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BgSummary {
+    pub id: u32,
+    pub command: String,
+    pub label: Option<String>,
+    /// `"running"` | `"exited"`. Kept stringly-typed at the UI boundary
+    /// to avoid pulling chrono/registry types into AppState.
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub treat_as_user_input: bool,
 }
 
 /// UI preferences
