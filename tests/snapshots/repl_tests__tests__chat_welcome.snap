@@ -1,10 +1,10 @@
 ---
 source: tests/repl_tests.rs
-assertion_line: 158
+assertion_line: 170
 expression: "lines.join(\"\\n\")"
 ---
 ┌ Chat Messages ──────────────────────────────────────────┐▲
-│✨  PeakBot v0.4.4                                        │█
+│✨  PeakBot v0.5.0                                        │█
 │Start a conversation or use /help for commands.          │█
 │                                                         │█
 │                                                         │█
