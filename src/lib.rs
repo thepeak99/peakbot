@@ -1,5 +1,6 @@
 //! PeakBot library - Core functionality for connecting to MCP servers and managing tools.
 
+pub mod bg_processes;
 mod config;
 mod context_manager;
 mod conversation;
@@ -86,6 +87,13 @@ enum QueueMessage {
     /// before the action is sent). The agent loop dequeues this between
     /// turns and runs `rebuild_agent_for_alias`.
     SwitchModel(String),
+    /// One or more `bash_bg` processes have output ready. Payload is
+    /// empty — the agent loop drains every bg buffer in one pass.
+    /// Multiple notifications coalesce naturally (the drain returns
+    /// `None` if buffers were already cleared). Pushed by per-process
+    /// reader threads (debounced inside the reader) and consumed
+    /// between turns. See `bash-background.md` § "Wiring into the agent loop".
+    BackgroundOutputReady,
 }
 
 /// How should a submitted input buffer be routed by the event loop?
@@ -417,6 +425,30 @@ impl AgentRunner {
         // Channel between event loop and agent loop
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<QueueMessage>(32);
 
+        // Background-process notification bridge: per-process reader
+        // threads push `()` pings here (debounced inside the reader);
+        // a small forwarder task translates each ping into a
+        // `QueueMessage::BackgroundOutputReady` and ships it through
+        // the same agent-loop queue user messages flow on. The
+        // `Sender<()>` is handed to `StateManager` so the `bash_bg`
+        // tool's `start` verb can hand a clone to each reader. See
+        // `bash-background.md` § "Wiring into the agent loop".
+        let (bg_notify_tx, mut bg_notify_rx) = mpsc::unbounded_channel::<()>();
+        if let Some(sm) = self.state_manager.as_ref() {
+            sm.attach_bg_notify(bg_notify_tx);
+        }
+        let bg_bridge_handle = {
+            let msg_tx = msg_tx.clone();
+            tokio::spawn(async move {
+                while bg_notify_rx.recv().await.is_some() {
+                    // Best-effort: if the queue is full the agent loop
+                    // is already busy; the next reader ping will
+                    // re-arm us. Drop the error.
+                    let _ = msg_tx.send(QueueMessage::BackgroundOutputReady).await;
+                }
+            })
+        };
+
         // Drain flag — set by event loop on /stop, consumed by agent loop to
         // discard any queued UserMessage/Command between the dropped turn and
         // the matching StopMarker. See `make-flow-great-again.md`: /stop ==
@@ -506,6 +538,13 @@ impl AgentRunner {
         // Wait for event loop to exit (View closed)
         event_handle.await.ok();
         agent_handle.abort();
+        // Drop the bg notify sender so the bridge wakes and exits.
+        if let Some(sm) = self.state_manager.as_ref() {
+            sm.detach_bg_notify();
+            // Kill any still-running bg processes before tearing down.
+            sm.clear_bg();
+        }
+        bg_bridge_handle.abort();
     }
 
     /// Event loop - receives UiActions from View, queues messages for agent loop.
@@ -769,11 +808,22 @@ impl AgentRunner {
                     }
                     Some(QueueMessage::UserMessage { .. })
                     | Some(QueueMessage::Command(_))
-                    | Some(QueueMessage::SwitchModel(_)) => {
+                    | Some(QueueMessage::SwitchModel(_))
+                    | Some(QueueMessage::BackgroundOutputReady) => {
                         // Discarded — pending counter was already zeroed by
                         // the event loop's drain trigger. (SwitchModel is
                         // included for safety; in practice the View only
                         // emits it between turns when nothing is running.)
+                        //
+                        // `BackgroundOutputReady` is discarded too: /stop ==
+                        // stop, *including* auto-injection. Buffers
+                        // themselves keep filling inside the registry (the
+                        // reader threads don't know about /stop); when a
+                        // new ping arrives after drain mode clears, the
+                        // accumulated lines flush in a single synthetic
+                        // turn. Per Q3: /stop suppresses synthetic turns,
+                        // unlimited-tier processes are functionally paused
+                        // (still running, just not flushed).
                         continue;
                     }
                     None => break,
@@ -790,6 +840,11 @@ impl AgentRunner {
                             sm.add_user_message_with_attachments(text.clone(), attachments);
                         }
                         sm.decrement_pending_input();
+                        // A real human turn resets the capped-tier circuit
+                        // breaker, so any bg processes that were paused by
+                        // it can resume injecting on the next ping. See
+                        // `bash-background.md` § "Circuit breaker".
+                        sm.reset_bg_counter();
                         sm.set_running(true);
                     }
 
@@ -876,6 +931,32 @@ impl AgentRunner {
 
                     // Send completion notification
                     completion_tx.send(result).ok();
+
+                    // Post-turn bg drain seam: if any background process
+                    // produced output during this turn (or while we were
+                    // parked), drain it into a synthetic user turn and
+                    // immediately run another iteration. See
+                    // `bash-background.md` § "Wiring into the agent loop".
+                    Self::run_bg_synthetic_turn_if_any(
+                        &state_manager,
+                        &agent,
+                        &config,
+                        &completion_tx,
+                    )
+                    .await;
+                }
+
+                Some(QueueMessage::BackgroundOutputReady) => {
+                    // Wake-up triggered by a reader thread. Same drain
+                    // path as the post-turn seam — extracted into a
+                    // helper so the contract is identical.
+                    Self::run_bg_synthetic_turn_if_any(
+                        &state_manager,
+                        &agent,
+                        &config,
+                        &completion_tx,
+                    )
+                    .await;
                 }
 
                 Some(QueueMessage::Command(cmd)) => {
@@ -1031,6 +1112,9 @@ impl AgentRunner {
         sm_for_provider.clear_chat();
         sm_for_provider.reset_stats();
         sm_for_provider.clear_all_todos();
+        // Kill any bg processes — they were rooted in the previous
+        // conversation. See `bash-background.md` edge-case table.
+        sm_for_provider.clear_bg();
         let convo_name = format!(
             "Conversation {}",
             chrono::Local::now().format("%Y-%m-%d %H:%M")
@@ -1498,6 +1582,52 @@ impl AgentRunner {
         })
     }
 
+    /// Drain any pending background-process output and, if non-empty,
+    /// inject it as a synthetic user turn and run an agent turn over
+    /// it. No-op when buffers are empty OR the capped-tier circuit
+    /// breaker is suppressing.
+    ///
+    /// Called by the agent loop in two places (the "two seams" of
+    /// `bash-background.md`):
+    /// 1. After a `UserMessage` turn completes (post-turn drain).
+    /// 2. On `QueueMessage::BackgroundOutputReady` while the loop is
+    ///    parked (idle wake-up).
+    ///
+    /// Both paths share the same drain + dispatch shape, so the helper
+    /// guarantees they behave identically — the only difference is who
+    /// triggers them.
+    async fn run_bg_synthetic_turn_if_any(
+        state_manager: &Option<Arc<StateManager>>,
+        agent: &Arc<DynAgent>,
+        config: &Config,
+        completion_tx: &tokio::sync::broadcast::Sender<CompletionResult>,
+    ) {
+        let Some(sm) = state_manager.as_ref() else {
+            return;
+        };
+        let Some(synthetic) = sm.drain_bg_output_into_synthetic_turn() else {
+            return;
+        };
+        // Persist the synthetic message with the bg discriminator so
+        // /load restores it with the right styling and proc-id
+        // provenance.
+        sm.add_user_message_from_background(
+            synthetic.text.clone(),
+            synthetic.proc_ids.clone(),
+            synthetic.any_unlimited,
+        );
+        sm.set_running(true);
+        let current_turn = sm
+            .build_current_turn_message()
+            .unwrap_or_else(|| rig::completion::message::Message::from(synthetic.text.as_str()));
+        let result =
+            Self::process_message_internal(current_turn, state_manager, agent, config).await;
+        sm.set_running(false);
+        // No "worked for …" system row here — bg-driven turns are
+        // ambient by design; the user already saw the bg block.
+        completion_tx.send(result).ok();
+    }
+
     /// Internal process_command
     async fn process_command_internal(
         cmd: &str,
@@ -1665,6 +1795,53 @@ impl AgentRunner {
                     tracing::warn!("State manager not available for /exit command");
                 }
             }
+            "/bg" => {
+                // Human-facing listing of background processes — mirrors
+                // what `bash_bg list` returns to the model. See
+                // `bash-background.md` open Q7.
+                if let Some(sm) = state_manager {
+                    let rows = sm.list_bg();
+                    if rows.is_empty() {
+                        sm.add_system_message("No background processes.".to_string());
+                    } else {
+                        let mut msg = format!("Background processes ({}):\n", rows.len());
+                        for r in rows {
+                            let tier = if r.treat_as_user_input {
+                                "💬 unlimited"
+                            } else {
+                                "🛰 capped"
+                            };
+                            let status = match r.status {
+                                crate::bg_processes::BgStatus::Running { .. } => {
+                                    "running".to_string()
+                                }
+                                crate::bg_processes::BgStatus::Exited { code, .. } => {
+                                    format!("exited({code})")
+                                }
+                            };
+                            let label = r
+                                .label
+                                .as_ref()
+                                .map(|l| format!(" [{l}]"))
+                                .unwrap_or_default();
+                            msg.push_str(&format!(
+                                "  #{} pid={} {} · {} · {}/{} lines · {}{}\n",
+                                r.id,
+                                r.pid,
+                                tier,
+                                status,
+                                r.buffer_len,
+                                r.capture_cap,
+                                r.command,
+                                label,
+                            ));
+                        }
+                        sm.add_system_message(msg);
+                    }
+                } else {
+                    tracing::warn!("State manager not available for /bg command");
+                }
+            }
             "/help" => {
                 // Derive the help text from `builtin_commands()` so the popup
                 // menu, the dispatcher, and /help stay in lockstep.
@@ -1695,6 +1872,11 @@ impl AgentRunner {
                     sm.clear_chat();
                     sm.reset_stats();
                     sm.clear_all_todos();
+                    // Background processes belong to the previous
+                    // conversation — /new severs that context, so the
+                    // processes go with it. See `bash-background.md`
+                    // edge-case table.
+                    sm.clear_bg();
                     let name = format!(
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")

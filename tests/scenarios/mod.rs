@@ -4,6 +4,7 @@
 //! Unit tests for individual components live in their respective source files.
 
 mod bash_tests;
+mod bg_tests;
 mod chat_render_tests;
 mod compaction_tests;
 mod context_tests;
