@@ -149,6 +149,27 @@ Extends the agent with event-driven post-processing capabilities:
 - `SessionStats` - Thread-safe statistics with `Arc<Mutex<>>`
 - `ModelPricing` - Fetched from OpenRouter API or uses defaults
 
+### Background Processes (`src/bg_processes.rs`)
+
+Long-running PTY-backed processes spawned by the [`bash_bg`](#tools-overview) tool. Each process gets a numeric id, a ring buffer of captured output lines, and a tier flag (`treat_as_user_input`) that determines whether its output participates in the synthetic-turn circuit breaker.
+
+**Data flow** (the "two seams" from `bash-background.md`):
+
+1. `bash_bg start` spawns a PTY via `portable-pty`, launches the child under `sh -c`, and registers the process with `StateManager::bg`.
+2. A per-process reader thread streams output lines into the ring buffer (ANSI-stripped, debounced at 500ms) and pings the agent loop via a tokio mpsc channel.
+3. Between turns, the agent loop calls `StateManager::drain_bg_output_into_synthetic_turn`, which builds a `[bg output]` block per non-empty buffer and runs an agent turn over it. The synthetic message is persisted with `MessageSource::Background { proc_ids, any_unlimited }` so the renderer can style it distinctly (🛰 capped, 💬 unlimited) on `/load`.
+
+**Circuit breaker** (two tiers, distinguished at `start` time):
+
+- **Capped** (default): each synthetic turn driven purely by capped processes increments a counter. After `MAX_CONSECUTIVE_AUTO_TURNS` (3) bg-only turns with no real input, auto-injection suppresses. Buffers keep filling — the next reset flushes everything accumulated.
+- **Unlimited** (`treat_as_user_input: true`): declared *legitimate input source* (telegram bridges, webhooks). Any contribution resets the counter to 0 — functionally equivalent to a real user message.
+
+**Lifecycle**:
+
+- `/new`, `/model`, `/load` kill all bg processes and clear the registry.
+- App exit drops the registry (`Drop` impl sends SIGHUP to every child and joins reader threads).
+- Buffers and live processes do **not** persist across restarts — the registry is in-memory only.
+
 ### Skills System (`src/skills/`)
 
 Agent Skills are modular capability packages that extend PeakBot's functionality:
@@ -218,11 +239,11 @@ All tools live in `src/tools/` and implement `rig::tool::Tool`. Each tool define
 - `definition()` -- returns the JSON Schema the model uses to know what to send
 - `call()` -- executes the tool logic
 
-PeakBot includes **10 built-in tools**:
+PeakBot includes **11 built-in tools**:
 
 ### Tools Overview
 
-PeakBot includes **10 built-in tools** (all always available):
+PeakBot includes **11 built-in tools** (all always available):
 
 | Tool | File | Description |
 |------|------|-------------|
@@ -232,6 +253,7 @@ PeakBot includes **10 built-in tools** (all always available):
 | `file_read` | `file_read.rs` | Read files with line ranges |
 | `list_directory` | `list_directory.rs` | List directory contents with recursion |
 | `bash` | `bash.rs` | Execute shell commands with timeout, truncate to last 50k chars, save full output to temp |
+| `bash_bg` | `bash_bg.rs` | Spawn long-running PTY-backed processes (4 verbs: start/stop/list/send_line). Output appears between turns as synthetic `[bg output]` user messages. `treat_as_user_input: true` declares an external-input source (telegram bridges, webhooks) — see `bash-background.md`. |
 | `fetch_url` | `fetch_url.rs` | HTTP GET requests to URLs |
 | `web_search` | `search.rs` | SearXNG-based web search |
 | `think` | `think.rs` | Reasoning tool for complex thinking |
@@ -410,6 +432,7 @@ mcp_servers:
 | `/stats` | Show session statistics (tokens, cost) |
 | `/context` | Show context usage status |
 | `/compact` | Force context compaction |
+| `/bg` | List background processes (`bash_bg` registry) |
 | `exit` | Quit the REPL |
 
 ### Settings
@@ -505,6 +528,7 @@ let main_agent = client
 src/
 ├── main.rs                 # Entry point, creates AgentRunner
 ├── lib.rs                  # AgentRunner, system prompt building, conversation conversion
+├── bg_processes.rs         # BgRegistry, PTY-backed long-running processes for `bash_bg`
 ├── config.rs               # Configuration loading from config.yaml + env vars
 ├── context_manager.rs      # Context compaction for long conversations
 ├── conversation.rs         # Conversation data structures
@@ -537,6 +561,7 @@ src/
 └── tools/
     ├── mod.rs              # Re-exports: all built-in tools
     ├── bash.rs             # BashTool -- shell execution with timeout
+    ├── bash_bg.rs          # BashBgTool -- start/stop/list/send_line long-running PTY processes
     ├── fetch_url.rs        # FetchUrlTool -- HTTP GET requests
     ├── file_edit/          # File-editing tool family (shared helpers in mod.rs)
     │   ├── mod.rs              # MatchLevel, FileEditError, matching + IO helpers, tests

@@ -109,6 +109,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("export", "Export a conversation (json|markdown)", true),
         SlashCommand::new("rename", "Rename the current conversation", true),
         SlashCommand::new("model", "List models, or switch with /model <alias>", true),
+        SlashCommand::new("bg", "List background processes (bash_bg)", false),
         SlashCommand::new("stop", "Stop the agent (interrupt current task)", false),
         SlashCommand::new("exit", "Quit PeakBot (no confirmation)", false),
     ]
@@ -311,6 +312,7 @@ mod tests {
                 "export",
                 "rename",
                 "model",
+                "bg",
                 "stop",
                 "exit",
             ],
@@ -335,6 +337,7 @@ mod tests {
         assert!(!by_name("reset"));
         assert!(!by_name("new"));
         assert!(!by_name("save"));
+        assert!(!by_name("bg"));
         assert!(!by_name("stop"));
         assert!(!by_name("exit"));
         // Arg-taking commands — dispatcher uses `starts_with("/name ")`
