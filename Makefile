@@ -123,7 +123,8 @@ release-bump:
 	echo "✅ Committed version bump to $$v"; \
 	echo "$$v" > .release-version
 
-## release-tag: Create annotated tag and push branch + tag
+## release-tag: Create annotated tag and push branch + tag.
+## If the branch is protected, automatically opens a PR, merges it, then pushes the tag.
 release-tag:
 	@set -eu; \
 	if [ ! -f .release-version ]; then \
@@ -141,9 +142,44 @@ release-tag:
 	  git tag -a "$$v" -m "Release $$v"; \
 	fi; \
 	echo "📤 Pushing branch and tag..."; \
-	git push origin "$$branch"; \
+	if git push origin "$$branch" 2>/dev/null; then \
+	  echo "✅ Branch pushed"; \
+	else \
+	  echo "⚠️  Direct push to $$branch failed (protected branch?). Creating PR..."; \
+	  if [ -z "$${GITEA_TOKEN:-}" ]; then \
+	    echo "❌ GITEA_TOKEN is not set. Cannot create PR."; exit 1; \
+	  fi; \
+	  command -v jq >/dev/null   || { echo "❌ 'jq' is required";   exit 1; }; \
+	  command -v curl >/dev/null || { echo "❌ 'curl' is required"; exit 1; }; \
+	  release_branch="release/$$v"; \
+	  git checkout -b "$$release_branch"; \
+	  git push origin "$$release_branch"; \
+	  api="$(GITEA_URL)/api/v1/repos/$(OWNER)/$(REPO)"; \
+	  pr_body="## Release $$v\\n\\nThis PR contains the version bump for v$$v.\\n\\nCo-authored by PeakBot!"; \
+	  pr_resp=$$(curl -sS -X POST "$$api/pulls" \
+	    -H "Authorization: token $$GITEA_TOKEN" \
+	    -H "Content-Type: application/json" \
+	    -d "{\"title\":\"chore: release $$v\",\"body\":\"$$pr_body\",\"head\":\"$$release_branch\",\"base\":\"$$branch\"}"); \
+	  pr_num=$$(echo "$$pr_resp" | jq -r '.number // empty'); \
+	  if [ -z "$$pr_num" ]; then \
+	    echo "❌ Failed to create PR. Response:"; echo "$$pr_resp" | jq .; exit 1; \
+	  fi; \
+	  echo "✅ Created PR #$$pr_num"; \
+	  echo "🔀 Merging PR #$$pr_num..."; \
+	  merge_resp=$$(curl -sS -X POST "$$api/pulls/$$pr_num/merge" \
+	    -H "Authorization: token $$GITEA_TOKEN" \
+	    -H "Content-Type: application/json" \
+	    -d '{"Do":"merge","merge_message_field":"chore: release '$$v'","delete_branch_after_merge":true}'); \
+	  if ! echo "$$merge_resp" | jq -e '.sha' >/dev/null 2>&1; then \
+	    echo "❌ Failed to merge PR. Response:"; echo "$$merge_resp" | jq .; exit 1; \
+	  fi; \
+	  echo "✅ PR merged"; \
+	  git checkout "$$branch"; \
+	  git pull origin "$$branch"; \
+	  git branch -D "$$release_branch" 2>/dev/null || true; \
+	fi; \
 	git push origin "$$v"; \
-	echo "✅ Pushed $$v"
+	echo "✅ Pushed tag $$v"
 
 ## release-build-linux: Build linux/amd64 binary (via Dockerfile.linux) with the release version baked into the filename
 release-build-linux:
