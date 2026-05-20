@@ -193,8 +193,10 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
     let skills_section = skills.to_system_prompt_section();
 
     let env_info = format!(
-        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n",
-        cwd, current_time
+        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n",
+        cwd,
+        current_time,
+        env!("CARGO_PKG_VERSION")
     );
 
     prompt.push_str(&skills_section);

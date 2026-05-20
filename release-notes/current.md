@@ -19,6 +19,7 @@ This file is the working draft for the next release. When a version is tagged, t
 - **Added**: `portable-pty = "0.9"` dependency for cross-platform PTY backing on Linux/macOS/Windows.
 - **Changed**: `/new`, `/model`, and `/load` kill all background processes — they are scoped to the conversation they were spawned in. Buffers and live processes do not survive a restart (in-memory registry only).
 - **Fixed**: `bash_bg` now uses the same environment variables as the synchronous `bash` tool. Processes spawned via `bash_bg start` inherit the custom `env` map from the `bash:` config section, overriding inherited OS variables — matching the `bash` tool's behavior.
+- **Added**: PeakBot version is now included in the system prompt sent to the LLM. The `# Environment Information` section now includes a `PeakBot Version` field, making the model aware of which version it is running on.
 
 
 
