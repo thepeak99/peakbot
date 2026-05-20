@@ -253,7 +253,7 @@ PeakBot includes **11 built-in tools** (all always available):
 | `file_read` | `file_read.rs` | Read files with line ranges |
 | `list_directory` | `list_directory.rs` | List directory contents with recursion |
 | `bash` | `bash.rs` | Execute shell commands with timeout, truncate to last 50k chars, save full output to temp |
-| `bash_bg` | `bash_bg.rs` | Spawn long-running PTY-backed processes (4 verbs: start/stop/list/send_line). Output appears between turns as synthetic `[bg output]` user messages. `treat_as_user_input: true` declares an external-input source (telegram bridges, webhooks) — see `bash-background.md`. |
+| `bash_bg` | `bash_bg.rs` | Spawn long-running PTY-backed processes (4 verbs: start/stop/list/send_line). The model is notified automatically — a synthetic `[bg output]` user turn lands on every output drain and on every process exit (including `capture_output_lines: 0`). Never poll. `treat_as_user_input: true` declares an external-input source (telegram bridges, webhooks) — see `bash-background.md`. |
 | `fetch_url` | `fetch_url.rs` | HTTP GET requests to URLs |
 | `web_search` | `search.rs` | SearXNG-based web search |
 | `think` | `think.rs` | Reasoning tool for complex thinking |

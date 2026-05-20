@@ -535,16 +535,22 @@ impl BgRegistry {
             if !shared.dirty {
                 continue;
             }
-            // Honour the suppression gate for capped-only contributors:
-            // their notifications still fired (reader is unaware of the
-            // breaker), but we don't drain them. The buffer keeps
-            // accumulating; a future drain after a reset will flush it.
-            if suppress && !proc.treat_as_user_input {
+            let exited = matches!(shared.status, BgStatus::Exited { .. });
+            // Honour the suppression gate for capped-only *running*
+            // contributors: their notifications still fired (reader is
+            // unaware of the breaker), but we don't drain them. The
+            // buffer keeps accumulating; a future drain after a reset
+            // will flush it.
+            //
+            // Exit notifications are exempt — a process exit is a
+            // one-shot terminal transition that cannot loop, so the
+            // breaker has no protective value here, and the model needs
+            // to learn the process is gone regardless of breaker state.
+            if suppress && !proc.treat_as_user_input && !exited {
                 continue;
             }
             let lines: Vec<String> = shared.buffer.drain(..).collect();
             shared.dirty = false;
-            let exited = matches!(shared.status, BgStatus::Exited { .. });
             let status_after = shared.status.clone();
             drop(shared);
 
@@ -923,6 +929,65 @@ mod tests {
 
         // Sanity: registry still owns both procs.
         assert_eq!(r.proc_count(), 2);
+    }
+
+    #[test]
+    fn exit_notification_bypasses_capped_suppression() {
+        // Regression pin for the "process exit must always notify"
+        // invariant: if the capped-tier circuit breaker is saturated and
+        // a capped process exits, the exit block must still drain so the
+        // model learns the process is gone. Exits are one-shot terminal
+        // transitions and cannot loop, so the breaker has no protective
+        // value here.
+        let mut r = BgRegistry::new();
+        // Force the breaker to the suppression threshold without going
+        // through real PTYs.
+        r.consecutive_capped_turns = MAX_CONSECUTIVE_AUTO_TURNS;
+        assert!(r.suppress_capped(), "test precondition: breaker saturated");
+
+        // Insert a capped process that has just exited.
+        let shared = Arc::new(Mutex::new(ProcessShared {
+            buffer: VecDeque::from(vec!["final tail line".to_string()]),
+            capture_cap: 10,
+            status: BgStatus::Exited {
+                code: 0,
+                at: Utc::now(),
+            },
+            dirty: true,
+        }));
+        r.procs.insert(
+            42,
+            BgProcess {
+                id: 42,
+                pid: 0,
+                command: "echo bye".into(),
+                label: None,
+                treat_as_user_input: false,
+                capture_cap: 10,
+                started_at: Utc::now(),
+                shared,
+                writer: Box::new(std::io::sink()),
+                killer: dummy_killer(),
+                reader: None,
+            },
+        );
+
+        let drained = r
+            .drain_outputs()
+            .expect("exit must surface even when capped suppression is active");
+        assert_eq!(drained.len(), 1, "exit block must drain");
+        let block = &drained[0];
+        assert!(block.exited(), "drained block must reflect Exited status");
+        assert_eq!(block.lines, vec!["final tail line".to_string()]);
+
+        // The exited process must be removed from the registry on drain
+        // (per `drain_outputs` contract — exited rows are reaped after
+        // their final tail is captured).
+        assert_eq!(
+            r.proc_count(),
+            0,
+            "exited process must be reaped after final drain"
+        );
     }
 
     /// Dummy killer for tests that bypass real PTY spawning.
