@@ -194,7 +194,7 @@ don't feel obliged to reply to every line.
                     },
                     "command": {
                         "type": "string",
-                        "description": "Shell command to spawn (required for `start`). Executed via `sh -c`."
+                        "description": "Shell command to spawn (required for `start`). Executed via the detected shell (bash/sh on Unix, PowerShell on Windows)."
                     },
                     "capture_output_lines": {
                         "type": "integer",
@@ -248,6 +248,7 @@ don't feel obliged to reply to every line.
                     label: args.label,
                     treat_as_user_input,
                     env: self.env.clone(),
+                    shell: String::new(),
                 })?;
                 Ok(json!({
                     "id": entry.id,
