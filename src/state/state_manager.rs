@@ -58,6 +58,11 @@ pub struct StateManager {
     /// attached (e.g. unit tests that exercise `StateManager` directly).
     bg_notify_tx: RwLock<Option<mpsc::UnboundedSender<()>>>,
 
+    // ── Background process shell ──────────────────────────────────────────────
+    /// Shell executable used by `bash_bg` when spawning background processes.
+    /// Injected by `main.rs` after shell detection. Empty until set.
+    shell: RwLock<String>,
+
     // ── Rendering Coalescence ─────────────────────────────────────────────────
     /// Monotonic counter for render coalescence — see `slow-messages.md` §4.4.
     revision: AtomicU64,
@@ -96,6 +101,7 @@ impl StateManager {
             current_conversation: Arc::new(Mutex::new(None)),
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             bg_notify_tx: RwLock::new(None),
+            shell: RwLock::new(String::new()),
             revision: AtomicU64::new(0),
         }
     }
@@ -1609,13 +1615,28 @@ impl StateManager {
         *self.bg_notify_tx.write().unwrap() = None;
     }
 
+    /// Set the shell executable used by background processes.
+    /// Called once at startup after shell detection.
+    pub fn set_shell(&self, shell: String) {
+        let mut guard = self.shell.write().unwrap();
+        *guard = shell;
+    }
+
     /// Spawn a new background process. Returns the [`BgListEntry`] for
     /// the freshly-registered process (id, pid, etc.) so callers can
     /// surface it to the model immediately.
     pub fn start_bg(
         &self,
-        params: StartParams,
+        mut params: StartParams,
     ) -> Result<crate::bg_processes::BgListEntry, BgError> {
+        // Inject the detected shell if the caller didn't specify one.
+        if params.shell.is_empty() {
+            let shell = self.shell.read().unwrap().clone();
+            if !shell.is_empty() {
+                params.shell = shell;
+            }
+        }
+
         // Snapshot the sender out of the lock before crossing into the
         // registry — registry::start drops a cloned sender into the
         // reader thread.

@@ -16,7 +16,7 @@ const TEMP_DIR_NAME: &str = "peakbot";
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
-pub enum BashError {
+pub enum PowerShellError {
     #[error("{0}")]
     Execution(String),
     #[error("IO error: {0}")]
@@ -24,7 +24,7 @@ pub enum BashError {
 }
 
 #[derive(Deserialize)]
-pub struct BashArgs {
+pub struct PowerShellArgs {
     #[allow(dead_code)]
     thought: String,
     command: String,
@@ -36,75 +36,56 @@ pub struct BashArgs {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct BashTool {
-    /// Shell executable path (e.g. "/bin/sh" or "C:\Program Files\Git\bin\bash.exe")
-    #[serde(default = "default_shell")]
+pub struct PowerShellTool {
+    /// Path to the PowerShell executable (pwsh.exe or powershell.exe)
     shell: String,
     /// Optional environment variables to set for the command
     #[serde(default)]
     env: Option<HashMap<String, String>>,
 }
 
-impl Default for BashTool {
+impl Default for PowerShellTool {
     fn default() -> Self {
         Self {
-            shell: default_shell(),
+            shell: "pwsh".to_string(),
             env: None,
         }
     }
 }
 
-fn default_shell() -> String {
-    "/bin/sh".to_string()
-}
-
-impl BashTool {
-    /// Create a new BashTool with the given shell path and environment variables.
+impl PowerShellTool {
+    /// Create a new PowerShellTool with the given executable and environment variables.
     pub fn new(shell: String, env: Option<HashMap<String, String>>) -> Self {
         Self { shell, env }
     }
 
-    /// Detect if the command appears to be doing file editing
-    /// Returns a warning message if file-editing patterns are detected
+    /// Detect if the command appears to be doing file editing.
+    /// Returns a warning message if file-editing patterns are detected.
     fn check_file_edit_patterns(&self, command: &str) -> Option<String> {
         let command_lower = command.to_lowercase();
 
-        // Check for common file-editing bash patterns
-        if command_lower.contains("sed -i") {
-            return Some(
-                self.file_edit_warning("sed -i for in-place file editing", "file_str_replace"),
-            );
-        }
-
-        // Check for awk with output redirection (awk ... > file)
-        if command_lower.contains("awk") && command.contains(">") {
-            return Some(self.file_edit_warning("awk for file modification", "file_str_replace"));
-        }
-
-        if command_lower.contains("perl -pi") {
-            return Some(
-                self.file_edit_warning("perl for in-place file editing", "file_str_replace"),
-            );
-        }
-
-        if command_lower.contains("ex +") && command.contains("%") {
+        // Check for Set-Content / Add-Content (PowerShell file writing)
+        if command_lower.contains("set-content") || command_lower.contains("add-content") {
             return Some(self.file_edit_warning(
-                "vim/ex for file editing",
-                "the file editing tools (file_create / file_str_replace / file_insert)",
+                "Set-Content / Add-Content for file writing",
+                "file_str_replace",
             ));
         }
 
-        if command_lower.contains("vi -c") {
+        // Check for Out-File with redirection
+        if command_lower.contains("out-file")
+            || command_lower.contains(">") && command_lower.contains("$")
+        {
             return Some(self.file_edit_warning(
-                "vi for file editing",
-                "the file editing tools (file_create / file_str_replace / file_insert)",
+                "Out-File / redirection for file modification",
+                "file_str_replace",
             ));
         }
 
         None
     }
 
-    /// Generate a standardized warning message for file-editing bash commands
+    /// Generate a standardized warning message for file-editing PowerShell commands
     fn file_edit_warning(&self, description: &str, tool_suggestion: &str) -> String {
         format!(
             "⚠️  Consider using {tool} instead of {description} for file modifications.\n\
@@ -113,7 +94,7 @@ impl BashTool {
             - Cross-platform compatibility\n\
             - Automatic whitespace handling\n\
             \nThis command will execute, but {tool} is recommended for file content modifications.\n\
-            Use bash ONLY for: file operations (mv/cp/rm), permissions, bulk operations on many files.",
+            Use PowerShell ONLY for: file operations (Move-Item/Copy-Item/Remove-Item), permissions, bulk operations on many files.",
             tool = tool_suggestion,
             description = description
         )
@@ -132,7 +113,7 @@ fn save_full_output(stdout: &str, stderr: &str) -> std::io::Result<(PathBuf, Pat
         .as_secs();
 
     let session_id = format!("{}_{}", timestamp, counter);
-    let base = temp_dir.join(format!("bash_{}", session_id));
+    let base = temp_dir.join(format!("powershell_{}", session_id));
 
     let stdout_path = base.with_extension("stdout.txt");
     let stderr_path = base.with_extension("stderr.txt");
@@ -198,26 +179,20 @@ fn apply_head_tail(s: &str, head: Option<usize>, tail: Option<usize>) -> (String
     )
 }
 
-impl Tool for BashTool {
-    const NAME: &'static str = "bash";
-    type Error = BashError;
-    type Args = BashArgs;
+impl Tool for PowerShellTool {
+    const NAME: &'static str = "powershell";
+    type Error = PowerShellError;
+    type Args = PowerShellArgs;
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        let shell_name = std::path::Path::new(&self.shell)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("sh");
         ToolDefinition {
-            name: "bash".to_string(),
-            description: format!(
-                "Run a shell command and return stdout and stderr. \
+            name: "powershell".to_string(),
+            description: "Run a PowerShell command and return stdout and stderr. \
                 Use `head` to show first N lines, `tail` to show last N lines (default: 100). \
                 Full output is always saved to /tmp/peakbot/ and accessible via file_read. \
-                Commands run in {}. Default timeout is 30 seconds.",
-                shell_name
-            ),
+                Commands run in PowerShell. Default timeout is 30 seconds."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -227,7 +202,7 @@ impl Tool for BashTool {
                     },
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute"
+                        "description": "The PowerShell command to execute"
                     },
                     "timeout_seconds": {
                         "type": "integer",
@@ -259,22 +234,19 @@ impl Tool for BashTool {
         // Log before execution
         tracing::info!(
             target: "peakbot",
-            tool_type = "bash",
+            tool_type = "powershell",
             command = %args.command,
             timeout_secs = timeout_secs,
             env_vars = ?self.env.as_ref().map(|e| e.keys().collect::<Vec<_>>()),
-            "Starting bash tool execution"
+            "Starting PowerShell tool execution"
         );
 
         let start_time = std::time::Instant::now();
 
         // Build the command with optional environment variables.
-        // stdin is explicitly detached: agent tools are non-interactive, and
-        // inheriting the parent's TTY lets the child (e.g. `sudo`, `ssh`,
-        // `$EDITOR`) fight ratatui for input and corrupt termios state.
-        // See `better-tty.md` for the full rationale.
+        // stdin is explicitly detached: agent tools are non-interactive.
         let mut cmd = Command::new(&self.shell);
-        cmd.arg("-c")
+        cmd.arg("-Command")
             .arg(&args.command)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -288,9 +260,9 @@ impl Tool for BashTool {
             }
         }
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| BashError::Execution(format!("Failed to spawn shell: {}", e)))?;
+        let child = cmd.spawn().map_err(|e| {
+            PowerShellError::Execution(format!("Failed to spawn PowerShell: {}", e))
+        })?;
 
         let result =
             tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
@@ -307,7 +279,7 @@ impl Tool for BashTool {
                     Err(e) => {
                         tracing::warn!(
                             target: "peakbot",
-                            tool_type = "bash",
+                            tool_type = "powershell",
                             error = %e,
                             "Failed to save full output to temp file"
                         );
@@ -357,14 +329,14 @@ impl Tool for BashTool {
                 // Log successful completion
                 tracing::info!(
                     target: "peakbot",
-                    tool_type = "bash",
+                    tool_type = "powershell",
                     exit_code = exit_code,
                     duration_ms = start_time.elapsed().as_millis(),
                     stdout_modified = stdout_modified,
                     stderr_modified = stderr_modified,
                     stdout_path = %stdout_path.display(),
                     stderr_path = %stderr_path.display(),
-                    "Bash tool completed successfully"
+                    "PowerShell tool completed successfully"
                 );
 
                 Ok(result)
@@ -373,11 +345,11 @@ impl Tool for BashTool {
                 let error = format!("Command failed: {}", e);
                 tracing::warn!(
                     target: "peakbot",
-                    tool_type = "bash",
+                    tool_type = "powershell",
                     error = %error,
-                    "Bash tool execution failed"
+                    "PowerShell tool execution failed"
                 );
-                Err(BashError::Execution(error))
+                Err(PowerShellError::Execution(error))
             }
             Err(_) => {
                 // child is dropped here -> killed automatically due to kill_on_drop
@@ -387,11 +359,11 @@ impl Tool for BashTool {
                 );
                 tracing::warn!(
                     target: "peakbot",
-                    tool_type = "bash",
+                    tool_type = "powershell",
                     timeout_secs = timeout_secs,
-                    "Bash tool timed out"
+                    "PowerShell tool timed out"
                 );
-                Err(BashError::Execution(error))
+                Err(PowerShellError::Execution(error))
             }
         }
     }

@@ -55,7 +55,8 @@ pub use storage::{ConversationStorage, FileStorage};
 pub use test_runner::{CompactionInfo, TestRunner};
 pub use tools::{
     BashTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool, FileStrReplaceTool,
-    ListDirectoryTool, SearchTool, ThinkTool, TodoArgs, TodoItem, TodoStatus, TodoTool,
+    ListDirectoryTool, PowerShellTool, SearchTool, ShellKind, ThinkTool, TodoArgs, TodoItem,
+    TodoStatus, TodoTool, print_no_shell_warning,
 };
 pub use ui::{Ui, UiAction};
 
@@ -286,6 +287,8 @@ pub struct RebuildContext {
     pub todo_tool: Option<crate::tools::TodoTool>,
     pub bash_config: crate::config::BashConfig,
     pub pipeline_registry: Option<Arc<crate::pipeline::SubAgentRegistry>>,
+    /// Detected shell kind — OS-level, so it persists across `/model` switches.
+    pub shell_kind: Option<crate::tools::ShellKind>,
 }
 
 /// Shared cell holding the *currently active* SessionHook. Replaced
@@ -1221,6 +1224,7 @@ impl AgentRunner {
             &ctx.bash_config,
             ctx.pipeline_registry.as_deref(),
             sm_for_provider.clone(),
+            ctx.shell_kind.as_ref(),
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 

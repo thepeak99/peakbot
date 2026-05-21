@@ -2,9 +2,9 @@
 
 use anyhow::Result;
 use peakbot::{
-    AgentRunner, Config, FileStorage, SubAgentRegistry, TodoTool, Ui, UiAction,
+    AgentRunner, Config, FileStorage, ShellKind, SubAgentRegistry, TodoTool, Ui, UiAction,
     build_system_prompt, create_provider, get_config_file_path, load_default_skills,
-    load_mcp_servers,
+    load_mcp_servers, print_no_shell_warning,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -178,6 +178,17 @@ async fn main() -> Result<()> {
     // with a misleading "OpenRouter API key not configured" error.
     let boot_provider_config = config.resolve_and_mirror_boot_provider(&model_registry);
 
+    // Detect the best available shell for this OS.
+    // On Windows with no shell found, warn the user but continue — other
+    // tools (file editing, fetch, search) still work.
+    let shell_kind = ShellKind::detect();
+    if let Some(ref sk) = shell_kind {
+        state_manager.set_shell(sk.executable().to_string());
+        tracing::info!("Detected shell: {} ({})", sk.name(), sk.executable());
+    } else {
+        print_no_shell_warning();
+    }
+
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
         &boot_provider_config,
         mcp_tools,
@@ -188,6 +199,7 @@ async fn main() -> Result<()> {
         &config.bash,
         pipeline_registry.as_ref(),
         state_manager.clone(),
+        shell_kind.as_ref(),
     )?;
 
     tracing::info!(
@@ -227,6 +239,7 @@ async fn main() -> Result<()> {
         todo_tool: Some(todo_tool),
         bash_config: config.bash.clone(),
         pipeline_registry: pipeline_registry.clone().map(Arc::new),
+        shell_kind,
     };
 
     // Resolve the boot model's context_size (from config or auto-detected).
