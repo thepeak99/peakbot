@@ -119,29 +119,66 @@ Distinct from the synchronous `bash` tool: `bash_bg start` returns
 immediately with a numeric id; the process keeps running until you call
 `bash_bg stop <id>`, it exits on its own, or the conversation ends.
 
-Output appears as synthetic user turns framed with `[bg output]` between
-agent turns. Each block tells you the process id, command, line count,
-and tier — `(unlimited, …)` means the process represents external input
-(e.g. a telegram bridge); plain blocks are observation/log feeds.
+## How notifications work (READ THIS)
 
-Actions:
+You are **event-driven** with respect to background processes. The
+runtime will deliver new turns to you automatically whenever:
+  - a bg process emits output (debounced ~500ms), OR
+  - a bg process exits (always, even with `capture_output_lines: 0`,
+    even when the circuit breaker is suppressing chatter).
+
+The new turn arrives as a synthetic user message framed with
+`[bg output]`. Each contributing process gets one block with a header
+like `─── #3 `tail -f log` (12 new lines) ───` or
+`─── #3 `tail -f log` (exited, code 0, 2 final lines) ───`.
+
+**DO NOT** poll. **DO NOT** `sleep N && bash_bg list` to wait for a
+process to finish. **DO NOT** spin on `bash_bg list` between turns.
+That wastes turns and tokens for no reason — the framework already
+guarantees you'll be re-woken on output or exit.
+
+The correct pattern after `bash_bg start`:
+  1. If you have other work to do this turn, do it.
+  2. Otherwise, finish your turn with a brief text reply (e.g.
+     "Started build #3 in background; I'll review the output when
+     it lands."). The next synthetic `[bg output]` turn is your
+     cue to act.
+
+Use `bash_bg list` only for an on-demand status check the user asked
+for, never as a wait loop.
+
+## Tiers
+
+Blocks marked `(unlimited, …)` come from processes started with
+`treat_as_user_input: true` and represent external input (a telegram
+bridge, webhook receiver, IRC bot). Treat them like a real user
+message arriving in the conversation. Plain blocks are observation
+feeds (logs, build watchers, metrics) — read, act if needed, but
+don't feel obliged to reply to every line.
+
+## Actions
+
   • `start`  — spawn a new process. Required: `command`. Optional:
-               `capture_output_lines` (default 200; `0` discards),
+               `capture_output_lines` (default 200; `0` discards
+               output but you still get the exit notification),
                `cwd`, `label`, `treat_as_user_input` (set true for
                telegram/webhook/IRC bridges — anything that brings
                external input into the conversation).
   • `stop`   — kill a process. Required: `id`. Returns final buffer
                tail and exit code in one last pass.
-  • `list`   — snapshot all current processes.
+  • `list`   — snapshot all current processes. For on-demand status
+               only, NOT for waiting.
   • `send_line` — write a line to a running process's stdin.
                Required: `id`, `line`.
 
-Notes:
+## Notes
+
   • `/new`, `/model`, and `/load` kill all background processes.
-  • Stopped processes are removed from the registry on the next drain.
-  • If a `treat_as_user_input` process appears to be in a feedback loop
-    (same line repeating, pathological output), stop it — there is no
-    structural rate limit on the unlimited tier."#
+  • Stopped/exited processes are removed from the registry on the
+    next drain (after their final tail is delivered to you).
+  • If a `treat_as_user_input` process appears to be in a feedback
+    loop (same line repeating, pathological output), stop it — there
+    is no structural rate limit on the unlimited tier."#
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -162,7 +199,7 @@ Notes:
                     "capture_output_lines": {
                         "type": "integer",
                         "minimum": 0,
-                        "description": "Lines retained in the per-process ring buffer. 0 disables capture. Defaults to 200."
+                        "description": "Lines retained in the per-process ring buffer. 0 disables output capture (but the exit notification still fires). Defaults to 200."
                     },
                     "cwd": {
                         "type": "string",
