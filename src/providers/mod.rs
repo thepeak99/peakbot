@@ -21,7 +21,8 @@ use crate::mock::MockCompletionModel;
 use crate::state::StateManager;
 use crate::tools::{
     BashBgTool, BashTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool,
-    FileStrReplaceTool, ListDirectoryTool, SearchTool, ThinkTool, TodoTool,
+    FileStrReplaceTool, ListDirectoryTool, PowerShellTool, SearchTool, ShellKind, ThinkTool,
+    TodoTool,
 };
 use anyhow::{Context, Result};
 use rig::agent::Agent;
@@ -166,6 +167,7 @@ pub fn create_provider(
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
+    shell_kind: Option<&ShellKind>,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
@@ -184,6 +186,7 @@ pub fn create_provider(
                 bash_config,
                 pipeline_registry,
                 state_manager,
+                shell_kind,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -203,6 +206,7 @@ pub fn create_provider(
                 bash_config,
                 pipeline_registry,
                 state_manager,
+                shell_kind,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -222,6 +226,7 @@ pub fn create_provider(
                 bash_config,
                 pipeline_registry,
                 state_manager,
+                shell_kind,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -241,6 +246,7 @@ pub fn create_provider(
                 bash_config,
                 pipeline_registry,
                 state_manager,
+                shell_kind,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -326,7 +332,11 @@ pub fn create_mock_compaction_model() -> (CompactionModel, MockCompletionModel) 
 }
 
 /// Get built-in tools for PeakBot (excluding SearchTool which requires config)
-/// If todo_tool is provided, uses it; otherwise creates a new one
+/// If todo_tool is provided, uses it; otherwise creates a new one.
+///
+/// `shell_kind` determines which shell tool is exposed to the model:
+/// - `ShellKind::Bash` → registers `bash` tool
+/// - `ShellKind::PowerShell` → registers `powershell` tool
 fn add_builtin_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P, rig::agent::NoToolConfig>,
     searxng_config: Option<&SearXngConfig>,
@@ -334,6 +344,7 @@ fn add_builtin_tools<M, P>(
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Option<Arc<StateManager>>,
+    shell_kind: Option<&ShellKind>,
 ) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
 where
     M: rig::completion::CompletionModel,
@@ -342,8 +353,21 @@ where
     // Use provided tool or create a new one (with optional StateManager)
     let todo = todo_tool.unwrap_or_default();
 
-    // Create BashTool with configured environment variables
-    let bash_tool = BashTool::new(bash_config.env.clone());
+    // Register exactly ONE shell tool based on the detected environment.
+    // The model only sees the tool that matches the actual shell available.
+    // If no shell is detected (e.g. Windows with nothing installed), no
+    // shell tool is registered at all.
+    let shell_tool = match shell_kind {
+        Some(ShellKind::PowerShell { path }) => Some(EitherTool::PowerShell(PowerShellTool::new(
+            path.clone(),
+            bash_config.env.clone(),
+        ))),
+        Some(ShellKind::Bash { path }) => Some(EitherTool::Bash(BashTool::new(
+            path.clone(),
+            bash_config.env.clone(),
+        ))),
+        None => None,
+    };
 
     // `bash_bg` requires StateManager — it has no state of its own
     // (registry lives on StateManager). When `state_manager` is `None`
@@ -362,12 +386,19 @@ where
         .tool(FileStrReplaceTool)
         .tool(FileInsertTool)
         .tool(FileReadTool)
-        .tool(bash_tool)
         .tool(bash_bg_tool)
         .tool(ListDirectoryTool)
         .tool(FetchUrlTool)
         .tool(ThinkTool)
         .tool(todo);
+
+    // Add the single shell tool (bash OR powershell, never both, or none)
+    if let Some(tool) = shell_tool {
+        builder = match tool {
+            EitherTool::Bash(t) => builder.tool(t),
+            EitherTool::PowerShell(t) => builder.tool(t),
+        };
+    }
 
     // Conditionally add search tool if SearXNG is configured
     if let Some(config) = searxng_config {
@@ -383,6 +414,12 @@ where
     builder
 }
 
+/// Internal enum to hold either a Bash or PowerShell tool for registration.
+enum EitherTool {
+    Bash(BashTool),
+    PowerShell(PowerShellTool),
+}
+
 /// Create OpenRouter agent and info
 fn create_openrouter_agent(
     config: &OpenRouterConfig,
@@ -394,6 +431,7 @@ fn create_openrouter_agent(
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
+    shell_kind: Option<&ShellKind>,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -443,6 +481,7 @@ fn create_openrouter_agent(
         bash_config,
         pipeline_registry,
         Some(state_manager.clone()),
+        shell_kind,
     );
 
     // Add MCP tools and build
@@ -473,6 +512,7 @@ fn create_ollama_agent(
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
+    shell_kind: Option<&ShellKind>,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -511,6 +551,7 @@ fn create_ollama_agent(
         bash_config,
         pipeline_registry,
         Some(state_manager.clone()),
+        shell_kind,
     );
 
     // Add MCP tools and build
@@ -541,6 +582,7 @@ fn create_openai_agent(
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
+    shell_kind: Option<&ShellKind>,
 ) -> Result<(
     Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -592,6 +634,7 @@ fn create_openai_agent(
         bash_config,
         pipeline_registry,
         Some(state_manager.clone()),
+        shell_kind,
     );
 
     // Add MCP tools and build
@@ -622,6 +665,7 @@ fn create_llamacpp_agent(
     bash_config: &BashConfig,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
+    shell_kind: Option<&ShellKind>,
 ) -> Result<(
     Agent<rig::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -676,6 +720,7 @@ fn create_llamacpp_agent(
         bash_config,
         pipeline_registry,
         Some(state_manager.clone()),
+        shell_kind,
     );
 
     // Add MCP tools and build
