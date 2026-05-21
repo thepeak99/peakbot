@@ -54,6 +54,7 @@ async fn bg_start_captures_echoed_lines_into_synthetic_turn() {
             label: None,
             treat_as_user_input: false,
             env: None,
+            shell: String::new(),
         })
         .expect("start_bg should succeed");
     assert!(entry.id >= 1, "id should be monotonic from 1");
@@ -93,6 +94,7 @@ async fn bg_unlimited_tier_marks_synthetic_turn() {
             label: Some("telegram".into()),
             treat_as_user_input: true,
             env: None,
+            shell: String::new(),
         })
         .expect("start_bg should succeed");
 
@@ -121,6 +123,7 @@ async fn bg_stop_returns_exit_code_and_final_lines() {
             label: None,
             treat_as_user_input: false,
             env: None,
+            shell: String::new(),
         })
         .expect("start_bg should succeed");
 
@@ -155,6 +158,7 @@ async fn bg_list_reflects_running_state() {
             label: Some("sleeper".into()),
             treat_as_user_input: false,
             env: None,
+            shell: String::new(),
         })
         .expect("start_bg");
 
@@ -181,6 +185,7 @@ async fn bg_clear_kills_all_processes() {
             label: None,
             treat_as_user_input: false,
             env: None,
+            shell: String::new(),
         })
         .expect("start a")
         .id;
@@ -192,6 +197,7 @@ async fn bg_clear_kills_all_processes() {
             label: None,
             treat_as_user_input: true,
             env: None,
+            shell: String::new(),
         })
         .expect("start b")
         .id;
@@ -215,6 +221,7 @@ async fn bg_drain_appends_synthetic_user_message_with_background_source() {
             label: None,
             treat_as_user_input: false,
             env: None,
+            shell: String::new(),
         })
         .expect("start_bg");
     let got = wait_for_buffered_line(&sm, entry.id, Duration::from_secs(3)).await;

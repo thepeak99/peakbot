@@ -4,7 +4,9 @@ mod fetch_url;
 pub mod file_edit;
 mod file_read;
 mod list_directory;
+mod powershell;
 mod search;
+mod shell_detect;
 mod think;
 pub mod todo;
 
@@ -14,6 +16,8 @@ pub use fetch_url::FetchUrlTool;
 pub use file_edit::{FileCreateTool, FileInsertTool, FileStrReplaceTool};
 pub use file_read::FileReadTool;
 pub use list_directory::ListDirectoryTool;
+pub use powershell::PowerShellTool;
 pub use search::SearchTool;
+pub use shell_detect::{ShellKind, print_no_shell_warning};
 pub use think::ThinkTool;
 pub use todo::{TodoArgs, TodoItem, TodoStatus, TodoTool};

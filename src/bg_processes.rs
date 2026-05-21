@@ -220,6 +220,9 @@ pub struct StartParams {
     /// Optional environment variables to set for the spawned process,
     /// inherited from the `bash:` config section (same source as `bash`).
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// Shell executable to use (e.g. "sh", "bash", "pwsh", "powershell").
+    /// If empty, defaults to "sh" for backward compatibility.
+    pub shell: String,
 }
 
 /// A drained chunk of output, one per contributing process.
@@ -363,9 +366,16 @@ impl BgRegistry {
             label,
             treat_as_user_input,
             env,
+            shell,
         } = params;
 
-        // Spawn via `sh -c` so the model can pass a shell line verbatim,
+        // Use the detected shell (or fall back to "sh" for backward compat).
+        let shell = if shell.is_empty() { "sh" } else { &shell };
+        let is_powershell =
+            shell.to_lowercase().contains("pwsh") || shell.to_lowercase().contains("powershell");
+        let cmd_arg = if is_powershell { "-Command" } else { "-c" };
+
+        // Spawn via `<shell> -c` so the model can pass a shell line verbatim,
         // identical to the existing `bash` tool's contract.
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -377,8 +387,8 @@ impl BgRegistry {
             })
             .map_err(|e| BgError::Spawn(format!("openpty: {e}")))?;
 
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.arg(cmd_arg);
         cmd.arg(&command);
         if let Some(d) = cwd.as_ref() {
             cmd.cwd(d);
@@ -807,6 +817,7 @@ mod tests {
                     label: None,
                     treat_as_user_input: false,
                     env: None,
+                    shell: String::new(),
                 },
                 tx.clone(),
             )
@@ -821,6 +832,7 @@ mod tests {
                     label: None,
                     treat_as_user_input: false,
                     env: None,
+                    shell: String::new(),
                 },
                 tx,
             )
