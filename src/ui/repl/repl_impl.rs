@@ -691,6 +691,11 @@ impl ReplUi {
                 .collect()
         };
 
+        let bg_segment = if bg_running > 0 {
+            format!(" · 🛰 {bg_running} bg")
+        } else {
+            String::new()
+        };
         let title = match (is_running, run_started_at) {
             (true, Some(t)) => {
                 // Truncate the phase label to ~24 chars to keep the title
@@ -710,11 +715,6 @@ impl ReplUi {
                 } else {
                     String::new()
                 };
-                let bg_segment = if bg_running > 0 {
-                    format!(" · 🛰 {bg_running} bg")
-                } else {
-                    String::new()
-                };
                 format!(
                     " {} Working · {} · {}{}{} · esc to stop ",
                     spinner::frame_for(t),
@@ -728,8 +728,10 @@ impl ReplUi {
             // affordance — what to press to send, what to press to cancel.
             // No emoji with VS16 — `✎` (U+270E) is a single-cell glyph
             // safe across kitty/vte/iTerm. See memory.md Class-B policy.
-            _ if multiline => " ✎ Multiline · Ctrl+G to send · Esc to cancel ".to_string(),
-            _ => " Input ".to_string(),
+            _ if multiline => {
+                format!(" ✎ Multiline · Ctrl+G to send · Esc to cancel{bg_segment} ")
+            }
+            _ => format!(" Input{bg_segment} "),
         };
 
         // Bottom-border hint about newline vs submit. Keybinding hints
