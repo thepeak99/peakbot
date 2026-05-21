@@ -193,11 +193,19 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
 
     let skills_section = skills.to_system_prompt_section();
 
+    let os = std::env::consts::OS;
+
+    let binary_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
+
     let env_info = format!(
-        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n",
+        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n- **Operating System**: {}\n- **PeakBot Binary Path**: {}\n",
         cwd,
         current_time,
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        os,
+        binary_path
     );
 
     prompt.push_str(&skills_section);
