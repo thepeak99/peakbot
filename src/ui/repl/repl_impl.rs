@@ -386,6 +386,23 @@ pub struct ReplUi {
     /// is view-only, mirrors the `show_quit_confirm` precedent rather than
     /// going through `StateManager`).
     pub(crate) command_popup: Option<CommandPopupState>,
+    /// **Sticky dismissal flag for the slash-command popup.** Set to
+    /// `true` when the user *explicitly* closes the popup (Esc,
+    /// accept_command via Tab/Enter, Shift/Alt+Enter). While `true`,
+    /// `sync_popup` refuses to auto-reopen the popup even when the
+    /// buffer matches a valid command-prefix pattern — respecting the
+    /// "user said no" semantic.
+    ///
+    /// Reset to `false` when:
+    /// - The buffer becomes empty (fresh slate), or
+    /// - The explicit `/` open arm fires (user-driven reopen).
+    ///
+    /// Distinct from sync_popup's *reactive* closes (whitespace inside
+    /// the prefix) — those leave the flag at `false` so that backspacing
+    /// out the offending whitespace restores the popup. See
+    /// `allehailmenu.md` §5.2 and the procedural rule "sync_popup must
+    /// not auto-open what accept_command just closed".
+    pub(crate) popup_dismissed: bool,
     /// **Multiline compose mode.** When `true`, plain `Enter` inserts a
     /// newline instead of submitting; `Ctrl+G` toggles the mode (or
     /// submits + exits when already on). View-only ephemeral state —
@@ -440,6 +457,7 @@ impl ReplUi {
             last_size: (0, 0),
             chat_cache: ChatRenderCache::new(renderer),
             command_popup: None,
+            popup_dismissed: false,
             multiline_mode: false,
         }
     }
@@ -1333,6 +1351,9 @@ impl ReplUi {
             // the handler (see `sync_popup`). See `allehailmenu.md` §5.2.
             KeyCode::Esc if self.command_popup.is_some() => {
                 self.command_popup = None;
+                // Explicit user dismissal — sync_popup must not
+                // auto-reopen until the buffer is cleared.
+                self.popup_dismissed = true;
             }
             KeyCode::Up if self.command_popup.is_some() => {
                 if let Some(p) = self.command_popup.as_mut() {
@@ -1355,6 +1376,8 @@ impl ReplUi {
                 // Shift/Alt+Enter closes popup + inserts newline (commands
                 // are one-liners — a newline means "I'm done autocompleting").
                 self.command_popup = None;
+                // Explicit user dismissal.
+                self.popup_dismissed = true;
                 self.ui_state.insert_newline();
             }
             KeyCode::Enter if self.command_popup.is_some() => {
@@ -1374,6 +1397,8 @@ impl ReplUi {
             {
                 self.ui_state.insert_char('/');
                 self.command_popup = Some(CommandPopupState::new(String::new()));
+                // Explicit user-driven open — clear any prior dismissal.
+                self.popup_dismissed = false;
             }
             // Default handlers — input buffer editing. `input_scroll` is
             // recomputed at render time using the real terminal width and
@@ -1487,6 +1512,31 @@ impl ReplUi {
     /// what `accept_command` just closed).
     fn sync_popup(&mut self) {
         let buf = self.ui_state.input_buffer.clone();
+
+        // Empty buffer is a fresh slate — clear any sticky dismissal so
+        // the next explicit `/` (or any future opener) works cleanly,
+        // and close any lingering popup (the SlashCommand branch below
+        // would also do this, but we want the empty-buffer behaviour to
+        // be consolidated in one place).
+        if buf.is_empty() {
+            self.popup_dismissed = false;
+            self.command_popup = None;
+            return;
+        }
+
+        if self.command_popup.is_none() {
+            // Popup is closed. If the user explicitly dismissed (Esc,
+            // accept_command, Shift+Enter), respect that until the
+            // buffer clears. Otherwise, attempt a *re-open* when the
+            // buffer matches a valid command-prefix pattern — this
+            // restores the popup after a reactive auto-close (e.g. the
+            // user typed an extra space and then backspaced it).
+            if !self.popup_dismissed {
+                self.try_reopen_popup(&buf);
+            }
+            return;
+        }
+
         let Some(popup) = self.command_popup.as_mut() else {
             return;
         };
@@ -1542,6 +1592,38 @@ impl ReplUi {
                     popup.selected_index = count - 1;
                 }
             }
+        }
+    }
+
+    /// Attempt to re-open a previously auto-closed popup based on the
+    /// buffer's current shape. Called from `sync_popup` *only* when
+    /// `popup_dismissed == false` (so explicit dismissals stay
+    /// dismissed). Mirrors the open patterns that originally created
+    /// the popup, so the user experience after a reactive close ≡ the
+    /// experience after the original trigger:
+    ///
+    /// - `/<name>` (no whitespace) → SlashCommand mode with prefix `<name>`.
+    /// - `/model ` or `/model <prefix>` (no whitespace inside `<prefix>`)
+    ///   → Argument mode for `model`.
+    ///
+    /// Anything else is a no-op (popup stays closed).
+    fn try_reopen_popup(&mut self, buf: &str) {
+        // Argument-mode trigger takes precedence: `/model ` or
+        // `/model <something>` (where `<something>` has no internal
+        // whitespace) should restore the Argument popup, not the
+        // SlashCommand one.
+        if let Some(rest) = buf.strip_prefix("/model ") {
+            let trimmed = rest.trim_start();
+            if !trimmed.contains(char::is_whitespace) {
+                self.open_or_sync_argument_popup("model", trimmed);
+                return;
+            }
+        }
+        // SlashCommand trigger: bare `/` or `/<name>` with no whitespace.
+        if let Some(rest) = buf.strip_prefix('/')
+            && !rest.contains(char::is_whitespace)
+        {
+            self.command_popup = Some(CommandPopupState::new(rest.to_string()));
         }
     }
 
@@ -1690,6 +1772,16 @@ impl ReplUi {
                     self.ui_state.cursor_pos = completed.len();
                 }
             }
+        }
+
+        // If accept_command ended with the popup still closed (e.g. Tab
+        // on a non-arg command, or Tab on an Argument-mode item), mark
+        // dismissed so sync_popup won't re-open it via the
+        // "no-explicit-dismissal" heuristic. When accept_command
+        // transitioned into Argument mode (e.g. Tab on `/model`), the
+        // popup is open again and dismissed stays at its prior value.
+        if self.command_popup.is_none() {
+            self.popup_dismissed = true;
         }
     }
 
@@ -3447,6 +3539,140 @@ mod model_popup_tests {
         // Both aliases should be present
         let values: Vec<&str> = popup.all_items.iter().map(|i| i.value.as_str()).collect();
         assert_eq!(values, vec!["opus", "sonnet"]);
+    }
+
+    /// Issue #52 follow-up #2: typing `/mod`, then a space (which
+    /// auto-closes the popup because the buffer leaves command-name
+    /// territory), then backspacing the space MUST reopen the popup.
+    /// The user did not explicitly dismiss — the popup was reactively
+    /// closed by sync_popup, so removing the offending whitespace
+    /// should restore the popup. Same applies to Argument mode.
+    #[test]
+    fn backspace_after_auto_close_in_slash_mode_reopens_popup() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/mod");
+        assert!(
+            ui.command_popup.is_some(),
+            "precondition: popup is open after typing /mod"
+        );
+
+        // Type space: buffer becomes `/mod `, popup auto-closes.
+        ui.handle_keyboard_input(press(KeyCode::Char(' ')));
+        assert!(
+            ui.command_popup.is_none(),
+            "popup should close when whitespace enters command-name territory"
+        );
+        assert_eq!(ui.ui_state.input_buffer, "/mod ");
+
+        // Backspace the space: buffer becomes `/mod` again — popup
+        // must reappear (user didn't explicitly dismiss).
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        let popup = ui
+            .command_popup
+            .as_ref()
+            .expect("popup must reopen after backspacing the offending space");
+        assert!(matches!(popup.mode, PopupMode::SlashCommand));
+        assert_eq!(popup.prefix, "mod");
+    }
+
+    /// Same regression in Argument mode: typing `/model `, then a space
+    /// (which auto-closes — `/model  ` is two spaces, whitespace inside
+    /// the prefix is allowed at the start, but typing a real word and
+    /// then more would close). The canonical user flow: type `/model
+    /// sonn`, accidentally hit space, type a character, realise, then
+    /// backspace through.
+    #[test]
+    fn backspace_after_auto_close_in_argument_mode_reopens_popup() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/model sonn");
+        assert!(
+            matches!(
+                ui.command_popup.as_ref().unwrap().mode,
+                PopupMode::Argument { .. }
+            ),
+            "precondition: popup is in Argument mode"
+        );
+
+        // Type ` x` to force whitespace inside the prefix → auto-close.
+        type_str(&mut ui, " x");
+        assert!(
+            ui.command_popup.is_none(),
+            "popup should close when whitespace appears inside arg prefix"
+        );
+
+        // Backspace twice to remove ` x` and land back at `/model sonn`.
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert_eq!(ui.ui_state.input_buffer, "/model sonn");
+        let popup = ui
+            .command_popup
+            .as_ref()
+            .expect("popup must reopen once the offending whitespace is gone");
+        assert!(
+            matches!(&popup.mode, PopupMode::Argument { command } if command == "model"),
+            "popup should be in Argument mode for `model`, got {:?}",
+            popup.mode
+        );
+        assert_eq!(popup.prefix, "sonn");
+    }
+
+    /// Esc explicitly dismisses the popup. After Esc, mutating the buffer
+    /// (e.g., backspacing) must NOT auto-reopen — user said no.
+    /// Re-opening only happens after the buffer is fully cleared and the
+    /// user types `/` again.
+    #[test]
+    fn esc_dismissal_persists_across_buffer_mutations() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/mod");
+        assert!(ui.command_popup.is_some());
+
+        // Esc: dismiss explicitly.
+        ui.handle_keyboard_input(press(KeyCode::Esc));
+        assert!(ui.command_popup.is_none(), "Esc closes the popup");
+
+        // Backspace: buffer becomes `/mo` — popup must stay closed.
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert!(
+            ui.command_popup.is_none(),
+            "popup must NOT reopen after Esc dismissal"
+        );
+
+        // Backspace down to empty.
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert_eq!(ui.ui_state.input_buffer, "");
+        assert!(ui.command_popup.is_none());
+
+        // Now typing `/` again should reopen (explicit trigger).
+        ui.handle_keyboard_input(press(KeyCode::Char('/')));
+        assert!(
+            ui.command_popup.is_some(),
+            "popup reopens via explicit `/` trigger after buffer clears"
+        );
+    }
+
+    /// Tab-accepting a non-arg-taking command (e.g. `/stats`) closes the
+    /// popup. Backspacing afterwards must NOT auto-reopen the popup —
+    /// this is the original procedural-rule case (sync_popup must not
+    /// auto-open what accept_command just closed).
+    #[test]
+    fn tab_accept_dismissal_persists_across_backspace() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/stat");
+        assert!(ui.command_popup.is_some());
+
+        // Tab accepts `/stats`.
+        ui.handle_keyboard_input(press(KeyCode::Tab));
+        assert!(ui.command_popup.is_none(), "Tab closes the popup");
+        assert_eq!(ui.ui_state.input_buffer, "/stats");
+
+        // Backspace one char: `/stats` → `/stat`. Popup must stay closed.
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert!(
+            ui.command_popup.is_none(),
+            "popup must NOT reopen after Tab-accept dismissal"
+        );
     }
 
     /// Issue #52 follow-up: "add a space and then correct" — typing a second
