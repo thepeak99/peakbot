@@ -1494,14 +1494,22 @@ impl ReplUi {
         match popup.mode.clone() {
             PopupMode::Argument { command } => {
                 let trigger = format!("/{} ", command);
-                if let Some(rest) = buf.strip_prefix(&trigger)
-                    && !rest.contains(char::is_whitespace)
-                {
-                    // Still in `/<command> <prefix>` — refresh prefix and
-                    // is_current flags through the helper.
-                    let cmd = command.clone();
-                    let rest_owned = rest.to_string();
-                    self.open_or_sync_argument_popup(&cmd, &rest_owned);
+                if let Some(rest) = buf.strip_prefix(&trigger) {
+                    // Trim leading whitespace so `/model  ` (extra spaces)
+                    // is treated the same as `/model ` — the popup stays
+                    // open with an empty prefix.
+                    let trimmed = rest.trim_start();
+                    if !trimmed.contains(char::is_whitespace) {
+                        // Still in `/<command> <prefix>` — refresh prefix
+                        // and is_current flags through the helper.
+                        let cmd = command.clone();
+                        let rest_owned = trimmed.to_string();
+                        self.open_or_sync_argument_popup(&cmd, &rest_owned);
+                    } else {
+                        // Whitespace inside the prefix (e.g., `/model x y`)
+                        // — close the popup.
+                        self.command_popup = None;
+                    }
                 } else if buf.starts_with('/') && !buf.contains(char::is_whitespace) {
                     // Backspaced out into the command-name region.
                     // Transition back to a SlashCommand-mode popup.
@@ -3307,5 +3315,165 @@ mod model_popup_tests {
             .expect("popup should remain open after backspace into command name");
         assert!(matches!(popup.mode, PopupMode::SlashCommand));
         assert_eq!(popup.prefix, "model");
+    }
+
+    /// Regression pin for issue #52: backspacing from Argument mode past
+    /// the `/` should keep the popup open in SlashCommand mode all the
+    /// way down to an empty prefix, then close only when the `/` itself
+    /// is removed.
+    #[test]
+    fn backspace_from_argument_mode_past_slash_keeps_popup_open() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/model ");
+        assert!(
+            matches!(
+                ui.command_popup.as_ref().unwrap().mode,
+                PopupMode::Argument { .. }
+            ),
+            "precondition: popup is in Argument mode"
+        );
+
+        // 1 backspace: `/model ` → `/model` → transition to SlashCommand
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        let popup = ui
+            .command_popup
+            .as_ref()
+            .expect("popup must stay open after backspacing space");
+        assert!(matches!(popup.mode, PopupMode::SlashCommand));
+        assert_eq!(popup.prefix, "model");
+
+        // 2 backspaces: `/model` → `/mode`
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        let popup = ui.command_popup.as_ref().expect("popup must stay open");
+        assert_eq!(popup.prefix, "mode");
+
+        // 3 backspaces: `/mode` → `/mod`
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        let popup = ui.command_popup.as_ref().expect("popup must stay open");
+        assert_eq!(popup.prefix, "mod");
+
+        // 4 backspaces: `/mod` → `/mo`
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        let popup = ui.command_popup.as_ref().expect("popup must stay open");
+        assert_eq!(popup.prefix, "mo");
+
+        // 5 backspaces: `/mo` → `/m`
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        let popup = ui.command_popup.as_ref().expect("popup must stay open");
+        assert_eq!(popup.prefix, "m");
+
+        // 6 backspaces: `/m` → `/` → empty prefix, still open
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        let popup = ui.command_popup.as_ref().expect("popup must stay open");
+        assert_eq!(popup.prefix, "");
+
+        // 7 backspaces: `/` → `` → popup closes
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert!(
+            ui.command_popup.is_none(),
+            "popup must close when buffer is empty"
+        );
+        assert_eq!(ui.ui_state.input_buffer, "");
+    }
+
+    /// Issue #52: after transitioning from Argument to SlashCommand mode,
+    /// the popup's filtered items should include the `/model` command
+    /// (since "model" is a valid slash command). This ensures the popup
+    /// is useful immediately after the transition.
+    #[test]
+    fn backspace_from_argument_mode_shows_model_command() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/model ");
+        assert!(matches!(
+            ui.command_popup.as_ref().unwrap().mode,
+            PopupMode::Argument { .. }
+        ));
+
+        // Backspace once: transition to SlashCommand
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        let popup = ui.command_popup.as_ref().unwrap();
+        assert!(matches!(popup.mode, PopupMode::SlashCommand));
+        assert_eq!(popup.prefix, "model");
+
+        // The "model" command should be visible after transition
+        let filtered: Vec<&str> = popup
+            .filtered_items()
+            .into_iter()
+            .map(|i| i.value.as_str())
+            .collect();
+        assert_eq!(
+            filtered,
+            vec!["model"],
+            "transitioned popup should show the /model command"
+        );
+    }
+
+    /// Issue #52 follow-up: after backspacing from `/model ` to `/model`
+    /// (SlashCommand mode), typing space again should transition back to
+    /// Argument mode. This is the "correct then space" path.
+    #[test]
+    fn space_after_backspace_from_argument_reopens_arg_popup() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/model ");
+        assert!(
+            matches!(
+                ui.command_popup.as_ref().unwrap().mode,
+                PopupMode::Argument { .. }
+            ),
+            "precondition: popup is in Argument mode"
+        );
+
+        // Backspace: transition to SlashCommand
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert!(
+            matches!(
+                ui.command_popup.as_ref().unwrap().mode,
+                PopupMode::SlashCommand
+            ),
+            "after backspace: popup should be in SlashCommand mode"
+        );
+
+        // Type space again: should transition back to Argument mode
+        ui.handle_keyboard_input(press(KeyCode::Char(' ')));
+        let popup = ui
+            .command_popup
+            .as_ref()
+            .expect("popup must stay open after typing space");
+        assert!(
+            matches!(&popup.mode, PopupMode::Argument { command } if command == "model"),
+            "after typing space: popup should be back in Argument mode, got {:?}",
+            popup.mode
+        );
+        // Both aliases should be present
+        let values: Vec<&str> = popup.all_items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(values, vec!["opus", "sonnet"]);
+    }
+
+    /// Issue #52 follow-up: "add a space and then correct" — typing a second
+    /// space in Argument mode should NOT close the popup. The user might
+    /// accidentally type an extra space while correcting their input.
+    #[test]
+    fn double_space_in_argument_mode_should_not_close_popup() {
+        let (mut ui, _rx) = harness_with_registry();
+        type_str(&mut ui, "/model ");
+        assert!(
+            matches!(
+                ui.command_popup.as_ref().unwrap().mode,
+                PopupMode::Argument { .. }
+            ),
+            "precondition: popup is in Argument mode"
+        );
+
+        // Type a second space: `/model  ` — popup should stay open
+        ui.handle_keyboard_input(press(KeyCode::Char(' ')));
+        let popup = ui
+            .command_popup
+            .as_ref()
+            .expect("popup must stay open after second space");
+        assert!(
+            matches!(&popup.mode, PopupMode::Argument { command } if command == "model"),
+            "after second space: popup should still be in Argument mode, got {:?}",
+            popup.mode
+        );
     }
 }
