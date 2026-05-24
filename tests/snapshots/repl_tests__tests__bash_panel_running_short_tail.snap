@@ -1,0 +1,13 @@
+---
+source: tests/repl_tests.rs
+assertion_line: 1382
+expression: sanitised
+---
+┌ > psql -f migrate.sql · pid 4821 · MM:SS ────────────────────────────────┐
+│                                                                              │
+│                                                                              │
+│NOTICE: table "users" does not exist, skipping                                │
+│CREATE TABLE                                                                  │
+│CREATE INDEX                                                                  │
+│stdin> _                                                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
