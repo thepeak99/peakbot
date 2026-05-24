@@ -676,7 +676,36 @@ Every PR must add an entry to `release-notes/current.md` describing what changed
 - Updated documentation
 ```
 
-The `current.md` file serves as a working draft for the next release. When a version is released, `current.md` is renamed to `<version>.md` (e.g., `0.3.0.md`) and a new empty `current.md` is created.
+**`current.md` is the working draft for the *next* release.** It accumulates changes as they land. It is **not** what the release pipeline reads — the pipeline reads `release-notes/<version>.md`.
+
+#### Release notes workflow (mandatory)
+
+Before running `make release`, you **must** promote `current.md` to a versioned file. The release pipeline will fail to find notes if you skip this step.
+
+```bash
+# 1. Rename the working draft to the versioned file
+mv release-notes/current.md release-notes/0.3.0.md
+
+# 2. Commit the versioned file
+git add release-notes/0.3.0.md
+git commit -m "docs: 0.3.0 release notes"
+
+# 3. Create a fresh empty current.md for the next cycle
+cat > release-notes/current.md <<'EOF'
+# Release Notes (Working Draft)
+
+This file is the working draft for the next release. When a version is tagged, this file is renamed to `<version>.md` and a new empty `current.md` is created.
+
+## Changes
+EOF
+git add release-notes/current.md
+git commit -m "docs: reset current.md for next release"
+
+# 4. Now run the release — it will pick up release-notes/0.3.0.md
+make release VERSION=0.3.0
+```
+
+**Why this matters:** `make release` reads the release body from `release-notes/<version>.md`. If that file does not exist, the release ships with a fallback body (`Release <version>`) and the changelog is lost from version control. The `current.md` file is never read by the release pipeline — it is only a human-edited staging area.
 
 **Never commit changes without updating `current.md`.** This ensures every release has complete, version-controlled release notes.
 
@@ -822,9 +851,13 @@ Markdown file, resolved in this order:
 2. `release-notes/<v>.md` in the repo (the default convention — version-controlled, PR-reviewable)
 3. The literal string `Release <v>` if neither exists
 
+**The release pipeline reads `release-notes/<v>.md`, never `current.md`.**
+See [Release notes workflow (mandatory)](#release-notes-workflow-mandatory) above
+for the full pre-release steps.
+
 Notes are optional — a release with no notes still ships; you'll see an
 `ℹ️  No release-notes file …` message and the default body is used. To
-ship notes, drop a file at `release-notes/<v>.md` *before* running
+ship notes, promote `current.md` to `release-notes/<v>.md` *before* running
 `make release`. The same content is used for both the Gitea release page
 and `git show <v>`.
 
@@ -832,10 +865,7 @@ The notes file is read via `jq --rawfile`, so any Markdown content is
 safe (newlines, backticks, quotes, `$`) — no shell escaping required.
 
 ```bash
-# Conventional flow (recommended)
-$EDITOR release-notes/0.3.0.md
-git add release-notes/0.3.0.md
-git commit -m "docs: 0.3.0 release notes"
+# Conventional flow (recommended) — see Changelog Requirements for full steps
 make release VERSION=0.3.0          # picks up release-notes/0.3.0.md automatically
 
 # Ad-hoc override
