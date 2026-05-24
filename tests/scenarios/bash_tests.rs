@@ -1,11 +1,16 @@
-//! Bash tool TTY isolation tests.
+//! Bash tool PTY behaviour tests.
 //!
-//! Guards the invariant that commands run via `BashTool` do NOT inherit the
-//! parent's controlling TTY. This prevents `sudo`, `ssh`, `$EDITOR`, and
-//! anything else that opens `/dev/tty` or calls `isatty(0)` from racing with
-//! ratatui for stdin and corrupting termios state.
+//! Slice 3 of `make-term-great-again.md` flipped the bash tool from
+//! `Stdio::null()` + piped stdout/stderr to a full PTY-backed runner.
+//! These tests guard the **new** contract:
 //!
-//! See `better-tty.md` for the full rationale.
+//! - the child sees a real TTY on stdin (so `isatty()`, `ls --color=auto`,
+//!   `sudo`, `ssh` host-key prompts behave correctly);
+//! - stdout and stderr are interleaved into a single OUTPUT block;
+//! - commands that block reading stdin will sit until `timeout_seconds`
+//!   elapses (the model is responsible for not running bare interactive
+//!   programs — pipe input in instead);
+//! - exit codes, head/tail truncation, and file-edit warnings still work.
 
 use peakbot::BashTool;
 use rig::tool::ToolDyn;
@@ -17,7 +22,7 @@ use std::time::{Duration, Instant};
 async fn run_bash(cmd: &str, timeout_seconds: u64) -> String {
     let tool = BashTool::default();
     let payload = serde_json::to_string(&json!({
-        "thought": "bash tty isolation test",
+        "thought": "bash pty behaviour test",
         "command": cmd,
         "timeout_seconds": timeout_seconds,
     }))
@@ -27,47 +32,24 @@ async fn run_bash(cmd: &str, timeout_seconds: u64) -> String {
         .expect("bash tool call succeeded")
 }
 
-/// The core invariant: the child must not see a TTY on stdin.
+/// The PTY contract: the child DOES see a TTY on stdin. This is the
+/// whole point of slice 3 — `sudo`, `ssh`, and `git push` credential
+/// prompts now work because programs calling `isatty(0)` see a real
+/// terminal.
 ///
-/// `test -t 0` exits 0 iff stdin is a TTY. We want it to exit non-zero,
-/// proving stdin was detached (null/pipe), not inherited from the parent.
+/// `test -t 0` exits 0 iff stdin is a TTY. Under PTY, it must exit 0.
 #[tokio::test]
-async fn bash_child_does_not_inherit_a_tty_on_stdin() {
+async fn bash_child_sees_a_tty_on_stdin() {
     let out = run_bash("test -t 0; echo exit=$?", 5).await;
     assert!(
-        out.contains("exit=1"),
-        "child's stdin should not be a TTY, but `test -t 0` reported it is.\n\
+        out.contains("exit=0"),
+        "PTY-backed child must see a TTY on stdin (`test -t 0` should exit 0).\n\
          Full tool output:\n{}",
         out
     );
 }
 
-/// A command that reads stdin must not hang when there's no input to give.
-///
-/// `cat` with no args reads stdin until EOF. With a detached stdin, EOF is
-/// immediate and `cat` exits 0 promptly. With a blocking inherited stdin it
-/// would hang until the timeout.
-#[tokio::test]
-async fn bash_child_reading_stdin_returns_promptly() {
-    let start = Instant::now();
-    let out = run_bash("cat", 5).await;
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "`cat` should return promptly when stdin is detached; took {:?}.\n\
-         Full tool output:\n{}",
-        elapsed,
-        out
-    );
-    assert!(
-        out.contains("Exit code: 0"),
-        "`cat` should exit 0 on immediate EOF, got:\n{}",
-        out
-    );
-}
-
-/// Regression guard: detaching stdin must not break ordinary commands.
+/// Regression guard: PTY allocation must not break ordinary commands.
 #[tokio::test]
 async fn bash_echo_still_works() {
     let out = run_bash("echo hello", 5).await;
@@ -85,7 +67,9 @@ async fn bash_echo_still_works() {
 
 // ── Execution behaviour tests ───────────────────────────────────────────────
 
-/// Stdout and stderr are both captured and labelled.
+/// Stdout and stderr are both captured. Under PTY they're interleaved
+/// into a single OUTPUT block (one tty, one byte stream) — the test
+/// just checks both lines reach the result.
 #[tokio::test]
 async fn bash_captures_stdout_and_stderr() {
     let out = run_bash("echo stdout-line; echo stderr-line >&2", 5).await;
@@ -226,4 +210,103 @@ async fn bash_timeout_kills_long_running_command() {
         "expected timeout message; got: {}",
         msg
     );
+}
+
+/// PTY merges stdout and stderr into a single OUTPUT block — the tool
+/// result must NOT carry separate `STDOUT:` / `STDERR:` headers, since
+/// that contract no longer holds.
+#[tokio::test]
+async fn bash_result_uses_combined_output_block() {
+    let out = run_bash("echo on-stdout; echo on-stderr >&2", 5).await;
+    assert!(
+        out.contains("OUTPUT:"),
+        "PTY result must use a single OUTPUT block; got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("STDOUT:") && !out.contains("STDERR:"),
+        "PTY result must NOT carry legacy STDOUT/STDERR headers; got:\n{}",
+        out
+    );
+}
+
+/// Piped stdin still works inside the shell command — `echo x | cat`
+/// finishes promptly because `cat` reads from the pipe, not the PTY.
+/// This is the documented "use a pipe" recipe in the tool description.
+#[tokio::test]
+async fn bash_piped_stdin_works_under_pty() {
+    let start = Instant::now();
+    let out = run_bash("echo hello-pipe | cat", 5).await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "piped stdin should finish promptly; took {:?}; got:\n{}",
+        elapsed,
+        out
+    );
+    assert!(
+        out.contains("hello-pipe"),
+        "piped output should reach the tool result; got:\n{}",
+        out
+    );
+}
+
+/// The cardinal rule of `make-term-great-again.md`: one buffer, two
+/// views. When wired to a `StateManager`, every line the panel saw
+/// must also appear in the tool result — same bytes, presented twice.
+#[tokio::test]
+async fn bash_panel_and_tool_result_share_the_same_bytes() {
+    use peakbot::StateManager;
+    use std::sync::Arc;
+
+    let sm = Arc::new(StateManager::new());
+    let tool = BashTool::default().with_state_manager(sm.clone());
+
+    let payload = serde_json::to_string(&json!({
+        "thought": "one-buffer two-views invariant",
+        "command": "for i in 1 2 3; do echo invariant-line-$i; done",
+        "timeout_seconds": 5,
+        // Disable tail truncation so the result mirrors the buffer exactly.
+        "tail": 0,
+    }))
+    .expect("serialize");
+    let out = ToolDyn::call(&tool, payload).await.expect("call");
+
+    // Tool result must contain every produced line.
+    for i in 1..=3 {
+        assert!(
+            out.contains(&format!("invariant-line-{}", i)),
+            "tool result missing line {}; got:\n{}",
+            i,
+            out
+        );
+    }
+
+    // Panel snapshot must be in Finished state with the tail mirroring
+    // the same lines (last 5 — we produced 3, so all three).
+    let snap = sm.get_state();
+    match snap.bash_panel {
+        peakbot::ui::app_state::BashPanelState::Finished {
+            exit_code, tail, ..
+        } => {
+            assert_eq!(
+                exit_code, 0,
+                "panel should record exit 0; got {}",
+                exit_code
+            );
+            for i in 1..=3 {
+                let needle = format!("invariant-line-{}", i);
+                assert!(
+                    tail.iter().any(|l| l.contains(&needle)),
+                    "panel tail missing line {} (panel saw {:?})",
+                    i,
+                    tail
+                );
+            }
+        }
+        other => panic!(
+            "panel should have transitioned to Finished after exec; saw {:?}",
+            other
+        ),
+    }
 }

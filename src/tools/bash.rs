@@ -1,16 +1,43 @@
+use crate::pty_runner::{self, PtyStatus, SpawnError, SpawnParams};
+use crate::state::StateManager;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::process::Command;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::unbounded_channel;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 7200; // 2 hours
 const TEMP_DIR_NAME: &str = "peakbot";
+
+/// Line-buffer cap for the foreground `bash` tool. A generous ring so
+/// long-running builds don't lose their preamble before we serialise the
+/// final tool result. Matched to the existing ~50k-char output budget at
+/// the model boundary (≈ 80 cols × 10_000 lines worst-case).
+const BASH_CAPTURE_CAP: usize = 10_000;
+
+/// Debounce for live panel updates. Mirrors `bash_bg`'s 500 ms shape
+/// but tighter — foreground bash has a human watching, so we trade a
+/// bit more CPU for snappier feedback. The exit ping always lands
+/// regardless of debounce (see `pty_runner::spawn_reader`).
+const PANEL_UPDATE_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// Grace window after a timeout-kill, waiting for the reader to flush
+/// the final exit notification. Capped so a wedged child can't pin the
+/// tool call open forever.
+const POST_KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// Tail rows mirrored into the live panel via
+/// [`StateManager::update_bash_panel_tail`]. Must match the panel's
+/// `TAIL_ROWS` constant (slice 2 renderer); kept private here so a
+/// future panel resize doesn't ripple into the tool layer — the
+/// renderer pads / clips its own input.
+const PANEL_TAIL_ROWS: usize = 5;
 
 /// Session-unique counter for generating output filenames
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -21,6 +48,8 @@ pub enum BashError {
     Execution(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("pty spawn failed: {0}")]
+    Spawn(#[from] SpawnError),
 }
 
 #[derive(Deserialize)]
@@ -35,33 +64,46 @@ pub struct BashArgs {
     tail: Option<usize>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 pub struct BashTool {
     /// Shell executable path (e.g. "/bin/sh" or "C:\Program Files\Git\bin\bash.exe")
-    #[serde(default = "default_shell")]
     shell: String,
     /// Optional environment variables to set for the command
-    #[serde(default)]
     env: Option<HashMap<String, String>>,
+    /// Optional handle for live panel updates (`start/update/finish_bash_panel`).
+    /// `None` in test paths and when the agent is built without a panel —
+    /// the tool still runs, just without the live UI side-effects.
+    state_manager: Option<Arc<StateManager>>,
 }
 
 impl Default for BashTool {
     fn default() -> Self {
         Self {
-            shell: default_shell(),
+            shell: "/bin/sh".to_string(),
             env: None,
+            state_manager: None,
         }
     }
 }
 
-fn default_shell() -> String {
-    "/bin/sh".to_string()
-}
-
 impl BashTool {
     /// Create a new BashTool with the given shell path and environment variables.
+    /// No panel updates — wire one in via [`Self::with_state_manager`].
     pub fn new(shell: String, env: Option<HashMap<String, String>>) -> Self {
-        Self { shell, env }
+        Self {
+            shell,
+            env,
+            state_manager: None,
+        }
+    }
+
+    /// Attach a state manager so this tool drives the live bash panel
+    /// (slice 3 of `make-term-great-again.md`). When attached, every
+    /// call transitions the panel `Idle → Running → Finished` and pushes
+    /// debounced tail updates as the child produces output.
+    pub fn with_state_manager(mut self, sm: Arc<StateManager>) -> Self {
+        self.state_manager = Some(sm);
+        self
     }
 
     /// Detect if the command appears to be doing file editing
@@ -120,8 +162,12 @@ impl BashTool {
     }
 }
 
-/// Save full output to temp files and return the paths
-fn save_full_output(stdout: &str, stderr: &str) -> std::io::Result<(PathBuf, PathBuf)> {
+/// Save the full PTY output to a temp file and return the path.
+///
+/// PTY merges stdout and stderr into a single stream (one tty, one byte
+/// pipe). Mirrors the "one buffer, two views" rule from
+/// `make-term-great-again.md` — same bytes the panel sees, persisted.
+fn save_full_output(output: &str) -> std::io::Result<PathBuf> {
     let temp_dir = std::env::temp_dir().join(TEMP_DIR_NAME);
     std::fs::create_dir_all(&temp_dir)?;
 
@@ -132,15 +178,9 @@ fn save_full_output(stdout: &str, stderr: &str) -> std::io::Result<(PathBuf, Pat
         .as_secs();
 
     let session_id = format!("{}_{}", timestamp, counter);
-    let base = temp_dir.join(format!("bash_{}", session_id));
-
-    let stdout_path = base.with_extension("stdout.txt");
-    let stderr_path = base.with_extension("stderr.txt");
-
-    std::fs::write(&stdout_path, stdout)?;
-    std::fs::write(&stderr_path, stderr)?;
-
-    Ok((stdout_path, stderr_path))
+    let path = temp_dir.join(format!("bash_{}.output.txt", session_id));
+    std::fs::write(&path, output)?;
+    Ok(path)
 }
 
 /// Apply head/tail line truncation to output
@@ -212,10 +252,16 @@ impl Tool for BashTool {
         ToolDefinition {
             name: "bash".to_string(),
             description: format!(
-                "Run a shell command and return stdout and stderr. \
+                "Run a shell command under a pseudo-terminal and return its output. \
+                stdout and stderr are interleaved into a single OUTPUT stream (PTY semantics); \
+                the child sees a real TTY so programs that check `isatty()` behave normally \
+                (`ls --color=auto`, `sudo`, `ssh`, `git push` credential prompts). \
+                Live output is mirrored to the on-screen bash panel while the command runs. \
                 Use `head` to show first N lines, `tail` to show last N lines (default: 100). \
                 Full output is always saved to /tmp/peakbot/ and accessible via file_read. \
-                Commands run in {}. Default timeout is 30 seconds.",
+                Commands run in {}. Default timeout is 30 seconds. \
+                Note: commands that block reading stdin (e.g. bare `cat`) will hang until \
+                timeout — pipe input in (`echo x | cat`) or redirect from a file.",
                 shell_name
             ),
             parameters: json!({
@@ -256,143 +302,203 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
-        // Log before execution
         tracing::info!(
             target: "peakbot",
             tool_type = "bash",
             command = %args.command,
             timeout_secs = timeout_secs,
             env_vars = ?self.env.as_ref().map(|e| e.keys().collect::<Vec<_>>()),
-            "Starting bash tool execution"
+            "Starting bash tool execution (PTY)"
         );
 
-        let start_time = std::time::Instant::now();
+        let start_time = Instant::now();
 
-        // Build the command with optional environment variables.
-        // stdin is explicitly detached: agent tools are non-interactive, and
-        // inheriting the parent's TTY lets the child (e.g. `sudo`, `ssh`,
-        // `$EDITOR`) fight ratatui for input and corrupt termios state.
-        // See `better-tty.md` for the full rationale.
-        let mut cmd = Command::new(&self.shell);
-        cmd.arg("-c")
-            .arg(&args.command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+        // Spawn under a PTY. The reader thread streams output into the
+        // shared buffer, ANSI-stripped, line by line. `notify_tx` pings
+        // (debounced) as fresh output lands and once unconditionally on
+        // exit — see `pty_runner::spawn_reader`.
+        let (notify_tx, mut notify_rx) = unbounded_channel::<()>();
+        let mut handle = pty_runner::spawn(
+            SpawnParams {
+                command: args.command.clone(),
+                cwd: None,
+                env: self.env.clone(),
+                shell: self.shell.clone(),
+                capture_cap: BASH_CAPTURE_CAP,
+                debounce: Some(PANEL_UPDATE_DEBOUNCE),
+            },
+            Some(notify_tx),
+        )?;
+        let pid = handle.pid;
+        let buffer = handle.buffer.clone();
 
-        // Add configured environment variables if any
-        if let Some(ref env_vars) = self.env {
-            for (key, value) in env_vars {
-                cmd.env(key, value);
-            }
+        // Panel goes Idle → Running. Transitions are no-ops without a
+        // state manager — the test path (`BashTool::default()`) takes
+        // this branch silently.
+        if let Some(sm) = &self.state_manager {
+            sm.start_bash_panel(args.command.clone(), pid);
         }
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| BashError::Execution(format!("Failed to spawn shell: {}", e)))?;
+        // Wait loop: pump notify pings into panel tail updates; break
+        // on the exit notification or hit the timeout. The buffer lock
+        // is only held inside scoped blocks — never across `.await`.
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut killed = false;
+        let exit_code: i32 = loop {
+            let now = Instant::now();
+            let wait = if killed {
+                POST_KILL_GRACE
+            } else if now >= deadline {
+                Duration::ZERO
+            } else {
+                deadline - now
+            };
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
-                let exit_code = output.status.code().unwrap_or(-1);
-                let stdout_raw = String::from_utf8_lossy(&output.stdout);
-                let stderr_raw = String::from_utf8_lossy(&output.stderr);
-
-                // Save full output to temp files (always saved)
-                let (stdout_path, stderr_path) = match save_full_output(&stdout_raw, &stderr_raw) {
-                    Ok(paths) => paths,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "peakbot",
-                            tool_type = "bash",
-                            error = %e,
-                            "Failed to save full output to temp file"
-                        );
-                        (PathBuf::new(), PathBuf::new())
+            tokio::select! {
+                biased;
+                ping = notify_rx.recv() => {
+                    if ping.is_none() {
+                        // Reader thread vanished without delivering an exit
+                        // ping — treat as failure.
+                        tracing::warn!(target: "peakbot", "pty notify channel closed unexpectedly");
+                        break -1;
                     }
-                };
-
-                // Apply head/tail truncation (defaults to tail: 100)
-                let default_tail = Some(100);
-                let (stdout, stdout_modified) =
-                    apply_head_tail(&stdout_raw, args.head, args.tail.or(default_tail));
-                let (stderr, stderr_modified) =
-                    apply_head_tail(&stderr_raw, args.head, args.tail.or(default_tail));
-
-                let mut result = format!("Exit code: {}\n", exit_code);
-                if !stdout_raw.is_empty() {
-                    result.push_str(&format!("\nSTDOUT:\n{}\n", stdout));
-                }
-                if !stderr_raw.is_empty() {
-                    result.push_str(&format!("\nSTDERR:\n{}\n", stderr));
-                }
-
-                // Always show full output location (it's always saved)
-                if !stdout_path.as_os_str().is_empty() || !stderr_path.as_os_str().is_empty() {
-                    let divider = "\n─────────────────────────────────────────────────\n";
-                    result.push_str(divider);
-                    result.push_str("Full output saved to:\n");
-                    if !stdout_path.as_os_str().is_empty() {
-                        result.push_str(&format!("  {}\n", stdout_path.display()));
+                    let (status, tail) = snapshot_for_panel(&buffer);
+                    if let Some(sm) = &self.state_manager {
+                        sm.update_bash_panel_tail(tail);
                     }
-                    if !stderr_path.as_os_str().is_empty() {
-                        result.push_str(&format!("  {}\n", stderr_path.display()));
+                    if let PtyStatus::Exited(code) = status {
+                        break code;
                     }
-                    if !stdout_modified && !stderr_modified {
-                        result.push_str("(output was not truncated)\n");
-                    } else {
-                        result.push_str("Use file_read tool to access the complete output.\n");
+                }
+                _ = tokio::time::sleep(wait) => {
+                    if killed {
+                        // Grace period exhausted; child is wedged. Give up
+                        // and let `Drop` clean up.
+                        break -1;
                     }
-                    result.push_str(divider);
+                    // First timeout — SIGHUP and wait for the exit ping.
+                    let _ = handle.kill();
+                    killed = true;
                 }
-
-                // Add warning if file-editing pattern was detected
-                if let Some(warning_msg) = warning {
-                    result.push_str(&format!("\n\n{}", warning_msg));
-                }
-
-                // Log successful completion
-                tracing::info!(
-                    target: "peakbot",
-                    tool_type = "bash",
-                    exit_code = exit_code,
-                    duration_ms = start_time.elapsed().as_millis(),
-                    stdout_modified = stdout_modified,
-                    stderr_modified = stderr_modified,
-                    stdout_path = %stdout_path.display(),
-                    stderr_path = %stderr_path.display(),
-                    "Bash tool completed successfully"
-                );
-
-                Ok(result)
             }
-            Ok(Err(e)) => {
-                let error = format!("Command failed: {}", e);
+        };
+
+        // Drain the final buffer for the tool result. Same bytes the
+        // panel just saw — the "one buffer, two views" rule.
+        let final_output = {
+            let buf = buffer.lock().expect("pty buffer poisoned");
+            buf.lines.iter().cloned().collect::<Vec<_>>().join("\n")
+        };
+        let final_tail_for_panel = {
+            let buf = buffer.lock().expect("pty buffer poisoned");
+            buf.lines
+                .iter()
+                .rev()
+                .take(PANEL_TAIL_ROWS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+        };
+
+        // Panel goes Running → Finished. Carries the exit code and final
+        // tail; the renderer freezes the strip until the next bash call.
+        if let Some(sm) = &self.state_manager {
+            sm.finish_bash_panel(exit_code, final_tail_for_panel);
+        }
+
+        // Explicitly drop the handle now to SIGHUP any lingering child
+        // and join the reader thread. (Drop runs on return anyway, but
+        // doing it here keeps the OS resource lifecycle obvious.)
+        drop(handle);
+
+        if killed {
+            tracing::warn!(
+                target: "peakbot",
+                tool_type = "bash",
+                timeout_secs = timeout_secs,
+                "Bash tool timed out"
+            );
+            return Err(BashError::Execution(format!(
+                "Command timed out after {} seconds. Consider increasing timeout_seconds.",
+                timeout_secs
+            )));
+        }
+
+        // Save the full PTY output to a temp file (always saved).
+        let output_path = match save_full_output(&final_output) {
+            Ok(p) => p,
+            Err(e) => {
                 tracing::warn!(
                     target: "peakbot",
                     tool_type = "bash",
-                    error = %error,
-                    "Bash tool execution failed"
+                    error = %e,
+                    "Failed to save full output to temp file"
                 );
-                Err(BashError::Execution(error))
+                PathBuf::new()
             }
-            Err(_) => {
-                // child is dropped here -> killed automatically due to kill_on_drop
-                let error = format!(
-                    "Command timed out after {} seconds. Consider increasing timeout_seconds.",
-                    timeout_secs
-                );
-                tracing::warn!(
-                    target: "peakbot",
-                    tool_type = "bash",
-                    timeout_secs = timeout_secs,
-                    "Bash tool timed out"
-                );
-                Err(BashError::Execution(error))
-            }
+        };
+
+        // Apply head/tail truncation (defaults to tail: 100).
+        let default_tail = Some(100);
+        let (displayed, modified) =
+            apply_head_tail(&final_output, args.head, args.tail.or(default_tail));
+
+        let mut result = format!("Exit code: {}\n", exit_code);
+        if !final_output.is_empty() {
+            result.push_str(&format!("\nOUTPUT:\n{}\n", displayed));
         }
+
+        if !output_path.as_os_str().is_empty() {
+            let divider = "\n─────────────────────────────────────────────────\n";
+            result.push_str(divider);
+            result.push_str("Full output saved to:\n");
+            result.push_str(&format!("  {}\n", output_path.display()));
+            if !modified {
+                result.push_str("(output was not truncated)\n");
+            } else {
+                result.push_str("Use file_read tool to access the complete output.\n");
+            }
+            result.push_str(divider);
+        }
+
+        if let Some(warning_msg) = warning {
+            result.push_str(&format!("\n\n{}", warning_msg));
+        }
+
+        tracing::info!(
+            target: "peakbot",
+            tool_type = "bash",
+            exit_code = exit_code,
+            duration_ms = start_time.elapsed().as_millis(),
+            output_modified = modified,
+            output_path = %output_path.display(),
+            "Bash tool completed successfully"
+        );
+
+        Ok(result)
     }
+}
+
+/// Snapshot the buffer for a live panel push: returns the current
+/// status plus the last `PANEL_TAIL_ROWS` lines. Scoped so the buffer
+/// lock is never held across `.await` (see `pty_runner` lock discipline).
+fn snapshot_for_panel(
+    buffer: &Arc<std::sync::Mutex<pty_runner::LineBuffer>>,
+) -> (PtyStatus, Vec<String>) {
+    let buf = buffer.lock().expect("pty buffer poisoned");
+    let status = buf.status.clone();
+    let tail: Vec<String> = buf
+        .lines
+        .iter()
+        .rev()
+        .take(PANEL_TAIL_ROWS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    (status, tail)
 }
