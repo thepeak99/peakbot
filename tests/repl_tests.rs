@@ -1142,6 +1142,29 @@ mod tests {
         assert_snapshot!("command_popup_takes_args_hint", lines.join("\n"));
     }
 
+    /// Issue #52: after transitioning from Argument to SlashCommand mode,
+    /// the popup should show the `/model` command (prefix "model" matches
+    /// the "model" slash command).
+    #[test]
+    fn command_popup_model_prefix_after_arg_transition() {
+        let popup = CommandPopupState::new("model".to_string());
+        let lines = snapshot_popup(&popup);
+        assert_snapshot!(
+            "command_popup_model_prefix_after_arg_transition",
+            lines.join("\n")
+        );
+    }
+
+    /// Issue #52: when the prefix doesn't match any command (e.g., "mode"
+    /// after backspacing from "model"), the popup should show the
+    /// "no matching commands" placeholder.
+    #[test]
+    fn command_popup_mode_prefix_no_matches() {
+        let popup = CommandPopupState::new("mode".to_string());
+        let lines = snapshot_popup(&popup);
+        assert_snapshot!("command_popup_mode_prefix_no_matches", lines.join("\n"));
+    }
+
     // === Chat Scrollbar Tests ===
 
     /// The scrollbar thumb position must be driven by the GLOBAL scroll
