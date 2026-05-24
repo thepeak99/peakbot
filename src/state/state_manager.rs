@@ -1152,6 +1152,9 @@ impl StateManager {
                 conv.metadata.total_cost,
             );
 
+            // Restore persisted todo list
+            *self.todo_list.lock().unwrap() = conv.todos.clone();
+
             let mut state = self.state.write().unwrap();
             state.chat.messages = messages;
             drop(state);
@@ -1159,6 +1162,12 @@ impl StateManager {
             // Push the restored stats into AppState so the status bar reflects
             // the loaded conversation instead of the previous session's totals.
             self.sync_stats_to_ui();
+            // Push restored todos into AppState so the UI panel reflects them.
+            self.sync_todo_to_ui(&self.todo_list.lock().unwrap());
+            // Auto-show todo panel when loaded conversation has todos
+            if !self.todo_list.lock().unwrap().list().is_empty() {
+                self.show_todo_panel();
+            }
         }
     }
 
@@ -1216,6 +1225,8 @@ impl StateManager {
             conv.metadata.total_api_calls = stats.total_api_calls;
             conv.metadata.total_cost = stats.total_cost;
             drop(stats);
+            // Snapshot todo list so /load restores it on a future session.
+            conv.todos = self.todo_list.lock().unwrap().clone();
             conv.updated_at = chrono::Utc::now();
         }
     }
@@ -2438,6 +2449,121 @@ mod tests {
         );
         assert_eq!(state.chat.messages[0].role, MessageRole::User);
         assert_eq!(state.chat.messages[1].role, MessageRole::Agent);
+    }
+
+    // ─── todo persistence roundtrip ──────────────────────────────────────
+
+    /// Todo items round-trip through sync_to_conversation / sync_from_conversation.
+    #[test]
+    fn todo_roundtrip_through_sync() {
+        use crate::tools::todo::TodoStatus;
+
+        let sm = StateManager::new();
+
+        // Add some todos
+        {
+            let mut list = sm.todo_list.lock().unwrap();
+            list.add("Fix auth bug".into());
+            list.add("Write tests".into());
+            list.update_status(1, TodoStatus::InProgress);
+        }
+
+        // Build a conversation and set it as current
+        let mut conv = Conversation::new("test".into(), "prov".into(), "model".into());
+        conv.add_user_message("hello".into());
+        *sm.current_conversation.lock().unwrap() = Some(conv);
+
+        // Save todos into conversation
+        sm.sync_to_conversation();
+
+        // Verify conversation has todos
+        {
+            let guard = sm.current_conversation.lock().unwrap();
+            let conv = guard.as_ref().unwrap();
+            assert_eq!(conv.todos.list().len(), 2);
+            assert_eq!(conv.todos.list()[0].task, "Fix auth bug");
+            assert_eq!(conv.todos.list()[0].status, TodoStatus::InProgress);
+            assert_eq!(conv.todos.list()[1].task, "Write tests");
+            assert_eq!(conv.todos.list()[1].status, TodoStatus::Pending);
+        }
+
+        // Clear the live todo list (simulate new session)
+        {
+            let mut list = sm.todo_list.lock().unwrap();
+            *list = crate::tools::todo::TodoList::new();
+        }
+
+        // Load todos back from conversation
+        sm.sync_from_conversation();
+
+        // Verify todos restored
+        {
+            let list = sm.todo_list.lock().unwrap();
+            assert_eq!(list.list().len(), 2);
+            assert_eq!(list.list()[0].task, "Fix auth bug");
+            assert_eq!(list.list()[0].status, TodoStatus::InProgress);
+            assert_eq!(list.list()[1].task, "Write tests");
+            assert_eq!(list.list()[1].status, TodoStatus::Pending);
+        }
+
+        // Verify next_id preserved (adding a new task gets id=3, not 1)
+        {
+            let mut list = sm.todo_list.lock().unwrap();
+            let result = list.add("Third task".into());
+            assert_eq!(result.id, 3, "next_id must survive roundtrip");
+        }
+    }
+
+    /// Pre-todo-persistence conversation JSON loads with empty todos.
+    #[test]
+    fn pre_todo_persistence_conversation_loads_with_empty_todos() {
+        let json = r#"{
+            "id": "10da8b9d-f242-4786-9c75-c3fbc2530f1f",
+            "name": "Old convo",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "messages": [],
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {"message_count": 0}
+        }"#;
+
+        let conv: Conversation = serde_json::from_str(json).unwrap();
+        assert!(conv.todos.list().is_empty());
+    }
+
+    /// Loading a conversation with todos auto-shows the todo panel.
+    #[test]
+    fn sync_from_conversation_with_todos_auto_shows_panel() {
+        let sm = StateManager::new();
+
+        // Build a conversation that has todos
+        let mut conv = Conversation::new("test".into(), "prov".into(), "model".into());
+        conv.add_user_message("hello".into());
+        conv.todos.add("Task from saved convo".into());
+        *sm.current_conversation.lock().unwrap() = Some(conv);
+
+        // Panel starts hidden
+        assert!(!sm.get_state().todo.visible);
+
+        // Load the conversation
+        sm.sync_from_conversation();
+
+        // Panel should now be visible because the convo has todos
+        assert!(sm.get_state().todo.visible);
+    }
+
+    /// Loading a conversation without todos does NOT auto-show the panel.
+    #[test]
+    fn sync_from_conversation_without_todos_keeps_panel_hidden() {
+        let sm = StateManager::new();
+
+        let mut conv = Conversation::new("test".into(), "prov".into(), "model".into());
+        conv.add_user_message("hello".into());
+        *sm.current_conversation.lock().unwrap() = Some(conv);
+
+        assert!(!sm.get_state().todo.visible);
+        sm.sync_from_conversation();
+        assert!(!sm.get_state().todo.visible);
     }
 
     // ─── workin-baby: working-indicator state transitions ────────────────
