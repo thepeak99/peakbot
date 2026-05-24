@@ -36,6 +36,7 @@ use tokio::time;
 use crate::state::StateManager;
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState};
+use crate::ui::repl::bash_panel::{panel_height as bash_panel_height, render_bash_panel};
 use crate::ui::repl::confirm_dialog::{ConfirmAction, ConfirmDialog, render_confirm_dialog};
 use crate::ui::repl::markdown::MarkdownRenderer;
 use crate::ui::repl::message_renderer::{MessageRenderer, PlainRenderer};
@@ -985,6 +986,13 @@ impl ReplUi {
                     let content_rows = wrapped_rows.min(MAX_INPUT_CONTENT_LINES);
                     let input_height = content_rows + 2;
 
+                    // Bash panel strip height — 0 when Idle ⇒ collapses
+                    // out of the layout entirely. Slice 2 of #11.
+                    // `Constraint::Length(0)` is well-defined in ratatui:
+                    // the chunk exists but has zero rows and renders
+                    // nothing.
+                    let bash_height = bash_panel_height(&state.bash_panel);
+
                     // Scroll-follow in *visual* rows (not logical lines) so
                     // soft-wrapped long lines scroll correctly. Computed at
                     // render time because width is only known here and
@@ -1001,10 +1009,21 @@ impl ReplUi {
                         .direction(Direction::Vertical)
                         .constraints([
                             Constraint::Percentage(100),
+                            Constraint::Length(bash_height),
                             Constraint::Length(input_height),
                             Constraint::Length(1),
                         ])
                         .split(main);
+
+                    // Layout indices: chunks[0]=chat, chunks[1]=bash strip
+                    // (0 rows when Idle ⇒ invisible), chunks[2]=input,
+                    // chunks[3]=status. The bash strip lives in the chat
+                    // column only (not full terminal width) — see slice 2
+                    // notes in `make-term-great-again.md`.
+                    let chat_chunk = chunks[0];
+                    let bash_strip_chunk = chunks[1];
+                    let input_chunk = chunks[2];
+                    let status_chunk = chunks[3];
 
                     // Width available for chat content depends on the
                     // chrome the chat pane currently draws. In normal
@@ -1031,7 +1050,7 @@ impl ReplUi {
                     // `slow-messages.md` §4.1.
                     self.chat_cache.sync(&state.chat.messages, chat_wrap_width);
 
-                    self.ui_state.viewport_height = chunks[0].height.saturating_sub(2);
+                    self.ui_state.viewport_height = chat_chunk.height.saturating_sub(2);
                     self.ui_state.content_height =
                         self.chat_cache.total_height().min(u16::MAX as u32) as u16;
 
@@ -1057,7 +1076,7 @@ impl ReplUi {
                     // and the right-edge scrollbar column. `select_mode`
                     // is already in scope (used above for
                     // `chat_pane_content_width`); reuse it here.
-                    let view = self.chat_cache.window(scroll as u32, chunks[0].height);
+                    let view = self.chat_cache.window(scroll as u32, chat_chunk.height);
                     let chat_history = if view.lines.is_empty() && state.chat.messages.is_empty() {
                         // Empty transcript — show the welcome banner.
                         Paragraph::new(Text::from(Self::welcome_lines()))
@@ -1073,13 +1092,22 @@ impl ReplUi {
 
                     Self::render_chat_history(
                         f,
-                        chunks[0],
+                        chat_chunk,
                         /* global_scroll    */ scroll,
                         /* paragraph_scroll */ view.inner_scroll,
                         chat_history,
                         self.ui_state.content_height,
                         select_mode,
                     );
+
+                    // Render the foreground bash-tool panel between chat
+                    // and input. `Idle` ⇒ `bash_height == 0` ⇒ the chunk
+                    // is zero-rows and the renderer no-ops. Slice 2 of
+                    // #11; producer wiring lands in slice 3.
+                    if bash_height > 0 {
+                        render_bash_panel(f, bash_strip_chunk, &state.bash_panel);
+                    }
+
                     // Input area: in select mode, swap its bordered block
                     // for a borderless one so a vertical selection
                     // through the input box doesn't pick up box chars
@@ -1090,22 +1118,22 @@ impl ReplUi {
                     } else {
                         input
                     };
-                    Self::render_input_area(f, chunks[1], input, self.ui_state.input_scroll);
+                    Self::render_input_area(f, input_chunk, input, self.ui_state.input_scroll);
                     if select_mode {
                         // Modal: replace the status bar with a banner that
                         // tells the user (1) what's happening and (2) how
                         // to leave. Mouse-wheel scroll is off; PgUp/PgDn
                         // still work, and so does typing into the input.
-                        Self::render_select_mode_banner(f, chunks[2]);
+                        Self::render_select_mode_banner(f, status_chunk);
                     } else {
-                        Self::render_status_bar(f, chunks[2], state);
+                        Self::render_status_bar(f, status_chunk, state);
                     }
 
                     // Render command popup ABOVE the input area if open.
                     // Drawn after the chat + input so it sits on top (via
                     // `Clear` inside the renderer). See `allehailmenu.md` §6.
                     if let Some(popup) = self.command_popup.as_ref() {
-                        crate::ui::repl::command_popup::render_command_popup(f, chunks[1], popup);
+                        crate::ui::repl::command_popup::render_command_popup(f, input_chunk, popup);
                     }
                 }
 

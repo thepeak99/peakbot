@@ -12,8 +12,8 @@ use crate::providers::CompactionModel;
 use crate::storage::{ConversationStorage, ConversationSummary};
 use crate::tools::todo::{TodoList, TodoStatus};
 use crate::ui::app_state::{
-    AppState, BgState, BgSummary, ChatMessage, ChatState, ContextState, SessionState, TodoItem,
-    TodoState, WelcomeState,
+    AppState, BashPanelState, BgState, BgSummary, ChatMessage, ChatState, ContextState,
+    SessionState, TodoItem, TodoState, WelcomeState,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -1766,6 +1766,93 @@ impl StateManager {
         {
             let mut state = self.state.write().unwrap();
             state.bg = snapshot;
+        }
+        let state = self.state.read().unwrap();
+        self.notify_update(&state);
+    }
+
+    // ── Foreground bash panel (`make-term-great-again.md`) ──────────────────
+
+    /// Transition the bash panel to [`BashPanelState::Running`].
+    ///
+    /// Called by the foreground `bash` tool the moment the PTY child is
+    /// spawned (slice 3). `started_at` is stamped to `now` so the
+    /// renderer's elapsed timer starts at zero. `tail` is empty until
+    /// the first reader debounce fires [`Self::update_bash_panel_tail`].
+    pub fn start_bash_panel(&self, command: String, pid: u32) {
+        {
+            let mut state = self.state.write().unwrap();
+            state.bash_panel = BashPanelState::Running {
+                command,
+                pid,
+                started_at: chrono::Local::now(),
+                tail: Vec::new(),
+            };
+        }
+        let state = self.state.read().unwrap();
+        self.notify_update(&state);
+    }
+
+    /// Replace the live tail of the running bash panel. No-op (and no
+    /// notify) when the panel is not currently `Running` — the producer
+    /// shouldn't push tail updates after `finish_bash_panel`, but the
+    /// guard keeps a late reader-thread debounce from corrupting a
+    /// `Finished` snapshot. Caller is responsible for trimming `tail`
+    /// to ≤ 5 lines.
+    pub fn update_bash_panel_tail(&self, tail: Vec<String>) {
+        {
+            let mut state = self.state.write().unwrap();
+            if let BashPanelState::Running { tail: t, .. } = &mut state.bash_panel {
+                *t = tail;
+            } else {
+                return;
+            }
+        }
+        let state = self.state.read().unwrap();
+        self.notify_update(&state);
+    }
+
+    /// Transition the bash panel to [`BashPanelState::Finished`].
+    ///
+    /// Carries over the `command` from the `Running` variant so the
+    /// renderer can keep displaying it. If the panel is not currently
+    /// `Running` (e.g. a stray finish for a panel that was already
+    /// cleared), the call is silently dropped — the producer-side
+    /// `bash` tool is the only legitimate caller and it never finishes
+    /// without first starting.
+    pub fn finish_bash_panel(&self, exit_code: i32, final_tail: Vec<String>) {
+        {
+            let mut state = self.state.write().unwrap();
+            let (command, started_at) = match &state.bash_panel {
+                BashPanelState::Running {
+                    command,
+                    started_at,
+                    ..
+                } => (command.clone(), *started_at),
+                _ => return,
+            };
+            let duration_secs = (chrono::Local::now() - started_at).num_seconds().max(0) as u64;
+            state.bash_panel = BashPanelState::Finished {
+                command,
+                exit_code,
+                duration_secs,
+                tail: final_tail,
+            };
+        }
+        let state = self.state.read().unwrap();
+        self.notify_update(&state);
+    }
+
+    /// Reset the bash panel to [`BashPanelState::Idle`] (hidden).
+    /// Called on `/new`, `/load`, and any other "fresh conversation"
+    /// boundary. Idempotent — already-idle is a no-op.
+    pub fn clear_bash_panel(&self) {
+        {
+            let mut state = self.state.write().unwrap();
+            if state.bash_panel.is_idle() {
+                return;
+            }
+            state.bash_panel = BashPanelState::Idle;
         }
         let state = self.state.read().unwrap();
         self.notify_update(&state);
@@ -3545,5 +3632,99 @@ mod tests {
             sm.get_current_conversation().unwrap().title.as_deref(),
             Some("Existing")
         );
+    }
+
+    // ── Bash panel lifecycle (slice 2 of #11) ──────────────────────────
+
+    #[test]
+    fn bash_panel_starts_idle() {
+        let sm = StateManager::new_arc();
+        let snap = sm.get_state();
+        assert!(snap.bash_panel.is_idle());
+    }
+
+    #[test]
+    fn start_bash_panel_transitions_to_running() {
+        let sm = StateManager::new_arc();
+        sm.start_bash_panel("ls -la".to_string(), 4242);
+        let snap = sm.get_state();
+        match snap.bash_panel {
+            BashPanelState::Running { command, pid, .. } => {
+                assert_eq!(command, "ls -la");
+                assert_eq!(pid, 4242);
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_bash_panel_tail_replaces_lines() {
+        let sm = StateManager::new_arc();
+        sm.start_bash_panel("yes".to_string(), 1);
+        sm.update_bash_panel_tail(vec!["a".into(), "b".into()]);
+        sm.update_bash_panel_tail(vec!["x".into(), "y".into(), "z".into()]);
+        let snap = sm.get_state();
+        match snap.bash_panel {
+            BashPanelState::Running { tail, .. } => {
+                assert_eq!(tail, vec!["x", "y", "z"]);
+            }
+            _ => panic!("expected Running"),
+        }
+    }
+
+    #[test]
+    fn update_bash_panel_tail_is_noop_when_not_running() {
+        // If we push tail bytes against an `Idle` (or `Finished`) panel,
+        // nothing should happen — guard exists so a late reader-thread
+        // debounce can't corrupt a `Finished` snapshot.
+        let sm = StateManager::new_arc();
+        sm.update_bash_panel_tail(vec!["leaked".into()]);
+        assert!(sm.get_state().bash_panel.is_idle());
+    }
+
+    #[test]
+    fn finish_bash_panel_transitions_running_to_finished() {
+        let sm = StateManager::new_arc();
+        sm.start_bash_panel("make".to_string(), 7);
+        sm.finish_bash_panel(0, vec!["done".into()]);
+        let snap = sm.get_state();
+        match snap.bash_panel {
+            BashPanelState::Finished {
+                command,
+                exit_code,
+                tail,
+                ..
+            } => {
+                assert_eq!(command, "make");
+                assert_eq!(exit_code, 0);
+                assert_eq!(tail, vec!["done"]);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_bash_panel_without_running_is_noop() {
+        let sm = StateManager::new_arc();
+        sm.finish_bash_panel(0, vec!["ghost".into()]);
+        assert!(sm.get_state().bash_panel.is_idle());
+    }
+
+    #[test]
+    fn clear_bash_panel_resets_to_idle() {
+        let sm = StateManager::new_arc();
+        sm.start_bash_panel("sleep 1".to_string(), 9);
+        sm.finish_bash_panel(0, vec![]);
+        assert!(!sm.get_state().bash_panel.is_idle());
+        sm.clear_bash_panel();
+        assert!(sm.get_state().bash_panel.is_idle());
+    }
+
+    #[test]
+    fn clear_bash_panel_is_idempotent_on_idle() {
+        let sm = StateManager::new_arc();
+        sm.clear_bash_panel();
+        sm.clear_bash_panel();
+        assert!(sm.get_state().bash_panel.is_idle());
     }
 }

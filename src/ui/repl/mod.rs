@@ -2,6 +2,7 @@
 //!
 //! This module wraps the existing REPL as a Ui trait implementation (View in MVC).
 
+pub mod bash_panel;
 pub mod command_popup;
 pub mod confirm_dialog;
 pub mod markdown;
