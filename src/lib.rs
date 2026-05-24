@@ -12,6 +12,7 @@ mod memory_compaction;
 pub mod mock;
 mod pipeline;
 mod providers;
+pub mod pty_runner;
 mod skills;
 pub mod state;
 pub mod storage;
