@@ -974,3 +974,164 @@ for v1; sidecar storage is a speculative Phase 2 (see `one-vision.md`).
   `vision::model_supports_vision(&model)` in every provider constructor
 - Dispatch path: `SubmitKind::MultimodalMessage` → `add_user_message_with_attachments`
   → `build_current_turn_message` → `prompt_with_history` (identical path to text turns)
+
+
+## CI (Gitea Actions)
+
+The repo runs CI on **Gitea Actions** via the workflow at
+[`.gitea/workflows/ci.yml`](./.gitea/workflows/ci.yml). Single job,
+single runner (`shinpachi`, label `dind`), `rust:1.95` container. The
+gate is: `cargo fmt --all -- --check` → `cargo clippy --all-targets
+--locked -- -D warnings` → `cargo test --workspace --locked`.
+
+### Reproducing the gate locally
+
+This is the same three commands CI runs. Run them from the repo root
+before pushing:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+Autofix pass when fmt/clippy flag something:
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets --fix --allow-dirty
+cargo clippy --all-targets --fix --allow-dirty --tests
+# then re-verify with the gate above
+```
+
+### Inspecting a failed run
+
+`GITEA_URL` / `GITEA_TOKEN` are already in the PeakBot shell env (confirm
+with `env | grep -i gitea`). Owner is `ai-bots`, repo is `peakbot`.
+
+**Step 1 — list latest runs:**
+
+```bash
+curl -s -H "Authorization: token $GITEA_TOKEN" \
+  "$GITEA_URL/api/v1/repos/ai-bots/peakbot/actions/tasks?page=1&limit=5" \
+  | jq '.workflow_runs[] | {id, run_number, status, conclusion, head_sha: .head_sha[0:8], display_title}'
+```
+
+Key fields: `id` (internal — used everywhere below), `run_number` (the
+UI number in the web URL), `status`, `conclusion`, `head_sha`.
+
+> ⚠️ **Gitea ID quirk:** `workflow_runs[*].url` looks like
+> `…/actions/runs/{run_number}` but every API endpoint below wants the
+> internal `id`. UI run #3 ≠ internal id. **Always use `id`.**
+
+**Step 2 — find the job id:**
+
+The expected path `/actions/runs/{id}/jobs` returns an empty list on
+our Gitea version. The path that actually works is:
+
+```bash
+curl -s -H "Authorization: token $GITEA_TOKEN" \
+  "$GITEA_URL/api/v1/repos/ai-bots/peakbot/actions/jobs?run=<anything>" \
+  | jq '.jobs[] | {id, run_id, head_sha: .head_sha[0:8], status, conclusion}'
+```
+
+The `?run=` filter is **ignored** — it returns every job in the repo.
+Match on `head_sha` to find the one you want.
+
+**Step 3 — pull the log:**
+
+```bash
+JOB_ID=<id from step 2>
+curl -s -H "Authorization: token $GITEA_TOKEN" \
+  "$GITEA_URL/api/v1/repos/ai-bots/peakbot/actions/jobs/$JOB_ID/logs" \
+  -o /tmp/peakbot/job_${JOB_ID}.log
+```
+
+`404 "job not found"` means you have the wrong id (probably the run id
+instead of the job id, or a stale `run_number`).
+
+**Step 4 — extract the failure:**
+
+```bash
+grep -E "::group|::endgroup|::error|Run Main|Process completed|fatal|error\[|test result|FAILED|panicked" \
+  /tmp/peakbot/job_${JOB_ID}.log | tail -n 60
+```
+
+The literal error is right before `##[error]Process completed with exit
+code N.` Read upward from there to the most recent `::group::Run …` to
+identify the failing step.
+
+**Step 5 — poll for the new run after pushing a fix:**
+
+```bash
+TARGET_SHA=$(git rev-parse --short HEAD)
+for i in $(seq 1 90); do
+  line=$(curl -s -H "Authorization: token $GITEA_TOKEN" \
+    "$GITEA_URL/api/v1/repos/ai-bots/peakbot/actions/tasks?page=1&limit=1" \
+    | python3 -c "import sys,json; r=json.load(sys.stdin)['workflow_runs'][0]; \
+                  print(r['head_sha'], r['status'], r.get('conclusion','') or '-', r['run_number'])")
+  echo "[poll $i] $line"
+  sha=$(echo "$line" | awk '{print $1}')
+  state=$(echo "$line" | awk '{print $2}')
+  if [ "${sha:0:7}" = "$TARGET_SHA" ] && \
+     { [ "$state" = "success" ] || [ "$state" = "failure" ] || [ "$state" = "cancelled" ]; }; then
+    echo "DONE: $state"; break
+  fi
+  sleep 15
+done
+```
+
+Warm rust:1.95 container: ~90 s. Cold: 3–6 min. Don't poll faster than
+every 10 s.
+
+### Sanity endpoints
+
+```bash
+# Runners visible to this repo / org
+curl -s -H "Authorization: token $GITEA_TOKEN" \
+  "$GITEA_URL/api/v1/repos/ai-bots/peakbot/actions/runners" | jq
+curl -s -H "Authorization: token $GITEA_TOKEN" \
+  "$GITEA_URL/api/v1/orgs/ai-bots/actions/runners" | jq
+```
+
+If both return empty, jobs sit `cancelled`/`queued` forever even with a
+valid workflow YAML. Currently `shinpachi` is registered at the
+**instance** level (not visible via the repo/org endpoints above — both
+return empty), and advertises the label `dind`.
+
+### Gitea-Actions vs GitHub-Actions: the must-knows
+
+Hard-won during CI bring-up:
+
+1. **`actions/checkout` is mandatory.** The workspace volume starts
+   empty — no auto-clone. We use a pure-git fallback so we don't need
+   `node` in the container:
+   ```yaml
+   - run: |
+       git init -q
+       git fetch --depth=1 \
+         "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+         "$GITHUB_SHA"
+       git checkout --detach FETCH_HEAD
+   ```
+2. **JS actions need `node` in the container.** Slim images (`rust`,
+   `alpine`, etc.) don't have it. Either bring node, install it, or
+   replace JS actions with shell steps (recommended).
+3. **`GITHUB_TOKEN` is NOT auto-exported into `run:` step env.** Mirror
+   it explicitly: `env: { GITHUB_TOKEN: ${{ github.token }} }`.
+4. **Toolchains arrive minimal.** Official `rust:*` images ship only
+   `cargo`/`rustc`/`rust-std`. Add `rustfmt`/`clippy` via
+   `rustup component add` if the gate uses them.
+5. **`runs-on:` must match an existing runner's advertised labels.**
+   Currently our runner advertises `dind`.
+6. **Tests that need network / external binaries must be `#[ignore]`d.**
+   The container has no `uvx`, `npm`, `python`, or general egress. Mark
+   such tests with `#[ignore = "reason"]` and run locally with
+   `cargo test -- --ignored`. (See the 2026-05-25 lesson where three
+   `test_connect_mcp_server_*` tests panicked in CI because they spawn
+   `uvx` to fetch an MCP server from GitHub.)
+7. **Lift `working-directory:` only if the subdir exists.** When
+   copying a workflow between repos, the `working-directory: backend`
+   from a monorepo will fail with `chdir … no such file or directory`
+   in a flat-layout repo. peakbot has `Cargo.toml` at the root — no
+   `working-directory` is needed.
