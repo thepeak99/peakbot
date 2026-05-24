@@ -175,6 +175,9 @@ pub struct Conversation {
     pub model: String,
     /// Additional metadata (token count, cost, etc.)
     pub metadata: ConversationMetadata,
+    /// Todo list persisted with this conversation
+    #[serde(default)]
+    pub todos: crate::tools::todo::TodoList,
 }
 
 impl Conversation {
@@ -197,6 +200,7 @@ impl Conversation {
             provider_name,
             model,
             metadata: ConversationMetadata::default(),
+            todos: crate::tools::todo::TodoList::new(),
         }
     }
 
