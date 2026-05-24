@@ -1,0 +1,25 @@
+---
+source: tests/repl_tests.rs
+assertion_line: 1152
+expression: "lines.join(\"\\n\")"
+---
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+┌ Commands ────────────────────────────────────────────────┐                    
+│  /model <args>  List models, or switch with /model <alia…│                    
+└───────────── ↑/↓ · Tab complete · Enter run · Esc cancel ┘
