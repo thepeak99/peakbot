@@ -95,6 +95,18 @@ pub struct AppState {
     /// after each registry mutation. See `bash-background.md`.
     #[serde(default)]
     pub bg: BgState,
+
+    /// Live state of the foreground `bash` tool panel.
+    ///
+    /// Drives the bottom-strip panel that surfaces the currently-running
+    /// (or last-run) `bash` invocation. UI scaffolding only in slice 2
+    /// of `make-term-great-again.md`; the producer side (foreground
+    /// `bash` PTY wiring) lands in slice 3, so in production this slot
+    /// stays at [`BashPanelState::Idle`] until then. Snapshot-shape, not
+    /// a handle — mirrors `BgState`'s pattern so AppState stays
+    /// `Clone + Serialize + Deserialize`.
+    #[serde(default)]
+    pub bash_panel: BashPanelState,
 }
 
 impl AppState {
@@ -1052,6 +1064,76 @@ pub struct BgSummary {
     pub status: String,
     pub exit_code: Option<i32>,
     pub treat_as_user_input: bool,
+}
+
+/// Snapshot of the foreground `bash` tool panel.
+///
+/// Mirrors the design in `make-term-great-again.md`:
+/// - **Idle** — no `bash` invocation has happened yet (or the state has
+///   been cleared by `/new` / `/load`). Panel is hidden — zero rows.
+/// - **Running** — a `bash` tool call is in flight. Panel shows the
+///   command, pid, elapsed time, and a 5-line scrolling tail of the
+///   live output buffer, plus a `stdin» _` row.
+/// - **Finished** — the previous `bash` tool call has exited. Panel
+///   shows the command, exit code, total duration, and the final 5
+///   lines of output. Stays visible until the next `bash` call or until
+///   the conversation is cleared.
+///
+/// The enum makes illegal states (e.g. `running` with an `exit_code`)
+/// unrepresentable — the lifecycle is compiler-enforced.
+///
+/// `tail` is **already trimmed to ≤ 5 lines** at the snapshot boundary
+/// by `StateManager`. The renderer pads with blanks if fewer; it never
+/// truncates here. The full ring buffer lives in the `pty_runner`
+/// `LineBuffer` (slice 3 wiring); this snapshot is just what the panel
+/// needs to draw — same shape as `BgState` / `BgSummary`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BashPanelState {
+    /// No foreground `bash` activity. Panel hidden.
+    #[default]
+    Idle,
+    /// A `bash` invocation is currently running.
+    Running {
+        /// The shell command being executed (verbatim — what the model
+        /// passed to the `bash` tool). Used for the panel header.
+        command: String,
+        /// Child process id. Surfaced in the header so the user can
+        /// `kill -9 N` from another terminal if needed.
+        pid: u32,
+        /// Wall-clock start of the invocation. The renderer computes
+        /// `elapsed = now - started_at` at draw time.
+        started_at: DateTime<Local>,
+        /// Last ≤ 5 lines of the live output buffer, ANSI-stripped.
+        /// Cardinal rule: same bytes the eventual tool result will
+        /// carry — see "one buffer, two views" in
+        /// `make-term-great-again.md`.
+        tail: Vec<String>,
+    },
+    /// The previous `bash` invocation has exited. Persists until the
+    /// next call or conversation reset.
+    Finished {
+        /// Same `command` string that drove [`Self::Running`].
+        command: String,
+        /// Process exit code (0 = success → `✓` glyph, anything else →
+        /// `✗` glyph).
+        exit_code: i32,
+        /// Total wall-clock duration in whole seconds. Stored as a scalar
+        /// rather than `(started_at, finished_at)` because the renderer
+        /// only needs the formatted duration (`ran 00:42`) — keeping the
+        /// snapshot lean (`BgSummary`-style discipline).
+        duration_secs: u64,
+        /// Final ≤ 5 lines of the output buffer, ANSI-stripped.
+        tail: Vec<String>,
+    },
+}
+
+impl BashPanelState {
+    /// Predicate for `skip_serializing_if` and layout decisions —
+    /// `Idle` ⇒ the panel takes zero rows in the layout.
+    pub fn is_idle(&self) -> bool {
+        matches!(self, BashPanelState::Idle)
+    }
 }
 
 /// UI preferences
