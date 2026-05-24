@@ -1,6 +1,7 @@
 //! PeakBot entry point
 
 use anyhow::Result;
+use clap::Parser;
 use peakbot::{
     AgentRunner, Config, FileStorage, ShellKind, SubAgentRegistry, TodoTool, Ui, UiAction,
     build_system_prompt, create_provider, get_config_file_path, load_default_skills,
@@ -9,6 +10,12 @@ use peakbot::{
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(name = "peakbot")]
+#[command(about = "PeakBot — AI coding assistant")]
+#[command(version)]
+struct Cli;
 
 /// Check if the provider has an API key configured.
 /// Returns true if any API key is set (OpenRouter, OpenAI, or LlamaCpp).
@@ -65,6 +72,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+
+    // Parse CLI args. --version / -v is handled automatically by clap.
+    let _cli = Cli::parse();
 
     // ── Shared setup ──────────────────────────────────────────────
 
