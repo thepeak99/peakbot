@@ -1,0 +1,12 @@
+---
+source: tests/repl_tests.rs
+assertion_line: 1458
+expression: "lines.join(\"\\n\")"
+---
+┌ x cargo test --doc · exit 101 · ran 00:07 ───────────────────────────────────┐
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│error[E0277]: trait bound not satisfied                                       │
+└──────────────────────────────────────────────────────────────────────────────┘

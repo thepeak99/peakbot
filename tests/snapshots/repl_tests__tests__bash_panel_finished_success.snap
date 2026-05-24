@@ -1,0 +1,12 @@
+---
+source: tests/repl_tests.rs
+assertion_line: 1436
+expression: "lines.join(\"\\n\")"
+---
+┌ + make build · exit 0 · ran 00:42 ───────────────────────────────────────────┐
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│Compiling peakbot v0.5.2                                                      │
+│Finished `dev` profile [unoptimized + debuginfo]                              │
+└──────────────────────────────────────────────────────────────────────────────┘

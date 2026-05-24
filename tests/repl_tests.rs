@@ -1333,4 +1333,209 @@ mod tests {
             "base symbol must survive: {joined:?}"
         );
     }
+
+    // === Bash panel snapshot tests (slice 2 of #11) ===
+    //
+    // Pin the rendered output of the foreground `bash` tool panel in
+    // each lifecycle state. The renderer is the slice 2 deliverable;
+    // these snapshots lock the visual contract so slice 3 (PTY wiring)
+    // and slice 4 (stdin field) can't silently regress the surface.
+    //
+    // Helper imports are kept local to each test to mirror the style
+    // already used by the todo-panel tests above.
+
+    #[test]
+    fn bash_panel_running_short_tail() {
+        use chrono::{Local, TimeZone};
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::render_bash_panel;
+
+        // Fixed start time so the elapsed clock in the header is
+        // deterministic across machines. Pick something many seconds in
+        // the past; the snapshot only locks the duration *format*, not
+        // a specific value, by sanitising the digits below.
+        let started_at = Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+        let state = BashPanelState::Running {
+            command: "psql -f migrate.sql".into(),
+            pid: 4821,
+            started_at,
+            tail: vec![
+                "NOTICE: table \"users\" does not exist, skipping".into(),
+                "CREATE TABLE".into(),
+                "CREATE INDEX".into(),
+            ],
+        };
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        // Replace the live-elapsed digits in the title so the snapshot
+        // is reproducible. Header has shape `... · MM:SS ─...`.
+        let sanitised = sanitise_elapsed(lines.join("\n"));
+        assert_snapshot!("bash_panel_running_short_tail", sanitised);
+    }
+
+    #[test]
+    fn bash_panel_running_overflow_keeps_last_5_lines() {
+        use chrono::{Local, TimeZone};
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::render_bash_panel;
+
+        let started_at = Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+        let tail: Vec<String> = (0..10).map(|i| format!("line {}", i)).collect();
+        let state = BashPanelState::Running {
+            command: "yes | head".into(),
+            pid: 100,
+            started_at,
+            tail,
+        };
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        let sanitised = sanitise_elapsed(lines.join("\n"));
+        assert_snapshot!("bash_panel_running_overflow_keeps_last_5_lines", sanitised);
+    }
+
+    #[test]
+    fn bash_panel_finished_success() {
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::render_bash_panel;
+
+        let state = BashPanelState::Finished {
+            command: "make build".into(),
+            exit_code: 0,
+            duration_secs: 42,
+            tail: vec![
+                "Compiling peakbot v0.5.2".into(),
+                "Finished `dev` profile [unoptimized + debuginfo]".into(),
+            ],
+        };
+
+        let backend = TestBackend::new(80, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("bash_panel_finished_success", lines.join("\n"));
+    }
+
+    #[test]
+    fn bash_panel_finished_failure() {
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::render_bash_panel;
+
+        let state = BashPanelState::Finished {
+            command: "cargo test --doc".into(),
+            exit_code: 101,
+            duration_secs: 7,
+            tail: vec!["error[E0277]: trait bound not satisfied".into()],
+        };
+
+        let backend = TestBackend::new(80, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("bash_panel_finished_failure", lines.join("\n"));
+    }
+
+    #[test]
+    fn bash_panel_idle_renders_nothing() {
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::{panel_height, render_bash_panel};
+
+        // Idle has zero height — the layout would not allocate any
+        // area. Sanity-check both that the height function returns 0
+        // *and* that calling the renderer on a zero-height area is a
+        // safe no-op (defensive: callers shouldn't, but renderers
+        // shouldn't panic if they do).
+        let state = BashPanelState::Idle;
+        assert_eq!(panel_height(&state), 0);
+
+        // A nonzero-height surface; the renderer must still no-op for
+        // `Idle` because the *state* says hidden.
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state);
+        });
+        let lines = buffer_to_lines(terminal.backend());
+        // All cells should be blank — the renderer drew nothing.
+        let joined: String = lines.join("");
+        assert!(
+            joined.chars().all(|c| c == ' '),
+            "Idle render should leave the surface blank, got: {lines:?}"
+        );
+    }
+
+    /// Replace the live `MM:SS` elapsed timer in the Running header so
+    /// snapshots are reproducible. The header is shaped like
+    /// `┌─ > psql ... · pid 4821 · 03:42 ─...┐`; we sweep any
+    /// `<one-or-more digits>:<exactly 2 digits>` pattern to `MM:SS`.
+    /// One-or-more on the left handles wide elapsed values like
+    /// `34567890:42` that show up when a Running snapshot test pins a
+    /// `started_at` years in the past.
+    ///
+    /// Cheap, scoped, and only touches the bash-panel snapshots.
+    fn sanitise_elapsed(s: String) -> String {
+        let mut out = String::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            // Look ahead for `\d+:\d{2}` starting at `i`.
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i
+                && j + 2 < bytes.len()
+                && bytes[j] == b':'
+                && bytes[j + 1].is_ascii_digit()
+                && bytes[j + 2].is_ascii_digit()
+            {
+                out.push_str("MM:SS");
+                i = j + 3;
+            } else {
+                // Push the next char (must respect UTF-8 boundaries).
+                let ch_end = utf8_char_end(bytes, i);
+                out.push_str(std::str::from_utf8(&bytes[i..ch_end]).unwrap());
+                i = ch_end;
+            }
+        }
+        out
+    }
+
+    fn utf8_char_end(bytes: &[u8], start: usize) -> usize {
+        let b = bytes[start];
+        // UTF-8 lead-byte → continuation-length table. A continuation
+        // byte (0x80..0xC0) is *not* a valid start, but if we somehow
+        // land on one we advance 1 to make progress instead of looping.
+        let len = match b {
+            0..=0x7F => 1,
+            0x80..=0xBF => 1, // defensive: malformed boundary, step over
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            _ => 4,
+        };
+        (start + len).min(bytes.len())
+    }
 }
