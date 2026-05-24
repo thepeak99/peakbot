@@ -5,44 +5,46 @@
 //! a tier flag (`treat_as_user_input`) that determines whether its output
 //! resets the synthetic-turn circuit breaker or contributes to it.
 //!
+//! The PTY plumbing (spawn, reader thread, ANSI strip, ring buffer, kill)
+//! is delegated to [`crate::pty_runner`]. This module owns the
+//! *registry-level* concerns: multi-process bookkeeping, the
+//! consecutive-auto-turns circuit breaker, two-tier classification
+//! (capped vs. unlimited), and the drain-into-synthetic-turn semantics.
+//!
 //! ## Lifecycle
 //!
-//! 1. `BgRegistry::start` opens a PTY, spawns the child under it, and
-//!    launches a reader thread that streams line-buffered output into a
-//!    ring buffer and notifies the agent via a tokio mpsc when a new
-//!    line lands.
-//! 2. The reader debounces notifications: after the first line, it
-//!    waits up to [`DEBOUNCE_MS`] before pinging again, so chatty
-//!    processes don't generate a turn per line.
+//! 1. `BgRegistry::start` calls [`pty_runner::spawn`] with a 500 ms
+//!    debounce window, then wraps the returned `PtyHandle` parts in a
+//!    `BgProcess` entry.
+//! 2. The reader thread (owned by `pty_runner`) streams output into the
+//!    shared `LineBuffer` and pings the agent loop on dirty.
 //! 3. Output is drained synchronously by `BgRegistry::drain_outputs`,
-//!    called between agent turns. The drain assembles a `[bg output]`
-//!    block per non-empty process and clears their rings.
-//! 4. `BgRegistry::stop` (or `Drop`) sends `SIGHUP` via
-//!    `portable-pty`'s `ChildKiller`, joins the reader, and removes the
-//!    process from the registry.
+//!    called between agent turns. The drain assembles one `[bg output]`
+//!    block per non-empty process and clears their rings. Exit
+//!    notifications bypass the circuit-breaker gate.
+//! 4. `BgRegistry::stop` (or `Drop`) calls the killer (SIGHUP on Unix),
+//!    joins the reader, and removes the process from the registry.
 //!
 //! ## Lock discipline
 //!
 //! All public methods take `&self` and lock the inner `Mutex` briefly.
-//! Reader threads acquire the same mutex on each line append. The
-//! mutex is **never** held across an `.await` — the registry is a
-//! synchronous data structure that lives behind an
+//! Reader threads acquire the per-process `LineBuffer` mutex on each
+//! line append. The registry mutex is **never** held across an `.await`
+//! — the registry is a synchronous data structure that lives behind an
 //! `Arc<Mutex<BgRegistry>>` on `StateManager`. See the async-lock
 //! discipline rules in `memory.md`.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
+use portable_pty::ChildKiller;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Maximum bytes per captured line before truncation kicks in.
-/// Protects the LLM from log floods carrying a single multi-MB line.
-pub const MAX_LINE_BYTES: usize = 4096;
+use crate::pty_runner::{self, LineBuffer, PtyStatus, SpawnError, SpawnParams as PtySpawnParams};
 
 /// Default ring-buffer capacity when `capture_output_lines` is omitted.
 pub const DEFAULT_CAPTURE_LINES: usize = 200;
@@ -57,7 +59,9 @@ pub const DEBOUNCE_MS: u64 = 500;
 /// contribution resets the counter. Open question Q1 was answered "OK" at 3.
 pub const MAX_CONSECUTIVE_AUTO_TURNS: usize = 3;
 
-/// Status of a background process.
+/// Status of a background process. Mirrors [`pty_runner::PtyStatus`] but
+/// adds a timestamp so the TUI / drain blocks can show *when* the
+/// transition happened.
 #[derive(Debug, Clone)]
 pub enum BgStatus {
     Running { since: DateTime<Utc> },
@@ -72,8 +76,8 @@ impl BgStatus {
 
 /// A single background process entry.
 ///
-/// Held inside `BgRegistry`. The reader thread holds a separate
-/// `Arc<Mutex<ProcessShared>>` clone to drop lines into the buffer
+/// Held inside `BgRegistry`. The reader thread (owned by `pty_runner`)
+/// holds an `Arc<Mutex<LineBuffer>>` clone to drop lines into the buffer
 /// without re-locking the whole registry on every line.
 pub struct BgProcess {
     pub id: u32,
@@ -90,15 +94,16 @@ pub struct BgProcess {
     /// discarded — useful for fire-and-forget watchers).
     pub capture_cap: usize,
     pub started_at: DateTime<Utc>,
+    /// Wall-clock timestamp the reader thread observed exit. `None`
+    /// while running; set on the first drain that sees `PtyStatus::Exited`.
+    exited_at: Option<DateTime<Utc>>,
 
-    /// Shared with the reader thread: the line buffer + status + exit
-    /// code land here when the reader observes them. The registry's
-    /// `drain_outputs` snapshots this slot under the lock.
-    shared: Arc<Mutex<ProcessShared>>,
+    /// Shared with the reader thread (via `pty_runner`): the line ring
+    /// + liveness status. The registry's `drain_outputs` snapshots this
+    ///   slot under the lock.
+    buffer: Arc<Mutex<LineBuffer>>,
 
     /// Writer end of the PTY — used by `send_line`.
-    /// `take_writer` is one-shot on the master, so we own it after
-    /// `start` and reuse on subsequent `send_line` calls.
     writer: Box<dyn Write + Send>,
 
     /// `ChildKiller` clone — calling `kill` sends `SIGHUP` on Unix /
@@ -110,104 +115,6 @@ pub struct BgProcess {
     /// Reader thread join handle. Always `Some` while the process is
     /// in the registry; taken out by `Drop` for the join.
     reader: Option<JoinHandle<()>>,
-}
-
-/// Reader-thread-side state for a single process. Cheap to lock because
-/// it only touches Vec/usize fields — no IO, no async.
-#[derive(Debug)]
-struct ProcessShared {
-    /// Line ring. Capped at `capture_cap`; oldest evicted on overflow.
-    buffer: VecDeque<String>,
-    /// Capacity for the ring (mirrors `BgProcess::capture_cap`).
-    capture_cap: usize,
-    /// Live status. Reader flips to `Exited` on EOF + `wait`.
-    status: BgStatus,
-    /// True ⇒ buffer changed since last drain. Set by the reader,
-    /// cleared by `drain_outputs`.
-    dirty: bool,
-}
-
-impl ProcessShared {
-    fn push_line(&mut self, line: String) {
-        if self.capture_cap == 0 {
-            // Capture disabled — still mark dirty so the agent gets
-            // *some* signal (e.g. "process exited"), but no payload.
-            self.dirty = true;
-            return;
-        }
-        let truncated = truncate_line(&line, MAX_LINE_BYTES);
-        if self.buffer.len() >= self.capture_cap {
-            self.buffer.pop_front();
-        }
-        self.buffer.push_back(truncated);
-        self.dirty = true;
-    }
-}
-
-fn truncate_line(s: &str, max_bytes: usize) -> String {
-    // Be UTF-8 boundary safe — see memory.md regression-pin arithmetic.
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let suffix = " … (truncated)";
-    // Walk back from `max_bytes - suffix.len()` to the nearest char boundary.
-    let target = max_bytes.saturating_sub(suffix.len());
-    let mut cut = target.min(s.len());
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}{suffix}", &s[..cut])
-}
-
-/// Strip ANSI escape sequences from a captured line so the LLM doesn't
-/// see SGR garbage. Conservative — only removes CSI sequences
-/// (`ESC [ … final-byte`). OSC and other less common sequences are
-/// rare in practice for the kinds of commands the agent runs.
-fn strip_ansi(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1B && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'[' => {
-                    // CSI: ESC [ ... final byte in 0x40..=0x7E
-                    let mut j = i + 2;
-                    while j < bytes.len() && !(0x40..=0x7E).contains(&bytes[j]) {
-                        j += 1;
-                    }
-                    i = j.saturating_add(1).min(bytes.len());
-                    continue;
-                }
-                b']' => {
-                    // OSC: ESC ] ... BEL or ESC \
-                    let mut j = i + 2;
-                    while j < bytes.len() && bytes[j] != 0x07 {
-                        if bytes[j] == 0x1B && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
-                            j += 1;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    i = j.saturating_add(1).min(bytes.len());
-                    continue;
-                }
-                _ => {
-                    // Bare ESC + single byte — skip the pair.
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    // Reader splits on `\n`; strip trailing `\r` left by PTY line discipline.
-    let mut s = String::from_utf8_lossy(&out).into_owned();
-    if s.ends_with('\r') {
-        s.pop();
-    }
-    s
 }
 
 /// Arguments for `BgRegistry::start`.
@@ -275,6 +182,12 @@ pub enum BgError {
     },
 }
 
+impl From<SpawnError> for BgError {
+    fn from(e: SpawnError) -> Self {
+        BgError::Spawn(e.to_string())
+    }
+}
+
 /// The registry. Held as `Arc<Mutex<BgRegistry>>` on `StateManager`.
 pub struct BgRegistry {
     procs: HashMap<u32, BgProcess>,
@@ -312,9 +225,9 @@ impl BgRegistry {
         self.procs
             .values()
             .filter(|p| {
-                p.shared
+                p.buffer
                     .lock()
-                    .map(|s| s.status.is_running())
+                    .map(|b| b.status.is_running())
                     .unwrap_or(false)
             })
             .count()
@@ -333,14 +246,14 @@ impl BgRegistry {
             .procs
             .values()
             .map(|p| {
-                let shared = p.shared.lock().expect("bg shared mutex poisoned");
+                let buf = p.buffer.lock().expect("pty buffer mutex poisoned");
                 BgListEntry {
                     id: p.id,
                     pid: p.pid,
                     command: p.command.clone(),
                     label: p.label.clone(),
-                    status: shared.status.clone(),
-                    buffer_len: shared.buffer.len(),
+                    status: bg_status_from(p, &buf),
+                    buffer_len: buf.lines.len(),
                     capture_cap: p.capture_cap,
                     treat_as_user_input: p.treat_as_user_input,
                 }
@@ -351,9 +264,9 @@ impl BgRegistry {
     }
 
     /// Spawn a new background process. The `notify_tx` channel is pinged
-    /// (debounced) whenever fresh output lands so the agent loop can
-    /// wake up and drain. The notification payload is intentionally
-    /// empty — see `QueueMessage::BackgroundOutputReady`.
+    /// (debounced at [`DEBOUNCE_MS`]) whenever fresh output lands so the
+    /// agent loop can wake up and drain. The notification payload is
+    /// intentionally empty — see `QueueMessage::BackgroundOutputReady`.
     pub fn start(
         &mut self,
         params: StartParams,
@@ -369,89 +282,38 @@ impl BgRegistry {
             shell,
         } = params;
 
-        // Use the detected shell (or fall back to "sh" for backward compat).
-        let shell = if shell.is_empty() { "sh" } else { &shell };
-        let is_powershell =
-            shell.to_lowercase().contains("pwsh") || shell.to_lowercase().contains("powershell");
-        let cmd_arg = if is_powershell { "-Command" } else { "-c" };
-
-        // Spawn via `<shell> -c` so the model can pass a shell line verbatim,
-        // identical to the existing `bash` tool's contract.
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| BgError::Spawn(format!("openpty: {e}")))?;
-
-        let mut cmd = CommandBuilder::new(shell);
-        cmd.arg(cmd_arg);
-        cmd.arg(&command);
-        if let Some(d) = cwd.as_ref() {
-            cmd.cwd(d);
-        }
-        // Inherit env explicitly so $PATH and friends work; portable-pty
-        // strips by default on some platforms.
-        for (k, v) in std::env::vars_os() {
-            cmd.env(k, v);
-        }
-        // Apply configured env vars from `bash:` config section (same source
-        // as the synchronous `bash` tool). These override inherited OS vars.
-        if let Some(env_vars) = env {
-            for (key, value) in env_vars {
-                cmd.env(key, value);
-            }
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| BgError::Spawn(format!("spawn: {e}")))?;
-        let pid = child.process_id().unwrap_or(0);
-        let killer = child.clone_killer();
-
-        // Drop the slave so EOF reaches the reader once the child exits.
-        drop(pair.slave);
-
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| BgError::Spawn(format!("clone_reader: {e}")))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| BgError::Spawn(format!("take_writer: {e}")))?;
+        let handle = pty_runner::spawn(
+            PtySpawnParams {
+                command: command.clone(),
+                cwd,
+                env,
+                shell,
+                capture_cap,
+                debounce: Some(Duration::from_millis(DEBOUNCE_MS)),
+            },
+            Some(notify_tx),
+        )?;
+        let parts = handle.into_parts();
 
         let id = self.next_id;
         self.next_id += 1;
-
-        let shared = Arc::new(Mutex::new(ProcessShared {
-            buffer: VecDeque::with_capacity(capture_cap.min(1024)),
-            capture_cap,
-            status: BgStatus::Running { since: Utc::now() },
-            dirty: false,
-        }));
-
-        let reader_handle = spawn_reader(reader, shared.clone(), child, notify_tx);
+        let started_at = Utc::now();
 
         let proc = BgProcess {
             id,
-            pid,
+            pid: parts.pid,
             command,
             label,
             treat_as_user_input,
             capture_cap,
-            started_at: Utc::now(),
-            shared,
-            writer,
-            killer,
-            reader: Some(reader_handle),
+            started_at,
+            exited_at: None,
+            buffer: parts.buffer,
+            writer: parts.writer,
+            killer: parts.killer,
+            reader: parts.reader,
         };
 
-        // Build the list entry before moving proc into the map.
         let entry = BgListEntry {
             id: proc.id,
             pid: proc.pid,
@@ -479,18 +341,16 @@ impl BgRegistry {
         // we join it below.
         let _ = proc.killer.kill();
         let (exit_code, final_lines) = {
-            let shared = proc.shared.lock().expect("bg shared mutex poisoned");
-            let code = match &shared.status {
-                BgStatus::Exited { code, .. } => *code,
-                BgStatus::Running { .. } => -1,
+            let buf = proc.buffer.lock().expect("pty buffer mutex poisoned");
+            let code = match &buf.status {
+                PtyStatus::Exited(code) => *code,
+                PtyStatus::Running => -1,
             };
-            (code, shared.buffer.iter().cloned().collect::<Vec<_>>())
+            (code, buf.lines.iter().cloned().collect::<Vec<_>>())
         };
         if let Some(h) = proc.reader.take() {
-            // Best-effort join with a short timeout — if the reader is
-            // wedged on `read()` for an exotic process, we don't want
-            // to block the agent.
-            let _ = std::thread::spawn(move || {
+            // Best-effort join on a side thread so stop doesn't block.
+            std::thread::spawn(move || {
                 let _ = h.join();
             });
         }
@@ -503,8 +363,8 @@ impl BgRegistry {
             return Err(BgError::NotFound(id));
         };
         {
-            let shared = proc.shared.lock().expect("bg shared mutex poisoned");
-            if !shared.status.is_running() {
+            let buf = proc.buffer.lock().expect("pty buffer mutex poisoned");
+            if !buf.status.is_running() {
                 return Err(BgError::Exited(id));
             }
         }
@@ -532,20 +392,18 @@ impl BgRegistry {
     /// Returns `None` when nothing was drained (all buffers clean OR
     /// the capped-tier circuit breaker is suppressing).
     pub fn drain_outputs(&mut self) -> Option<Vec<DrainedBlock>> {
-        // Pre-filter under a single pass: collect (id, treat_as_user_input,
-        // is_dirty, exited) for every process, then decide whether to flush.
         let suppress = self.suppress_capped();
         let mut blocks: Vec<DrainedBlock> = Vec::new();
         let mut had_unlimited = false;
         let mut had_capped = false;
         let mut to_remove: Vec<u32> = Vec::new();
 
-        for proc in self.procs.values() {
-            let mut shared = proc.shared.lock().expect("bg shared mutex poisoned");
-            if !shared.dirty {
+        for proc in self.procs.values_mut() {
+            let mut buf = proc.buffer.lock().expect("pty buffer mutex poisoned");
+            if !buf.dirty {
                 continue;
             }
-            let exited = matches!(shared.status, BgStatus::Exited { .. });
+            let exited = matches!(buf.status, PtyStatus::Exited(_));
             // Honour the suppression gate for capped-only *running*
             // contributors: their notifications still fired (reader is
             // unaware of the breaker), but we don't drain them. The
@@ -559,10 +417,15 @@ impl BgRegistry {
             if suppress && !proc.treat_as_user_input && !exited {
                 continue;
             }
-            let lines: Vec<String> = shared.buffer.drain(..).collect();
-            shared.dirty = false;
-            let status_after = shared.status.clone();
-            drop(shared);
+            let lines: Vec<String> = buf.lines.drain(..).collect();
+            buf.dirty = false;
+            // Stamp the exit timestamp on first observation so the
+            // surfaced `BgStatus::Exited::at` is stable across drains.
+            if exited && proc.exited_at.is_none() {
+                proc.exited_at = Some(Utc::now());
+            }
+            let status_after = bg_status_from(proc, &buf);
+            drop(buf);
 
             if lines.is_empty() && !exited {
                 continue;
@@ -591,7 +454,7 @@ impl BgRegistry {
             if let Some(mut p) = self.procs.remove(&id)
                 && let Some(h) = p.reader.take()
             {
-                let _ = std::thread::spawn(move || {
+                std::thread::spawn(move || {
                     let _ = h.join();
                 });
             }
@@ -601,7 +464,6 @@ impl BgRegistry {
             return None;
         }
 
-        // Counter update.
         if had_unlimited {
             self.consecutive_capped_turns = 0;
         } else if had_capped {
@@ -628,7 +490,7 @@ impl BgRegistry {
         self.consecutive_capped_turns = 0;
     }
 
-    /// Process id ⇒ contributing-tier accessor for tests.
+    /// Process count accessor for tests.
     #[cfg(test)]
     fn proc_count(&self) -> usize {
         self.procs.len()
@@ -647,162 +509,26 @@ impl Drop for BgRegistry {
     }
 }
 
-/// Spawn the per-process reader thread. Owns the `Box<dyn Read>` and the
-/// `Box<dyn Child>`. The thread terminates when `read` returns EOF (i.e.
-/// the child closed its side of the PTY); it then calls `wait` to harvest
-/// the exit status and flips `shared.status` to `Exited`.
-fn spawn_reader(
-    mut reader: Box<dyn Read + Send>,
-    shared: Arc<Mutex<ProcessShared>>,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    notify_tx: UnboundedSender<()>,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        let mut leftover: Vec<u8> = Vec::new();
-        let mut last_notify: Option<Instant> = None;
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    leftover.extend_from_slice(&buf[..n]);
-                    // Pull complete lines.
-                    let mut any_new_line = false;
-                    while let Some(pos) = leftover.iter().position(|&b| b == b'\n') {
-                        let line_bytes: Vec<u8> = leftover.drain(..=pos).collect();
-                        let raw = String::from_utf8_lossy(&line_bytes);
-                        let clean = strip_ansi(raw.trim_end_matches('\n'));
-                        {
-                            let mut s = shared.lock().expect("bg shared mutex poisoned");
-                            s.push_line(clean);
-                        }
-                        any_new_line = true;
-                    }
-                    if any_new_line {
-                        // Debounce: only ping if it's been DEBOUNCE_MS
-                        // since the last successful ping, OR this is
-                        // the first one.
-                        let now = Instant::now();
-                        let should_ping = match last_notify {
-                            None => true,
-                            Some(t) => now.duration_since(t) >= Duration::from_millis(DEBOUNCE_MS),
-                        };
-                        if should_ping {
-                            let _ = notify_tx.send(());
-                            last_notify = Some(now);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("bg reader read error: {e}");
-                    break;
-                }
-            }
-        }
-
-        // Flush trailing leftover bytes as one final line (no newline).
-        if !leftover.is_empty() {
-            let raw = String::from_utf8_lossy(&leftover);
-            let clean = strip_ansi(raw.trim_end_matches('\n'));
-            if !clean.is_empty()
-                && let Ok(mut s) = shared.lock()
-            {
-                s.push_line(clean);
-            }
-        }
-
-        // Reap exit code.
-        let code = match child.wait() {
-            Ok(status) => status.exit_code() as i32,
-            Err(_) => -1,
-        };
-        if let Ok(mut s) = shared.lock() {
-            s.status = BgStatus::Exited {
-                code,
-                at: Utc::now(),
-            };
-            s.dirty = true;
-        }
-        // Always ping once on exit so the agent observes the transition.
-        let _ = notify_tx.send(());
-    })
+/// Convert a `pty_runner::PtyStatus` plus the registry's bookkeeping
+/// timestamps into the timestamped `BgStatus` consumed by the rest of
+/// the codebase.
+fn bg_status_from(proc: &BgProcess, buf: &LineBuffer) -> BgStatus {
+    match &buf.status {
+        PtyStatus::Running => BgStatus::Running {
+            since: proc.started_at,
+        },
+        PtyStatus::Exited(code) => BgStatus::Exited {
+            code: *code,
+            at: proc.exited_at.unwrap_or_else(Utc::now),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use tokio::sync::mpsc::unbounded_channel;
-
-    #[test]
-    fn strip_ansi_removes_csi() {
-        // `ls --color=auto`-style red coloured filename.
-        let s = "\x1b[31merror.log\x1b[0m";
-        assert_eq!(strip_ansi(s), "error.log");
-    }
-
-    #[test]
-    fn strip_ansi_passes_plain_text() {
-        assert_eq!(strip_ansi("hello world"), "hello world");
-    }
-
-    #[test]
-    fn strip_ansi_drops_trailing_cr() {
-        assert_eq!(strip_ansi("line\r"), "line");
-    }
-
-    #[test]
-    fn truncate_line_short_input_passes_through() {
-        assert_eq!(truncate_line("hi", MAX_LINE_BYTES), "hi");
-    }
-
-    #[test]
-    fn truncate_line_long_input_gets_truncated_marker() {
-        let s = "a".repeat(MAX_LINE_BYTES + 100);
-        let t = truncate_line(&s, MAX_LINE_BYTES);
-        assert!(t.ends_with(" … (truncated)"));
-        assert!(t.len() <= MAX_LINE_BYTES);
-    }
-
-    #[test]
-    fn truncate_line_respects_utf8_boundaries() {
-        // 4-byte emoji at a boundary that would land mid-codepoint
-        // under naive byte slicing.
-        let s = format!("a{}", "🦀".repeat(2000));
-        let t = truncate_line(&s, MAX_LINE_BYTES);
-        // Must still be valid UTF-8 and not panic.
-        assert!(t.is_char_boundary(t.len() - " … (truncated)".len()));
-    }
-
-    #[test]
-    fn ring_buffer_evicts_oldest_on_overflow() {
-        let mut p = ProcessShared {
-            buffer: VecDeque::new(),
-            capture_cap: 3,
-            status: BgStatus::Running { since: Utc::now() },
-            dirty: false,
-        };
-        for i in 0..5 {
-            p.push_line(format!("line {i}"));
-        }
-        assert_eq!(p.buffer.len(), 3);
-        assert_eq!(p.buffer[0], "line 2");
-        assert_eq!(p.buffer[2], "line 4");
-    }
-
-    #[test]
-    fn ring_buffer_capacity_zero_drops_everything() {
-        let mut p = ProcessShared {
-            buffer: VecDeque::new(),
-            capture_cap: 0,
-            status: BgStatus::Running { since: Utc::now() },
-            dirty: false,
-        };
-        p.push_line("anything".into());
-        assert!(p.buffer.is_empty());
-        // …but `dirty` is still set so the agent learns the process
-        // produced something (e.g. for the "exited" signal).
-        assert!(p.dirty);
-    }
 
     #[test]
     fn registry_assigns_monotonic_ids() {
@@ -860,16 +586,16 @@ mod tests {
         // Simulate the contributing-tier bookkeeping directly — full
         // PTY-driven integration sits in tests/scenarios/bg_tests.rs.
         // Manually push a fake exited process.
-        let shared_cap = Arc::new(Mutex::new(ProcessShared {
-            buffer: VecDeque::from(vec!["hi".to_string()]),
-            capture_cap: 10,
-            status: BgStatus::Running { since: Utc::now() },
+        let shared_cap = Arc::new(Mutex::new(LineBuffer {
+            lines: VecDeque::from(vec!["hi".to_string()]),
+            cap: 10,
+            status: PtyStatus::Running,
             dirty: true,
         }));
-        let shared_un = Arc::new(Mutex::new(ProcessShared {
-            buffer: VecDeque::from(vec!["from-tg".to_string()]),
-            capture_cap: 10,
-            status: BgStatus::Running { since: Utc::now() },
+        let shared_un = Arc::new(Mutex::new(LineBuffer {
+            lines: VecDeque::from(vec!["from-tg".to_string()]),
+            cap: 10,
+            status: PtyStatus::Running,
             dirty: true,
         }));
         // Insert capped process by hand.
@@ -883,7 +609,8 @@ mod tests {
                 treat_as_user_input: false,
                 capture_cap: 10,
                 started_at: Utc::now(),
-                shared: shared_cap.clone(),
+                exited_at: None,
+                buffer: shared_cap.clone(),
                 writer: Box::new(std::io::sink()),
                 killer: dummy_killer(),
                 reader: None,
@@ -899,7 +626,8 @@ mod tests {
                 treat_as_user_input: true,
                 capture_cap: 10,
                 started_at: Utc::now(),
-                shared: shared_un.clone(),
+                exited_at: None,
+                buffer: shared_un.clone(),
                 writer: Box::new(std::io::sink()),
                 killer: dummy_killer(),
                 reader: None,
@@ -952,19 +680,13 @@ mod tests {
         // transitions and cannot loop, so the breaker has no protective
         // value here.
         let mut r = BgRegistry::new();
-        // Force the breaker to the suppression threshold without going
-        // through real PTYs.
         r.consecutive_capped_turns = MAX_CONSECUTIVE_AUTO_TURNS;
         assert!(r.suppress_capped(), "test precondition: breaker saturated");
 
-        // Insert a capped process that has just exited.
-        let shared = Arc::new(Mutex::new(ProcessShared {
-            buffer: VecDeque::from(vec!["final tail line".to_string()]),
-            capture_cap: 10,
-            status: BgStatus::Exited {
-                code: 0,
-                at: Utc::now(),
-            },
+        let buf = Arc::new(Mutex::new(LineBuffer {
+            lines: VecDeque::from(vec!["final tail line".to_string()]),
+            cap: 10,
+            status: PtyStatus::Exited(0),
             dirty: true,
         }));
         r.procs.insert(
@@ -977,7 +699,8 @@ mod tests {
                 treat_as_user_input: false,
                 capture_cap: 10,
                 started_at: Utc::now(),
-                shared,
+                exited_at: None,
+                buffer: buf,
                 writer: Box::new(std::io::sink()),
                 killer: dummy_killer(),
                 reader: None,
