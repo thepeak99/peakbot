@@ -656,6 +656,27 @@ let harness = TestHarness::new()
     .build();
 ```
 
+## Zen of Engineering Review (Mandatory)
+
+**No implementation begins without a Zen review.** This is non-negotiable. Before writing any code — whether for a new feature, a bugfix, or a refactor — you must run the proposed change through the `zen-engineering` skill.
+
+The Zen review enforces:
+- **Simplicity first** — every abstraction, layer, and config option must earn its place.
+- **No code before the plan is locked** — write the plan, get agreement, then code. Sunk cost is real; once implementation starts, the plan stops being a plan and becomes a description of what was already built.
+- **What can be removed?** — identify dead code, redundant validation, premature abstractions, and over-engineered extensibility points before they ship.
+- **What will confuse people?** — catch naming mismatches, surprising control flow, implicit contracts, and violations of the principle of least astonishment.
+- **Are the boundaries clean?** — validation belongs at entry points, data models should make illegal states unrepresentable, and DRY applies only to things that are *necessarily* the same.
+- **YAGNI** — don't build for hypothetical future needs. Build for what is needed now.
+
+### How to run the review
+
+Trigger the `zen-engineering` skill by asking for a review of the proposed design, architecture, or change. Provide enough context for a meaningful critique: the problem statement, the planned approach, and any tradeoffs you're considering.
+
+**Do not skip this step.** The Zen review is the first line of defense against complexity creep, especially when working with AI-assisted coding. Models have a tendency to gold-plate, add error handling for impossible cases, and introduce patterns that weren't asked for. The Zen review exists to catch that before it becomes code.
+
+If the review flags significant issues, address them in the plan before touching any source files. If the review surfaces new rule candidates for the skill, note them and propose additions.
+
+---
 ## Commit Procedure
 
 **IMPORTANT: All changes must be made through Pull Requests.**
