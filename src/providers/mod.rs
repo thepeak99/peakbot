@@ -362,10 +362,18 @@ where
             path.clone(),
             bash_config.env.clone(),
         ))),
-        Some(ShellKind::Bash { path }) => Some(EitherTool::Bash(BashTool::new(
-            path.clone(),
-            bash_config.env.clone(),
-        ))),
+        Some(ShellKind::Bash { path }) => {
+            // Wire the live panel (slice 3 of make-term-great-again.md)
+            // when a state manager is available. Without one, the tool
+            // still runs PTY-backed but skips the UI side-effects —
+            // the same shape `BashBgTool` uses.
+            let bash = BashTool::new(path.clone(), bash_config.env.clone());
+            let bash = match state_manager.clone() {
+                Some(sm) => bash.with_state_manager(sm),
+                None => bash,
+            };
+            Some(EitherTool::Bash(bash))
+        }
         None => None,
     };
 
