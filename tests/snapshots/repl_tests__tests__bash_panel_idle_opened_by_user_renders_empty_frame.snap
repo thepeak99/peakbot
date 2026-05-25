@@ -1,0 +1,8 @@
+---
+source: tests/repl_tests.rs
+assertion_line: 1681
+expression: "lines.join(\"\\n\")"
+---
+┌ $ no bash output yet · Ctrl+B to hide ───────────────────┐
+│                                                          │
+└──────────────────────────────────────────────────────────┘

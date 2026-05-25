@@ -531,6 +531,12 @@ impl ReplUi {
     /// stays the dominant label, and clipped gracefully on narrow
     /// terminals (ratatui truncates titles that don't fit).
     ///
+    /// Hint ordering reflects keybind likelihood of use:
+    /// `Ctrl+C exit` → universal escape, always first;
+    /// `Ctrl+T tasks` / `Ctrl+B bash` → panel toggles, grouped;
+    /// `F4 select` → mode switch, less frequent;
+    /// `Ctrl+G multi` → input mode, least frequent.
+    ///
     /// When `select_mode` is `true`, the block returns *naked* — no
     /// borders, no titles, no hint. The point is that with the
     /// terminal's mouse capture disabled (see `toggle_select_mode`)
@@ -545,7 +551,7 @@ impl ReplUi {
         Block::default()
             .title(" Chat Messages ")
             .title_bottom(
-                Line::from(" Ctrl+C exit · Ctrl+T tasks · F4 select · Ctrl+G multi ")
+                Line::from(" Ctrl+C exit · Ctrl+T tasks · Ctrl+B bash · F4 select · Ctrl+G multi ")
                     .right_aligned(),
             )
             .borders(Borders::ALL)
@@ -786,8 +792,8 @@ impl ReplUi {
         // Bottom-border hint about newline vs submit. Keybinding hints
         // belong on borders, not content (memory 2026-04-24). Discoverability
         // for Ctrl+G lives on the *chat* block's bottom hint (alongside
-        // Ctrl+C / Ctrl+T / F4) so the input hint stays short enough to
-        // fit on narrow terminals (snapshot tests use width=60).
+        // Ctrl+C / Ctrl+T / Ctrl+B / F4) so the input hint stays short
+        // enough to fit on narrow terminals (snapshot tests use width=60).
         let hint_text = if multiline {
             " Enter: newline · Ctrl+G: send "
         } else {
@@ -1034,12 +1040,13 @@ impl ReplUi {
                     // out of the layout entirely. Slice 2 of #11.
                     // `Constraint::Length(0)` is well-defined in ratatui:
                     // the chunk exists but has zero rows and renders
-                    // nothing. The `effective_*` form also collapses
-                    // when the user has pressed `Ctrl+B` to hide
-                    // (close-bash-panel-v2.md) — hidden ≡ Idle at the
-                    // layout layer.
+                    // nothing. The `effective_*` form combines the
+                    // producer state with the user's `Ctrl+B` visibility
+                    // override (`bash-panel-as-real-panel.md`): Idle +
+                    // OpenedByUser renders a small empty frame;
+                    // ClosedByUser collapses regardless of state.
                     let bash_height =
-                        bash_effective_panel_height(&state.bash_panel, state.bash_panel_hidden);
+                        bash_effective_panel_height(&state.bash_panel, state.bash_panel_visibility);
 
                     // Scroll-follow in *visual* rows (not logical lines) so
                     // soft-wrapped long lines scroll correctly. Computed at
@@ -1345,24 +1352,29 @@ impl ReplUi {
             //
             // **View-only** — never touches the underlying
             // [`BashPanelState`]. Running bashes keep streaming under
-            // the hood; the panel just stops drawing. Idle ⇒ no-op
-            // (the `!is_idle()` guard means Ctrl+B doesn't silently
-            // flip a flag the user can't see). The hidden flag
-            // auto-clears at the next user prompt via
-            // `StateManager::add_user_message`.
+            // the hood; the panel just stops drawing.
+            //
+            // Works in every state including Idle (where it opens a
+            // small empty frame) — that's the "open it anytime, like
+            // the tasks panel" contract. See
+            // `bash-panel-as-real-panel.md` for the design.
+            //
+            // The visibility flag persists across user messages — a
+            // hide carries until either another Ctrl+B or until the
+            // agent starts a new bash invocation (which clears the
+            // override; see `StateManager::start_bash_panel`).
+            // Conversation resets (`/new`, `/load`, `/model`) restore
+            // visibility to `Auto`.
             //
             // Why Ctrl+B (not Esc): Esc routes to the agent-interrupt
             // catch-all at the bottom of this handler. Any Esc-based
             // dismiss would steal the agent-stop keystroke the moment
             // a panel showed. The cardinal regression-pin
             // `esc_still_interrupts_agent_with_finished_panel_visible`
-            // guards this; the design doc lives in
+            // guards this; original design doc lives in
             // `close-bash-panel-v2.md`.
-            KeyCode::Char('b' | 'B')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !self.state_manager.get_state().bash_panel.is_idle() =>
-            {
-                self.state_manager.toggle_bash_panel_hidden();
+            KeyCode::Char('b' | 'B') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state_manager.toggle_bash_panel_visibility();
             }
             // F4: toggle "select mode" — disables our mouse capture so the
             // terminal's own click-and-drag selection (and native copy
@@ -3248,7 +3260,7 @@ mod command_popup_tests {
         );
     }
 
-    // ── Bash panel hide flag (close-bash-panel.md) ───────────────────────
+    // ── Bash panel visibility (bash-panel-as-real-panel.md) ──────────────
 
     fn make_finished_panel(ui: &ReplUi) {
         ui.state_manager.start_bash_panel("make".into(), 99);
@@ -3256,16 +3268,22 @@ mod command_popup_tests {
     }
 
     #[test]
-    fn ctrl_b_with_running_panel_hides_it() {
-        // Running + Ctrl+B ⇒ hidden flag flips; underlying state stays
-        // Running so bash output keeps streaming under the hood (the
-        // panel just stops drawing).
+    fn ctrl_b_with_running_panel_closes_it() {
+        // Running + Ctrl+B ⇒ ClosedByUser (panel collapses).
+        // Underlying state stays Running so bash output keeps streaming
+        // under the hood.
         let (mut ui, _rx) = harness();
         make_running_panel(&ui);
-        assert!(!ui.state_manager.get_state().bash_panel_hidden);
+        assert!(matches!(
+            ui.state_manager.get_state().bash_panel_visibility,
+            crate::ui::app_state::BashPanelVisibility::Auto
+        ));
         ui.handle_keyboard_input(press_with(KeyCode::Char('b'), KeyModifiers::CONTROL));
         let snap = ui.state_manager.get_state();
-        assert!(snap.bash_panel_hidden, "Ctrl+B should set hidden");
+        assert!(matches!(
+            snap.bash_panel_visibility,
+            crate::ui::app_state::BashPanelVisibility::ClosedByUser
+        ));
         assert!(
             snap.bash_panel.is_running(),
             "underlying state must NOT change — bash keeps running"
@@ -3273,14 +3291,18 @@ mod command_popup_tests {
     }
 
     #[test]
-    fn ctrl_b_with_finished_panel_hides_it() {
-        // Finished + Ctrl+B ⇒ hidden flag flips; underlying state stays
-        // Finished (cycle-boundary will clear hidden on next prompt).
+    fn ctrl_b_with_finished_panel_closes_it() {
+        // Finished + Ctrl+B ⇒ ClosedByUser; underlying state stays
+        // Finished. Visibility persists across user messages (see
+        // user_close_survives_new_user_message in state_manager tests).
         let (mut ui, _rx) = harness();
         make_finished_panel(&ui);
         ui.handle_keyboard_input(press_with(KeyCode::Char('b'), KeyModifiers::CONTROL));
         let snap = ui.state_manager.get_state();
-        assert!(snap.bash_panel_hidden);
+        assert!(matches!(
+            snap.bash_panel_visibility,
+            crate::ui::app_state::BashPanelVisibility::ClosedByUser
+        ));
         assert!(matches!(
             snap.bash_panel,
             crate::ui::app_state::BashPanelState::Finished { .. }
@@ -3288,36 +3310,46 @@ mod command_popup_tests {
     }
 
     #[test]
-    fn ctrl_b_with_idle_panel_is_noop() {
-        // Idle ⇒ no panel to hide. Ctrl+B must NOT silently flip the
-        // flag (no visible effect ⇒ no state change; principle of least
-        // astonishment).
+    fn ctrl_b_with_idle_panel_opens_empty_frame() {
+        // The "open it anytime, like the tasks panel" contract:
+        // Ctrl+B on Idle is NO LONGER a no-op — it opens the panel
+        // (OpenedByUser). The renderer will draw the 3-row empty
+        // frame.
         let (mut ui, _rx) = harness();
         assert!(ui.state_manager.get_state().bash_panel.is_idle());
         ui.handle_keyboard_input(press_with(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        assert!(!ui.state_manager.get_state().bash_panel_hidden);
+        assert!(matches!(
+            ui.state_manager.get_state().bash_panel_visibility,
+            crate::ui::app_state::BashPanelVisibility::OpenedByUser
+        ));
     }
 
     #[test]
-    fn ctrl_b_toggles_when_already_hidden() {
-        // Press once → hide; press again → un-hide. Spec: "remains
-        // hidden until I open it again or I enter a new prompt."
+    fn ctrl_b_toggles_when_already_closed() {
+        // Press once → ClosedByUser. Press again → OpenedByUser
+        // (toggle inverts effective visibility).
         let (mut ui, _rx) = harness();
         make_running_panel(&ui);
         ui.handle_keyboard_input(press_with(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        assert!(ui.state_manager.get_state().bash_panel_hidden);
+        assert!(matches!(
+            ui.state_manager.get_state().bash_panel_visibility,
+            crate::ui::app_state::BashPanelVisibility::ClosedByUser
+        ));
         ui.handle_keyboard_input(press_with(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        assert!(!ui.state_manager.get_state().bash_panel_hidden);
+        assert!(matches!(
+            ui.state_manager.get_state().bash_panel_visibility,
+            crate::ui::app_state::BashPanelVisibility::OpenedByUser
+        ));
     }
 
     #[test]
     fn ctrl_b_does_not_request_agent_stop() {
         // The cardinal pin behind this whole feature: Ctrl+B must NOT
         // emit `UiAction::RequestStop`. Esc (the v1 proposal) would
-        // have routed through the agent-interrupt catch-all at
-        // repl_impl.rs:1632 the moment a Finished panel showed. The
-        // user's pushback ("esc is used to stop the agent") created
-        // this test. See close-bash-panel-v2.md.
+        // have routed through the agent-interrupt catch-all the moment
+        // a Finished panel showed. The user's original pushback
+        // ("esc is used to stop the agent") created this test. See
+        // close-bash-panel-v2.md.
         let (mut ui, mut rx) = harness();
         make_finished_panel(&ui);
         ui.handle_keyboard_input(press_with(KeyCode::Char('b'), KeyModifiers::CONTROL));
