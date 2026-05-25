@@ -1,0 +1,13 @@
+---
+source: tests/repl_tests.rs
+assertion_line: 1572
+expression: sanitised
+---
+┌ > cat huge.log · pid 9999 · MM:SS ───────────────────────────────────────┐
+│                                                                              │
+│                                                                              │
+│before the long line                                                          │
+│XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX│
+│after the long line                                                           │
+│stdin>  · [Ctrl+S]                                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
