@@ -3,7 +3,7 @@ source: tests/repl_tests.rs
 assertion_line: 1411
 expression: sanitised
 ---
-┌ > yes | head · pid 100 · MM:SS ──────────────────────────────────────────┐
+┌ > yes | head · pid 100 · MM:SS · Ctrl+B to hide ─────────────────────────┐
 │line 5                                                                        │
 │line 6                                                                        │
 │line 7                                                                        │
