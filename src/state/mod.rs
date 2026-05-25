@@ -6,4 +6,4 @@
 pub mod state_manager;
 
 // Re-export StateManager for convenience
-pub use state_manager::StateManager;
+pub use state_manager::{StateManager, StdinNotActive};

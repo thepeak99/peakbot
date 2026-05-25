@@ -1134,6 +1134,14 @@ impl BashPanelState {
     pub fn is_idle(&self) -> bool {
         matches!(self, BashPanelState::Idle)
     }
+
+    /// True iff the panel is currently `Running` (a live PTY child is
+    /// attached). Used by the REPL to gate the `Ctrl+S` stdin-focus
+    /// keybind — focusing an empty stdin row would just confuse the
+    /// user.
+    pub fn is_running(&self) -> bool {
+        matches!(self, BashPanelState::Running { .. })
+    }
 }
 
 /// UI preferences
