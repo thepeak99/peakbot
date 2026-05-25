@@ -3,7 +3,7 @@ source: tests/repl_tests.rs
 assertion_line: 1489
 expression: sanitised
 ---
-┌ > sudo apt update · pid 4242 · MM:SS ────────────────────────────────────┐
+┌ > sudo apt update · pid 4242 · MM:SS · Ctrl+B to hide ───────────────────┐
 │                                                                              │
 │                                                                              │
 │                                                                              │

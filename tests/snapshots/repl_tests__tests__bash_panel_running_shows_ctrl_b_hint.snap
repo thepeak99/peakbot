@@ -1,13 +1,13 @@
 ---
 source: tests/repl_tests.rs
-assertion_line: 1382
+assertion_line: 1631
 expression: sanitised
 ---
-┌ > psql -f migrate.sql · pid 4821 · MM:SS · Ctrl+B to hide ───────────────┐
+┌ > yes | head -n 20 · pid 4242 · MM:SS · Ctrl+B to hide ──────────────────┐
 │                                                                              │
 │                                                                              │
-│NOTICE: table "users" does not exist, skipping                                │
-│CREATE TABLE                                                                  │
-│CREATE INDEX                                                                  │
+│y                                                                             │
+│y                                                                             │
+│y                                                                             │
 │stdin>  · [Ctrl+S]                                                            │
 └──────────────────────────────────────────────────────────────────────────────┘

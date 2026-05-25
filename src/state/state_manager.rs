@@ -1266,7 +1266,15 @@ impl StateManager {
     /// gate (mid-loop) is the right boundary — it fires immediately before
     /// every wire request, including the first one of a new prompt, so this
     /// site doesn't need its own check. See `mid-compaction.md` § 3 Step 4.
+    ///
+    /// Cycle-boundary side-effect: clears `bash_panel_hidden`. A new user
+    /// prompt is the "end of cycle" trigger from `close-bash-panel-v2.md`
+    /// — any Ctrl+B hide intent was per-turn, and this is the per-turn
+    /// chokepoint every direct user submission funnels through. Slash
+    /// commands skip this site (their handlers run their own routes),
+    /// which is correct — `/stats` is not a new prompt.
     pub fn add_user_message(&self, content: String) {
+        self.reset_bash_panel_hidden_on_new_turn();
         let msg = ChatMessage::user(content);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -1295,11 +1303,15 @@ impl StateManager {
     ///
     /// Same persistence behaviour as [`add_user_message`]; compaction is not
     /// triggered here (handled at the wire boundary by `SessionHook`).
+    ///
+    /// Cycle-boundary side-effect: clears `bash_panel_hidden` — see
+    /// [`Self::add_user_message`] for the rationale.
     pub fn add_user_message_with_attachments(
         &self,
         content: String,
         attachments: Vec<crate::vision::ImageAttachment>,
     ) {
+        self.reset_bash_panel_hidden_on_new_turn();
         let msg = ChatMessage::user_with_attachments(content, attachments);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -1871,6 +1883,45 @@ impl StateManager {
         }
         let state = self.state.read().unwrap();
         self.notify_update(&state);
+    }
+
+    /// Toggle the bash panel's `hidden` view-only flag.
+    ///
+    /// Used by the REPL's `Ctrl+B` keybind. Orthogonal to the underlying
+    /// [`BashPanelState`]: the producer keeps running unaffected; only
+    /// the renderer changes draw behaviour. Auto-reset to `false` on the
+    /// next user prompt — see [`Self::add_user_message`]. Atomic single
+    /// write (matches the discipline of `toggle_todo_panel`).
+    pub fn toggle_bash_panel_hidden(&self) {
+        {
+            let mut state = self.state.write().unwrap();
+            state.bash_panel_hidden = !state.bash_panel_hidden;
+        }
+        let state = self.state.read().unwrap();
+        self.notify_update(&state);
+    }
+
+    /// Clear `bash_panel_hidden` at the start of a new user turn.
+    ///
+    /// Single chokepoint called by every "real" user-submission path
+    /// ([`Self::add_user_message`], [`Self::add_user_message_with_attachments`]).
+    /// Background synthetic turns deliberately do NOT call this — the
+    /// spec is "until I enter a new prompt", and a bg drain isn't user
+    /// input. Silent no-op when already false; only emits an update
+    /// when the value actually changes.
+    fn reset_bash_panel_hidden_on_new_turn(&self) {
+        let needs_emit = {
+            let mut state = self.state.write().unwrap();
+            if !state.bash_panel_hidden {
+                return;
+            }
+            state.bash_panel_hidden = false;
+            true
+        };
+        if needs_emit {
+            let state = self.state.read().unwrap();
+            self.notify_update(&state);
+        }
     }
 
     // ── Foreground bash stdin forwarding (slice 4) ──────────────────────────
@@ -3808,6 +3859,72 @@ mod tests {
         sm.clear_bash_panel();
         sm.clear_bash_panel();
         assert!(sm.get_state().bash_panel.is_idle());
+    }
+
+    // ── Foreground bash panel hide flag (close-bash-panel.md) ────────────
+    //
+    // Visibility is orthogonal to the state machine. `bash_panel_hidden`
+    // lives next to `bash_panel` on `AppState`, never inside the variants.
+    // The producer (`BashTool::call`) keeps writing Running/Finished
+    // blind; the renderer gates draw on the flag.
+
+    #[test]
+    fn bash_panel_hidden_starts_false() {
+        // Fresh state — nobody has pressed Ctrl+B yet.
+        let sm = StateManager::new_arc();
+        let snap = sm.get_state();
+        assert!(!snap.bash_panel_hidden);
+    }
+
+    #[test]
+    fn toggle_bash_panel_hidden_flips_value() {
+        let sm = StateManager::new_arc();
+        assert!(!sm.get_state().bash_panel_hidden);
+        sm.toggle_bash_panel_hidden();
+        assert!(sm.get_state().bash_panel_hidden);
+        sm.toggle_bash_panel_hidden();
+        assert!(!sm.get_state().bash_panel_hidden);
+    }
+
+    #[test]
+    fn add_user_message_resets_bash_panel_hidden() {
+        // Cycle-boundary auto-revert: a new user prompt is the end of the
+        // hide-cycle. Spec: "hidden until I open it again or I enter a
+        // new prompt." See close-bash-panel-v2.md.
+        let sm = StateManager::new_arc();
+        sm.toggle_bash_panel_hidden();
+        assert!(sm.get_state().bash_panel_hidden);
+        sm.add_user_message("hello".to_string());
+        assert!(
+            !sm.get_state().bash_panel_hidden,
+            "new user prompt must clear the hide flag"
+        );
+    }
+
+    #[test]
+    fn add_user_message_with_attachments_resets_bash_panel_hidden() {
+        // Same cycle-boundary as add_user_message — vision turns are also
+        // user prompts.
+        let sm = StateManager::new_arc();
+        sm.toggle_bash_panel_hidden();
+        assert!(sm.get_state().bash_panel_hidden);
+        sm.add_user_message_with_attachments("look".to_string(), Vec::new());
+        assert!(!sm.get_state().bash_panel_hidden);
+    }
+
+    #[test]
+    fn add_user_message_from_background_does_not_reset_bash_panel_hidden() {
+        // Bg-driven synthetic turns are agent-side input, not the user
+        // "entering a new prompt." Per the literal spec the hide flag
+        // survives a bg drain — user intent is per-user-cycle, not per
+        // agent-turn-boundary.
+        let sm = StateManager::new_arc();
+        sm.toggle_bash_panel_hidden();
+        sm.add_user_message_from_background("[bg output]".to_string(), vec![1], false);
+        assert!(
+            sm.get_state().bash_panel_hidden,
+            "bg synthetic turn must NOT reset the hide flag"
+        );
     }
 
     // ── Foreground bash stdin sidecar (slice 4) ──────────────────────────

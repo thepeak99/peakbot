@@ -1575,6 +1575,62 @@ mod tests {
         );
     }
 
+    /// close-bash-panel: the Finished panel title carries a
+    /// `· Ctrl+B to hide` action-hint chunk. The hint is plain text,
+    /// rendered with the same style as the status chunks (the
+    /// astonishment risk is documented in the renderer source — same
+    /// row as status, different category, deliberately inline).
+    #[test]
+    fn bash_panel_finished_shows_ctrl_b_hint() {
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::render_bash_panel;
+
+        let state = BashPanelState::Finished {
+            command: "make build".into(),
+            exit_code: 0,
+            duration_secs: 42,
+            tail: vec!["Compiling peakbot".into()],
+        };
+
+        let backend = TestBackend::new(80, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state, "", false);
+        });
+        let lines = buffer_to_lines(terminal.backend());
+        assert_snapshot!("bash_panel_finished_shows_ctrl_b_hint", lines.join("\n"));
+    }
+
+    /// close-bash-panel: the Running panel title carries the same
+    /// `· Ctrl+B to hide` hint. Symmetric with Finished — discoverability
+    /// during a noisy live tail is the primary use case for hiding.
+    #[test]
+    fn bash_panel_running_shows_ctrl_b_hint() {
+        use chrono::{Local, TimeZone};
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::render_bash_panel;
+
+        let started_at = Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+        let state = BashPanelState::Running {
+            command: "yes | head -n 20".into(),
+            pid: 4242,
+            started_at,
+            tail: vec!["y".into(), "y".into(), "y".into()],
+        };
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state, "", false);
+        });
+        let lines = buffer_to_lines(terminal.backend());
+        let sanitised = sanitise_elapsed(lines.join("\n"));
+        assert_snapshot!("bash_panel_running_shows_ctrl_b_hint", sanitised);
+    }
+
     #[test]
     fn bash_panel_idle_renders_nothing() {
         use peakbot::ui::app_state::BashPanelState;
