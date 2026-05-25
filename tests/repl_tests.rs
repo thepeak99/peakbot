@@ -1632,31 +1632,55 @@ mod tests {
     }
 
     #[test]
-    fn bash_panel_idle_renders_nothing() {
+    fn bash_panel_idle_zero_area_is_noop() {
         use peakbot::ui::app_state::BashPanelState;
         use peakbot::ui::repl::bash_panel::{panel_height, render_bash_panel};
 
-        // Idle has zero height — the layout would not allocate any
-        // area. Sanity-check both that the height function returns 0
-        // *and* that calling the renderer on a zero-height area is a
-        // safe no-op (defensive: callers shouldn't, but renderers
+        // `panel_height(Idle) == 0` ⇒ the layout would allocate a
+        // zero-row chunk for an Idle/Auto panel. Sanity-pin that
+        // calling the renderer on a zero-height area is a safe
+        // no-op (defensive: callers shouldn't, but renderers
         // shouldn't panic if they do).
+        //
+        // Note: Idle + a non-zero area is *no longer* a no-op — it
+        // means the user opened the panel via Ctrl+B (`OpenedByUser`)
+        // and the layout has given us `IDLE_OPEN_HEIGHT` rows to
+        // draw an empty frame. That contract is pinned by
+        // `bash_panel_idle_opened_by_user_renders_empty_frame`.
         let state = BashPanelState::Idle;
         assert_eq!(panel_height(&state), 0);
 
-        // A nonzero-height surface; the renderer must still no-op for
-        // `Idle` because the *state* says hidden.
-        let backend = TestBackend::new(40, 3);
+        // Zero-height surface: must render nothing.
+        let backend = TestBackend::new(40, 0);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state, "", false);
+        });
+        // No panic ⇒ pass. (Buffer is empty; nothing to introspect.)
+    }
+
+    /// bash-panel-as-real-panel: when the user opens the panel via
+    /// Ctrl+B with no bash running (Idle + OpenedByUser), the layout
+    /// allocates `IDLE_OPEN_HEIGHT` rows and we render a small
+    /// bordered empty frame with the `Ctrl+B to hide` affordance in
+    /// the title. The visual asymmetry with the Running frame is
+    /// intentional — Idle shouldn't pretend to have output.
+    #[test]
+    fn bash_panel_idle_opened_by_user_renders_empty_frame() {
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::{IDLE_OPEN_HEIGHT, render_bash_panel};
+
+        let state = BashPanelState::Idle;
+
+        let backend = TestBackend::new(60, IDLE_OPEN_HEIGHT);
         let mut terminal = Terminal::new(backend).unwrap();
         let _ = terminal.draw(|f| {
             render_bash_panel(f, f.area(), &state, "", false);
         });
         let lines = buffer_to_lines(terminal.backend());
-        // All cells should be blank — the renderer drew nothing.
-        let joined: String = lines.join("");
-        assert!(
-            joined.chars().all(|c| c == ' '),
-            "Idle render should leave the surface blank, got: {lines:?}"
+        assert_snapshot!(
+            "bash_panel_idle_opened_by_user_renders_empty_frame",
+            lines.join("\n")
         );
     }
 

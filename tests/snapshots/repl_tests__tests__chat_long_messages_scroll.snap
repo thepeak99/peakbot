@@ -1,6 +1,6 @@
 ---
 source: tests/repl_tests.rs
-assertion_line: 523
+assertion_line: 576
 expression: "lines.join(\"\\n\")"
 ---
 ┌ Chat Messages ──────────────────────────────────────────┐▲
@@ -11,4 +11,4 @@ expression: "lines.join(\"\\n\")"
 │[12:00:01] 🤖  Agent: Here is another lengthy response    │║
 │that will definitely require multiple lines to display   │║
 │properly. It has detailed explanations and lots of       │║
-└── Ctrl+C exit · Ctrl+T tasks · F4 select · Ctrl+G multi ┘▼
+└ · Ctrl+T tasks · Ctrl+B bash · F4 select · Ctrl+G multi ┘▼
