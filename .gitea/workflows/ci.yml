@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: fmt + clippy + test
+    runs-on: dind
+    timeout-minutes: 30
+    container: rust:1.95
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout (no-node, pure git)
+        run: |
+          git init -q
+          git fetch --depth=1 \
+            "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Install rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: Rust checks
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
