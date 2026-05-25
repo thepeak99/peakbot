@@ -3504,6 +3504,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs network + uvx (Python); run locally with --ignored"]
     async fn test_connect_mcp_server_hello() {
         let config = McpServerConfig {
             name: "hello-mcp-server".to_string(),
@@ -3530,6 +3531,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs network + uvx (Python); run locally with --ignored"]
     async fn test_connect_mcp_server_with_env() {
         let mut env = HashMap::new();
         env.insert("TEST_ENV_VAR".to_string(), "test_value".to_string());
@@ -3561,6 +3563,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs network + uvx (Python); run locally with --ignored"]
     async fn test_connect_mcp_server_call_tool() {
         let config = McpServerConfig {
             name: "hello-mcp-server".to_string(),
