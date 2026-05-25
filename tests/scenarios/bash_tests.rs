@@ -346,7 +346,14 @@ async fn bash_stdin_no_echo_suppressed_under_pty() {
 
     let payload = serde_json::to_string(&json!({
         "thought": "slice 4 no-echo invariant under PTY",
-        "command": "read -s pw; echo \"got: $pw\"",
+        // POSIX-portable equivalent of `read -s`: disable echo on the
+        // tty before reading, restore after. Plain `read -s` doesn't
+        // work under dash (CI image's /bin/sh), but `stty -echo` is
+        // honoured the same way by the PTY layer and proves the same
+        // invariant: the password bytes never echo into the output
+        // stream. The trailing `echo got: $pw` confirms the bytes
+        // *did* reach the shell.
+        "command": "stty -echo; read pw; stty echo; echo \"got: $pw\"",
         "timeout_seconds": 5,
         "tail": 0,
     }))
