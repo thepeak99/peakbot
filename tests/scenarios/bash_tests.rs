@@ -353,7 +353,15 @@ async fn bash_stdin_no_echo_suppressed_under_pty() {
         // invariant: the password bytes never echo into the output
         // stream. The trailing `echo got: $pw` confirms the bytes
         // *did* reach the shell.
-        "command": "stty -echo; read pw; stty echo; echo \"got: $pw\"",
+        //
+        // The READY marker eliminates a race: `has_active_bash_stdin()`
+        // flips true the instant the tool's wait loop starts, but the
+        // shell hasn't necessarily run `stty -echo` yet. Send too
+        // early and the kernel's line discipline echoes the bytes
+        // back before stty takes effect. Waiting for `READY` in the
+        // buffer guarantees `stty -echo` has completed. CI catches
+        // the race; local doesn't (different scheduler / PTY setup).
+        "command": "stty -echo; echo READY; read pw; stty echo; echo \"got: $pw\"",
         "timeout_seconds": 5,
         "tail": 0,
     }))
@@ -365,10 +373,32 @@ async fn bash_stdin_no_echo_suppressed_under_pty() {
         ToolDyn::call(&tool, payload).await.expect("call")
     });
 
+    // First wait: tool registered its tx (necessary).
     let started = Instant::now();
     while !sm.has_active_bash_stdin() {
         if started.elapsed() > Duration::from_secs(2) {
             panic!("tool never registered stdin tx within 2s");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Second wait: shell has actually run `stty -echo` (proven by the
+    // `READY` marker landing in the panel tail). Without this we race
+    // the shell — CI is slow enough that bytes can arrive before
+    // `stty -echo` takes effect; locally the scheduler wins for us.
+    let ready_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snap = sm.get_state();
+        let saw_ready = matches!(
+            &snap.bash_panel,
+            peakbot::ui::app_state::BashPanelState::Running { tail, .. }
+                if tail.iter().any(|l| l.contains("READY"))
+        );
+        if saw_ready {
+            break;
+        }
+        if Instant::now() > ready_deadline {
+            panic!("shell never reached the READY marker within 2s");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
