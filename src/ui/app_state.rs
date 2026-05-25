@@ -108,17 +108,28 @@ pub struct AppState {
     #[serde(default)]
     pub bash_panel: BashPanelState,
 
-    /// View-only flag — true when the user has pressed `Ctrl+B` to hide
-    /// the foreground bash panel. **Orthogonal to [`Self::bash_panel`]**:
-    /// the producer (`BashTool`) keeps writing Running/Finished blind,
-    /// the renderer gates draw on this flag, layout treats `hidden ≡ Idle`
-    /// (zero rows). Auto-reset by `StateManager::add_user_message` at the
-    /// next user prompt — spec: "remains hidden until I open it again or
-    /// I enter a new prompt." See `close-bash-panel-v2.md` for the
-    /// design and the Esc-collision pushback that drove the
-    /// hide-not-dismiss model.
+    /// View-layer panel-visibility override for the foreground `bash`
+    /// panel. **Three-state enum** ([`BashPanelVisibility`]) because
+    /// the panel has three meaningful visibility regimes — `Auto`
+    /// (follow producer state), `OpenedByUser` (force visible even on
+    /// Idle), `ClosedByUser` (force hidden even on Running/Finished).
+    /// A two-bool encoding would admit an illegal "both true" state;
+    /// the enum makes it unrepresentable.
+    ///
+    /// Toggled by `Ctrl+B` (see [`StateManager::toggle_bash_panel_visibility`]).
+    /// Reset to `Auto` by:
+    /// - `StateManager::start_bash_panel` (a new bash starting is implicit
+    ///   consent to show its output — the user's prior dismissal was
+    ///   about the *previous* output, not future ones);
+    /// - `StateManager::reset_bash_panel` (called on `/new`, `/load`,
+    ///   `/model` rebuilds — fresh conversations start clean).
+    ///
+    /// **NOT reset by new user messages.** That was the v1 (PR #67)
+    /// contract; it was inverted because typing a follow-up question
+    /// shouldn't re-open a panel the user just closed. See the
+    /// "Producer→view orthogonality" Zen pass.
     #[serde(default)]
-    pub bash_panel_hidden: bool,
+    pub bash_panel_visibility: BashPanelVisibility,
 }
 
 impl AppState {
@@ -1153,6 +1164,61 @@ impl BashPanelState {
     /// user.
     pub fn is_running(&self) -> bool {
         matches!(self, BashPanelState::Running { .. })
+    }
+}
+
+/// View-layer override for [`BashPanelState`] visibility.
+///
+/// Encodes the three meaningful regimes of the foreground bash panel's
+/// visibility as one enum field on [`AppState`]. The natural reach —
+/// "is_hidden: bool" or two booleans — either loses a state or admits
+/// an illegal one. This enum picks the type-system-friendly middle.
+///
+/// **Effective visibility** (the rule the renderer consumes):
+///
+/// | Visibility       | Idle  | Running | Finished |
+/// |------------------|-------|---------|----------|
+/// | `Auto`           | false | true    | true     |
+/// | `OpenedByUser`   | true  | true    | true     |
+/// | `ClosedByUser`   | false | false   | false    |
+///
+/// Variant names describe **how we got into this state**, not what
+/// the renderer should do. `OpenedByUser` aged better than `ForceShow`
+/// when this enum was reviewed — a future rendering-rule tweak
+/// doesn't invalidate the gesture history.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BashPanelVisibility {
+    /// No user override. Renderer follows producer state: visible
+    /// when Running/Finished, hidden when Idle. This is the fresh
+    /// default and the state every reset path returns to.
+    #[default]
+    Auto,
+    /// User pressed `Ctrl+B` while the panel was hidden — force
+    /// visible. Meaningful primarily on Idle (renders an empty
+    /// "no bash output yet" frame). On Running/Finished it's a
+    /// no-op equivalent to `Auto`.
+    OpenedByUser,
+    /// User pressed `Ctrl+B` while the panel was visible — force
+    /// hidden. Survives new user messages (typing a follow-up does
+    /// NOT re-open). Cleared only by another `Ctrl+B`, by a new
+    /// bash invocation (the producer reset), or by a conversation
+    /// reset (`/new`, `/load`, `/model`).
+    ClosedByUser,
+}
+
+impl BashPanelVisibility {
+    /// Derive effective visibility given the current producer state.
+    ///
+    /// Single source of truth for the renderer-vs-state contract.
+    /// Used by [`crate::ui::repl::bash_panel::effective_panel_height`]
+    /// and by [`crate::state::StateManager::toggle_bash_panel_visibility`]
+    /// (to decide which gesture variant to flip into).
+    pub fn is_visible(self, state: &BashPanelState) -> bool {
+        match self {
+            BashPanelVisibility::Auto => !state.is_idle(),
+            BashPanelVisibility::OpenedByUser => true,
+            BashPanelVisibility::ClosedByUser => false,
+        }
     }
 }
 

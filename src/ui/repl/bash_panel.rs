@@ -15,10 +15,11 @@
 //!   for the slice 4 input field.
 //!
 //! Total vertical footprint:
-//! - `Idle`     → 0 rows (panel hidden by the layout — never reaches
-//!   this module).
-//! - `Running`  → 8 rows: top border + 5 tail + stdin + bottom border.
-//! - `Finished` → 7 rows: top border + 5 tail + bottom border.
+//! - `Idle` + `Auto`         → 0 rows (panel collapsed — most common case).
+//! - `Idle` + `OpenedByUser` → 3 rows: top border + 1 empty line + bottom border.
+//!   Reachable only when the user pressed `Ctrl+B` with no bash in flight.
+//! - `Running`               → 8 rows: top border + 5 tail + stdin + bottom border.
+//! - `Finished`              → 7 rows: top border + 5 tail + bottom border.
 //!
 //! See `make-term-great-again.md` "Panel layout" for the locked design.
 //! Slice 2 ships the renderer; slice 3 wires the foreground `bash` tool
@@ -31,7 +32,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use crate::ui::app_state::BashPanelState;
+use crate::ui::app_state::{BashPanelState, BashPanelVisibility};
 
 /// Fixed number of output rows shown by the panel. Locked at 5 by the
 /// design — *not* a config option. If a future need for scroll appears
@@ -51,6 +52,13 @@ pub const RUNNING_HEIGHT: u16 = 1 + TAIL_ROWS + 1 + 1;
 /// reading.
 pub const FINISHED_HEIGHT: u16 = 1 + TAIL_ROWS + 1;
 
+/// Total height of the panel when the user opened it on Idle (no bash
+/// running): top border + 1 empty content row + bottom border. Stays
+/// visually consistent with the bordered Running/Finished frames
+/// (asymmetric "1 borderless row" would jar against the heavier
+/// running frame).
+pub const IDLE_OPEN_HEIGHT: u16 = 1 + 1 + 1;
+
 /// Vertical footprint required to render the given panel state.
 /// `Idle` is the only zero-height variant; the caller's layout uses
 /// this to decide whether to allocate a strip at all.
@@ -62,19 +70,35 @@ pub fn panel_height(state: &BashPanelState) -> u16 {
     }
 }
 
-/// Effective vertical footprint accounting for the view-layer `hidden`
-/// flag. When `hidden` is true, the panel takes zero rows regardless of
-/// the underlying state — the layout collapses the chunk and the
-/// renderer's existing `if h > 0 { render(...) }` gate at the caller
-/// site (`repl_impl::render`) skips the draw. Single named contract for
-/// the wiring; `close-bash-panel-v2.md` design note.
-pub fn effective_panel_height(state: &BashPanelState, hidden: bool) -> u16 {
-    if hidden { 0 } else { panel_height(state) }
+/// Effective vertical footprint accounting for the view-layer
+/// visibility override. Combines `(state, visibility)` into the single
+/// "how many rows does the layout need to allocate?" number used by
+/// the REPL layout step. The companion gate at the caller site
+/// (`if h > 0 { render(...) }`) then skips the actual draw when this
+/// returns 0.
+///
+/// Mapping (see [`BashPanelVisibility`] for the full table):
+/// - `Auto`         + Idle/Running/Finished → `0 / RUNNING_HEIGHT / FINISHED_HEIGHT`
+/// - `OpenedByUser` + Idle                  → `IDLE_OPEN_HEIGHT` (3 rows, empty frame)
+/// - `OpenedByUser` + Running/Finished      → as Auto (no extra height)
+/// - `ClosedByUser` + any                   → `0`
+pub fn effective_panel_height(state: &BashPanelState, visibility: BashPanelVisibility) -> u16 {
+    if !visibility.is_visible(state) {
+        return 0;
+    }
+    if state.is_idle() {
+        // Visible-on-Idle is only reachable via OpenedByUser; render
+        // the small empty frame.
+        return IDLE_OPEN_HEIGHT;
+    }
+    panel_height(state)
 }
 
-/// Render the bash panel into `area`. No-op for [`BashPanelState::Idle`]
-/// — the layout shouldn't have given us a non-zero area in that case,
-/// but the guard keeps the renderer safe under surprise.
+/// Render the bash panel into `area`. The Idle branch is reachable
+/// only when the user has explicitly opened the panel via `Ctrl+B`
+/// while no bash was running — the layout caller checks
+/// [`effective_panel_height`] first and skips this function entirely
+/// when the result is 0, so an unintended Idle draw is impossible.
 ///
 /// `stdin_buffer` and `stdin_focused` shape the stdin row when the
 /// panel is `Running` (no effect on `Finished` — nothing is reading).
@@ -89,7 +113,21 @@ pub fn render_bash_panel(
     stdin_buffer: &str,
     stdin_focused: bool,
 ) {
-    if matches!(state, BashPanelState::Idle) || area.height == 0 {
+    if area.height == 0 {
+        return;
+    }
+
+    // Idle + non-zero area ⇒ user opened the panel on Idle via Ctrl+B.
+    // Render the empty frame and return. Kept inline rather than in a
+    // separate function because the rendering is 4 lines and would
+    // require duplicating the block/title machinery below.
+    if matches!(state, BashPanelState::Idle) {
+        let block = Block::default()
+            .title(" $ no bash output yet · Ctrl+B to hide ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let paragraph = Paragraph::new(Text::from(vec![Line::from("")])).block(block);
+        f.render_widget(paragraph, area);
         return;
     }
 
@@ -291,15 +329,13 @@ mod tests {
         assert_eq!(FINISHED_HEIGHT, 7);
     }
 
-    // ── Hide flag plumbing (close-bash-panel.md) ──────────────────────────
+    // ── Visibility plumbing (close-bash-panel-v2 + bash-panel-as-real-panel) ──
 
     #[test]
-    fn effective_panel_height_zero_when_hidden() {
-        // Wiring contract: regardless of underlying state, hidden ⇒ 0.
-        // The caller in `repl_impl` uses this to collapse the layout
-        // chunk; the existing `if bash_height > 0 { render(...) }` gate
-        // then skips the actual draw. One contract, one named function.
-        // See close-bash-panel-v2.md.
+    fn effective_panel_height_collapses_when_closed_by_user() {
+        // ClosedByUser ⇒ always 0, regardless of producer state.
+        // The caller's `if h > 0 { render(...) }` gate then skips the
+        // actual draw.
         let running = BashPanelState::Running {
             command: "yes".into(),
             pid: 1,
@@ -312,22 +348,86 @@ mod tests {
             duration_secs: 1,
             tail: Vec::new(),
         };
-        // hidden=true ⇒ always 0
-        assert_eq!(effective_panel_height(&BashPanelState::Idle, true), 0);
-        assert_eq!(effective_panel_height(&running, true), 0);
-        assert_eq!(effective_panel_height(&finished, true), 0);
-        // hidden=false ⇒ identical to panel_height (no view-state effect)
         assert_eq!(
-            effective_panel_height(&BashPanelState::Idle, false),
-            panel_height(&BashPanelState::Idle)
+            effective_panel_height(&BashPanelState::Idle, BashPanelVisibility::ClosedByUser),
+            0
         );
         assert_eq!(
-            effective_panel_height(&running, false),
-            panel_height(&running)
+            effective_panel_height(&running, BashPanelVisibility::ClosedByUser),
+            0
         );
         assert_eq!(
-            effective_panel_height(&finished, false),
-            panel_height(&finished)
+            effective_panel_height(&finished, BashPanelVisibility::ClosedByUser),
+            0
+        );
+    }
+
+    #[test]
+    fn effective_panel_height_auto_follows_producer() {
+        // Auto: Idle ⇒ 0, Running/Finished ⇒ their natural heights.
+        let running = BashPanelState::Running {
+            command: "yes".into(),
+            pid: 1,
+            started_at: Local::now(),
+            tail: Vec::new(),
+        };
+        let finished = BashPanelState::Finished {
+            command: "ls".into(),
+            exit_code: 0,
+            duration_secs: 1,
+            tail: Vec::new(),
+        };
+        assert_eq!(
+            effective_panel_height(&BashPanelState::Idle, BashPanelVisibility::Auto),
+            0
+        );
+        assert_eq!(
+            effective_panel_height(&running, BashPanelVisibility::Auto),
+            RUNNING_HEIGHT
+        );
+        assert_eq!(
+            effective_panel_height(&finished, BashPanelVisibility::Auto),
+            FINISHED_HEIGHT
+        );
+    }
+
+    #[test]
+    fn effective_panel_height_opened_by_user_on_idle_renders_empty_frame() {
+        // The key new behaviour: user opened the panel with no bash
+        // running ⇒ render the 3-row empty frame, not zero. The
+        // "open it anytime, like the tasks panel" contract.
+        assert_eq!(
+            effective_panel_height(&BashPanelState::Idle, BashPanelVisibility::OpenedByUser),
+            IDLE_OPEN_HEIGHT
+        );
+        assert_eq!(IDLE_OPEN_HEIGHT, 3, "top border + 1 line + bottom border");
+    }
+
+    #[test]
+    fn effective_panel_height_opened_by_user_on_running_is_natural_height() {
+        // OpenedByUser is meaningful primarily on Idle; on Running/
+        // Finished it's a no-op equivalent to Auto (the panel was
+        // visible anyway). Sanity-pin so a future renderer change
+        // doesn't accidentally pad the running frame.
+        let running = BashPanelState::Running {
+            command: "yes".into(),
+            pid: 1,
+            started_at: Local::now(),
+            tail: Vec::new(),
+        };
+        let finished = BashPanelState::Finished {
+            command: "ls".into(),
+            exit_code: 0,
+            duration_secs: 1,
+            tail: Vec::new(),
+        };
+        assert_eq!(
+            effective_panel_height(&running, BashPanelVisibility::OpenedByUser),
+            RUNNING_HEIGHT
+        );
+        assert_eq!(
+            effective_panel_height(&finished, BashPanelVisibility::OpenedByUser),
+            FINISHED_HEIGHT
         );
     }
 

@@ -11,4 +11,4 @@ expression: "lines.join(\"\\n\")"
 │                                                         │█
 │                                                         │║
 │                                                         │║
-└── Ctrl+C exit · Ctrl+T tasks · F4 select · Ctrl+G multi ┘▼
+└ · Ctrl+T tasks · Ctrl+B bash · F4 select · Ctrl+G multi ┘▼
