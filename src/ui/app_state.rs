@@ -107,6 +107,18 @@ pub struct AppState {
     /// `Clone + Serialize + Deserialize`.
     #[serde(default)]
     pub bash_panel: BashPanelState,
+
+    /// View-only flag — true when the user has pressed `Ctrl+B` to hide
+    /// the foreground bash panel. **Orthogonal to [`Self::bash_panel`]**:
+    /// the producer (`BashTool`) keeps writing Running/Finished blind,
+    /// the renderer gates draw on this flag, layout treats `hidden ≡ Idle`
+    /// (zero rows). Auto-reset by `StateManager::add_user_message` at the
+    /// next user prompt — spec: "remains hidden until I open it again or
+    /// I enter a new prompt." See `close-bash-panel-v2.md` for the
+    /// design and the Esc-collision pushback that drove the
+    /// hide-not-dismiss model.
+    #[serde(default)]
+    pub bash_panel_hidden: bool,
 }
 
 impl AppState {

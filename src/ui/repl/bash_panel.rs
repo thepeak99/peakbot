@@ -62,6 +62,16 @@ pub fn panel_height(state: &BashPanelState) -> u16 {
     }
 }
 
+/// Effective vertical footprint accounting for the view-layer `hidden`
+/// flag. When `hidden` is true, the panel takes zero rows regardless of
+/// the underlying state — the layout collapses the chunk and the
+/// renderer's existing `if h > 0 { render(...) }` gate at the caller
+/// site (`repl_impl::render`) skips the draw. Single named contract for
+/// the wiring; `close-bash-panel-v2.md` design note.
+pub fn effective_panel_height(state: &BashPanelState, hidden: bool) -> u16 {
+    if hidden { 0 } else { panel_height(state) }
+}
+
 /// Render the bash panel into `area`. No-op for [`BashPanelState::Idle`]
 /// — the layout shouldn't have given us a non-zero area in that case,
 /// but the guard keeps the renderer safe under surprise.
@@ -92,8 +102,14 @@ pub fn render_bash_panel(
             tail,
         } => {
             let elapsed = (chrono::Local::now() - *started_at).num_seconds().max(0) as u64;
+            // Trailing ` · Ctrl+B to hide` is an *action hint*, not a
+            // status chunk like `· pid 1234 · 00:42`. Kept inline by
+            // design (no second block/footer); see
+            // `close-bash-panel-v2.md` § "What to add" #6 — the only
+            // astonishment risk we accepted, mitigated by this comment
+            // and the snapshot pin `bash_panel_running_shows_ctrl_b_hint`.
             let title = format!(
-                " > {} · pid {} · {} ",
+                " > {} · pid {} · {} · Ctrl+B to hide ",
                 short_command(command),
                 pid,
                 format_duration(elapsed),
@@ -114,8 +130,12 @@ pub fn render_bash_panel(
             } else {
                 ("x", Color::Red)
             };
+            // Same action-hint discipline as the Running branch — the
+            // trailing chunk is `Ctrl+B to hide`, not status. Symmetric
+            // hint so the user sees the same dismissal affordance
+            // whether the bash call is live or finished.
             let title = format!(
-                " {} {} · exit {} · ran {} ",
+                " {} {} · exit {} · ran {} · Ctrl+B to hide ",
                 glyph,
                 short_command(command),
                 exit_code,
@@ -269,6 +289,46 @@ mod tests {
         };
         assert_eq!(panel_height(&state), FINISHED_HEIGHT);
         assert_eq!(FINISHED_HEIGHT, 7);
+    }
+
+    // ── Hide flag plumbing (close-bash-panel.md) ──────────────────────────
+
+    #[test]
+    fn effective_panel_height_zero_when_hidden() {
+        // Wiring contract: regardless of underlying state, hidden ⇒ 0.
+        // The caller in `repl_impl` uses this to collapse the layout
+        // chunk; the existing `if bash_height > 0 { render(...) }` gate
+        // then skips the actual draw. One contract, one named function.
+        // See close-bash-panel-v2.md.
+        let running = BashPanelState::Running {
+            command: "yes".into(),
+            pid: 1,
+            started_at: Local::now(),
+            tail: Vec::new(),
+        };
+        let finished = BashPanelState::Finished {
+            command: "ls".into(),
+            exit_code: 0,
+            duration_secs: 1,
+            tail: Vec::new(),
+        };
+        // hidden=true ⇒ always 0
+        assert_eq!(effective_panel_height(&BashPanelState::Idle, true), 0);
+        assert_eq!(effective_panel_height(&running, true), 0);
+        assert_eq!(effective_panel_height(&finished, true), 0);
+        // hidden=false ⇒ identical to panel_height (no view-state effect)
+        assert_eq!(
+            effective_panel_height(&BashPanelState::Idle, false),
+            panel_height(&BashPanelState::Idle)
+        );
+        assert_eq!(
+            effective_panel_height(&running, false),
+            panel_height(&running)
+        );
+        assert_eq!(
+            effective_panel_height(&finished, false),
+            panel_height(&finished)
+        );
     }
 
     #[test]
