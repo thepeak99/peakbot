@@ -1372,7 +1372,7 @@ mod tests {
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let _ = terminal.draw(|f| {
-            render_bash_panel(f, f.area(), &state);
+            render_bash_panel(f, f.area(), &state, "", false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -1403,7 +1403,7 @@ mod tests {
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let _ = terminal.draw(|f| {
-            render_bash_panel(f, f.area(), &state);
+            render_bash_panel(f, f.area(), &state, "", false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -1429,7 +1429,7 @@ mod tests {
         let backend = TestBackend::new(80, 7);
         let mut terminal = Terminal::new(backend).unwrap();
         let _ = terminal.draw(|f| {
-            render_bash_panel(f, f.area(), &state);
+            render_bash_panel(f, f.area(), &state, "", false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
@@ -1451,11 +1451,80 @@ mod tests {
         let backend = TestBackend::new(80, 7);
         let mut terminal = Terminal::new(backend).unwrap();
         let _ = terminal.draw(|f| {
-            render_bash_panel(f, f.area(), &state);
+            render_bash_panel(f, f.area(), &state, "", false);
         });
 
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("bash_panel_finished_failure", lines.join("\n"));
+    }
+
+    /// Slice 4: stdin row when unfocused — shows label + buffer + the
+    /// `[Ctrl+S]` hint. Locks the visual the user sees while typing a
+    /// chat message with a bash panel open.
+    #[test]
+    fn bash_panel_running_stdin_unfocused_shows_hint() {
+        use chrono::{Local, TimeZone};
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::render_bash_panel;
+
+        let started_at = Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+        let state = BashPanelState::Running {
+            command: "sudo apt update".into(),
+            pid: 4242,
+            started_at,
+            tail: vec!["[sudo] password for user:".into()],
+        };
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state, "", false);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        let sanitised = sanitise_elapsed(lines.join("\n"));
+        assert_snapshot!("bash_panel_running_stdin_unfocused_shows_hint", sanitised);
+    }
+
+    /// Slice 4: stdin row when focused — shows buffer + block cursor,
+    /// no hint. The cursor IS the focus signal. Also exercises a
+    /// non-empty buffer so the wrapping/clipping behaviour is pinned.
+    #[test]
+    fn bash_panel_running_stdin_focused_with_buffer_and_cursor() {
+        use chrono::{Local, TimeZone};
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::render_bash_panel;
+
+        let started_at = Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+        let state = BashPanelState::Running {
+            command: "sudo apt update".into(),
+            pid: 4242,
+            started_at,
+            tail: vec!["[sudo] password for user:".into()],
+        };
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            // Buffer shown as typed; the renderer doesn't mask it
+            // (echo suppression is the PTY's job — see the
+            // `bash_stdin_no_echo_suppressed_under_pty` integration
+            // pin).
+            render_bash_panel(f, f.area(), &state, "hunter2", true);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        let sanitised = sanitise_elapsed(lines.join("\n"));
+        assert_snapshot!(
+            "bash_panel_running_stdin_focused_with_buffer_and_cursor",
+            sanitised
+        );
     }
 
     #[test]
@@ -1476,7 +1545,7 @@ mod tests {
         let backend = TestBackend::new(40, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         let _ = terminal.draw(|f| {
-            render_bash_panel(f, f.area(), &state);
+            render_bash_panel(f, f.area(), &state, "", false);
         });
         let lines = buffer_to_lines(terminal.backend());
         // All cells should be blank — the renderer drew nothing.

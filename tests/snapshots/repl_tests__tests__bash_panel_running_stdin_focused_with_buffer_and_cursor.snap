@@ -1,0 +1,13 @@
+---
+source: tests/repl_tests.rs
+assertion_line: 1524
+expression: sanitised
+---
+┌ > sudo apt update · pid 4242 · MM:SS ────────────────────────────────────┐
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│[sudo] password for user:                                                     │
+│stdin> hunter2█                                                               │
+└──────────────────────────────────────────────────────────────────────────────┘

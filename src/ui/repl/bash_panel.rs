@@ -65,7 +65,20 @@ pub fn panel_height(state: &BashPanelState) -> u16 {
 /// Render the bash panel into `area`. No-op for [`BashPanelState::Idle`]
 /// — the layout shouldn't have given us a non-zero area in that case,
 /// but the guard keeps the renderer safe under surprise.
-pub fn render_bash_panel(f: &mut ratatui::Frame, area: Rect, state: &BashPanelState) {
+///
+/// `stdin_buffer` and `stdin_focused` shape the stdin row when the
+/// panel is `Running` (no effect on `Finished` — nothing is reading).
+/// When `stdin_focused` is true, the buffer is rendered bright with a
+/// trailing `█` block-cursor; when false, the buffer is dim italic
+/// with a `[Ctrl+S]` hint right-aligned so the user knows how to
+/// claim focus.
+pub fn render_bash_panel(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    state: &BashPanelState,
+    stdin_buffer: &str,
+    stdin_focused: bool,
+) {
     if matches!(state, BashPanelState::Idle) || area.height == 0 {
         return;
     }
@@ -117,7 +130,7 @@ pub fn render_bash_panel(f: &mut ratatui::Frame, area: Rect, state: &BashPanelSt
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
 
-    let content_lines = build_content_lines(tail, show_stdin);
+    let content_lines = build_content_lines(tail, show_stdin, stdin_buffer, stdin_focused);
     let paragraph = Paragraph::new(Text::from(content_lines)).block(block);
     f.render_widget(paragraph, area);
 }
@@ -127,13 +140,22 @@ pub fn render_bash_panel(f: &mut ratatui::Frame, area: Rect, state: &BashPanelSt
 /// - The last `TAIL_ROWS` lines of `tail`, padded at the top with
 ///   blanks if fewer (so new output appears at the *bottom*, like
 ///   `tail -f`).
-/// - When `show_stdin` is true, a `stdin» _` row underneath.
+/// - When `show_stdin` is true, a stdin row underneath. Its shape
+///   depends on `stdin_focused`: unfocused renders `stdin> <buffer>`
+///   dim italic with a right-aligned `[Ctrl+S]` hint; focused renders
+///   `stdin> <buffer>█` bright with a block cursor and no hint
+///   (cursor presence IS the focus signal).
 ///
 /// Long lines are *not* truncated here — ratatui's `Paragraph` will
 /// clip at the right edge. Wrapping is intentionally disabled in v1
 /// to keep the 5-row tail height stable; a future iteration can move
 /// to `Wrap { trim: false }` if we accept a variable footprint.
-fn build_content_lines(tail: &[String], show_stdin: bool) -> Vec<Line<'static>> {
+fn build_content_lines(
+    tail: &[String],
+    show_stdin: bool,
+    stdin_buffer: &str,
+    stdin_focused: bool,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(TAIL_ROWS as usize + 1);
 
     let take = TAIL_ROWS as usize;
@@ -147,18 +169,49 @@ fn build_content_lines(tail: &[String], show_stdin: bool) -> Vec<Line<'static>> 
     }
 
     if show_stdin {
-        lines.push(Line::from(vec![
+        lines.push(build_stdin_row(stdin_buffer, stdin_focused));
+    }
+
+    lines
+}
+
+/// Render the single stdin row. Extracted so unit tests can exercise
+/// it in isolation — the visuals are the slice's most user-visible
+/// surface and the snapshot pins lock the variants.
+fn build_stdin_row(stdin_buffer: &str, stdin_focused: bool) -> Line<'static> {
+    if stdin_focused {
+        // Bright label + buffer + block cursor. No hint — the cursor
+        // makes "you are typing here" unambiguous.
+        Line::from(vec![
+            Span::styled(
+                "stdin> ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(stdin_buffer.to_string(), Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ])
+    } else {
+        // Dim italic label + buffer (or empty), trailing hint.
+        // We don't right-align the hint by computing column widths
+        // (that needs the area width which lives in the renderer);
+        // a `· [Ctrl+S]` middle-dot separator keeps the row legible
+        // without layout math.
+        Line::from(vec![
             Span::styled(
                 "stdin> ",
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             ),
-            Span::styled("_", Style::default().fg(Color::DarkGray)),
-        ]));
+            Span::styled(
+                stdin_buffer.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(" · [Ctrl+S]", Style::default().fg(Color::DarkGray)),
+        ])
     }
-
-    lines
 }
 
 /// Format a command string for the header — keeps the first ~60 chars
@@ -247,7 +300,7 @@ mod tests {
     #[test]
     fn build_content_lines_pads_top_for_short_tail() {
         let tail = vec!["one".to_string(), "two".to_string()];
-        let lines = build_content_lines(&tail, false);
+        let lines = build_content_lines(&tail, false, "", false);
         // 5 tail rows, no stdin
         assert_eq!(lines.len(), 5);
         // First 3 are blank padding; last 2 are content
@@ -258,7 +311,7 @@ mod tests {
     #[test]
     fn build_content_lines_takes_last_5_when_overflow() {
         let tail: Vec<String> = (0..10).map(|i| format!("line {}", i)).collect();
-        let lines = build_content_lines(&tail, false);
+        let lines = build_content_lines(&tail, false, "", false);
         assert_eq!(lines.len(), 5);
         // Should be lines 5..=9 (the last 5)
         let first_text = lines[0].spans[0].content.to_string();
@@ -269,10 +322,49 @@ mod tests {
 
     #[test]
     fn build_content_lines_appends_stdin_row_when_requested() {
-        let lines = build_content_lines(&[], true);
+        let lines = build_content_lines(&[], true, "", false);
         assert_eq!(lines.len(), 6);
         // Last line should be the stdin prompt
         let txt: String = lines[5].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(txt.starts_with("stdin>"));
+    }
+
+    // ── Slice 4: stdin row variants ──────────────────────────────────────
+
+    #[test]
+    fn stdin_row_unfocused_shows_label_and_hint() {
+        let line = build_stdin_row("", false);
+        let txt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(txt.starts_with("stdin>"));
+        assert!(txt.contains("[Ctrl+S]"));
+        // No block cursor when unfocused.
+        assert!(!txt.contains('█'));
+    }
+
+    #[test]
+    fn stdin_row_unfocused_with_buffer_shows_buffer() {
+        let line = build_stdin_row("password", false);
+        let txt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(txt.contains("password"));
+        assert!(txt.contains("[Ctrl+S]"));
+    }
+
+    #[test]
+    fn stdin_row_focused_shows_cursor_no_hint() {
+        let line = build_stdin_row("hello", true);
+        let txt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(txt.starts_with("stdin>"));
+        assert!(txt.contains("hello"));
+        // Block cursor present, hint absent — cursor IS the focus signal.
+        assert!(txt.contains('█'));
+        assert!(!txt.contains("[Ctrl+S]"));
+    }
+
+    #[test]
+    fn stdin_row_focused_empty_buffer_still_has_cursor() {
+        let line = build_stdin_row("", true);
+        let txt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(txt.contains('█'));
+        assert!(!txt.contains("[Ctrl+S]"));
     }
 }
