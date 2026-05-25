@@ -1129,6 +1129,10 @@ impl AgentRunner {
         // Kill any bg processes — they were rooted in the previous
         // conversation. See `bash-background.md` edge-case table.
         sm_for_provider.clear_bg();
+        // Foreground bash panel is conversation-scoped — restore
+        // (state, visibility) to defaults so the model swap looks
+        // like a fresh chat in every panel surface.
+        sm_for_provider.reset_bash_panel();
         let convo_name = format!(
             "Conversation {}",
             chrono::Local::now().format("%Y-%m-%d %H:%M")
@@ -1892,6 +1896,12 @@ impl AgentRunner {
                     // processes go with it. See `bash-background.md`
                     // edge-case table.
                     sm.clear_bg();
+                    // Foreground bash panel is conversation-scoped too
+                    // — a lingering Finished frame from the previous
+                    // chat or a ClosedByUser override would be stale
+                    // and misleading. Restore (state, visibility) to
+                    // defaults.
+                    sm.reset_bash_panel();
                     let name = format!(
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")
