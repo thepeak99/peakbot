@@ -1527,6 +1527,54 @@ mod tests {
         );
     }
 
+    /// Slice 5 (#11): pin the v1 long-line contract. The plan
+    /// (`make-term-great-again.md`, layout section) originally called for
+    /// wrap-at-panel-width with wrapped lines consuming multiple display
+    /// rows of the 5-row tail. The implementation deliberately chose the
+    /// opposite contract — *clip at the right edge* — to keep the
+    /// 5-row footprint stable; see the doc-comment on `build_content_lines`
+    /// in `src/ui/repl/bash_panel.rs` for the rationale. This snapshot
+    /// locks the chosen behaviour so any future "let me turn on
+    /// `Wrap { trim: false }`" PR shows up as a deliberate snapshot diff.
+    #[test]
+    fn bash_panel_running_long_line_clips_at_right_edge() {
+        use chrono::{Local, TimeZone};
+        use peakbot::ui::app_state::BashPanelState;
+        use peakbot::ui::repl::bash_panel::render_bash_panel;
+
+        let started_at = Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+        // One line that's well over the 80-column test backend width.
+        // The snapshot must show it cut off at the right edge, NOT
+        // wrapped onto a second row eating into the 5-row tail.
+        let long = "X".repeat(160);
+        let state = BashPanelState::Running {
+            command: "cat huge.log".into(),
+            pid: 9999,
+            started_at,
+            tail: vec![
+                "before the long line".into(),
+                long,
+                "after the long line".into(),
+            ],
+        };
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let _ = terminal.draw(|f| {
+            render_bash_panel(f, f.area(), &state, "", false);
+        });
+
+        let lines = buffer_to_lines(terminal.backend());
+        let sanitised = sanitise_elapsed(lines.join("\n"));
+        assert_snapshot!(
+            "bash_panel_running_long_line_clips_at_right_edge",
+            sanitised
+        );
+    }
+
     #[test]
     fn bash_panel_idle_renders_nothing() {
         use peakbot::ui::app_state::BashPanelState;
