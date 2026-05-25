@@ -1,13 +1,13 @@
 ---
 source: tests/repl_tests.rs
-assertion_line: 1382
+assertion_line: 1489
 expression: sanitised
 ---
-┌ > psql -f migrate.sql · pid 4821 · MM:SS ────────────────────────────────┐
+┌ > sudo apt update · pid 4242 · MM:SS ────────────────────────────────────┐
 │                                                                              │
 │                                                                              │
-│NOTICE: table "users" does not exist, skipping                                │
-│CREATE TABLE                                                                  │
-│CREATE INDEX                                                                  │
+│                                                                              │
+│                                                                              │
+│[sudo] password for user:                                                     │
 │stdin>  · [Ctrl+S]                                                            │
 └──────────────────────────────────────────────────────────────────────────────┘

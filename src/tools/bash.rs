@@ -339,6 +339,24 @@ impl Tool for BashTool {
             sm.start_bash_panel(args.command.clone(), pid);
         }
 
+        // Stdin forwarding channel (slice 4). Per-call: UI registers
+        // here, pushes typed lines, the select! arm below drains and
+        // writes to the PTY master. Receiver lives on the stack; the
+        // sender goes into the state manager so the REPL can find it
+        // via `try_forward_bash_stdin`. Cleared **before**
+        // `finish_bash_panel` on the loop exit path so a late UI send
+        // during the Running → Finished window can't land on a dropped
+        // receiver.
+        let mut stdin_rx = if self.state_manager.is_some() {
+            let (stdin_tx, stdin_rx) = unbounded_channel::<String>();
+            if let Some(sm) = &self.state_manager {
+                sm.set_bash_stdin_tx(stdin_tx);
+            }
+            Some(stdin_rx)
+        } else {
+            None
+        };
+
         // Wait loop: pump notify pings into panel tail updates; break
         // on the exit notification or hit the timeout. The buffer lock
         // is only held inside scoped blocks — never across `.await`.
@@ -352,6 +370,19 @@ impl Tool for BashTool {
                 Duration::ZERO
             } else {
                 deadline - now
+            };
+
+            // `tokio::select!` needs a concrete future per arm. When
+            // there's no state manager (test path), the receiver is
+            // absent — substitute a future that never resolves so the
+            // arm is structurally present but never wins. Two-arm and
+            // three-arm select! diverge in macro shape; keeping the
+            // arm always-present is cheaper than duplicating the loop.
+            let stdin_recv = async {
+                match &mut stdin_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Option<String>>().await,
+                }
             };
 
             tokio::select! {
@@ -371,6 +402,26 @@ impl Tool for BashTool {
                         break code;
                     }
                 }
+                line = stdin_recv => {
+                    // `None` ⇒ UI dropped its sender (impossible while
+                    // the slot is held in the state manager, but cheap
+                    // to handle). The loop continues either way.
+                    if let Some(line) = line {
+                        // `write_stdin` appends `\n` if missing — see
+                        // `pty_runner::PtyHandle::write_stdin`. Errors
+                        // here mean the child closed stdin (e.g. exited
+                        // mid-prompt). We swallow + log; the next loop
+                        // iteration hits the exit ping and breaks
+                        // cleanly with the real exit code.
+                        if let Err(e) = handle.write_stdin(&line) {
+                            tracing::warn!(
+                                target: "peakbot",
+                                error = %e,
+                                "bash stdin forward failed (child likely closed stdin)"
+                            );
+                        }
+                    }
+                }
                 _ = tokio::time::sleep(wait) => {
                     if killed {
                         // Grace period exhausted; child is wedged. Give up
@@ -383,6 +434,21 @@ impl Tool for BashTool {
                 }
             }
         };
+
+        // Deregister the stdin sender BEFORE flipping the panel to
+        // Finished. Ordering matters: any UI send arriving during the
+        // tiny window between these two state changes will see a
+        // panel still nominally Running but get `Err(StdinNotActive)`
+        // back, which the UI handles by preserving the buffer (the
+        // user retries on the next prompt). The inverse order would
+        // let a send land on a dropped receiver after the panel
+        // already says "Finished" — strictly worse.
+        if let Some(sm) = &self.state_manager {
+            sm.clear_bash_stdin_tx();
+        }
+        // Drop the receiver explicitly so any in-flight send observes
+        // the channel closure deterministically.
+        drop(stdin_rx);
 
         // Drain the final buffer for the tool result. Same bytes the
         // panel just saw — the "one buffer, two views" rule.

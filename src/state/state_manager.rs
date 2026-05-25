@@ -58,6 +58,20 @@ pub struct StateManager {
     /// attached (e.g. unit tests that exercise `StateManager` directly).
     bg_notify_tx: RwLock<Option<mpsc::UnboundedSender<()>>>,
 
+    // ── Foreground bash stdin forwarding (slice 4) ────────────────────────────
+    /// Per-call channel set by the foreground `bash` tool when its PTY
+    /// child is spawned and cleared when the child exits. The REPL UI
+    /// pushes user-typed lines here; the tool's wait-loop `select!` arm
+    /// drains the receiver and writes the bytes (plus `\n`) to the PTY
+    /// master. `None` ⇒ no live foreground bash, so
+    /// [`Self::try_forward_bash_stdin`] returns [`StdinNotActive`].
+    ///
+    /// Lifecycle is single-call: the tool sets the slot on spawn and
+    /// clears it **before** [`Self::finish_bash_panel`] runs, so a late
+    /// UI send during the `Running → Finished` window lands on `None`
+    /// and the UI keeps the buffer instead of dropping the typed bytes.
+    bash_stdin_tx: RwLock<Option<mpsc::UnboundedSender<String>>>,
+
     // ── Background process shell ──────────────────────────────────────────────
     /// Shell executable used by `bash_bg` when spawning background processes.
     /// Injected by `main.rs` after shell detection. Empty until set.
@@ -101,6 +115,7 @@ impl StateManager {
             current_conversation: Arc::new(Mutex::new(None)),
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             bg_notify_tx: RwLock::new(None),
+            bash_stdin_tx: RwLock::new(None),
             shell: RwLock::new(String::new()),
             revision: AtomicU64::new(0),
         }
@@ -1857,7 +1872,74 @@ impl StateManager {
         let state = self.state.read().unwrap();
         self.notify_update(&state);
     }
+
+    // ── Foreground bash stdin forwarding (slice 4) ──────────────────────────
+
+    /// Register the foreground `bash` tool's stdin sender. Called once
+    /// by `BashTool::call` after the PTY child is spawned and before the
+    /// wait loop enters its `select!`.
+    ///
+    /// Overwrites any prior sender — the foreground `bash` tool is
+    /// single-call (the agent loop awaits its `call()` future), so a
+    /// stale sender in the slot is a contract violation upstream, not
+    /// something this method tries to defend against.
+    pub fn set_bash_stdin_tx(&self, tx: mpsc::UnboundedSender<String>) {
+        *self.bash_stdin_tx.write().unwrap() = Some(tx);
+    }
+
+    /// Clear the foreground bash stdin sender. Called by `BashTool::call`
+    /// **before** [`Self::finish_bash_panel`] on the loop exit path so a
+    /// late UI send during the `Running → Finished` window can't land on
+    /// a dropped receiver. Idempotent on an already-empty slot.
+    pub fn clear_bash_stdin_tx(&self) {
+        *self.bash_stdin_tx.write().unwrap() = None;
+    }
+
+    /// True iff a foreground bash stdin sender is currently registered.
+    /// Test-facing helper — the UI doesn't need this because it gates
+    /// focus on `bash_panel.is_running()` instead.
+    pub fn has_active_bash_stdin(&self) -> bool {
+        self.bash_stdin_tx.read().unwrap().is_some()
+    }
+
+    /// Forward a line of user-typed input to the running foreground
+    /// `bash` child's stdin. `Ok(())` iff a sender was present and
+    /// `send` succeeded; `Err(StdinNotActive)` otherwise (no live
+    /// foreground bash, or the receiver was dropped between
+    /// `clear_bash_stdin_tx` and the UI's send).
+    ///
+    /// The error is a *recovery contract*: the UI keeps the typed
+    /// buffer on `Err` so a user typing a password into a stale channel
+    /// doesn't lose the bytes.
+    pub fn try_forward_bash_stdin(&self, line: String) -> Result<(), StdinNotActive> {
+        // Snapshot the sender out of the lock — `send` is sync but we
+        // never hold the lock across any potentially-blocking call.
+        let tx = {
+            let guard = self.bash_stdin_tx.read().unwrap();
+            guard.clone()
+        };
+        match tx {
+            Some(tx) => tx.send(line).map_err(|_| StdinNotActive),
+            None => Err(StdinNotActive),
+        }
+    }
 }
+
+/// The foreground `bash` tool is not currently accepting stdin —
+/// either no child is running, or the receiver was dropped between the
+/// tool's `clear_bash_stdin_tx` call and the UI's send. The UI's
+/// recovery contract is documented on
+/// [`StateManager::try_forward_bash_stdin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdinNotActive;
+
+impl std::fmt::Display for StdinNotActive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no active foreground bash stdin channel")
+    }
+}
+
+impl std::error::Error for StdinNotActive {}
 
 /// Payload returned by `drain_bg_output_into_synthetic_turn`.
 ///
@@ -3726,5 +3808,64 @@ mod tests {
         sm.clear_bash_panel();
         sm.clear_bash_panel();
         assert!(sm.get_state().bash_panel.is_idle());
+    }
+
+    // ── Foreground bash stdin sidecar (slice 4) ──────────────────────────
+
+    #[test]
+    fn try_forward_bash_stdin_returns_err_when_no_active_tx() {
+        let sm = StateManager::new_arc();
+        assert!(!sm.has_active_bash_stdin());
+        let res = sm.try_forward_bash_stdin("hello".to_string());
+        assert_eq!(res, Err(StdinNotActive));
+    }
+
+    #[test]
+    fn try_forward_bash_stdin_returns_ok_when_tx_set_and_delivers() {
+        let sm = StateManager::new_arc();
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        sm.set_bash_stdin_tx(tx);
+        assert!(sm.has_active_bash_stdin());
+
+        let res = sm.try_forward_bash_stdin("password\n".to_string());
+        assert!(res.is_ok());
+
+        // The line lands on the receiver as-is — the tool is the one
+        // that decides whether to append a newline (write_stdin does it).
+        let got = rx.try_recv().expect("line should be queued");
+        assert_eq!(got, "password\n");
+    }
+
+    #[test]
+    fn clear_bash_stdin_tx_idempotent_on_unset() {
+        let sm = StateManager::new_arc();
+        // Empty → empty: no panic, slot stays empty.
+        sm.clear_bash_stdin_tx();
+        sm.clear_bash_stdin_tx();
+        assert!(!sm.has_active_bash_stdin());
+
+        // Set → clear → clear: still no panic, slot stays empty.
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        sm.set_bash_stdin_tx(tx);
+        assert!(sm.has_active_bash_stdin());
+        sm.clear_bash_stdin_tx();
+        sm.clear_bash_stdin_tx();
+        assert!(!sm.has_active_bash_stdin());
+    }
+
+    #[test]
+    fn try_forward_bash_stdin_returns_err_after_receiver_dropped() {
+        // Models the "Running → Finished" race: tool dropped the rx
+        // (via clear_bash_stdin_tx) but the UI still holds a stale view
+        // through the slot. We replicate by dropping rx ourselves while
+        // the slot still has the tx, then sending. send() should fail
+        // and we should report StdinNotActive (the user-facing meaning
+        // is identical to slot=None: "nothing's reading").
+        let sm = StateManager::new_arc();
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        sm.set_bash_stdin_tx(tx);
+        drop(rx);
+        let res = sm.try_forward_bash_stdin("hi".to_string());
+        assert_eq!(res, Err(StdinNotActive));
     }
 }

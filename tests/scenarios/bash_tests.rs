@@ -251,6 +251,147 @@ async fn bash_piped_stdin_works_under_pty() {
     );
 }
 
+/// Slice 4 cardinal pin — stdin forwarding reaches the child under
+/// the PTY. We spawn a `read x; echo "got: $x"` script, register a
+/// stdin sender via `StateManager::set_bash_stdin_tx` (done by the
+/// tool internally — we just verify it's active), then push a line
+/// from outside the call() future and assert the child consumed it.
+#[tokio::test]
+async fn bash_stdin_forward_reaches_child_under_pty() {
+    use peakbot::StateManager;
+    use std::sync::Arc;
+
+    let sm = Arc::new(StateManager::new());
+    let tool = BashTool::default().with_state_manager(sm.clone());
+
+    let payload = serde_json::to_string(&json!({
+        "thought": "slice 4 cardinal: stdin reaches the child",
+        "command": "read x; echo \"got: $x\"",
+        "timeout_seconds": 5,
+        "tail": 0,
+    }))
+    .expect("serialize");
+
+    // Spawn the tool call so we can interact from the test task.
+    let sm_for_call = sm.clone();
+    let tool_handle = tokio::spawn(async move {
+        let _ = sm_for_call; // keep the Arc alive on the call task
+        ToolDyn::call(&tool, payload).await.expect("call")
+    });
+
+    // Wait until the tool registers its stdin tx (race-tight: the
+    // child is spawned and the wait loop is entered). 1s should be
+    // overkill on any sane runner.
+    let started = Instant::now();
+    while !sm.has_active_bash_stdin() {
+        if started.elapsed() > Duration::from_secs(2) {
+            panic!("tool never registered stdin tx within 2s");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Forward the line. write_stdin appends '\n' so we don't need to.
+    sm.try_forward_bash_stdin("hello".to_string())
+        .expect("forward should succeed while child is reading");
+
+    let out = tool_handle.await.expect("tool task panicked");
+    assert!(
+        out.contains("got: hello"),
+        "tool result should contain `got: hello`; got:\n{}",
+        out
+    );
+}
+
+/// After the tool call returns, the stdin tx slot must be empty.
+/// Proves the `clear_bash_stdin_tx()` call on the loop exit path
+/// actually runs.
+#[tokio::test]
+async fn bash_stdin_tx_cleared_after_exit() {
+    use peakbot::StateManager;
+    use std::sync::Arc;
+
+    let sm = Arc::new(StateManager::new());
+    let tool = BashTool::default().with_state_manager(sm.clone());
+
+    assert!(
+        !sm.has_active_bash_stdin(),
+        "slot should start empty before any call"
+    );
+
+    let payload = serde_json::to_string(&json!({
+        "thought": "stdin tx cleanup after exit",
+        "command": "echo hello",
+        "timeout_seconds": 5,
+    }))
+    .expect("serialize");
+    let _ = ToolDyn::call(&tool, payload).await.expect("call");
+
+    assert!(
+        !sm.has_active_bash_stdin(),
+        "slot should be cleared after the call returns"
+    );
+}
+
+/// No-echo suppression: the PTY honours `termios ECHO off` set by
+/// `read -s`, so a forwarded password never echoes back into the
+/// output buffer / tool result. This pin makes "no masked-input mode
+/// needed" a hard contract, not a future-verify claim.
+#[tokio::test]
+async fn bash_stdin_no_echo_suppressed_under_pty() {
+    use peakbot::StateManager;
+    use std::sync::Arc;
+
+    let sm = Arc::new(StateManager::new());
+    let tool = BashTool::default().with_state_manager(sm.clone());
+
+    let payload = serde_json::to_string(&json!({
+        "thought": "slice 4 no-echo invariant under PTY",
+        "command": "read -s pw; echo \"got: $pw\"",
+        "timeout_seconds": 5,
+        "tail": 0,
+    }))
+    .expect("serialize");
+
+    let sm_for_call = sm.clone();
+    let tool_handle = tokio::spawn(async move {
+        let _ = sm_for_call;
+        ToolDyn::call(&tool, payload).await.expect("call")
+    });
+
+    let started = Instant::now();
+    while !sm.has_active_bash_stdin() {
+        if started.elapsed() > Duration::from_secs(2) {
+            panic!("tool never registered stdin tx within 2s");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    sm.try_forward_bash_stdin("s3cret".to_string())
+        .expect("forward should succeed while child is reading");
+
+    let out = tool_handle.await.expect("tool task panicked");
+
+    // The echo from `echo "got: $pw"` must contain the password —
+    // that proves the byte stream reached the shell.
+    assert!(
+        out.contains("got: s3cret"),
+        "tool result should contain `got: s3cret`; got:\n{}",
+        out
+    );
+
+    // But the typed characters themselves must NOT appear on a line
+    // of their own (or as a prefix that wasn't part of "got: …").
+    // Strip the only legitimate occurrence and assert no other
+    // `s3cret` survives in the output.
+    let scrubbed = out.replace("got: s3cret", "got: [REDACTED]");
+    assert!(
+        !scrubbed.contains("s3cret"),
+        "echo leaked the typed password into the output stream; \
+         the PTY did not honour ECHO off. Output:\n{}",
+        out
+    );
+}
+
 /// The cardinal rule of `make-term-great-again.md`: one buffer, two
 /// views. When wired to a `StateManager`, every line the panel saw
 /// must also appear in the tool result — same bytes, presented twice.

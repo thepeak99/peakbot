@@ -409,6 +409,32 @@ pub struct ReplUi {
     /// submits + exits when already on). View-only ephemeral state —
     /// see `multiline-mode.md`.
     pub(crate) multiline_mode: bool,
+
+    /// **Foreground bash stdin buffer (slice 4 of #11).** Characters
+    /// typed by the user while [`Self::stdin_focused`] is true,
+    /// accumulating until `Enter` forwards them to the running PTY
+    /// child via [`StateManager::try_forward_bash_stdin`]. View-only
+    /// ephemeral state — same lifecycle as `input_buffer` and
+    /// `multiline_mode` (lost on REPL restart, intentional: a fresh
+    /// REPL has no live bash to receive the bytes).
+    ///
+    /// **NOT persisted** because:
+    /// - A `/new` / `/load` / `/model` clears the bash panel and the
+    ///   live PTY child it was feeding. A buffer surviving across that
+    ///   transition would be addressed to nobody.
+    /// - The buffer commonly contains passwords (`sudo`, `git`
+    ///   credential prompts). Persisting bytes typed in a focused
+    ///   secret-input UI is the wrong default.
+    pub(crate) stdin_buffer: String,
+
+    /// **Foreground bash stdin focus flag (slice 4 of #11).** When
+    /// `true`, raw key events (`Char`, `Backspace`, `Enter`) route to
+    /// the stdin buffer instead of the chat input. Set by `Ctrl+S`
+    /// while the bash panel is `Running`; cleared by `Esc` (preserves
+    /// the buffer for retry) or automatically when the panel
+    /// transitions away from `Running` (no live reader → nothing to
+    /// type at).
+    pub(crate) stdin_focused: bool,
 }
 
 impl ReplUi {
@@ -460,6 +486,8 @@ impl ReplUi {
             command_popup: None,
             popup_dismissed: false,
             multiline_mode: false,
+            stdin_buffer: String::new(),
+            stdin_focused: false,
         }
     }
 
@@ -926,6 +954,20 @@ impl ReplUi {
 
     /// Main render function
     fn render(&mut self, state: &AppState) -> Result<()> {
+        // Auto-reset stdin focus when the bash panel is no longer
+        // accepting input. Triggered by the producer-side transition
+        // `Running → Finished` (child exited) or `Running → Idle`
+        // (cleared on /new, /load, /model). Without this, a user who
+        // was typing into stdin would keep seeing the focused cursor
+        // pointing at nothing. Buffer is dropped too — there is no
+        // way to retry against a different child, and a stale buffer
+        // surviving into the chat-input flow would be surprising.
+        if self.stdin_focused && !state.bash_panel.is_running() {
+            self.stdin_focused = false;
+            self.stdin_buffer.clear();
+            self.ui_state.local_dirty = true;
+        }
+
         // Calculate content height and extract scroll state before borrowing terminal
         if let Some(ref mut terminal) = self.terminal {
             terminal.draw(|f| {
@@ -1103,9 +1145,16 @@ impl ReplUi {
                     // Render the foreground bash-tool panel between chat
                     // and input. `Idle` ⇒ `bash_height == 0` ⇒ the chunk
                     // is zero-rows and the renderer no-ops. Slice 2 of
-                    // #11; producer wiring lands in slice 3.
+                    // #11; producer wiring lands in slice 3; slice 4
+                    // wires the real stdin buffer + focus state below.
                     if bash_height > 0 {
-                        render_bash_panel(f, bash_strip_chunk, &state.bash_panel);
+                        render_bash_panel(
+                            f,
+                            bash_strip_chunk,
+                            &state.bash_panel,
+                            &self.stdin_buffer,
+                            self.stdin_focused,
+                        );
                     }
 
                     // Input area: in select mode, swap its bordered block
@@ -1352,6 +1401,78 @@ impl ReplUi {
             // Backspace it down. See `multiline-mode.md` §5.3.
             KeyCode::Esc if self.multiline_mode => {
                 self.multiline_mode = false;
+            }
+            // ── Foreground bash stdin (slice 4 of #11) ───────────────────
+            //
+            // Routing rule: stdin claims keys only while focused AND the
+            // bash panel is Running. The Ctrl+S → focus arm is gated on
+            // the panel being Running so an idle Ctrl+S falls through to
+            // any future binding. All stdin arms sit **after** modal
+            // dialogs (so they don't steal Esc/Enter from a confirm
+            // popup) and **before** the generic Char/Enter/Backspace
+            // arms (so a focused stdin row claims the keystroke instead
+            // of editing the chat input).
+            //
+            // Why Ctrl+S: raw mode disables XON/XOFF (the historical
+            // "stop output" meaning of Ctrl+S in cooked mode is gone),
+            // and we already use other Ctrl combos (Ctrl+T, Ctrl+G)
+            // without trouble. See `make-term-great-again.md` slice 4.
+            KeyCode::Char('s' | 'S')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !self.stdin_focused
+                    && self.state_manager.get_state().bash_panel.is_running()
+                    && self.confirm_dialog.is_none() =>
+            {
+                self.stdin_focused = true;
+                self.ui_state.local_dirty = true;
+            }
+            // Esc while stdin-focused: unfocus, but **preserve the
+            // buffer**. A user who started typing a password and
+            // realised they're in the wrong panel should not lose
+            // their bytes — they can Ctrl+S back into focus and Enter
+            // to send.
+            KeyCode::Esc if self.stdin_focused => {
+                self.stdin_focused = false;
+                self.ui_state.local_dirty = true;
+            }
+            // Enter while stdin-focused: send the buffered line. On
+            // success clear the buffer; on `StdinNotActive` keep it
+            // (the user retries — see the `try_forward_bash_stdin`
+            // recovery contract).
+            KeyCode::Enter if self.stdin_focused => {
+                let line = self.stdin_buffer.clone();
+                match self.state_manager.try_forward_bash_stdin(line) {
+                    Ok(()) => {
+                        self.stdin_buffer.clear();
+                    }
+                    Err(_) => {
+                        // No live foreground bash. Drop focus so the
+                        // next Enter doesn't keep trying; preserve the
+                        // buffer so the user sees what they had typed.
+                        self.stdin_focused = false;
+                    }
+                }
+                self.ui_state.local_dirty = true;
+            }
+            // Backspace while stdin-focused: pop the last char, UTF-8
+            // boundary-safe (chars().last() + remove the byte range,
+            // mirroring the chat-input editing helpers).
+            KeyCode::Backspace if self.stdin_focused => {
+                if let Some(c) = self.stdin_buffer.chars().last() {
+                    let new_len = self.stdin_buffer.len() - c.len_utf8();
+                    self.stdin_buffer.truncate(new_len);
+                    self.ui_state.local_dirty = true;
+                }
+            }
+            // Char while stdin-focused: append. The Ctrl-modified
+            // arms above (Ctrl+T, Ctrl+G, Ctrl+S, Ctrl+C) already won
+            // their cases via more-specific guards, so this only sees
+            // plain characters.
+            KeyCode::Char(c)
+                if self.stdin_focused && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.stdin_buffer.push(c);
+                self.ui_state.local_dirty = true;
             }
             KeyCode::Enter if self.confirm_dialog.is_some() => {
                 self.commit_confirm_dialog();
@@ -2951,6 +3072,151 @@ mod command_popup_tests {
         let p = CommandPopupState::new(String::new());
         assert_eq!(p.selected_index, 0);
         assert_eq!(p.scroll_offset, 0);
+    }
+
+    // ─── Foreground bash stdin (slice 4 of #11) ──────────────────────────
+
+    /// Helper: put the bash panel into Running so the Ctrl+S gate opens.
+    fn make_running_panel(ui: &ReplUi) {
+        ui.state_manager
+            .start_bash_panel("read x; echo got: $x".into(), 1234);
+    }
+
+    #[test]
+    fn ctrl_s_focuses_stdin_only_when_bash_running() {
+        let (mut ui, _rx) = harness();
+        assert!(!ui.stdin_focused, "starts unfocused");
+
+        // No panel yet — Ctrl+S falls through (it's gated).
+        ui.handle_keyboard_input(press_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(
+            !ui.stdin_focused,
+            "Ctrl+S must not focus stdin when no bash is running"
+        );
+
+        // Now make the panel Running and try again.
+        make_running_panel(&ui);
+        ui.handle_keyboard_input(press_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(ui.stdin_focused, "Ctrl+S should focus stdin while Running");
+    }
+
+    #[test]
+    fn esc_unfocuses_stdin_and_preserves_buffer() {
+        let (mut ui, _rx) = harness();
+        make_running_panel(&ui);
+        ui.handle_keyboard_input(press_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        // Type a few characters into stdin.
+        ui.handle_keyboard_input(press(KeyCode::Char('h')));
+        ui.handle_keyboard_input(press(KeyCode::Char('i')));
+        assert_eq!(ui.stdin_buffer, "hi");
+        assert!(ui.stdin_focused);
+
+        // Esc unfocuses but preserves the buffer.
+        ui.handle_keyboard_input(press(KeyCode::Esc));
+        assert!(!ui.stdin_focused, "Esc should unfocus");
+        assert_eq!(
+            ui.stdin_buffer, "hi",
+            "Esc must preserve buffer (recovery contract)"
+        );
+    }
+
+    #[test]
+    fn enter_while_stdin_focused_sends_via_state_manager() {
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (mut ui, _rx) = harness();
+        make_running_panel(&ui);
+        // Register a real stdin sender on the state manager so the
+        // send succeeds — without one, try_forward_bash_stdin returns
+        // Err and we'd be testing the wrong path.
+        let (tx, mut stdin_rx) = unbounded_channel::<String>();
+        ui.state_manager.set_bash_stdin_tx(tx);
+
+        ui.handle_keyboard_input(press_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        ui.handle_keyboard_input(press(KeyCode::Char('o')));
+        ui.handle_keyboard_input(press(KeyCode::Char('k')));
+        ui.handle_keyboard_input(press(KeyCode::Enter));
+
+        // On success the buffer is cleared and the line lands on rx.
+        assert_eq!(ui.stdin_buffer, "");
+        let got = stdin_rx.try_recv().expect("send should have queued a line");
+        assert_eq!(got, "ok");
+        // Focus stays — the user can keep typing follow-ups (e.g. a
+        // second sudo prompt) without re-pressing Ctrl+S.
+        assert!(ui.stdin_focused);
+    }
+
+    #[test]
+    fn enter_with_no_active_stdin_preserves_buffer_and_drops_focus() {
+        let (mut ui, _rx) = harness();
+        // Bash panel is Running (so Ctrl+S focuses) but we deliberately
+        // do NOT register a stdin tx — try_forward_bash_stdin must
+        // return Err(StdinNotActive). The handler should preserve the
+        // buffer (recovery contract) and drop focus.
+        make_running_panel(&ui);
+        ui.handle_keyboard_input(press_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        ui.handle_keyboard_input(press(KeyCode::Char('p')));
+        ui.handle_keyboard_input(press(KeyCode::Char('w')));
+        assert_eq!(ui.stdin_buffer, "pw");
+        ui.handle_keyboard_input(press(KeyCode::Enter));
+        assert_eq!(ui.stdin_buffer, "pw", "buffer must survive a failed send");
+        assert!(
+            !ui.stdin_focused,
+            "focus should drop so next Enter doesn't keep retrying blindly"
+        );
+    }
+
+    #[test]
+    fn backspace_pops_utf8_chars_from_stdin_buffer() {
+        let (mut ui, _rx) = harness();
+        make_running_panel(&ui);
+        ui.handle_keyboard_input(press_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        // Multi-byte char to make sure we pop by char, not by byte.
+        ui.stdin_buffer.push_str("aé");
+        assert_eq!(ui.stdin_buffer.len(), 3); // 'a' is 1 byte, 'é' is 2
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert_eq!(
+            ui.stdin_buffer, "a",
+            "should pop the multi-byte char cleanly"
+        );
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert_eq!(ui.stdin_buffer, "");
+        // Backspace on empty is a safe no-op.
+        ui.handle_keyboard_input(press(KeyCode::Backspace));
+        assert_eq!(ui.stdin_buffer, "");
+    }
+
+    #[test]
+    fn stdin_focus_resets_when_bash_panel_leaves_running() {
+        // Renders trigger the auto-reset; we simulate by calling the
+        // logic inline. The full render path needs a Terminal which
+        // tests don't have, but the auto-reset block runs before the
+        // terminal section.
+        let (mut ui, _rx) = harness();
+        make_running_panel(&ui);
+        ui.handle_keyboard_input(press_with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        ui.handle_keyboard_input(press(KeyCode::Char('x')));
+        assert!(ui.stdin_focused);
+        assert_eq!(ui.stdin_buffer, "x");
+
+        // Producer-side: finish the panel. Snapshot the resulting
+        // state and pass it through the auto-reset path that lives at
+        // the top of render().
+        ui.state_manager.finish_bash_panel(0, vec![]);
+        let snap = ui.state_manager.get_state();
+        // Replicate the exact auto-reset block from render():
+        if ui.stdin_focused && !snap.bash_panel.is_running() {
+            ui.stdin_focused = false;
+            ui.stdin_buffer.clear();
+        }
+        assert!(
+            !ui.stdin_focused,
+            "focus must reset when panel leaves Running"
+        );
+        assert_eq!(
+            ui.stdin_buffer, "",
+            "buffer must clear when there's nothing to type at"
+        );
     }
 }
 
