@@ -7,6 +7,7 @@ mod conversation;
 mod conversation_manager;
 mod conversation_title;
 mod hooks;
+mod mcp_auth;
 mod memory_compaction;
 #[cfg(feature = "mock")]
 pub mod mock;
@@ -61,7 +62,7 @@ pub use tools::{
 };
 pub use ui::{Ui, UiAction};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -2386,17 +2387,34 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
 
     // Build the streamable-http config with optional bearer token + custom headers.
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.clone());
+    // Lazily holds the OAuth-aware HTTP client when the server uses oauth.
+    // `None` means the default reqwest client baked into `from_config` will be used.
+    let mut auth_client: Option<crate::mcp_auth::AuthorizedClient> = None;
 
     match config.auth_resolved() {
         Some(crate::config::ResolvedAuth::Bearer { token }) => {
             transport_config = transport_config.auth_header(token);
         }
-        Some(crate::config::ResolvedAuth::Oauth) => {
-            // Slice 1: config shape parses but the OAuth dance isn't wired yet.
-            // Slice 2 replaces this bail with a call into `mcp_auth::authorize`.
-            bail!(
-                "MCP server '{}': OAuth support is not yet implemented in this build; use the `mcp-remote` bridge as a temporary workaround.",
-                config.name
+        Some(crate::config::ResolvedAuth::Oauth {
+            client_id,
+            client_secret,
+            scopes,
+        }) => {
+            // Slice 2 + Slice 3a: full OAuth 2.1 + PKCE flow.
+            // - `client_id` absent → DCR (Linear shape)
+            // - `client_id` present → static credentials (Google shape)
+            // `authorize` returns an `AuthClient<reqwest::Client>` that
+            // implements `StreamableHttpClient`, so we feed it into the
+            // transport via `with_client` below.
+            let params = crate::mcp_auth::OauthParams {
+                client_id,
+                client_secret,
+                scopes,
+            };
+            auth_client = Some(
+                crate::mcp_auth::authorize(&config.name, url, params)
+                    .await
+                    .map_err(|e| anyhow!("MCP server '{}': {e}", config.name))?,
             );
         }
         None => {}
@@ -2428,12 +2446,26 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
         }
     }
 
-    let transport = StreamableHttpClientTransport::from_config(transport_config);
-
-    let service = ()
-        .serve(transport)
+    // `StreamableHttpClientTransport<C>` is generic over the inner HTTP
+    // client, so the two branches produce different concrete types and
+    // can't be unified by a `let transport = if ...`. Drive `.serve`
+    // from inside each arm — the resulting `service` (`RunningService<…>`)
+    // has the same type regardless because the transport type-parameter
+    // is erased by the worker boundary.
+    let service = if let Some(client) = auth_client {
+        // OAuth-aware client: signs every request and silently refreshes
+        // access tokens.
+        ().serve(StreamableHttpClientTransport::with_client(
+            client,
+            transport_config,
+        ))
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?
+    } else {
+        ().serve(StreamableHttpClientTransport::from_config(transport_config))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?
+    };
 
     let server_info = service
         .peer_info()
@@ -3778,41 +3810,16 @@ headers:
         assert!(config.validate().is_err());
     }
 
-    /// Slice 1 of the MCP OAuth work parses the `auth: { type: oauth }`
-    /// shape but doesn't yet wire the OAuth flow — the connect path
-    /// must bail with a clear, actionable message rather than silently
-    /// falling back to "no auth". Slice 2 replaces the `bail!` with a
-    /// real call into `mcp_auth::authorize`; this pin will then need to
-    /// be deleted (or flipped to assert success).
-    #[tokio::test]
-    async fn oauth_variant_returns_not_yet_implemented() {
-        let config = McpServerConfig {
-            name: "linear-pending".to_string(),
-            transport_type: McpTransportType::StreamableHttp,
-            command: None,
-            args: None,
-            env: None,
-            url: Some("https://mcp.linear.app/mcp".to_string()),
-            auth_token: None,
-            auth: Some(crate::config::McpAuth::Oauth),
-            headers: None,
-            enabled: true,
-        };
-
-        let err = match connect_mcp_server(&config).await {
-            Ok(_) => panic!("OAuth must bail until Slice 2 lands"),
-            Err(e) => e,
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("OAuth support is not yet implemented"),
-            "error must explain the missing implementation, got: {msg}"
-        );
-        assert!(
-            msg.contains("linear-pending"),
-            "error must name the offending server, got: {msg}"
-        );
-    }
+    // ─── Slice 2: OAuth wiring (no in-process pin) ──────────────────────────
+    //
+    // Slice 1 of the MCP OAuth work parsed the `auth: { type: oauth }`
+    // shape but didn't wire the flow — that pin
+    // (`oauth_variant_returns_not_yet_implemented`) lived here. Slice 2
+    // (this branch) wires the real `mcp_auth::authorize` path. The
+    // replacement contract is the pre-merge live Linear smoke test
+    // recorded in `autho.md`; there is no in-process pin because the
+    // happy path requires DCR + browser + token exchange against a real
+    // OAuth server.
 
     // ─── Mid-action compaction: production wire-payload contract ────────────
     //
