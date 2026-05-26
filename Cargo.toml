@@ -13,6 +13,7 @@ rmcp = { version = "1.6", features = [
     "transport-child-process",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
+    "auth",
 ] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +50,17 @@ ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
 # Same crate the (future) interactive tool will use — keep this entry in
 # sync with `terminal-uber-alles.md` when that lands.
 portable-pty = "0.9"
+
+# MCP OAuth 2.1 (#19, src/mcp_auth.rs). axum runs a one-shot localhost
+# callback listener; the `Query<T>` extractor URL-decodes automatically
+# (which the Slice 1.5 Linear spike showed matters — Linear `%3A`-encodes
+# the `:` separators in the auth code). Default features off — we only
+# need HTTP/1.1 + tokio runtime.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+# Cross-platform browser launcher (xdg-open / open / cmd /c start).
+open = "5"
+# Required to impl rmcp's `#[async_trait] CredentialStore`.
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3.27"
