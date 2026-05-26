@@ -61,7 +61,7 @@ pub use tools::{
 };
 pub use ui::{Ui, UiAction};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -2377,13 +2377,29 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
 
     tracing::info!("Connecting to MCP server '{}' at {}", config.name, url);
 
+    // Surface deprecation warnings (e.g. legacy `auth_token`) at connect
+    // time. `validate()` already rejected the "both set" footgun, so this
+    // is purely informational.
+    for warning in config.deprecation_warnings() {
+        tracing::warn!("{warning}");
+    }
+
     // Build the streamable-http config with optional bearer token + custom headers.
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.clone());
 
-    if let Some(token) = config.auth_token.as_ref()
-        && !token.is_empty()
-    {
-        transport_config = transport_config.auth_header(token.clone());
+    match config.auth_resolved() {
+        Some(crate::config::ResolvedAuth::Bearer { token }) => {
+            transport_config = transport_config.auth_header(token);
+        }
+        Some(crate::config::ResolvedAuth::Oauth) => {
+            // Slice 1: config shape parses but the OAuth dance isn't wired yet.
+            // Slice 2 replaces this bail with a call into `mcp_auth::authorize`.
+            bail!(
+                "MCP server '{}': OAuth support is not yet implemented in this build; use the `mcp-remote` bridge as a temporary workaround.",
+                config.name
+            );
+        }
+        None => {}
     }
 
     if let Some(headers) = config.headers.as_ref() {
@@ -3505,6 +3521,7 @@ mod tests {
             env: Some(env),
             url: None,
             auth_token: None,
+            auth: None,
             headers: None,
             enabled: true,
         };
@@ -3528,6 +3545,7 @@ mod tests {
             env: None,
             url: None,
             auth_token: None,
+            auth: None,
             headers: None,
             enabled: true,
         };
@@ -3558,6 +3576,7 @@ mod tests {
             env: Some(env),
             url: None,
             auth_token: None,
+            auth: None,
             headers: None,
             enabled: true,
         };
@@ -3587,6 +3606,7 @@ mod tests {
             env: None,
             url: None,
             auth_token: None,
+            auth: None,
             headers: None,
             enabled: true,
         };
@@ -3706,6 +3726,7 @@ headers:
             env: None,
             url: None,
             auth_token: None,
+            auth: None,
             headers: None,
             enabled: true,
         };
@@ -3720,6 +3741,7 @@ headers:
             env: None,
             url: None,
             auth_token: None,
+            auth: None,
             headers: None,
             enabled: true,
         };
@@ -3734,6 +3756,7 @@ headers:
             env: None,
             url: Some("https://example.com/mcp".to_string()),
             auth_token: None,
+            auth: None,
             headers: None,
             enabled: true,
         };
@@ -3748,10 +3771,47 @@ headers:
             env: None,
             url: None,
             auth_token: None,
+            auth: None,
             headers: None,
             enabled: true,
         };
         assert!(config.validate().is_err());
+    }
+
+    /// Slice 1 of the MCP OAuth work parses the `auth: { type: oauth }`
+    /// shape but doesn't yet wire the OAuth flow — the connect path
+    /// must bail with a clear, actionable message rather than silently
+    /// falling back to "no auth". Slice 2 replaces the `bail!` with a
+    /// real call into `mcp_auth::authorize`; this pin will then need to
+    /// be deleted (or flipped to assert success).
+    #[tokio::test]
+    async fn oauth_variant_returns_not_yet_implemented() {
+        let config = McpServerConfig {
+            name: "linear-pending".to_string(),
+            transport_type: McpTransportType::StreamableHttp,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("https://mcp.linear.app/mcp".to_string()),
+            auth_token: None,
+            auth: Some(crate::config::McpAuth::Oauth),
+            headers: None,
+            enabled: true,
+        };
+
+        let err = match connect_mcp_server(&config).await {
+            Ok(_) => panic!("OAuth must bail until Slice 2 lands"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OAuth support is not yet implemented"),
+            "error must explain the missing implementation, got: {msg}"
+        );
+        assert!(
+            msg.contains("linear-pending"),
+            "error must name the offending server, got: {msg}"
+        );
     }
 
     // ─── Mid-action compaction: production wire-payload contract ────────────

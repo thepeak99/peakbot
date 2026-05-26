@@ -559,6 +559,57 @@ impl fmt::Display for McpTransportType {
     }
 }
 
+/// Authentication strategy for a remote MCP server.
+///
+/// Internally tagged on `type`. The locked config shape is:
+///
+/// ```yaml
+/// auth:
+///   type: bearer
+///   token: "sk-xxx"
+/// ```
+///
+/// or
+///
+/// ```yaml
+/// auth:
+///   type: oauth
+/// ```
+///
+/// "No auth" is encoded by omitting the `auth` field entirely
+/// (`Option::None` on `McpServerConfig::auth`). There is no `type: none`
+/// variant by design.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum McpAuth {
+    /// Static `Authorization: Bearer <token>` header.
+    Bearer { token: String },
+    /// OAuth 2.1 + Dynamic Client Registration + PKCE per the MCP
+    /// authorization spec. Slice 1 only parses the variant; Slice 2 wires
+    /// it through `src/mcp_auth.rs`.
+    Oauth,
+}
+
+/// Resolved auth strategy after merging the legacy `auth_token` field
+/// with the new `auth:` block. Internal-only type — produced by
+/// [`McpServerConfig::auth_resolved`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedAuth {
+    Bearer { token: String },
+    Oauth,
+}
+
+/// Strip a leading `Bearer ` (case-sensitive — matches the wire spelling)
+/// and trim surrounding whitespace. Lets users paste either the raw token
+/// or the full `Authorization` header value without producing a doubled
+/// `Bearer Bearer xxx` header. Returns the cleaned token.
+fn normalize_bearer_token(raw: &str) -> String {
+    raw.strip_prefix("Bearer ")
+        .unwrap_or(raw)
+        .trim()
+        .to_string()
+}
+
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
@@ -580,10 +631,16 @@ pub struct McpServerConfig {
     pub env: Option<HashMap<String, String>>,
     /// URL for remote transports (sse, streamable-http)
     pub url: Option<String>,
-    /// Bearer token sent in the `Authorization: Bearer <token>` header
-    /// for remote transports. Convenience for the most common auth case.
+    /// **Deprecated.** Use `auth: { type: bearer, token: "…" }` instead.
+    /// Kept parseable for one release with a deprecation warning at
+    /// connect time. Setting both `auth_token` and `auth` is a config
+    /// error (see [`McpServerConfig::validate`]). Will be removed in the
+    /// release after the next.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Authentication strategy. See [`McpAuth`].
+    #[serde(default)]
+    pub auth: Option<McpAuth>,
     /// Custom HTTP headers sent with every request for remote transports.
     /// Header names must be valid HTTP token characters; values must be
     /// visible ASCII. Invalid entries are logged and skipped.
@@ -603,6 +660,17 @@ impl McpServerConfig {
     /// Validates the configuration based on transport type.
     /// Returns Ok(()) if valid, or Err with an error message.
     pub fn validate(&self) -> Result<(), String> {
+        // Cross-validation: legacy `auth_token` and the new `auth:` block
+        // are mutually exclusive. Setting both is a contract violation
+        // — refuse to start rather than silently pick one.
+        if self.auth_token.is_some() && self.auth.is_some() {
+            return Err(format!(
+                "MCP server '{}': cannot set both `auth_token` and `auth`. \
+                 Migrate `auth_token` to `auth: {{ type: bearer, token: \"…\" }}` and remove the legacy field.",
+                self.name
+            ));
+        }
+
         match self.transport_type {
             McpTransportType::Stdio => {
                 if self.command.is_none() || self.command.as_ref().unwrap().is_empty() {
@@ -622,6 +690,58 @@ impl McpServerConfig {
             }
         }
         Ok(())
+    }
+
+    /// Merge the legacy `auth_token` field and the new `auth:` block into
+    /// a single resolved strategy. Returns `None` when neither is set.
+    ///
+    /// Defensive [`Bearer ` prefix-strip][normalize_bearer_token] is applied
+    /// to both paths so `Bearer xxx` and `xxx` both produce the same
+    /// `Authorization: Bearer xxx` header on the wire. Empty tokens
+    /// (after trimming) are treated as `None` — same as before the
+    /// refactor.
+    ///
+    /// Cross-validation in [`Self::validate`] guarantees that this
+    /// method's "legacy" branch and the "new" branch are mutually
+    /// exclusive at boot. We still tolerate both being set defensively
+    /// (the new `auth:` block wins) so a misconfigured user gets the
+    /// validation error, not a panic.
+    pub fn auth_resolved(&self) -> Option<ResolvedAuth> {
+        if let Some(auth) = &self.auth {
+            return Some(match auth {
+                McpAuth::Bearer { token } => {
+                    let cleaned = normalize_bearer_token(token);
+                    if cleaned.is_empty() {
+                        return None;
+                    }
+                    ResolvedAuth::Bearer { token: cleaned }
+                }
+                McpAuth::Oauth => ResolvedAuth::Oauth,
+            });
+        }
+        if let Some(raw) = self.auth_token.as_deref() {
+            let cleaned = normalize_bearer_token(raw);
+            if cleaned.is_empty() {
+                return None;
+            }
+            return Some(ResolvedAuth::Bearer { token: cleaned });
+        }
+        None
+    }
+
+    /// Returns user-facing deprecation warnings for this config. Empty
+    /// when nothing is deprecated. The caller is expected to log each
+    /// entry via `tracing::warn!`; surfacing them as plain strings keeps
+    /// this method side-effect-free and trivially unit-testable.
+    pub fn deprecation_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.auth_token.is_some() && self.auth.is_none() {
+            out.push(format!(
+                "MCP server '{}': `auth_token` is deprecated; use `auth: {{ type: bearer, token: \"…\" }}` instead. The legacy field will be removed in a future release.",
+                self.name
+            ));
+        }
+        out
     }
 }
 
@@ -1109,6 +1229,7 @@ mod tests {
                 env: None,
                 url: None,
                 auth_token: None,
+                auth: None,
                 headers: None,
                 enabled: true,
             }]),
@@ -1124,6 +1245,7 @@ mod tests {
                 env: None,
                 url: None,
                 auth_token: None,
+                auth: None,
                 headers: None,
                 enabled: true,
             }]),
@@ -1445,5 +1567,196 @@ cost_tracking: false
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.providers[0].models.len(), 1);
         assert_eq!(cfg.providers[0].models[0].max_tokens, Some(8192));
+    }
+
+    // ─── MCP OAuth — Slice 1 config-shape pins ──────────────────────────
+    //
+    // These tests pin the locked YAML shape from `autho.md` and the
+    // resolution semantics in `auth_resolved()` / `deprecation_warnings()`.
+    // Tracks Gitea #19. Slice 2 will exercise the OAuth flow itself; this
+    // slice only proves the config plumbing.
+
+    fn http_config_with(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport_type: McpTransportType::StreamableHttp,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("https://example.com/mcp".to_string()),
+            auth_token: None,
+            auth: None,
+            headers: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn auth_oauth_round_trips_through_yaml() {
+        let yaml = r#"
+name: linear
+type: streamablehttp
+url: https://mcp.linear.app/mcp
+auth:
+  type: oauth
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).expect("oauth config must parse");
+        assert_eq!(config.auth, Some(McpAuth::Oauth));
+        // No legacy field set on the OAuth path.
+        assert!(config.auth_token.is_none());
+        // The cross-validator must accept the new shape on its own.
+        assert!(config.validate().is_ok());
+        assert_eq!(config.auth_resolved(), Some(ResolvedAuth::Oauth));
+        assert!(config.deprecation_warnings().is_empty());
+    }
+
+    #[test]
+    fn auth_bearer_round_trips_through_yaml() {
+        let yaml = r#"
+name: bearer-mcp
+type: streamablehttp
+url: https://example.com/mcp
+auth:
+  type: bearer
+  token: "sk-abc123"
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).expect("bearer config must parse");
+        assert_eq!(
+            config.auth,
+            Some(McpAuth::Bearer {
+                token: "sk-abc123".to_string()
+            })
+        );
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.auth_resolved(),
+            Some(ResolvedAuth::Bearer {
+                token: "sk-abc123".to_string()
+            })
+        );
+        assert!(config.deprecation_warnings().is_empty());
+    }
+
+    #[test]
+    fn auth_and_auth_token_set_together_is_rejected() {
+        // Setting both fields is a contract violation: refuse to start
+        // rather than silently pick one. The legacy field has a one-release
+        // migration path; "set both" is never a valid migration step.
+        let mut config = http_config_with("conflict");
+        config.auth_token = Some("legacy".to_string());
+        config.auth = Some(McpAuth::Bearer {
+            token: "new".to_string(),
+        });
+        let err = config
+            .validate()
+            .expect_err("must reject conflicting auth fields");
+        assert!(
+            err.contains("cannot set both"),
+            "validation error must explain the conflict, got: {err}"
+        );
+    }
+
+    #[test]
+    fn bearer_token_with_bearer_prefix_is_stripped() {
+        // Users sometimes paste the full `Authorization` header value.
+        // The resolver must strip a single leading `Bearer ` so the
+        // wire layer doesn't produce `Bearer Bearer xxx`.
+        let mut config = http_config_with("prefix-test");
+        config.auth = Some(McpAuth::Bearer {
+            token: "Bearer xxx".to_string(),
+        });
+        assert_eq!(
+            config.auth_resolved(),
+            Some(ResolvedAuth::Bearer {
+                token: "xxx".to_string()
+            })
+        );
+
+        // Same defensive strip on the legacy field.
+        let mut legacy = http_config_with("prefix-legacy");
+        legacy.auth_token = Some("Bearer xxx".to_string());
+        assert_eq!(
+            legacy.auth_resolved(),
+            Some(ResolvedAuth::Bearer {
+                token: "xxx".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn bearer_token_without_prefix_unchanged() {
+        // The complement to the strip test: a bare token must survive
+        // intact. Whitespace around the value is trimmed (paste-safety).
+        let mut config = http_config_with("plain");
+        config.auth = Some(McpAuth::Bearer {
+            token: "  xxx  ".to_string(),
+        });
+        assert_eq!(
+            config.auth_resolved(),
+            Some(ResolvedAuth::Bearer {
+                token: "xxx".to_string()
+            })
+        );
+
+        let mut legacy = http_config_with("plain-legacy");
+        legacy.auth_token = Some("xxx".to_string());
+        assert_eq!(
+            legacy.auth_resolved(),
+            Some(ResolvedAuth::Bearer {
+                token: "xxx".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_auth_token_surfaces_deprecation_warning() {
+        // The legacy `auth_token` field keeps working for one release,
+        // but must announce its retirement loudly. The warning text is
+        // exposed as plain strings (side-effect-free) so it's trivially
+        // testable; the production caller forwards each entry to
+        // `tracing::warn!`.
+        let mut config = http_config_with("legacy");
+        config.auth_token = Some("sk-old".to_string());
+
+        let warnings = config.deprecation_warnings();
+        assert_eq!(warnings.len(), 1, "expected exactly one deprecation entry");
+        assert!(
+            warnings[0].contains("`auth_token` is deprecated"),
+            "warning text must name the deprecated field, got: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("legacy"),
+            "warning must mention the server name, got: {}",
+            warnings[0]
+        );
+
+        // The new shape on its own must NOT emit a deprecation warning.
+        let mut modern = http_config_with("modern");
+        modern.auth = Some(McpAuth::Bearer {
+            token: "sk-new".to_string(),
+        });
+        assert!(modern.deprecation_warnings().is_empty());
+    }
+
+    #[test]
+    fn auth_block_rejects_unknown_inner_field() {
+        // `deny_unknown_fields` must apply inside the `auth:` block too —
+        // a typo like `tokn:` should be loud, not silent.
+        let yaml = r#"
+name: typo
+type: streamablehttp
+url: https://example.com/mcp
+auth:
+  type: bearer
+  tokn: "sk-typo"
+"#;
+        let err = serde_yaml::from_str::<McpServerConfig>(yaml)
+            .expect_err("unknown field inside auth must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tokn") || msg.contains("unknown field"),
+            "deserialization error must name the unknown field, got: {msg}"
+        );
     }
 }
