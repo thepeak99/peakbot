@@ -584,10 +584,31 @@ impl fmt::Display for McpTransportType {
 pub enum McpAuth {
     /// Static `Authorization: Bearer <token>` header.
     Bearer { token: String },
-    /// OAuth 2.1 + Dynamic Client Registration + PKCE per the MCP
-    /// authorization spec. Slice 1 only parses the variant; Slice 2 wires
-    /// it through `src/mcp_auth.rs`.
-    Oauth,
+    /// OAuth 2.1 + PKCE per the MCP authorization spec. Two modes:
+    ///
+    /// 1. **Dynamic Client Registration** (RFC 7591) — all three fields
+    ///    omitted. The server must advertise a `registration_endpoint`.
+    ///    Used by Linear-shaped MCP servers.
+    /// 2. **Static client credentials** — user pre-registers an OAuth
+    ///    client at the server's console (e.g. Google Cloud Console),
+    ///    pastes `client_id` + `client_secret` + the required `scopes`.
+    ///    Used by Google Workspace MCP servers (Gmail, Drive, Calendar).
+    ///
+    /// `client_id` without `client_secret` is allowed (public client).
+    /// `client_secret` without `client_id` is rejected at [`validate`].
+    /// `scopes` defaults to empty (the DCR path on Linear works
+    /// scope-less); for static-credentials servers the user must list
+    /// the scopes their consent screen was configured for.
+    ///
+    /// [`validate`]: McpServerConfig::validate
+    Oauth {
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
+        scopes: Vec<String>,
+    },
 }
 
 /// Resolved auth strategy after merging the legacy `auth_token` field
@@ -595,8 +616,14 @@ pub enum McpAuth {
 /// [`McpServerConfig::auth_resolved`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedAuth {
-    Bearer { token: String },
-    Oauth,
+    Bearer {
+        token: String,
+    },
+    Oauth {
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        scopes: Vec<String>,
+    },
 }
 
 /// Strip a leading `Bearer ` (case-sensitive — matches the wire spelling)
@@ -671,6 +698,24 @@ impl McpServerConfig {
             ));
         }
 
+        // OAuth inner-shape sanity check: `client_secret` without
+        // `client_id` is nonsensical (the token endpoint authenticates
+        // by client_id; the secret is meaningless on its own). Reject
+        // it at boot so the user sees the typo immediately, not via a
+        // mid-flow OAuth error.
+        if let Some(McpAuth::Oauth {
+            client_id: None,
+            client_secret: Some(_),
+            ..
+        }) = &self.auth
+        {
+            return Err(format!(
+                "MCP server '{}': `auth.client_secret` is set but `auth.client_id` is missing. \
+                 Either provide both (static-credentials path) or remove both (dynamic registration path).",
+                self.name
+            ));
+        }
+
         match self.transport_type {
             McpTransportType::Stdio => {
                 if self.command.is_none() || self.command.as_ref().unwrap().is_empty() {
@@ -716,7 +761,15 @@ impl McpServerConfig {
                     }
                     ResolvedAuth::Bearer { token: cleaned }
                 }
-                McpAuth::Oauth => ResolvedAuth::Oauth,
+                McpAuth::Oauth {
+                    client_id,
+                    client_secret,
+                    scopes,
+                } => ResolvedAuth::Oauth {
+                    client_id: client_id.clone(),
+                    client_secret: client_secret.clone(),
+                    scopes: scopes.clone(),
+                },
             });
         }
         if let Some(raw) = self.auth_token.as_deref() {
@@ -1601,12 +1654,27 @@ auth:
   type: oauth
 "#;
         let config: McpServerConfig = serde_yaml::from_str(yaml).expect("oauth config must parse");
-        assert_eq!(config.auth, Some(McpAuth::Oauth));
+        // DCR shape: all three inner fields default to their empty form.
+        assert_eq!(
+            config.auth,
+            Some(McpAuth::Oauth {
+                client_id: None,
+                client_secret: None,
+                scopes: vec![],
+            })
+        );
         // No legacy field set on the OAuth path.
         assert!(config.auth_token.is_none());
         // The cross-validator must accept the new shape on its own.
         assert!(config.validate().is_ok());
-        assert_eq!(config.auth_resolved(), Some(ResolvedAuth::Oauth));
+        assert_eq!(
+            config.auth_resolved(),
+            Some(ResolvedAuth::Oauth {
+                client_id: None,
+                client_secret: None,
+                scopes: vec![],
+            })
+        );
         assert!(config.deprecation_warnings().is_empty());
     }
 
@@ -1756,6 +1824,131 @@ auth:
         let msg = err.to_string();
         assert!(
             msg.contains("tokn") || msg.contains("unknown field"),
+            "deserialization error must name the unknown field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn oauth_static_credentials_round_trip_through_yaml() {
+        // The Google-Gmail shape: explicit client_id + client_secret +
+        // scopes. All three fields must round-trip into `auth_resolved`
+        // unchanged so downstream `mcp_auth::authorize` can take the
+        // static-credentials path instead of DCR.
+        let yaml = r#"
+name: gmail
+type: streamablehttp
+url: https://gmailmcp.googleapis.com/mcp/v1
+auth:
+  type: oauth
+  client_id: "1234567890.apps.googleusercontent.com"
+  client_secret: "GOCSPX-secretzzz"
+  scopes:
+    - https://www.googleapis.com/auth/gmail.readonly
+    - https://www.googleapis.com/auth/gmail.compose
+"#;
+        let config: McpServerConfig =
+            serde_yaml::from_str(yaml).expect("static-creds oauth config must parse");
+        assert!(config.validate().is_ok());
+        let resolved = config.auth_resolved().expect("resolved should be Some");
+        match resolved {
+            ResolvedAuth::Oauth {
+                client_id,
+                client_secret,
+                scopes,
+            } => {
+                assert_eq!(
+                    client_id.as_deref(),
+                    Some("1234567890.apps.googleusercontent.com")
+                );
+                assert_eq!(client_secret.as_deref(), Some("GOCSPX-secretzzz"));
+                assert_eq!(
+                    scopes,
+                    vec![
+                        "https://www.googleapis.com/auth/gmail.readonly".to_string(),
+                        "https://www.googleapis.com/auth/gmail.compose".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected ResolvedAuth::Oauth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_public_client_no_secret_is_allowed() {
+        // A client_id without a client_secret is a public-client config
+        // (RFC 6749 §2.1) — not all OAuth servers require a secret. The
+        // validator must accept it; the downstream OAuth flow will pass
+        // `None` for the secret to rmcp's `OAuthClientConfig`.
+        let yaml = r#"
+name: public
+type: streamablehttp
+url: https://example.com/mcp
+auth:
+  type: oauth
+  client_id: "public-app-id"
+  scopes:
+    - read
+"#;
+        let config: McpServerConfig =
+            serde_yaml::from_str(yaml).expect("public-client oauth config must parse");
+        assert!(config.validate().is_ok());
+        let resolved = config.auth_resolved().expect("resolved should be Some");
+        assert_eq!(
+            resolved,
+            ResolvedAuth::Oauth {
+                client_id: Some("public-app-id".to_string()),
+                client_secret: None,
+                scopes: vec!["read".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn oauth_client_secret_without_client_id_is_rejected() {
+        // The mirror of the public-client case: secret-without-id makes
+        // no sense (the token endpoint authenticates by client_id). Must
+        // fail at boot, not mid-OAuth-flow.
+        let yaml = r#"
+name: broken
+type: streamablehttp
+url: https://example.com/mcp
+auth:
+  type: oauth
+  client_secret: "GOCSPX-orphaned-secret"
+"#;
+        let config: McpServerConfig =
+            serde_yaml::from_str(yaml).expect("config must parse before validate runs");
+        let err = config
+            .validate()
+            .expect_err("client_secret without client_id must fail validation");
+        assert!(
+            err.contains("client_secret") && err.contains("client_id"),
+            "validation error must name both fields, got: {err}"
+        );
+    }
+
+    #[test]
+    fn oauth_block_rejects_unknown_inner_field() {
+        // Sibling pin to `auth_block_rejects_unknown_inner_field` for
+        // the bearer arm — must also fire on the oauth arm. A typo like
+        // `scope:` (singular) on a Google-shape config would otherwise
+        // silently lose the scopes and fail mid-consent.
+        let yaml = r#"
+name: typo
+type: streamablehttp
+url: https://example.com/mcp
+auth:
+  type: oauth
+  client_id: "id"
+  client_secret: "secret"
+  scope:
+    - read
+"#;
+        let err = serde_yaml::from_str::<McpServerConfig>(yaml)
+            .expect_err("unknown field inside auth.oauth must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("scope") || msg.contains("unknown field"),
             "deserialization error must name the unknown field, got: {msg}"
         );
     }
