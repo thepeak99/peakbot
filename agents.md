@@ -432,6 +432,24 @@ mcp_servers:
     url: https://mcp.linear.app/mcp
     auth:
       type: oauth
+
+  # OAuth 2.1 + static client credentials + PKCE (e.g. Google Workspace).
+  # Google's Gmail/Drive/Calendar MCP servers do NOT support Dynamic
+  # Client Registration — you must create an OAuth 2.0 Desktop-app
+  # client in Google Cloud Console, copy the client_id + client_secret,
+  # and list the exact scopes you configured the consent screen for.
+  # Loopback redirects on any port are accepted (RFC 8252 §7.3), so no
+  # extra coordination with the console is needed.
+  - name: gmail
+    type: streamable-http
+    url: https://gmailmcp.googleapis.com/mcp/v1
+    auth:
+      type: oauth
+      client_id: "1234567890-xxxxxx.apps.googleusercontent.com"
+      client_secret: "GOCSPX-xxxxxxxxxxxx"
+      scopes:
+        - https://www.googleapis.com/auth/gmail.readonly
+        - https://www.googleapis.com/auth/gmail.compose
 ```
 
 > **OAuth on SSH.** When `$SSH_CONNECTION` is set PeakBot prints the

@@ -2395,13 +2395,24 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
         Some(crate::config::ResolvedAuth::Bearer { token }) => {
             transport_config = transport_config.auth_header(token);
         }
-        Some(crate::config::ResolvedAuth::Oauth) => {
-            // Slice 2: wire the full OAuth 2.1 + DCR + PKCE flow.
+        Some(crate::config::ResolvedAuth::Oauth {
+            client_id,
+            client_secret,
+            scopes,
+        }) => {
+            // Slice 2 + Slice 3a: full OAuth 2.1 + PKCE flow.
+            // - `client_id` absent → DCR (Linear shape)
+            // - `client_id` present → static credentials (Google shape)
             // `authorize` returns an `AuthClient<reqwest::Client>` that
             // implements `StreamableHttpClient`, so we feed it into the
             // transport via `with_client` below.
+            let params = crate::mcp_auth::OauthParams {
+                client_id,
+                client_secret,
+                scopes,
+            };
             auth_client = Some(
-                crate::mcp_auth::authorize(&config.name, url)
+                crate::mcp_auth::authorize(&config.name, url, params)
                     .await
                     .map_err(|e| anyhow!("MCP server '{}': {e}", config.name))?,
             );
