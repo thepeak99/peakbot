@@ -414,7 +414,54 @@ mcp_servers:
   - name: filesystem
     command: "npx"
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+
+  # Streamable-HTTP server with a static bearer token.
+  - name: my-bearer-mcp
+    type: streamable-http
+    url: https://example.com/mcp
+    auth:
+      type: bearer
+      token: "xxx-keep-me-secret"
+
+  # OAuth 2.1 + DCR + PKCE (e.g. Linear).
+  # On first connect, PeakBot opens your browser to authorise. The token
+  # is cached under `~/.cache/peakbot/mcp-auth/<name>.json` (mode 0600 on
+  # Unix). Subsequent runs skip the browser. Refresh is silent.
+  - name: linear
+    type: streamable-http
+    url: https://mcp.linear.app/mcp
+    auth:
+      type: oauth
+
+  # OAuth 2.1 + static client credentials + PKCE (e.g. Google Workspace).
+  # Google's Gmail/Drive/Calendar MCP servers do NOT support Dynamic
+  # Client Registration — you must create an OAuth 2.0 Desktop-app
+  # client in Google Cloud Console, copy the client_id + client_secret,
+  # and list the exact scopes you configured the consent screen for.
+  # Loopback redirects on any port are accepted (RFC 8252 §7.3), so no
+  # extra coordination with the console is needed.
+  - name: gmail
+    type: streamable-http
+    url: https://gmailmcp.googleapis.com/mcp/v1
+    auth:
+      type: oauth
+      client_id: "1234567890-xxxxxx.apps.googleusercontent.com"
+      client_secret: "GOCSPX-xxxxxxxxxxxx"
+      scopes:
+        - https://www.googleapis.com/auth/gmail.readonly
+        - https://www.googleapis.com/auth/gmail.compose
 ```
+
+> **OAuth on SSH.** When `$SSH_CONNECTION` is set PeakBot prints the
+> authorisation URL instead of launching a browser (which would open on
+> the wrong machine). To complete the flow from a remote host, forward
+> the ephemeral callback port back to your workstation:
+> `ssh -L 9999:127.0.0.1:9999 user@host` — the URL printed by PeakBot
+> tells you the actual port to use.
+
+> **Deprecated:** the top-level `auth_token: "xxx"` field still works
+> but emits a warning on connect. Migrate to `auth: { type: bearer,
+> token: "xxx" }`. Setting both is a hard config error.
 
 ### Environment Variables
 
