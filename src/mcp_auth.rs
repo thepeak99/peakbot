@@ -42,7 +42,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::{Router, extract::Query, response::Html, routing::get};
 use rmcp::transport::auth::{
-    AuthClient, AuthError, AuthorizationManager, CredentialStore, StoredCredentials,
+    AuthClient, AuthError, AuthorizationManager, CredentialStore, OAuthClientConfig,
+    StoredCredentials,
 };
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -299,14 +300,40 @@ fn open_or_print_url(url: &str, server_name: &str) {
 /// satisfies the transport's bound.
 pub type AuthorizedClient = AuthClient<reqwest::Client>;
 
+/// Per-server OAuth parameters resolved from config and handed to
+/// [`authorize`]. Three knobs control which branch the flow takes:
+///
+/// * `client_id` **absent** → Dynamic Client Registration (RFC 7591).
+///   The server must advertise a `registration_endpoint` in its OAuth
+///   metadata. Used by Linear-shaped MCP servers.
+/// * `client_id` **present** → static-credentials path. We skip DCR
+///   and call rmcp's [`AuthorizationManager::configure_client`] with
+///   the user-supplied id (and optional `client_secret` for
+///   confidential clients). Used by Google Workspace MCP servers.
+///
+/// `scopes` is passed verbatim into both `register_client` and
+/// `get_authorization_url` so the consent screen requests the exact
+/// access the user configured. Empty `scopes` is valid for DCR-style
+/// servers that infer scope from the resource (Linear's behaviour) but
+/// will produce a useless token for scope-strict servers like Google.
+#[derive(Debug, Clone, Default)]
+pub struct OauthParams {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub scopes: Vec<String>,
+}
+
 /// Run the full OAuth 2.1 + PKCE authorisation flow for an MCP server.
 ///
 /// Returns a ready-to-use HTTP client that injects `Authorization: Bearer
 /// <token>` on every request and silently refreshes when the access token
 /// nears expiry.
+///
+/// See [`OauthParams`] for the DCR-vs-static-credentials branching.
 pub async fn authorize(
     server_name: &str,
     mcp_url: &str,
+    params: OauthParams,
 ) -> Result<AuthorizedClient, AuthorizationError> {
     let store =
         FilesystemCredentialStore::for_server(server_name).ok_or(AuthorizationError::NoCacheDir)?;
@@ -333,9 +360,16 @@ pub async fn authorize(
     // ── Bind callback listener (port FIRST, then DCR with the real URI) ────
     //
     // OAuth servers validate `redirect_uri` byte-for-byte against the
-    // value used during DCR, so we must know the ephemeral port BEFORE
-    // we call `register_client`. The autho.md draft had these reversed
-    // and tried to string-replace the port after the fact — rejected.
+    // value used during DCR / client configuration, so we must know the
+    // ephemeral port BEFORE we call `register_client` /
+    // `configure_client`. The autho.md draft had these reversed and
+    // tried to string-replace the port after the fact — rejected.
+    //
+    // For the static-credentials path, the user is expected to have
+    // pre-registered a loopback redirect URI at the OAuth provider's
+    // console. Google's Desktop-app client type explicitly allows
+    // `http://127.0.0.1` with *any* port (RFC 8252 §7.3), which is why
+    // the ephemeral-port pattern works without coordination.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| AuthorizationError::Internal(format!("cannot bind localhost: {e}")))?;
@@ -349,12 +383,39 @@ pub async fn authorize(
         "OAuth: callback listener bound on loopback",
     );
 
-    // ── Dynamic Client Registration ────────────────────────────────────────
-    info!(server = %server_name, "OAuth: registering dynamic client");
-    mgr.register_client("peakbot", &redirect_uri, &[]).await?;
+    // ── Configure the OAuth client (static creds OR dynamic registration) ──
+    //
+    // `scopes` is owned `Vec<String>`; rmcp's APIs want `&[&str]`, so we
+    // borrow once here and reuse the slice in both `register_client`
+    // and `get_authorization_url`. Doing this twice is a footgun:
+    // mismatched scopes between the two calls produced "invalid_scope"
+    // errors in earlier iterations.
+    let scope_refs: Vec<&str> = params.scopes.iter().map(|s| s.as_str()).collect();
+    if let Some(client_id) = params.client_id.as_deref() {
+        info!(
+            server = %server_name,
+            client_id = %client_id,
+            scopes = ?params.scopes,
+            "OAuth: configuring static client credentials (skipping DCR)",
+        );
+        let mut cfg =
+            OAuthClientConfig::new(client_id, &redirect_uri).with_scopes(params.scopes.clone());
+        if let Some(secret) = params.client_secret.as_deref() {
+            cfg = cfg.with_client_secret(secret);
+        }
+        mgr.configure_client(cfg)?;
+    } else {
+        info!(
+            server = %server_name,
+            scopes = ?params.scopes,
+            "OAuth: registering dynamic client",
+        );
+        mgr.register_client("peakbot", &redirect_uri, &scope_refs)
+            .await?;
+    }
 
     // ── Build PKCE authorisation URL ───────────────────────────────────────
-    let auth_url = mgr.get_authorization_url(&[]).await?;
+    let auth_url = mgr.get_authorization_url(&scope_refs).await?;
 
     // Extract the CSRF state from the URL for the axum-side guard.
     // rmcp generates the URL with `state=<csrf_token>`; we don't have a
