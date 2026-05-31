@@ -2,7 +2,7 @@ use crate::utils::strings::truncate_with_suffix;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
-use spider::page::{AntiBotTech, Page};
+use spider::page::Page;
 use spider_transformations::transformation::content::{
     ReturnFormat, TransformConfig, transform_content,
 };
@@ -111,8 +111,8 @@ impl Tool for FetchPageTool {
                 verbatim. If the page returns a transient error (e.g. 429 \
                 rate-limit, a temporary 5xx, or a 403 that only serves to \
                 browsers), it is retried automatically with exponential \
-                backoff; an anti-bot/WAF wall is detected and reported \
-                instead of retried. Output is truncated to 50,000 characters."
+                backoff (a 403 is retried once with a browser user-agent). \
+                Output is truncated to 50,000 characters."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -159,30 +159,18 @@ impl Tool for FetchPageTool {
         let mut browser_ua_tried = false;
 
         // `Page::new_page` never returns `Err` — HTTP failures land in
-        // `page.status_code`, and anti-bot signals in `page.waf_check` /
-        // `page.anti_bot_tech`. Retry policy (no chrome):
+        // `page.status_code`. Retry policy (no chrome):
         //   * transient status (408/425/429/5xx)  → retry with backoff
         //   * 403 Forbidden                        → retry ONCE with a browser UA
-        //   * WAF / anti-bot tech detected         → fail fast (can't beat a JS
-        //                                             challenge without a browser)
         //   * anything else (2xx/3xx/4xx-permanent) → done
+        //
+        // Note: spider's `anti_bot_tech`/`waf_check` fields are populated only
+        // by its chrome fetcher, never by this plain HTTP path — so there's no
+        // WAF detection to act on here. The browser-UA swap is the one cheap
+        // defense available without a real browser.
         let mut page = Page::new_page(&args.url, &client).await;
         for attempt in 0..MAX_RETRIES {
             let status = page.status_code;
-
-            // A real anti-bot wall needs a browser we don't have. Don't burn
-            // retries hammering it — stop and let the caller know.
-            if page.waf_check || page.anti_bot_tech != AntiBotTech::None {
-                tracing::warn!(
-                    target: "peakbot",
-                    tool_type = "fetch_page",
-                    url = %args.url,
-                    waf_check = page.waf_check,
-                    anti_bot_tech = ?page.anti_bot_tech,
-                    "fetch_page hit an anti-bot wall, stopping early"
-                );
-                break;
-            }
 
             let retry = if status.as_u16() == 403 && !browser_ua_tried {
                 // Some sites 403 a non-browser UA. Swap once and rebuild.
