@@ -9,6 +9,14 @@ use spider_transformations::transformation::content::{
 
 const MAX_RESPONSE_CHARS: usize = 50_000;
 
+/// Number of retries after the first attempt when a fetch returns a 4xx
+/// (client error such as 403/429 — some sites block the first hit but serve
+/// a retry). So the URL is fetched up to `1 + MAX_RETRIES` times in total.
+const MAX_RETRIES: usize = 3;
+
+/// Fixed delay between retry attempts.
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Default for the `markdown` arg: convert HTML to Markdown unless the caller
 /// opts out. Kept as a free function so `#[serde(default = …)]` can name it.
 fn default_markdown() -> bool {
@@ -49,7 +57,9 @@ impl Tool for FetchPageTool {
                 HTML pages — the markdown conversion strips boilerplate and makes the content \
                 easy to read. For raw data such as JSON/REST APIs, XML, or plain-text \
                 endpoints, prefer the `fetch_url` tool instead, which returns the body \
-                verbatim. Output is truncated to 50,000 characters."
+                verbatim. If the page returns a 4xx client error (e.g. a temporary \
+                block), it is retried automatically a few times before giving up. \
+                Output is truncated to 50,000 characters."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -97,7 +107,27 @@ impl Tool for FetchPageTool {
             .user_agent("PeakBot/1.0")
             .build()?;
 
-        let page = Page::new_page(&args.url, &client).await;
+        // `Page::new_page` does a one-shot fetch and never returns an `Err` —
+        // HTTP failures land in `page.status_code`. Some sites block the first
+        // hit with a 4xx (403/429); retry up to MAX_RETRIES times with a fixed
+        // delay. Any non-4xx result (success, redirect, or 5xx) stops the loop.
+        let mut page = Page::new_page(&args.url, &client).await;
+        for attempt in 1..=MAX_RETRIES {
+            if !page.status_code.is_client_error() {
+                break;
+            }
+            tracing::warn!(
+                target: "peakbot",
+                tool_type = "fetch_page",
+                url = %args.url,
+                status_code = page.status_code.as_u16(),
+                attempt,
+                max_retries = MAX_RETRIES,
+                "fetch_page got 4xx, retrying after 1s"
+            );
+            tokio::time::sleep(RETRY_DELAY).await;
+            page = Page::new_page(&args.url, &client).await;
+        }
         let status = page.status_code;
 
         let content = if args.markdown {

@@ -15,7 +15,9 @@ This file is the working draft for the next release. When a version is tagged, t
   unchanged and remains the right choice for JSON/REST APIs, XML, and
   other raw-data endpoints; the tool descriptions steer the agent to
   pick `fetch_page` for human-readable pages and `fetch_url` for raw
-  data. Built-in tool count is now **11**. The spider dependency is
+  data. If a page returns a 4xx client error (e.g. a site that blocks
+  the first hit with 403/429), `fetch_page` retries up to 3 times with
+  a 1-second delay before giving up. Built-in tool count is now **11**. The spider dependency is
   pulled with `default-features = false` + `reqwest_rustls_tls` so it
   reuses peakbot's existing reqwest 0.13 / rustls stack and drags in no
   headless-browser, sqlx, or sysinfo baggage.
