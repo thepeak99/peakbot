@@ -15,8 +15,9 @@ const MAX_RESPONSE_CHARS: usize = 50_000;
 const MAX_RETRIES: u32 = 3;
 
 /// Base unit for exponential backoff: `BACKOFF_BASE * 2^attempt`, capped at
-/// `BACKOFF_CAP`. With base 1s the delays are ~1s, 2s, 4s (plus jitter).
-const BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// `BACKOFF_CAP`. With base 3s the delays are ~3s, 6s, then capped at 8s
+/// (plus jitter).
+const BACKOFF_BASE: Duration = Duration::from_secs(3);
 
 /// Upper bound on a single backoff sleep, so a high retry count can't stall
 /// the tool for minutes.
@@ -278,12 +279,16 @@ mod tests {
 
     #[test]
     fn backoff_grows_and_caps() {
-        // Strip jitter (<= 250ms) to assert on the exponential base.
-        let floor = |d: Duration| d.saturating_sub(Duration::from_millis(250));
-        assert!(floor(backoff_with_jitter(0)) <= Duration::from_secs(1));
-        assert!(floor(backoff_with_jitter(1)) >= Duration::from_secs(1));
-        assert!(floor(backoff_with_jitter(2)) >= Duration::from_secs(3));
-        // Large attempt is clamped to the cap (+ jitter), never overflows.
-        assert!(backoff_with_jitter(30) <= BACKOFF_CAP + Duration::from_millis(250));
+        // Jitter is additive in [0, 250ms), so each delay sits in
+        // [exp_base, exp_base + 250ms). BACKOFF_BASE = 3s → 3s, 6s, then
+        // clamped to the 8s cap.
+        let jit = Duration::from_millis(250);
+        let within = |d: Duration, base: Duration| d >= base && d < base + jit;
+        assert!(within(backoff_with_jitter(0), Duration::from_secs(3)));
+        assert!(within(backoff_with_jitter(1), Duration::from_secs(6)));
+        // Attempt 2 would be 12s but is clamped to the 8s cap.
+        assert!(within(backoff_with_jitter(2), BACKOFF_CAP));
+        // Large attempt is clamped to the cap, never overflows.
+        assert!(within(backoff_with_jitter(30), BACKOFF_CAP));
     }
 }
