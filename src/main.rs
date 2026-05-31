@@ -281,7 +281,7 @@ async fn main() -> Result<()> {
         provider_name: provider_info.name.clone(),
         model: provider_info.model.clone(),
         max_tokens: config.max_tokens() as usize,
-        builtin_tools_count: 10, // file_create, file_str_replace, file_insert, file_read, bash, list_directory, fetch_url, think, todo, search
+        builtin_tools_count: 11, // file_create, file_str_replace, file_insert, file_read, bash, list_directory, fetch_url, fetch_page, think, todo, search
         mcp_tools_count,
         skills_count,
         searxng_enabled: config.searxng_enabled(),

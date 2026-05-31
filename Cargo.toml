@@ -62,6 +62,17 @@ open = "5"
 # Required to impl rmcp's `#[async_trait] CredentialStore`.
 async-trait = "0.1"
 
+# Single-page web fetch + HTML→Markdown for the `fetch_page` tool. We use
+# spider purely for `Page::new_page(url, &reqwest::Client)` (one-shot fetch,
+# NOT the crawler) and `spider_transformations::transform_content` for the
+# markdown conversion. `default-features = false` drops chrome/sqlx/sysinfo;
+# `reqwest_rustls_tls` aliases spider's `Client` to a plain `reqwest::Client`
+# on rustls — the same reqwest 0.13 major peakbot already uses, so it dedupes.
+# spider_transformations keeps its default `serde` feature (its chunking
+# module fails to compile without it).
+spider = { version = "2.51", default-features = false, features = ["reqwest_rustls_tls"] }
+spider_transformations = "2.39"
+
 [dev-dependencies]
 tempfile = "3.27"
 insta = { version = "1.40", features = ["yaml", "serde"] }
