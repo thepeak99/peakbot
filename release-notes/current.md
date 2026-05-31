@@ -19,10 +19,8 @@ This file is the working draft for the next release. When a version is tagged, t
   (429 rate-limit, 408/425, or any 5xx) are retried up to 3 times with
   exponential backoff + jitter; a `403 Forbidden` is retried once with a
   realistic browser user-agent (some sites only serve browser-shaped
-  UAs); and a detected anti-bot/WAF wall (Cloudflare, DataDome, etc., via
-  spider's `Page::anti_bot_tech`/`waf_check`) is reported immediately
-  instead of being hammered. Permanent client errors (400/401/404/…) are
-  not retried. Built-in tool count is now **11**. The spider dependency is
+  UAs). Permanent client errors (400/401/404/…) are not retried.
+  Built-in tool count is now **11**. The spider dependency is
   pulled with `default-features = false` + `reqwest_rustls_tls` so it
   reuses peakbot's existing reqwest 0.13 / rustls stack and drags in no
   headless-browser, sqlx, or sysinfo baggage.
