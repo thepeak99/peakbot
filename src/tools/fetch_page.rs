@@ -2,20 +2,70 @@ use crate::utils::strings::truncate_with_suffix;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
-use spider::page::Page;
+use spider::page::{AntiBotTech, Page};
 use spider_transformations::transformation::content::{
     ReturnFormat, TransformConfig, transform_content,
 };
+use std::time::Duration;
 
 const MAX_RESPONSE_CHARS: usize = 50_000;
 
-/// Number of retries after the first attempt when a fetch returns a 4xx
-/// (client error such as 403/429 — some sites block the first hit but serve
-/// a retry). So the URL is fetched up to `1 + MAX_RETRIES` times in total.
-const MAX_RETRIES: usize = 3;
+/// Number of retries after the first attempt. The URL is fetched up to
+/// `1 + MAX_RETRIES` times in total.
+const MAX_RETRIES: u32 = 3;
 
-/// Fixed delay between retry attempts.
-const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Base unit for exponential backoff: `BACKOFF_BASE * 2^attempt`, capped at
+/// `BACKOFF_CAP`. With base 1s the delays are ~1s, 2s, 4s (plus jitter).
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// Upper bound on a single backoff sleep, so a high retry count can't stall
+/// the tool for minutes.
+const BACKOFF_CAP: Duration = Duration::from_secs(8);
+
+/// Honest default user-agent for the first attempt. On a 403/429 retry we swap
+/// to `BROWSER_UA` since some sites serve content only to browser-shaped UAs.
+const DEFAULT_UA: &str = "PeakBot/1.0";
+
+/// Realistic desktop-browser user-agent used on retry when a site blocks the
+/// honest UA. No chrome involved — this is just the request header.
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/// HTTP request timeout, shared by both the default and browser-UA clients.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether an HTTP status is worth retrying. We retry only *transient* codes:
+/// `408 Request Timeout`, `425 Too Early`, `429 Too Many Requests`, and any
+/// `5xx`. `403 Forbidden` is handled separately (retry once with a browser UA).
+/// Permanent client errors (`400`, `401`, `404`, …) never change on retry, so
+/// we don't waste round-trips on them.
+fn is_transient(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error()
+}
+
+/// Backoff for the given attempt (0-indexed): `BACKOFF_BASE * 2^attempt`,
+/// capped, with up to ~250ms of cheap nano-derived jitter so concurrent
+/// callers don't synchronize their retries. No `rand` dependency.
+fn backoff_with_jitter(attempt: u32) -> Duration {
+    let exp = BACKOFF_BASE.saturating_mul(1u32 << attempt.min(16));
+    let base = exp.min(BACKOFF_CAP);
+    // Cheap, dependency-free jitter: low bits of the wall clock in nanos.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let jitter = Duration::from_millis((nanos % 250) as u64);
+    base + jitter
+}
+
+/// Build a one-shot HTTP client with the given user-agent. Spider's `Client`
+/// aliases to `reqwest::Client` under the `reqwest_rustls_tls` feature.
+fn build_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(user_agent)
+        .build()
+}
 
 /// Default for the `markdown` arg: convert HTML to Markdown unless the caller
 /// opts out. Kept as a free function so `#[serde(default = …)]` can name it.
@@ -57,9 +107,11 @@ impl Tool for FetchPageTool {
                 HTML pages — the markdown conversion strips boilerplate and makes the content \
                 easy to read. For raw data such as JSON/REST APIs, XML, or plain-text \
                 endpoints, prefer the `fetch_url` tool instead, which returns the body \
-                verbatim. If the page returns a 4xx client error (e.g. a temporary \
-                block), it is retried automatically a few times before giving up. \
-                Output is truncated to 50,000 characters."
+                verbatim. If the page returns a transient error (e.g. 429 \
+                rate-limit, a temporary 5xx, or a 403 that only serves to \
+                browsers), it is retried automatically with exponential \
+                backoff; an anti-bot/WAF wall is detected and reported \
+                instead of retried. Output is truncated to 50,000 characters."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -100,32 +152,63 @@ impl Tool for FetchPageTool {
         }
 
         // Plain reqwest client (spider's `Client` aliases to `reqwest::Client`
-        // under the `reqwest_rustls_tls` feature). 30s timeout + UA for parity
-        // with `fetch_url`. `Page::new_page` does a one-shot fetch — no crawl.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("PeakBot/1.0")
-            .build()?;
+        // under the `reqwest_rustls_tls` feature). `Page::new_page` does a
+        // one-shot fetch — no crawl. Start honest with `DEFAULT_UA`.
+        let mut client = build_client(DEFAULT_UA)?;
+        let mut browser_ua_tried = false;
 
-        // `Page::new_page` does a one-shot fetch and never returns an `Err` —
-        // HTTP failures land in `page.status_code`. Some sites block the first
-        // hit with a 4xx (403/429); retry up to MAX_RETRIES times with a fixed
-        // delay. Any non-4xx result (success, redirect, or 5xx) stops the loop.
+        // `Page::new_page` never returns `Err` — HTTP failures land in
+        // `page.status_code`, and anti-bot signals in `page.waf_check` /
+        // `page.anti_bot_tech`. Retry policy (no chrome):
+        //   * transient status (408/425/429/5xx)  → retry with backoff
+        //   * 403 Forbidden                        → retry ONCE with a browser UA
+        //   * WAF / anti-bot tech detected         → fail fast (can't beat a JS
+        //                                             challenge without a browser)
+        //   * anything else (2xx/3xx/4xx-permanent) → done
         let mut page = Page::new_page(&args.url, &client).await;
-        for attempt in 1..=MAX_RETRIES {
-            if !page.status_code.is_client_error() {
+        for attempt in 0..MAX_RETRIES {
+            let status = page.status_code;
+
+            // A real anti-bot wall needs a browser we don't have. Don't burn
+            // retries hammering it — stop and let the caller know.
+            if page.waf_check || page.anti_bot_tech != AntiBotTech::None {
+                tracing::warn!(
+                    target: "peakbot",
+                    tool_type = "fetch_page",
+                    url = %args.url,
+                    waf_check = page.waf_check,
+                    anti_bot_tech = ?page.anti_bot_tech,
+                    "fetch_page hit an anti-bot wall, stopping early"
+                );
                 break;
             }
+
+            let retry = if status.as_u16() == 403 && !browser_ua_tried {
+                // Some sites 403 a non-browser UA. Swap once and rebuild.
+                browser_ua_tried = true;
+                client = build_client(BROWSER_UA)?;
+                true
+            } else {
+                is_transient(status)
+            };
+
+            if !retry {
+                break;
+            }
+
+            let delay = backoff_with_jitter(attempt);
             tracing::warn!(
                 target: "peakbot",
                 tool_type = "fetch_page",
                 url = %args.url,
-                status_code = page.status_code.as_u16(),
-                attempt,
+                status_code = status.as_u16(),
+                attempt = attempt + 1,
                 max_retries = MAX_RETRIES,
-                "fetch_page got 4xx, retrying after 1s"
+                backoff_ms = delay.as_millis(),
+                browser_ua = browser_ua_tried,
+                "fetch_page retrying"
             );
-            tokio::time::sleep(RETRY_DELAY).await;
+            tokio::time::sleep(delay).await;
             page = Page::new_page(&args.url, &client).await;
         }
         let status = page.status_code;
@@ -167,5 +250,40 @@ impl Tool for FetchPageTool {
             status.canonical_reason().unwrap_or("Unknown"),
             content
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn transient_statuses_retry() {
+        for code in [408u16, 425, 429, 500, 502, 503, 504] {
+            let s = StatusCode::from_u16(code).unwrap();
+            assert!(is_transient(s), "{code} should be transient");
+        }
+    }
+
+    #[test]
+    fn permanent_statuses_do_not_retry() {
+        // 403 is handled separately (browser-UA swap), so it must NOT be
+        // classified as transient here, alongside the other permanent codes.
+        for code in [200u16, 301, 400, 401, 403, 404, 410] {
+            let s = StatusCode::from_u16(code).unwrap();
+            assert!(!is_transient(s), "{code} should not be transient");
+        }
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        // Strip jitter (<= 250ms) to assert on the exponential base.
+        let floor = |d: Duration| d.saturating_sub(Duration::from_millis(250));
+        assert!(floor(backoff_with_jitter(0)) <= Duration::from_secs(1));
+        assert!(floor(backoff_with_jitter(1)) >= Duration::from_secs(1));
+        assert!(floor(backoff_with_jitter(2)) >= Duration::from_secs(3));
+        // Large attempt is clamped to the cap (+ jitter), never overflows.
+        assert!(backoff_with_jitter(30) <= BACKOFF_CAP + Duration::from_millis(250));
     }
 }

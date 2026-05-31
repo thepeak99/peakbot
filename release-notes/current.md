@@ -15,9 +15,14 @@ This file is the working draft for the next release. When a version is tagged, t
   unchanged and remains the right choice for JSON/REST APIs, XML, and
   other raw-data endpoints; the tool descriptions steer the agent to
   pick `fetch_page` for human-readable pages and `fetch_url` for raw
-  data. If a page returns a 4xx client error (e.g. a site that blocks
-  the first hit with 403/429), `fetch_page` retries up to 3 times with
-  a 1-second delay before giving up. Built-in tool count is now **11**. The spider dependency is
+  data. Retry policy (no headless browser involved): transient failures
+  (429 rate-limit, 408/425, or any 5xx) are retried up to 3 times with
+  exponential backoff + jitter; a `403 Forbidden` is retried once with a
+  realistic browser user-agent (some sites only serve browser-shaped
+  UAs); and a detected anti-bot/WAF wall (Cloudflare, DataDome, etc., via
+  spider's `Page::anti_bot_tech`/`waf_check`) is reported immediately
+  instead of being hammered. Permanent client errors (400/401/404/…) are
+  not retried. Built-in tool count is now **11**. The spider dependency is
   pulled with `default-features = false` + `reqwest_rustls_tls` so it
   reuses peakbot's existing reqwest 0.13 / rustls stack and drags in no
   headless-browser, sqlx, or sysinfo baggage.
