@@ -4,6 +4,27 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **New `fetch_page` tool — websites as clean Markdown.** Added a
+  dedicated tool for fetching web pages and converting them to Markdown
+  (`markdown: true` by default; set `false` for raw HTML). It uses the
+  [`spider`](https://crates.io/crates/spider) crate's single-page
+  primitive (`Page::new_page`) — a one-shot HTTP fetch, *not* the
+  crawler — plus `spider_transformations` for the HTML→Markdown
+  conversion. Output is prefixed with the HTTP status and truncated to
+  50,000 chars, matching `fetch_url`. The existing `fetch_url` tool is
+  unchanged and remains the right choice for JSON/REST APIs, XML, and
+  other raw-data endpoints; the tool descriptions steer the agent to
+  pick `fetch_page` for human-readable pages and `fetch_url` for raw
+  data. Retry policy (no headless browser involved): transient failures
+  (429 rate-limit, 408/425, or any 5xx) are retried up to 3 times with
+  exponential backoff + jitter; a `403 Forbidden` is retried once with a
+  realistic browser user-agent (some sites only serve browser-shaped
+  UAs). Permanent client errors (400/401/404/…) are not retried.
+  Built-in tool count is now **11**. The spider dependency is
+  pulled with `default-features = false` + `reqwest_rustls_tls` so it
+  reuses peakbot's existing reqwest 0.13 / rustls stack and drags in no
+  headless-browser, sqlx, or sysinfo baggage.
+
 - **MCP OAuth static client credentials — Slice 3a (#19).** Extends the
   OAuth 2.1 wiring so PeakBot can connect to MCP servers that don't
   support Dynamic Client Registration — primary target: Google
