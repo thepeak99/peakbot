@@ -5,3 +5,4 @@ output
 *.md
 !release-notes/**/*.md
 .release-version
+.peakbot/vectors.db
