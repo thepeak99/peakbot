@@ -22,13 +22,14 @@ mod tool_use_validator;
 mod tools;
 pub mod ui;
 pub mod utils;
+pub mod vector;
 pub mod vision;
 
 pub use config::{
     AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, LoadedConfig,
     McpServerConfig, McpTransportType, ModelEntry, ModelRegistry, OllamaConfig, OpenRouterConfig,
     PipelineConfig, ProviderConfig, ProviderEntry, ProviderType, RegistryError, ResolvedModel,
-    RetryConfig, SearXngConfig, get_config_file_path,
+    RetryConfig, SearXngConfig, VectorDbConfig, get_config_file_path,
 };
 use context_manager::ContextManager;
 pub use context_manager::{CompactionResult, auto_detect_context_size};
@@ -299,6 +300,10 @@ pub struct RebuildContext {
     pub pipeline_registry: Option<Arc<crate::pipeline::SubAgentRegistry>>,
     /// Detected shell kind — OS-level, so it persists across `/model` switches.
     pub shell_kind: Option<crate::tools::ShellKind>,
+    /// Shared vector store (doc_index / doc_search), if configured. Cheap to
+    /// clone (Arc-backed); persists across `/model` switches like the MCP
+    /// handles, since the DB handle is provider-independent.
+    pub vector_store: Option<crate::vector::VectorStore>,
 }
 
 /// Shared cell holding the *currently active* SessionHook. Replaced
@@ -1239,6 +1244,7 @@ impl AgentRunner {
             ctx.pipeline_registry.as_deref(),
             sm_for_provider.clone(),
             ctx.shell_kind.as_ref(),
+            ctx.vector_store.as_ref(),
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 
