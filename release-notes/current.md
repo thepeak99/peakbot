@@ -28,6 +28,20 @@ This file is the working draft for the next release. When a version is tagged, t
   hits and touches neither disk nor the embeddings endpoint; only the
   first chunk written materializes the store.
 
+  `doc_index` now accepts an optional **free-form `metadata`** object
+  (e.g. `{"author": "...", "book": "...", "year": "..."}`) applied to
+  every chunk of every indexed file. Stored inline on each vector entry,
+  it travels back with every search hit and is rendered next to the
+  result (`[author=…, book=…, year=…]`) so the model can cite sources.
+  The four system-owned keys (`source`, `chunk_index`, `text`, `sha256`)
+  are reserved and silently dropped from user metadata so they can't be
+  shadowed. Metadata is folded into the content hash, so re-indexing the
+  same text with a changed author/book/year correctly counts as an
+  *update* rather than being skipped as unchanged. There is intentionally
+  **no metadata filtering** — `ruvector`'s search filter is a post-top-k
+  `retain`, which would silently miss matching chunks ranked below the
+  cut; metadata here is for citation, not query narrowing.
+
   Configure with an OpenAI-compatible embeddings endpoint (independent
   of the chat provider — OpenAI, llama.cpp, Ollama, LM Studio, TEI, …):
 

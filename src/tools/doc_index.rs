@@ -1,5 +1,6 @@
 //! `doc_index` tool: parse → chunk → embed → store a file or directory.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rig::completion::ToolDefinition;
@@ -15,6 +16,11 @@ pub struct DocIndexArgs {
     /// When `path` is a directory, recurse into subdirectories (default: false).
     #[serde(default)]
     pub recursive: Option<bool>,
+    /// Free-form metadata applied to every chunk of every indexed file
+    /// (e.g. author, book, year). Returned alongside each search hit for
+    /// citation. Reserved keys (source, chunk_index, text, sha256) are ignored.
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +72,11 @@ impl Tool for DocIndexTool {
                         "type": "boolean",
                         "description": "When path is a directory, recurse into subdirectories (default: false).",
                         "default": false
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional free-form metadata applied to every chunk of every indexed file (e.g. {\"author\": \"...\", \"book\": \"...\", \"year\": \"...\"}). Returned alongside each search hit for citation. The reserved keys source, chunk_index, text, and sha256 are ignored.",
+                        "additionalProperties": true
                     }
                 },
                 "required": ["thought", "path"]
@@ -89,7 +100,7 @@ impl Tool for DocIndexTool {
                 report.unsupported += 1;
                 continue;
             }
-            match self.store.index_file(&file).await {
+            match self.store.index_file(&file, &args.metadata).await {
                 Ok(IndexOutcome::Indexed(n)) => {
                     report.indexed += 1;
                     report.chunks += n;

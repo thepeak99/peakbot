@@ -82,14 +82,64 @@ impl Tool for DocSearchTool {
         let mut out = format!("Top {} result(s) for: {}\n", hits.len(), args.query);
         for (i, hit) in hits.iter().enumerate() {
             out.push_str(&format!(
-                "\n[{}] {} (chunk {}, score {:.3})\n{}\n",
+                "\n[{}] {} (chunk {}, score {:.3}){}\n{}\n",
                 i + 1,
                 hit.source,
                 hit.chunk_index,
                 hit.score,
+                format_metadata(&hit.metadata),
                 hit.text.trim()
             ));
         }
         Ok(out)
+    }
+}
+
+/// Render user metadata as ` [key=value, …]`, keys sorted for stable output.
+/// Returns an empty string when there's no metadata so the header line stays
+/// clean for un-annotated documents.
+fn format_metadata(md: &std::collections::HashMap<String, serde_json::Value>) -> String {
+    if md.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<String> = md
+        .iter()
+        .map(|(k, v)| {
+            // Render strings bare (author=Tolkien, not author="Tolkien").
+            let val = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            format!("{k}={val}")
+        })
+        .collect();
+    pairs.sort();
+    format!(" [{}]", pairs.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn format_metadata_empty_is_blank() {
+        assert_eq!(format_metadata(&HashMap::new()), "");
+    }
+
+    #[test]
+    fn format_metadata_sorts_and_unquotes_strings() {
+        let mut md = HashMap::new();
+        md.insert("year".to_string(), serde_json::json!("1954"));
+        md.insert("author".to_string(), serde_json::json!("Tolkien"));
+        // Keys sorted; string values rendered bare (no surrounding quotes).
+        assert_eq!(format_metadata(&md), " [author=Tolkien, year=1954]");
+    }
+
+    #[test]
+    fn format_metadata_renders_non_string_values() {
+        let mut md = HashMap::new();
+        md.insert("page".to_string(), serde_json::json!(12));
+        assert_eq!(format_metadata(&md), " [page=12]");
     }
 }

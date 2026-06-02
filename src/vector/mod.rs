@@ -68,12 +68,20 @@ pub enum VectorStoreError {
     },
 }
 
+/// Reserved metadata keys owned by the store. User-supplied metadata that
+/// collides with any of these is dropped at the boundary so it can never
+/// shadow the fields search relies on.
+const RESERVED_METADATA_KEYS: [&str; 4] = ["source", "chunk_index", "text", "sha256"];
+
 /// One indexed chunk hit returned from a search.
 pub struct Hit {
     pub source: String,
     pub chunk_index: usize,
     pub text: String,
     pub score: f32,
+    /// User-supplied metadata stored at index time (author, book, year, …).
+    /// Reserved keys are already stripped out — this is only the caller's data.
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 /// Per-file outcome counters for an index run.
@@ -161,7 +169,11 @@ impl VectorStore {
     ///
     /// `doc_index` aggregates these outcomes across a directory walk into an
     /// [`IndexReport`].
-    pub async fn index_file(&self, path: &Path) -> Result<IndexOutcome, VectorStoreError> {
+    pub async fn index_file(
+        &self,
+        path: &Path,
+        user_metadata: &HashMap<String, serde_json::Value>,
+    ) -> Result<IndexOutcome, VectorStoreError> {
         if !parse::is_supported(path) {
             return Err(VectorStoreError::Parse(ParseError::Unsupported(
                 parse::extension_of(path),
@@ -170,7 +182,14 @@ impl VectorStore {
 
         let source = path.display().to_string();
         let text = parse::extract_text(path)?;
-        let content_hash = sha256_hex(text.as_bytes());
+
+        // Strip reserved keys once, here at the boundary; the interior trusts
+        // that `clean_metadata` holds only caller-owned fields.
+        let clean_metadata = sanitize_metadata(user_metadata);
+
+        // The hash covers content AND metadata, so re-indexing the same text
+        // with a new author/book/year is an update, not a silent skip.
+        let content_hash = content_hash(&text, &clean_metadata);
 
         // Skip if this exact content is already indexed (id of chunk 0 carries
         // the file's content hash in metadata). One lookup decides both
@@ -196,7 +215,10 @@ impl VectorStore {
         let vectors = self.inner.embeddings.embed(&chunks).await?;
         let mut entries = Vec::with_capacity(chunks.len());
         for (i, (text, vector)) in chunks.into_iter().zip(vectors).enumerate() {
-            let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
+            // Start from the caller's metadata, then layer the reserved system
+            // fields on top — reserved keys always win (they were already
+            // stripped from `clean_metadata`, so this can't conflict).
+            let mut metadata = clean_metadata.clone();
             metadata.insert("source".into(), serde_json::json!(source));
             metadata.insert("chunk_index".into(), serde_json::json!(i));
             metadata.insert("text".into(), serde_json::json!(text));
@@ -264,6 +286,7 @@ impl VectorStore {
                         as usize,
                     text: string_field(&md, "text"),
                     score: r.score,
+                    metadata: strip_reserved(md),
                 }
             })
             .collect();
@@ -349,10 +372,44 @@ fn chunk_id(source: &str, index: usize) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Hash that covers the file text and the (already-sanitized) user metadata.
+/// Folding metadata in means changing only an author/book/year — same text —
+/// still re-indexes instead of being skipped as unchanged. Keys are sorted so
+/// the hash is independent of `HashMap` iteration order.
+fn content_hash(text: &str, metadata: &HashMap<String, serde_json::Value>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    hasher.update(text.as_bytes());
+    let mut keys: Vec<&String> = metadata.keys().collect();
+    keys.sort();
+    for k in keys {
+        hasher.update([0u8]);
+        hasher.update(k.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(metadata[k].to_string().as_bytes());
+    }
     format!("{:x}", hasher.finalize())
+}
+
+/// Drop reserved keys from caller-supplied metadata so it can never shadow the
+/// system fields. Applied once at the index boundary.
+fn sanitize_metadata(
+    md: &HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    md.iter()
+        .filter(|(k, _)| !RESERVED_METADATA_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Remove the system-owned reserved keys, leaving only the caller's metadata.
+/// Used when building a `Hit` so callers see only what they stored.
+fn strip_reserved(
+    mut md: HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    for key in RESERVED_METADATA_KEYS {
+        md.remove(key);
+    }
+    md
 }
 
 fn string_field(md: &HashMap<String, serde_json::Value>, key: &str) -> String {
@@ -386,9 +443,53 @@ mod tests {
     }
 
     #[test]
-    fn sha256_changes_with_content() {
-        assert_ne!(sha256_hex(b"hello"), sha256_hex(b"world"));
-        assert_eq!(sha256_hex(b"hello"), sha256_hex(b"hello"));
+    fn content_hash_changes_with_text_and_metadata() {
+        let empty = HashMap::new();
+        assert_ne!(content_hash("hello", &empty), content_hash("world", &empty));
+        assert_eq!(content_hash("hello", &empty), content_hash("hello", &empty));
+
+        // Same text, different metadata → different hash (so a metadata-only
+        // change still re-indexes instead of being skipped).
+        let mut md = HashMap::new();
+        md.insert("author".to_string(), serde_json::json!("Tolkien"));
+        assert_ne!(content_hash("hello", &empty), content_hash("hello", &md));
+    }
+
+    #[test]
+    fn content_hash_is_key_order_independent() {
+        let mut a = HashMap::new();
+        a.insert("author".to_string(), serde_json::json!("A"));
+        a.insert("year".to_string(), serde_json::json!("1999"));
+        let mut b = HashMap::new();
+        b.insert("year".to_string(), serde_json::json!("1999"));
+        b.insert("author".to_string(), serde_json::json!("A"));
+        assert_eq!(content_hash("t", &a), content_hash("t", &b));
+    }
+
+    #[test]
+    fn sanitize_metadata_drops_reserved_keys() {
+        let mut md = HashMap::new();
+        md.insert("author".to_string(), serde_json::json!("A"));
+        md.insert("source".to_string(), serde_json::json!("hacker.txt"));
+        md.insert("text".to_string(), serde_json::json!("evil"));
+        let clean = sanitize_metadata(&md);
+        assert_eq!(clean.len(), 1);
+        assert!(clean.contains_key("author"));
+        assert!(!clean.contains_key("source"));
+        assert!(!clean.contains_key("text"));
+    }
+
+    #[test]
+    fn strip_reserved_leaves_only_user_metadata() {
+        let mut md = HashMap::new();
+        md.insert("source".to_string(), serde_json::json!("a.txt"));
+        md.insert("chunk_index".to_string(), serde_json::json!(0));
+        md.insert("text".to_string(), serde_json::json!("body"));
+        md.insert("sha256".to_string(), serde_json::json!("deadbeef"));
+        md.insert("book".to_string(), serde_json::json!("LOTR"));
+        let user = strip_reserved(md);
+        assert_eq!(user.len(), 1);
+        assert_eq!(user.get("book"), Some(&serde_json::json!("LOTR")));
     }
 
     /// Re-indexing a file that shrank to fewer chunks must delete the orphaned
