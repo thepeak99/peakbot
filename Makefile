@@ -124,7 +124,9 @@ release-bump:
 	echo "$$v" > .release-version
 
 ## release-tag: Create annotated tag and push branch + tag.
-## If the branch is protected, automatically opens a PR, merges it, then pushes the tag.
+## If the branch is protected, automatically opens a PR, merges it (verifying
+## the merge via the PR's `merged` flag, not the merge response body), then
+## pushes the tag.
 release-tag:
 	@set -eu; \
 	if [ ! -f .release-version ]; then \
@@ -170,8 +172,9 @@ release-tag:
 	    -H "Authorization: token $$GITEA_TOKEN" \
 	    -H "Content-Type: application/json" \
 	    -d '{"Do":"merge","merge_message_field":"chore: release '$$v'","delete_branch_after_merge":true}'); \
-	  if ! echo "$$merge_resp" | jq -e '.sha' >/dev/null 2>&1; then \
-	    echo "❌ Failed to merge PR. Response:"; echo "$$merge_resp" | jq .; exit 1; \
+	  merged=$$(curl -sS -H "Authorization: token $$GITEA_TOKEN" "$$api/pulls/$$pr_num" | jq -r '.merged // false'); \
+	  if [ "$$merged" != "true" ]; then \
+	    echo "❌ Failed to merge PR. Merge response:"; echo "$$merge_resp" | jq . 2>/dev/null || echo "$$merge_resp"; exit 1; \
 	  fi; \
 	  echo "✅ PR merged"; \
 	  git checkout "$$branch"; \
