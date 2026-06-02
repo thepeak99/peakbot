@@ -15,9 +15,32 @@ This file is the working draft for the next release. When a version is tagged, t
   `(source_path, chunk_index)` and the file's content `sha256` is stored
   in metadata, so pointing `doc_index` at a folder again reports
   `indexed N, updated K, skipped M (unchanged)` and never duplicates.
+  Re-indexing a file that **shrank** to fewer chunks now reaps the
+  orphaned trailing chunk rows (deleting from the new chunk count upward
+  until a missing id), so a shrunken or emptied file never leaves stale
+  chunks behind to surface in search.
   Both tools are **opt-in** — they are only registered when a
   `vector_db:` block is present and `enabled`; otherwise they are not
   exposed at all (no silent no-op). Built-in tool count is now **13**.
+  The DB file is created **lazily on the first index** — merely enabling
+  `vector_db` no longer writes `.peakbot/vectors.db` at startup. A
+  read-only session (`doc_search` before anything is indexed) returns no
+  hits and touches neither disk nor the embeddings endpoint; only the
+  first chunk written materializes the store.
+
+  `doc_index` now accepts an optional **free-form `metadata`** object
+  (e.g. `{"author": "...", "book": "...", "year": "..."}`) applied to
+  every chunk of every indexed file. Stored inline on each vector entry,
+  it travels back with every search hit and is rendered next to the
+  result (`[author=…, book=…, year=…]`) so the model can cite sources.
+  The four system-owned keys (`source`, `chunk_index`, `text`, `sha256`)
+  are reserved and silently dropped from user metadata so they can't be
+  shadowed. Metadata is folded into the content hash, so re-indexing the
+  same text with a changed author/book/year correctly counts as an
+  *update* rather than being skipped as unchanged. There is intentionally
+  **no metadata filtering** — `ruvector`'s search filter is a post-top-k
+  `retain`, which would silently miss matching chunks ranked below the
+  cut; metadata here is for citation, not query narrowing.
 
   Configure with an OpenAI-compatible embeddings endpoint (independent
   of the chat provider — OpenAI, llama.cpp, Ollama, LM Studio, TEI, …):
