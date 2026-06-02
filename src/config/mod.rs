@@ -218,6 +218,10 @@ pub struct Config {
     /// Multi-agent pipeline configuration
     #[serde(default)]
     pub pipeline: Option<PipelineConfig>,
+    /// Vector DB configuration (doc_index / doc_search tools).
+    /// When absent, both tools are skipped entirely (not registered).
+    #[serde(default)]
+    pub vector_db: Option<VectorDbConfig>,
 }
 
 /// Multi-agent pipeline configuration
@@ -819,6 +823,48 @@ pub struct SearXngConfig {
     pub bearer_token: Option<String>,
 }
 
+/// Vector DB configuration for the `doc_index` / `doc_search` tools.
+///
+/// When this block is present and `enabled`, a single shared `VectorStore`
+/// is opened at startup and injected into both tools. When absent (or
+/// `enabled: false`), neither tool is registered — there is no silent no-op.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VectorDbConfig {
+    /// Enable/disable the vector tools (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Path to the redb-backed vector store. Per-repo by default.
+    /// ⚠ On reopen, ruvector rebuilds from disk and uses the STORED config
+    /// (dimensions, metric) — the dimensions below are only used to CREATE a
+    /// new DB. A model whose dims differ from an existing DB is rejected.
+    #[serde(default = "default_vector_db_path")]
+    pub db_path: String,
+    /// Embeddings endpoint configuration (independent of the chat provider).
+    pub embeddings: EmbeddingsConfig,
+}
+
+/// Embeddings endpoint — any OpenAI-compatible `POST /v1/embeddings` server
+/// (OpenAI, llama.cpp, Ollama, LM Studio, TEI, …).
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingsConfig {
+    /// Base URL of the embeddings server, e.g. `https://api.openai.com/v1`.
+    pub base_url: String,
+    /// API key. Optional for local servers that don't authenticate.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Embedding model name, e.g. `text-embedding-3-small`.
+    pub model: String,
+    /// Output dimensionality of the model. Must match the model's real output
+    /// and the dimensions of an existing DB at `db_path`.
+    pub dimensions: usize,
+}
+
+fn default_vector_db_path() -> String {
+    "./.peakbot/vectors.db".to_string()
+}
+
 /// Configuration for context compaction
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1077,6 +1123,7 @@ impl Default for Config {
             bash: BashConfig::default(),
             retry: RetryConfig::default(),
             pipeline: None,
+            vector_db: None,
         }
     }
 }

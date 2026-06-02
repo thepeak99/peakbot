@@ -4,6 +4,45 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Semantic document memory — new `doc_index` / `doc_search` tools
+  (Phase 1).** PeakBot can now build a persistent, per-repo semantic
+  index over documents and retrieve the most relevant chunks by meaning.
+  `doc_index` parses a file or directory (txt, md, source code, HTML,
+  PDF, DOCX), splits the text into overlapping chunks, embeds them, and
+  stores them; `doc_search` embeds a query and returns the top-k most
+  similar chunks with their source and similarity score. Re-indexing is
+  **idempotent**: each chunk's id is a stable hash of
+  `(source_path, chunk_index)` and the file's content `sha256` is stored
+  in metadata, so pointing `doc_index` at a folder again reports
+  `indexed N, updated K, skipped M (unchanged)` and never duplicates.
+  Both tools are **opt-in** — they are only registered when a
+  `vector_db:` block is present and `enabled`; otherwise they are not
+  exposed at all (no silent no-op). Built-in tool count is now **13**.
+
+  Configure with an OpenAI-compatible embeddings endpoint (independent
+  of the chat provider — OpenAI, llama.cpp, Ollama, LM Studio, TEI, …):
+
+  ```yaml
+  vector_db:
+    enabled: true
+    db_path: ./.peakbot/vectors.db          # per-repo; default if omitted
+    embeddings:
+      base_url: https://api.openai.com/v1
+      api_key: sk-...                        # optional for local servers
+      model: text-embedding-3-small
+      dimensions: 1536                        # must match the model
+  ```
+
+  Storage is [`ruvector-core`](https://crates.io/crates/ruvector-core)
+  (embedded HNSW index + redb persistence), pulled with
+  `default-features = false` so it drags in **no** duplicate reqwest and
+  **no** `simsimd` C library — keeping the Linux/Windows/macOS
+  cross-compiles clean. PDF text extraction uses the pure-Rust
+  `pdfsink-rs`; DOCX uses `docx-lite`; HTML reuses the existing
+  `spider_transformations` text extractor. The vector DB file is
+  gitignored. Dimension mismatches (model vs. existing DB) surface as a
+  clear, actionable error rather than silent corruption.
+
 - **New `fetch_page` tool — websites as clean Markdown.** Added a
   dedicated tool for fetching web pages and converting them to Markdown
   (`markdown: true` by default; set `false` for raw HTML). It uses the

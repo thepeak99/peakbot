@@ -168,6 +168,7 @@ pub fn create_provider(
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
+    vector_store: Option<&crate::vector::VectorStore>,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
@@ -187,6 +188,7 @@ pub fn create_provider(
                 pipeline_registry,
                 state_manager,
                 shell_kind,
+                vector_store,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -207,6 +209,7 @@ pub fn create_provider(
                 pipeline_registry,
                 state_manager,
                 shell_kind,
+                vector_store,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -227,6 +230,7 @@ pub fn create_provider(
                 pipeline_registry,
                 state_manager,
                 shell_kind,
+                vector_store,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -247,6 +251,7 @@ pub fn create_provider(
                 pipeline_registry,
                 state_manager,
                 shell_kind,
+                vector_store,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -345,6 +350,7 @@ fn add_builtin_tools<M, P>(
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Option<Arc<StateManager>>,
     shell_kind: Option<&ShellKind>,
+    vector_store: Option<&crate::vector::VectorStore>,
 ) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
 where
     M: rig::completion::CompletionModel,
@@ -414,6 +420,13 @@ where
         builder = builder.tool(SearchTool::new(config));
     }
 
+    // Conditionally add the vector tools when a store is configured.
+    if let Some(store) = vector_store {
+        builder = builder
+            .tool(crate::tools::DocIndexTool::new(store.clone()))
+            .tool(crate::tools::DocSearchTool::new(store.clone()));
+    }
+
     // Add DelegateTool if pipeline is enabled
     if let Some(registry) = pipeline_registry {
         let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(registry.clone()));
@@ -441,6 +454,7 @@ fn create_openrouter_agent(
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
+    vector_store: Option<&crate::vector::VectorStore>,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -491,6 +505,7 @@ fn create_openrouter_agent(
         pipeline_registry,
         Some(state_manager.clone()),
         shell_kind,
+        vector_store,
     );
 
     // Add MCP tools and build
@@ -522,6 +537,7 @@ fn create_ollama_agent(
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
+    vector_store: Option<&crate::vector::VectorStore>,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -561,6 +577,7 @@ fn create_ollama_agent(
         pipeline_registry,
         Some(state_manager.clone()),
         shell_kind,
+        vector_store,
     );
 
     // Add MCP tools and build
@@ -592,6 +609,7 @@ fn create_openai_agent(
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
+    vector_store: Option<&crate::vector::VectorStore>,
 ) -> Result<(
     Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -644,6 +662,7 @@ fn create_openai_agent(
         pipeline_registry,
         Some(state_manager.clone()),
         shell_kind,
+        vector_store,
     );
 
     // Add MCP tools and build
@@ -675,6 +694,7 @@ fn create_llamacpp_agent(
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
+    vector_store: Option<&crate::vector::VectorStore>,
 ) -> Result<(
     Agent<rig::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -730,6 +750,7 @@ fn create_llamacpp_agent(
         pipeline_registry,
         Some(state_manager.clone()),
         shell_kind,
+        vector_store,
     );
 
     // Add MCP tools and build

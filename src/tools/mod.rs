@@ -1,5 +1,7 @@
 mod bash;
 mod bash_bg;
+mod doc_index;
+mod doc_search;
 mod fetch_page;
 mod fetch_url;
 pub mod file_edit;
@@ -13,6 +15,8 @@ pub mod todo;
 
 pub use bash::BashTool;
 pub use bash_bg::BashBgTool;
+pub use doc_index::DocIndexTool;
+pub use doc_search::DocSearchTool;
 pub use fetch_page::FetchPageTool;
 pub use fetch_url::FetchUrlTool;
 pub use file_edit::{FileCreateTool, FileInsertTool, FileStrReplaceTool};
