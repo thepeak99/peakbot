@@ -7,12 +7,22 @@
 //! correct shape — two independently-opened handles on the same path would
 //! race.
 //!
+//! ## Lazy materialization
+//! Opening the store builds only the embeddings client — it touches no disk.
+//! The redb file at `db_path` is created on the **first write** (first
+//! `index_file` that actually inserts chunks). Reads (`search`) and the
+//! re-index skip-check before that point are pure no-ops: config-enabled is
+//! not the same as on-disk. All DB access routes through one lazily-initialised
+//! cell so the "nothing on disk until first index" invariant holds everywhere.
+//!
 //! ## Idempotent re-index
 //! Each chunk's id is a stable hash of `(source_path, chunk_index)`, so
 //! re-indexing an unchanged file overwrites the same ids (no duplicates). We
 //! also store the file's content `sha256` in metadata, letting `doc_index`
 //! skip files whose hash is unchanged — making "point it at the folder again"
-//! safe and fast.
+//! safe and fast. When a file shrinks to fewer chunks, the now-orphaned
+//! trailing rows are reaped (`delete_chunks_from`) so a shrunken or emptied
+//! file leaves nothing stale behind.
 
 mod chunk;
 mod embeddings;
@@ -26,6 +36,7 @@ use ruvector_core::types::{DbOptions, DistanceMetric, SearchQuery, VectorEntry};
 use ruvector_core::vector_db::VectorDB;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::OnceCell;
 
 use crate::config::VectorDbConfig;
 
@@ -80,50 +91,67 @@ pub struct IndexReport {
     pub chunks: usize,
 }
 
-/// Shared vector store. Cheap to clone (everything is `Arc`-backed).
+/// Shared vector store. Cheap to clone (everything is `Arc`-backed). The redb
+/// file is created lazily on the first write — see the module-level
+/// "Lazy materialization" note.
 #[derive(Clone)]
 pub struct VectorStore {
-    db: Arc<VectorDB>,
+    inner: Arc<StoreInner>,
+}
+
+struct StoreInner {
+    /// The redb-backed DB handle, created on first write. `None` until then.
+    db: OnceCell<Arc<VectorDB>>,
+    /// Where the DB will be created. Held so materialization is config-free.
+    db_path: String,
     embeddings: EmbeddingsClient,
 }
 
 impl VectorStore {
-    /// Open (or create) the store at `config.db_path` and build the embeddings
-    /// client. The parent directory is created if missing.
+    /// Build the store. Touches no disk: only constructs the embeddings client
+    /// and records where the DB *will* live. The redb file is created on the
+    /// first write (see [`VectorStore::db`]).
+    pub fn open(config: &VectorDbConfig) -> Result<Self, VectorStoreError> {
+        let embeddings = EmbeddingsClient::new(&config.embeddings);
+        Ok(Self {
+            inner: Arc::new(StoreInner {
+                db: OnceCell::new(),
+                db_path: config.db_path.clone(),
+                embeddings,
+            }),
+        })
+    }
+
+    /// The DB handle, creating the redb file (and parent dir) on first call.
+    /// This is the **only** path that materializes the store — call it solely
+    /// when about to write.
     ///
     /// ⚠ On reopen of an existing path, ruvector rebuilds the index from disk
-    /// using the STORED dimensions/metric — the `DbOptions` passed here only
-    /// take effect when creating a fresh DB. A model whose output dimension
-    /// differs from an existing DB surfaces as a clear error on first insert
-    /// (via [`EmbeddingsError::DimMismatch`] / a ruvector dimension error),
-    /// never as silent corruption.
-    pub fn open(config: &VectorDbConfig) -> Result<Self, VectorStoreError> {
-        let path = PathBuf::from(&config.db_path);
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|source| VectorStoreError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
-        }
+    /// using the STORED dimensions/metric — the `DbOptions` here only take
+    /// effect when creating a fresh DB. A model whose output dimension differs
+    /// from an existing DB surfaces as a clear error on insert, never as silent
+    /// corruption.
+    async fn db(&self) -> Result<Arc<VectorDB>, VectorStoreError> {
+        let db = self
+            .inner
+            .db
+            .get_or_try_init(|| async {
+                let path = self.inner.db_path.clone();
+                let dimensions = self.inner.embeddings.dimensions();
+                // ruvector's create is sync + does disk IO — keep it off the
+                // async runtime.
+                tokio::task::spawn_blocking(move || create_db(&path, dimensions))
+                    .await
+                    .expect("vector db create task panicked")
+            })
+            .await?;
+        Ok(db.clone())
+    }
 
-        let embeddings = EmbeddingsClient::new(&config.embeddings);
-        let opts = DbOptions {
-            dimensions: embeddings.dimensions(),
-            distance_metric: DistanceMetric::Cosine,
-            storage_path: config.db_path.clone(),
-            ..Default::default()
-        };
-        let db = VectorDB::new(opts).map_err(|source| VectorStoreError::Open {
-            path: config.db_path.clone(),
-            source,
-        })?;
-
-        Ok(Self {
-            db: Arc::new(db),
-            embeddings,
-        })
+    /// The DB handle iff it has already been materialized. Reads use this so
+    /// they never create the file: an un-indexed store is empty by definition.
+    fn db_if_materialized(&self) -> Option<Arc<VectorDB>> {
+        self.inner.db.get().cloned()
     }
 
     /// Index a single file: parse → chunk → embed → upsert. Returns the number
@@ -155,16 +183,17 @@ impl VectorStore {
 
         let chunks = chunk::split(&text);
         if chunks.is_empty() {
-            // Empty/whitespace-only file: nothing to index, but it's not an
-            // error. Treat as zero-chunk index.
-            return Ok(if is_update {
-                IndexOutcome::Updated(0)
-            } else {
-                IndexOutcome::Indexed(0)
-            });
+            // Empty/whitespace-only file: nothing to index. If this file had
+            // chunks before, reap them all so the now-empty file leaves nothing
+            // behind in the store.
+            if is_update {
+                self.delete_chunks_from(&source, 0).await?;
+                return Ok(IndexOutcome::Updated(0));
+            }
+            return Ok(IndexOutcome::Indexed(0));
         }
 
-        let vectors = self.embeddings.embed(&chunks).await?;
+        let vectors = self.inner.embeddings.embed(&chunks).await?;
         let mut entries = Vec::with_capacity(chunks.len());
         for (i, (text, vector)) in chunks.into_iter().zip(vectors).enumerate() {
             let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
@@ -180,12 +209,19 @@ impl VectorStore {
         }
 
         let n = entries.len();
-        // ruvector's VectorDB is sync; run the insert off the async runtime so
-        // the agent loop isn't starved on a large batch.
-        let db = self.db.clone();
+        // The first write materializes the store. ruvector's VectorDB is sync;
+        // run the insert off the async runtime so the agent loop isn't starved.
+        let db = self.db().await?;
         tokio::task::spawn_blocking(move || db.insert_batch(&entries))
             .await
             .expect("vector insert task panicked")?;
+
+        // If the file shrank, chunks 0..n were overwritten in place but any
+        // higher-indexed rows from the previous version are now orphans. Reap
+        // them. (No-op for a brand-new file, and cheap when nothing shrank.)
+        if is_update {
+            self.delete_chunks_from(&source, n).await?;
+        }
 
         Ok(if is_update {
             IndexOutcome::Updated(n)
@@ -194,14 +230,19 @@ impl VectorStore {
         })
     }
 
-    /// Embed `query` and return the top `k` most similar chunks.
+    /// Embed `query` and return the top `k` most similar chunks. If nothing has
+    /// been indexed yet the store isn't materialized — return no hits without
+    /// touching the network or disk.
     pub async fn search(&self, query: &str, k: usize) -> Result<Vec<Hit>, VectorStoreError> {
+        let Some(db) = self.db_if_materialized() else {
+            return Ok(Vec::new());
+        };
+
         let vector = {
-            let mut v = self.embeddings.embed(&[query.to_string()]).await?;
+            let mut v = self.inner.embeddings.embed(&[query.to_string()]).await?;
             v.pop().unwrap_or_default()
         };
 
-        let db = self.db.clone();
         let results = tokio::task::spawn_blocking(move || {
             db.search(SearchQuery {
                 vector,
@@ -230,10 +271,15 @@ impl VectorStore {
     }
 
     /// The content hash stored for a file's chunk 0, if the file was indexed
-    /// before. Returns `None` if the file is not in the store.
+    /// before. Returns `None` if the file is not in the store — including the
+    /// case where nothing has been indexed yet (store not materialized), which
+    /// must not create the DB file.
     fn stored_hash(&self, source: &str) -> Result<Option<String>, VectorStoreError> {
+        let Some(db) = self.db_if_materialized() else {
+            return Ok(None);
+        };
         let id = chunk_id(source, 0);
-        match self.db.get(&id)? {
+        match db.get(&id)? {
             Some(entry) => Ok(entry
                 .metadata
                 .as_ref()
@@ -242,6 +288,55 @@ impl VectorStore {
             None => Ok(None),
         }
     }
+
+    /// Delete chunk rows for `source` from index `start` upward, stopping at the
+    /// first absent id. Chunks are always written as a contiguous `0..count`
+    /// run, so a miss means we've passed the end. Used after a re-index to
+    /// reap orphans left when a file shrinks to fewer chunks (or to zero). A
+    /// no-op when the store isn't materialized (nothing to delete).
+    async fn delete_chunks_from(&self, source: &str, start: usize) -> Result<(), VectorStoreError> {
+        let Some(db) = self.db_if_materialized() else {
+            return Ok(());
+        };
+        let source = source.to_string();
+        tokio::task::spawn_blocking(move || -> Result<(), VectorStoreError> {
+            let mut i = start;
+            // `delete` returns false when the id was absent — our stop signal.
+            while db.delete(&chunk_id(&source, i))? {
+                i += 1;
+            }
+            Ok(())
+        })
+        .await
+        .expect("vector delete task panicked")
+    }
+}
+
+/// Create (or reopen) the redb-backed DB at `db_path`, creating the parent
+/// directory if missing. This is the single point that touches disk, invoked
+/// lazily from [`VectorStore::db`] on the first write.
+fn create_db(db_path: &str, dimensions: usize) -> Result<Arc<VectorDB>, VectorStoreError> {
+    let path = PathBuf::from(db_path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| VectorStoreError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+
+    let opts = DbOptions {
+        dimensions,
+        distance_metric: DistanceMetric::Cosine,
+        storage_path: db_path.to_string(),
+        ..Default::default()
+    };
+    let db = VectorDB::new(opts).map_err(|source| VectorStoreError::Open {
+        path: db_path.to_string(),
+        source,
+    })?;
+    Ok(Arc::new(db))
 }
 
 /// Stable, deterministic id for a chunk: `sha256(source + "\0" + index)`.
@@ -281,6 +376,7 @@ pub enum IndexOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::EmbeddingsConfig;
 
     #[test]
     fn chunk_id_is_stable_and_index_sensitive() {
@@ -293,6 +389,93 @@ mod tests {
     fn sha256_changes_with_content() {
         assert_ne!(sha256_hex(b"hello"), sha256_hex(b"world"));
         assert_eq!(sha256_hex(b"hello"), sha256_hex(b"hello"));
+    }
+
+    /// Re-indexing a file that shrank to fewer chunks must delete the orphaned
+    /// trailing chunks, not leave them behind to surface in search. Exercises
+    /// the deletion primitive directly with synthetic rows so no embeddings
+    /// endpoint is needed.
+    #[tokio::test]
+    async fn delete_chunks_from_removes_trailing_orphans() {
+        use ruvector_core::types::VectorEntry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = VectorDbConfig {
+            enabled: true,
+            db_path: dir.path().join("v.db").display().to_string(),
+            embeddings: EmbeddingsConfig {
+                base_url: "http://unused.invalid".into(),
+                api_key: None,
+                model: "test".into(),
+                dimensions: 3,
+            },
+        };
+        let store = VectorStore::open(&config).unwrap();
+        // Materialize the DB so we can seed it directly.
+        let db = store.db().await.unwrap();
+
+        // Seed a 3-chunk file: chunks 0, 1, 2.
+        let source = "shrinking.txt";
+        let entries: Vec<VectorEntry> = (0..3)
+            .map(|i| VectorEntry {
+                id: Some(chunk_id(source, i)),
+                vector: vec![i as f32, 0.0, 0.0],
+                metadata: None,
+            })
+            .collect();
+        db.insert_batch(&entries).unwrap();
+
+        // File shrank to 1 chunk → delete everything from index 1 onward.
+        store.delete_chunks_from(source, 1).await.unwrap();
+
+        assert!(
+            db.get(&chunk_id(source, 0)).unwrap().is_some(),
+            "chunk 0 must survive"
+        );
+        assert!(
+            db.get(&chunk_id(source, 1)).unwrap().is_none(),
+            "orphan chunk 1 must be deleted"
+        );
+        assert!(
+            db.get(&chunk_id(source, 2)).unwrap().is_none(),
+            "orphan chunk 2 must be deleted"
+        );
+    }
+
+    /// The store must not touch disk until the first *write*. Opening it,
+    /// and even searching before anything is indexed, must leave the path
+    /// untouched; only the first index materializes the DB file. Exercises the
+    /// invariant directly via the getters so no embeddings endpoint is needed.
+    #[tokio::test]
+    async fn open_does_not_create_db_until_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sub").join("vectors.db");
+        let config = VectorDbConfig {
+            enabled: true,
+            db_path: db_path.display().to_string(),
+            embeddings: EmbeddingsConfig {
+                base_url: "http://unused.invalid".into(),
+                api_key: None,
+                model: "test".into(),
+                dimensions: 3,
+            },
+        };
+
+        let store = VectorStore::open(&config).unwrap();
+        assert!(!db_path.exists(), "open() must not create the DB file");
+
+        // A read (search) before anything is indexed is a pure no-op: empty
+        // results, no network embed call, no DB file.
+        let hits = store.search("anything", 3).await.unwrap();
+        assert!(hits.is_empty(), "search on an empty store returns no hits");
+        assert!(
+            !db_path.exists(),
+            "search before any index must not create the DB"
+        );
+
+        // The first write materializes the store.
+        let _db = store.db().await.unwrap();
+        assert!(db_path.exists(), "first write must create the DB file");
     }
 
     #[test]
