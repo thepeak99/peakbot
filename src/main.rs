@@ -199,6 +199,29 @@ async fn main() -> Result<()> {
         print_no_shell_warning();
     }
 
+    // Build the shared vector store (doc_index / doc_search) when configured
+    // and enabled. Opened once here and injected into both tools via the
+    // provider builder; reused across `/model` switches via RebuildContext.
+    // A failure to open is non-fatal — we warn and continue without the tools,
+    // matching how a missing shell degrades gracefully.
+    let vector_store = match config.vector_db.as_ref() {
+        Some(vc) if vc.enabled => match peakbot::vector::VectorStore::open(vc) {
+            Ok(store) => {
+                tracing::info!("Vector store enabled at: {}", vc.db_path);
+                Some(store)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to open vector store at {}: {e}. \
+                     Continuing without doc_index/doc_search.",
+                    vc.db_path
+                );
+                None
+            }
+        },
+        _ => None,
+    };
+
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
         &boot_provider_config,
         mcp_tools,
@@ -210,6 +233,7 @@ async fn main() -> Result<()> {
         pipeline_registry.as_ref(),
         state_manager.clone(),
         shell_kind.as_ref(),
+        vector_store.as_ref(),
     )?;
 
     tracing::info!(
@@ -250,6 +274,7 @@ async fn main() -> Result<()> {
         bash_config: config.bash.clone(),
         pipeline_registry: pipeline_registry.clone().map(Arc::new),
         shell_kind,
+        vector_store,
     };
 
     // Resolve the boot model's context_size (from config or auto-detected).

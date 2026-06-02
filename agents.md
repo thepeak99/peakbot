@@ -239,11 +239,14 @@ All tools live in `src/tools/` and implement `rig::tool::Tool`. Each tool define
 - `definition()` -- returns the JSON Schema the model uses to know what to send
 - `call()` -- executes the tool logic
 
-PeakBot includes **11 built-in tools**:
+PeakBot includes **11 always-on built-in tools** (plus 2 opt-in vector
+tools, see below):
 
 ### Tools Overview
 
-PeakBot includes **11 built-in tools** (all always available):
+PeakBot includes **11 always-on built-in tools**, plus **2 opt-in vector
+tools** (`doc_index` / `doc_search`) registered only when a `vector_db:`
+block is configured — **13 total** when the vector store is enabled:
 
 | Tool | File | Description |
 |------|------|-------------|
@@ -258,8 +261,19 @@ PeakBot includes **11 built-in tools** (all always available):
 | `web_search` | `search.rs` | SearXNG-based web search |
 | `think` | `think.rs` | Reasoning tool for complex thinking |
 | `todo` | `todo.rs` | Todo list management |
+| `doc_index` *(opt-in)* | `doc_index.rs` | Parse → chunk → embed → store a file/dir into the semantic vector store. Idempotent re-index (skips unchanged files via stored `sha256`). Registered only when `vector_db:` is configured. |
+| `doc_search` *(opt-in)* | `doc_search.rs` | Embed a query and return the top-k most relevant indexed chunks with source + score. Registered only when `vector_db:` is configured. |
 
 Plus optional **MCP tools** from configured servers.
+
+The two vector tools share a single `VectorStore` (`src/vector/mod.rs`)
+built once at startup and injected into both — the same injection pattern
+as `SearchTool::new(config)`. The store wraps a `ruvector-core` `VectorDB`
+(HNSW + redb) behind `Arc` (single redb writer) plus an `EmbeddingsClient`
+(`src/vector/embeddings.rs`) that hits any OpenAI-compatible
+`/v1/embeddings` endpoint. Sync DB ops run under `spawn_blocking`. See the
+`vector_db:` config block under [Configuration](#configuration).
+
 
 ## Data Flow
 
@@ -398,6 +412,26 @@ searxng:
   timeout_seconds: 30
   max_results: 10
   bearer_token: "optional-token"   # optional: sent as `Authorization: Bearer …`
+
+# Vector DB — semantic document memory (doc_index / doc_search tools).
+# When this block is absent or `enabled: false`, neither tool is registered.
+vector_db:
+  enabled: true
+  db_path: ./.peakbot/vectors.db              # per-repo; default if omitted
+  embeddings:
+    base_url: https://api.openai.com/v1        # any OpenAI-compatible endpoint
+    api_key: sk-...                            # optional for local servers
+    model: text-embedding-3-small
+    dimensions: 1536                           # must match the model's output
+# Notes:
+#   - The embeddings endpoint is configured independently of the chat
+#     provider — point it at OpenAI, llama.cpp, Ollama, LM Studio, TEI, etc.
+#   - `dimensions` must match the model AND any existing DB at `db_path`.
+#     On reopen, ruvector uses the STORED dimensions/metric; a model whose
+#     dims differ from the existing DB is rejected with an actionable error.
+#   - Chunk size (1000 chars), overlap (200), distance (Cosine), and default
+#     `k` (5) are constants, not config.
+#   - `.peakbot/vectors.db` is gitignored.
 
 # Context compaction settings
 context:
@@ -580,6 +614,11 @@ src/
 ├── context_manager.rs      # Context compaction for long conversations
 ├── conversation.rs         # Conversation data structures
 ├── conversation_manager.rs # Conversation persistence manager
+├── vector/                 # Semantic document memory (doc_index / doc_search)
+│   ├── mod.rs              # VectorStore (Arc<VectorDB> + EmbeddingsClient); open/index_file/search; id hashing; spawn_blocking
+│   ├── embeddings.rs       # EmbeddingsClient -- reqwest → /v1/embeddings, batched, dim-validated
+│   ├── parse.rs            # extract_text(path) -- dispatch by ext (txt/md/src/html/pdf/docx)
+│   └── chunk.rs            # split(text) -- overlapping char windows (size+overlap constants)
 ├── system_prompt.txt       # Base system prompt (included at compile time)
 ├── providers/
 │   └── mod.rs              # Provider abstraction (OpenRouter, OpenAI, LlamaCpp, Ollama), DynAgent, CostTracker
@@ -609,6 +648,8 @@ src/
     ├── mod.rs              # Re-exports: all built-in tools
     ├── bash.rs             # BashTool -- shell execution with timeout
     ├── bash_bg.rs          # BashBgTool -- start/stop/list/send_line long-running PTY processes
+    ├── doc_index.rs        # DocIndexTool -- parse/chunk/embed/store a file or dir (opt-in)
+    ├── doc_search.rs       # DocSearchTool -- semantic top-k search over the store (opt-in)
     ├── fetch_url.rs        # FetchUrlTool -- HTTP GET requests
     ├── file_edit/          # File-editing tool family (shared helpers in mod.rs)
     │   ├── mod.rs              # MatchLevel, FileEditError, matching + IO helpers, tests

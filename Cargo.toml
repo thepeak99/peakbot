@@ -73,6 +73,21 @@ async-trait = "0.1"
 spider = { version = "2.51", default-features = false, features = ["reqwest_rustls_tls"] }
 spider_transformations = "2.39"
 
+# Vector DB (doc_index / doc_search tools). `default-features = false` drops
+# ruvector's `api-embeddings` (a duplicate reqwest 0.11) and `simd` (the
+# `simsimd` C lib) — both would break the mingw/zigbuild cross-compiles.
+# We bring our own embeddings client and rely on ruvector's pure-Rust distance
+# fallback. `uuid-support` is intentionally omitted: ids are self-assigned as a
+# stable hash of (source, chunk_index) for idempotent re-index, so the DB never
+# auto-generates uuids. Backends: hnsw_rs (index) + redb (persistence).
+ruvector-core = { version = "=2.2.0", default-features = false, features = ["hnsw", "storage", "parallel"] }
+# PDF text extraction (MIT, pure-Rust; built on lopdf + pdf-extract).
+pdfsink-rs = "0.2.8"
+# DOCX text extraction (MIT/Apache, pure-Rust; deps = quick-xml + zip + thiserror).
+docx-lite = "0.2"
+# Chunk hashing for idempotent re-index (stable id + content sha256).
+sha2 = "0.10"
+
 [dev-dependencies]
 tempfile = "3.27"
 insta = { version = "1.40", features = ["yaml", "serde"] }
