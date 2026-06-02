@@ -15,9 +15,18 @@ This file is the working draft for the next release. When a version is tagged, t
   `(source_path, chunk_index)` and the file's content `sha256` is stored
   in metadata, so pointing `doc_index` at a folder again reports
   `indexed N, updated K, skipped M (unchanged)` and never duplicates.
+  Re-indexing a file that **shrank** to fewer chunks now reaps the
+  orphaned trailing chunk rows (deleting from the new chunk count upward
+  until a missing id), so a shrunken or emptied file never leaves stale
+  chunks behind to surface in search.
   Both tools are **opt-in** — they are only registered when a
   `vector_db:` block is present and `enabled`; otherwise they are not
   exposed at all (no silent no-op). Built-in tool count is now **13**.
+  The DB file is created **lazily on the first index** — merely enabling
+  `vector_db` no longer writes `.peakbot/vectors.db` at startup. A
+  read-only session (`doc_search` before anything is indexed) returns no
+  hits and touches neither disk nor the embeddings endpoint; only the
+  first chunk written materializes the store.
 
   Configure with an OpenAI-compatible embeddings endpoint (independent
   of the chat provider — OpenAI, llama.cpp, Ollama, LM Studio, TEI, …):

@@ -271,8 +271,14 @@ built once at startup and injected into both — the same injection pattern
 as `SearchTool::new(config)`. The store wraps a `ruvector-core` `VectorDB`
 (HNSW + redb) behind `Arc` (single redb writer) plus an `EmbeddingsClient`
 (`src/vector/embeddings.rs`) that hits any OpenAI-compatible
-`/v1/embeddings` endpoint. Sync DB ops run under `spawn_blocking`. See the
-`vector_db:` config block under [Configuration](#configuration).
+`/v1/embeddings` endpoint. Sync DB ops run under `spawn_blocking`. The
+`VectorDB` itself is created **lazily on the first write** (held in a
+`tokio::sync::OnceCell` inside an `Arc<StoreInner>` shared by both tool
+clones): `VectorStore::open` touches no disk, and reads (`search`,
+re-index skip-check) before any index are pure no-ops — so enabling
+`vector_db` does not write `.peakbot/vectors.db` until the first chunk is
+indexed. See the `vector_db:` config block under
+[Configuration](#configuration).
 
 
 ## Data Flow
