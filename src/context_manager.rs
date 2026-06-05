@@ -200,6 +200,13 @@ impl ContextManager {
             uncompacted[compact_count].0
         };
 
+        // Never let the boundary bisect a tool_use/tool_result pair: the summary
+        // is inserted *at* the boundary, and a boundary landing on a ToolResult
+        // would wedge the summary between a (rescued) ToolCall and its result —
+        // Anthropic rejects that as an orphaned tool_use. See
+        // snap_boundary_past_tool_results.
+        let boundary = snap_boundary_past_tool_results(messages, boundary);
+
         // Format older messages for summarization (everything before boundary that isn't already compacted)
         let to_summarize: Vec<&ChatMessage> = messages[..boundary]
             .iter()
@@ -331,6 +338,31 @@ pub(crate) fn find_needed_tool_calls_chat(messages: &[ChatMessage], boundary: us
     }
 
     needed
+}
+
+/// Advance a compaction boundary forward so it never lands *on* a `ToolResult`.
+///
+/// The summary message is inserted at the boundary by
+/// `StateManager::apply_compaction`. If the boundary points at a `ToolResult`
+/// whose `ToolCall` is just before it, `find_needed_tool_calls_chat` rescues the
+/// call (keeps it un-compacted) — but the summary then gets wedged *between* the
+/// `tool_use` and its `tool_result`. Anthropic requires the `tool_result` to
+/// come immediately after the `tool_use`, so that split produces:
+///   `tool_use ids were found without tool_result blocks immediately after`.
+///
+/// Snapping forward past any leading `ToolResult`(s) keeps each call/result pair
+/// together: the dangling result is compacted alongside its call, and the first
+/// kept message is always a non-`ToolResult` — so the summary can never bisect a
+/// pair. Returns the original boundary unchanged when it already points at a
+/// non-`ToolResult` (or at the end of the list).
+pub(crate) fn snap_boundary_past_tool_results(messages: &[ChatMessage], boundary: usize) -> usize {
+    use crate::ui::app_state::MessageRole;
+
+    let mut b = boundary;
+    while b < messages.len() && messages[b].role == MessageRole::ToolResult {
+        b += 1;
+    }
+    b
 }
 
 /// Get the default context config
@@ -489,6 +521,117 @@ mod tests {
 
         let needed = find_needed_tool_calls_chat(&messages, 2);
         assert_eq!(needed, vec![1]);
+    }
+
+    /// Regression: a boundary landing *on* a ToolResult must snap forward past
+    /// it. Otherwise the inserted summary wedges between the (rescued) ToolCall
+    /// and its result, and Anthropic rejects the orphaned tool_use. This is the
+    /// exact failure reproduced from conversation a6bc2a29 (orphan id
+    /// `lXFwm_eGvoGVvaIk5I05C`).
+    #[test]
+    fn snap_boundary_advances_past_tool_result() {
+        let messages = vec![
+            ChatMessage::user("q".to_string()),
+            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
+            ChatMessage::tool_result("bash", "{}", "out", Some("c1".to_string())),
+            ChatMessage::agent("a".to_string()),
+        ];
+
+        // Boundary points at the ToolResult (index 2) — the bug trigger.
+        assert_eq!(snap_boundary_past_tool_results(&messages, 2), 3);
+    }
+
+    #[test]
+    fn snap_boundary_leaves_non_tool_result_untouched() {
+        let messages = vec![
+            ChatMessage::user("q".to_string()),
+            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
+            ChatMessage::tool_result("bash", "{}", "out", Some("c1".to_string())),
+            ChatMessage::tool_call("bash", "{}", Some("c2".to_string())),
+        ];
+
+        // Boundary on a ToolCall: kept call+result stay together, no snap needed.
+        assert_eq!(snap_boundary_past_tool_results(&messages, 3), 3);
+        // Boundary on a User message: untouched.
+        assert_eq!(snap_boundary_past_tool_results(&messages, 0), 0);
+    }
+
+    #[test]
+    fn snap_boundary_skips_consecutive_tool_results() {
+        // A ToolCall whose call_id has two results (duplicate-id case) — snap
+        // must skip BOTH so neither gets orphaned across the summary insert.
+        let messages = vec![
+            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
+            ChatMessage::tool_result("bash", "{}", "r1", Some("c1".to_string())),
+            ChatMessage::tool_result("bash", "{}", "r2", Some("c1".to_string())),
+            ChatMessage::agent("done".to_string()),
+        ];
+
+        assert_eq!(snap_boundary_past_tool_results(&messages, 1), 3);
+    }
+
+    #[test]
+    fn snap_boundary_clamps_at_end() {
+        let messages = vec![
+            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
+            ChatMessage::tool_result("bash", "{}", "r1", Some("c1".to_string())),
+        ];
+
+        // Boundary at the trailing ToolResult would snap to len() (compact all).
+        assert_eq!(snap_boundary_past_tool_results(&messages, 1), 2);
+        // Boundary already at end is a no-op.
+        assert_eq!(snap_boundary_past_tool_results(&messages, 2), 2);
+    }
+
+    /// End-to-end pin of the bug: after the snap, no ToolCall in the kept
+    /// region (with the summary inserted at the boundary) is left without its
+    /// ToolResult immediately following.
+    #[test]
+    fn snap_prevents_summary_splitting_a_pair() {
+        use crate::ui::app_state::MessageRole;
+
+        let messages = vec![
+            ChatMessage::user("q".to_string()),
+            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
+            ChatMessage::tool_result("bash", "{}", "out", Some("c1".to_string())),
+            ChatMessage::agent("a".to_string()),
+        ];
+
+        // Raw boundary bisects the pair (points at the ToolResult).
+        let raw = 2;
+        let snapped = snap_boundary_past_tool_results(&messages, raw);
+
+        // Simulate apply_compaction: rescue calls before boundary whose result is
+        // at/after boundary, then insert a summary at the boundary.
+        let needed: std::collections::HashSet<usize> =
+            find_needed_tool_calls_chat(&messages, snapped)
+                .into_iter()
+                .collect();
+        let mut seq: Vec<(MessageRole, Option<String>)> = Vec::new();
+        for (i, m) in messages.iter().enumerate() {
+            if i == snapped {
+                seq.push((MessageRole::Summary, None));
+            }
+            if i >= snapped || needed.contains(&i) {
+                seq.push((m.role, m.call_id.clone()));
+            }
+        }
+        if snapped >= messages.len() {
+            seq.push((MessageRole::Summary, None));
+        }
+
+        // Invariant: every kept ToolCall is immediately followed by its result.
+        for w in seq.windows(2) {
+            if w[0].0 == MessageRole::ToolCall {
+                assert_eq!(
+                    w[1].0,
+                    MessageRole::ToolResult,
+                    "ToolCall must be immediately followed by ToolResult, got {:?}",
+                    w[1]
+                );
+                assert_eq!(w[0].1, w[1].1, "call_id mismatch across the pair");
+            }
+        }
     }
 
     #[test]
