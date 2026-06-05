@@ -771,6 +771,16 @@ Trigger the `zen-engineering` skill by asking for a review of the proposed desig
 If the review flags significant issues, address them in the plan before touching any source files. If the review surfaces new rule candidates for the skill, note them and propose additions.
 
 ---
+## Comment Style
+
+Code comments are signal, not narration. Keep them tight:
+
+- **2–3 lines tops, ideally 1.** If a comment needs a paragraph, the code probably needs a refactor or the explanation belongs in a doc, not inline.
+- **Explain *why*, not *what*.** The code already says what it does. Comment the non-obvious reason, the gotcha, the invariant.
+- **No plans, stages, or temporal narration.** Never write comments like `// Step 1:`, `// now we…`, `// TODO later we'll…`, `// new approach`, `// changed to fix X`. These describe a moment in time that is already gone the instant the code lands — they rot immediately and mislead the next reader. Version control is the record of how the code evolved; comments are for the code as it is *now*.
+- **Fix old mess-ups on sight.** When you touch a file and spot bloated, stale, or narrative comments, trim them as part of your change. Leave every file cleaner than you found it.
+
+---
 ## Commit Procedure
 
 **IMPORTANT: All changes must be made through Pull Requests.**

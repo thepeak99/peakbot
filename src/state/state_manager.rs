@@ -327,10 +327,8 @@ impl StateManager {
         let mut state = self.state.write().unwrap();
         let messages = &mut state.chat.messages;
 
-        // Defense-in-depth: re-snap against the *live* messages so the summary
-        // is never inserted between a tool_use and its tool_result, even if the
-        // plan's boundary was computed from a slightly different snapshot.
-        // Idempotent when the plan boundary was already snapped in compact().
+        // Re-snap against the live messages: the plan's boundary may come from a
+        // slightly different snapshot. Idempotent if already snapped in compact().
         let boundary = snap_boundary_past_tool_results(messages, plan.boundary);
 
         // Find tool calls before boundary that are needed by results after boundary
