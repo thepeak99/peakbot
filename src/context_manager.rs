@@ -200,11 +200,8 @@ impl ContextManager {
             uncompacted[compact_count].0
         };
 
-        // Never let the boundary bisect a tool_use/tool_result pair: the summary
-        // is inserted *at* the boundary, and a boundary landing on a ToolResult
-        // would wedge the summary between a (rescued) ToolCall and its result —
-        // Anthropic rejects that as an orphaned tool_use. See
-        // snap_boundary_past_tool_results.
+        // Snap the boundary off any ToolResult so the inserted summary can't
+        // split a tool_use/tool_result pair (see snap_boundary_past_tool_results).
         let boundary = snap_boundary_past_tool_results(messages, boundary);
 
         // Format older messages for summarization (everything before boundary that isn't already compacted)
@@ -342,19 +339,12 @@ pub(crate) fn find_needed_tool_calls_chat(messages: &[ChatMessage], boundary: us
 
 /// Advance a compaction boundary forward so it never lands *on* a `ToolResult`.
 ///
-/// The summary message is inserted at the boundary by
-/// `StateManager::apply_compaction`. If the boundary points at a `ToolResult`
-/// whose `ToolCall` is just before it, `find_needed_tool_calls_chat` rescues the
-/// call (keeps it un-compacted) — but the summary then gets wedged *between* the
-/// `tool_use` and its `tool_result`. Anthropic requires the `tool_result` to
-/// come immediately after the `tool_use`, so that split produces:
-///   `tool_use ids were found without tool_result blocks immediately after`.
-///
-/// Snapping forward past any leading `ToolResult`(s) keeps each call/result pair
-/// together: the dangling result is compacted alongside its call, and the first
-/// kept message is always a non-`ToolResult` — so the summary can never bisect a
-/// pair. Returns the original boundary unchanged when it already points at a
-/// non-`ToolResult` (or at the end of the list).
+/// The summary is inserted at the boundary; a boundary on a `ToolResult` whose
+/// `ToolCall` was rescued just before it wedges the summary between the pair,
+/// which Anthropic rejects (`tool_use ids were found without tool_result blocks
+/// immediately after`). Snapping past leading `ToolResult`s keeps each pair
+/// together. Returns the boundary unchanged when it already points at a
+/// non-`ToolResult` or the end of the list.
 pub(crate) fn snap_boundary_past_tool_results(messages: &[ChatMessage], boundary: usize) -> usize {
     use crate::ui::app_state::MessageRole;
 
@@ -523,11 +513,8 @@ mod tests {
         assert_eq!(needed, vec![1]);
     }
 
-    /// Regression: a boundary landing *on* a ToolResult must snap forward past
-    /// it. Otherwise the inserted summary wedges between the (rescued) ToolCall
-    /// and its result, and Anthropic rejects the orphaned tool_use. This is the
-    /// exact failure reproduced from conversation a6bc2a29 (orphan id
-    /// `lXFwm_eGvoGVvaIk5I05C`).
+    /// Regression: a boundary on a ToolResult must snap forward, else the
+    /// inserted summary orphans the rescued ToolCall and Anthropic rejects it.
     #[test]
     fn snap_boundary_advances_past_tool_result() {
         let messages = vec![
@@ -583,9 +570,8 @@ mod tests {
         assert_eq!(snap_boundary_past_tool_results(&messages, 2), 2);
     }
 
-    /// End-to-end pin of the bug: after the snap, no ToolCall in the kept
-    /// region (with the summary inserted at the boundary) is left without its
-    /// ToolResult immediately following.
+    /// After the snap, every kept ToolCall is immediately followed by its
+    /// ToolResult even with the summary inserted at the boundary.
     #[test]
     fn snap_prevents_summary_splitting_a_pair() {
         use crate::ui::app_state::MessageRole;

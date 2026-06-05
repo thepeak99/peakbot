@@ -4,6 +4,13 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Added a "Comment Style" rule to `agents.md`** and trimmed the
+  branch's own comments to match: keep comments to 2–3 lines (ideally 1),
+  explain *why* not *what*, never narrate plans/stages/temporal changes,
+  and fix stale/bloated comments on sight. Condensed the over-long doc and
+  inline comments around `snap_boundary_past_tool_results` and its tests
+  to follow the new rule.
+
 - **Fixed a compaction bug that could crash the next request with an
   Anthropic "orphaned tool_use" error.** When the compaction boundary
   happened to land *on* a `tool_result` whose `tool_use` was just before
