@@ -322,18 +322,25 @@ impl StateManager {
     /// Also clears `last_input_tokens` (loop-guard) — see `mid-compaction.md` § 3.
     fn apply_compaction(&self, plan: &crate::context_manager::CompactionPlan) {
         use crate::context_manager::find_needed_tool_calls_chat;
+        use crate::context_manager::snap_boundary_past_tool_results;
 
         let mut state = self.state.write().unwrap();
         let messages = &mut state.chat.messages;
 
+        // Defense-in-depth: re-snap against the *live* messages so the summary
+        // is never inserted between a tool_use and its tool_result, even if the
+        // plan's boundary was computed from a slightly different snapshot.
+        // Idempotent when the plan boundary was already snapped in compact().
+        let boundary = snap_boundary_past_tool_results(messages, plan.boundary);
+
         // Find tool calls before boundary that are needed by results after boundary
         let needed_tc: std::collections::HashSet<usize> =
-            find_needed_tool_calls_chat(messages, plan.boundary)
+            find_needed_tool_calls_chat(messages, boundary)
                 .into_iter()
                 .collect();
 
         // Tag messages before boundary as compacted, except needed tool calls
-        for (i, msg) in messages.iter_mut().enumerate().take(plan.boundary) {
+        for (i, msg) in messages.iter_mut().enumerate().take(boundary) {
             if !msg.compacted && !needed_tc.contains(&i) {
                 msg.compacted = true;
             }
@@ -341,7 +348,7 @@ impl StateManager {
 
         // Insert the summary message at the boundary position
         let summary = ChatMessage::summary(plan.summary.clone());
-        messages.insert(plan.boundary, summary);
+        messages.insert(boundary, summary);
 
         self.notify_update(&state);
         // Lock order: state → stats. Drop state guard before acquiring stats.
