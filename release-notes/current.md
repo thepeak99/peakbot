@@ -4,6 +4,26 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Added a "Comment Style" rule to `agents.md`** and trimmed the
+  branch's own comments to match: keep comments to 2–3 lines (ideally 1),
+  explain *why* not *what*, never narrate plans/stages/temporal changes,
+  and fix stale/bloated comments on sight. Condensed the over-long doc and
+  inline comments around `snap_boundary_past_tool_results` and its tests
+  to follow the new rule.
+
+- **Fixed a compaction bug that could crash the next request with an
+  Anthropic "orphaned tool_use" error.** When the compaction boundary
+  happened to land *on* a `tool_result` whose `tool_use` was just before
+  it, the tool call was correctly preserved but the inserted conversation
+  *summary* got wedged between the `tool_use` and its `tool_result`.
+  Anthropic requires the `tool_result` to immediately follow the
+  `tool_use`, so the very next request failed with
+  `tool_use ids were found without tool_result blocks immediately after`.
+  The compaction boundary is now snapped forward past any trailing
+  `tool_result`(s) so a `tool_use`/`tool_result` pair is never split by
+  the summary — applied both where the plan is built and, defensively,
+  where it is applied.
+
 - **Fixed a false-negative in the `release-tag` Make target's
   protected-branch path.** When `master` is protected, `release-tag`
   opens and merges a `release/<v>` PR via the Gitea API. It previously
