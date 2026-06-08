@@ -283,7 +283,7 @@ impl ChatMessage {
     /// these as ordinary user turns at the wire boundary, but the
     /// renderer and the persisted transcript know the difference via
     /// [`MessageSource::Background`].
-    pub fn user_from_background(content: String, proc_ids: Vec<u32>, any_unlimited: bool) -> Self {
+    pub fn user_from_background(content: String, proc_ids: Vec<u32>) -> Self {
         Self {
             role: MessageRole::User,
             content,
@@ -294,10 +294,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
-            source: MessageSource::Background {
-                proc_ids,
-                any_unlimited,
-            },
+            source: MessageSource::Background { proc_ids },
         }
     }
 
@@ -677,14 +674,10 @@ pub enum MessageSource {
     #[default]
     Human,
     /// Synthetic user turn produced by draining background process output.
-    /// Carries the ids of contributing processes and whether any of them
-    /// is on the unlimited (treat-as-user-input) tier.
+    /// Carries the ids of contributing processes.
     Background {
         /// Ids of processes that contributed to this synthetic turn.
         proc_ids: Vec<u32>,
-        /// `true` ⇒ at least one contributor was `treat_as_user_input`.
-        /// Rendered with 💬, vs 🛰 for capped-only.
-        any_unlimited: bool,
     },
 }
 
@@ -1086,7 +1079,6 @@ pub struct BgSummary {
     /// to avoid pulling chrono/registry types into AppState.
     pub status: String,
     pub exit_code: Option<i32>,
-    pub treat_as_user_input: bool,
 }
 
 /// Snapshot of the foreground `bash` tool panel.

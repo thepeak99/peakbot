@@ -9,7 +9,9 @@
 //!
 //! See `bash-background.md` for the full design.
 
-use crate::bg_processes::{BgError, BgStatus, DEFAULT_CAPTURE_LINES, StartParams};
+use crate::bg_processes::{
+    BgError, BgStatus, DEFAULT_CAPTURE_LINES, DEFAULT_COOLDOWN_SECS, StartParams,
+};
 use crate::state::StateManager;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -17,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BashBgError {
@@ -80,17 +83,15 @@ pub struct BashBgArgs {
     /// command.
     #[serde(default)]
     pub label: Option<String>,
-    /// Declares this process as an **external input source** (telegram
-    /// bridge, webhook receiver, IRC bot, etc.). Its output bypasses
-    /// the capped-tier circuit breaker and resets the consecutive-auto-
-    /// turns counter — exactly like a real human typing would. Use for
-    /// processes whose output represents a person, an inbox, or a
-    /// queue of external requests. Leave `false` (the default) for
-    /// logs, metrics, build watchers, or other observation streams.
-    /// If an `treat_as_user_input` process appears to be in a feedback
-    /// loop (the same line repeating, pathological output), stop it.
+    /// Output-coalescing window in seconds. After this process injects a
+    /// `[bg output]` turn, further output accumulates and is flushed in a
+    /// single batch once `cooldown_secs` elapses. `0` = real-time (inject
+    /// every batch). Omitted ⇒ 60. Set `0` for external-input sources
+    /// (telegram/webhook/IRC bridges) where you need to react to each
+    /// line immediately; leave the default for logs, metrics, and build
+    /// watchers so you aren't woken on every line.
     #[serde(default)]
-    pub treat_as_user_input: Option<bool>,
+    pub cooldown_secs: Option<u64>,
 
     // ── stop / send_line ───────────────────────────────────────────
     /// Numeric process id returned by `start`.
@@ -123,9 +124,9 @@ immediately with a numeric id; the process keeps running until you call
 
 You are **event-driven** with respect to background processes. The
 runtime will deliver new turns to you automatically whenever:
-  - a bg process emits output (debounced ~500ms), OR
+  - a bg process's output is flushed (see Cooldown below), OR
   - a bg process exits (always, even with `capture_output_lines: 0`,
-    even when the circuit breaker is suppressing chatter).
+    even mid-cooldown).
 
 The new turn arrives as a synthetic user message framed with
 `[bg output]`. Each contributing process gets one block with a header
@@ -147,23 +148,31 @@ The correct pattern after `bash_bg start`:
 Use `bash_bg list` only for an on-demand status check the user asked
 for, never as a wait loop.
 
-## Tiers
+## Cooldown (output pacing)
 
-Blocks marked `(unlimited, …)` come from processes started with
-`treat_as_user_input: true` and represent external input (a telegram
-bridge, webhook receiver, IRC bot). Treat them like a real user
-message arriving in the conversation. Plain blocks are observation
-feeds (logs, build watchers, metrics) — read, act if needed, but
-don't feel obliged to reply to every line.
+Each process has a per-process `cooldown_secs` (default 60). After a
+process injects a `[bg output]` turn, its further output is **coalesced**
+— buffered and flushed in one batch once the cooldown elapses — so a
+chatty log doesn't wake you on every line. `cooldown_secs: 0` disables
+coalescing (real-time: every batch injects immediately).
+
+Pick the cooldown by intent:
+  - **Logs / metrics / build watchers** → leave the 60s default (or set
+    a larger value). You'll get periodic digests, not a firehose.
+  - **External input** (a telegram bridge, webhook receiver, IRC bot —
+    anything that brings a person, inbox, or request queue into the
+    conversation) → set `cooldown_secs: 0` so you react to each line
+    immediately, as if the human typed it. Respond to those blocks like
+    real user messages. If such a process appears to be in a feedback
+    loop (the same line repeating, pathological output), stop it.
 
 ## Actions
 
   • `start`  — spawn a new process. Required: `command`. Optional:
                `capture_output_lines` (default 200; `0` discards
                output but you still get the exit notification),
-               `cwd`, `label`, `treat_as_user_input` (set true for
-               telegram/webhook/IRC bridges — anything that brings
-               external input into the conversation).
+               `cwd`, `label`, `cooldown_secs` (default 60; `0` for
+               real-time external-input bridges).
   • `stop`   — kill a process. Required: `id`. Returns final buffer
                tail and exit code in one last pass.
   • `list`   — snapshot all current processes. For on-demand status
@@ -176,9 +185,8 @@ don't feel obliged to reply to every line.
   • `/new`, `/model`, and `/load` kill all background processes.
   • Stopped/exited processes are removed from the registry on the
     next drain (after their final tail is delivered to you).
-  • If a `treat_as_user_input` process appears to be in a feedback
-    loop (same line repeating, pathological output), stop it — there
-    is no structural rate limit on the unlimited tier."#
+  • A real user message flushes all buffered bg output immediately,
+    regardless of cooldown."#
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -209,9 +217,10 @@ don't feel obliged to reply to every line.
                         "type": "string",
                         "description": "Optional human-friendly tag shown in `list` and the /bg slash command."
                     },
-                    "treat_as_user_input": {
-                        "type": "boolean",
-                        "description": "Set true when the process represents an external input source (telegram bridge, webhook receiver, IRC bot). Such processes bypass the consecutive-bg-turns circuit breaker. Default false."
+                    "cooldown_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Seconds to coalesce this process's output before injecting a `[bg output]` turn. 0 = real-time (inject every batch). Default 60. Use 0 for external-input bridges (telegram/webhook/IRC) so you react to each line immediately; leave the default for logs/metrics/watchers."
                     },
                     "id": {
                         "type": "integer",
@@ -240,13 +249,13 @@ don't feel obliged to reply to every line.
                     .command
                     .ok_or(BashBgError::MissingField("command", "start"))?;
                 let capture_cap = args.capture_output_lines.unwrap_or(DEFAULT_CAPTURE_LINES);
-                let treat_as_user_input = args.treat_as_user_input.unwrap_or(false);
+                let cooldown_secs = args.cooldown_secs.unwrap_or(DEFAULT_COOLDOWN_SECS);
                 let entry = sm.start_bg(StartParams {
                     command: command.clone(),
                     capture_cap,
                     cwd: args.cwd,
                     label: args.label,
-                    treat_as_user_input,
+                    cooldown: Duration::from_secs(cooldown_secs),
                     env: self.env.clone(),
                     shell: String::new(),
                 })?;
@@ -255,7 +264,7 @@ don't feel obliged to reply to every line.
                     "pid": entry.pid,
                     "command": command,
                     "capture_output_lines": capture_cap,
-                    "treat_as_user_input": treat_as_user_input,
+                    "cooldown_secs": cooldown_secs,
                     "message": format!(
                         "Started bg #{} (pid {}). Output will appear between turns as `[bg output]`.",
                         entry.id, entry.pid
@@ -289,7 +298,7 @@ don't feel obliged to reply to every line.
                             "exit_code": exit_code,
                             "buffer_len": r.buffer_len,
                             "capture_cap": r.capture_cap,
-                            "treat_as_user_input": r.treat_as_user_input,
+                            "cooldown_secs": r.cooldown.as_secs(),
                         })
                     })
                     .collect();
@@ -328,7 +337,7 @@ mod tests {
                 capture_output_lines: None,
                 cwd: None,
                 label: None,
-                treat_as_user_input: None,
+                cooldown_secs: None,
                 id: None,
                 line: None,
             })
@@ -349,7 +358,7 @@ mod tests {
                 capture_output_lines: None,
                 cwd: None,
                 label: None,
-                treat_as_user_input: None,
+                cooldown_secs: None,
                 id: None,
                 line: None,
             })
@@ -374,7 +383,7 @@ mod tests {
                 capture_output_lines: None,
                 cwd: None,
                 label: None,
-                treat_as_user_input: None,
+                cooldown_secs: None,
                 id: None,
                 line: None,
             })
@@ -397,7 +406,7 @@ mod tests {
                 capture_output_lines: None,
                 cwd: None,
                 label: None,
-                treat_as_user_input: None,
+                cooldown_secs: None,
                 id: None,
                 line: None,
             })
