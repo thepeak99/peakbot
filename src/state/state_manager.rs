@@ -1285,16 +1285,11 @@ impl StateManager {
     }
 
     /// Add a synthetic user message produced by the `bash_bg` drain seam.
-    /// Persisted with `MessageSource::Background { proc_ids, any_unlimited }`
-    /// so the renderer can style the row (🛰 capped, 💬 unlimited) and the
-    /// transcript records which background processes contributed.
-    pub fn add_user_message_from_background(
-        &self,
-        content: String,
-        proc_ids: Vec<u32>,
-        any_unlimited: bool,
-    ) {
-        let msg = ChatMessage::user_from_background(content, proc_ids, any_unlimited);
+    /// Persisted with `MessageSource::Background { proc_ids }` so the
+    /// renderer can style the row and the transcript records which
+    /// background processes contributed.
+    pub fn add_user_message_from_background(&self, content: String, proc_ids: Vec<u32>) {
+        let msg = ChatMessage::user_from_background(content, proc_ids);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
             tracing::error!("Failed to persist bg synthetic user message: {}", e);
@@ -1733,26 +1728,36 @@ impl StateManager {
         self.update_bg_state();
     }
 
-    /// Reset the capped-tier circuit-breaker counter. Called by the
-    /// agent loop whenever a real user message is dequeued, so
-    /// consecutive auto-injections that were paused can resume.
-    pub fn reset_bg_counter(&self) {
+    /// Clear all per-process bg cooldowns so the next drain flushes every
+    /// buffered line. Called by the agent loop whenever a real user
+    /// message is dequeued — engaging the agent is a natural point to
+    /// surface accumulated background output.
+    pub fn reset_bg_cooldowns(&self) {
         let mut reg = self.bg.lock().unwrap();
-        reg.reset_counter();
+        reg.reset_cooldowns();
     }
 
-    /// Drain every non-empty bg buffer into a single synthetic-turn
+    /// Earliest instant at which a background process waiting out its
+    /// cooldown becomes eligible to inject. `None` when nothing is
+    /// pending. The agent loop arms a flush wakeup on this so a buffer
+    /// that goes quiet mid-cooldown still flushes when its window expires.
+    pub fn next_bg_poke_deadline(&self) -> Option<std::time::Instant> {
+        let reg = self.bg.lock().unwrap();
+        reg.next_poke_deadline(std::time::Instant::now())
+    }
+
+    /// Drain every eligible bg buffer into a single synthetic-turn
     /// payload. Returns `None` when nothing was drained (all buffers
-    /// clean or capped-tier suppression is active).
+    /// clean, or every dirty process is still inside its cooldown window).
     ///
     /// Side effects (inside the registry):
-    /// - touched ring buffers cleared,
+    /// - eligible ring buffers cleared,
     /// - exited processes removed,
-    /// - circuit-breaker counter updated per tier contributions.
+    /// - contributing processes' cooldown timers stamped.
     pub fn drain_bg_output_into_synthetic_turn(&self) -> Option<SyntheticTurn> {
         let blocks = {
             let mut reg = self.bg.lock().unwrap();
-            reg.drain_outputs()?
+            reg.drain_outputs(std::time::Instant::now())?
         };
         self.update_bg_state();
         Some(SyntheticTurn::from_blocks(blocks))
@@ -1780,7 +1785,6 @@ impl StateManager {
                         BgStatus::Exited { code, .. } => Some(code),
                         _ => None,
                     },
-                    treat_as_user_input: e.treat_as_user_input,
                 })
                 .collect();
             BgState {
@@ -2000,8 +2004,8 @@ impl std::error::Error for StdinNotActive {}
 /// Payload returned by `drain_bg_output_into_synthetic_turn`.
 ///
 /// The caller appends this as a synthetic user turn and runs an agent
-/// turn. The `proc_ids` and `any_unlimited` fields are persisted on the
-/// resulting [`ChatMessage`] via [`crate::ui::app_state::MessageSource::Background`].
+/// turn. The `proc_ids` are persisted on the resulting [`ChatMessage`]
+/// via [`crate::ui::app_state::MessageSource::Background`].
 #[derive(Debug, Clone)]
 pub struct SyntheticTurn {
     /// Pre-rendered `[bg output]` block, ready to ship as a user-role
@@ -2009,19 +2013,13 @@ pub struct SyntheticTurn {
     pub text: String,
     /// Ids of processes whose output contributed to this turn.
     pub proc_ids: Vec<u32>,
-    /// `true` iff at least one contributor was `treat_as_user_input`.
-    pub any_unlimited: bool,
 }
 
 impl SyntheticTurn {
     fn from_blocks(blocks: Vec<DrainedBlock>) -> Self {
         let mut text = String::from("[bg output]\n");
         let mut proc_ids: Vec<u32> = Vec::with_capacity(blocks.len());
-        let mut any_unlimited = false;
         for b in &blocks {
-            if b.treat_as_user_input {
-                any_unlimited = true;
-            }
             proc_ids.push(b.id);
             let label_part = b
                 .label
@@ -2030,29 +2028,19 @@ impl SyntheticTurn {
                 .unwrap_or_default();
             let header = match &b.status_after {
                 BgStatus::Exited { code, .. } => format!(
-                    "─── #{id} `{cmd}`{lbl} (exited, code {code}, {n} final lines{tier}) ───",
+                    "─── #{id} `{cmd}`{lbl} (exited, code {code}, {n} final lines) ───",
                     id = b.id,
                     cmd = b.command,
                     lbl = label_part,
                     code = code,
                     n = b.lines.len(),
-                    tier = if b.treat_as_user_input {
-                        ", unlimited"
-                    } else {
-                        ""
-                    },
                 ),
                 BgStatus::Running { .. } => format!(
-                    "─── #{id} `{cmd}`{lbl} ({n} new lines{tier}) ───",
+                    "─── #{id} `{cmd}`{lbl} ({n} new lines) ───",
                     id = b.id,
                     cmd = b.command,
                     lbl = label_part,
                     n = b.lines.len(),
-                    tier = if b.treat_as_user_input {
-                        ", unlimited"
-                    } else {
-                        ""
-                    },
                 ),
             };
             text.push_str(&header);
@@ -2062,11 +2050,7 @@ impl SyntheticTurn {
                 text.push('\n');
             }
         }
-        Self {
-            text,
-            proc_ids,
-            any_unlimited,
-        }
+        Self { text, proc_ids }
     }
 }
 
@@ -3976,7 +3960,7 @@ mod tests {
         let sm = StateManager::new_arc();
         sm.toggle_bash_panel_visibility(); // OpenedByUser (on Idle)
         sm.toggle_bash_panel_visibility(); // ClosedByUser
-        sm.add_user_message_from_background("[bg output]".to_string(), vec![1], false);
+        sm.add_user_message_from_background("[bg output]".to_string(), vec![1]);
         assert!(matches!(
             sm.get_state().bash_panel_visibility,
             BashPanelVisibility::ClosedByUser

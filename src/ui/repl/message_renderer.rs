@@ -82,18 +82,11 @@ impl MessageRenderer for PlainRenderer {
     fn render(&self, msg: &ChatMessage, _width: u16) -> Vec<Line<'static>> {
         // Bg-driven synthetic user turns get a distinct prefix and colour
         // so the user can tell at a glance whether a "user" line came from
-        // them or from a background process. 💬 = unlimited tier (treat-as-
-        // user-input source), 🛰 = capped tier (log/watcher). See
-        // `bash-background.md` open Q5.
+        // them or from a background process.
         let bg_override = match (&msg.role, &msg.source) {
-            (
-                MessageRole::User,
-                crate::ui::app_state::MessageSource::Background { any_unlimited, .. },
-            ) => Some(if *any_unlimited {
-                ("💬 Background", Color::LightCyan)
-            } else {
-                ("🛰 Background", Color::LightBlue)
-            }),
+            (MessageRole::User, crate::ui::app_state::MessageSource::Background { .. }) => {
+                Some(("🛰 Background", Color::LightBlue))
+            }
             _ => None,
         };
         let (prefix, color) = match bg_override {
