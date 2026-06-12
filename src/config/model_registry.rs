@@ -72,7 +72,7 @@ pub struct ModelEntry {
     #[serde(default)]
     pub extra_params: Option<serde_json::Value>,
     /// Anthropic prompt-caching mode for this model (Anthropic provider only).
-    /// `None` means `off`. See [`crate::config::AnthropicCaching`].
+    /// `None` means `auto`. See [`crate::config::AnthropicCaching`].
     #[serde(default)]
     pub prompt_caching: Option<crate::config::AnthropicCaching>,
     /// Per-model context size in tokens. When `None`, resolved at

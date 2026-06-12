@@ -6,12 +6,15 @@ This file is the working draft for the next release. When a version is tagged, t
 
 - **Added Anthropic prompt caching** (`prompt_caching:` in the Anthropic
   provider config). Injects ephemeral `cache_control` breakpoints to cut
-  input-token cost on the stable request prefix. Modes: `off` (default),
-  `manual` (system prompt + last tool + last message — the LiteLLM
-  `system/0` + `user/-1` injection-point shape, 5-minute TTL), `auto`
-  (top-level breakpoint the API advances as the conversation grows), and
-  `auto_1h` (auto with a 1-hour TTL). Configurable in both the legacy
-  `provider:` block and per-model in the multi-model `providers:` format.
+  input-token cost on the stable request prefix. Modes: `auto` (default —
+  top-level breakpoint the API advances as the conversation grows, 5-minute
+  TTL; recommended for multi-turn Claude usage), `auto_1h` (auto with a
+  1-hour TTL), `manual` (system prompt + last tool + last message — the
+  LiteLLM `system/0` + `user/-1` injection-point shape, 5-minute TTL), and
+  `off` (no caching; set explicitly when pointing `base_url` at a local
+  llama-server endpoint that may not honor `cache_control`). Configurable in
+  both the legacy `provider:` block and per-model in the multi-model
+  `providers:` format.
 - **Added a `view_image` tool so the agent can SEE local images it finds
   during a task** — screenshots, diagrams, UI captures, charts. Until now
   only the user could attach images (via `[img:…]`); the agent had no way
