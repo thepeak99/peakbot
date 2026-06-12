@@ -5,10 +5,10 @@
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
-use rig::completion::message::AssistantContent;
-use rig::completion::{CompletionModel, CompletionResponse, message::Message};
-use rig::one_or_many::OneOrMany;
+use rig_core::agent::{HookAction, PromptHook, ToolCallHookAction};
+use rig_core::completion::message::AssistantContent;
+use rig_core::completion::{CompletionModel, CompletionResponse, message::Message};
+use rig_core::one_or_many::OneOrMany;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -511,13 +511,15 @@ fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (Strin
                 let mut reasonings = String::new();
                 for rc in &r.content {
                     match rc {
-                        rig::completion::message::ReasoningContent::Text { text: t, .. } => {
+                        rig_core::completion::message::ReasoningContent::Text {
+                            text: t, ..
+                        } => {
                             if !reasonings.is_empty() {
                                 reasonings.push('\n');
                             }
                             reasonings.push_str(t);
                         }
-                        rig::completion::message::ReasoningContent::Summary(s) => {
+                        rig_core::completion::message::ReasoningContent::Summary(s) => {
                             if !reasonings.is_empty() {
                                 reasonings.push('\n');
                             }

@@ -18,7 +18,8 @@
 //! stays as it was. *(reuse the seam that already exists)*
 
 use crate::config::{
-    LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig, ProviderType,
+    AnthropicConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig,
+    ProviderType,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -338,6 +339,15 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
             model: model.name.clone(),
             max_tokens: model.max_tokens.unwrap_or(default_max_tokens()),
         }),
+        ProviderType::Anthropic => ProviderConfig::Anthropic(AnthropicConfig {
+            api_key: prov.api_key.clone(),
+            base_url: prov
+                .base_url
+                .clone()
+                .unwrap_or_else(default_anthropic_base_url),
+            model: model.name.clone(),
+            max_tokens: model.max_tokens.unwrap_or(default_max_tokens()),
+        }),
         ProviderType::LlamaCpp => ProviderConfig::LlamaCpp(LlamaCppConfig {
             api_key: prov.api_key.clone(),
             base_url: prov
@@ -368,6 +378,9 @@ fn default_max_tokens() -> u64 {
 }
 fn default_openai_base_url() -> String {
     "https://api.openai.com/v1".to_string()
+}
+fn default_anthropic_base_url() -> String {
+    "https://api.anthropic.com".to_string()
 }
 fn default_llamacpp_base_url() -> String {
     "http://localhost:8080".to_string()

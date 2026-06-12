@@ -7,7 +7,7 @@ edition = "2024"
 mock = []
 
 [dependencies]
-rig-core = { version = "0.36", features = ["rmcp"] }
+rig-core = { version = "0.38", features = ["rmcp"] }
 rmcp = { version = "1.6", features = [
     "client",
     "transport-child-process",

@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn fingerprint_changes_when_attachments_are_added() {
         use crate::vision::{ImageAttachment, ImageSource};
-        use rig::completion::message::ImageMediaType;
+        use rig_core::completion::message::ImageMediaType;
 
         let text_only = ChatMessage::user("same text".to_string());
         let with_image = ChatMessage::user_with_attachments(

@@ -14,11 +14,11 @@
 //! ## Adapter (wire boundary)
 //!
 //! This module owns the UI-level types ([`ImageSource`], [`ImageAttachment`]).
-//! The conversion to `rig::Image` lives in `state_manager.rs` alongside
+//! The conversion to `rig_core::Image` lives in `state_manager.rs` alongside
 //! `get_agent_history` — that is the single seam where chat-message data
 //! becomes wire data.
 
-use rig::completion::message::{ImageDetail, ImageMediaType};
+use rig_core::completion::message::{ImageDetail, ImageMediaType};
 use std::path::{Path, PathBuf};
 
 /// Maximum file size accepted for a single image attachment. Bigger files are
