@@ -4,6 +4,58 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Added a `view_image` tool so the agent can SEE local images it finds
+  during a task** — screenshots, diagrams, UI captures, charts. Until now
+  only the user could attach images (via `[img:…]`); the agent had no way
+  to pull an image into its own vision context mid-task. `view_image`
+  takes a filesystem path (`/abs`, `./rel`, `~/home`), reuses the existing
+  image loader (10 MB cap, PNG/JPEG/GIF/WEBP allowlist), and returns the
+  image as a structured tool result that rig feeds into the model's sight.
+- **Fixed image tool results being flattened to text on the way back to
+  the model.** PeakBot rebuilds its chat history into wire messages every
+  turn, and the tool-result reconstruction *always* wrapped the stored
+  result as `ToolResultContent::Text` — so an image tool result (e.g. from
+  `view_image`) was replayed to the model as a giant base64 *string*, not
+  an image block. The model saw no picture. All four reconstruction sites
+  (`get_agent_history`, `build_current_turn_message`, the resumption
+  builder, and `convert_conversation_to_rig_messages`) now use rig's own
+  `ToolResultContent::from_tool_output`, which parses image-JSON results
+  into `Image` and leaves plain results as text. Verified end-to-end
+  against a live Anthropic-Messages gateway.
+- **Added a first-class `anthropic` provider with a custom `base_url`.**
+  This is the enabler for `view_image`: in rig 0.36 the Anthropic Messages
+  API is the *only* provider whose tool-result channel actually delivers
+  images to the model (OpenRouter substitutes a placeholder string, Ollama
+  drops the image, OpenAI errors). Pointing `base_url` at a local
+  llama-server's `/v1/messages` endpoint lets a local multimodal model
+  receive images from `view_image`. `view_image` is therefore registered
+  only on the Anthropic provider; other providers don't advertise a tool
+  that would be a silent no-op for them. Config:
+
+  ```yaml
+  provider:
+    type: anthropic
+    config:
+      base_url: http://localhost:8080   # local llama-server, or omit for Claude
+      model: your-multimodal-model
+  ```
+
+- **Upgraded `rig-core` 0.36 → 0.38.2, fixing image tool-results being
+  rejected by the Anthropic Messages API.** rig 0.36 serialized an image
+  tool-result as a newtype enum variant, which collided the inner and
+  outer serde tags and emitted a *duplicate* `type` key
+  (`{"type":"image","type":"base64",…}`). The Anthropic API (and any
+  Messages-compatible proxy, e.g. LiteLLM) reads the last key, sees
+  `base64`, and rejects the request with
+  `Input tag 'base64' … does not match any of the expected tags`. So
+  `view_image` could never actually deliver an image to a real Anthropic
+  endpoint. The fix shipped upstream in rig 0.38 (the variant now nests
+  the source: `{"type":"image","source":{…}}`). A regression test in
+  `view_image.rs` converts a generic image tool-result through rig's own
+  Anthropic conversion and pins the wire shape so this can't regress
+  silently.
+
+
 - **Replaced the background-process "3-turns-and-stop" circuit breaker
   with a per-process cooldown the model controls.** `bash_bg start` now
   takes an optional `cooldown_secs` (default **60**): after a process

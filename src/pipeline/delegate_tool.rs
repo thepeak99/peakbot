@@ -4,8 +4,8 @@
 //! to call specialized sub-agents defined in the pipeline configuration.
 
 use crate::pipeline::registry::SubAgentRegistry;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig_core::completion::ToolDefinition;
+use rig_core::tool::Tool;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

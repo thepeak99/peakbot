@@ -17,6 +17,7 @@ pub enum ProviderType {
     #[default]
     OpenRouter,
     OpenAI,
+    Anthropic,
     LlamaCpp,
     Ollama,
 }
@@ -26,6 +27,7 @@ impl fmt::Display for ProviderType {
         match self {
             ProviderType::OpenRouter => write!(f, "openrouter"),
             ProviderType::OpenAI => write!(f, "openai"),
+            ProviderType::Anthropic => write!(f, "anthropic"),
             ProviderType::LlamaCpp => write!(f, "llamacpp"),
             ProviderType::Ollama => write!(f, "ollama"),
         }
@@ -79,6 +81,32 @@ pub struct OpenAIConfig {
     pub max_tokens: u64,
 }
 
+/// Configuration for Anthropic provider (Claude API, or any server that
+/// speaks the Anthropic Messages API — notably llama.cpp's `/v1/messages`).
+///
+/// Unlike the OpenAI-completions and Responses APIs, the Anthropic Messages
+/// API carries images inside `tool_result` blocks. That is the whole reason
+/// this provider exists as a first-class option: pointing `base_url` at a
+/// local llama-server lets the `view_image` tool feed pixels back to a local
+/// multimodal model.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AnthropicConfig {
+    /// API key (optional for local servers that don't authenticate).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Base URL for the Anthropic Messages API (default: https://api.anthropic.com).
+    /// Point this at e.g. `http://localhost:8080` for a local llama-server.
+    #[serde(default = "default_anthropic_url")]
+    pub base_url: String,
+    /// Model to use (e.g., "claude-3-5-sonnet-latest", or any model served
+    /// by a local Anthropic-compatible endpoint).
+    pub model: String,
+    /// Maximum tokens for responses.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u64,
+}
+
 /// Configuration for LlamaCpp provider (uses OpenAI-compatible completions API)
 /// This is compatible with llama.cpp's server mode which provides an OpenAI-compatible API
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -110,6 +138,10 @@ fn default_openai_url() -> String {
     "https://api.openai.com/v1".to_string()
 }
 
+fn default_anthropic_url() -> String {
+    "https://api.anthropic.com".to_string()
+}
+
 fn default_llamacpp_url() -> String {
     "http://localhost:8080".to_string()
 }
@@ -122,6 +154,8 @@ pub enum ProviderConfig {
     OpenRouter(OpenRouterConfig),
     #[serde(rename = "openai")]
     OpenAI(OpenAIConfig),
+    #[serde(rename = "anthropic")]
+    Anthropic(AnthropicConfig),
     #[serde(rename = "llamacpp")]
     LlamaCpp(LlamaCppConfig),
     #[serde(rename = "ollama")]
@@ -293,6 +327,7 @@ impl Config {
         match &self.provider {
             ProviderConfig::OpenRouter(c) => &c.model,
             ProviderConfig::OpenAI(c) => &c.model,
+            ProviderConfig::Anthropic(c) => &c.model,
             ProviderConfig::LlamaCpp(c) => &c.model,
             ProviderConfig::Ollama(c) => &c.model,
         }
@@ -303,6 +338,7 @@ impl Config {
         match &self.provider {
             ProviderConfig::OpenRouter(c) => c.max_tokens,
             ProviderConfig::OpenAI(c) => c.max_tokens,
+            ProviderConfig::Anthropic(c) => c.max_tokens,
             ProviderConfig::LlamaCpp(c) => c.max_tokens,
             ProviderConfig::Ollama(_) => 4096, // Ollama doesn't have this setting in the same way
         }
@@ -313,6 +349,7 @@ impl Config {
         match &self.provider {
             ProviderConfig::OpenRouter(c) => c.api_key.as_deref(),
             ProviderConfig::OpenAI(c) => c.api_key.as_deref(),
+            ProviderConfig::Anthropic(c) => c.api_key.as_deref(),
             ProviderConfig::LlamaCpp(c) => c.api_key.as_deref(),
             ProviderConfig::Ollama(_) => None,
         }
@@ -328,6 +365,7 @@ impl Config {
         match &self.provider {
             ProviderConfig::OpenRouter(_) => "openrouter",
             ProviderConfig::OpenAI(_) => "openai",
+            ProviderConfig::Anthropic(_) => "anthropic",
             ProviderConfig::LlamaCpp(_) => "llamacpp",
             ProviderConfig::Ollama(_) => "ollama",
         }
@@ -511,6 +549,15 @@ fn describe_legacy(
         ),
         ProviderConfig::OpenAI(c) => (
             ProviderType::OpenAI,
+            c.api_key.clone(),
+            Some(c.base_url.clone()),
+            c.model.clone(),
+            c.max_tokens,
+            None,
+            None,
+        ),
+        ProviderConfig::Anthropic(c) => (
+            ProviderType::Anthropic,
             c.api_key.clone(),
             Some(c.base_url.clone()),
             c.model.clone(),

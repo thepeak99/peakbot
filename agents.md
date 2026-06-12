@@ -2,7 +2,7 @@
 
 ## Overview
 
-PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.33). It runs as a terminal REPL, equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills. Additional features include conversation persistence, todo list management, and an event-driven hooks system for cost tracking.
+PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.38). It runs as a terminal REPL, equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills. Additional features include conversation persistence, todo list management, and an event-driven hooks system for cost tracking.
 
 ## Architecture
 
@@ -92,6 +92,7 @@ PeakBot supports multiple LLM providers through a unified provider abstraction:
 |----------|----------|---------------|----------|
 | **OpenRouter** | Access to 100+ models via API | ✅ Full support | Completion API |
 | **OpenAI** | Direct access to GPT models, configurable endpoint | ✅ Full support | Responses API |
+| **Anthropic** | Claude API or any Anthropic-compatible server (e.g. llama.cpp `/v1/messages`); configurable `base_url`. The only provider whose tool results carry images — enables `view_image` | ❌ Not supported | Messages API |
 | **LlamaCpp** | llama.cpp compatible endpoints | ✅ Supported | Completion API |
 | **Ollama** | Local models (llama3, qwen, mistral, etc.) | ❌ Not supported | Completion API |
 
@@ -103,6 +104,7 @@ The provider system provides:
 **DynAgent Variants**:
 - `OpenRouter(Agent<CompletionModel, SessionHook>)` - Full cost tracking
 - `OpenAI(Agent<ResponsesCompletionModel, SessionHook>)` - Uses OpenAI's responses API
+- `Anthropic(Agent<CompletionModel, SessionHook>)` - Messages API; carries images in tool results (`view_image`)
 - `LlamaCpp(Agent<CompletionModel, SessionHook>)` - llama.cpp compatible
 - `Ollama(Agent<CompletionModel, ()>)` - No hook for local models
 
@@ -243,13 +245,15 @@ All tools live in `src/tools/` and implement `rig::tool::Tool`. Each tool define
 - `call()` -- executes the tool logic
 
 PeakBot includes **11 always-on built-in tools** (plus 2 opt-in vector
-tools, see below):
+tools and 1 provider-gated `view_image` tool, see below):
 
 ### Tools Overview
 
 PeakBot includes **11 always-on built-in tools**, plus **2 opt-in vector
 tools** (`doc_index` / `doc_search`) registered only when a `vector_db:`
-block is configured — **13 total** when the vector store is enabled:
+block is configured, plus **1 provider-gated tool** (`view_image`)
+registered only on the Anthropic provider — **14 total** when both the
+vector store and the Anthropic provider are active:
 
 | Tool | File | Description |
 |------|------|-------------|
@@ -266,6 +270,7 @@ block is configured — **13 total** when the vector store is enabled:
 | `todo` | `todo.rs` | Todo list management |
 | `doc_index` *(opt-in)* | `doc_index.rs` | Parse → chunk → embed → store a file/dir into the semantic vector store. Idempotent re-index (skips unchanged files via stored `sha256`). Registered only when `vector_db:` is configured. |
 | `doc_search` *(opt-in)* | `doc_search.rs` | Embed a query and return the top-k most relevant indexed chunks with source + score. Registered only when `vector_db:` is configured. |
+| `view_image` *(Anthropic-only)* | `view_image.rs` | Load a local image file (PNG/JPEG/GIF/WEBP, ≤10 MB) into the model's vision context as a structured image tool result. Reuses `vision::load_image_from_path`. Registered **only on the Anthropic provider** — the lone rig provider whose tool-result channel delivers images (OpenRouter substitutes a placeholder, Ollama drops it, OpenAI errors). |
 
 Plus optional **MCP tools** from configured servers.
 
@@ -390,6 +395,18 @@ provider:
     api_key: optional  # Optional for local instances
     base_url: http://localhost:8080
     model: llama3
+    max_tokens: 4096
+
+# Anthropic example (Claude API, or any Anthropic-compatible server).
+# This is the provider that supports `view_image` — point base_url at a
+# local llama-server's Messages endpoint to feed images to a local
+# multimodal model. Omit base_url to use the hosted Claude API.
+provider:
+  type: anthropic
+  config:
+    api_key: optional        # Optional for local servers; required for Claude
+    base_url: http://localhost:8080   # llama-server /v1/messages; default: https://api.anthropic.com
+    model: your-multimodal-model      # e.g. claude-3-5-sonnet-latest, or a local GGUF name
     max_tokens: 4096
 
 # Ollama example (local models)
@@ -670,6 +687,7 @@ src/
     ├── search.rs           # SearchTool -- SearXNG web search
     ├── think.rs            # ThinkTool -- reasoning tool
     ├── todo.rs             # TodoTool -- todo list management
+    ├── view_image.rs       # ViewImageTool -- load a local image into vision (Anthropic-only)
     └── logging_wrapper.rs  # LoggingToolDyn -- wrapper for MCP tool tracing
 └── tests/
     ├── integration.rs         # Test module entry point

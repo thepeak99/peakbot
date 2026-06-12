@@ -209,7 +209,7 @@ mod tests {
     // ── Attachment rendering ───────────────────────────────────────────
 
     fn base64_attachment(name: &str, bytes: usize) -> ImageAttachment {
-        use rig::completion::message::ImageMediaType;
+        use rig_core::completion::message::ImageMediaType;
         ImageAttachment {
             display_name: name.to_string(),
             source: ImageSource::Base64 {

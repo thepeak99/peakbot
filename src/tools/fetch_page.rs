@@ -1,6 +1,6 @@
 use crate::utils::strings::truncate_with_suffix;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig_core::completion::ToolDefinition;
+use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use spider::page::Page;
 use spider_transformations::transformation::content::{
