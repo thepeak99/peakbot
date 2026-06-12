@@ -3684,6 +3684,7 @@ mod model_popup_tests {
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None,
                 },
                 ModelEntry {
@@ -3693,6 +3694,7 @@ mod model_popup_tests {
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None,
                 },
             ],

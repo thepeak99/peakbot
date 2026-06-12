@@ -75,6 +75,11 @@ pub struct ModelEntry {
     /// `None` means `auto`. See [`crate::config::AnthropicCaching`].
     #[serde(default)]
     pub prompt_caching: Option<crate::config::AnthropicCaching>,
+    /// Explicit image-support override for this model. `None` (default) →
+    /// auto-detect; `Some(true)`/`Some(false)` force `[img:…]` on/off (and, on
+    /// the Anthropic provider, the `view_image` tool with it).
+    #[serde(default)]
+    pub vision: Option<bool>,
     /// Per-model context size in tokens. When `None`, resolved at
     /// registry-build time via
     /// [`crate::context_manager::auto_detect_context_size`].
@@ -333,6 +338,7 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
             api_key: prov.api_key.clone(),
             model: model.name.clone(),
             max_tokens: model.max_tokens.unwrap_or(default_max_tokens()),
+            vision: model.vision,
         }),
         ProviderType::OpenAI => ProviderConfig::OpenAI(OpenAIConfig {
             api_key: prov.api_key.clone(),
@@ -342,6 +348,7 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
                 .unwrap_or_else(default_openai_base_url),
             model: model.name.clone(),
             max_tokens: model.max_tokens.unwrap_or(default_max_tokens()),
+            vision: model.vision,
         }),
         ProviderType::Anthropic => ProviderConfig::Anthropic(AnthropicConfig {
             api_key: prov.api_key.clone(),
@@ -352,6 +359,7 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
             model: model.name.clone(),
             max_tokens: model.max_tokens.unwrap_or(default_max_tokens()),
             prompt_caching: model.prompt_caching.clone().unwrap_or_default(),
+            vision: model.vision,
         }),
         ProviderType::LlamaCpp => ProviderConfig::LlamaCpp(LlamaCppConfig {
             api_key: prov.api_key.clone(),
@@ -362,6 +370,7 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
             model: model.name.clone(),
             max_tokens: model.max_tokens.unwrap_or(default_max_tokens()),
             extra_params: model.extra_params.clone(),
+            vision: model.vision,
         }),
         ProviderType::Ollama => ProviderConfig::Ollama(OllamaConfig {
             base_url: prov
@@ -370,6 +379,7 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
                 .unwrap_or_else(default_ollama_base_url),
             model: model.name.clone(),
             temperature: model.temperature,
+            vision: model.vision,
         }),
     }
 }
@@ -412,6 +422,7 @@ mod tests {
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None,
                 },
                 ModelEntry {
@@ -421,6 +432,7 @@ mod tests {
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None,
                 },
             ],
@@ -441,6 +453,7 @@ mod tests {
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None,
                 },
                 ModelEntry {
@@ -450,6 +463,7 @@ mod tests {
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None,
                 },
             ],
@@ -507,6 +521,7 @@ mod tests {
                 temperature: None,
                 extra_params: None,
                 prompt_caching: None,
+                vision: None,
                 context_size: None,
             }],
         };
@@ -624,6 +639,7 @@ mod tests {
                 temperature: None,
                 extra_params: None,
                 prompt_caching: None,
+                vision: None,
                 context_size: None,
             }],
         };
@@ -652,6 +668,7 @@ mod tests {
                 temperature: None,
                 extra_params: None,
                 prompt_caching: None,
+                vision: None,
                 context_size: None,
             }],
         };
@@ -679,6 +696,7 @@ mod tests {
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None, // → auto-detect → 200_000
                 },
                 ModelEntry {
@@ -688,6 +706,7 @@ mod tests {
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: Some(42), // explicit → 42
                 },
             ],
@@ -727,6 +746,7 @@ mod tests {
                 temperature: None,
                 extra_params: None,
                 prompt_caching: None,
+                vision: None,
                 context_size: None,
             }],
         };
@@ -775,6 +795,30 @@ models:
 ";
         let prov: ProviderEntry = serde_yaml::from_str(yaml).expect("context_size field parses");
         assert_eq!(prov.models[0].context_size, Some(204000));
+    }
+
+    /// A per-model `vision:` flag parses and is copied into the built
+    /// `ProviderConfig`, where the provider constructor reads it.
+    #[test]
+    fn per_model_vision_flag_parses_and_propagates_to_provider_config() {
+        let yaml = "
+name: local
+type: anthropic
+base_url: http://localhost:8080
+models:
+  - name: my-multimodal-gguf
+    alias: local
+    vision: true
+";
+        let prov: ProviderEntry = serde_yaml::from_str(yaml).expect("vision flag parses");
+        assert_eq!(prov.models[0].vision, Some(true));
+
+        let reg = ModelRegistry::build(std::slice::from_ref(&prov), Some("local"))
+            .expect("registry builds");
+        match &reg.resolve("local").unwrap().provider_config {
+            ProviderConfig::Anthropic(c) => assert_eq!(c.vision, Some(true)),
+            other => panic!("expected Anthropic config, got {other:?}"),
+        }
     }
 
     // ── find_by_wire_id ──────────────────────────────────────────────────
