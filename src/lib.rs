@@ -3227,6 +3227,7 @@ mod tests {
                         max_tokens: None,
                         temperature: None,
                         extra_params: None,
+                        prompt_caching: None,
                         context_size: None,
                     },
                     ModelEntry {
@@ -3235,6 +3236,7 @@ mod tests {
                         max_tokens: None,
                         temperature: None,
                         extra_params: None,
+                        prompt_caching: None,
                         context_size: None,
                     },
                 ],

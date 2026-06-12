@@ -3683,6 +3683,7 @@ mod model_popup_tests {
                     max_tokens: Some(8192),
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None,
                 },
                 ModelEntry {
@@ -3691,6 +3692,7 @@ mod model_popup_tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None,
                 },
             ],
