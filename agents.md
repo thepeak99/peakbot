@@ -358,7 +358,7 @@ Rules:
 - The literal alias `unknown` is reserved and rejected at config load (used as the sentinel for pre-v4 conversation files).
 - `default_model` is required iff any models are declared, and must reference one of the declared aliases.
 - `provider name` is informational — it's only used in `/conversations` and the `/model` listing, never cross-referenced.
-- Per-model overrides: `max_tokens`, `temperature`, `num_ctx` (Ollama), `extra_params` (LlamaCpp), `context_window_override`.
+- Per-model overrides: `max_tokens`, `temperature`, `num_ctx` (Ollama), `extra_params` (LlamaCpp), `context_window_override`, `vision` (`true`/`false` to force image support on/off; omit for auto-detection — see [Vision](#vision-image-input)).
 
 `/model` semantics:
 - `/model` (no arg) — lists every alias with the active one marked `→`.
@@ -418,6 +418,11 @@ provider:
     #             that may not honor `cache_control`)
     # In the multi-model `providers:` format, set `prompt_caching:` per model.
     # prompt_caching: off
+    # Force image support on (registers `view_image` + allows `[img:…]`) for a
+    # model whose name auto-detection doesn't recognise as vision-capable —
+    # e.g. a local multimodal GGUF. Omit for auto-detection. `vision: false`
+    # forces it off. In the multi-model format, set `vision:` per model.
+    # vision: true
 
 # Ollama example (local models)
 provider:
@@ -1085,6 +1090,27 @@ Detection is conservative (substring match on model name). Known-vision models:
 Unknown model names default to `supports_vision = false` — attach an image
 against an unrecognised model and PeakBot emits a system error instead of
 shipping bytes that will be rejected downstream.
+
+**Exception — the `anthropic` provider gates on transport, not model name.**
+The Anthropic Messages transport carries images natively, so `[img:…]` is
+accepted on the `anthropic` provider for *any* model name (mirrors how the
+`view_image` tool is gated — see `providers::supports_vision_for`). This is
+deliberate: a local llama-server GGUF or a gateway model (e.g.
+`minimax/MiniMax-M3`) has a name the conservative detector can't recognise,
+and blocking a capable model pre-flight is worse than letting a genuinely
+non-vision model reply "I can't see images". Every other provider keeps the
+name-based detection above.
+
+**Per-model override — `vision: true` / `vision: false`.** Any model entry can
+set an explicit `vision:` flag that overrides auto-detection (see
+[per-model overrides](#multi-model-with-model)). `true` forces image support
+on (enables `[img:…]`, and on the Anthropic provider also registers the
+`view_image` tool); `false` forces it off. Omit the flag for the auto
+behaviour described above. This is the resolution implemented by
+`providers::resolve_supports_vision(override, provider, model)` — a single
+point feeding both the `[img:…]` gate and `view_image` registration. Because
+`view_image` only delivers images on the Anthropic transport, `vision: true`
+on a non-Anthropic model enables `[img:…]` but does not register `view_image`.
 
 ### Provider quirks
 

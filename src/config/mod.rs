@@ -47,6 +47,10 @@ pub struct OpenRouterConfig {
     /// Maximum tokens for responses
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
+    /// Explicit image-support override. `None` (default) → auto-detect from the
+    /// model name; `Some(true)`/`Some(false)` force `[img:…]` acceptance on/off.
+    #[serde(default)]
+    pub vision: Option<bool>,
 }
 
 /// Configuration for Ollama provider (local models)
@@ -61,6 +65,10 @@ pub struct OllamaConfig {
     /// Temperature setting (optional)
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Explicit image-support override. `None` (default) → auto-detect from the
+    /// model name; `Some(true)`/`Some(false)` force `[img:…]` acceptance on/off.
+    #[serde(default)]
+    pub vision: Option<bool>,
 }
 
 /// Configuration for OpenAI provider
@@ -79,6 +87,10 @@ pub struct OpenAIConfig {
     /// Maximum tokens for responses
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
+    /// Explicit image-support override. `None` (default) → auto-detect from the
+    /// model name; `Some(true)`/`Some(false)` force `[img:…]` acceptance on/off.
+    #[serde(default)]
+    pub vision: Option<bool>,
 }
 
 /// Anthropic prompt-caching mode. Injects ephemeral `cache_control`
@@ -133,6 +145,12 @@ pub struct AnthropicConfig {
     /// endpoints that may not honor `cache_control`).
     #[serde(default)]
     pub prompt_caching: AnthropicCaching,
+    /// Explicit image-support override. `None` (default) → auto-detect (the
+    /// Anthropic transport carries images, so this is on by default). On this
+    /// provider the flag also gates the `view_image` tool: `Some(true)` shows it
+    /// and allows `[img:…]`; `Some(false)` hides the tool and refuses `[img:…]`.
+    #[serde(default)]
+    pub vision: Option<bool>,
 }
 
 /// Configuration for LlamaCpp provider (uses OpenAI-compatible completions API)
@@ -156,6 +174,10 @@ pub struct LlamaCppConfig {
     /// (LiteLLM) or vendor extensions that aren't in the OpenAI schema.
     #[serde(default)]
     pub extra_params: Option<serde_json::Value>,
+    /// Explicit image-support override. `None` (default) → auto-detect from the
+    /// model name; `Some(true)`/`Some(false)` force `[img:…]` acceptance on/off.
+    #[serde(default)]
+    pub vision: Option<bool>,
 }
 
 fn default_ollama_url() -> String {
@@ -202,6 +224,7 @@ impl Default for OpenRouterConfig {
             api_key: None,
             model: default_model(),
             max_tokens: default_max_tokens(),
+            vision: None,
         }
     }
 }
@@ -213,6 +236,7 @@ impl Default for OpenAIConfig {
             base_url: default_openai_url(),
             model: "gpt-4o".to_string(),
             max_tokens: default_max_tokens(),
+            vision: None,
         }
     }
 }
@@ -225,6 +249,7 @@ impl Default for LlamaCppConfig {
             model: "llama3".to_string(),
             max_tokens: default_max_tokens(),
             extra_params: None,
+            vision: None,
         }
     }
 }
@@ -492,8 +517,17 @@ impl Config {
             // Legacy synthesis path. We construct a single-entry list
             // whose ProviderEntry copies the legacy `provider:` shape.
             // The wire id is read off the active legacy variant.
-            let (kind, api_key, base_url, model_name, max_tokens, temperature, extra, caching) =
-                describe_legacy(&self.provider);
+            let (
+                kind,
+                api_key,
+                base_url,
+                model_name,
+                max_tokens,
+                temperature,
+                extra,
+                caching,
+                vision,
+            ) = describe_legacy(&self.provider);
             let synthetic_alias = "default".to_string();
             let provider_entry = ProviderEntry {
                 name: kind.to_string(),
@@ -507,6 +541,7 @@ impl Config {
                     temperature,
                     extra_params: extra,
                     prompt_caching: caching,
+                    vision,
                     context_size: None,
                 }],
             };
@@ -566,6 +601,7 @@ fn describe_legacy(
     Option<f32>,
     Option<serde_json::Value>,
     Option<AnthropicCaching>,
+    Option<bool>,
 ) {
     match p {
         ProviderConfig::OpenRouter(c) => (
@@ -577,6 +613,7 @@ fn describe_legacy(
             None,
             None,
             None,
+            c.vision,
         ),
         ProviderConfig::OpenAI(c) => (
             ProviderType::OpenAI,
@@ -587,6 +624,7 @@ fn describe_legacy(
             None,
             None,
             None,
+            c.vision,
         ),
         ProviderConfig::Anthropic(c) => (
             ProviderType::Anthropic,
@@ -597,6 +635,7 @@ fn describe_legacy(
             None,
             None,
             Some(c.prompt_caching.clone()),
+            c.vision,
         ),
         ProviderConfig::LlamaCpp(c) => (
             ProviderType::LlamaCpp,
@@ -607,6 +646,7 @@ fn describe_legacy(
             None,
             c.extra_params.clone(),
             None,
+            c.vision,
         ),
         ProviderConfig::Ollama(c) => (
             ProviderType::Ollama,
@@ -618,6 +658,7 @@ fn describe_legacy(
             c.temperature,
             None,
             None,
+            c.vision,
         ),
     }
 }
@@ -1416,6 +1457,7 @@ provider:
                 api_key: Some("repo-key".to_string()),
                 model: "google/gemini-2.0-flash-001".to_string(),
                 max_tokens: 8192,
+                vision: None,
             }),
             ..Config::default()
         };
@@ -1554,6 +1596,7 @@ provider:
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None,
                 }],
             }],
@@ -1583,6 +1626,7 @@ provider:
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None,
                 }],
             }],
@@ -1628,6 +1672,7 @@ provider:
                     temperature: None,
                     extra_params: None,
                     prompt_caching: None,
+                    vision: None,
                     context_size: None,
                 }],
             }],
@@ -1687,6 +1732,7 @@ provider:
                 api_key: Some("sk-legacy".into()),
                 model: "anthropic/claude-3.5-sonnet".into(),
                 max_tokens: 4096,
+                vision: None,
             }),
             ..Config::default()
         };

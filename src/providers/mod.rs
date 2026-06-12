@@ -49,11 +49,42 @@ pub struct ProviderInfo {
     pub supports_pricing: bool,
     /// Whether this provider+model can accept image input.
     ///
-    /// Detected conservatively from the model name via
-    /// [`crate::vision::model_supports_vision`]. Used by the dispatcher to
-    /// block `[img:…]` submissions when the active model cannot see — emits
-    /// a system error rather than silently dropping the images.
+    /// Set via [`supports_vision_for`]. Used by the dispatcher to block
+    /// `[img:…]` submissions when the active model cannot see — emits a
+    /// system error rather than silently dropping the images.
     pub supports_vision: bool,
+}
+
+/// Decide whether `[img:…]` attachments may flow to this provider+model.
+///
+/// The Anthropic transport carries images natively in both the user-message
+/// and tool-result channels (it is the lone provider whose tool-result
+/// channel delivers images — hence `view_image` is registered only there).
+/// When fronting a local Anthropic-compatible server (e.g. llama-server's
+/// `/v1/messages`), the model name is an arbitrary GGUF string the
+/// conservative name-based detector cannot recognise. Gate on the transport,
+/// not the name — the same decision `view_image` already makes — so a capable
+/// local/gateway model isn't blocked by a name we don't know. A genuinely
+/// non-vision model simply replies "I can't see images", a softer failure than
+/// a hard pre-flight block on a model that *can*.
+///
+/// Every other provider keeps name-based detection: their image handling is
+/// uneven, and the model name is the best signal available.
+pub fn supports_vision_for(provider_name: &str, model: &str) -> bool {
+    provider_name == "anthropic" || crate::vision::model_supports_vision(model)
+}
+
+/// Resolve the effective vision capability for a model, honouring an explicit
+/// per-model `vision:` config override. `Some(true)`/`Some(false)` force the
+/// answer; `None` falls back to auto-detection ([`supports_vision_for`]). This
+/// is the single point that decides both `[img:…]` acceptance and (on
+/// Anthropic) whether the `view_image` tool is registered.
+pub fn resolve_supports_vision(
+    vision_override: Option<bool>,
+    provider_name: &str,
+    model: &str,
+) -> bool {
+    vision_override.unwrap_or_else(|| supports_vision_for(provider_name, model))
 }
 
 /// Tool-free completion model for compaction summarization.
@@ -572,7 +603,7 @@ fn create_openrouter_agent(
         name: "openrouter".to_string(),
         model: model.clone(),
         supports_pricing: true,
-        supports_vision: crate::vision::model_supports_vision(&model),
+        supports_vision: resolve_supports_vision(config.vision, "openrouter", &model),
     };
 
     Ok((agent, info, receiver, hook))
@@ -619,6 +650,9 @@ fn create_anthropic_agent(
 
     let session_stats = state_manager.stats_arc();
 
+    // One decision feeds both `[img:…]` acceptance and `view_image` registration.
+    let supports_vision = resolve_supports_vision(config.vision, "anthropic", &model);
+
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
         .with_state_manager(&state_manager);
@@ -648,7 +682,7 @@ fn create_anthropic_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
-        true,
+        supports_vision,
     );
 
     let agent = if let Some(tools) = mcp_tools {
@@ -661,7 +695,7 @@ fn create_anthropic_agent(
         name: "anthropic".to_string(),
         model: model.clone(),
         supports_pricing: false,
-        supports_vision: crate::vision::model_supports_vision(&model),
+        supports_vision,
     };
 
     Ok((agent, info, receiver, hook))
@@ -734,7 +768,7 @@ fn create_ollama_agent(
         name: "ollama".to_string(),
         model: model.clone(),
         supports_pricing: false,
-        supports_vision: crate::vision::model_supports_vision(&model),
+        supports_vision: resolve_supports_vision(config.vision, "ollama", &model),
     };
 
     Ok((agent, info))
@@ -820,7 +854,7 @@ fn create_openai_agent(
         name: "openai".to_string(),
         model: model.clone(),
         supports_pricing: true,
-        supports_vision: crate::vision::model_supports_vision(&model),
+        supports_vision: resolve_supports_vision(config.vision, "openai", &model),
     };
 
     Ok((agent, info, receiver, hook))
@@ -909,7 +943,7 @@ fn create_llamacpp_agent(
         name: "llamacpp".to_string(),
         model: model.clone(),
         supports_pricing: true,
-        supports_vision: crate::vision::model_supports_vision(&model),
+        supports_vision: resolve_supports_vision(config.vision, "llamacpp", &model),
     };
 
     Ok((agent, info, receiver, hook))
@@ -1009,6 +1043,62 @@ mod tests {
     }
 
     #[test]
+    fn supports_vision_for_gates_anthropic_on_transport_not_model_name() {
+        // The bug: `[img:…]` was blocked on the Anthropic provider whenever the
+        // model name wasn't a known vision pattern — which is exactly the case
+        // for local/gateway multimodal models (e.g. a GGUF name, or
+        // "minimax/MiniMax-M3"). view_image worked there because it gates on the
+        // transport; the inline path must too.
+        assert!(supports_vision_for("anthropic", "minimax/MiniMax-M3"));
+        assert!(supports_vision_for("anthropic", "some-local-gguf"));
+        assert!(supports_vision_for("anthropic", "claude-3.5-sonnet"));
+
+        // Other providers still rely on name-based detection.
+        assert!(supports_vision_for(
+            "openrouter",
+            "anthropic/claude-3.5-sonnet"
+        ));
+        assert!(!supports_vision_for("openrouter", "qwen/qwq-32b"));
+        assert!(!supports_vision_for("ollama", "some-local-gguf"));
+    }
+
+    #[test]
+    fn resolve_supports_vision_override_beats_auto_detection() {
+        // None → auto-detection (unchanged behaviour).
+        assert!(resolve_supports_vision(
+            None,
+            "anthropic",
+            "some-local-gguf"
+        ));
+        assert!(!resolve_supports_vision(None, "openrouter", "qwen/qwq-32b"));
+
+        // Some(true) forces ON even for an unrecognised name on a provider whose
+        // auto-detection would say no (the user's `vision: true` case).
+        assert!(resolve_supports_vision(
+            Some(true),
+            "ollama",
+            "some-local-gguf"
+        ));
+        assert!(resolve_supports_vision(
+            Some(true),
+            "openrouter",
+            "qwen/qwq-32b"
+        ));
+
+        // Some(false) forces OFF even for a model auto-detection would accept.
+        assert!(!resolve_supports_vision(
+            Some(false),
+            "anthropic",
+            "claude-3.5-sonnet"
+        ));
+        assert!(!resolve_supports_vision(
+            Some(false),
+            "openrouter",
+            "gpt-4o"
+        ));
+    }
+
+    #[test]
     fn prompt_with_history_signature_accepts_string_and_message() {
         // Compile-only pin: if this builds, both a `&str` and a
         // `rig_core::Message::User` with multimodal content satisfy the
@@ -1061,6 +1151,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o".to_string(),
             max_tokens: 1024,
+            vision: None,
         });
         let result = create_compaction_model(&cfg, None);
         assert!(
@@ -1081,6 +1172,7 @@ mod tests {
             api_key: None,
             model: "anthropic/claude-3.5-sonnet".to_string(),
             max_tokens: 1024,
+            vision: None,
         });
         let result = create_compaction_model(&cfg, None);
         assert!(result.is_err(), "missing api_key must surface as an error");
@@ -1103,6 +1195,7 @@ mod tests {
             base_url: "http://localhost:11434".to_string(),
             model: "llama3".to_string(),
             temperature: None,
+            vision: None,
         });
         let result = create_compaction_model(&cfg, Some("qwen2.5-coder:7b"));
         assert!(

@@ -143,7 +143,7 @@ impl SubAgentRegistry {
                         name: "anthropic".to_string(),
                         model: model.clone(),
                         supports_pricing: false,
-                        supports_vision: crate::vision::model_supports_vision(&model),
+                        supports_vision: crate::providers::supports_vision_for("anthropic", &model),
                     },
                 ))
             }

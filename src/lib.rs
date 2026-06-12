@@ -3228,6 +3228,7 @@ mod tests {
                         temperature: None,
                         extra_params: None,
                         prompt_caching: None,
+                        vision: None,
                         context_size: None,
                     },
                     ModelEntry {
@@ -3237,6 +3238,7 @@ mod tests {
                         temperature: None,
                         extra_params: None,
                         prompt_caching: None,
+                        vision: None,
                         context_size: None,
                     },
                 ],

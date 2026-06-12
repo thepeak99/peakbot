@@ -304,6 +304,41 @@ fn get_model_pricing(models: Vec<OpenRouterModel>, model: &str) -> Result<ModelP
 mod tests {
     use super::*;
 
+    /// `input_context_tokens` must recover the TRUE prompt size across the two
+    /// provider usage shapes, and degrade gracefully when `total_tokens` is unset.
+    #[test]
+    fn input_context_tokens_normalizes_across_providers() {
+        let mut u = rig_core::completion::Usage::new();
+
+        // Anthropic with prompt caching: input_tokens is the UNCACHED portion
+        // only; the bulk lives in cache_read/cache_creation. total reflects the
+        // full prompt. The naive `input_tokens` (5) badly under-counts; the
+        // helper must report the full 4005 input.
+        u.input_tokens = 5;
+        u.cached_input_tokens = 3000;
+        u.cache_creation_input_tokens = 1000;
+        u.output_tokens = 200;
+        u.total_tokens = 5 + 3000 + 1000 + 200;
+        assert_eq!(input_context_tokens(&u), 4005);
+
+        // OpenAI/OpenRouter: input_tokens already folds in cached tokens, so it
+        // must NOT be double-counted. total = prompt + completion.
+        let mut o = rig_core::completion::Usage::new();
+        o.input_tokens = 4005; // includes the 3000 cached as a subset
+        o.cached_input_tokens = 3000;
+        o.output_tokens = 200;
+        o.total_tokens = 4205;
+        assert_eq!(input_context_tokens(&o), 4005);
+
+        // Degenerate provider that leaves total_tokens at 0: fall back to the
+        // raw input_tokens rather than reporting 0.
+        let mut d = rig_core::completion::Usage::new();
+        d.input_tokens = 1234;
+        d.output_tokens = 56;
+        d.total_tokens = 0;
+        assert_eq!(input_context_tokens(&d), 1234);
+    }
+
     #[test]
     fn test_get_model_pricing_minimax() {
         // JSON data from OpenRouter API for MiniMax M2.5 model
@@ -492,6 +527,24 @@ impl SessionHook {
     }
 }
 
+/// Provider-agnostic input (prompt) token count for a request.
+///
+/// `usage.input_tokens` is NOT comparable across providers under prompt
+/// caching: Anthropic reports it as the *uncached* portion only (cached
+/// tokens live in separate `cache_read`/`cache_creation` fields), while
+/// OpenAI/OpenRouter fold cached tokens into `input_tokens` already. Using
+/// the raw field made the Anthropic context counter read far too low and
+/// kept compaction from ever firing. rig's `total_tokens` is normalised
+/// per provider, so `total_tokens - output_tokens` recovers the true input
+/// size for both shapes; the `max` guards providers that leave
+/// `total_tokens` unset (then we fall back to the raw `input_tokens`).
+fn input_context_tokens(usage: &rig_core::completion::Usage) -> u64 {
+    usage
+        .total_tokens
+        .saturating_sub(usage.output_tokens)
+        .max(usage.input_tokens)
+}
+
 /// Extract text and reasoning from the response choice
 fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (String, Option<String>) {
     let mut text = String::new();
@@ -596,12 +649,13 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         response: &CompletionResponse<M::Response>,
     ) -> HookAction {
         let usage = &response.usage;
+        let input_tokens = input_context_tokens(usage);
 
         // Update the session stats with this request's usage
         // This is critical for ContextManager to track actual token counts
         if let Ok(mut stats) = self.stats.lock() {
             stats.add_request(
-                usage.input_tokens,
+                input_tokens,
                 usage.output_tokens,
                 0.0, // Cost is calculated externally
             );
@@ -611,14 +665,14 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             // Extract content and reasoning from response using rig's API
             let (content, reasoning) = extract_content_from_response(&response.choice);
 
-            // Emit event with RAW token counts - cost calculation happens in CostHandler
+            // Emit event with per-request token counts; cost is computed in CostHandler.
             let event = AgentEvent::CompletionResponse {
                 content,
                 reasoning,
                 usage: EventTokenUsage {
-                    input_tokens: usage.input_tokens,
+                    input_tokens,
                     output_tokens: usage.output_tokens,
-                    total_tokens: usage.input_tokens + usage.output_tokens,
+                    total_tokens: input_tokens + usage.output_tokens,
                     cost: 0.0, // Cost = 0 here, calculated by CostHandler
                 },
                 timestamp: Utc::now(),

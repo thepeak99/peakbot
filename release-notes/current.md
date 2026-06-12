@@ -15,6 +15,18 @@ This file is the working draft for the next release. When a version is tagged, t
   llama-server endpoint that may not honor `cache_control`). Configurable in
   both the legacy `provider:` block and per-model in the multi-model
   `providers:` format.
+- **Fixed the token/context counter under-reporting on Anthropic with
+  prompt caching.** Anthropic reports per-request `input_tokens` as the
+  *uncached* portion only (cached tokens are reported separately), so with
+  caching on (the `auto` default) the status-bar "Context %" and the
+  session input-token total read far too low — and, more dangerously,
+  automatic context compaction could fail to trigger because the tracked
+  context size never approached the window. The session hook now derives a
+  provider-agnostic input size as `total_tokens − output_tokens` (falling
+  back to the raw `input_tokens` when a provider leaves `total_tokens`
+  unset). This is correct for both usage shapes — Anthropic, where cached
+  tokens are *additive* to `input_tokens`, and OpenAI/OpenRouter, where
+  they're already *folded into* `input_tokens` — with no double-counting.
 - **Added a `view_image` tool so the agent can SEE local images it finds
   during a task** — screenshots, diagrams, UI captures, charts. Until now
   only the user could attach images (via `[img:…]`); the agent had no way
@@ -65,6 +77,42 @@ This file is the working draft for the next release. When a version is tagged, t
   `view_image.rs` converts a generic image tool-result through rig's own
   Anthropic conversion and pins the wire shape so this can't regress
   silently.
+
+- **Fixed `[img:…]` inline attachments being rejected on the Anthropic
+  provider for local/gateway models.** The inline image path gated on a
+  conservative model-name match (`gpt-4o`, `claude-3`, …), so attaching an
+  image to a multimodal model whose name we don't recognise — a local GGUF,
+  or a gateway model like `minimax/MiniMax-M3` — failed with *"Model … does
+  not support vision"*, even though the `view_image` tool worked fine on the
+  same model. `view_image` gates on the *transport* (Anthropic carries
+  images natively), not the model name; the inline path now does the same.
+  On the Anthropic provider, `[img:…]` is allowed regardless of model name —
+  a genuinely non-vision model just replies "I can't see images" rather than
+  being blocked pre-flight. All other providers keep name-based detection.
+
+- **Added a per-model `vision:` config flag to force image support on or off.**
+  Set it on any model in the `providers:` list (or the legacy `provider:`
+  block) to override auto-detection:
+
+  ```yaml
+  providers:
+    - name: local
+      type: anthropic
+      base_url: http://localhost:8080
+      models:
+        - name: my-multimodal-gguf
+          alias: local
+          vision: true        # force image support on
+  ```
+
+  `vision: true` enables `[img:…]` user attachments on any provider, and —
+  on the Anthropic provider — also registers the `view_image` tool so the
+  model can load images itself. `vision: false` forces image support off
+  (e.g. to stop a name-detected vision model from accepting images, saving
+  tokens). Omitting `vision:` keeps the existing auto-detection. Note:
+  `view_image` only works on the Anthropic transport (the lone provider whose
+  tool-result channel delivers images), so `vision: true` on a non-Anthropic
+  model enables `[img:…]` but does not register `view_image`.
 
 
 - **Replaced the background-process "3-turns-and-stop" circuit breaker
