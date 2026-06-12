@@ -1,7 +1,7 @@
 use crate::pty_runner::{self, PtyStatus, SpawnError, SpawnParams};
 use crate::state::StateManager;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig_core::completion::ToolDefinition;
+use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;

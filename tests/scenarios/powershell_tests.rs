@@ -5,7 +5,7 @@
 //! not guarantee PowerShell availability.
 
 use peakbot::PowerShellTool;
-use rig::tool::ToolDyn;
+use rig_core::tool::ToolDyn;
 use serde_json::json;
 
 /// File-editing pattern: `Set-Content` triggers a warning.

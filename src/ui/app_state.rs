@@ -190,7 +190,7 @@ pub struct ChatMessage {
     ///
     /// Empty for all non-user messages and for text-only user messages.
     /// Skipped from JSON when empty → zero size overhead for existing
-    /// conversations. Converted to `rig::UserContent::Image` at the wire
+    /// conversations. Converted to `rig_core::UserContent::Image` at the wire
     /// boundary in `StateManager::get_agent_history` /
     /// `build_current_turn_message`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -201,7 +201,7 @@ pub struct ChatMessage {
 
     // ── Structured tool data (lossless) ──────────────────────────────
     // These fields preserve the original data from rig so that
-    // ChatMessage → Conversation::Message and ChatMessage → rig::Message
+    // ChatMessage → Conversation::Message and ChatMessage → rig_core::Message
     // roundtrips are lossless.
     /// Tool name (for ToolCall and ToolResult roles)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,7 +258,7 @@ impl ChatMessage {
     /// Create a user message with image attachments.
     ///
     /// Mirrors [`ChatMessage::user`] but carries images that will be
-    /// converted to `rig::UserContent::Image` at the wire boundary. Intended
+    /// converted to `rig_core::UserContent::Image` at the wire boundary. Intended
     /// for `[img:…]` inline syntax flowing through `SubmitKind::MultimodalMessage`.
     pub fn user_with_attachments(
         content: String,

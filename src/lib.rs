@@ -26,10 +26,10 @@ pub mod vector;
 pub mod vision;
 
 pub use config::{
-    AgentDefinition, BashConfig, Config, ContextConfig, ConversationConfig, LoadedConfig,
-    McpServerConfig, McpTransportType, ModelEntry, ModelRegistry, OllamaConfig, OpenRouterConfig,
-    PipelineConfig, ProviderConfig, ProviderEntry, ProviderType, RegistryError, ResolvedModel,
-    RetryConfig, SearXngConfig, VectorDbConfig, get_config_file_path,
+    AgentDefinition, AnthropicConfig, BashConfig, Config, ContextConfig, ConversationConfig,
+    LoadedConfig, McpServerConfig, McpTransportType, ModelEntry, ModelRegistry, OllamaConfig,
+    OpenRouterConfig, PipelineConfig, ProviderConfig, ProviderEntry, ProviderType, RegistryError,
+    ResolvedModel, RetryConfig, SearXngConfig, VectorDbConfig, get_config_file_path,
 };
 use context_manager::ContextManager;
 pub use context_manager::{CompactionResult, auto_detect_context_size};
@@ -47,9 +47,9 @@ pub use providers::{
     CompactionModel, DynAgent, ProviderInfo, create_compaction_model, create_provider,
 };
 
-use rig::completion::{Message, PromptError};
-use rig::tool::ToolDyn;
-use rig::tool::rmcp::McpTool;
+use rig_core::completion::{Message, PromptError};
+use rig_core::tool::ToolDyn;
+use rig_core::tool::rmcp::McpTool;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpClientTransport};
 pub use skills::{SkillRegistry, load_default_skills};
@@ -223,10 +223,10 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
 /// Convert stored conversation messages to rig Messages for LLM chat history
 pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message> {
     use crate::conversation::Message as StoredMessage;
-    use rig::completion::message::{
-        AssistantContent, Text, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
+    use rig_core::completion::message::{
+        AssistantContent, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
     };
-    use rig::one_or_many::OneOrMany;
+    use rig_core::one_or_many::OneOrMany;
 
     let mut messages = Vec::new();
 
@@ -266,9 +266,9 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
                     content: OneOrMany::one(UserContent::ToolResult(ToolResult {
                         id,
                         call_id: None,
-                        content: OneOrMany::one(ToolResultContent::Text(Text {
-                            text: result.clone(),
-                        })),
+                        // Image-JSON results (`view_image`) reconstruct as Image;
+                        // plain results stay text. See get_agent_history.
+                        content: ToolResultContent::from_tool_output(result.clone()),
                     })),
                 });
             }
@@ -944,7 +944,7 @@ impl AgentRunner {
                         .unwrap_or_else(|| {
                             // Fallback: no state manager (test-only paths) —
                             // pass the String through as a text-only Message.
-                            rig::completion::message::Message::from(text.as_str())
+                            rig_core::completion::message::Message::from(text.as_str())
                         });
 
                     let result = Self::process_message_internal(
@@ -1241,13 +1241,14 @@ impl AgentRunner {
         // Rebuild MCP tool list from the long-lived handles. McpTool
         // implements Clone (rig 0.33), so we get a fresh Vec without
         // restarting any subprocess. See agents.md / multi-model.md.
-        let mcp_tools: Option<Vec<Box<dyn rig::tool::ToolDyn>>> = if ctx.mcp_handles.is_empty() {
+        let mcp_tools: Option<Vec<Box<dyn rig_core::tool::ToolDyn>>> = if ctx.mcp_handles.is_empty()
+        {
             None
         } else {
             let mut all = Vec::new();
             for h in ctx.mcp_handles.iter() {
                 for t in h.tools().iter().cloned() {
-                    all.push(Box::new(t) as Box<dyn rig::tool::ToolDyn>);
+                    all.push(Box::new(t) as Box<dyn rig_core::tool::ToolDyn>);
                 }
             }
             Some(all)
@@ -1443,7 +1444,7 @@ impl AgentRunner {
     /// against infinite terminate-restart cycles is in
     /// `apply_compaction` — see that fn's doc and `SessionStats::clear_last_input_tokens`.
     async fn process_message_internal(
-        mut current_turn: rig::completion::message::Message,
+        mut current_turn: rig_core::completion::message::Message,
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
@@ -1459,7 +1460,7 @@ impl AgentRunner {
         // also `current_turn`), breaking Anthropic / OpenAI conversation
         // invariants. See the data-layer pin
         // `production_resumption_payload_must_not_duplicate_toolresult`.
-        let mut history_override: Option<Vec<rig::completion::message::Message>> = None;
+        let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
 
         loop {
             // Compaction is handled at the wire boundary by SessionHook
@@ -1659,9 +1660,9 @@ impl AgentRunner {
         // provenance.
         sm.add_user_message_from_background(synthetic.text.clone(), synthetic.proc_ids.clone());
         sm.set_running(true);
-        let current_turn = sm
-            .build_current_turn_message()
-            .unwrap_or_else(|| rig::completion::message::Message::from(synthetic.text.as_str()));
+        let current_turn = sm.build_current_turn_message().unwrap_or_else(|| {
+            rig_core::completion::message::Message::from(synthetic.text.as_str())
+        });
         let result =
             Self::process_message_internal(current_turn, state_manager, agent, config).await;
         sm.set_running(false);
@@ -2207,9 +2208,9 @@ impl AgentRunner {
 /// agent loop. See the regression pins
 /// `derive_history_for_iteration_*` in this module.
 fn derive_history_for_iteration(
-    override_: &mut Option<Vec<rig::completion::message::Message>>,
+    override_: &mut Option<Vec<rig_core::completion::message::Message>>,
     state_manager: &Option<Arc<StateManager>>,
-) -> Vec<rig::completion::message::Message> {
+) -> Vec<rig_core::completion::message::Message> {
     match override_.take() {
         Some(h) => h,
         None => state_manager
@@ -3226,6 +3227,8 @@ mod tests {
                         max_tokens: None,
                         temperature: None,
                         extra_params: None,
+                        prompt_caching: None,
+                        vision: None,
                         context_size: None,
                     },
                     ModelEntry {
@@ -3234,6 +3237,8 @@ mod tests {
                         max_tokens: None,
                         temperature: None,
                         extra_params: None,
+                        prompt_caching: None,
+                        vision: None,
                         context_size: None,
                     },
                 ],
@@ -3867,8 +3872,8 @@ headers:
     /// Helper: extract every visible text fragment from a rig
     /// `Message` for substring assertions. Walks User text, User
     /// ToolResult text, and Assistant text + tool-call arguments.
-    fn message_texts(msg: &rig::completion::message::Message) -> Vec<String> {
-        use rig::completion::message::{
+    fn message_texts(msg: &rig_core::completion::message::Message) -> Vec<String> {
+        use rig_core::completion::message::{
             AssistantContent, Message as RigMessage, ToolResultContent, UserContent,
         };
         let mut out = Vec::new();
@@ -3909,7 +3914,7 @@ headers:
     }
 
     /// Count occurrences of `needle` across a slice of rig Messages.
-    fn count_occurrences(msgs: &[rig::completion::message::Message], needle: &str) -> usize {
+    fn count_occurrences(msgs: &[rig_core::completion::message::Message], needle: &str) -> usize {
         msgs.iter()
             .flat_map(message_texts)
             .filter(|t| t.contains(needle))
@@ -4002,7 +4007,7 @@ headers:
         sm.add_user_message("hello".to_string());
         sm.add_assistant_message("hi there".to_string());
 
-        let mut history_override: Option<Vec<rig::completion::message::Message>> = None;
+        let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
         let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
         let derived = derive_history_for_iteration(&mut history_override, &sm_opt);
 
@@ -4018,7 +4023,7 @@ headers:
     /// No-regression: empty `(None, None)` returns an empty Vec.
     #[test]
     fn derive_history_for_iteration_handles_no_state_manager() {
-        let mut history_override: Option<Vec<rig::completion::message::Message>> = None;
+        let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
         let sm_opt: Option<Arc<StateManager>> = None;
         let derived = derive_history_for_iteration(&mut history_override, &sm_opt);
         assert!(derived.is_empty());

@@ -7,8 +7,8 @@ use crate::config::{AgentDefinition, PipelineConfig};
 use crate::hooks::SessionHook;
 use crate::providers::{DynAgent, ProviderInfo};
 use anyhow::{Context, Result};
-use rig::client::completion::CompletionClient;
-use rig::providers::openrouter;
+use rig_core::client::completion::CompletionClient;
+use rig_core::providers::openrouter;
 use std::collections::HashMap;
 
 /// A registry of sub-agents with factory methods
@@ -40,6 +40,7 @@ impl SubAgentRegistry {
         let model = def.model.clone().unwrap_or_else(|| match def.agent_type {
             crate::config::ProviderType::OpenRouter => "anthropic/claude-3.7-sonnet".to_string(),
             crate::config::ProviderType::OpenAI => "gpt-4o".to_string(),
+            crate::config::ProviderType::Anthropic => "claude-3-5-sonnet-latest".to_string(),
             crate::config::ProviderType::LlamaCpp => "llama3".to_string(),
             crate::config::ProviderType::Ollama => "llama3".to_string(),
         });
@@ -88,7 +89,7 @@ impl SubAgentRegistry {
 
                 let base = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
-                let client = rig::providers::openai::Client::builder()
+                let client = rig_core::providers::openai::Client::builder()
                     .api_key(&api_key)
                     .base_url(&base)
                     .build()
@@ -114,11 +115,43 @@ impl SubAgentRegistry {
                     },
                 ))
             }
+            crate::config::ProviderType::Anthropic => {
+                // Local Anthropic-compatible servers need no key, so an empty
+                // default is fine (mirrors the LlamaCpp arm).
+                let api_key = def.api_key.clone().unwrap_or_default();
+                let base = base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string());
+
+                let client = rig_core::providers::anthropic::Client::builder()
+                    .api_key(&api_key)
+                    .base_url(&base)
+                    .build()
+                    .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?;
+
+                let (hook, _receiver) = SessionHook::with_channel();
+
+                let agent = client
+                    .agent(&model)
+                    .preamble(&def.prompt)
+                    .max_tokens(max_tokens)
+                    .default_max_turns(50)
+                    .hook(hook)
+                    .build();
+
+                Ok((
+                    DynAgent::Anthropic(agent),
+                    ProviderInfo {
+                        name: "anthropic".to_string(),
+                        model: model.clone(),
+                        supports_pricing: false,
+                        supports_vision: crate::providers::supports_vision_for("anthropic", &model),
+                    },
+                ))
+            }
             crate::config::ProviderType::LlamaCpp => {
                 let api_key = def.api_key.clone().unwrap_or_default();
                 let base = base_url.unwrap_or_else(|| "http://localhost:8080".to_string());
 
-                let client = rig::providers::openai::Client::builder()
+                let client = rig_core::providers::openai::Client::builder()
                     .api_key(&api_key)
                     .base_url(&base)
                     .build()
@@ -146,13 +179,13 @@ impl SubAgentRegistry {
                 ))
             }
             crate::config::ProviderType::Ollama => {
-                use rig::providers::ollama;
+                use rig_core::providers::ollama;
 
                 let base = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
 
                 let client = ollama::Client::builder()
                     .base_url(&base)
-                    .api_key(rig::client::Nothing)
+                    .api_key(rig_core::client::Nothing)
                     .build()
                     .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?;
 

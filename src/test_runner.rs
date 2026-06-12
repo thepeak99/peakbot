@@ -14,8 +14,8 @@ use crate::context_manager::ContextManager;
 use crate::hooks::SessionHook;
 use crate::providers::DynAgent;
 use crate::state::StateManager;
-use rig::completion::PromptError;
-use rig::completion::message::Message;
+use rig_core::completion::PromptError;
+use rig_core::completion::message::Message;
 use std::sync::{Arc, Mutex};
 
 /// Result of processing a message through the TestRunner
@@ -359,11 +359,11 @@ impl TestRunner {
 /// The mock agent's `prompt_with_history` takes `&str`, but after compaction
 /// we may need to resume with any message type (User, Agent, ToolResult).
 /// This helper extracts human-readable text from whichever variant is present.
-fn extract_prompt_text(msg: &rig::completion::message::Message) -> String {
-    use rig::completion::message::{AssistantContent, ToolResultContent, UserContent};
+fn extract_prompt_text(msg: &rig_core::completion::message::Message) -> String {
+    use rig_core::completion::message::{AssistantContent, ToolResultContent, UserContent};
 
     match msg {
-        rig::completion::message::Message::User { content } => {
+        rig_core::completion::message::Message::User { content } => {
             // OneOrMany has first + rest fields, not enum variants.
             // Check for ToolResult content first (from build_resumption_for_compaction).
             let first = content.first_ref();
@@ -386,7 +386,7 @@ fn extract_prompt_text(msg: &rig::completion::message::Message) -> String {
             }
             texts.join(" ")
         }
-        rig::completion::message::Message::Assistant { content, .. } => {
+        rig_core::completion::message::Message::Assistant { content, .. } => {
             // OneOrMany has first + rest fields, not enum variants.
             let mut texts = Vec::new();
             if let AssistantContent::Text(t) = content.first_ref() {
@@ -400,7 +400,7 @@ fn extract_prompt_text(msg: &rig::completion::message::Message) -> String {
             texts.join(" ")
         }
         // System messages don't have text content in the same way
-        rig::completion::message::Message::System { .. } => String::new(),
+        rig_core::completion::message::Message::System { .. } => String::new(),
     }
 }
 
@@ -418,7 +418,7 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let session_hook = SessionHook::new(Some(sender.clone()));
 
-        let agent = rig::agent::AgentBuilder::new(mock_model)
+        let agent = rig_core::agent::AgentBuilder::new(mock_model)
             .preamble("You are a helpful assistant.")
             .max_tokens(1024)
             .default_max_turns(10)
@@ -453,7 +453,7 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let session_hook = SessionHook::new(Some(sender.clone()));
 
-        let agent = rig::agent::AgentBuilder::new(mock_model)
+        let agent = rig_core::agent::AgentBuilder::new(mock_model)
             .preamble("You are a helpful assistant.")
             .max_tokens(1024)
             .default_max_turns(10)

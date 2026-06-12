@@ -14,7 +14,7 @@ use peakbot::mock::{MockCompletionModel, MockResponse, RecordedRequest};
 use peakbot::test_runner::TestRunner;
 use peakbot::ui::AppState;
 use peakbot::{AgentEvent, SessionStats, StateManager, TodoItem};
-use rig::completion::message::Message;
+use rig_core::completion::message::Message;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -80,7 +80,7 @@ impl TestHarness {
             peakbot::SessionHook::new(Some(sender.clone())).with_state_manager(&state_manager);
 
         // Build agent with mock model, session hook, and built-in tools
-        let agent = rig::agent::AgentBuilder::new(mock_model_clone)
+        let agent = rig_core::agent::AgentBuilder::new(mock_model_clone)
             .preamble(preamble)
             .max_tokens(1024)
             .default_max_turns(10)
@@ -294,9 +294,9 @@ impl TestHarness {
     pub fn extract_summarization_prompt(request: &RecordedRequest) -> Option<String> {
         // The compaction model receives the prompt as the last user message
         request.chat_history.last().and_then(|msg| {
-            if let rig::completion::message::Message::User { content } = msg {
+            if let rig_core::completion::message::Message::User { content } = msg {
                 content.iter().find_map(|c| {
-                    if let rig::completion::message::UserContent::Text(t) = c {
+                    if let rig_core::completion::message::UserContent::Text(t) = c {
                         if t.text.contains("Summarize this conversation concisely")
                             || t.text.contains("Previous conversation:")
                         {

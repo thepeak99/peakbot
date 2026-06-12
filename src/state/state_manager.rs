@@ -1349,7 +1349,7 @@ impl StateManager {
 
     // ── History Conversion for Agent ───────────────────────────────────────────
 
-    /// Convert chat messages to rig::Message for agent history.
+    /// Convert chat messages to rig_core::Message for agent history.
     /// Produces proper rig message types:
     /// - User → `Message::User` with text content
     /// - Agent → `Message::Assistant` with text content
@@ -1363,13 +1363,13 @@ impl StateManager {
     /// user turn. Since `add_user_message()` is called before this method in
     /// the production flow, including it here would send the same message to
     /// the model twice.
-    pub fn get_agent_history(&self) -> Vec<rig::completion::message::Message> {
+    pub fn get_agent_history(&self) -> Vec<rig_core::completion::message::Message> {
         use crate::ui::app_state::MessageRole;
-        use rig::completion::message::{
+        use rig_core::completion::message::{
             AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
             ToolResultContent, UserContent,
         };
-        use rig::one_or_many::OneOrMany;
+        use rig_core::one_or_many::OneOrMany;
 
         let state = self.state.read().unwrap();
 
@@ -1402,9 +1402,7 @@ impl StateManager {
                 }),
                 MessageRole::Agent => Some(RigMessage::Assistant {
                     id: None,
-                    content: OneOrMany::one(AssistantContent::Text(Text {
-                        text: msg.content.clone(),
-                    })),
+                    content: OneOrMany::one(AssistantContent::Text(Text::new(msg.content.clone()))),
                 }),
                 MessageRole::ToolCall => {
                     let tool_name = msg.tool_name.as_deref()?;
@@ -1430,23 +1428,25 @@ impl StateManager {
                         content: OneOrMany::one(UserContent::ToolResult(ToolResult {
                             id: call_id,
                             call_id: None,
-                            content: OneOrMany::one(ToolResultContent::Text(Text {
-                                text: result_text.to_string(),
-                            })),
+                            // Reuse rig's parser so image-JSON results (e.g. from
+                            // `view_image`) reconstruct as `Image`, not a base64
+                            // text blob the model can't see. Plain results stay text.
+                            content: ToolResultContent::from_tool_output(result_text),
                         })),
                     })
                 }
                 MessageRole::Summary => Some(RigMessage::User {
-                    content: OneOrMany::one(UserContent::Text(Text {
-                        text: format!("[Conversation summary] {}", msg.content),
-                    })),
+                    content: OneOrMany::one(UserContent::Text(Text::new(format!(
+                        "[Conversation summary] {}",
+                        msg.content
+                    )))),
                 }),
                 MessageRole::System => None,
             })
             .collect()
     }
 
-    /// Build the `rig::Message` representing the current user turn — the one
+    /// Build the `rig_core::Message` representing the current user turn — the one
     /// that gets passed as the `prompt` argument to
     /// `DynAgent::prompt_with_history`, alongside the history returned by
     /// [`get_agent_history`].
@@ -1459,9 +1459,9 @@ impl StateManager {
     /// Returns `None` only if there is no user message in the chat history —
     /// which shouldn't happen in the production dispatch flow, where
     /// `add_user_message(_with_attachments)` is called before this.
-    pub fn build_current_turn_message(&self) -> Option<rig::completion::message::Message> {
+    pub fn build_current_turn_message(&self) -> Option<rig_core::completion::message::Message> {
         use crate::ui::app_state::MessageRole;
-        use rig::completion::message::Message as RigMessage;
+        use rig_core::completion::message::Message as RigMessage;
 
         let state = self.state.read().unwrap();
         let last_user = state
@@ -1498,15 +1498,15 @@ impl StateManager {
     pub fn build_resumption_for_compaction(
         &self,
     ) -> Option<(
-        rig::completion::message::Message,
-        Vec<rig::completion::message::Message>,
+        rig_core::completion::message::Message,
+        Vec<rig_core::completion::message::Message>,
     )> {
         use crate::ui::app_state::MessageRole;
-        use rig::completion::message::{
+        use rig_core::completion::message::{
             AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
             ToolResultContent, UserContent,
         };
-        use rig::one_or_many::OneOrMany;
+        use rig_core::one_or_many::OneOrMany;
 
         let state = self.state.read().unwrap();
         let messages = &state.chat.messages;
@@ -1536,9 +1536,7 @@ impl StateManager {
                 }),
                 MessageRole::Agent => Some(RigMessage::Assistant {
                     id: None,
-                    content: OneOrMany::one(AssistantContent::Text(Text {
-                        text: msg.content.clone(),
-                    })),
+                    content: OneOrMany::one(AssistantContent::Text(Text::new(msg.content.clone()))),
                 }),
                 MessageRole::ToolCall => {
                     let tool_name = msg.tool_name.as_deref()?;
@@ -1564,16 +1562,15 @@ impl StateManager {
                         content: OneOrMany::one(UserContent::ToolResult(ToolResult {
                             id: call_id,
                             call_id: None,
-                            content: OneOrMany::one(ToolResultContent::Text(Text {
-                                text: result_text.to_string(),
-                            })),
+                            content: ToolResultContent::from_tool_output(result_text),
                         })),
                     })
                 }
                 MessageRole::Summary => Some(RigMessage::User {
-                    content: OneOrMany::one(UserContent::Text(Text {
-                        text: format!("[Conversation summary] {}", msg.content),
-                    })),
+                    content: OneOrMany::one(UserContent::Text(Text::new(format!(
+                        "[Conversation summary] {}",
+                        msg.content
+                    )))),
                 }),
                 MessageRole::System => None,
             })
@@ -1586,9 +1583,9 @@ impl StateManager {
             },
             MessageRole::Agent => RigMessage::Assistant {
                 id: None,
-                content: OneOrMany::one(AssistantContent::Text(Text {
-                    text: last_msg.content.clone(),
-                })),
+                content: OneOrMany::one(AssistantContent::Text(Text::new(
+                    last_msg.content.clone(),
+                ))),
             },
             MessageRole::ToolCall => {
                 let tool_name = last_msg.tool_name.as_deref()?;
@@ -1620,16 +1617,15 @@ impl StateManager {
                     content: OneOrMany::one(UserContent::ToolResult(ToolResult {
                         id: call_id,
                         call_id: None,
-                        content: OneOrMany::one(ToolResultContent::Text(Text {
-                            text: result_text.to_string(),
-                        })),
+                        content: ToolResultContent::from_tool_output(result_text),
                     })),
                 }
             }
             MessageRole::Summary => RigMessage::User {
-                content: OneOrMany::one(UserContent::Text(Text {
-                    text: format!("[Conversation summary] {}", last_msg.content),
-                })),
+                content: OneOrMany::one(UserContent::Text(Text::new(format!(
+                    "[Conversation summary] {}",
+                    last_msg.content
+                )))),
             },
             MessageRole::System => return None,
         };
@@ -2061,14 +2057,12 @@ impl SyntheticTurn {
 /// otherwise attachments come first, then the caption.
 fn user_content_from_chat_message(
     msg: &crate::ui::app_state::ChatMessage,
-) -> rig::one_or_many::OneOrMany<rig::completion::message::UserContent> {
-    use rig::completion::message::{Text, UserContent};
-    use rig::one_or_many::OneOrMany;
+) -> rig_core::one_or_many::OneOrMany<rig_core::completion::message::UserContent> {
+    use rig_core::completion::message::{Text, UserContent};
+    use rig_core::one_or_many::OneOrMany;
 
     if msg.attachments.is_empty() {
-        return OneOrMany::one(UserContent::Text(Text {
-            text: msg.content.clone(),
-        }));
+        return OneOrMany::one(UserContent::Text(Text::new(msg.content.clone())));
     }
 
     let mut parts: Vec<UserContent> = msg
@@ -2076,16 +2070,14 @@ fn user_content_from_chat_message(
         .iter()
         .map(user_content_from_attachment)
         .collect();
-    parts.push(UserContent::Text(Text {
-        text: msg.content.clone(),
-    }));
+    parts.push(UserContent::Text(Text::new(msg.content.clone())));
 
     // `OneOrMany::many` errors on empty input; we always have ≥2 parts here.
     OneOrMany::many(parts).expect("attachments present → non-empty parts")
 }
 
 /// Adapter at the wire boundary — converts a UI-level `ImageAttachment` into
-/// a `rig::UserContent::Image`.
+/// a `rig_core::UserContent::Image`.
 ///
 /// **Detail defaulting (load-bearing):** rig-core's OpenAI provider rejects
 /// base64 images with `detail: None` (`"OpenAI image URI must have image
@@ -2095,11 +2087,11 @@ fn user_content_from_chat_message(
 /// Explicit user-set details (Low/High) are preserved.
 fn user_content_from_attachment(
     att: &crate::vision::ImageAttachment,
-) -> rig::completion::message::UserContent {
+) -> rig_core::completion::message::UserContent {
     use crate::vision::ImageSource;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use rig::completion::message::{DocumentSourceKind, Image, ImageDetail, UserContent};
+    use rig_core::completion::message::{DocumentSourceKind, Image, ImageDetail, UserContent};
 
     let detail = Some(att.detail.clone().unwrap_or(ImageDetail::Auto));
 
@@ -2348,7 +2340,7 @@ mod tests {
     /// Test that get_agent_history() produces proper rig ToolCall messages (not text approximations)
     #[test]
     fn test_get_agent_history_tool_call_is_structured() {
-        use rig::completion::message::{AssistantContent, Message as RigMessage};
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage};
 
         let sm = StateManager::new();
         sm.add_tool_call(
@@ -2382,7 +2374,9 @@ mod tests {
     /// Test that get_agent_history() produces proper rig ToolResult messages
     #[test]
     fn test_get_agent_history_tool_result_is_structured() {
-        use rig::completion::message::{Message as RigMessage, ToolResultContent, UserContent};
+        use rig_core::completion::message::{
+            Message as RigMessage, ToolResultContent, UserContent,
+        };
 
         let sm = StateManager::new();
         sm.add_tool_result(
@@ -2467,7 +2461,7 @@ mod tests {
     #[test]
     fn test_roundtrip_conversation_json_to_rig_messages() {
         use crate::conversation::{Conversation, Message as ConvMsg};
-        use rig::completion::message::{
+        use rig_core::completion::message::{
             AssistantContent, Message as RigMessage, ToolResultContent, UserContent,
         };
 
@@ -3055,7 +3049,7 @@ mod tests {
 
     fn sample_attachment(name: &str) -> crate::vision::ImageAttachment {
         use crate::vision::{ImageAttachment, ImageSource};
-        use rig::completion::message::ImageMediaType;
+        use rig_core::completion::message::ImageMediaType;
         ImageAttachment {
             display_name: name.to_string(),
             source: ImageSource::Base64 {
@@ -3068,7 +3062,7 @@ mod tests {
 
     #[test]
     fn get_agent_history_emits_text_only_user_when_no_attachments() {
-        use rig::completion::message::{Message as RigMessage, UserContent};
+        use rig_core::completion::message::{Message as RigMessage, UserContent};
 
         let sm = StateManager::new();
         sm.add_user_message("first".to_string());
@@ -3090,7 +3084,7 @@ mod tests {
 
     #[test]
     fn get_agent_history_emits_image_then_text_order_when_attachments_present() {
-        use rig::completion::message::{Message as RigMessage, UserContent};
+        use rig_core::completion::message::{Message as RigMessage, UserContent};
 
         let sm = StateManager::new();
         sm.add_user_message_with_attachments(
@@ -3115,6 +3109,51 @@ mod tests {
         }
     }
 
+    /// An image tool result (the JSON shape `view_image` emits) must be
+    /// reconstructed as a rig `ToolResultContent::Image`, not flattened to a
+    /// base64 text blob — otherwise the model never sees the picture.
+    #[test]
+    fn get_agent_history_reconstructs_image_tool_result_as_image() {
+        use rig_core::completion::message::{
+            Message as RigMessage, ToolResultContent, UserContent,
+        };
+
+        let sm = StateManager::new();
+        sm.add_user_message("look".to_string());
+        sm.add_tool_call(
+            "view_image".to_string(),
+            r#"{"path":"/tmp/x.png"}"#.to_string(),
+            Some("call_1".to_string()),
+        );
+        // Exactly the shape `view_image` returns.
+        sm.add_tool_result(
+            "view_image".to_string(),
+            r#"{"path":"/tmp/x.png"}"#.to_string(),
+            r#"{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}"#.to_string(),
+            Some("call_1".to_string()),
+        );
+        // A trailing user turn so the tool result is not the excluded last msg.
+        sm.add_user_message("describe it".to_string());
+
+        let history = sm.get_agent_history();
+        let tool_result = history
+            .iter()
+            .find_map(|m| match m {
+                RigMessage::User { content } => content.iter().find_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("a tool result must be present in history");
+
+        assert!(
+            matches!(tool_result.content.first(), ToolResultContent::Image(_)),
+            "image tool result must reconstruct as Image, got {:?}",
+            tool_result.content.first()
+        );
+    }
+
     #[test]
     fn get_agent_history_still_excludes_trailing_user_even_with_attachments() {
         let sm = StateManager::new();
@@ -3126,7 +3165,7 @@ mod tests {
 
     #[test]
     fn build_current_turn_message_returns_multimodal_when_attachments_present() {
-        use rig::completion::message::{Message as RigMessage, UserContent};
+        use rig_core::completion::message::{Message as RigMessage, UserContent};
 
         let sm = StateManager::new();
         sm.add_user_message_with_attachments(
@@ -3153,7 +3192,7 @@ mod tests {
     /// match the behaviour rig already gives URL-shaped images.
     #[test]
     fn user_content_from_attachment_defaults_base64_detail_to_auto() {
-        use rig::completion::message::{ImageDetail, UserContent};
+        use rig_core::completion::message::{ImageDetail, UserContent};
 
         let att = sample_attachment("cat.png");
         assert!(att.detail.is_none(), "fixture must start with no detail");
@@ -3176,7 +3215,7 @@ mod tests {
     #[test]
     fn user_content_from_attachment_defaults_url_detail_to_auto() {
         use crate::vision::{ImageAttachment, ImageSource};
-        use rig::completion::message::{ImageDetail, UserContent};
+        use rig_core::completion::message::{ImageDetail, UserContent};
 
         let att = ImageAttachment {
             display_name: "https://example.com/x.png".to_string(),
@@ -3196,7 +3235,7 @@ mod tests {
     #[test]
     fn user_content_from_attachment_preserves_explicit_detail() {
         use crate::vision::{ImageAttachment, ImageSource};
-        use rig::completion::message::{ImageDetail, ImageMediaType, UserContent};
+        use rig_core::completion::message::{ImageDetail, ImageMediaType, UserContent};
 
         let att = ImageAttachment {
             display_name: "x.png".to_string(),
@@ -3215,7 +3254,7 @@ mod tests {
 
     #[test]
     fn build_current_turn_message_returns_text_only_when_no_attachments() {
-        use rig::completion::message::{Message as RigMessage, UserContent};
+        use rig_core::completion::message::{Message as RigMessage, UserContent};
 
         let sm = StateManager::new();
         sm.add_user_message("hello".to_string());
@@ -3248,7 +3287,7 @@ mod tests {
     #[test]
     fn build_current_turn_message_skips_compacted_users() {
         use crate::ui::app_state::ChatMessage;
-        use rig::completion::message::{Message as RigMessage, UserContent};
+        use rig_core::completion::message::{Message as RigMessage, UserContent};
 
         let sm = StateManager::new();
 
@@ -3379,11 +3418,11 @@ mod tests {
     }
 
     /// Extract text from a rig Message for test assertions.
-    fn extract_resumption_text(msg: &rig::completion::message::Message) -> String {
-        use rig::completion::message::{AssistantContent, ToolResultContent, UserContent};
+    fn extract_resumption_text(msg: &rig_core::completion::message::Message) -> String {
+        use rig_core::completion::message::{AssistantContent, ToolResultContent, UserContent};
 
         match msg {
-            rig::completion::message::Message::User { content } => {
+            rig_core::completion::message::Message::User { content } => {
                 // OneOrMany has first + rest fields, not enum variants.
                 // Check for ToolResult content first (from build_resumption_for_compaction).
                 let first = content.first_ref();
@@ -3406,7 +3445,7 @@ mod tests {
                 }
                 texts.join(" ")
             }
-            rig::completion::message::Message::Assistant { content, .. } => {
+            rig_core::completion::message::Message::Assistant { content, .. } => {
                 // OneOrMany has first + rest fields, not enum variants.
                 let mut texts = Vec::new();
                 if let AssistantContent::Text(t) = content.first_ref() {

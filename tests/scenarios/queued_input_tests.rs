@@ -179,7 +179,7 @@ async fn pending_input_counter_lifecycles_correctly() {
 /// `queued_messages_are_sent_as_separate_turns_not_glued` below.
 #[tokio::test]
 async fn queued_messages_are_sent_as_separate_turns_not_glued() {
-    use rig::completion::message::{Message as RigMessage, UserContent};
+    use rig_core::completion::message::{Message as RigMessage, UserContent};
 
     let mut harness = TestHarness::new();
     harness.add_response(MockResponse::text("ack 1"));
