@@ -1,7 +1,7 @@
 //! `doc_search` tool: semantic search over indexed documents.
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig_core::completion::ToolDefinition;
+use rig_core::tool::Tool;
 use serde::Deserialize;
 
 use crate::vector::{DEFAULT_K, VectorStore, VectorStoreError};

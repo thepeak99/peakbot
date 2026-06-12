@@ -12,6 +12,7 @@ mod search;
 mod shell_detect;
 mod think;
 pub mod todo;
+mod view_image;
 
 pub use bash::BashTool;
 pub use bash_bg::BashBgTool;
@@ -27,3 +28,4 @@ pub use search::SearchTool;
 pub use shell_detect::{ShellKind, print_no_shell_warning};
 pub use think::ThinkTool;
 pub use todo::{TodoArgs, TodoItem, TodoStatus, TodoTool};
+pub use view_image::ViewImageTool;

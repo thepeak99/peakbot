@@ -13,8 +13,8 @@ use crate::bg_processes::{
     BgError, BgStatus, DEFAULT_CAPTURE_LINES, DEFAULT_COOLDOWN_SECS, StartParams,
 };
 use crate::state::StateManager;
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig_core::completion::ToolDefinition;
+use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;

@@ -2,7 +2,7 @@
 
 ## Overview
 
-PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.33). It runs as a terminal REPL, equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills. Additional features include conversation persistence, todo list management, and an event-driven hooks system for cost tracking.
+PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.38). It runs as a terminal REPL, equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills. Additional features include conversation persistence, todo list management, and an event-driven hooks system for cost tracking.
 
 ## Architecture
 
@@ -92,6 +92,7 @@ PeakBot supports multiple LLM providers through a unified provider abstraction:
 |----------|----------|---------------|----------|
 | **OpenRouter** | Access to 100+ models via API | ✅ Full support | Completion API |
 | **OpenAI** | Direct access to GPT models, configurable endpoint | ✅ Full support | Responses API |
+| **Anthropic** | Claude API or any Anthropic-compatible server (e.g. llama.cpp `/v1/messages`); configurable `base_url`. The only provider whose tool results carry images — enables `view_image` | ❌ Not supported | Messages API |
 | **LlamaCpp** | llama.cpp compatible endpoints | ✅ Supported | Completion API |
 | **Ollama** | Local models (llama3, qwen, mistral, etc.) | ❌ Not supported | Completion API |
 
@@ -103,6 +104,7 @@ The provider system provides:
 **DynAgent Variants**:
 - `OpenRouter(Agent<CompletionModel, SessionHook>)` - Full cost tracking
 - `OpenAI(Agent<ResponsesCompletionModel, SessionHook>)` - Uses OpenAI's responses API
+- `Anthropic(Agent<CompletionModel, SessionHook>)` - Messages API; carries images in tool results (`view_image`)
 - `LlamaCpp(Agent<CompletionModel, SessionHook>)` - llama.cpp compatible
 - `Ollama(Agent<CompletionModel, ()>)` - No hook for local models
 
@@ -243,13 +245,15 @@ All tools live in `src/tools/` and implement `rig::tool::Tool`. Each tool define
 - `call()` -- executes the tool logic
 
 PeakBot includes **11 always-on built-in tools** (plus 2 opt-in vector
-tools, see below):
+tools and 1 provider-gated `view_image` tool, see below):
 
 ### Tools Overview
 
 PeakBot includes **11 always-on built-in tools**, plus **2 opt-in vector
 tools** (`doc_index` / `doc_search`) registered only when a `vector_db:`
-block is configured — **13 total** when the vector store is enabled:
+block is configured, plus **1 provider-gated tool** (`view_image`)
+registered only on the Anthropic provider — **14 total** when both the
+vector store and the Anthropic provider are active:
 
 | Tool | File | Description |
 |------|------|-------------|
@@ -266,6 +270,7 @@ block is configured — **13 total** when the vector store is enabled:
 | `todo` | `todo.rs` | Todo list management |
 | `doc_index` *(opt-in)* | `doc_index.rs` | Parse → chunk → embed → store a file/dir into the semantic vector store. Idempotent re-index (skips unchanged files via stored `sha256`). Registered only when `vector_db:` is configured. |
 | `doc_search` *(opt-in)* | `doc_search.rs` | Embed a query and return the top-k most relevant indexed chunks with source + score. Registered only when `vector_db:` is configured. |
+| `view_image` *(Anthropic-only)* | `view_image.rs` | Load a local image file (PNG/JPEG/GIF/WEBP, ≤10 MB) into the model's vision context as a structured image tool result. Reuses `vision::load_image_from_path`. Registered **only on the Anthropic provider** — the lone rig provider whose tool-result channel delivers images (OpenRouter substitutes a placeholder, Ollama drops it, OpenAI errors). |
 
 Plus optional **MCP tools** from configured servers.
 
@@ -353,7 +358,7 @@ Rules:
 - The literal alias `unknown` is reserved and rejected at config load (used as the sentinel for pre-v4 conversation files).
 - `default_model` is required iff any models are declared, and must reference one of the declared aliases.
 - `provider name` is informational — it's only used in `/conversations` and the `/model` listing, never cross-referenced.
-- Per-model overrides: `max_tokens`, `temperature`, `num_ctx` (Ollama), `extra_params` (LlamaCpp), `context_window_override`.
+- Per-model overrides: `max_tokens`, `temperature`, `num_ctx` (Ollama), `extra_params` (LlamaCpp), `context_window_override`, `vision` (`true`/`false` to force image support on/off; omit for auto-detection — see [Vision](#vision-image-input)).
 
 `/model` semantics:
 - `/model` (no arg) — lists every alias with the active one marked `→`.
@@ -391,6 +396,33 @@ provider:
     base_url: http://localhost:8080
     model: llama3
     max_tokens: 4096
+
+# Anthropic example (Claude API, or any Anthropic-compatible server).
+# This is the provider that supports `view_image` — point base_url at a
+# local llama-server's Messages endpoint to feed images to a local
+# multimodal model. Omit base_url to use the hosted Claude API.
+provider:
+  type: anthropic
+  config:
+    api_key: optional        # Optional for local servers; required for Claude
+    base_url: http://localhost:8080   # llama-server /v1/messages; default: https://api.anthropic.com
+    model: your-multimodal-model      # e.g. claude-3-5-sonnet-latest, or a local GGUF name
+    max_tokens: 4096
+    # Prompt caching (default: auto). Injects ephemeral `cache_control`
+    # breakpoints to cut input-token cost on the stable request prefix.
+    #   auto    — top-level breakpoint the API advances as the chat grows, 5m
+    #   auto_1h — same as auto, 1-hour TTL
+    #   manual  — system prompt + last tool + last message (≈ LiteLLM
+    #             system/0 + user/-1 injection points), 5-minute TTL
+    #   off     — no caching (set explicitly for local llama-server endpoints
+    #             that may not honor `cache_control`)
+    # In the multi-model `providers:` format, set `prompt_caching:` per model.
+    # prompt_caching: off
+    # Force image support on (registers `view_image` + allows `[img:…]`) for a
+    # model whose name auto-detection doesn't recognise as vision-capable —
+    # e.g. a local multimodal GGUF. Omit for auto-detection. `vision: false`
+    # forces it off. In the multi-model format, set `vision:` per model.
+    # vision: true
 
 # Ollama example (local models)
 provider:
@@ -670,6 +702,7 @@ src/
     ├── search.rs           # SearchTool -- SearXNG web search
     ├── think.rs            # ThinkTool -- reasoning tool
     ├── todo.rs             # TodoTool -- todo list management
+    ├── view_image.rs       # ViewImageTool -- load a local image into vision (Anthropic-only)
     └── logging_wrapper.rs  # LoggingToolDyn -- wrapper for MCP tool tracing
 └── tests/
     ├── integration.rs         # Test module entry point
@@ -1057,6 +1090,27 @@ Detection is conservative (substring match on model name). Known-vision models:
 Unknown model names default to `supports_vision = false` — attach an image
 against an unrecognised model and PeakBot emits a system error instead of
 shipping bytes that will be rejected downstream.
+
+**Exception — the `anthropic` provider gates on transport, not model name.**
+The Anthropic Messages transport carries images natively, so `[img:…]` is
+accepted on the `anthropic` provider for *any* model name (mirrors how the
+`view_image` tool is gated — see `providers::supports_vision_for`). This is
+deliberate: a local llama-server GGUF or a gateway model (e.g.
+`minimax/MiniMax-M3`) has a name the conservative detector can't recognise,
+and blocking a capable model pre-flight is worse than letting a genuinely
+non-vision model reply "I can't see images". Every other provider keeps the
+name-based detection above.
+
+**Per-model override — `vision: true` / `vision: false`.** Any model entry can
+set an explicit `vision:` flag that overrides auto-detection (see
+[per-model overrides](#multi-model-with-model)). `true` forces image support
+on (enables `[img:…]`, and on the Anthropic provider also registers the
+`view_image` tool); `false` forces it off. Omit the flag for the auto
+behaviour described above. This is the resolution implemented by
+`providers::resolve_supports_vision(override, provider, model)` — a single
+point feeding both the `[img:…]` gate and `view_image` registration. Because
+`view_image` only delivers images on the Anthropic transport, `vision: true`
+on a non-Anthropic model enables `[img:…]` but does not register `view_image`.
 
 ### Provider quirks
 

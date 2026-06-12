@@ -4,14 +4,14 @@
 //! It provides MockCompletionModel for testing the agent loop without real API calls.
 
 use crate::mock::response::MockResponse;
-use rig::completion::message::Message;
-use rig::completion::message::{Text, ToolCall, ToolFunction};
-use rig::completion::{
+use rig_core::completion::message::Message;
+use rig_core::completion::message::{Text, ToolCall, ToolFunction};
+use rig_core::completion::{
     AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
     GetTokenUsage, Usage as RigUsage,
 };
-use rig::one_or_many::OneOrMany;
-use rig::streaming::StreamingCompletionResponse;
+use rig_core::one_or_many::OneOrMany;
+use rig_core::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -76,6 +76,8 @@ impl MockCompletionModel {
             total_tokens: input + output,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            tool_use_prompt_tokens: 0,
+            reasoning_tokens: 0,
         };
     }
 
@@ -127,6 +129,8 @@ impl GetTokenUsage for MockModelResponse {
             total_tokens: 150,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            tool_use_prompt_tokens: 0,
+            reasoning_tokens: 0,
         })
     }
 }
@@ -167,12 +171,14 @@ impl CompletionModel for MockCompletionModel {
                         total_tokens: u.input_tokens + u.output_tokens,
                         cached_input_tokens: 0,
                         cache_creation_input_tokens: 0,
+                        tool_use_prompt_tokens: 0,
+                        reasoning_tokens: 0,
                     })
                     .unwrap_or(self.default_usage);
 
                 let content_clone = content.clone();
                 Ok(CompletionResponse {
-                    choice: OneOrMany::one(AssistantContent::Text(Text { text: content })),
+                    choice: OneOrMany::one(AssistantContent::Text(Text::new(content))),
                     usage,
                     raw_response: MockModelResponse {
                         content: content_clone,
@@ -196,7 +202,7 @@ impl CompletionModel for MockCompletionModel {
 
                 // Add follow-up text if present
                 let raw_text = if let Some(ref text) = follow_up {
-                    contents.push(AssistantContent::Text(Text { text: text.clone() }));
+                    contents.push(AssistantContent::Text(Text::new(text.clone())));
                     text.clone()
                 } else {
                     format!("Tool call: {}", tool)
@@ -209,6 +215,8 @@ impl CompletionModel for MockCompletionModel {
                         total_tokens: u.input_tokens + u.output_tokens,
                         cached_input_tokens: 0,
                         cache_creation_input_tokens: 0,
+                        tool_use_prompt_tokens: 0,
+                        reasoning_tokens: 0,
                     })
                     .unwrap_or(self.default_usage);
 
@@ -233,7 +241,7 @@ impl CompletionModel for MockCompletionModel {
         request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         use futures::stream;
-        use rig::streaming::RawStreamingChoice;
+        use rig_core::streaming::RawStreamingChoice;
 
         // For simplicity, return a single-item stream with the completion
         let response = self.completion(request).await?;

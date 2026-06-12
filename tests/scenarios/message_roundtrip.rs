@@ -121,8 +121,8 @@ async fn stats_accumulate_after_messages() {
 /// This test verifies that doesn't happen.
 #[tokio::test]
 async fn user_message_not_duplicated_in_request() {
-    use rig::completion::message::Message as RigMessage;
-    use rig::completion::message::UserContent;
+    use rig_core::completion::message::Message as RigMessage;
+    use rig_core::completion::message::UserContent;
 
     let mut harness = TestHarness::new();
     harness.add_response(MockResponse::text("Got it!"));
@@ -177,8 +177,8 @@ async fn user_message_not_duplicated_production_flow() {
     use peakbot::mock::{MockCompletionModel, MockResponse as MR};
     use peakbot::state::StateManager;
     use peakbot::{DynAgent, SessionHook};
-    use rig::completion::message::Message as RigMessage;
-    use rig::completion::message::UserContent;
+    use rig_core::completion::message::Message as RigMessage;
+    use rig_core::completion::message::UserContent;
     use std::sync::Arc;
 
     let mock_model = MockCompletionModel::new();
@@ -189,7 +189,7 @@ async fn user_message_not_duplicated_production_flow() {
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     let session_hook = SessionHook::new(Some(sender));
 
-    let agent = rig::agent::AgentBuilder::new(mock_model_ref)
+    let agent = rig_core::agent::AgentBuilder::new(mock_model_ref)
         .preamble("You are a helpful assistant.")
         .max_tokens(1024)
         .default_max_turns(10)
@@ -243,8 +243,8 @@ async fn user_message_not_duplicated_production_flow() {
 /// that history accumulation doesn't cause the latest message to duplicate.
 #[tokio::test]
 async fn second_user_message_not_duplicated_in_request() {
-    use rig::completion::message::Message as RigMessage;
-    use rig::completion::message::UserContent;
+    use rig_core::completion::message::Message as RigMessage;
+    use rig_core::completion::message::UserContent;
 
     let mut harness = TestHarness::new();
     harness.add_responses(vec![

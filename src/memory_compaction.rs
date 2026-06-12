@@ -45,7 +45,7 @@ pub fn read_if_oversized(path: &Path, threshold_bytes: usize) -> Option<String> 
 pub async fn compact_memory(
     content: &str,
     model: &CompactionModel,
-) -> Result<String, rig::completion::PromptError> {
+) -> Result<String, rig_core::completion::PromptError> {
     let prompt = format!("{}{}", MEMORY_COMPACTION_PROMPT, content);
     model.summarize(&prompt).await
 }
@@ -136,10 +136,10 @@ mod tests {
             // The chat history should contain our memory compaction prompt + content
             let last_msg = requests[0].chat_history.last().unwrap();
             let msg_text = match last_msg {
-                rig::completion::message::Message::User { content } => content
+                rig_core::completion::message::Message::User { content } => content
                     .iter()
                     .map(|c| match c {
-                        rig::completion::message::UserContent::Text(t) => t.text.clone(),
+                        rig_core::completion::message::UserContent::Text(t) => t.text.clone(),
                         _ => String::new(),
                     })
                     .collect::<Vec<_>>()

@@ -11,8 +11,8 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use crate::config::{
-    BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig,
-    SearXngConfig,
+    AnthropicCaching, AnthropicConfig, BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig,
+    OpenRouterConfig, ProviderConfig, SearXngConfig,
 };
 use crate::hooks::SessionHook;
 use crate::hooks::events::AgentEvent;
@@ -25,15 +25,16 @@ use crate::tools::{
     ThinkTool, TodoTool,
 };
 use anyhow::{Context, Result};
-use rig::agent::Agent;
-use rig::client::completion::CompletionClient;
-use rig::completion::Prompt;
-use rig::completion::PromptError;
-use rig::completion::message::Message;
-use rig::providers::ollama;
-use rig::providers::openai;
-use rig::providers::openrouter;
-use rig::tool::ToolDyn;
+use rig_core::agent::{Agent, AgentBuilder};
+use rig_core::client::completion::CompletionClient;
+use rig_core::completion::Prompt;
+use rig_core::completion::PromptError;
+use rig_core::completion::message::Message;
+use rig_core::providers::anthropic;
+use rig_core::providers::ollama;
+use rig_core::providers::openai;
+use rig_core::providers::openrouter;
+use rig_core::tool::ToolDyn;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -48,19 +49,37 @@ pub struct ProviderInfo {
     pub supports_pricing: bool,
     /// Whether this provider+model can accept image input.
     ///
-    /// Detected conservatively from the model name via
-    /// [`crate::vision::model_supports_vision`]. Used by the dispatcher to
-    /// block `[img:…]` submissions when the active model cannot see — emits
-    /// a system error rather than silently dropping the images.
+    /// Set via [`supports_vision_for`]. Used by the dispatcher to block
+    /// `[img:…]` submissions when the active model cannot see — emits a
+    /// system error rather than silently dropping the images.
     pub supports_vision: bool,
+}
+
+/// Whether `[img:…]` attachments may flow to this provider+model. Anthropic
+/// gates on transport (it carries images in user + tool-result channels), so
+/// unknown model names are accepted there; other providers gate on the name.
+pub fn supports_vision_for(provider_name: &str, model: &str) -> bool {
+    provider_name == "anthropic" || crate::vision::model_supports_vision(model)
+}
+
+/// Apply an explicit `vision:` override on top of [`supports_vision_for`].
+/// `Some(b)` forces; `None` auto-detects. Single point for both `[img:…]`
+/// acceptance and (on Anthropic) `view_image` registration.
+pub fn resolve_supports_vision(
+    vision_override: Option<bool>,
+    provider_name: &str,
+    model: &str,
+) -> bool {
+    vision_override.unwrap_or_else(|| supports_vision_for(provider_name, model))
 }
 
 /// Tool-free completion model for compaction summarization.
 #[derive(Clone)]
 pub enum CompactionModel {
     OpenRouter(Agent<<openrouter::Client as CompletionClient>::CompletionModel, ()>),
-    OpenAI(Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, ()>),
-    LlamaCpp(Agent<rig::providers::openai::completion::CompletionModel, ()>),
+    OpenAI(Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, ()>),
+    Anthropic(Agent<rig_core::providers::anthropic::completion::CompletionModel, ()>),
+    LlamaCpp(Agent<rig_core::providers::openai::completion::CompletionModel, ()>),
     Ollama(Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>),
     #[cfg(feature = "mock")]
     Mock(Agent<MockCompletionModel, ()>),
@@ -71,6 +90,7 @@ impl CompactionModel {
         match self {
             CompactionModel::OpenRouter(a) => a.prompt(prompt).await,
             CompactionModel::OpenAI(a) => a.prompt(prompt).await,
+            CompactionModel::Anthropic(a) => a.prompt(prompt).await,
             CompactionModel::LlamaCpp(a) => a.prompt(prompt).await,
             CompactionModel::Ollama(a) => a.prompt(prompt).await,
             #[cfg(feature = "mock")]
@@ -85,9 +105,14 @@ pub enum DynAgent {
     /// OpenRouter agent with session hook
     OpenRouter(Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>),
     /// OpenAI agent (uses modern responses API)
-    OpenAI(Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>),
+    OpenAI(
+        Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
+    ),
+    /// Anthropic agent (Messages API — carries images in tool results;
+    /// works against Claude or a local Anthropic-compatible server)
+    Anthropic(Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>),
     /// LlamaCpp agent (uses completions API for compatibility with llama.cpp)
-    LlamaCpp(Agent<rig::providers::openai::completion::CompletionModel, SessionHook>),
+    LlamaCpp(Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>),
     /// Ollama agent (no hook for local models)
     Ollama(Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>),
     /// Mock agent for testing (uses MockCompletionModel with session hook)
@@ -101,6 +126,7 @@ impl DynAgent {
         match self {
             DynAgent::OpenRouter(agent) => agent.prompt(prompt).await,
             DynAgent::OpenAI(agent) => agent.prompt(prompt).await,
+            DynAgent::Anthropic(agent) => agent.prompt(prompt).await,
             DynAgent::LlamaCpp(agent) => agent.prompt(prompt).await,
             DynAgent::Ollama(agent) => agent.prompt(prompt).await,
             #[cfg(feature = "mock")]
@@ -122,7 +148,7 @@ impl DynAgent {
         // Own the Message once — then clone per match arm, since rig's
         // `prompt()` takes `impl Into<Message>` by value.
         //
-        // rig 0.36 changed `with_history` to take `IntoIterator<Item: Into<Message>>`.
+        // rig's `with_history` takes `IntoIterator<Item: Into<Message>>`.
         // `&mut Vec<Message>` iterates as `&mut Message`, which doesn't impl
         // `Into<Message>`. Reborrow as `&Vec<Message>` (yields `&Message`,
         // which DOES impl `Into<Message>` via blanket clone).
@@ -131,6 +157,7 @@ impl DynAgent {
         match self {
             DynAgent::OpenRouter(agent) => agent.prompt(prompt.clone()).with_history(history).await,
             DynAgent::OpenAI(agent) => agent.prompt(prompt.clone()).with_history(history).await,
+            DynAgent::Anthropic(agent) => agent.prompt(prompt.clone()).with_history(history).await,
             DynAgent::LlamaCpp(agent) => agent.prompt(prompt.clone()).with_history(history).await,
             DynAgent::Ollama(agent) => agent.prompt(prompt.clone()).with_history(history).await,
             #[cfg(feature = "mock")]
@@ -218,6 +245,27 @@ pub fn create_provider(
                 Arc::new(hook),
             ))
         }
+        ProviderConfig::Anthropic(c) => {
+            let (agent, info, receiver, hook) = create_anthropic_agent(
+                c,
+                mcp_tools,
+                system_prompt,
+                searxng_config,
+                max_turns,
+                todo_tool,
+                bash_config,
+                pipeline_registry,
+                state_manager,
+                shell_kind,
+                vector_store,
+            )?;
+            Ok((
+                DynAgent::Anthropic(agent),
+                info,
+                Some(receiver),
+                Arc::new(hook),
+            ))
+        }
         ProviderConfig::LlamaCpp(c) => {
             let (agent, info, receiver, hook) = create_llamacpp_agent(
                 c,
@@ -299,6 +347,17 @@ pub fn create_compaction_model(
             let agent = client.agent(model).preamble(COMPACTION_PREAMBLE).build();
             Ok(CompactionModel::OpenAI(agent))
         }
+        ProviderConfig::Anthropic(c) => {
+            let api_key = c.api_key.clone().unwrap_or_default();
+            let client = anthropic::Client::builder()
+                .api_key(&api_key)
+                .base_url(&c.base_url)
+                .build()
+                .context("Failed to create Anthropic client for compaction")?;
+            let model = model_override.unwrap_or(&c.model);
+            let agent = client.agent(model).preamble(COMPACTION_PREAMBLE).build();
+            Ok(CompactionModel::Anthropic(agent))
+        }
         ProviderConfig::LlamaCpp(c) => {
             let api_key = c.api_key.clone().unwrap_or_default();
             let client = openai::Client::builder()
@@ -314,7 +373,7 @@ pub fn create_compaction_model(
         ProviderConfig::Ollama(c) => {
             let client = ollama::Client::builder()
                 .base_url(&c.base_url)
-                .api_key(rig::client::Nothing)
+                .api_key(rig_core::client::Nothing)
                 .build()
                 .context("Failed to create Ollama client for compaction")?;
             let model = model_override.unwrap_or(&c.model);
@@ -327,7 +386,7 @@ pub fn create_compaction_model(
 /// Create a mock CompactionModel for testing
 #[cfg(feature = "mock")]
 pub fn create_mock_compaction_model() -> (CompactionModel, MockCompletionModel) {
-    use rig::agent::AgentBuilder;
+    use rig_core::agent::AgentBuilder;
     let mock_model = MockCompletionModel::new();
     let model_clone = mock_model.clone();
     let agent = AgentBuilder::new(mock_model)
@@ -343,7 +402,7 @@ pub fn create_mock_compaction_model() -> (CompactionModel, MockCompletionModel) 
 /// - `ShellKind::Bash` → registers `bash` tool
 /// - `ShellKind::PowerShell` → registers `powershell` tool
 fn add_builtin_tools<M, P>(
-    builder: rig::agent::AgentBuilder<M, P, rig::agent::NoToolConfig>,
+    builder: rig_core::agent::AgentBuilder<M, P, rig_core::agent::NoToolConfig>,
     searxng_config: Option<&SearXngConfig>,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
@@ -351,10 +410,11 @@ fn add_builtin_tools<M, P>(
     state_manager: Option<Arc<StateManager>>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
-) -> rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>
+    register_view_image: bool,
+) -> rig_core::agent::AgentBuilder<M, P, rig_core::agent::WithBuilderTools>
 where
-    M: rig::completion::CompletionModel,
-    P: rig::agent::PromptHook<M>,
+    M: rig_core::completion::CompletionModel,
+    P: rig_core::agent::PromptHook<M>,
 {
     // Use provided tool or create a new one (with optional StateManager)
     let todo = todo_tool.unwrap_or_default();
@@ -425,6 +485,12 @@ where
         builder = builder
             .tool(crate::tools::DocIndexTool::new(store.clone()))
             .tool(crate::tools::DocSearchTool::new(store.clone()));
+    }
+
+    // `view_image` needs a tool-result channel that carries images — only
+    // Anthropic. Other providers swap/err/drop the image, so registration is gated.
+    if register_view_image {
+        builder = builder.tool(crate::tools::ViewImageTool);
     }
 
     // Add DelegateTool if pipeline is enabled
@@ -506,6 +572,7 @@ fn create_openrouter_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
+        false,
     );
 
     // Add MCP tools and build
@@ -519,7 +586,96 @@ fn create_openrouter_agent(
         name: "openrouter".to_string(),
         model: model.clone(),
         supports_pricing: true,
-        supports_vision: crate::vision::model_supports_vision(&model),
+        supports_vision: resolve_supports_vision(config.vision, "openrouter", &model),
+    };
+
+    Ok((agent, info, receiver, hook))
+}
+
+/// Create Anthropic agent and info. `base_url` fronts hosted Claude or a
+/// local Anthropic-compatible server (e.g. llama-server `/v1/messages`);
+/// the tool-result channel carries images, hence `view_image` is here.
+fn create_anthropic_agent(
+    config: &AnthropicConfig,
+    mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
+    system_prompt: &str,
+    searxng_config: Option<&SearXngConfig>,
+    max_turns: usize,
+    todo_tool: Option<TodoTool>,
+    bash_config: &BashConfig,
+    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
+    state_manager: Arc<StateManager>,
+    shell_kind: Option<&ShellKind>,
+    vector_store: Option<&crate::vector::VectorStore>,
+) -> Result<(
+    Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
+    ProviderInfo,
+    mpsc::UnboundedReceiver<AgentEvent>,
+    SessionHook,
+)> {
+    // API key is optional — local Anthropic-compatible servers often need none.
+    let api_key = config.api_key.clone().unwrap_or_default();
+
+    if config.model.is_empty() {
+        anyhow::bail!("Anthropic model not specified");
+    }
+
+    let client = anthropic::Client::builder()
+        .api_key(&api_key)
+        .base_url(&config.base_url)
+        .build()
+        .context("Failed to create Anthropic client")?;
+
+    let model = config.model.clone();
+
+    let session_stats = state_manager.stats_arc();
+
+    // One decision feeds both `[img:…]` acceptance and `view_image` registration.
+    let supports_vision = resolve_supports_vision(config.vision, "anthropic", &model);
+
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
+        .with_state_manager(&state_manager);
+
+    let completion_model = client.completion_model(&model);
+    // Build the model explicitly so prompt caching can be toggled — `client.agent()`
+    // hides the model and exposes no hook for the caching flags.
+    let completion_model = match config.prompt_caching {
+        AnthropicCaching::Off => completion_model,
+        AnthropicCaching::Manual => completion_model.with_prompt_caching(),
+        AnthropicCaching::Auto => completion_model.with_automatic_caching(),
+        AnthropicCaching::Auto1h => completion_model.with_automatic_caching_1h(),
+    };
+
+    let agent_builder = AgentBuilder::new(completion_model)
+        .preamble(system_prompt)
+        .max_tokens(config.max_tokens)
+        .default_max_turns(max_turns)
+        .hook(hook.clone());
+
+    let agent_builder = add_builtin_tools(
+        agent_builder,
+        searxng_config,
+        todo_tool,
+        bash_config,
+        pipeline_registry,
+        Some(state_manager.clone()),
+        shell_kind,
+        vector_store,
+        supports_vision,
+    );
+
+    let agent = if let Some(tools) = mcp_tools {
+        agent_builder.tools(tools).build()
+    } else {
+        agent_builder.build()
+    };
+
+    let info = ProviderInfo {
+        name: "anthropic".to_string(),
+        model: model.clone(),
+        supports_pricing: false,
+        supports_vision,
     };
 
     Ok((agent, info, receiver, hook))
@@ -549,7 +705,7 @@ fn create_ollama_agent(
     // Use Nothing as API key since Ollama doesn't require one
     let client = ollama::Client::builder()
         .base_url(&config.base_url)
-        .api_key(rig::client::Nothing)
+        .api_key(rig_core::client::Nothing)
         .build()
         .context(format!(
             "Failed to create Ollama client at {}",
@@ -578,6 +734,7 @@ fn create_ollama_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
+        false,
     );
 
     // Add MCP tools and build
@@ -591,7 +748,7 @@ fn create_ollama_agent(
         name: "ollama".to_string(),
         model: model.clone(),
         supports_pricing: false,
-        supports_vision: crate::vision::model_supports_vision(&model),
+        supports_vision: resolve_supports_vision(config.vision, "ollama", &model),
     };
 
     Ok((agent, info))
@@ -611,7 +768,7 @@ fn create_openai_agent(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
 ) -> Result<(
-    Agent<rig::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
+    Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
@@ -663,6 +820,7 @@ fn create_openai_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
+        false,
     );
 
     // Add MCP tools and build
@@ -676,7 +834,7 @@ fn create_openai_agent(
         name: "openai".to_string(),
         model: model.clone(),
         supports_pricing: true,
-        supports_vision: crate::vision::model_supports_vision(&model),
+        supports_vision: resolve_supports_vision(config.vision, "openai", &model),
     };
 
     Ok((agent, info, receiver, hook))
@@ -696,7 +854,7 @@ fn create_llamacpp_agent(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
 ) -> Result<(
-    Agent<rig::providers::openai::completion::CompletionModel, SessionHook>,
+    Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
     mpsc::UnboundedReceiver<AgentEvent>,
     SessionHook,
@@ -751,6 +909,7 @@ fn create_llamacpp_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
+        false,
     );
 
     // Add MCP tools and build
@@ -764,7 +923,7 @@ fn create_llamacpp_agent(
         name: "llamacpp".to_string(),
         model: model.clone(),
         supports_pricing: true,
-        supports_vision: crate::vision::model_supports_vision(&model),
+        supports_vision: resolve_supports_vision(config.vision, "llamacpp", &model),
     };
 
     Ok((agent, info, receiver, hook))
@@ -786,7 +945,7 @@ pub fn create_mock_agent(
     Arc<SessionHook>,
     MockCompletionModel,
 )> {
-    use rig::agent::AgentBuilder;
+    use rig_core::agent::AgentBuilder;
 
     let mock_model = MockCompletionModel::new();
     let model_clone = mock_model.clone();
@@ -864,14 +1023,67 @@ mod tests {
     }
 
     #[test]
+    fn supports_vision_for_gates_anthropic_on_transport_not_model_name() {
+        // Regression: `[img:…]` was blocked on Anthropic for any unknown name
+        // (e.g. local GGUF), while `view_image` worked there — must gate alike.
+        assert!(supports_vision_for("anthropic", "minimax/MiniMax-M3"));
+        assert!(supports_vision_for("anthropic", "some-local-gguf"));
+        assert!(supports_vision_for("anthropic", "claude-3.5-sonnet"));
+
+        // Other providers still rely on name-based detection.
+        assert!(supports_vision_for(
+            "openrouter",
+            "anthropic/claude-3.5-sonnet"
+        ));
+        assert!(!supports_vision_for("openrouter", "qwen/qwq-32b"));
+        assert!(!supports_vision_for("ollama", "some-local-gguf"));
+    }
+
+    #[test]
+    fn resolve_supports_vision_override_beats_auto_detection() {
+        // None → auto-detection (unchanged behaviour).
+        assert!(resolve_supports_vision(
+            None,
+            "anthropic",
+            "some-local-gguf"
+        ));
+        assert!(!resolve_supports_vision(None, "openrouter", "qwen/qwq-32b"));
+
+        // Some(true) forces ON even for an unrecognised name on a provider whose
+        // auto-detection would say no (the user's `vision: true` case).
+        assert!(resolve_supports_vision(
+            Some(true),
+            "ollama",
+            "some-local-gguf"
+        ));
+        assert!(resolve_supports_vision(
+            Some(true),
+            "openrouter",
+            "qwen/qwq-32b"
+        ));
+
+        // Some(false) forces OFF even for a model auto-detection would accept.
+        assert!(!resolve_supports_vision(
+            Some(false),
+            "anthropic",
+            "claude-3.5-sonnet"
+        ));
+        assert!(!resolve_supports_vision(
+            Some(false),
+            "openrouter",
+            "gpt-4o"
+        ));
+    }
+
+    #[test]
     fn prompt_with_history_signature_accepts_string_and_message() {
         // Compile-only pin: if this builds, both a `&str` and a
-        // `rig::Message::User` with multimodal content satisfy the
+        // `rig_core::Message::User` with multimodal content satisfy the
         // `impl Into<Message>` bound on `prompt_with_history`. We don't
         // invoke the call because it would require a real agent; the type
         // bound is the contract we're pinning.
-        use rig::OneOrMany;
-        use rig::completion::message::{
+        use rig_core::OneOrMany;
+        use rig_core::completion::message::{
             DocumentSourceKind, Image, ImageMediaType, Message, Text, UserContent,
         };
 
@@ -888,9 +1100,7 @@ mod tests {
                     detail: None,
                     additional_params: None,
                 }),
-                UserContent::Text(Text {
-                    text: "what is this?".into(),
-                }),
+                UserContent::Text(Text::new("what is this?")),
             ])
             .expect("non-empty"),
         };
@@ -918,6 +1128,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o".to_string(),
             max_tokens: 1024,
+            vision: None,
         });
         let result = create_compaction_model(&cfg, None);
         assert!(
@@ -938,6 +1149,7 @@ mod tests {
             api_key: None,
             model: "anthropic/claude-3.5-sonnet".to_string(),
             max_tokens: 1024,
+            vision: None,
         });
         let result = create_compaction_model(&cfg, None);
         assert!(result.is_err(), "missing api_key must surface as an error");
@@ -960,6 +1172,7 @@ mod tests {
             base_url: "http://localhost:11434".to_string(),
             model: "llama3".to_string(),
             temperature: None,
+            vision: None,
         });
         let result = create_compaction_model(&cfg, Some("qwen2.5-coder:7b"));
         assert!(

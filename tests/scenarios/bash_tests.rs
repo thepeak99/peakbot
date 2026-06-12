@@ -13,7 +13,7 @@
 //! - exit codes, head/tail truncation, and file-edit warnings still work.
 
 use peakbot::BashTool;
-use rig::tool::ToolDyn;
+use rig_core::tool::ToolDyn;
 use serde_json::json;
 use std::time::{Duration, Instant};
 

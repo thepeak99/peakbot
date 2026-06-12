@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig_core::completion::ToolDefinition;
+use rig_core::tool::Tool;
 use serde::Deserialize;
 
 use crate::vector::{IndexOutcome, IndexReport, VectorStore, VectorStoreError, is_supported};

@@ -23,6 +23,7 @@ fn has_api_key(config: &Config) -> bool {
     match &config.provider {
         peakbot::ProviderConfig::OpenRouter(c) => c.api_key.is_some(),
         peakbot::ProviderConfig::OpenAI(c) => c.api_key.is_some(),
+        peakbot::ProviderConfig::Anthropic(_) => true, // Anthropic key optional (local servers)
         peakbot::ProviderConfig::LlamaCpp(c) => c.api_key.is_some(),
         peakbot::ProviderConfig::Ollama(_) => true, // Ollama uses no API key
     }
@@ -123,7 +124,7 @@ async fn main() -> Result<()> {
     } else {
         let mut all_tools = Vec::new();
         for handle in mcp_handles_arc.iter() {
-            use rig::tool::ToolDyn;
+            use rig_core::tool::ToolDyn;
             let tools: Vec<Box<dyn ToolDyn>> = handle
                 .tools()
                 .iter()

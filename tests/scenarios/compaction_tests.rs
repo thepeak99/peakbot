@@ -277,9 +277,9 @@ async fn post_compaction_request_has_compacted_history() {
 
     // Verify the summary message is in the history sent to the LLM
     let has_summary = last_regular.chat_history.iter().any(|msg| {
-        if let rig::completion::message::Message::User { content } = msg {
+        if let rig_core::completion::message::Message::User { content } = msg {
             content.iter().any(|c| {
-                if let rig::completion::message::UserContent::Text(t) = c {
+                if let rig_core::completion::message::UserContent::Text(t) = c {
                     t.text.contains("[Conversation summary]")
                 } else {
                     false
@@ -325,9 +325,9 @@ async fn summary_text_appears_in_history() {
     // In get_agent_history() it's converted to a User message with "[Conversation summary]" prefix.
     let history = harness.get_chat_history();
     let has_summary = history.iter().any(|msg| {
-        if let rig::completion::message::Message::User { content } = msg {
+        if let rig_core::completion::message::Message::User { content } = msg {
             content.iter().any(|c| {
-                if let rig::completion::message::UserContent::Text(t) = c {
+                if let rig_core::completion::message::UserContent::Text(t) = c {
                     t.text.contains("[Conversation summary]")
                         && t.text.contains("THE_CUSTOM_SUMMARY_TEXT")
                 } else {
@@ -386,18 +386,18 @@ async fn post_compaction_history_structure() {
         "History should not be empty after compaction"
     );
 
-    let first_is_summary = if let rig::completion::message::Message::User { content } = &history[0]
-    {
-        content.iter().any(|c| {
-            if let rig::completion::message::UserContent::Text(t) = c {
-                t.text.contains("[Conversation summary]")
-            } else {
-                false
-            }
-        })
-    } else {
-        false
-    };
+    let first_is_summary =
+        if let rig_core::completion::message::Message::User { content } = &history[0] {
+            content.iter().any(|c| {
+                if let rig_core::completion::message::UserContent::Text(t) = c {
+                    t.text.contains("[Conversation summary]")
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        };
     assert!(
         first_is_summary,
         "First message in history should be the summary. Got: {:?}",
@@ -999,9 +999,9 @@ async fn keep_recent_zero_summarizes_everything() {
         // With keep_recent=0, EVERYTHING before the current turn gets summarized.
         // After compaction: [summary]. Then current turn adds [user, assistant].
         let has_summary = history.iter().any(|msg| {
-            if let rig::completion::message::Message::User { content } = msg {
+            if let rig_core::completion::message::Message::User { content } = msg {
                 content.iter().any(|c| {
-                    if let rig::completion::message::UserContent::Text(t) = c {
+                    if let rig_core::completion::message::UserContent::Text(t) = c {
                         t.text.contains("TOTAL_SUMMARY")
                     } else {
                         false
