@@ -55,30 +55,16 @@ pub struct ProviderInfo {
     pub supports_vision: bool,
 }
 
-/// Decide whether `[img:…]` attachments may flow to this provider+model.
-///
-/// The Anthropic transport carries images natively in both the user-message
-/// and tool-result channels (it is the lone provider whose tool-result
-/// channel delivers images — hence `view_image` is registered only there).
-/// When fronting a local Anthropic-compatible server (e.g. llama-server's
-/// `/v1/messages`), the model name is an arbitrary GGUF string the
-/// conservative name-based detector cannot recognise. Gate on the transport,
-/// not the name — the same decision `view_image` already makes — so a capable
-/// local/gateway model isn't blocked by a name we don't know. A genuinely
-/// non-vision model simply replies "I can't see images", a softer failure than
-/// a hard pre-flight block on a model that *can*.
-///
-/// Every other provider keeps name-based detection: their image handling is
-/// uneven, and the model name is the best signal available.
+/// Whether `[img:…]` attachments may flow to this provider+model. Anthropic
+/// gates on transport (it carries images in user + tool-result channels), so
+/// unknown model names are accepted there; other providers gate on the name.
 pub fn supports_vision_for(provider_name: &str, model: &str) -> bool {
     provider_name == "anthropic" || crate::vision::model_supports_vision(model)
 }
 
-/// Resolve the effective vision capability for a model, honouring an explicit
-/// per-model `vision:` config override. `Some(true)`/`Some(false)` force the
-/// answer; `None` falls back to auto-detection ([`supports_vision_for`]). This
-/// is the single point that decides both `[img:…]` acceptance and (on
-/// Anthropic) whether the `view_image` tool is registered.
+/// Apply an explicit `vision:` override on top of [`supports_vision_for`].
+/// `Some(b)` forces; `None` auto-detects. Single point for both `[img:…]`
+/// acceptance and (on Anthropic) `view_image` registration.
 pub fn resolve_supports_vision(
     vision_override: Option<bool>,
     provider_name: &str,
@@ -501,11 +487,8 @@ where
             .tool(crate::tools::DocSearchTool::new(store.clone()));
     }
 
-    // `view_image` is registered only for providers whose tool-result channel
-    // actually delivers images to the model — the Anthropic Messages API
-    // alone. OpenRouter swaps the image for a placeholder string,
-    // Ollama drops it, and OpenAI errors. Registering it elsewhere would be a
-    // silent no-op, so the caller gates it per provider.
+    // `view_image` needs a tool-result channel that carries images — only
+    // Anthropic. Other providers swap/err/drop the image, so registration is gated.
     if register_view_image {
         builder = builder.tool(crate::tools::ViewImageTool);
     }
@@ -609,12 +592,9 @@ fn create_openrouter_agent(
     Ok((agent, info, receiver, hook))
 }
 
-/// Create Anthropic agent and info.
-///
-/// Uses rig's Anthropic Messages client. `base_url` lets this front a local
-/// Anthropic-compatible server (e.g. llama-server's `/v1/messages`) as well as
-/// the hosted Claude API. This is the one provider whose tool-result channel
-/// carries images, so `view_image` is registered here (`register_view_image`).
+/// Create Anthropic agent and info. `base_url` fronts hosted Claude or a
+/// local Anthropic-compatible server (e.g. llama-server `/v1/messages`);
+/// the tool-result channel carries images, hence `view_image` is here.
 fn create_anthropic_agent(
     config: &AnthropicConfig,
     mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
@@ -1044,11 +1024,8 @@ mod tests {
 
     #[test]
     fn supports_vision_for_gates_anthropic_on_transport_not_model_name() {
-        // The bug: `[img:…]` was blocked on the Anthropic provider whenever the
-        // model name wasn't a known vision pattern — which is exactly the case
-        // for local/gateway multimodal models (e.g. a GGUF name, or
-        // "minimax/MiniMax-M3"). view_image worked there because it gates on the
-        // transport; the inline path must too.
+        // Regression: `[img:…]` was blocked on Anthropic for any unknown name
+        // (e.g. local GGUF), while `view_image` worked there — must gate alike.
         assert!(supports_vision_for("anthropic", "minimax/MiniMax-M3"));
         assert!(supports_vision_for("anthropic", "some-local-gguf"));
         assert!(supports_vision_for("anthropic", "claude-3.5-sonnet"));
