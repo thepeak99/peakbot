@@ -11,8 +11,8 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use crate::config::{
-    AnthropicConfig, BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig,
-    ProviderConfig, SearXngConfig,
+    AnthropicCaching, AnthropicConfig, BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig,
+    OpenRouterConfig, ProviderConfig, SearXngConfig,
 };
 use crate::hooks::SessionHook;
 use crate::hooks::events::AgentEvent;
@@ -25,7 +25,7 @@ use crate::tools::{
     ThinkTool, TodoTool,
 };
 use anyhow::{Context, Result};
-use rig_core::agent::Agent;
+use rig_core::agent::{Agent, AgentBuilder};
 use rig_core::client::completion::CompletionClient;
 use rig_core::completion::Prompt;
 use rig_core::completion::PromptError;
@@ -623,8 +623,17 @@ fn create_anthropic_agent(
     let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
         .with_state_manager(&state_manager);
 
-    let agent_builder = client
-        .agent(&model)
+    let completion_model = client.completion_model(&model);
+    // Build the model explicitly so prompt caching can be toggled — `client.agent()`
+    // hides the model and exposes no hook for the caching flags.
+    let completion_model = match config.prompt_caching {
+        AnthropicCaching::Off => completion_model,
+        AnthropicCaching::Manual => completion_model.with_prompt_caching(),
+        AnthropicCaching::Auto => completion_model.with_automatic_caching(),
+        AnthropicCaching::Auto1h => completion_model.with_automatic_caching_1h(),
+    };
+
+    let agent_builder = AgentBuilder::new(completion_model)
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
         .default_max_turns(max_turns)

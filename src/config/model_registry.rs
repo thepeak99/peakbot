@@ -71,6 +71,10 @@ pub struct ModelEntry {
     /// Optional pass-through extra params for LlamaCpp.
     #[serde(default)]
     pub extra_params: Option<serde_json::Value>,
+    /// Anthropic prompt-caching mode for this model (Anthropic provider only).
+    /// `None` means `off`. See [`crate::config::AnthropicCaching`].
+    #[serde(default)]
+    pub prompt_caching: Option<crate::config::AnthropicCaching>,
     /// Per-model context size in tokens. When `None`, resolved at
     /// registry-build time via
     /// [`crate::context_manager::auto_detect_context_size`].
@@ -347,6 +351,7 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
                 .unwrap_or_else(default_anthropic_base_url),
             model: model.name.clone(),
             max_tokens: model.max_tokens.unwrap_or(default_max_tokens()),
+            prompt_caching: model.prompt_caching.clone().unwrap_or_default(),
         }),
         ProviderType::LlamaCpp => ProviderConfig::LlamaCpp(LlamaCppConfig {
             api_key: prov.api_key.clone(),
@@ -406,6 +411,7 @@ mod tests {
                     max_tokens: Some(8192),
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None,
                 },
                 ModelEntry {
@@ -414,6 +420,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None,
                 },
             ],
@@ -433,6 +440,7 @@ mod tests {
                     max_tokens: Some(4000),
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None,
                 },
                 ModelEntry {
@@ -441,6 +449,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None,
                 },
             ],
@@ -497,6 +506,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 extra_params: None,
+                prompt_caching: None,
                 context_size: None,
             }],
         };
@@ -613,6 +623,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 extra_params: None,
+                prompt_caching: None,
                 context_size: None,
             }],
         };
@@ -640,6 +651,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 extra_params: None,
+                prompt_caching: None,
                 context_size: None,
             }],
         };
@@ -666,6 +678,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None, // → auto-detect → 200_000
                 },
                 ModelEntry {
@@ -674,6 +687,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: Some(42), // explicit → 42
                 },
             ],
@@ -712,6 +726,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 extra_params: None,
+                prompt_caching: None,
                 context_size: None,
             }],
         };

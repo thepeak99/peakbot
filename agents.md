@@ -408,6 +408,15 @@ provider:
     base_url: http://localhost:8080   # llama-server /v1/messages; default: https://api.anthropic.com
     model: your-multimodal-model      # e.g. claude-3-5-sonnet-latest, or a local GGUF name
     max_tokens: 4096
+    # Prompt caching (default: off). Injects ephemeral `cache_control`
+    # breakpoints to cut input-token cost on the stable request prefix.
+    #   off     — no caching
+    #   manual  — system prompt + last tool + last message (≈ LiteLLM
+    #             system/0 + user/-1 injection points), 5-minute TTL
+    #   auto    — top-level breakpoint the API advances as the chat grows, 5m
+    #   auto_1h — same as auto, 1-hour TTL
+    # In the multi-model `providers:` format, set `prompt_caching:` per model.
+    prompt_caching: manual
 
 # Ollama example (local models)
 provider:

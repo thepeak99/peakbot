@@ -81,6 +81,28 @@ pub struct OpenAIConfig {
     pub max_tokens: u64,
 }
 
+/// Anthropic prompt-caching mode. Injects ephemeral `cache_control`
+/// breakpoints to cut input-token cost on the stable prefix of each request.
+///
+/// `Manual` mirrors LiteLLM's `system/0` + `user/-1` injection points
+/// (rig also marks the tool-schema block, within Anthropic's 4-breakpoint
+/// budget). `Auto*` use Anthropic's top-level breakpoint that advances as the
+/// conversation grows — recommended for multi-turn.
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicCaching {
+    /// No caching (default).
+    #[default]
+    Off,
+    /// Manual breakpoints: system prompt + last tool + last message (5m TTL).
+    Manual,
+    /// Automatic top-level breakpoint, 5-minute TTL.
+    Auto,
+    /// Automatic top-level breakpoint, 1-hour TTL.
+    #[serde(rename = "auto_1h", alias = "auto1h")]
+    Auto1h,
+}
+
 /// Configuration for Anthropic provider (Claude API, or any server that
 /// speaks the Anthropic Messages API — notably llama.cpp's `/v1/messages`).
 ///
@@ -105,6 +127,9 @@ pub struct AnthropicConfig {
     /// Maximum tokens for responses.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
+    /// Prompt-caching mode (default: `off`). See [`AnthropicCaching`].
+    #[serde(default)]
+    pub prompt_caching: AnthropicCaching,
 }
 
 /// Configuration for LlamaCpp provider (uses OpenAI-compatible completions API)
@@ -464,7 +489,7 @@ impl Config {
             // Legacy synthesis path. We construct a single-entry list
             // whose ProviderEntry copies the legacy `provider:` shape.
             // The wire id is read off the active legacy variant.
-            let (kind, api_key, base_url, model_name, max_tokens, temperature, extra) =
+            let (kind, api_key, base_url, model_name, max_tokens, temperature, extra, caching) =
                 describe_legacy(&self.provider);
             let synthetic_alias = "default".to_string();
             let provider_entry = ProviderEntry {
@@ -478,6 +503,7 @@ impl Config {
                     max_tokens: Some(max_tokens),
                     temperature,
                     extra_params: extra,
+                    prompt_caching: caching,
                     context_size: None,
                 }],
             };
@@ -536,6 +562,7 @@ fn describe_legacy(
     u64,
     Option<f32>,
     Option<serde_json::Value>,
+    Option<AnthropicCaching>,
 ) {
     match p {
         ProviderConfig::OpenRouter(c) => (
@@ -544,6 +571,7 @@ fn describe_legacy(
             None,
             c.model.clone(),
             c.max_tokens,
+            None,
             None,
             None,
         ),
@@ -555,6 +583,7 @@ fn describe_legacy(
             c.max_tokens,
             None,
             None,
+            None,
         ),
         ProviderConfig::Anthropic(c) => (
             ProviderType::Anthropic,
@@ -564,6 +593,7 @@ fn describe_legacy(
             c.max_tokens,
             None,
             None,
+            Some(c.prompt_caching.clone()),
         ),
         ProviderConfig::LlamaCpp(c) => (
             ProviderType::LlamaCpp,
@@ -573,6 +603,7 @@ fn describe_legacy(
             c.max_tokens,
             None,
             c.extra_params.clone(),
+            None,
         ),
         ProviderConfig::Ollama(c) => (
             ProviderType::Ollama,
@@ -582,6 +613,7 @@ fn describe_legacy(
             // Ollama has no max_tokens — use the default placeholder.
             default_max_tokens(),
             c.temperature,
+            None,
             None,
         ),
     }
@@ -1307,6 +1339,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_anthropic_prompt_caching_defaults_off() {
+        let yaml = r#"
+provider:
+  type: anthropic
+  config:
+    model: claude-sonnet-4-5
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).expect("must parse");
+        match cfg.provider {
+            ProviderConfig::Anthropic(c) => {
+                assert_eq!(c.prompt_caching, AnthropicCaching::Off);
+            }
+            _ => panic!("expected Anthropic provider"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_prompt_caching_modes_parse() {
+        for (s, want) in [
+            ("manual", AnthropicCaching::Manual),
+            ("auto", AnthropicCaching::Auto),
+            ("auto_1h", AnthropicCaching::Auto1h),
+            ("off", AnthropicCaching::Off),
+        ] {
+            let yaml = format!(
+                "provider:\n  type: anthropic\n  config:\n    model: m\n    prompt_caching: {s}\n"
+            );
+            let cfg: Config = serde_yaml::from_str(&yaml).expect("must parse");
+            match cfg.provider {
+                ProviderConfig::Anthropic(c) => assert_eq!(c.prompt_caching, want, "mode {s}"),
+                _ => panic!("expected Anthropic provider"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_legacy_anthropic_caching_survives_registry() {
+        // The legacy `provider:` block routes through describe_legacy →
+        // ModelEntry → resolve. Caching must not be dropped along the way.
+        let yaml = r#"
+provider:
+  type: anthropic
+  config:
+    model: claude-sonnet-4-5
+    prompt_caching: manual
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).expect("must parse");
+        let registry = cfg.build_model_registry().expect("registry builds");
+        let resolved = registry.resolve("default").expect("default alias resolves");
+        match &resolved.provider_config {
+            ProviderConfig::Anthropic(c) => {
+                assert_eq!(c.prompt_caching, AnthropicCaching::Manual);
+            }
+            _ => panic!("expected Anthropic provider"),
+        }
+    }
+
+    #[test]
     fn test_merge_with_partial_provider_override() {
         // Master config with full OpenRouter settings
         let mut master = Config::default();
@@ -1460,6 +1550,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None,
                 }],
             }],
@@ -1488,6 +1579,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None,
                 }],
             }],
@@ -1532,6 +1624,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     extra_params: None,
+                    prompt_caching: None,
                     context_size: None,
                 }],
             }],
