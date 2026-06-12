@@ -91,12 +91,13 @@ pub struct OpenAIConfig {
 #[derive(Debug, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AnthropicCaching {
-    /// No caching (default).
-    #[default]
+    /// No caching. Set explicitly to opt out of the default.
     Off,
     /// Manual breakpoints: system prompt + last tool + last message (5m TTL).
     Manual,
-    /// Automatic top-level breakpoint, 5-minute TTL.
+    /// Automatic top-level breakpoint, 5-minute TTL. (Default — recommended
+    /// for multi-turn Claude usage; cut input-token cost on the stable prefix.)
+    #[default]
     Auto,
     /// Automatic top-level breakpoint, 1-hour TTL.
     #[serde(rename = "auto_1h", alias = "auto1h")]
@@ -127,7 +128,9 @@ pub struct AnthropicConfig {
     /// Maximum tokens for responses.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
-    /// Prompt-caching mode (default: `off`). See [`AnthropicCaching`].
+    /// Prompt-caching mode (default: `auto`). See [`AnthropicCaching`].
+    /// Set `prompt_caching: off` to opt out (e.g. for local llama-server
+    /// endpoints that may not honor `cache_control`).
     #[serde(default)]
     pub prompt_caching: AnthropicCaching,
 }
@@ -1339,7 +1342,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_anthropic_prompt_caching_defaults_off() {
+    fn test_anthropic_prompt_caching_defaults_auto() {
         let yaml = r#"
 provider:
   type: anthropic
@@ -1349,7 +1352,7 @@ provider:
         let cfg: Config = serde_yaml::from_str(yaml).expect("must parse");
         match cfg.provider {
             ProviderConfig::Anthropic(c) => {
-                assert_eq!(c.prompt_caching, AnthropicCaching::Off);
+                assert_eq!(c.prompt_caching, AnthropicCaching::Auto);
             }
             _ => panic!("expected Anthropic provider"),
         }
