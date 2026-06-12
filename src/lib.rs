@@ -454,17 +454,38 @@ impl AgentRunner {
         // tool's `start` verb can hand a clone to each reader. See
         // `bash-background.md` § "Wiring into the agent loop".
         let (bg_notify_tx, mut bg_notify_rx) = mpsc::unbounded_channel::<()>();
-        if let Some(sm) = self.state_manager.as_ref() {
+        let bg_sm = self.state_manager.clone();
+        if let Some(sm) = bg_sm.as_ref() {
             sm.attach_bg_notify(bg_notify_tx);
         }
         let bg_bridge_handle = {
             let msg_tx = msg_tx.clone();
             tokio::spawn(async move {
-                while bg_notify_rx.recv().await.is_some() {
-                    // Best-effort: if the queue is full the agent loop
-                    // is already busy; the next reader ping will
-                    // re-arm us. Drop the error.
-                    let _ = msg_tx.send(QueueMessage::BackgroundOutputReady).await;
+                loop {
+                    // A process may be coalescing output behind its
+                    // cooldown; arm a wakeup at the soonest window expiry
+                    // so a buffer that goes quiet still flushes on time.
+                    let deadline = bg_sm.as_ref().and_then(|sm| sm.next_bg_poke_deadline());
+                    let flush = async {
+                        match deadline {
+                            Some(d) => tokio::time::sleep_until(d.into()).await,
+                            // No pending cooldown → park this arm forever;
+                            // the next reader ping re-evaluates the deadline.
+                            None => std::future::pending::<()>().await,
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        ping = bg_notify_rx.recv() => {
+                            if ping.is_none() {
+                                break; // sender dropped → loop torn down
+                            }
+                            let _ = msg_tx.send(QueueMessage::BackgroundOutputReady).await;
+                        }
+                        _ = flush => {
+                            let _ = msg_tx.send(QueueMessage::BackgroundOutputReady).await;
+                        }
+                    }
                 }
             })
         };
@@ -860,11 +881,10 @@ impl AgentRunner {
                             sm.add_user_message_with_attachments(text.clone(), attachments);
                         }
                         sm.decrement_pending_input();
-                        // A real human turn resets the capped-tier circuit
-                        // breaker, so any bg processes that were paused by
-                        // it can resume injecting on the next ping. See
-                        // `bash-background.md` § "Circuit breaker".
-                        sm.reset_bg_counter();
+                        // A real human turn clears all bg cooldowns, so any
+                        // buffered background output flushes on the next drain
+                        // alongside the user's message.
+                        sm.reset_bg_cooldowns();
                         sm.set_running(true);
                     }
 
@@ -1637,11 +1657,7 @@ impl AgentRunner {
         // Persist the synthetic message with the bg discriminator so
         // /load restores it with the right styling and proc-id
         // provenance.
-        sm.add_user_message_from_background(
-            synthetic.text.clone(),
-            synthetic.proc_ids.clone(),
-            synthetic.any_unlimited,
-        );
+        sm.add_user_message_from_background(synthetic.text.clone(), synthetic.proc_ids.clone());
         sm.set_running(true);
         let current_turn = sm
             .build_current_turn_message()
@@ -1832,10 +1848,10 @@ impl AgentRunner {
                     } else {
                         let mut msg = format!("Background processes ({}):\n", rows.len());
                         for r in rows {
-                            let tier = if r.treat_as_user_input {
-                                "💬 unlimited"
+                            let cooldown = if r.cooldown.is_zero() {
+                                "real-time".to_string()
                             } else {
-                                "🛰 capped"
+                                format!("{}s cooldown", r.cooldown.as_secs())
                             };
                             let status = match r.status {
                                 crate::bg_processes::BgStatus::Running { .. } => {
@@ -1851,10 +1867,10 @@ impl AgentRunner {
                                 .map(|l| format!(" [{l}]"))
                                 .unwrap_or_default();
                             msg.push_str(&format!(
-                                "  #{} pid={} {} · {} · {}/{} lines · {}{}\n",
+                                "  #{} pid={} 🛰 {} · {} · {}/{} lines · {}{}\n",
                                 r.id,
                                 r.pid,
-                                tier,
+                                cooldown,
                                 status,
                                 r.buffer_len,
                                 r.capture_cap,

@@ -4,6 +4,26 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Replaced the background-process "3-turns-and-stop" circuit breaker
+  with a per-process cooldown the model controls.** `bash_bg start` now
+  takes an optional `cooldown_secs` (default **60**): after a process
+  injects a `[bg output]` turn, its further output is coalesced and
+  flushed in one batch once the cooldown elapses, so a chatty log no
+  longer wakes you on every line. `cooldown_secs: 0` is real-time (inject
+  every batch) — use it for external-input bridges (telegram, webhooks,
+  IRC) where you react to each line immediately. Process exits always
+  bypass the cooldown, and a real user message flushes all buffered
+  output at once. A quiet buffer that fell silent mid-window still
+  flushes on time via a deadline-driven wakeup in the agent loop.
+- **Removed the `treat_as_user_input` flag and the two-tier (capped /
+  unlimited) model.** The single `cooldown_secs` knob now covers what the
+  tier flag used to: set `0` for instant external input, leave the
+  default for ambient feeds. Background turns render uniformly (🛰
+  Background). The `telegram-chat` skill now starts its listener with
+  `cooldown_secs: 0`. Conversations saved before this change still load
+  (the stale `any_unlimited` field is ignored).
+
+
 - **Added a "Comment Style" rule to `agents.md`** and trimmed the
   branch's own comments to match: keep comments to 2–3 lines (ideally 1),
   explain *why* not *what*, never narrate plans/stages/temporal changes,

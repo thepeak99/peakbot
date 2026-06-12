@@ -2,14 +2,22 @@
 //!
 //! Long-running PTY-attached processes managed by the agent. Each process
 //! has a numeric id, an optional ring-buffer of captured output lines, and
-//! a tier flag (`treat_as_user_input`) that determines whether its output
-//! resets the synthetic-turn circuit breaker or contributes to it.
+//! a per-process `cooldown` that throttles how often its output is injected
+//! into the conversation as a synthetic turn.
 //!
 //! The PTY plumbing (spawn, reader thread, ANSI strip, ring buffer, kill)
 //! is delegated to [`crate::pty_runner`]. This module owns the
-//! *registry-level* concerns: multi-process bookkeeping, the
-//! consecutive-auto-turns circuit breaker, two-tier classification
-//! (capped vs. unlimited), and the drain-into-synthetic-turn semantics.
+//! *registry-level* concerns: multi-process bookkeeping, the per-process
+//! cooldown gate, and the drain-into-synthetic-turn semantics.
+//!
+//! ## Cooldown
+//!
+//! Each process coalesces its output: after an injection, further output
+//! accumulates in the ring buffer until the process's `cooldown` elapses,
+//! then the whole batch is flushed in one synthetic turn. `cooldown == 0`
+//! disables coalescing (real-time — every drained batch injects). Process
+//! exits always bypass the cooldown so the model learns the process is
+//! gone immediately.
 //!
 //! ## Lifecycle
 //!
@@ -20,8 +28,8 @@
 //!    shared `LineBuffer` and pings the agent loop on dirty.
 //! 3. Output is drained synchronously by `BgRegistry::drain_outputs`,
 //!    called between agent turns. The drain assembles one `[bg output]`
-//!    block per non-empty process and clears their rings. Exit
-//!    notifications bypass the circuit-breaker gate.
+//!    block per non-empty process whose cooldown has elapsed and clears
+//!    their rings. Exit notifications bypass the cooldown gate.
 //! 4. `BgRegistry::stop` (or `Drop`) calls the killer (SIGHUP on Unix),
 //!    joins the reader, and removes the process from the registry.
 //!
@@ -38,7 +46,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use portable_pty::ChildKiller;
@@ -53,11 +61,10 @@ pub const DEFAULT_CAPTURE_LINES: usize = 200;
 /// before pinging the agent loop. Open question Q2 was answered "OK" at 500ms.
 pub const DEBOUNCE_MS: u64 = 500;
 
-/// Capped-tier circuit breaker: after this many consecutive synthetic turns
-/// driven by capped-only processes (no `treat_as_user_input` contributor),
-/// suppress auto-injection until a real user message or an unlimited-tier
-/// contribution resets the counter. Open question Q1 was answered "OK" at 3.
-pub const MAX_CONSECUTIVE_AUTO_TURNS: usize = 3;
+/// Default per-process cooldown (seconds) when the model omits `cooldown_secs`.
+/// Output is coalesced into at most one synthetic turn per this interval; `0`
+/// means real-time (every drained batch injects).
+pub const DEFAULT_COOLDOWN_SECS: u64 = 60;
 
 /// Status of a background process. Mirrors [`pty_runner::PtyStatus`] but
 /// adds a timestamp so the TUI / drain blocks can show *when* the
@@ -84,11 +91,12 @@ pub struct BgProcess {
     pub pid: u32,
     pub command: String,
     pub label: Option<String>,
-    /// `true` ⇒ output represents external input (telegram, webhooks).
-    /// Synthetic turns containing any contribution from such a process
-    /// reset the circuit-breaker counter, exactly like a typed user
-    /// message would.
-    pub treat_as_user_input: bool,
+    /// How long to coalesce this process's output before injecting a
+    /// synthetic turn. `Duration::ZERO` ⇒ real-time (no coalescing).
+    pub cooldown: Duration,
+    /// When this process last had output injected. `None` until the first
+    /// injection — the cooldown gate treats `None` as "eligible now".
+    last_inject: Option<Instant>,
     /// Ring capacity. `0` disables capture entirely (output is still
     /// drained from the PTY so the child doesn't block, but lines are
     /// discarded — useful for fire-and-forget watchers).
@@ -123,7 +131,8 @@ pub struct StartParams {
     pub capture_cap: usize,
     pub cwd: Option<String>,
     pub label: Option<String>,
-    pub treat_as_user_input: bool,
+    /// Output-coalescing window. `Duration::ZERO` ⇒ real-time.
+    pub cooldown: Duration,
     /// Optional environment variables to set for the spawned process,
     /// inherited from the `bash:` config section (same source as `bash`).
     pub env: Option<std::collections::HashMap<String, String>>,
@@ -138,7 +147,6 @@ pub struct DrainedBlock {
     pub id: u32,
     pub command: String,
     pub label: Option<String>,
-    pub treat_as_user_input: bool,
     pub status_after: BgStatus,
     pub lines: Vec<String>,
 }
@@ -161,7 +169,7 @@ pub struct BgListEntry {
     pub status: BgStatus,
     pub buffer_len: usize,
     pub capture_cap: usize,
-    pub treat_as_user_input: bool,
+    pub cooldown: Duration,
 }
 
 /// Errors surfaced by registry operations. Each variant maps to a coach
@@ -192,10 +200,6 @@ impl From<SpawnError> for BgError {
 pub struct BgRegistry {
     procs: HashMap<u32, BgProcess>,
     next_id: u32,
-    /// Counter for the capped-tier circuit breaker. Incremented when a
-    /// synthetic turn drains capped-only contributions; reset by a real
-    /// user message OR any unlimited-tier contribution.
-    consecutive_capped_turns: usize,
 }
 
 impl BgRegistry {
@@ -203,7 +207,6 @@ impl BgRegistry {
         Self {
             procs: HashMap::new(),
             next_id: 1,
-            consecutive_capped_turns: 0,
         }
     }
 
@@ -233,11 +236,26 @@ impl BgRegistry {
             .count()
     }
 
-    /// Whether the capped-tier circuit breaker is currently suppressing
-    /// auto-injection. Reader threads keep filling buffers regardless;
-    /// the next reset flushes everything accumulated.
-    pub fn suppress_capped(&self) -> bool {
-        self.consecutive_capped_turns >= MAX_CONSECUTIVE_AUTO_TURNS
+    /// Earliest instant at which any running process with buffered output
+    /// becomes eligible to inject (its cooldown elapses). `None` when no
+    /// process is currently waiting out a cooldown. Drives the agent
+    /// loop's flush wakeup so a buffer that goes quiet mid-cooldown still
+    /// flushes when its window expires.
+    pub fn next_poke_deadline(&self, now: Instant) -> Option<Instant> {
+        self.procs
+            .values()
+            .filter_map(|p| {
+                let buf = p.buffer.lock().ok()?;
+                // Only running, dirty processes that are still inside their
+                // cooldown window are waiting on a future poke. Eligible-now
+                // and clean processes don't need one.
+                if !buf.dirty || !buf.status.is_running() {
+                    return None;
+                }
+                let deadline = p.last_inject? + p.cooldown;
+                (deadline > now).then_some(deadline)
+            })
+            .min()
     }
 
     /// Snapshot list for the `list` verb / `/bg` slash command.
@@ -255,7 +273,7 @@ impl BgRegistry {
                     status: bg_status_from(p, &buf),
                     buffer_len: buf.lines.len(),
                     capture_cap: p.capture_cap,
-                    treat_as_user_input: p.treat_as_user_input,
+                    cooldown: p.cooldown,
                 }
             })
             .collect();
@@ -277,7 +295,7 @@ impl BgRegistry {
             capture_cap,
             cwd,
             label,
-            treat_as_user_input,
+            cooldown,
             env,
             shell,
         } = params;
@@ -304,7 +322,8 @@ impl BgRegistry {
             pid: parts.pid,
             command,
             label,
-            treat_as_user_input,
+            cooldown,
+            last_inject: None,
             capture_cap,
             started_at,
             exited_at: None,
@@ -324,7 +343,7 @@ impl BgRegistry {
             },
             buffer_len: 0,
             capture_cap: proc.capture_cap,
-            treat_as_user_input: proc.treat_as_user_input,
+            cooldown: proc.cooldown,
         };
         self.procs.insert(id, proc);
         Ok(entry)
@@ -379,23 +398,25 @@ impl BgRegistry {
         Ok(bytes.len())
     }
 
-    /// Drain every non-empty buffer into one `DrainedBlock` per process.
+    /// Drain every eligible non-empty buffer into one `DrainedBlock` per
+    /// process. `now` is the reference instant for the cooldown gate
+    /// (injected so the decision is a pure, testable function of time).
+    ///
+    /// A dirty process contributes iff it has **exited** OR its cooldown
+    /// has elapsed since its last injection (`last_inject + cooldown <=
+    /// now`; a never-injected process is always eligible). Processes still
+    /// inside their cooldown window are skipped — their buffers keep
+    /// accumulating and flush on a later drain once the window expires.
     ///
     /// Side effects:
-    /// - Each touched ring is cleared.
+    /// - Each contributing ring is cleared.
+    /// - Contributing running processes have `last_inject` stamped to `now`.
     /// - Exited processes are removed from the registry **after** their
     ///   block is captured (so the model sees the final tail once).
-    /// - The circuit-breaker counter is updated based on the tiers of
-    ///   contributing processes — capped-only ⇒ `+= 1`, any unlimited
-    ///   contribution ⇒ reset to 0.
     ///
-    /// Returns `None` when nothing was drained (all buffers clean OR
-    /// the capped-tier circuit breaker is suppressing).
-    pub fn drain_outputs(&mut self) -> Option<Vec<DrainedBlock>> {
-        let suppress = self.suppress_capped();
+    /// Returns `None` when nothing was drained.
+    pub fn drain_outputs(&mut self, now: Instant) -> Option<Vec<DrainedBlock>> {
         let mut blocks: Vec<DrainedBlock> = Vec::new();
-        let mut had_unlimited = false;
-        let mut had_capped = false;
         let mut to_remove: Vec<u32> = Vec::new();
 
         for proc in self.procs.values_mut() {
@@ -404,17 +425,12 @@ impl BgRegistry {
                 continue;
             }
             let exited = matches!(buf.status, PtyStatus::Exited(_));
-            // Honour the suppression gate for capped-only *running*
-            // contributors: their notifications still fired (reader is
-            // unaware of the breaker), but we don't drain them. The
-            // buffer keeps accumulating; a future drain after a reset
-            // will flush it.
-            //
-            // Exit notifications are exempt — a process exit is a
-            // one-shot terminal transition that cannot loop, so the
-            // breaker has no protective value here, and the model needs
-            // to learn the process is gone regardless of breaker state.
-            if suppress && !proc.treat_as_user_input && !exited {
+            // Cooldown gate: a running process inside its window is held
+            // back (the reader keeps filling the buffer; a later drain
+            // flushes it). Exits are exempt — a one-shot terminal
+            // transition the model must learn immediately.
+            let elapsed = proc.last_inject.is_none_or(|t| now >= t + proc.cooldown);
+            if !exited && !elapsed {
                 continue;
             }
             let lines: Vec<String> = buf.lines.drain(..).collect();
@@ -431,19 +447,15 @@ impl BgRegistry {
                 continue;
             }
 
-            if proc.treat_as_user_input {
-                had_unlimited = true;
-            } else {
-                had_capped = true;
-            }
             if exited {
                 to_remove.push(proc.id);
+            } else {
+                proc.last_inject = Some(now);
             }
             blocks.push(DrainedBlock {
                 id: proc.id,
                 command: proc.command.clone(),
                 label: proc.label.clone(),
-                treat_as_user_input: proc.treat_as_user_input,
                 status_after,
                 lines,
             });
@@ -460,24 +472,17 @@ impl BgRegistry {
             }
         }
 
-        if blocks.is_empty() {
-            return None;
-        }
-
-        if had_unlimited {
-            self.consecutive_capped_turns = 0;
-        } else if had_capped {
-            self.consecutive_capped_turns += 1;
-        }
-
-        Some(blocks)
+        (!blocks.is_empty()).then_some(blocks)
     }
 
-    /// Reset the consecutive-capped-turns counter. Called by `StateManager`
-    /// whenever a *real* user message is dequeued. (Synthetic turns
-    /// driven by unlimited contributors reset it via `drain_outputs`.)
-    pub fn reset_counter(&mut self) {
-        self.consecutive_capped_turns = 0;
+    /// Clear every process's `last_inject` so the next drain flushes all
+    /// buffered output regardless of cooldown. Called by `StateManager`
+    /// whenever a *real* user message is dequeued — engaging the agent is
+    /// a natural point to surface everything accumulated.
+    pub fn reset_cooldowns(&mut self) {
+        for proc in self.procs.values_mut() {
+            proc.last_inject = None;
+        }
     }
 
     /// Kill every process. Called on `/new`, `/model`, `/load` rebuild,
@@ -487,7 +492,6 @@ impl BgRegistry {
         for id in ids {
             let _ = self.stop(id);
         }
-        self.consecutive_capped_turns = 0;
     }
 
     /// Process count accessor for tests.
@@ -541,7 +545,7 @@ mod tests {
                     capture_cap: 0,
                     cwd: None,
                     label: None,
-                    treat_as_user_input: false,
+                    cooldown: Duration::ZERO,
                     env: None,
                     shell: String::new(),
                 },
@@ -556,7 +560,7 @@ mod tests {
                     capture_cap: 0,
                     cwd: None,
                     label: None,
-                    treat_as_user_input: false,
+                    cooldown: Duration::ZERO,
                     env: None,
                     shell: String::new(),
                 },
@@ -580,149 +584,164 @@ mod tests {
         }
     }
 
-    #[test]
-    fn circuit_breaker_increments_on_capped_only_and_resets_on_unlimited() {
-        let mut r = BgRegistry::new();
-        // Simulate the contributing-tier bookkeeping directly — full
-        // PTY-driven integration sits in tests/scenarios/bg_tests.rs.
-        // Manually push a fake exited process.
-        let shared_cap = Arc::new(Mutex::new(LineBuffer {
-            lines: VecDeque::from(vec!["hi".to_string()]),
+    /// Insert a hand-built process (bypassing real PTY spawn) so the
+    /// cooldown gate can be exercised synchronously. Returns the shared
+    /// buffer so the test can push more lines later.
+    fn insert_fake(
+        r: &mut BgRegistry,
+        id: u32,
+        cooldown: Duration,
+        status: PtyStatus,
+        first_line: &str,
+    ) -> Arc<Mutex<LineBuffer>> {
+        let buf = Arc::new(Mutex::new(LineBuffer {
+            lines: VecDeque::from(vec![first_line.to_string()]),
             cap: 10,
-            status: PtyStatus::Running,
+            status,
             dirty: true,
         }));
-        let shared_un = Arc::new(Mutex::new(LineBuffer {
-            lines: VecDeque::from(vec!["from-tg".to_string()]),
-            cap: 10,
-            status: PtyStatus::Running,
-            dirty: true,
-        }));
-        // Insert capped process by hand.
         r.procs.insert(
-            10,
+            id,
             BgProcess {
-                id: 10,
+                id,
                 pid: 0,
-                command: "tail".into(),
+                command: "fake".into(),
                 label: None,
-                treat_as_user_input: false,
+                cooldown,
+                last_inject: None,
                 capture_cap: 10,
                 started_at: Utc::now(),
                 exited_at: None,
-                buffer: shared_cap.clone(),
+                buffer: buf.clone(),
                 writer: Box::new(std::io::sink()),
                 killer: dummy_killer(),
                 reader: None,
             },
         );
-        r.procs.insert(
-            11,
-            BgProcess {
-                id: 11,
-                pid: 0,
-                command: "telegram".into(),
-                label: None,
-                treat_as_user_input: true,
-                capture_cap: 10,
-                started_at: Utc::now(),
-                exited_at: None,
-                buffer: shared_un.clone(),
-                writer: Box::new(std::io::sink()),
-                killer: dummy_killer(),
-                reader: None,
-            },
-        );
-
-        // First drain: both contribute → unlimited wins → counter = 0.
-        let _ = r.drain_outputs();
-        assert_eq!(r.consecutive_capped_turns, 0);
-
-        // Now refill *only* the capped one.
-        shared_cap.lock().unwrap().push_line("hi again".into());
-        let _ = r.drain_outputs();
-        assert_eq!(r.consecutive_capped_turns, 1);
-
-        shared_cap.lock().unwrap().push_line("hi 3".into());
-        let _ = r.drain_outputs();
-        assert_eq!(r.consecutive_capped_turns, 2);
-
-        shared_cap.lock().unwrap().push_line("hi 4".into());
-        let _ = r.drain_outputs();
-        assert_eq!(r.consecutive_capped_turns, 3);
-        assert!(r.suppress_capped());
-
-        // Even when capped fires again, suppression skips the drain
-        // entirely → counter stays at 3.
-        shared_cap.lock().unwrap().push_line("hi 5".into());
-        let drained = r.drain_outputs();
-        assert!(drained.is_none(), "capped-only drain must suppress");
-        assert_eq!(r.consecutive_capped_turns, 3);
-
-        // Unlimited fires → suppression bypassed → counter resets.
-        shared_un
-            .lock()
-            .unwrap()
-            .push_line("hi from tg again".into());
-        let _ = r.drain_outputs();
-        assert_eq!(r.consecutive_capped_turns, 0);
-
-        // Sanity: registry still owns both procs.
-        assert_eq!(r.proc_count(), 2);
+        buf
     }
 
     #[test]
-    fn exit_notification_bypasses_capped_suppression() {
-        // Regression pin for the "process exit must always notify"
-        // invariant: if the capped-tier circuit breaker is saturated and
-        // a capped process exits, the exit block must still drain so the
-        // model learns the process is gone. Exits are one-shot terminal
-        // transitions and cannot loop, so the breaker has no protective
-        // value here.
+    fn cooldown_withholds_capped_until_window_elapses() {
         let mut r = BgRegistry::new();
-        r.consecutive_capped_turns = MAX_CONSECUTIVE_AUTO_TURNS;
-        assert!(r.suppress_capped(), "test precondition: breaker saturated");
+        let cooldown = Duration::from_secs(60);
+        let buf = insert_fake(&mut r, 1, cooldown, PtyStatus::Running, "first");
+        let t0 = Instant::now();
 
-        let buf = Arc::new(Mutex::new(LineBuffer {
-            lines: VecDeque::from(vec!["final tail line".to_string()]),
-            cap: 10,
-            status: PtyStatus::Exited(0),
-            dirty: true,
-        }));
-        r.procs.insert(
+        // First drain: never injected → eligible → flushes.
+        let d = r.drain_outputs(t0).expect("first batch flushes");
+        assert_eq!(d[0].lines, vec!["first".to_string()]);
+
+        // More output arrives inside the window → withheld.
+        buf.lock().unwrap().push_line("second".into());
+        assert!(
+            r.drain_outputs(t0 + Duration::from_secs(10)).is_none(),
+            "output inside cooldown must be withheld"
+        );
+
+        // Still buffered (not lost).
+        assert_eq!(buf.lock().unwrap().lines.len(), 1);
+
+        // Window elapses → the accumulated batch flushes.
+        let d = r
+            .drain_outputs(t0 + cooldown)
+            .expect("batch flushes once window elapses");
+        assert_eq!(d[0].lines, vec!["second".to_string()]);
+    }
+
+    #[test]
+    fn cooldown_zero_is_realtime() {
+        let mut r = BgRegistry::new();
+        let buf = insert_fake(&mut r, 1, Duration::ZERO, PtyStatus::Running, "a");
+        let t0 = Instant::now();
+
+        assert!(r.drain_outputs(t0).is_some(), "first batch flushes");
+        buf.lock().unwrap().push_line("b".into());
+        // Same instant, zero cooldown → still eligible (last_inject + 0 <= now).
+        assert!(
+            r.drain_outputs(t0).is_some(),
+            "zero cooldown injects every batch (real-time)"
+        );
+    }
+
+    #[test]
+    fn exit_notification_bypasses_cooldown() {
+        // Exits must surface immediately even inside a long cooldown
+        // window — a one-shot terminal transition the model must learn.
+        let mut r = BgRegistry::new();
+        let buf = insert_fake(
+            &mut r,
             42,
-            BgProcess {
-                id: 42,
-                pid: 0,
-                command: "echo bye".into(),
-                label: None,
-                treat_as_user_input: false,
-                capture_cap: 10,
-                started_at: Utc::now(),
-                exited_at: None,
-                buffer: buf,
-                writer: Box::new(std::io::sink()),
-                killer: dummy_killer(),
-                reader: None,
-            },
+            Duration::from_secs(3600),
+            PtyStatus::Running,
+            "warmup",
         );
+        let t0 = Instant::now();
+        r.drain_outputs(t0)
+            .expect("warmup flush stamps last_inject");
 
+        // Process exits 1s later — well inside the 1h cooldown.
+        {
+            let mut b = buf.lock().unwrap();
+            b.push_line("final tail line".into());
+            b.status = PtyStatus::Exited(0);
+        }
         let drained = r
-            .drain_outputs()
-            .expect("exit must surface even when capped suppression is active");
+            .drain_outputs(t0 + Duration::from_secs(1))
+            .expect("exit must surface even inside the cooldown window");
         assert_eq!(drained.len(), 1, "exit block must drain");
-        let block = &drained[0];
-        assert!(block.exited(), "drained block must reflect Exited status");
-        assert_eq!(block.lines, vec!["final tail line".to_string()]);
+        assert!(drained[0].exited(), "block must reflect Exited status");
+        assert_eq!(drained[0].lines, vec!["final tail line".to_string()]);
+        assert_eq!(r.proc_count(), 0, "exited process reaped after final drain");
+    }
 
-        // The exited process must be removed from the registry on drain
-        // (per `drain_outputs` contract — exited rows are reaped after
-        // their final tail is captured).
-        assert_eq!(
-            r.proc_count(),
-            0,
-            "exited process must be reaped after final drain"
+    #[test]
+    fn next_poke_deadline_tracks_soonest_capped() {
+        let mut r = BgRegistry::new();
+        let short = insert_fake(&mut r, 1, Duration::from_secs(10), PtyStatus::Running, "x");
+        let _long = insert_fake(&mut r, 2, Duration::from_secs(300), PtyStatus::Running, "y");
+        let t0 = Instant::now();
+
+        // Nothing injected yet → both eligible-now → no future deadline.
+        assert!(r.next_poke_deadline(t0).is_none());
+
+        // Flush both (stamps last_inject = t0), then refill so they're
+        // dirty again and waiting out their windows.
+        r.drain_outputs(t0).expect("both flush");
+        short.lock().unwrap().push_line("x2".into());
+        r.procs
+            .get(&2)
+            .unwrap()
+            .buffer
+            .lock()
+            .unwrap()
+            .push_line("y2".into());
+
+        // Soonest deadline is the 10s process.
+        let deadline = r.next_poke_deadline(t0).expect("a window is pending");
+        assert_eq!(deadline, t0 + Duration::from_secs(10));
+    }
+
+    #[test]
+    fn reset_cooldowns_flushes_everything_next_drain() {
+        let mut r = BgRegistry::new();
+        let buf = insert_fake(
+            &mut r,
+            1,
+            Duration::from_secs(60),
+            PtyStatus::Running,
+            "first",
         );
+        let t0 = Instant::now();
+        r.drain_outputs(t0).expect("first flush");
+
+        buf.lock().unwrap().push_line("second".into());
+        // Inside the window normally → withheld; reset clears the stamp.
+        r.reset_cooldowns();
+        let d = r
+            .drain_outputs(t0 + Duration::from_secs(1))
+            .expect("reset_cooldowns makes the next drain flush immediately");
+        assert_eq!(d[0].lines, vec!["second".to_string()]);
     }
 
     /// Dummy killer for tests that bypass real PTY spawning.

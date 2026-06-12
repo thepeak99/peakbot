@@ -2,10 +2,10 @@
 //!
 //! Exercises the full `bash_bg` flow end-to-end via the public
 //! `StateManager` surface: spawn → reader captures output → drain
-//! assembles synthetic turn → counter updates correctly. Full
-//! agent-loop wiring (`QueueMessage::BackgroundOutputReady` → drain
-//! seam) is exercised by the unit tests in `bg_processes.rs::tests`
-//! plus the wire-shape coverage here.
+//! assembles synthetic turn. Full agent-loop wiring
+//! (`QueueMessage::BackgroundOutputReady` → drain seam) is exercised by
+//! the unit tests in `bg_processes.rs::tests` plus the wire-shape
+//! coverage here.
 //!
 //! These tests spawn real `sh` processes, so they require a working
 //! `sh` on `$PATH`. They're tagged `tokio::test` because they wait
@@ -52,7 +52,7 @@ async fn bg_start_captures_echoed_lines_into_synthetic_turn() {
             capture_cap: DEFAULT_CAPTURE_LINES,
             cwd: None,
             label: None,
-            treat_as_user_input: false,
+            cooldown: Duration::ZERO,
             env: None,
             shell: String::new(),
         })
@@ -76,15 +76,11 @@ async fn bg_start_captures_echoed_lines_into_synthetic_turn() {
         "captured line must appear in the synthetic turn; got: {}",
         synth.text
     );
-    assert!(
-        !synth.any_unlimited,
-        "default tier is capped, not unlimited"
-    );
     assert_eq!(synth.proc_ids, vec![entry.id]);
 }
 
 #[tokio::test]
-async fn bg_unlimited_tier_marks_synthetic_turn() {
+async fn bg_zero_cooldown_drains_in_real_time() {
     let (sm, _rx) = make_sm_with_bridge();
     let entry = sm
         .start_bg(StartParams {
@@ -92,7 +88,7 @@ async fn bg_unlimited_tier_marks_synthetic_turn() {
             capture_cap: 50,
             cwd: None,
             label: Some("telegram".into()),
-            treat_as_user_input: true,
+            cooldown: Duration::ZERO,
             env: None,
             shell: String::new(),
         })
@@ -102,10 +98,9 @@ async fn bg_unlimited_tier_marks_synthetic_turn() {
     assert!(got);
 
     let synth = sm.drain_bg_output_into_synthetic_turn().expect("drain");
-    assert!(synth.any_unlimited, "unlimited contributor sets the flag");
     assert!(
-        synth.text.contains("unlimited"),
-        "block header must mark unlimited tier; got: {}",
+        synth.text.contains("from-telegram"),
+        "zero-cooldown output must drain immediately; got: {}",
         synth.text
     );
 }
@@ -121,7 +116,7 @@ async fn bg_stop_returns_exit_code_and_final_lines() {
             capture_cap: 10,
             cwd: None,
             label: None,
-            treat_as_user_input: false,
+            cooldown: Duration::ZERO,
             env: None,
             shell: String::new(),
         })
@@ -156,7 +151,7 @@ async fn bg_list_reflects_running_state() {
             capture_cap: 0,
             cwd: None,
             label: Some("sleeper".into()),
-            treat_as_user_input: false,
+            cooldown: Duration::ZERO,
             env: None,
             shell: String::new(),
         })
@@ -168,7 +163,7 @@ async fn bg_list_reflects_running_state() {
         .find(|r| r.id == entry.id)
         .expect("started process must appear in list");
     assert_eq!(row.label.as_deref(), Some("sleeper"));
-    assert!(!row.treat_as_user_input);
+    assert_eq!(row.cooldown, Duration::ZERO);
 
     // Cleanup.
     let _ = sm.stop_bg(entry.id);
@@ -183,7 +178,7 @@ async fn bg_clear_kills_all_processes() {
             capture_cap: 0,
             cwd: None,
             label: None,
-            treat_as_user_input: false,
+            cooldown: Duration::ZERO,
             env: None,
             shell: String::new(),
         })
@@ -195,7 +190,7 @@ async fn bg_clear_kills_all_processes() {
             capture_cap: 0,
             cwd: None,
             label: None,
-            treat_as_user_input: true,
+            cooldown: Duration::ZERO,
             env: None,
             shell: String::new(),
         })
@@ -219,7 +214,7 @@ async fn bg_drain_appends_synthetic_user_message_with_background_source() {
             capture_cap: 10,
             cwd: None,
             label: None,
-            treat_as_user_input: false,
+            cooldown: Duration::ZERO,
             env: None,
             shell: String::new(),
         })
@@ -230,11 +225,7 @@ async fn bg_drain_appends_synthetic_user_message_with_background_source() {
     let synth = sm
         .drain_bg_output_into_synthetic_turn()
         .expect("drain returned a turn");
-    sm.add_user_message_from_background(
-        synth.text.clone(),
-        synth.proc_ids.clone(),
-        synth.any_unlimited,
-    );
+    sm.add_user_message_from_background(synth.text.clone(), synth.proc_ids.clone());
 
     let state = sm.get_state();
     let last = state
@@ -245,12 +236,8 @@ async fn bg_drain_appends_synthetic_user_message_with_background_source() {
     // The discriminator must be Background (not Human).
     use peakbot::ui::app_state::MessageSource;
     match &last.source {
-        MessageSource::Background {
-            proc_ids,
-            any_unlimited,
-        } => {
+        MessageSource::Background { proc_ids } => {
             assert_eq!(proc_ids, &vec![entry.id]);
-            assert!(!any_unlimited);
         }
         MessageSource::Human => panic!("synthetic turn must carry Background source"),
     }

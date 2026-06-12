@@ -151,18 +151,21 @@ Extends the agent with event-driven post-processing capabilities:
 
 ### Background Processes (`src/bg_processes.rs`)
 
-Long-running PTY-backed processes spawned by the [`bash_bg`](#tools-overview) tool. Each process gets a numeric id, a ring buffer of captured output lines, and a tier flag (`treat_as_user_input`) that determines whether its output participates in the synthetic-turn circuit breaker.
+Long-running PTY-backed processes spawned by the [`bash_bg`](#tools-overview) tool. Each process gets a numeric id, a ring buffer of captured output lines, and a per-process `cooldown` that paces how often its output is injected as a synthetic turn.
 
 **Data flow** (the "two seams" from `bash-background.md`):
 
 1. `bash_bg start` spawns a PTY via `portable-pty`, launches the child under `sh -c`, and registers the process with `StateManager::bg`.
 2. A per-process reader thread streams output lines into the ring buffer (ANSI-stripped, debounced at 500ms) and pings the agent loop via a tokio mpsc channel.
-3. Between turns, the agent loop calls `StateManager::drain_bg_output_into_synthetic_turn`, which builds a `[bg output]` block per non-empty buffer and runs an agent turn over it. The synthetic message is persisted with `MessageSource::Background { proc_ids, any_unlimited }` so the renderer can style it distinctly (🛰 capped, 💬 unlimited) on `/load`.
+3. Between turns (and on a deadline-driven wakeup), the agent loop calls `StateManager::drain_bg_output_into_synthetic_turn`, which builds a `[bg output]` block per *eligible* buffer and runs an agent turn over it. The synthetic message is persisted with `MessageSource::Background { proc_ids }` so the renderer styles it (🛰 Background) on `/load`.
 
-**Circuit breaker** (two tiers, distinguished at `start` time):
+**Cooldown** (per-process, `cooldown_secs`, default 60):
 
-- **Capped** (default): each synthetic turn driven purely by capped processes increments a counter. After `MAX_CONSECUTIVE_AUTO_TURNS` (3) bg-only turns with no real input, auto-injection suppresses. Buffers keep filling — the next reset flushes everything accumulated.
-- **Unlimited** (`treat_as_user_input: true`): declared *legitimate input source* (telegram bridges, webhooks). Any contribution resets the counter to 0 — functionally equivalent to a real user message.
+- After a process injects output, further output is **coalesced** — accumulated in the ring buffer and flushed in one batch once the process's cooldown elapses. `drain_outputs(now)` gates each dirty process on `last_inject + cooldown <= now` (a pure function of an injected `now`, so the decision is unit-testable).
+- `cooldown_secs: 0` ⇒ real-time (every drained batch injects). Used for external-input bridges (telegram, webhooks) so each line surfaces immediately.
+- **Process exits always bypass the cooldown** — a one-shot terminal transition the model must learn at once.
+- A quiet buffer that fell silent mid-window still flushes on time: the agent-loop forwarder arms a wakeup at `BgRegistry::next_poke_deadline` (the soonest pending window expiry).
+- A real user message calls `reset_bg_cooldowns`, clearing every process's timer so buffered output flushes alongside the user's turn.
 
 **Lifecycle**:
 
@@ -256,7 +259,7 @@ block is configured — **13 total** when the vector store is enabled:
 | `file_read` | `file_read.rs` | Read files with line ranges |
 | `list_directory` | `list_directory.rs` | List directory contents with recursion |
 | `bash` | `bash.rs` | Execute shell commands with timeout, truncate to last 50k chars, save full output to temp |
-| `bash_bg` | `bash_bg.rs` | Spawn long-running PTY-backed processes (4 verbs: start/stop/list/send_line). The model is notified automatically — a synthetic `[bg output]` user turn lands on every output drain and on every process exit (including `capture_output_lines: 0`). Never poll. `treat_as_user_input: true` declares an external-input source (telegram bridges, webhooks) — see `bash-background.md`. |
+| `bash_bg` | `bash_bg.rs` | Spawn long-running PTY-backed processes (4 verbs: start/stop/list/send_line). The model is notified automatically — a synthetic `[bg output]` user turn lands when a process's output is flushed and on every process exit (including `capture_output_lines: 0`). Never poll. Per-process `cooldown_secs` (default 60) coalesces output; `0` = real-time for external-input bridges (telegram/webhooks) — see `bash-background.md`. |
 | `fetch_url` | `fetch_url.rs` | HTTP GET requests to URLs |
 | `web_search` | `search.rs` | SearXNG-based web search |
 | `think` | `think.rs` | Reasoning tool for complex thinking |
