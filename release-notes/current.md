@@ -113,6 +113,10 @@ This file is the working draft for the next release. When a version is tagged, t
   `view_image` only works on the Anthropic transport (the lone provider whose
   tool-result channel delivers images), so `vision: true` on a non-Anthropic
   model enables `[img:…]` but does not register `view_image`.
+- **`view_image`: unreachable `ImageSource::Url` arm is now `unreachable!`**
+  rather than silently emitting a bogus (url, "image/png") payload.
+  `load_image_from_path` only ever returns `Base64`; the defensive fallback
+  would have hidden a future bug there.
 
 
 - **Replaced the background-process "3-turns-and-stop" circuit breaker
@@ -141,6 +145,15 @@ This file is the working draft for the next release. When a version is tagged, t
   and fix stale/bloated comments on sight. Condensed the over-long doc and
   inline comments around `snap_boundary_past_tool_results` and its tests
   to follow the new rule.
+- **Trimmed the rig-0.38 / `view_image` / Anthropic provider branch's
+  over-long doc comments** to the new 2–3-line rule. Touched
+  `src/tools/view_image.rs` (module doc, test docstring, unreachable-arm
+  comment), `src/providers/mod.rs` (`supports_vision_for`,
+  `resolve_supports_vision`, `create_anthropic_agent`, `view_image`
+  registration comment, regression-test rationale), `src/config/mod.rs`
+  (`AnthropicCaching`, `AnthropicConfig`, `AnthropicConfig::vision`), and
+  `src/hooks/session_hook.rs` (`input_context_tokens` and its test
+  rationale).
 
 - **Fixed a compaction bug that could crash the next request with an
   Anthropic "orphaned tool_use" error.** When the compaction boundary

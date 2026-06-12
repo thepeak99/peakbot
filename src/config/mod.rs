@@ -93,13 +93,9 @@ pub struct OpenAIConfig {
     pub vision: Option<bool>,
 }
 
-/// Anthropic prompt-caching mode. Injects ephemeral `cache_control`
-/// breakpoints to cut input-token cost on the stable prefix of each request.
-///
-/// `Manual` mirrors LiteLLM's `system/0` + `user/-1` injection points
-/// (rig also marks the tool-schema block, within Anthropic's 4-breakpoint
-/// budget). `Auto*` use Anthropic's top-level breakpoint that advances as the
-/// conversation grows — recommended for multi-turn.
+/// Anthropic prompt-caching mode. `Auto*` use the top-level breakpoint that
+/// advances with the chat (recommended for multi-turn); `Manual` pins system +
+/// tool + last user. All cut input-token cost on the stable prefix.
 #[derive(Debug, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AnthropicCaching {
@@ -116,14 +112,9 @@ pub enum AnthropicCaching {
     Auto1h,
 }
 
-/// Configuration for Anthropic provider (Claude API, or any server that
-/// speaks the Anthropic Messages API — notably llama.cpp's `/v1/messages`).
-///
-/// Unlike the OpenAI-completions and Responses APIs, the Anthropic Messages
-/// API carries images inside `tool_result` blocks. That is the whole reason
-/// this provider exists as a first-class option: pointing `base_url` at a
-/// local llama-server lets the `view_image` tool feed pixels back to a local
-/// multimodal model.
+/// Configuration for Anthropic provider (Claude API, or any Messages-API
+/// server — notably llama.cpp's `/v1/messages`). The Messages transport is
+/// the only one carrying images in tool results, hence `view_image` is here.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AnthropicConfig {
@@ -145,10 +136,8 @@ pub struct AnthropicConfig {
     /// endpoints that may not honor `cache_control`).
     #[serde(default)]
     pub prompt_caching: AnthropicCaching,
-    /// Explicit image-support override. `None` (default) → auto-detect (the
-    /// Anthropic transport carries images, so this is on by default). On this
-    /// provider the flag also gates the `view_image` tool: `Some(true)` shows it
-    /// and allows `[img:…]`; `Some(false)` hides the tool and refuses `[img:…]`.
+    /// Explicit image-support override. `None` → auto-detect (on for this
+    /// provider; also gates `view_image` registration). `Some(b)` forces.
     #[serde(default)]
     pub vision: Option<bool>,
 }

@@ -1,17 +1,6 @@
 //! `view_image` — load a local image file into the model's vision context.
-//!
-//! This is the tool counterpart to the user-facing `[img:…]` attachment
-//! syntax: it lets the *agent* pull an image it discovers during a task
-//! (a screenshot, a diagram, a UI capture) into its own sight.
-//!
-//! The image is returned as the structured JSON shape rig recognises in
-//! [`rig_core::completion::message::ToolResultContent::from_tool_output`]:
-//! `{"type":"image","data":"<base64>","mimeType":"image/png"}`. rig converts
-//! that into an image tool-result block on the wire.
-//!
-//! **Provider note:** only the Anthropic Messages API actually delivers an
-//! image tool-result to the model. Registration is therefore gated to the
-//! Anthropic provider in `add_builtin_tools` — see `register_view_image`.
+//! Anthropic-only: no other provider's tool-result channel carries images, so
+//! registration is gated to that provider.
 
 use crate::vision::{AttachmentError, ImageSource, load_image_from_path};
 use base64::Engine;
@@ -87,9 +76,8 @@ impl Tool for ViewImageTool {
                 STANDARD.encode(bytes),
                 media_type.to_mime_type().to_string(),
             ),
-            // load_image_from_path only ever returns Base64; Url is unreachable
-            // here but handled to keep the match total without a panic.
-            ImageSource::Url(url) => (url, "image/png".to_string()),
+            // load_image_from_path only ever returns Base64.
+            ImageSource::Url(_) => unreachable!("this should never happen"),
         };
 
         tracing::info!(
@@ -162,13 +150,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Regression pin for the rig 0.36 bug (fixed in 0.38): the Anthropic
-    /// provider serialized an image tool-result as a newtype enum variant,
-    /// emitting a *duplicate* `type` key (`{"type":"image","type":"base64",…}`).
-    /// Parsers take the last key → `base64` → Anthropic rejects the request.
-    /// The correct shape nests the source: `{"type":"image","source":{…}}`.
-    /// We convert a generic image tool-result through rig's own Anthropic
-    /// `TryFrom` and assert the wire shape so a future regression fails loudly.
+    /// Pin the wire shape: rig 0.36 flattened the source as a duplicate
+    /// `type` key; rig 0.38 nests it under `source`. A regression fails here.
     #[test]
     fn anthropic_image_tool_result_wire_shape_has_nested_source() {
         use rig_core::completion::message::{

@@ -310,10 +310,8 @@ mod tests {
     fn input_context_tokens_normalizes_across_providers() {
         let mut u = rig_core::completion::Usage::new();
 
-        // Anthropic with prompt caching: input_tokens is the UNCACHED portion
-        // only; the bulk lives in cache_read/cache_creation. total reflects the
-        // full prompt. The naive `input_tokens` (5) badly under-counts; the
-        // helper must report the full 4005 input.
+        // Anthropic + caching: input_tokens is the uncached slice only;
+        // total - output_tokens recovers the full prompt (4005, not 5).
         u.input_tokens = 5;
         u.cached_input_tokens = 3000;
         u.cache_creation_input_tokens = 1000;
@@ -527,17 +525,9 @@ impl SessionHook {
     }
 }
 
-/// Provider-agnostic input (prompt) token count for a request.
-///
-/// `usage.input_tokens` is NOT comparable across providers under prompt
-/// caching: Anthropic reports it as the *uncached* portion only (cached
-/// tokens live in separate `cache_read`/`cache_creation` fields), while
-/// OpenAI/OpenRouter fold cached tokens into `input_tokens` already. Using
-/// the raw field made the Anthropic context counter read far too low and
-/// kept compaction from ever firing. rig's `total_tokens` is normalised
-/// per provider, so `total_tokens - output_tokens` recovers the true input
-/// size for both shapes; the `max` guards providers that leave
-/// `total_tokens` unset (then we fall back to the raw `input_tokens`).
+/// Provider-agnostic input token count. Under caching, `input_tokens` is
+/// unreliable (Anthropic = uncached only; OpenAI = folded). Use
+/// `total_tokens - output_tokens`, falling back to `input_tokens` if unset.
 fn input_context_tokens(usage: &rig_core::completion::Usage) -> u64 {
     usage
         .total_tokens
