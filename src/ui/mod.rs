@@ -19,9 +19,13 @@ pub mod ui_trait;
 // REPL UI
 pub mod repl;
 
+// NDJSON stdio UI (`peakbot --stdio`)
+pub mod stdio;
+
 // Re-export commonly used types
 pub use app_state::*;
 pub use ui_trait::*;
 
 // Re-export UI implementations
 pub use repl::*;
+pub use stdio::{StdioUi, build_models_snapshot};
