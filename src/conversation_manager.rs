@@ -196,14 +196,18 @@ impl<S: ConversationStorage> ConversationManager<S> {
 
         for msg in &conversation.messages {
             match msg {
-                Message::User { content, timestamp } => {
+                Message::User {
+                    content, timestamp, ..
+                } => {
                     md.push_str(&format!(
                         "## User ({})\n\n{}\n\n",
                         timestamp.format("%Y-%m-%d %H:%M"),
                         content
                     ));
                 }
-                Message::Assistant { content, timestamp } => {
+                Message::Assistant {
+                    content, timestamp, ..
+                } => {
                     md.push_str(&format!(
                         "## Assistant ({})\n\n{}\n\n",
                         timestamp.format("%Y-%m-%d %H:%M"),
@@ -236,6 +240,13 @@ impl<S: ConversationStorage> ConversationManager<S> {
                         timestamp.format("%Y-%m-%d %H:%M"),
                         arguments,
                         result
+                    ));
+                }
+                Message::Summary { content, timestamp } => {
+                    md.push_str(&format!(
+                        "## Summary ({})\n\n{}\n\n",
+                        timestamp.format("%Y-%m-%d %H:%M"),
+                        content
                     ));
                 }
             }
