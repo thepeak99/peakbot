@@ -1097,6 +1097,9 @@ impl StateManager {
                 } => {
                     output.push_str(&format!("### Tool Result: {}\n\n{}\n\n", tool_name, result));
                 }
+                ConvMsg::Summary { content, .. } => {
+                    output.push_str(&format!("## Summary\n\n{}\n\n", content));
+                }
             }
         }
 
@@ -1147,21 +1150,45 @@ impl StateManager {
                 .messages
                 .iter()
                 .map(|msg| match msg {
-                    ConvMsg::User { content, .. } => ChatMessage::user(content.clone()),
-                    ConvMsg::Assistant { content, .. } => ChatMessage::agent(content.clone()),
+                    ConvMsg::User {
+                        content, compacted, ..
+                    } => {
+                        let mut m = ChatMessage::user(content.clone());
+                        m.compacted = *compacted;
+                        m
+                    }
+                    ConvMsg::Assistant {
+                        content, compacted, ..
+                    } => {
+                        let mut m = ChatMessage::agent(content.clone());
+                        m.compacted = *compacted;
+                        m
+                    }
                     ConvMsg::ToolCall {
                         tool_name,
                         arguments,
                         call_id,
+                        compacted,
                         ..
-                    } => ChatMessage::tool_call(tool_name, arguments, call_id.clone()),
+                    } => {
+                        let mut m = ChatMessage::tool_call(tool_name, arguments, call_id.clone());
+                        m.compacted = *compacted;
+                        m
+                    }
                     ConvMsg::ToolResult {
                         tool_name,
                         arguments,
                         result,
                         call_id,
+                        compacted,
                         ..
-                    } => ChatMessage::tool_result(tool_name, arguments, result, call_id.clone()),
+                    } => {
+                        let mut m =
+                            ChatMessage::tool_result(tool_name, arguments, result, call_id.clone());
+                        m.compacted = *compacted;
+                        m
+                    }
+                    ConvMsg::Summary { content, .. } => ChatMessage::summary(content.clone()),
                 })
                 .collect();
 
@@ -1210,10 +1237,12 @@ impl StateManager {
                 .filter_map(|msg| match msg.role {
                     MessageRole::User => Some(ConvMsg::User {
                         content: msg.content.clone(),
+                        compacted: msg.compacted,
                         timestamp: chrono::Utc::now(),
                     }),
                     MessageRole::Agent => Some(ConvMsg::Assistant {
                         content: msg.content.clone(),
+                        compacted: msg.compacted,
                         timestamp: chrono::Utc::now(),
                     }),
                     MessageRole::ToolCall => {
@@ -1223,6 +1252,7 @@ impl StateManager {
                             tool_name,
                             arguments,
                             call_id: msg.call_id.clone(),
+                            compacted: msg.compacted,
                             timestamp: chrono::Utc::now(),
                         })
                     }
@@ -1235,10 +1265,15 @@ impl StateManager {
                             arguments,
                             result,
                             call_id: msg.call_id.clone(),
+                            compacted: msg.compacted,
                             timestamp: chrono::Utc::now(),
                         })
                     }
-                    MessageRole::Summary | MessageRole::System => None,
+                    MessageRole::Summary => Some(ConvMsg::Summary {
+                        content: msg.content.clone(),
+                        timestamp: chrono::Utc::now(),
+                    }),
+                    MessageRole::System => None,
                 })
                 .collect();
             conv.metadata.message_count = conv.messages.len();
@@ -2589,6 +2624,82 @@ mod tests {
         assert!(
             state.chat.messages[0].content.contains("Summary"),
             "First message should be the summary"
+        );
+    }
+
+    // ─── compaction persistence roundtrip (issue #59) ────────────────────
+    //
+    // A compacted conversation must reload with its `compacted` flags and
+    // Summary intact — else the full history resurfaces and re-trips the
+    // threshold.
+    #[test]
+    fn compaction_survives_save_load_roundtrip() {
+        use crate::ui::app_state::MessageRole;
+
+        let sm = StateManager::new();
+
+        // Post-compaction layout: tagged old messages, Summary at the
+        // boundary, recent tail. The tool pair guards the tool-pair case.
+        let mut old_user = ChatMessage::user("old question".into());
+        old_user.compacted = true;
+        let mut old_call = ChatMessage::tool_call("bash", "{}", Some("c1".into()));
+        old_call.compacted = true;
+        let mut old_result =
+            ChatMessage::tool_result("bash", "{}", "old output", Some("c1".into()));
+        old_result.compacted = true;
+        let summary = ChatMessage::summary("Summary of earlier work".into());
+        let recent_user = ChatMessage::user("recent question".into());
+        let recent_agent = ChatMessage::agent("recent answer".into());
+
+        {
+            let mut state = sm.state.write().unwrap();
+            state.chat.messages = vec![
+                old_user,
+                old_call,
+                old_result,
+                summary,
+                recent_user,
+                recent_agent,
+            ];
+        }
+
+        let conv = Conversation::new("test".into(), "prov".into(), "model".into());
+        *sm.current_conversation.lock().unwrap() = Some(conv);
+
+        // Save, wipe the live chat, reload — the real persistence path.
+        sm.sync_to_conversation();
+        {
+            let mut state = sm.state.write().unwrap();
+            state.chat.messages.clear();
+        }
+        sm.sync_from_conversation();
+
+        let state = sm.get_state();
+        let msgs = &state.chat.messages;
+
+        // Nothing lost: 3 compacted + Summary + 2 recent = 6.
+        assert_eq!(
+            msgs.len(),
+            6,
+            "all messages (incl. Summary) must survive the roundtrip"
+        );
+
+        assert!(msgs[0].compacted && msgs[0].role == MessageRole::User);
+        assert!(msgs[1].compacted && msgs[1].role == MessageRole::ToolCall);
+        assert!(msgs[2].compacted && msgs[2].role == MessageRole::ToolResult);
+
+        assert_eq!(msgs[3].role, MessageRole::Summary);
+        assert!(!msgs[3].compacted);
+        assert_eq!(msgs[3].content, "Summary of earlier work");
+
+        assert!(!msgs[4].compacted && msgs[4].role == MessageRole::User);
+        assert!(!msgs[5].compacted && msgs[5].role == MessageRole::Agent);
+
+        // Compaction must not be undone by the reload (the #59 symptom).
+        let uncompacted = msgs.iter().filter(|m| !m.compacted).count();
+        assert_eq!(
+            uncompacted, 3,
+            "Summary + 2 recent — compaction must not be undone by reload"
         );
     }
 

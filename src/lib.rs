@@ -272,6 +272,9 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
                     })),
                 });
             }
+            StoredMessage::Summary { content, .. } => {
+                messages.push(Message::user(format!("[Conversation summary] {content}")));
+            }
         }
     }
 
