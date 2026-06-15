@@ -41,7 +41,12 @@ impl Default for ConversationMetadata {
     }
 }
 
-/// A message in the conversation history
+/// A message in the conversation history.
+///
+/// `compacted` marks a message that compaction hid from the LLM in a
+/// prior session; persisted so a reload restores the compacted state
+/// instead of resurrecting the full history (#59). `serde(default)`
+/// keeps pre-compaction files loading as `false`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role")]
 pub enum Message {
@@ -49,6 +54,8 @@ pub enum Message {
     User {
         /// Message content
         content: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compacted: bool,
         /// Timestamp when message was sent
         timestamp: DateTime<Utc>,
     },
@@ -56,6 +63,8 @@ pub enum Message {
     Assistant {
         /// Message content
         content: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compacted: bool,
         /// Timestamp when message was generated
         timestamp: DateTime<Utc>,
     },
@@ -68,6 +77,8 @@ pub enum Message {
         /// Tool call ID for correlating calls with results
         #[serde(skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compacted: bool,
         /// Timestamp when tool was called
         timestamp: DateTime<Utc>,
     },
@@ -82,7 +93,17 @@ pub enum Message {
         /// Tool call ID for correlating calls with results
         #[serde(skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compacted: bool,
         /// Timestamp when tool was executed
+        timestamp: DateTime<Utc>,
+    },
+    /// Compaction summary inserted at the boundary; the live stand-in for
+    /// the hidden region, never `compacted` itself.
+    Summary {
+        /// The summary text produced by the compaction model
+        content: String,
+        /// Timestamp when the summary was generated
         timestamp: DateTime<Utc>,
     },
 }
@@ -92,6 +113,7 @@ impl Message {
     pub fn user(content: String) -> Self {
         Message::User {
             content,
+            compacted: false,
             timestamp: Utc::now(),
         }
     }
@@ -100,6 +122,7 @@ impl Message {
     pub fn assistant(content: String) -> Self {
         Message::Assistant {
             content,
+            compacted: false,
             timestamp: Utc::now(),
         }
     }
@@ -110,6 +133,7 @@ impl Message {
             tool_name,
             arguments,
             call_id,
+            compacted: false,
             timestamp: Utc::now(),
         }
     }
@@ -126,6 +150,7 @@ impl Message {
             arguments,
             result,
             call_id,
+            compacted: false,
             timestamp: Utc::now(),
         }
     }
@@ -135,6 +160,7 @@ impl Message {
         match self {
             Message::User { content, .. } => content,
             Message::Assistant { content, .. } => content,
+            Message::Summary { content, .. } => content,
             Message::ToolResult { result, .. } => result,
             Message::ToolCall { .. } => "",
         }
@@ -630,5 +656,84 @@ mod tests {
         let conv: Conversation = serde_json::from_str(json).unwrap();
         assert!(conv.title.is_none());
         assert_eq!(conv.name, "Old convo");
+    }
+
+    // === issue #59: compaction persistence ============================
+
+    /// The `compacted` flag and `Summary` variant round-trip through serde.
+    #[test]
+    fn compacted_flag_and_summary_roundtrip() {
+        let mut conv = Conversation::new("t".into(), "prov".into(), "model".into());
+        let mut old = Message::user("old".into());
+        if let Message::User {
+            ref mut compacted, ..
+        } = old
+        {
+            *compacted = true;
+        }
+        conv.messages.push(old);
+        conv.messages.push(Message::Summary {
+            content: "summary text".into(),
+            timestamp: Utc::now(),
+        });
+        conv.messages.push(Message::user("recent".into()));
+
+        let json = serde_json::to_string(&conv).unwrap();
+        let loaded: Conversation = serde_json::from_str(&json).unwrap();
+
+        assert!(matches!(
+            loaded.messages[0],
+            Message::User {
+                compacted: true,
+                ..
+            }
+        ));
+        assert!(matches!(loaded.messages[1], Message::Summary { .. }));
+        assert!(matches!(
+            loaded.messages[2],
+            Message::User {
+                compacted: false,
+                ..
+            }
+        ));
+    }
+
+    /// Pre-compaction files (no `compacted` field) load as `compacted = false`.
+    #[test]
+    fn pre_compaction_file_defaults_compacted_to_false() {
+        let json = r#"{
+            "id": "10da8b9d-f242-4786-9c75-c3fbc2530f1f",
+            "name": "Old convo",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "messages": [
+                {"role": "User", "content": "hi", "timestamp": "2026-01-01T00:00:00Z"}
+            ],
+            "model": "m",
+            "metadata": {"message_count": 1}
+        }"#;
+        let conv: Conversation = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            conv.messages[0],
+            Message::User {
+                compacted: false,
+                ..
+            }
+        ));
+    }
+
+    /// A non-compacted message must NOT emit a `compacted` key (skip_serializing_if).
+    #[test]
+    fn uncompacted_message_omits_compacted_key() {
+        let conv = {
+            let mut c = Conversation::new("t".into(), "prov".into(), "model".into());
+            c.add_user_message("hi".into());
+            c
+        };
+        let json = serde_json::to_string(&conv).unwrap();
+        assert!(
+            !json.contains("compacted"),
+            "uncompacted messages must not write the flag; got: {json}"
+        );
     }
 }
