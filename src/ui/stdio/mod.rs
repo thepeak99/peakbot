@@ -1,17 +1,14 @@
 //! StdioUi — a PeakBot `Ui` implementation that speaks NDJSON over stdio.
 //!
-//! Selected at launch with `peakbot --stdio`. Each line on stdin is one
-//! inbound message from the client (e.g. an IDE plugin); each line on
-//! stdout is one outbound message from the agent. The agent, providers,
-//! tools, skills, MCP servers, conversation persistence, and cost
-//! tracking are all the same machinery the TUI drives — only the View
-//! differs.
+//! Selected with `peakbot --stdio`. One stdin line = one inbound message
+//! from the client (e.g. an IDE plugin); one stdout line = one outbound
+//! message. Everything below the View (agent, providers, tools, skills,
+//! MCP, persistence, cost tracking) is the same machinery the TUI drives.
 //!
 //! ## Stdout discipline
 //!
-//! Stdout is the protocol channel — *only* NDJSON lines emitted here go
-//! there. `main` routes `tracing` to stderr under `--stdio` so the
-//! client never has to parse around log noise.
+//! Stdout is the protocol channel — *only* NDJSON lines go there. `main`
+//! routes `tracing` to stderr under `--stdio` so logs can't corrupt it.
 //!
 //! ## Wire protocol
 //!
@@ -45,11 +42,9 @@
 //! cache it.
 //!
 //! `conversations_list` is **pull-only**: the client sends
-//! `request_conversations` whenever it wants a fresh snapshot. This is a
-//! read-only side channel answered directly in the stdin task — it never
-//! reaches the agent loop, so it deliberately is not a `UiAction`. The
-//! host keeps no cache; `/save`, `/delete`, `/rename` and per-turn
-//! auto-saves mutate the list, so any server-side cache would need
+//! `request_conversations` for a fresh snapshot. Answered directly in the
+//! stdin task (not a `UiAction`) and never cached — `/save`, `/delete`,
+//! `/rename`, and auto-saves mutate the list, so a cache would need
 //! invalidation we don't want.
 //!
 //! ## Concurrency
@@ -72,37 +67,33 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum InboundMessage {
-    /// Send a user message (or slash command starting with `/`).
-    SendMessage { text: String },
-    /// Request the agent to stop the current turn.
+    /// `text` may be a slash command (`/new`, `/load <id>`, …) — peakbot
+    /// classifies it internally.
+    SendMessage {
+        text: String,
+    },
     Stop,
-    /// Switch the active model by alias.
-    SwitchModel { alias: String },
-    /// Ask for a fresh snapshot of saved conversations (pull model).
+    SwitchModel {
+        alias: String,
+    },
     RequestConversations,
-    /// Cleanly tear down the agent loop.
     Shutdown,
 }
 
-/// One entry in the `models_available` outbound message. Mirrors the
-/// public fields of `ResolvedModel` that the UI needs to render a model
-/// picker. Built once at boot from the [`ModelRegistry`].
+/// One `models_available` entry — the subset of `ResolvedModel` a model
+/// picker needs.
 #[derive(Debug, Serialize, Clone)]
 pub struct ModelInfo {
-    /// Canonical user handle — what `/model <alias>` accepts.
+    /// What `/model <alias>` accepts.
     pub alias: String,
-    /// Informational provider name (`"openrouter"`, `"patchnotes"`, ...).
     pub provider_name: String,
-    /// Wire id (model name as the provider knows it).
+    /// Model name as the provider knows it.
     pub model_name: String,
-    /// Resolved context size in tokens.
     pub context_size: usize,
 }
 
-/// Build the static `Vec<ModelInfo>` handed to [`StdioUi`] for the
-/// one-shot `models_available` emission. Empty when the registry is
-/// empty (legacy single-provider path) — `run()` skips the emission in
-/// that case.
+/// Snapshot for [`StdioUi`]'s one-shot `models_available` emission. Empty
+/// for the legacy single-provider path, where `run()` skips the emission.
 pub fn build_models_snapshot(registry: &ModelRegistry) -> Vec<ModelInfo> {
     registry
         .iter_sorted()
@@ -116,46 +107,37 @@ pub fn build_models_snapshot(registry: &ModelRegistry) -> Vec<ModelInfo> {
         .collect()
 }
 
-/// One entry in the `conversations_list` outbound message. Trimmed
-/// subset of `ConversationSummary` — only what a dropdown picker needs.
-/// Backend already sorts newest first.
+/// Trimmed subset of `ConversationSummary` for a dropdown picker
+/// (backend already sorts newest first).
 #[derive(Debug, Serialize)]
 struct ConversationSummaryWire {
-    /// Wire id (UUID stringified) — fed back to peakbot as `/load <id>`.
+    /// Fed back as `/load <id>`.
     id: String,
-    /// Human-readable name as the user named it (or default).
     name: String,
-    /// ISO 8601 UTC of the most recent update.
+    /// ISO 8601 UTC.
     updated_at: String,
-    /// Total messages in the conversation.
     message_count: usize,
-    /// Wire id of the model the conversation last used.
     model: String,
 }
 
-/// Outbound message envelopes to the client. Owning (no lifetime) so
-/// any task can push to the shared writer channel without dancing
-/// around borrows.
+/// Outbound message envelopes to the client. Owning (no lifetime) so any
+/// task can push to the shared writer channel.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutboundMessage {
-    /// Initial handshake — sent once after subscribe so the client can
-    /// render the welcome banner before any user input is sent.
+    /// Handshake, sent once before any user input so the client can render
+    /// the welcome banner.
     Ready,
-    /// Static snapshot of the model registry. Emitted once after
-    /// `ready`. `active` is the boot alias (may be empty in the legacy
-    /// single-provider path).
+    /// One-shot registry snapshot, emitted right after `ready`. `active`
+    /// may be empty in the legacy single-provider path.
     ModelsAvailable {
         active: String,
         models: Vec<ModelInfo>,
     },
-    /// A full `AppState` snapshot. Mirrors the broadcast the TUI sees.
-    /// Boxed because `AppState` is large — keeps the enum slim so the
-    /// channel's per-message overhead stays cheap (clippy's
-    /// `large_enum_variant` lint).
+    /// A full `AppState` snapshot — the same broadcast the TUI sees. Boxed
+    /// to keep the enum slim (clippy `large_enum_variant`).
     State { state: Box<AppState> },
-    /// Reply to `request_conversations`. May be empty if no storage is
-    /// configured or there are no saved conversations.
+    /// Reply to `request_conversations`; empty when no storage is configured.
     ConversationsList { items: Vec<ConversationSummaryWire> },
     /// A non-fatal protocol or parse error.
     Error { message: String },
@@ -166,12 +148,9 @@ enum OutboundMessage {
 pub struct StdioUi {
     state_manager: Arc<StateManager>,
     action_sender: UnboundedSender<UiAction>,
-    /// Snapshot of the model registry built at boot. Empty in the
-    /// legacy single-provider path — in that case we skip the
-    /// `models_available` emission (no picker to populate).
+    /// Empty in the legacy single-provider path — no picker to populate, so
+    /// `models_available` is skipped.
     models: Vec<ModelInfo>,
-    /// Boot alias, mirrored from the registry. May be empty in the
-    /// legacy path; the picker simply shows no preselection then.
     active_alias: String,
 }
 
@@ -193,18 +172,15 @@ impl StdioUi {
 
 impl Ui for StdioUi {
     async fn init(&mut self) -> Result<()> {
-        // No-op: stdout writes are funneled through `run()`'s writer
-        // task. The `ready` + `models_available` emissions happen as
-        // the first messages on that channel.
+        // All stdout writes funnel through `run()`'s writer task.
         Ok(())
     }
 
     async fn run(&mut self) -> Result<()> {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
-        // Writer task: SOLE owner of stdout. Drains the MPSC and writes
-        // one NDJSON line per message. Two-writer races are impossible
-        // by construction — exactly one task ever touches stdout.
+        // Sole owner of stdout — keeps NDJSON lines atomic since no other
+        // task ever writes there.
         let writer_task = tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
                 let line = match serde_json::to_string(&msg) {
@@ -221,8 +197,7 @@ impl Ui for StdioUi {
             }
         });
 
-        // Boot emissions: ready + (optional) models_available. Ordering
-        // matters — the client expects `ready` first.
+        // `ready` must precede `models_available`.
         let _ = out_tx.send(OutboundMessage::Ready);
         if !self.models.is_empty() {
             let _ = out_tx.send(OutboundMessage::ModelsAvailable {
@@ -231,9 +206,8 @@ impl Ui for StdioUi {
             });
         }
 
-        // Stdin reader: forwards UiActions to the controller, replies
-        // directly to pull-style requests (currently only
-        // `request_conversations`).
+        // Forwards UiActions to the controller; answers pull-style requests
+        // (`request_conversations`) directly.
         let action_sender = self.action_sender.clone();
         let state_manager = self.state_manager.clone();
         let stdin_tx = out_tx.clone();
@@ -243,8 +217,7 @@ impl Ui for StdioUi {
             }
         });
 
-        // State broadcast loop. Owns `out_tx` until exit, then drops it
-        // so the writer task drains and exits.
+        // Holds `out_tx` until exit, then drops it so the writer drains.
         let mut state_rx = self.state_manager.subscribe();
         while let Some(state) = state_rx.recv().await {
             let exit = state.exit_requested;
@@ -254,7 +227,7 @@ impl Ui for StdioUi {
                 })
                 .is_err()
             {
-                // Writer dropped its receiver — nothing left to listen.
+                // Writer dropped its receiver.
                 break;
             }
             if exit {
@@ -262,8 +235,7 @@ impl Ui for StdioUi {
             }
         }
 
-        // Tear down: stdin task may still be parked on a read; abort it.
-        // Drop our local sender, then await the writer to drain.
+        // stdin task may be parked on a read; abort it, then drain the writer.
         stdin_task.abort();
         drop(out_tx);
         let _ = writer_task.await;
@@ -271,7 +243,6 @@ impl Ui for StdioUi {
     }
 
     async fn shutdown(&mut self) -> Result<()> {
-        // Best-effort flush of stdout.
         let mut stdout = tokio::io::stdout();
         let _ = stdout.flush().await;
         Ok(())
@@ -279,11 +250,8 @@ impl Ui for StdioUi {
 }
 
 /// Read NDJSON from stdin and dispatch [`UiAction`]s. Returns when stdin
-/// closes or a shutdown message is received.
-///
-/// Owns a clone of the outbound channel so pull-style replies
-/// (`conversations_list`, `error`) can be sent without touching stdout
-/// directly.
+/// closes or a shutdown message arrives. Owns an outbound-channel clone so
+/// pull-style replies bypass stdout.
 async fn run_stdin_loop(
     action_sender: UnboundedSender<UiAction>,
     out_tx: mpsc::UnboundedSender<OutboundMessage>,
@@ -323,10 +291,8 @@ async fn run_stdin_loop(
                 }
             }
             Ok(InboundMessage::Shutdown) => {
-                // Submit /exit as a slash command — AgentRunner sets
-                // `exit_requested` on AppState, which kicks the state
-                // loop out of `run` and lets `main` tear everything
-                // down cleanly.
+                // `/exit` sets `exit_requested`, which unwinds the state loop
+                // and lets `main` tear down cleanly.
                 let _ = action_sender.send(UiAction::SendMessage("/exit".to_string()));
                 break;
             }
@@ -343,9 +309,8 @@ async fn run_stdin_loop(
     Ok(())
 }
 
-/// Build the wire-shaped snapshot of saved conversations. Returns an
-/// empty vec when no storage is configured — the client treats that as
-/// "hide the picker".
+/// Wire-shaped snapshot of saved conversations. Empty when no storage is
+/// configured — the client treats that as "hide the picker".
 fn build_conversations_snapshot(sm: &StateManager) -> Vec<ConversationSummaryWire> {
     sm.list_conversations()
         .unwrap_or_default()
@@ -360,9 +325,8 @@ fn build_conversations_snapshot(sm: &StateManager) -> Vec<ConversationSummaryWir
         .collect()
 }
 
-/// Write a single NDJSON line to stdout with newline + flush. Only ever
-/// called from the writer task — no other code path may touch stdout,
-/// to keep line atomicity.
+/// Write one NDJSON line (+ newline + flush). Writer-task only, to keep
+/// line atomicity.
 async fn write_line(line: &str) -> Result<()> {
     let mut stdout = tokio::io::stdout();
     stdout.write_all(line.as_bytes()).await?;

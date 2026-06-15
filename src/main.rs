@@ -16,9 +16,9 @@ use tracing_subscriber::EnvFilter;
 #[command(about = "PeakBot — AI coding assistant")]
 #[command(version)]
 struct Cli {
-    /// Run the NDJSON stdin/stdout frontend instead of the terminal UI.
-    /// Designed for IDE integrations (e.g. the VSCode extension). Under
-    /// this flag stdout is the protocol channel, so logs go to stderr.
+    /// Run the NDJSON stdin/stdout frontend instead of the terminal UI
+    /// (for IDE integrations). stdout becomes the protocol channel, so logs
+    /// go to stderr.
     #[arg(long)]
     stdio: bool,
 }
@@ -76,10 +76,8 @@ fn print_config_not_found_message(config_path: &std::path::Path) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse CLI args first — `--version` / `--help` short-circuit here,
-    // and we need `--stdio` to decide where logs go. Under `--stdio`,
-    // stdout is the NDJSON protocol channel, so tracing MUST go to
-    // stderr or it would corrupt the wire.
+    // `--stdio` must be known before tracing init: under it stdout is the
+    // NDJSON wire, so logs MUST go to stderr or they corrupt the protocol.
     let cli = Cli::parse();
 
     let subscriber = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
@@ -332,17 +330,14 @@ async fn main() -> Result<()> {
         cwd: std::env::current_dir().unwrap_or_default(),
     });
 
-    // ── Run the selected View ─────────────────────────────────────────
     use peakbot::ui::{ReplUi, StdioUi, build_models_snapshot};
 
-    // Spawn controller task
     let runner_handle = tokio::spawn(async move {
         runner.run_loop(action_receiver).await;
     });
 
-    // Both Views drive the same Model/Controller seam; only the View
-    // differs. The TUI is the default; `--stdio` swaps in the NDJSON
-    // frontend for IDE integrations.
+    // Both Views share the Model/Controller seam; `--stdio` only swaps the
+    // View for the NDJSON frontend.
     if cli.stdio {
         let mut ui = StdioUi::new(
             state_manager.clone(),
@@ -354,9 +349,8 @@ async fn main() -> Result<()> {
         ui.run().await?;
         ui.shutdown().await?;
     } else {
-        // Pass the model registry through so `/model <alias>` is
-        // intercepted, validated, and confirmed in the View before any
-        // UiAction is dispatched.
+        // The registry lets the View intercept/validate `/model <alias>`
+        // before any UiAction is dispatched.
         let mut ui =
             ReplUi::new_with_registry(state_manager.clone(), action_sender, model_registry.clone());
         ui.init().await?;
