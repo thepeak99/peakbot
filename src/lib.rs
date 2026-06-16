@@ -1736,7 +1736,13 @@ impl AgentRunner {
                 // /compact is an ACTION, not a data-display command.
                 // It was mistakenly grouped with /stats and /context above.
                 if let Some(sm) = state_manager {
-                    match sm.force_compact().await {
+                    // Same status the auto/in-loop path emits, so the working
+                    // spinner reads "Compacting context..." instead of falling
+                    // back to the default "thinking" label.
+                    sm.set_status(Some("Compacting context...".to_string()));
+                    let outcome = sm.force_compact().await;
+                    sm.set_status(None);
+                    match outcome {
                         Some(result) => {
                             sm.add_system_message(format!(
                                 "Context compacted: {} → {} messages, {} discarded",
