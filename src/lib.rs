@@ -164,8 +164,13 @@ enum CompletionResult {
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 
-/// Build the system prompt dynamically with environment information
-pub fn build_system_prompt(skills: &SkillRegistry) -> String {
+/// Build the system prompt dynamically with environment information.
+///
+/// `shell_kind` is the shell detected at startup; its presence appends a
+/// `**Shell**:` line to the environment block so the model uses the right
+/// syntax and the right shell tool name. On a PowerShell host this also
+/// overrides the bash-centric guidance baked into the static prompt.
+pub fn build_system_prompt(skills: &SkillRegistry, shell_kind: Option<&ShellKind>) -> String {
     let mut prompt = SYSTEM_PROMPT.to_string();
 
     let cwd = std::env::current_dir()
@@ -203,12 +208,13 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
         .unwrap_or_else(|_| "Unknown".to_string());
 
     let env_info = format!(
-        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n- **Operating System**: {}\n- **PeakBot Binary Path**: {}\n",
+        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n- **Operating System**: {}\n- **PeakBot Binary Path**: {}\n{}",
         cwd,
         current_time,
         env!("CARGO_PKG_VERSION"),
         os,
-        binary_path
+        binary_path,
+        shell_line(shell_kind),
     );
 
     prompt.push_str(&skills_section);
@@ -218,6 +224,26 @@ pub fn build_system_prompt(skills: &SkillRegistry) -> String {
     debug!("System prompt:\n {}", prompt);
 
     prompt
+}
+
+/// The `**Shell**:` env-block line, derived from the detected shell.
+///
+/// On PowerShell this is deliberately emphatic: it names the `powershell`
+/// tool and instructs PowerShell syntax, overriding the bash examples in
+/// the static prompt (the recency/specificity of this trailing line wins).
+/// Empty when no shell was detected (Windows with nothing installed).
+fn shell_line(shell_kind: Option<&ShellKind>) -> String {
+    match shell_kind {
+        Some(ShellKind::PowerShell { path }) => format!(
+            "- **Shell**: powershell ({path}) — your shell tool is named `powershell`. \
+            Write PowerShell syntax (e.g. `Select-String`, `Get-ChildItem`, `Get-Content`), \
+            NOT bash/sed/grep. The bash examples elsewhere in this prompt do not apply here.\n"
+        ),
+        Some(ShellKind::Bash { path }) => {
+            format!("- **Shell**: bash ({path}) — use POSIX/bash syntax.\n")
+        }
+        None => String::new(),
+    }
 }
 
 /// Convert stored conversation messages to rig Messages for LLM chat history
@@ -2600,6 +2626,46 @@ mod tests {
                 cmd.description
             );
         }
+    }
+
+    // --- system-prompt shell awareness (#82) ---------------------------------
+
+    #[test]
+    fn system_prompt_powershell_instructs_powershell_syntax() {
+        let skills = SkillRegistry::new();
+        let ps = ShellKind::PowerShell {
+            path: "pwsh.exe".to_string(),
+        };
+        let prompt = build_system_prompt(&skills, Some(&ps));
+        assert!(
+            prompt.contains("**Shell**: powershell"),
+            "PowerShell env line missing from prompt"
+        );
+        assert!(
+            prompt.contains("`powershell`"),
+            "prompt must name the `powershell` tool on a PowerShell host"
+        );
+        assert!(
+            prompt.contains("PowerShell syntax"),
+            "prompt must instruct PowerShell syntax on a PowerShell host"
+        );
+    }
+
+    #[test]
+    fn system_prompt_bash_does_not_instruct_powershell() {
+        let skills = SkillRegistry::new();
+        let bash = ShellKind::Bash {
+            path: "/bin/sh".to_string(),
+        };
+        let prompt = build_system_prompt(&skills, Some(&bash));
+        assert!(
+            prompt.contains("**Shell**: bash"),
+            "bash env line missing from prompt"
+        );
+        assert!(
+            !prompt.contains("PowerShell syntax"),
+            "bash host must not carry PowerShell guidance"
+        );
     }
 
     #[tokio::test]
