@@ -355,7 +355,15 @@ pub fn create_compaction_model(
                 .build()
                 .context("Failed to create Anthropic client for compaction")?;
             let model = model_override.unwrap_or(&c.model);
-            let agent = client.agent(model).preamble(COMPACTION_PREAMBLE).build();
+            // Anthropic hard-requires max_tokens (rig errors locally if it's
+            // unset), and rig's per-model default is None for any non-Claude
+            // name — so compaction/title generation silently failed on
+            // gateway models like `minimax/MiniMax-M3`. Set it explicitly.
+            let agent = client
+                .agent(model)
+                .preamble(COMPACTION_PREAMBLE)
+                .max_tokens(c.max_tokens)
+                .build();
             Ok(CompactionModel::Anthropic(agent))
         }
         ProviderConfig::LlamaCpp(c) => {
@@ -1178,6 +1186,38 @@ mod tests {
         assert!(
             result.is_ok(),
             "Ollama construction shouldn't fail on a well-formed config (offline)"
+        );
+    }
+
+    /// Regression: the Anthropic compaction model must set `max_tokens`.
+    /// rig errors *locally* with "max_tokens must be set for Anthropic"
+    /// when it's unset, and its per-model default is None for any
+    /// non-Claude name (e.g. a gateway model like `minimax/MiniMax-M3`).
+    /// That swallowed the title/compaction LLM call silently. We can't
+    /// read the built agent's private fields, but we can drive
+    /// `summarize` against an unroutable host: with `max_tokens` set the
+    /// failure is a *transport* error, NOT the local max_tokens guard.
+    #[tokio::test]
+    async fn anthropic_compaction_model_sets_max_tokens_for_non_claude_model() {
+        let cfg = ProviderConfig::Anthropic(crate::config::AnthropicConfig {
+            api_key: Some("test-key".to_string()),
+            // Reserved TEST-NET-1 (RFC 5737) — guaranteed unroutable, so
+            // the call fails at transport, never reaching a real server.
+            base_url: "http://192.0.2.1:1/v1/messages".to_string(),
+            model: "minimax/MiniMax-M3".to_string(),
+            max_tokens: 64,
+            prompt_caching: crate::config::AnthropicCaching::Off,
+            vision: None,
+        });
+        let model = create_compaction_model(&cfg, None).expect("construction must succeed");
+        let err = model
+            .summarize("title this")
+            .await
+            .expect_err("call to an unroutable host must fail");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            !msg.contains("max_tokens"),
+            "max_tokens must be set so rig doesn't reject locally; got: {msg}"
         );
     }
 }
