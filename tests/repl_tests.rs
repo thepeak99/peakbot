@@ -167,7 +167,13 @@ mod tests {
         });
 
         let lines = buffer_to_lines(terminal.backend());
-        assert_snapshot!("chat_welcome", lines.join("\n"));
+        // Redact the banner version so a release version bump (which rewrites
+        // CARGO_PKG_VERSION) doesn't break this snapshot in CI.
+        insta::with_settings!({
+            filters => vec![(r"v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", "vX.Y.Z")],
+        }, {
+            assert_snapshot!("chat_welcome", lines.join("\n"));
+        });
     }
 
     #[test]
