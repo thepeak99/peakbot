@@ -106,7 +106,12 @@ async fn main() -> Result<()> {
     let mut config = loaded.config;
     let skills = load_default_skills()?;
     let skills_count = skills.len(); // Keep count before moving skills
-    let system_prompt = build_system_prompt(&skills);
+
+    // Detect the shell first — the system prompt needs it so the model is
+    // told which syntax + shell tool to use (#82). On Windows with no shell
+    // found, warn and continue; other tools still work.
+    let shell_kind = ShellKind::detect();
+    let system_prompt = build_system_prompt(&skills, shell_kind.as_ref());
 
     // Build the model registry. Two paths:
     // - `providers:` list declared → multi-model, `/model` enabled.
@@ -199,10 +204,8 @@ async fn main() -> Result<()> {
     // with a misleading "OpenRouter API key not configured" error.
     let boot_provider_config = config.resolve_and_mirror_boot_provider(&model_registry);
 
-    // Detect the best available shell for this OS.
-    // On Windows with no shell found, warn the user but continue — other
-    // tools (file editing, fetch, search) still work.
-    let shell_kind = ShellKind::detect();
+    // Apply the detected shell (detection ran earlier so the system prompt
+    // could reference it). On Windows with no shell, warn the user.
     if let Some(ref sk) = shell_kind {
         state_manager.set_shell(sk.executable().to_string());
         tracing::info!("Detected shell: {} ({})", sk.name(), sk.executable());
