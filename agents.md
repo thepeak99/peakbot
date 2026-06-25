@@ -274,6 +274,30 @@ vector store and the Anthropic provider are active:
 
 Plus optional **MCP tools** from configured servers.
 
+### The `thought` field (ThoughtGate)
+
+No tool declares a `thought` parameter of its own. Instead, every built-in
+**and** MCP tool is wrapped at registration in `ThoughtGate`
+(`src/tools/thought_gate.rs`), a `ToolDyn` decorator that owns the
+`thought` concern centrally:
+
+1. **Schema injection** — `definition()` adds a required `thought` string
+   property to the inner tool's schema (idempotent: skipped if the inner
+   tool already exposes `thought`). The model is always *told* `thought`
+   is required.
+2. **Strip before delegate** — `thought` is synthetic; the inner tool / MCP
+   server never declared it, so the gate removes it from the args before
+   calling (a strict MCP server may reject unknown params).
+3. **Soft nudge, never a hard error** — because the gate parses args as
+   `serde_json::Value`, a missing/blank `thought` can never produce a
+   `JsonError` that skips the call. The tool runs regardless; when
+   `thought` was absent, null, or whitespace, a one-line reminder is
+   appended to the result.
+
+The `think` tool is the **one exception** — it is registered ungated,
+because its `thought` *is* the payload it echoes back, not metadata.
+Wrapping it would strip the very thing it returns.
+
 The two vector tools share a single `VectorStore` (`src/vector/mod.rs`)
 built once at startup and injected into both — the same injection pattern
 as `SearchTool::new(config)`. The store wraps a `ruvector-core` `VectorDB`
@@ -701,6 +725,7 @@ src/
     ├── list_directory.rs   # ListDirectoryTool -- dir listing with recursion
     ├── search.rs           # SearchTool -- SearXNG web search
     ├── think.rs            # ThinkTool -- reasoning tool
+    ├── thought_gate.rs     # ThoughtGate -- injects the `thought` field + soft nudge; wraps every built-in & MCP tool
     ├── todo.rs             # TodoTool -- todo list management
     ├── view_image.rs       # ViewImageTool -- load a local image into vision (Anthropic-only)
     └── logging_wrapper.rs  # LoggingToolDyn -- wrapper for MCP tool tracing

@@ -54,8 +54,6 @@ pub enum BashError {
 
 #[derive(Deserialize)]
 pub struct BashArgs {
-    #[allow(dead_code)]
-    thought: String,
     command: String,
     timeout_seconds: Option<u64>,
     /// Show first N lines of output (optional)
@@ -267,10 +265,6 @@ impl Tool for BashTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute"
@@ -288,7 +282,7 @@ impl Tool for BashTool {
                         "description": "Show last N lines of output (default: 100, use 0 for all)"
                     }
                 },
-                "required": ["thought", "command"]
+                "required": ["command"]
             }),
         }
     }
