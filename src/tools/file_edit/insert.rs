@@ -14,8 +14,6 @@ use super::{
 
 #[derive(Deserialize)]
 pub struct FileInsertArgs {
-    #[allow(dead_code)]
-    thought: String,
     path: String,
     insert_line: usize,
     insert_text: String,
@@ -44,10 +42,6 @@ after line N. Returns an error if `insert_line` exceeds the file's line count."
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "path": {
                         "type": "string",
                         "description": "Absolute path to the file."
@@ -61,7 +55,7 @@ after line N. Returns an error if `insert_line` exceeds the file's line count."
                         "description": "The text to insert."
                     }
                 },
-                "required": ["thought", "path", "insert_line", "insert_text"]
+                "required": ["path", "insert_line", "insert_text"]
             }),
         }
     }

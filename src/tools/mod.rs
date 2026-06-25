@@ -11,6 +11,7 @@ mod powershell;
 mod search;
 mod shell_detect;
 mod think;
+mod thought_gate;
 pub mod todo;
 mod view_image;
 
@@ -27,5 +28,6 @@ pub use powershell::PowerShellTool;
 pub use search::SearchTool;
 pub use shell_detect::{ShellKind, print_no_shell_warning};
 pub use think::ThinkTool;
+pub use thought_gate::ThoughtGate;
 pub use todo::{TodoArgs, TodoItem, TodoStatus, TodoTool};
 pub use view_image::ViewImageTool;

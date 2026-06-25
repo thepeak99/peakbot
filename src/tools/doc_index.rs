@@ -60,10 +60,6 @@ impl Tool for DocIndexTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "path": {
                         "type": "string",
                         "description": "Absolute path to the file or directory to index."
@@ -79,7 +75,7 @@ impl Tool for DocIndexTool {
                         "additionalProperties": true
                     }
                 },
-                "required": ["thought", "path"]
+                "required": ["path"]
             }),
         }
     }
