@@ -49,10 +49,6 @@ impl Tool for DocSearchTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "query": {
                         "type": "string",
                         "description": "The natural-language query to search for."
@@ -63,7 +59,7 @@ impl Tool for DocSearchTool {
                         "default": DEFAULT_K
                     }
                 },
-                "required": ["thought", "query"]
+                "required": ["query"]
             }),
         }
     }

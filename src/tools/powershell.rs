@@ -25,8 +25,6 @@ pub enum PowerShellError {
 
 #[derive(Deserialize)]
 pub struct PowerShellArgs {
-    #[allow(dead_code)]
-    thought: String,
     command: String,
     timeout_seconds: Option<u64>,
     /// Show first N lines of output (optional)
@@ -196,10 +194,6 @@ impl Tool for PowerShellTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "command": {
                         "type": "string",
                         "description": "The PowerShell command to execute"
@@ -217,7 +211,7 @@ impl Tool for PowerShellTool {
                         "description": "Show last N lines of output (default: 100, use 0 for all)"
                     }
                 },
-                "required": ["thought", "command"]
+                "required": ["command"]
             }),
         }
     }

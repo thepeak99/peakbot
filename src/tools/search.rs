@@ -95,8 +95,6 @@ struct SearXngResult {
 /// Arguments for the search tool
 #[derive(Debug, Deserialize)]
 pub struct SearchArgs {
-    #[allow(dead_code)]
-    thought: String,
     /// The search query (plain text, no special syntax required)
     query: String,
 
@@ -157,10 +155,6 @@ impl Tool for SearchTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "query": {
                         "type": "string",
                         "description": "The search query"
@@ -185,7 +179,7 @@ impl Tool for SearchTool {
                         "enum": ["day", "month", "year"]
                     }
                 },
-                "required": ["thought", "query"]
+                "required": ["query"]
             }),
         }
     }

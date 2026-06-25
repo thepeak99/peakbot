@@ -84,8 +84,6 @@ pub enum FetchPageError {
 
 #[derive(Deserialize)]
 pub struct FetchPageArgs {
-    #[allow(dead_code)]
-    thought: String,
     url: String,
     #[serde(default = "default_markdown")]
     markdown: bool,
@@ -117,10 +115,6 @@ impl Tool for FetchPageTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "url": {
                         "type": "string",
                         "description": "The URL of the web page to fetch."
@@ -130,7 +124,7 @@ impl Tool for FetchPageTool {
                         "description": "Convert the page to Markdown (default: true). Set to false to get the raw HTML."
                     }
                 },
-                "required": ["thought", "url"]
+                "required": ["url"]
             }),
         }
     }

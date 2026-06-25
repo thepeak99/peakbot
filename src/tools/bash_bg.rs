@@ -59,11 +59,6 @@ impl BashBgTool {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct BashBgArgs {
-    /// Brief thought — match `todo`/`bash`/`think` convention.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub thought: String,
-
     /// One of: `start`, `stop`, `list`, `send_line`.
     pub action: String,
 
@@ -191,10 +186,6 @@ Pick the cooldown by intent:
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain why you're starting/stopping/listing/writing."
-                    },
                     "action": {
                         "type": "string",
                         "enum": ["start", "stop", "list", "send_line"],
@@ -232,7 +223,7 @@ Pick the cooldown by intent:
                         "description": "Text to write to the process's stdin (required for `send_line`). Newline appended if absent."
                     }
                 },
-                "required": ["thought", "action"]
+                "required": ["action"]
             }),
         }
     }
@@ -331,7 +322,6 @@ mod tests {
         let tool = BashBgTool::default();
         let err = tool
             .call(BashBgArgs {
-                thought: String::new(),
                 action: "list".into(),
                 command: None,
                 capture_output_lines: None,
@@ -352,7 +342,6 @@ mod tests {
         let tool = BashBgTool::new_with_env(sm, None);
         let err = tool
             .call(BashBgArgs {
-                thought: String::new(),
                 action: "bogus".into(),
                 command: None,
                 capture_output_lines: None,
@@ -377,7 +366,6 @@ mod tests {
         let tool = BashBgTool::new_with_env(sm, None);
         let err = tool
             .call(BashBgArgs {
-                thought: String::new(),
                 action: "start".into(),
                 command: None,
                 capture_output_lines: None,
@@ -400,7 +388,6 @@ mod tests {
         let tool = BashBgTool::new_with_env(sm, None);
         let out = tool
             .call(BashBgArgs {
-                thought: String::new(),
                 action: "list".into(),
                 command: None,
                 capture_output_lines: None,
