@@ -14,8 +14,6 @@ use super::{
 
 #[derive(Deserialize)]
 pub struct FileStrReplaceArgs {
-    #[allow(dead_code)]
-    thought: String,
     path: String,
     old_str: String,
     new_str: Option<String>,
@@ -47,10 +45,6 @@ If editing fails, read the file first with `file_read` to get exact content, the
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "path": {
                         "type": "string",
                         "description": "Absolute path to the file."
@@ -68,7 +62,7 @@ If editing fails, read the file first with `file_read` to get exact content, the
                         "description": "If true, replace all occurrences. Default: false (single match only)."
                     }
                 },
-                "required": ["thought", "path", "old_str"]
+                "required": ["path", "old_str"]
             }),
         }
     }

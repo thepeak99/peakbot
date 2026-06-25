@@ -214,10 +214,6 @@ impl TodoTool {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct TodoArgs {
-    /// Brief explanation of what you're doing
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub thought: String,
     /// The action to perform: add, update, remove, list, clear
     pub action: String,
     /// Task descriptions (for add)
@@ -235,7 +231,6 @@ impl TodoArgs {
     /// Create a new TodoArgs for adding tasks
     pub fn add(tasks: Vec<String>) -> Self {
         Self {
-            thought: "Adding tasks".to_string(),
             action: "add".to_string(),
             tasks: Some(tasks),
             status: None,
@@ -246,7 +241,6 @@ impl TodoArgs {
     /// Create a new TodoArgs for listing tasks
     pub fn list() -> Self {
         Self {
-            thought: "Listing tasks".to_string(),
             action: "list".to_string(),
             tasks: None,
             status: None,
@@ -257,7 +251,6 @@ impl TodoArgs {
     /// Create a new TodoArgs for updating a task
     pub fn update(id: usize, status: &str) -> Self {
         Self {
-            thought: "Updating task".to_string(),
             action: "update".to_string(),
             tasks: None,
             status: Some(status.to_string()),
@@ -268,7 +261,6 @@ impl TodoArgs {
     /// Create a new TodoArgs for removing a task
     pub fn remove(id: usize) -> Self {
         Self {
-            thought: "Removing task".to_string(),
             action: "remove".to_string(),
             tasks: None,
             status: None,
@@ -279,7 +271,6 @@ impl TodoArgs {
     /// Create a new TodoArgs for clearing completed tasks
     pub fn clear() -> Self {
         Self {
-            thought: "Clearing completed".to_string(),
             action: "clear".to_string(),
             tasks: None,
             status: None,
@@ -301,10 +292,6 @@ impl Tool for TodoTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "action": {
                         "type": "string",
                         "enum": ["add", "update", "remove", "list", "clear"],
@@ -325,7 +312,7 @@ impl Tool for TodoTool {
                         "description": "Task ID (required for update and remove actions)"
                     }
                 },
-                "required": ["thought", "action"]
+                "required": ["action"]
             }),
         }
     }

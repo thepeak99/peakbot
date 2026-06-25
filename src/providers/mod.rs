@@ -463,57 +463,74 @@ where
         None => BashBgTool::default(),
     };
 
-    let mut builder = builder
-        .tool(FileCreateTool)
-        .tool(FileStrReplaceTool)
-        .tool(FileInsertTool)
-        .tool(FileReadTool)
-        .tool(bash_bg_tool)
-        .tool(ListDirectoryTool)
-        .tool(FetchUrlTool)
-        .tool(FetchPageTool)
-        .tool(ThinkTool)
-        .tool(todo);
+    let mut tools: Vec<Box<dyn ToolDyn>> = vec![
+        gate(Box::new(FileCreateTool)),
+        gate(Box::new(FileStrReplaceTool)),
+        gate(Box::new(FileInsertTool)),
+        gate(Box::new(FileReadTool)),
+        gate(Box::new(bash_bg_tool)),
+        gate(Box::new(ListDirectoryTool)),
+        gate(Box::new(FetchUrlTool)),
+        gate(Box::new(FetchPageTool)),
+        gate(Box::new(todo)),
+        // `think` is ungated: its `thought` IS the payload it echoes back,
+        // not metadata — gating would strip the very thing it returns.
+        Box::new(ThinkTool),
+    ];
 
     // Add the single shell tool (bash OR powershell, never both, or none)
     if let Some(tool) = shell_tool {
-        builder = match tool {
-            EitherTool::Bash(t) => builder.tool(t),
-            EitherTool::PowerShell(t) => builder.tool(t),
-        };
+        tools.push(match tool {
+            EitherTool::Bash(t) => gate(Box::new(t)),
+            EitherTool::PowerShell(t) => gate(Box::new(t)),
+        });
     }
 
     // Conditionally add search tool if SearXNG is configured
     if let Some(config) = searxng_config {
-        builder = builder.tool(SearchTool::new(config));
+        tools.push(gate(Box::new(SearchTool::new(config))));
     }
 
     // Conditionally add the vector tools when a store is configured.
     if let Some(store) = vector_store {
-        builder = builder
-            .tool(crate::tools::DocIndexTool::new(store.clone()))
-            .tool(crate::tools::DocSearchTool::new(store.clone()));
+        tools.push(gate(Box::new(crate::tools::DocIndexTool::new(
+            store.clone(),
+        ))));
+        tools.push(gate(Box::new(crate::tools::DocSearchTool::new(
+            store.clone(),
+        ))));
     }
 
     // `view_image` needs a tool-result channel that carries images — only
     // Anthropic. Other providers swap/err/drop the image, so registration is gated.
     if register_view_image {
-        builder = builder.tool(crate::tools::ViewImageTool);
+        tools.push(gate(Box::new(crate::tools::ViewImageTool)));
     }
 
     // Add DelegateTool if pipeline is enabled
     if let Some(registry) = pipeline_registry {
         let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(registry.clone()));
-        builder = builder.tool(delegate_tool);
+        tools.push(gate(Box::new(delegate_tool)));
     }
 
-    builder
+    builder.tools(tools)
 }
 
 /// Internal enum to hold either a Bash or PowerShell tool for registration.
 enum EitherTool {
     Bash(BashTool),
     PowerShell(PowerShellTool),
+}
+
+/// Wrap a tool in [`ThoughtGate`] so it gains the cross-cutting `thought`
+/// field + soft nudge. Applied to every built-in and MCP tool.
+fn gate(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
+    Box::new(crate::tools::ThoughtGate::wrap(inner))
+}
+
+/// Wrap a slice of already-boxed tools (e.g. MCP) in `ThoughtGate`.
+pub(crate) fn gate_all(tools: Vec<Box<dyn ToolDyn>>) -> Vec<Box<dyn ToolDyn>> {
+    tools.into_iter().map(gate).collect()
 }
 
 /// Create OpenRouter agent and info
@@ -585,7 +602,7 @@ fn create_openrouter_agent(
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(tools).build()
+        agent_builder.tools(gate_all(tools)).build()
     } else {
         agent_builder.build()
     };
@@ -674,7 +691,7 @@ fn create_anthropic_agent(
     );
 
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(tools).build()
+        agent_builder.tools(gate_all(tools)).build()
     } else {
         agent_builder.build()
     };
@@ -747,7 +764,7 @@ fn create_ollama_agent(
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(tools).build()
+        agent_builder.tools(gate_all(tools)).build()
     } else {
         agent_builder.build()
     };
@@ -833,7 +850,7 @@ fn create_openai_agent(
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(tools).build()
+        agent_builder.tools(gate_all(tools)).build()
     } else {
         agent_builder.build()
     };
@@ -922,7 +939,7 @@ fn create_llamacpp_agent(
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(tools).build()
+        agent_builder.tools(gate_all(tools)).build()
     } else {
         agent_builder.build()
     };

@@ -11,8 +11,6 @@ use super::{FileEditError, write_file};
 
 #[derive(Deserialize)]
 pub struct FileCreateArgs {
-    #[allow(dead_code)]
-    thought: String,
     path: String,
     file_text: Option<String>,
 }
@@ -43,10 +41,6 @@ and editing it later."
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Briefly explain what you're about to do and why, before acting."
-                    },
                     "path": {
                         "type": "string",
                         "description": "Absolute path to the file to create."
@@ -56,7 +50,7 @@ and editing it later."
                         "description": "The full content of the new file. If omitted or empty, an empty file is created. Recommended: provide content upfront to avoid creating an empty file and editing it later."
                     }
                 },
-                "required": ["thought", "path"]
+                "required": ["path"]
             }),
         }
     }
