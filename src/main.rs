@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::Parser;
 use peakbot::{
     AgentRunner, Config, FileStorage, ShellKind, SubAgentRegistry, TodoTool, Ui, UiAction,
-    build_system_prompt, create_provider, get_config_file_path, load_default_skills,
-    load_mcp_servers, print_no_shell_warning,
+    build_system_prompt, create_provider, ensure_ca_bundle, get_config_file_path,
+    load_default_skills, load_mcp_servers, print_no_shell_warning,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -76,6 +76,11 @@ fn print_config_not_found_message(config_path: &std::path::Path) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Point rustls at a compiled-in CA bundle when the host has no system
+    // trust store (static musl binary on bare Android/Termux). Must run
+    // before any TLS client is constructed. No-op when roots already exist.
+    ensure_ca_bundle();
+
     // `--stdio` must be known before tracing init: under it stdout is the
     // NDJSON wire, so logs MUST go to stderr or they corrupt the protocol.
     let cli = Cli::parse();

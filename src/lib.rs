@@ -1,6 +1,7 @@
 //! PeakBot library - Core functionality for connecting to MCP servers and managing tools.
 
 pub mod bg_processes;
+mod ca_certs;
 mod config;
 mod context_manager;
 mod conversation;
@@ -25,6 +26,7 @@ pub mod utils;
 pub mod vector;
 pub mod vision;
 
+pub use ca_certs::ensure_ca_bundle;
 pub use config::{
     AgentDefinition, AnthropicConfig, BashConfig, Config, ContextConfig, ConversationConfig,
     LoadedConfig, McpServerConfig, McpTransportType, ModelEntry, ModelRegistry, OllamaConfig,

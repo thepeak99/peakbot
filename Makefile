@@ -76,7 +76,7 @@ $(OUTPUT_DIR)/$(MACOS_BIN): Dockerfile.macos
 	@echo "✅ Built: $(OUTPUT_DIR)/$(MACOS_BIN)"
 	@ls -lh $(OUTPUT_DIR)/$(MACOS_BIN)
 
-## build-android: Cross-compile to Android arm64 (aarch64-linux-android) terminal binary
+## build-android: Cross-compile to Android/Termux arm64 (aarch64-unknown-linux-musl) terminal binary
 build-android: $(OUTPUT_DIR)/$(ANDROID_BIN)
 
 $(OUTPUT_DIR)/$(ANDROID_BIN): Dockerfile.android

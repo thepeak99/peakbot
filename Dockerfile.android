@@ -1,50 +1,36 @@
-# PeakBot Android Cross-Compile Builder
+# PeakBot Android (Termux) Cross-Compile Builder
 #
-# Produces a standalone aarch64 (arm64-v8a) terminal binary for Android —
-# runnable in Termux or via `adb shell`. This is NOT an APK and NOT a jniLibs
-# `.so`; it's a plain CLI/TUI executable for the `aarch64-linux-android` target.
+# Produces a standalone aarch64 terminal binary for Termux. This is NOT an APK
+# and NOT a jniLibs `.so`; it's a plain CLI/TUI executable.
 #
-# Cross-compilation needs the Android NDK (which ships the clang linker) plus
-# `cargo-ndk`, which auto-detects the NDK and sets every CC/AR/linker env var
-# correctly (the NDK linker path embeds the host triple AND NDK version, so
-# auto-detection keeps this Dockerfile from hardcoding a brittle path).
-#
-# PeakBot is pure rustls/ring (no openssl-sys), so there is no Android system
-# SSL to link against — the usual Android cross-compile wall does not apply.
+# Target is `aarch64-unknown-linux-musl`, NOT `aarch64-linux-android`, on
+# purpose: PeakBot's TLS stack (rustls via reqwest) pulls in
+# `rustls-platform-verifier`, whose Android backend calls into the JVM for
+# certificate verification. A Termux/CLI binary has no JVM, so that backend
+# panics at the first HTTPS request ("expect rustls platform verifier to be
+# initialized"). The platform-verifier's JVM code path is gated on
+# `target_os = "android"`; building for linux-musl selects its Unix backend
+# instead, which reads roots from the system trust store. A bare device has
+# none, so the binary embeds the Mozilla CA bundle and points SSL_CERT_FILE at
+# it at startup (see `src/ca_certs.rs`) — no `ca-certificates` install needed.
+# A fully static musl binary runs fine under Termux and `adb shell` alike — no
+# NDK, no bionic, no JVM.
 #
 # Usage:
 #   podman build -f Dockerfile.android --output type=local,dest=./output .
 #   docker build -f Dockerfile.android --output type=local,dest=./output .
 
-FROM ghcr.io/rust-lang/rust:1.91-bookworm AS builder
+# cargo-zigbuild + zig supply a complete musl C sysroot, so the C deps rustls
+# pulls in (aws-lc-sys/BoringSSL) cross-compile cleanly — a plain glibc cross
+# gcc can't find musl's headers. Same builder image Dockerfile.macos uses.
+FROM ghcr.io/rust-cross/cargo-zigbuild:latest AS builder
 
-# arm64-v8a covers essentially every modern Android phone.
-ARG TARGET=aarch64-linux-android
+# arm64 covers essentially every modern Android phone. musl → fully static.
+ARG TARGET=aarch64-unknown-linux-musl
 ENV TARGET=${TARGET}
 
-# Minimum Android API level (24 = Android 7.0, the Termux floor).
-# Set via CARGO_NDK_PLATFORM rather than a CLI flag: cargo-ndk v4's `-p`
-# collides with cargo's `--package` passthrough, so the env var is unambiguous.
-ARG ANDROID_API=24
-ENV CARGO_NDK_PLATFORM=${ANDROID_API}
-
-# Pinned NDK revision (LTS). Bump deliberately.
-ARG NDK_VERSION=r27c
-
-# Install the NDK (provides the clang cross-linker) + cargo-ndk.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        unzip curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL -o /tmp/ndk.zip \
-        "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip" \
-    && unzip -q /tmp/ndk.zip -d /opt \
-    && rm /tmp/ndk.zip
-ENV ANDROID_NDK_HOME=/opt/android-ndk-${NDK_VERSION}
-
-# Add the Rust target and the cargo-ndk extension.
 RUN rustup target add ${TARGET} \
-    && rustup target list --installed \
-    && cargo install cargo-ndk --locked
+    && rustup target list --installed
 
 # Copy manifests first for better layer caching
 WORKDIR /build
@@ -55,20 +41,19 @@ RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs
 
 # Build dependencies only (faster layer caching)
-RUN cargo ndk -t ${TARGET} build --release && \
-    rm -rf target/${TARGET}/deps/*.rlib target/${TARGET}/deps/*.d
+RUN cargo zigbuild --release --target ${TARGET}
 
 # Copy actual source
 COPY src/ src/
 
 # Build the actual binary (touch main.rs so cargo rebuilds the bin crate; deps stay cached)
 RUN touch src/main.rs && \
-    cargo ndk -t ${TARGET} build --release
+    cargo zigbuild --release --target ${TARGET}
 
 # Export only the binary, named with the release/version + platform suffix so
 # the Makefile doesn't have to rename it post-build.
 FROM scratch
-ARG TARGET=aarch64-linux-android
+ARG TARGET=aarch64-unknown-linux-musl
 # VERSION is injected by `make release-build-android` from .release-version.
 # Unset (default): artifact is `peakbot-android-arm64`.
 # Set to e.g. 0.2.0: artifact is `peakbot-0.2.0-android-arm64`.

@@ -24,6 +24,12 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }
+# Compiled-in Mozilla CA bundle. reqwest 0.13's rustls path uses
+# rustls-platform-verifier, which reads the system trust store — empty on a
+# bare Android/Termux musl host. `ensure_ca_bundle()` writes these roots out
+# and sets SSL_CERT_FILE so every TLS client finds them. Already in the graph
+# transitively; declared direct so we own the version.
+webpki-root-certs = "1"
 http = "1"
 chrono = "0.4"
 directories-next = "2"
