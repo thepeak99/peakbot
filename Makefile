@@ -1,17 +1,19 @@
-.PHONY: all build build-linux build-macos build-windows clean test docker-build help \
+.PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
         release release-bump release-tag \
-        release-build-linux release-build-windows release-build-macos release-publish
+        release-build-linux release-build-windows release-build-macos release-build-android release-publish
 
 # Config
 DOCKERFILE         := Dockerfile.windows
 DOCKERFILE_LINUX   := Dockerfile.linux
 DOCKERFILE_MACOS   := Dockerfile.macos
+DOCKERFILE_ANDROID := Dockerfile.android
 OUTPUT_DIR         := output
 # Default (unversioned) artifact names. Release builds bake the version into
 # the filename via --build-arg VERSION=$v from the .release-version stash.
 LINUX_BIN          := peakbot-linux-amd64
 WIN_BIN            := peakbot-windows-amd64.exe
 MACOS_BIN          := peakbot-macos-universal2
+ANDROID_BIN        := peakbot-android-arm64
 CONTAINER_BUILDER ?= $(shell command -v podman 2>/dev/null || echo docker)
 
 # Release config — derived from `origin` remote so you only need GITEA_TOKEN
@@ -30,8 +32,8 @@ NOTES ?=
 # Default target
 all: build
 
-## build: Cross-compile all three platforms (linux, windows, macos)
-build: build-linux build-windows build-macos
+## build: Cross-compile all four platforms (linux, windows, macos, android)
+build: build-linux build-windows build-macos build-android
 
 ## build-windows: Cross-compile to Windows x86_64 .exe (via Dockerfile.windows)
 build-windows: $(OUTPUT_DIR)/$(WIN_BIN)
@@ -74,6 +76,20 @@ $(OUTPUT_DIR)/$(MACOS_BIN): Dockerfile.macos
 	@echo "✅ Built: $(OUTPUT_DIR)/$(MACOS_BIN)"
 	@ls -lh $(OUTPUT_DIR)/$(MACOS_BIN)
 
+## build-android: Cross-compile to Android arm64 (aarch64-linux-android) terminal binary
+build-android: $(OUTPUT_DIR)/$(ANDROID_BIN)
+
+$(OUTPUT_DIR)/$(ANDROID_BIN): Dockerfile.android
+	@mkdir -p $(OUTPUT_DIR)
+	@echo "🤖 Cross-compiling peakbot for Android (arm64)..."
+	$(CONTAINER_BUILDER) build \
+		--output type=local,dest=$(OUTPUT_DIR) \
+		-f $(DOCKERFILE_ANDROID) \
+		.
+	@chmod +x $(OUTPUT_DIR)/$(ANDROID_BIN)
+	@echo "✅ Built: $(OUTPUT_DIR)/$(ANDROID_BIN)"
+	@ls -lh $(OUTPUT_DIR)/$(ANDROID_BIN)
+
 ## clean: Remove output artifacts
 clean:
 	rm -rf $(OUTPUT_DIR)
@@ -90,7 +106,7 @@ rebuild: clean build
 # ─────────────────────────────────────────────────────────────────────────────
 
 ## release: Full release flow — bump, tag, build, publish to Gitea
-release: release-bump release-tag release-build-linux release-build-windows release-build-macos release-publish
+release: release-bump release-tag release-build-linux release-build-windows release-build-macos release-build-android release-publish
 	@echo ""
 	@echo "🎉 Release $$(grep '^version' Cargo.toml | head -1 | cut -d'\"' -f2) complete!"
 
@@ -231,6 +247,22 @@ release-build-macos:
 	echo "✅ $(OUTPUT_DIR)/peakbot-$$v-macos-universal2"; \
 	ls -lh $(OUTPUT_DIR)/peakbot-$$v-macos-universal2
 
+## release-build-android: Build Android arm64 binary (via Dockerfile.android) with the release version baked into the filename
+release-build-android:
+	@set -eu; \
+	if [ ! -f .release-version ]; then echo "❌ run release-bump first"; exit 1; fi; \
+	v=$$(cat .release-version); \
+	mkdir -p $(OUTPUT_DIR); \
+	echo "🤖 Cross-compiling peakbot $$v for Android (arm64)..."; \
+	$(CONTAINER_BUILDER) build \
+		--build-arg VERSION=$$v \
+		--output type=local,dest=$(OUTPUT_DIR) \
+		-f $(DOCKERFILE_ANDROID) \
+		.; \
+	chmod +x $(OUTPUT_DIR)/peakbot-$$v-android-arm64; \
+	echo "✅ $(OUTPUT_DIR)/peakbot-$$v-android-arm64"; \
+	ls -lh $(OUTPUT_DIR)/peakbot-$$v-android-arm64
+
 ## release-publish: Create Gitea release and upload binaries
 release-publish:
 	@set -eu; \
@@ -244,9 +276,11 @@ release-publish:
 	linux_asset="$(OUTPUT_DIR)/peakbot-$$v-linux-amd64"; \
 	win_asset="$(OUTPUT_DIR)/peakbot-$$v-windows-amd64.exe"; \
 	macos_asset="$(OUTPUT_DIR)/peakbot-$$v-macos-universal2"; \
+	android_asset="$(OUTPUT_DIR)/peakbot-$$v-android-arm64"; \
 	[ -f "$$linux_asset" ] || { echo "❌ Missing $$linux_asset"; exit 1; }; \
 	[ -f "$$win_asset"   ] || { echo "❌ Missing $$win_asset";   exit 1; }; \
 	[ -f "$$macos_asset" ] || { echo "❌ Missing $$macos_asset"; exit 1; }; \
+	[ -f "$$android_asset" ] || { echo "❌ Missing $$android_asset"; exit 1; }; \
 	api="$(GITEA_URL)/api/v1/repos/$(OWNER)/$(REPO)"; \
 	echo "🚀 Creating Gitea release $$v at $$api/releases ..."; \
 	notes="$${NOTES:-release-notes/$$v.md}"; \
@@ -268,7 +302,7 @@ release-publish:
 	  echo "❌ Failed to create release. Response:"; echo "$$resp" | jq .; exit 1; \
 	fi; \
 	echo "✅ Release id=$$rid"; \
-	for f in "$$linux_asset" "$$win_asset" "$$macos_asset"; do \
+	for f in "$$linux_asset" "$$win_asset" "$$macos_asset" "$$android_asset"; do \
 	  name=$$(basename "$$f"); \
 	  echo "⬆️  Uploading $$name ..."; \
 	  up=$$(curl -sS -X POST "$$api/releases/$$rid/assets?name=$$name" \
