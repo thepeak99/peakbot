@@ -5,6 +5,10 @@ edition = "2024"
 
 [features]
 mock = []
+# Compile in the Mozilla CA bundle and write it to SSL_CERT_FILE at startup.
+# Enabled only by Dockerfile.android (static musl/Termux binary, no system
+# trust store). Off everywhere else so desktop binaries stay lean.
+embed-ca-certs = ["dep:webpki-root-certs"]
 
 [dependencies]
 rig-core = { version = "0.38", features = ["rmcp"] }
@@ -24,12 +28,14 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }
-# Compiled-in Mozilla CA bundle. reqwest 0.13's rustls path uses
+# Compiled-in Mozilla CA bundle, pulled in ONLY under the `embed-ca-certs`
+# feature (enabled by Dockerfile.android). reqwest 0.13's rustls path uses
 # rustls-platform-verifier, which reads the system trust store — empty on a
 # bare Android/Termux musl host. `ensure_ca_bundle()` writes these roots out
-# and sets SSL_CERT_FILE so every TLS client finds them. Already in the graph
-# transitively; declared direct so we own the version.
-webpki-root-certs = "1"
+# and sets SSL_CERT_FILE so every TLS client finds them. Optional so the
+# desktop/Windows/macOS binaries don't carry the ~250 KB of roots they never
+# use (they have a real OS trust store).
+webpki-root-certs = { version = "1", optional = true }
 http = "1"
 chrono = "0.4"
 directories-next = "2"

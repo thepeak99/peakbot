@@ -13,8 +13,10 @@ This file is the working draft for the next release. When a version is tagged, t
 
 - Fixed the Android/Termux binary panicking at startup with "No CA
   certificates were loaded from the system" on devices with no system trust
-  store. The binary now embeds the Mozilla CA bundle and points
-  `SSL_CERT_FILE` at it before any TLS client is built (`src/ca_certs.rs`), so
-  every HTTPS client (provider, MCP, web fetch) finds roots with zero device
-  setup. No-op when the host already has `SSL_CERT_FILE`/`SSL_CERT_DIR` set or
-  a standard system bundle present.
+  store. The Android build now enables the `embed-ca-certs` feature, which
+  embeds the Mozilla CA bundle and points `SSL_CERT_FILE` at it before any TLS
+  client is built (`src/ca_certs.rs`), so every HTTPS client (provider, MCP,
+  web fetch) finds roots with zero device setup. The feature is off on every
+  other platform, so the desktop/Windows/macOS binaries don't carry the CA
+  roots they never use. No-op when the host already has `SSL_CERT_FILE`/
+  `SSL_CERT_DIR` set or a standard system bundle present.
