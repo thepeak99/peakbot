@@ -897,7 +897,7 @@ make release VERSION=0.3.0
 
 ### Pre-commit Gate
 This is non-negotiable — the build pipeline treats clippy warnings as
-real signals, the release flow rebuilds three platforms, and stale
+real signals, the release flow rebuilds four platforms, and stale
 warnings hide real ones. Run the gate locally so CI doesn't have to
 catch you.
 
@@ -949,7 +949,7 @@ Never commit `.snap.new` files; they'll fail CI.
 
 ### Why this matters
 
-- The release flow (`make release`) compiles three platforms from
+- The release flow (`make release`) compiles four platforms from
   scratch. A warning that compiles fine on Linux can be a hard error on
   Windows or macOS.
 - The `-D warnings` gate means *any* new warning blocks the commit.
@@ -961,7 +961,7 @@ Never commit `.snap.new` files; they'll fail CI.
 
 ## Build & Release
 
-PeakBot ships as a single static binary for **Linux x86_64**, **Windows x86_64**, and **macOS universal2** (Intel + Apple Silicon in one fat binary). All three are produced from Linux via container builds — no native macOS/Windows host required. The driver is a top-level `Makefile`; cross-compilation is handled by three sibling Dockerfiles.
+PeakBot ships as a single static binary for **Linux x86_64**, **Windows x86_64**, **macOS universal2** (Intel + Apple Silicon in one fat binary), and **Android arm64** (a terminal binary for Termux / `adb shell` — not an APK). All four are produced from Linux via container builds — no native macOS/Windows/Android host required. The driver is a top-level `Makefile`; cross-compilation is handled by four sibling Dockerfiles.
 
 ### Dockerfiles
 
@@ -970,8 +970,9 @@ PeakBot ships as a single static binary for **Linux x86_64**, **Windows x86_64**
 | `Dockerfile.linux` | `rust:1.88-bookworm` | `x86_64-unknown-linux-gnu` | Native build inside Debian; uses dummy-main caching trick |
 | `Dockerfile.windows` | `rust:1.88-bookworm` + mingw | `x86_64-pc-windows-gnu` | Cross via gcc-mingw; final stage `FROM scratch` |
 | `Dockerfile.macos` | `ghcr.io/rust-cross/cargo-zigbuild:latest` | `universal2-apple-darwin` | Cross via zig + bundled macOS SDK; produces fat binary (lipo merge) |
+| `Dockerfile.android` | `rust:1.91-bookworm` + Android NDK r27c | `aarch64-linux-android` | Cross via `cargo-ndk` (NDK clang linker). API level via `CARGO_NDK_PLATFORM` (24), NOT the `-p` flag — cargo-ndk v4's `-p` collides with cargo's `--package`. Links only bionic (libc/libm/libdl). Works clean because PeakBot is pure rustls/ring (no OpenSSL). |
 
-All three use a `FROM scratch` final stage and `--output type=local,dest=./output` so `make` extracts only the binary into `output/` without leaving an image in the local registry. Override the rust target with `--build-arg TARGET=...` if you need a single-arch macOS or a different libc.
+All four use a `FROM scratch` final stage and `--output type=local,dest=./output` so `make` extracts only the binary into `output/` without leaving an image in the local registry. Override the rust target with `--build-arg TARGET=...` if you need a single-arch macOS or a different libc.
 
 > **Gotcha:** `ARG` does not propagate across `FROM` stage boundaries. Each Dockerfile redeclares `ARG TARGET=...` in its scratch stage so the `COPY --from=builder target/${TARGET}/release/...` path interpolates correctly.
 
@@ -981,12 +982,13 @@ Run `make help` for the full list. Day-to-day:
 
 | Target | What it does |
 |--------|--------------|
-| `make` / `make build` | Build all three platforms in sequence (linux, windows, macos) |
+| `make` / `make build` | Build all four platforms in sequence (linux, windows, macos, android) |
 | `make build-linux` | Build `output/peakbot-linux-amd64` (Linux x86_64) |
 | `make build-windows` | Build `output/peakbot-windows-amd64.exe` (Windows x86_64) |
 | `make build-macos` | Build `output/peakbot-macos-universal2` (macOS universal2) |
+| `make build-android` | Build `output/peakbot-android-arm64` (Android arm64, Termux/`adb shell`) |
 | `make clean` | `rm -rf output/` |
-| `make rebuild` | `clean` + `build` (rebuilds all three) |
+| `make rebuild` | `clean` + `build` (rebuilds all four) |
 | `make help` | Print this table from `## ` doc comments in the Makefile |
 
 Non-release builds produce **unversioned** filenames (e.g. `peakbot-linux-amd64`). The release flow injects the semver via `--build-arg VERSION=$v`, which the Dockerfiles splice into the artifact name as `peakbot-<v>-<platform>`. With `VERSION` unset (the default), the conditional `${VERSION:+-${VERSION}}` substitution in each Dockerfile collapses to nothing — same `cargo build --release`, just a cleaner name.
@@ -998,7 +1000,7 @@ Non-release builds produce **unversioned** filenames (e.g. `peakbot-linux-amd64`
 The `make release` target runs the full release flow end-to-end:
 
 ```
-release-bump → release-tag → release-build-linux → release-build-windows → release-build-macos → release-publish
+release-bump → release-tag → release-build-linux → release-build-windows → release-build-macos → release-build-android → release-publish
 ```
 
 Each phase does one thing and can be re-run independently if a later phase fails. In-flight state is stashed in `.release-version` (gitignored) and deleted after a successful publish.
@@ -1007,8 +1009,8 @@ Each phase does one thing and can be re-run independently if a later phase fails
 |-------|--------|
 | `release-bump` | Validate semver, refuse if tag exists, refuse on dirty tree (override with `ALLOW_DIRTY=1`), rewrite `[package].version` in `Cargo.toml`, sync `Cargo.lock` via `cargo update -p peakbot --precise <v>`, commit `chore: release <v>` |
 | `release-tag` | Create annotated tag `<v>` (bare semver, no `v` prefix), push current branch + tag to `origin` |
-| `release-build-{linux,windows,macos}` | Run the matching Docker build, copy artifact to `output/peakbot-<v>-{linux-amd64,windows-amd64.exe,macos-universal2}` |
-| `release-publish` | Create a Gitea release via REST API and upload all three asset files |
+| `release-build-{linux,windows,macos,android}` | Run the matching Docker build, copy artifact to `output/peakbot-<v>-{linux-amd64,windows-amd64.exe,macos-universal2,android-arm64}` |
+| `release-publish` | Create a Gitea release via REST API and upload all four asset files |
 
 #### Usage
 
@@ -1024,7 +1026,7 @@ make release VERSION=0.2.0 ALLOW_DIRTY=1     # bypass clean-tree check
 #### Required tools on the release host
 
 - `git`, `cargo` — for the version bump and tag
-- `podman` or `docker` — to run the three Dockerfile builds
+- `podman` or `docker` — to run the four Dockerfile builds
 - `curl`, `jq` — used by `release-publish` to talk to Gitea
 - `awk` — portable invocation only (no PCRE lazy quantifiers); works under gawk / mawk / busybox awk
 
