@@ -248,7 +248,7 @@ impl Tool for SearchTool {
         }
 
         // Make the HTTP request
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(self.timeout_seconds))
             .build()?;
 

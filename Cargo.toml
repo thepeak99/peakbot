@@ -91,6 +91,18 @@ docx-lite = "0.2"
 # Chunk hashing for idempotent re-index (stable id + content sha256).
 sha2 = "0.10"
 
+# Android-only TLS. On the NDK `aarch64-linux-android` target, reqwest 0.13's
+# hard-wired `rustls-platform-verifier` panics at runtime (it needs a JVM
+# `Context` to reach the system trust store, which a Termux/`adb shell` binary
+# lacks — reqwest#2968). src/http.rs builds a rustls config from the bundled
+# Mozilla roots and feeds it to every client via `use_preconfigured_tls`. This
+# is gated to Android so desktop builds keep reqwest's default OS platform
+# verifier unchanged. aws_lc_rs is already linked via reqwest's `rustls`
+# feature, so naming the provider here adds no new C dependency.
+[target.'cfg(target_os = "android")'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+webpki-roots = "1"
+
 [dev-dependencies]
 tempfile = "3.27"
 insta = { version = "1.40", features = ["yaml", "serde", "filters"] }

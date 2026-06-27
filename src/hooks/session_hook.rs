@@ -253,7 +253,7 @@ struct Pricing {
 /// * `Ok(ModelPricing)` - The pricing information for the model
 /// * `Err` - If the API call fails or model is not found
 pub async fn fetch_model_pricing(api_key: &str, model: &str) -> Result<ModelPricing> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let response = client
         .get("https://openrouter.ai/api/v1/models")
         .header("Authorization", format!("Bearer {}", api_key))

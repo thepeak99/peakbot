@@ -329,6 +329,7 @@ pub fn create_compaction_model(
                 .clone()
                 .context("OpenRouter API key not configured")?;
             let client = openrouter::Client::builder()
+                .http_client(crate::http::client())
                 .api_key(&api_key)
                 .build()
                 .context("Failed to create OpenRouter client for compaction")?;
@@ -339,6 +340,7 @@ pub fn create_compaction_model(
         ProviderConfig::OpenAI(c) => {
             let api_key = c.api_key.clone().context("OpenAI API key not configured")?;
             let client = openai::Client::builder()
+                .http_client(crate::http::client())
                 .api_key(&api_key)
                 .base_url(&c.base_url)
                 .build()
@@ -350,6 +352,7 @@ pub fn create_compaction_model(
         ProviderConfig::Anthropic(c) => {
             let api_key = c.api_key.clone().unwrap_or_default();
             let client = anthropic::Client::builder()
+                .http_client(crate::http::client())
                 .api_key(&api_key)
                 .base_url(&c.base_url)
                 .build()
@@ -369,6 +372,7 @@ pub fn create_compaction_model(
         ProviderConfig::LlamaCpp(c) => {
             let api_key = c.api_key.clone().unwrap_or_default();
             let client = openai::Client::builder()
+                .http_client(crate::http::client())
                 .api_key(&api_key)
                 .base_url(&c.base_url)
                 .build()
@@ -380,6 +384,7 @@ pub fn create_compaction_model(
         }
         ProviderConfig::Ollama(c) => {
             let client = ollama::Client::builder()
+                .http_client(crate::http::client())
                 .base_url(&c.base_url)
                 .api_key(rig_core::client::Nothing)
                 .build()
@@ -566,6 +571,7 @@ fn create_openrouter_agent(
     }
 
     let client = openrouter::Client::builder()
+        .http_client(crate::http::client())
         .api_key(&api_key)
         .build()
         .context("Failed to create OpenRouter client")?;
@@ -647,6 +653,7 @@ fn create_anthropic_agent(
     }
 
     let client = anthropic::Client::builder()
+        .http_client(crate::http::client())
         .api_key(&api_key)
         .base_url(&config.base_url)
         .build()
@@ -730,6 +737,7 @@ fn create_ollama_agent(
 
     // Use Nothing as API key since Ollama doesn't require one
     let client = ollama::Client::builder()
+        .http_client(crate::http::client())
         .base_url(&config.base_url)
         .api_key(rig_core::client::Nothing)
         .build()
@@ -813,6 +821,7 @@ fn create_openai_agent(
 
     // Build the OpenAI client with configurable base URL
     let client = openai::Client::builder()
+        .http_client(crate::http::client())
         .api_key(&api_key)
         .base_url(&config.base_url)
         .build()
@@ -894,6 +903,7 @@ fn create_llamacpp_agent(
 
     // Build the OpenAI client with completions API for llama.cpp compatibility
     let client = openai::Client::builder()
+        .http_client(crate::http::client())
         .api_key(&api_key)
         .base_url(&config.base_url)
         .build()

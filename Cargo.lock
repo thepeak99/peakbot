@@ -3044,6 +3044,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rig-core",
  "rmcp",
+ "rustls",
  "ruvector-core",
  "serde",
  "serde_json",
@@ -3058,6 +3059,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
