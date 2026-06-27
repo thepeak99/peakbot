@@ -1,26 +1,18 @@
-//! Shared reqwest client construction.
+//! Shared reqwest client construction — one TLS policy for every HTTP client.
 //!
-//! Every HTTP client in PeakBot is built here so they all share one TLS policy.
+//! On Android, reqwest's default `rustls-platform-verifier` panics (no JVM to
+//! reach the system trust store, reqwest#2968), so there we root TLS in the
+//! bundled Mozilla `webpki-roots`. Desktop keeps the OS platform verifier.
 //!
-//! On **Android** we hand reqwest a rustls config rooted in the bundled Mozilla
-//! `webpki-roots` instead of letting it default to `rustls-platform-verifier`,
-//! which panics on Android/Termux where no JVM is available to reach the system
-//! trust store (reqwest#2968). The roots are static and the binary is rebuilt
-//! every release, so a frozen trust set is the right trade-off there.
-//!
-//! On **desktop** (Linux/macOS/Windows) we change nothing: reqwest keeps its
-//! default platform verifier and the OS system trust store, exactly as before.
-//!
-//! New HTTP clients MUST be built through `client()` / `client_builder()` (or,
-//! for rig-core providers, `.http_client(http::client())`) so the Android TLS
-//! policy is applied consistently. A bare `reqwest::Client::new()` works on
-//! desktop but crashes on Android.
+//! Always build clients via `client()` / `client_builder()` (rig providers:
+//! `.http_client(http::client())`); a bare `reqwest::Client::new()` crashes on
+//! Android.
 
 #[cfg(target_os = "android")]
 use std::sync::Arc;
 
-/// A rustls config trusting the bundled Mozilla webpki roots, using the
-/// aws-lc-rs provider already linked via reqwest's `rustls` feature.
+/// rustls config trusting the bundled Mozilla webpki roots (aws-lc-rs provider,
+/// already linked via reqwest's `rustls` feature).
 #[cfg(target_os = "android")]
 fn tls_config() -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
@@ -35,9 +27,8 @@ fn tls_config() -> rustls::ClientConfig {
     .with_no_client_auth()
 }
 
-/// A reqwest builder. On Android it is preconfigured with webpki-root TLS; on
-/// desktop it is reqwest's default (OS platform verifier). Callers add their own
-/// timeout / user-agent and then `.build()`.
+/// reqwest builder with the platform TLS policy (Android: webpki roots; desktop:
+/// OS verifier). Callers add timeout / user-agent then `.build()`.
 pub fn client_builder() -> reqwest::ClientBuilder {
     #[cfg(target_os = "android")]
     {
@@ -49,8 +40,7 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     }
 }
 
-/// A ready reqwest client with the platform-appropriate TLS policy and no extra
-/// options.
+/// Ready reqwest client with the platform TLS policy and no extra options.
 pub fn client() -> reqwest::Client {
     client_builder()
         .build()
