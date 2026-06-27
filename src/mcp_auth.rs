@@ -349,7 +349,7 @@ pub async fn authorize(
     // ── Cache hit fast-path ────────────────────────────────────────────────
     if mgr.initialize_from_store().await? {
         info!(server = %server_name, "OAuth: cached token loaded, skipping browser");
-        return Ok(AuthClient::new(reqwest::Client::new(), mgr));
+        return Ok(AuthClient::new(crate::http::client(), mgr));
     }
 
     // ── Discover metadata ──────────────────────────────────────────────────
@@ -456,7 +456,7 @@ pub async fn authorize(
         .await?;
 
     info!(server = %server_name, "OAuth: authorisation complete, token cached");
-    Ok(AuthClient::new(reqwest::Client::new(), mgr))
+    Ok(AuthClient::new(crate::http::client(), mgr))
 }
 
 /// Pull `?state=…` out of a URL without dragging in the `url` crate

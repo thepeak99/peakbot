@@ -59,10 +59,10 @@ fn backoff_with_jitter(attempt: u32) -> Duration {
     base + jitter
 }
 
-/// Build a one-shot HTTP client with the given user-agent. Spider's `Client`
-/// aliases to `reqwest::Client` under the `reqwest_rustls_tls` feature.
+/// Build a one-shot HTTP client with the given user-agent. TLS comes from the
+/// shared webpki-root config (see crate::http) so this works on Android too.
 fn build_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(user_agent)
         .build()

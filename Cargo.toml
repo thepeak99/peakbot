@@ -32,10 +32,8 @@ serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
-# Already pulled in transitively by ratatui; declare it directly so we can
-# rely on `.width()` / `.width_cjk()` for terminal-cell-accurate sizing
-# in the markdown renderer (emojis, CJK, combining chars). Pinning to
-# the same major as ratatui's transitive use keeps deduping clean.
+# Direct dep (transitive via ratatui) for terminal-cell-accurate `.width()` in
+# the markdown renderer; same major as ratatui's use to keep deduping clean.
 unicode-width = "0.2"
 
 # CLI argument parsing
@@ -46,50 +44,43 @@ futures = "0.3.32"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
 
-# PTY backend for `bash_bg` (long-running background processes).
-# Same crate the (future) interactive tool will use — keep this entry in
-# sync with `terminal-uber-alles.md` when that lands.
+# PTY backend for `bash_bg` long-running background processes.
 portable-pty = "0.9"
 
-# MCP OAuth 2.1 (#19, src/mcp_auth.rs). axum runs a one-shot localhost
-# callback listener; the `Query<T>` extractor URL-decodes automatically
-# (which the Slice 1.5 Linear spike showed matters — Linear `%3A`-encodes
-# the `:` separators in the auth code). Default features off — we only
-# need HTTP/1.1 + tokio runtime.
+# MCP OAuth 2.1 (#19, src/mcp_auth.rs): one-shot localhost callback listener.
+# The `query` extractor URL-decodes auto (Linear `%3A`-encodes the auth code).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 # Cross-platform browser launcher (xdg-open / open / cmd /c start).
 open = "5"
 # Required to impl rmcp's `#[async_trait] CredentialStore`.
 async-trait = "0.1"
 
-# Single-page web fetch + HTML→Markdown for the `fetch_page` tool. We use
-# spider purely for `Page::new_page(url, &reqwest::Client)` (one-shot fetch,
-# NOT the crawler) and `spider_transformations::transform_content` for the
-# markdown conversion. `default-features = false` drops chrome/sqlx/sysinfo;
-# `reqwest_rustls_tls` aliases spider's `Client` to a plain `reqwest::Client`
-# on rustls — the same reqwest 0.13 major peakbot already uses, so it dedupes.
-# spider_transformations keeps its default `serde` feature (its chunking
-# module fails to compile without it).
+# `fetch_page` tool: one-shot fetch via `Page::new_page` + HTML→Markdown. No
+# crawler; `reqwest_rustls_tls` dedupes spider's Client onto our reqwest 0.13.
+# spider_transformations keeps default `serde` (its chunking module needs it).
 spider = { version = "2.51", default-features = false, features = ["reqwest_rustls_tls"] }
 spider_transformations = "2.39"
 
-# Vector DB (doc_index / doc_search tools). `default-features = false` drops
-# ruvector's `api-embeddings` (a duplicate reqwest 0.11) and `simd` (the
-# `simsimd` C lib) — both would break the mingw/zigbuild cross-compiles.
-# We bring our own embeddings client and rely on ruvector's pure-Rust distance
-# fallback. `uuid-support` is intentionally omitted: ids are self-assigned as a
-# stable hash of (source, chunk_index) for idempotent re-index, so the DB never
-# auto-generates uuids. Backends: hnsw_rs (index) + redb (persistence).
+# Vector DB (doc_index / doc_search). `default-features = false` drops
+# `api-embeddings` (dup reqwest 0.11) and `simd` (simsimd C lib) — both break
+# the cross-compiles; we bring our own embeddings + pure-Rust distance. Ids are
+# self-hashed (no `uuid-support`). Backends: hnsw_rs (index) + redb (storage).
 ruvector-core = { version = "=2.2.0", default-features = false, features = ["hnsw", "storage", "parallel"] }
-# PDF text + markdown extraction (MIT/Apache, pure-Rust). default-features=false
-# drops `icc` (qcms, colour-only); `legacy-crypto` keeps R<=4 RC4/MD5 decryption.
-# All C-dep features (lcms2, aws-lc, OCR/ML, pdfium) stay off, so the graph
-# cross-compiles clean to mingw/zig/android like the rest of the tree.
+# PDF text + markdown extraction (pure-Rust). `legacy-crypto` keeps R<=4 RC4/MD5
+# decrypt; all C-dep features (icc/lcms2/aws-lc/OCR/pdfium) stay off so it
+# cross-compiles clean.
 pdf_oxide = { version = "0.3", default-features = false, features = ["legacy-crypto"] }
-# DOCX text extraction (MIT/Apache, pure-Rust; deps = quick-xml + zip + thiserror).
+# DOCX text extraction (pure-Rust; quick-xml + zip + thiserror).
 docx-lite = "0.2"
-# Chunk hashing for idempotent re-index (stable id + content sha256).
+# Chunk hashing for idempotent re-index.
 sha2 = "0.10"
+
+# Android-only TLS: reqwest 0.13's `rustls-platform-verifier` panics at runtime
+# on Android (needs a JVM Context, reqwest#2968), so src/http.rs roots TLS in the
+# bundled Mozilla certs. aws_lc_rs is already linked via reqwest's `rustls`.
+[target.'cfg(target_os = "android")'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 tempfile = "3.27"

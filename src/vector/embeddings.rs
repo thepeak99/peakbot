@@ -64,7 +64,7 @@ impl EmbeddingsClient {
         // Join base_url + "/embeddings", tolerating a trailing slash on base_url.
         let base = config.base_url.trim_end_matches('/');
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             url: format!("{base}/embeddings"),
             api_key: config.api_key.clone(),
             model: config.model.clone(),

@@ -56,6 +56,7 @@ impl SubAgentRegistry {
                     .map_err(|e| SubAgentError::Configuration(e.to_string()))?;
 
                 let client = openrouter::Client::builder()
+                    .http_client(crate::http::client())
                     .api_key(&api_key)
                     .build()
                     .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?;
@@ -90,6 +91,7 @@ impl SubAgentRegistry {
                 let base = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
                 let client = rig_core::providers::openai::Client::builder()
+                    .http_client(crate::http::client())
                     .api_key(&api_key)
                     .base_url(&base)
                     .build()
@@ -122,6 +124,7 @@ impl SubAgentRegistry {
                 let base = base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string());
 
                 let client = rig_core::providers::anthropic::Client::builder()
+                    .http_client(crate::http::client())
                     .api_key(&api_key)
                     .base_url(&base)
                     .build()
@@ -152,6 +155,7 @@ impl SubAgentRegistry {
                 let base = base_url.unwrap_or_else(|| "http://localhost:8080".to_string());
 
                 let client = rig_core::providers::openai::Client::builder()
+                    .http_client(crate::http::client())
                     .api_key(&api_key)
                     .base_url(&base)
                     .build()
@@ -184,6 +188,7 @@ impl SubAgentRegistry {
                 let base = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
 
                 let client = ollama::Client::builder()
+                    .http_client(crate::http::client())
                     .base_url(&base)
                     .api_key(rig_core::client::Nothing)
                     .build()

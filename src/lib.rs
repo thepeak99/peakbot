@@ -7,6 +7,7 @@ mod conversation;
 mod conversation_manager;
 mod conversation_title;
 mod hooks;
+mod http;
 mod mcp_auth;
 mod memory_compaction;
 #[cfg(feature = "mock")]
@@ -2479,12 +2480,12 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
     }
 
     if let Some(headers) = config.headers.as_ref() {
-        let mut parsed: std::collections::HashMap<http::HeaderName, http::HeaderValue> =
+        let mut parsed: std::collections::HashMap<::http::HeaderName, ::http::HeaderValue> =
             std::collections::HashMap::with_capacity(headers.len());
         for (k, v) in headers {
             match (
-                http::HeaderName::try_from(k.as_str()),
-                http::HeaderValue::try_from(v.as_str()),
+                ::http::HeaderName::try_from(k.as_str()),
+                ::http::HeaderValue::try_from(v.as_str()),
             ) {
                 (Ok(name), Ok(value)) => {
                     parsed.insert(name, value);
@@ -2520,9 +2521,12 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?
     } else {
-        ().serve(StreamableHttpClientTransport::from_config(transport_config))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?
+        ().serve(StreamableHttpClientTransport::with_client(
+            crate::http::client(),
+            transport_config,
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?
     };
 
     let server_info = service
