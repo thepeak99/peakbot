@@ -36,7 +36,7 @@ pub enum ParseError {
     Pdf {
         path: String,
         #[source]
-        source: pdfsink_rs::Error,
+        source: pdf_oxide::Error,
     },
     #[error("failed to extract DOCX text from {path}: {source}")]
     Docx {
@@ -73,11 +73,24 @@ pub fn extract_text(path: &Path) -> Result<String, ParseError> {
             Ok(transform_text(&html))
         }
         "pdf" => {
-            let doc = pdfsink_rs::PdfDocument::open(path).map_err(|source| ParseError::Pdf {
+            let doc = pdf_oxide::PdfDocument::open(path).map_err(|source| ParseError::Pdf {
                 path: path_str.clone(),
                 source,
             })?;
-            Ok(doc.extract_text())
+            let pages = doc.page_count().map_err(|source| ParseError::Pdf {
+                path: path_str.clone(),
+                source,
+            })?;
+            let mut text = String::new();
+            for page in 0..pages {
+                let page_text = doc.extract_text(page).map_err(|source| ParseError::Pdf {
+                    path: path_str.clone(),
+                    source,
+                })?;
+                text.push_str(&page_text);
+                text.push('\n');
+            }
+            Ok(text)
         }
         "docx" => docx_lite::extract_text(path).map_err(|source| ParseError::Docx {
             path: path_str,
@@ -141,5 +154,29 @@ mod tests {
     fn unsupported_extension_errors() {
         let err = extract_text(Path::new("/tmp/photo.png")).unwrap_err();
         assert!(matches!(err, ParseError::Unsupported(ext) if ext == "png"));
+    }
+
+    #[test]
+    fn extracts_pdf_text() {
+        // Minimal single-page PDF whose only text is "Hello PDF".
+        const HELLO_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n\
+4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n\
+5 0 obj\n<< /Length 40 >>\nstream\nBT /F1 24 Tf 72 700 Td (Hello PDF) Tj ET\nendstream\nendobj\n\
+xref\n0 6\n\
+0000000000 65535 f \n\
+0000000009 00000 n \n\
+0000000058 00000 n \n\
+0000000115 00000 n \n\
+0000000241 00000 n \n\
+0000000311 00000 n \n\
+trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n401\n%%EOF\n";
+        let mut f = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        f.write_all(HELLO_PDF).unwrap();
+        f.flush().unwrap();
+        let text = extract_text(f.path()).unwrap();
+        assert!(text.contains("Hello PDF"), "got: {text:?}");
     }
 }

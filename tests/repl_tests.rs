@@ -167,8 +167,10 @@ mod tests {
         });
 
         let lines = buffer_to_lines(terminal.backend());
-        // Redact the banner version so a release version bump (which rewrites
-        // CARGO_PKG_VERSION) doesn't break this snapshot in CI.
+        // Redact the banner version so version bumps don't break this snapshot.
+        // The placeholder must stay the same character length as the version it
+        // replaces — otherwise the rendered line width shifts and the snapshot's
+        // trailing-space padding drifts by the same amount.
         insta::with_settings!({
             filters => vec![(r"v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", "vX.Y.Z")],
         }, {

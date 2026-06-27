@@ -244,15 +244,15 @@ All tools live in `src/tools/` and implement `rig::tool::Tool`. Each tool define
 - `definition()` -- returns the JSON Schema the model uses to know what to send
 - `call()` -- executes the tool logic
 
-PeakBot includes **11 always-on built-in tools** (plus 2 opt-in vector
+PeakBot includes **12 always-on built-in tools** (plus 2 opt-in vector
 tools and 1 provider-gated `view_image` tool, see below):
 
 ### Tools Overview
 
-PeakBot includes **11 always-on built-in tools**, plus **2 opt-in vector
+PeakBot includes **12 always-on built-in tools**, plus **2 opt-in vector
 tools** (`doc_index` / `doc_search`) registered only when a `vector_db:`
 block is configured, plus **1 provider-gated tool** (`view_image`)
-registered only on the Anthropic provider — **14 total** when both the
+registered only on the Anthropic provider — **15 total** when both the
 vector store and the Anthropic provider are active:
 
 | Tool | File | Description |
@@ -261,6 +261,7 @@ vector store and the Anthropic provider are active:
 | `file_str_replace` | `file_edit/str_replace.rs` | Replace exact text in an existing file, with whitespace-flexible fallback matching |
 | `file_insert` | `file_edit/insert.rs` | Insert text at a specific line in an existing file |
 | `file_read` | `file_read.rs` | Read files with line ranges |
+| `pdf_read` | `pdf_read.rs` | Extract text or Markdown from a PDF (all pages, or a 1-indexed inclusive `start_page`/`end_page` range; `format` = `text`/`markdown`). Built on `pdf_oxide` (pure-Rust, cross-target-safe). Truncates to 50k chars. |
 | `list_directory` | `list_directory.rs` | List directory contents with recursion |
 | `bash` | `bash.rs` | Execute shell commands with timeout, truncate to last 50k chars, save full output to temp |
 | `bash_bg` | `bash_bg.rs` | Spawn long-running PTY-backed processes (4 verbs: start/stop/list/send_line). The model is notified automatically — a synthetic `[bg output]` user turn lands when a process's output is flushed and on every process exit (including `capture_output_lines: 0`). Never poll. Per-process `cooldown_secs` (default 60) coalesces output; `0` = real-time for external-input bridges (telegram/webhooks) — see `bash-background.md`. |
@@ -722,6 +723,7 @@ src/
     │   ├── str_replace.rs      # FileStrReplaceTool -- replace exact text
     │   └── insert.rs           # FileInsertTool -- insert at line
     ├── file_read.rs        # FileReadTool -- read with line ranges
+    ├── pdf_read.rs         # PdfReadTool -- extract text/markdown from a PDF (pdf_oxide)
     ├── list_directory.rs   # ListDirectoryTool -- dir listing with recursion
     ├── search.rs           # SearchTool -- SearXNG web search
     ├── think.rs            # ThinkTool -- reasoning tool

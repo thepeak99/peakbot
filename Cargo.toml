@@ -81,8 +81,11 @@ spider_transformations = "2.39"
 # stable hash of (source, chunk_index) for idempotent re-index, so the DB never
 # auto-generates uuids. Backends: hnsw_rs (index) + redb (persistence).
 ruvector-core = { version = "=2.2.0", default-features = false, features = ["hnsw", "storage", "parallel"] }
-# PDF text extraction (MIT, pure-Rust; built on lopdf + pdf-extract).
-pdfsink-rs = "0.2.8"
+# PDF text + markdown extraction (MIT/Apache, pure-Rust). default-features=false
+# drops `icc` (qcms, colour-only); `legacy-crypto` keeps R<=4 RC4/MD5 decryption.
+# All C-dep features (lcms2, aws-lc, OCR/ML, pdfium) stay off, so the graph
+# cross-compiles clean to mingw/zig/android like the rest of the tree.
+pdf_oxide = { version = "0.3", default-features = false, features = ["legacy-crypto"] }
 # DOCX text extraction (MIT/Apache, pure-Rust; deps = quick-xml + zip + thiserror).
 docx-lite = "0.2"
 # Chunk hashing for idempotent re-index (stable id + content sha256).
