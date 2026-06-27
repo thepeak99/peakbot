@@ -21,8 +21,8 @@ use crate::mock::MockCompletionModel;
 use crate::state::StateManager;
 use crate::tools::{
     BashBgTool, BashTool, FetchPageTool, FetchUrlTool, FileCreateTool, FileInsertTool,
-    FileReadTool, FileStrReplaceTool, ListDirectoryTool, PowerShellTool, SearchTool, ShellKind,
-    ThinkTool, TodoTool,
+    FileReadTool, FileStrReplaceTool, ListDirectoryTool, PdfReadTool, PowerShellTool, SearchTool,
+    ShellKind, ThinkTool, TodoTool,
 };
 use anyhow::{Context, Result};
 use rig_core::agent::{Agent, AgentBuilder};
@@ -468,6 +468,7 @@ where
         gate(Box::new(FileStrReplaceTool)),
         gate(Box::new(FileInsertTool)),
         gate(Box::new(FileReadTool)),
+        gate(Box::new(PdfReadTool)),
         gate(Box::new(bash_bg_tool)),
         gate(Box::new(ListDirectoryTool)),
         gate(Box::new(FetchUrlTool)),
