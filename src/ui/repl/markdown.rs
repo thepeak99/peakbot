@@ -103,6 +103,18 @@ fn list_marker_style() -> Style {
     Style::default().fg(Color::Cyan)
 }
 
+fn link_url_style() -> Style {
+    Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
+}
+
+/// Schemes terminals reliably auto-linkify into a clickable URL. Others
+/// (relative paths, `#frag`, `file://`) are skipped in Phase 1 to avoid
+/// noise.
+fn is_clickable_scheme(url: &str) -> bool {
+    let u = url.to_ascii_lowercase();
+    u.starts_with("http://") || u.starts_with("https://") || u.starts_with("mailto:")
+}
+
 // ─── Agent prefix line ────────────────────────────────────────────────
 
 /// Build the timestamp + role prefix as a standalone `Line`. Matches the
@@ -169,6 +181,13 @@ struct ListContext {
     next_number: Option<u64>,
 }
 
+/// One open markdown link: its destination plus the visible text seen so
+/// far, so we can suppress a redundant `(url)` suffix when text == url.
+struct LinkFrame {
+    url: String,
+    text: String,
+}
+
 const LIST_INDENT_STEP: usize = 2;
 
 struct MarkdownState {
@@ -184,6 +203,10 @@ struct MarkdownState {
     /// Active list nesting (outermost at index 0). Empty when not inside
     /// any list. Pushed on `Start(List)`, popped on `End(List)`.
     list_stack: Vec<ListContext>,
+    /// Active hyperlink frames, pushed on `Start(Link)` / popped on
+    /// `End(Link)`. Lets us append the bare URL after the anchor text so
+    /// terminals auto-linkify it. See the OSC8 plan (Phase 1).
+    link_stack: Vec<LinkFrame>,
 }
 
 impl MarkdownState {
@@ -195,6 +218,7 @@ impl MarkdownState {
             style_stack: Vec::new(),
             mode: Mode::Body,
             list_stack: Vec::new(),
+            link_stack: Vec::new(),
         }
     }
 
@@ -240,6 +264,17 @@ impl MarkdownState {
         self.push_span(text.to_string(), style);
     }
 
+    /// Append the bare URL after a closed anchor when it adds info (differs
+    /// from the visible text) and is a clickable scheme. Skipped for
+    /// autolinks (text == url) and non-web schemes so we don't add noise.
+    fn emit_link_url_suffix(&mut self, frame: &LinkFrame) {
+        let url = frame.url.trim();
+        if url.is_empty() || url == frame.text.trim() || !is_clickable_scheme(url) {
+            return;
+        }
+        self.push_span(format!(" ({url})"), link_url_style());
+    }
+
     /// Force a paragraph break: end the current line if non-empty, then
     /// emit a blank separator line.
     fn paragraph_break(&mut self) {
@@ -283,7 +318,12 @@ impl MarkdownState {
         match ev {
             Event::Start(tag) => self.handle_start(tag),
             Event::End(tag) => self.handle_end(tag),
-            Event::Text(t) => self.push_text(&t),
+            Event::Text(t) => {
+                if let Some(frame) = self.link_stack.last_mut() {
+                    frame.text.push_str(&t);
+                }
+                self.push_text(&t);
+            }
             Event::Code(t) => {
                 let style = inline_code_style();
                 // Wrap inline code with thin spaces so it's visually
@@ -353,9 +393,14 @@ impl MarkdownState {
                     current_cell: String::new(),
                 };
             }
-            Tag::Link { .. } => self
-                .style_stack
-                .push(Style::default().add_modifier(Modifier::UNDERLINED)),
+            Tag::Link { dest_url, .. } => {
+                self.style_stack
+                    .push(Style::default().add_modifier(Modifier::UNDERLINED));
+                self.link_stack.push(LinkFrame {
+                    url: dest_url.to_string(),
+                    text: String::new(),
+                });
+            }
             Tag::List(start) => {
                 // Closing any in-progress paragraph line BEFORE pushing
                 // the list frame keeps `Start(Item)` from glueing its
@@ -422,8 +467,14 @@ impl MarkdownState {
                 // Blank line after headings for visual breathing room.
                 self.lines.push(Line::from(""));
             }
-            TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
+            TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough => {
                 self.style_stack.pop();
+            }
+            TagEnd::Link => {
+                self.style_stack.pop();
+                if let Some(frame) = self.link_stack.pop() {
+                    self.emit_link_url_suffix(&frame);
+                }
             }
             TagEnd::Item | TagEnd::List(_) if !self.current_spans.is_empty() => {
                 self.finish_line();
@@ -979,6 +1030,55 @@ mod tests {
                 && s.style.add_modifier.contains(Modifier::ITALIC)
         });
         assert!(has_both, "***both*** must yield BOLD+ITALIC");
+    }
+
+    // ─── Links ────────────────────────────────────────────────────────
+
+    #[test]
+    fn link_appends_url_after_anchor_text() {
+        let t = render_to_text("[docs](https://ratatui.rs)", 80);
+        assert!(t.contains("docs"), "anchor text must render: {t}");
+        assert!(
+            t.contains("(https://ratatui.rs)"),
+            "bare URL must follow anchor text: {t}"
+        );
+    }
+
+    #[test]
+    fn link_anchor_text_is_underlined() {
+        let lines = render("[docs](https://ratatui.rs)", 80);
+        let body = lines.iter().skip(1).flat_map(|l| l.spans.iter());
+        let underlined = body.into_iter().any(|s| {
+            s.content.as_ref().contains("docs")
+                && s.style.add_modifier.contains(Modifier::UNDERLINED)
+        });
+        assert!(underlined, "anchor text must keep UNDERLINED");
+    }
+
+    #[test]
+    fn autolink_does_not_duplicate_url() {
+        let t = render_to_text("<https://example.com>", 80);
+        assert_eq!(
+            t.matches("https://example.com").count(),
+            1,
+            "autolink (text == url) must not append a redundant suffix: {t}"
+        );
+    }
+
+    #[test]
+    fn mailto_link_appends_url() {
+        let t = render_to_text("[me](mailto:me@example.com)", 80);
+        assert!(t.contains("(mailto:me@example.com)"), "mailto suffix: {t}");
+    }
+
+    #[test]
+    fn non_web_scheme_link_has_no_url_suffix() {
+        let t = render_to_text("[here](./local.md)", 80);
+        assert!(t.contains("here"), "anchor text must render: {t}");
+        assert!(
+            !t.contains("(./local.md)"),
+            "relative path must not be appended in Phase 1: {t}"
+        );
     }
 
     // ─── Inline code ──────────────────────────────────────────────────
