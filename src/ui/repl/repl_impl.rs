@@ -190,6 +190,26 @@ impl UiState {
         self.content_height.saturating_sub(self.viewport_height)
     }
 
+    /// Resolve the line offset to render this frame AND persist it back
+    /// into `scroll_position`.
+    ///
+    /// When pinned to the bottom (`auto_scroll`), the offset is
+    /// `max_scroll`; otherwise it's the stored position clamped to range.
+    /// Writing it back keeps `scroll_position` truthful so the scroll
+    /// handlers always start from where the viewport actually is — without
+    /// this, the first scroll-up off the bottom computed from a stale
+    /// `scroll_position` and teleported the view (issue #31).
+    pub fn effective_scroll(&mut self) -> u16 {
+        let max_scroll = self.max_scroll();
+        let scroll = if self.auto_scroll {
+            max_scroll
+        } else {
+            self.scroll_position.min(max_scroll)
+        };
+        self.scroll_position = scroll;
+        scroll
+    }
+
     // ─── Input editor: single-char edits ──────────────────────────────────
 
     /// Insert a character at the cursor and advance the cursor by one char.
@@ -1109,15 +1129,10 @@ impl ReplUi {
                     self.ui_state.content_height =
                         self.chat_cache.total_height().min(u16::MAX as u32) as u16;
 
-                    // Calculate scroll based on auto_scroll setting
-                    let max_scroll = self.ui_state.max_scroll();
-                    let scroll = if self.ui_state.auto_scroll {
-                        // Scroll to bottom
-                        max_scroll
-                    } else {
-                        // Use stored position (clamped to valid range)
-                        self.ui_state.scroll_position.min(max_scroll)
-                    };
+                    // Calculate scroll based on auto_scroll setting, and
+                    // persist it so the scroll handlers start from the real
+                    // viewport position (issue #31).
+                    let scroll = self.ui_state.effective_scroll();
 
                     // Build the viewport-sized paragraph from the cache.
                     // Work here is O(viewport), independent of history size.
@@ -2620,6 +2635,45 @@ mod chat_scroll_tests {
             s.content_height,
             "max_scroll must bottom-align the final line exactly"
         );
+    }
+
+    #[test]
+    fn effective_scroll_syncs_position_to_bottom_while_auto_scrolling() {
+        // The issue #31 bug: while pinned to the bottom, `scroll_position`
+        // stayed stale (initial 0), so the first scroll-up off the bottom
+        // teleported the view to the top. `effective_scroll` must write the
+        // computed bottom offset back so the next handler starts from there.
+        let mut s = UiState::new();
+        s.content_height = 100;
+        s.viewport_height = 30;
+        s.auto_scroll = true;
+        s.scroll_position = 0; // stale
+
+        let scroll = s.effective_scroll();
+
+        assert_eq!(scroll, s.max_scroll(), "auto_scroll renders at the bottom");
+        assert_eq!(
+            s.scroll_position,
+            s.max_scroll(),
+            "scroll_position must be synced to the bottom, not left stale"
+        );
+    }
+
+    #[test]
+    fn effective_scroll_clamps_and_syncs_when_not_auto_scrolling() {
+        // When the user has scrolled up, a stored position past the new
+        // max_scroll (content shrank) must be clamped — and the clamp must
+        // persist, not just be used for this one frame.
+        let mut s = UiState::new();
+        s.content_height = 40;
+        s.viewport_height = 30; // max_scroll == 10
+        s.auto_scroll = false;
+        s.scroll_position = 999; // beyond range
+
+        let scroll = s.effective_scroll();
+
+        assert_eq!(scroll, 10, "stored position clamped to max_scroll");
+        assert_eq!(s.scroll_position, 10, "clamp persisted back to state");
     }
 }
 
