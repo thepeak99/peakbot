@@ -58,7 +58,7 @@ export function App() {
         isRunning={isRunning}
         connected={connected}
         models={models}
-        activeAlias={activeAlias}
+        activeAlias={stats?.modelAlias || activeAlias}
         hasTranscript={hasTranscript}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
       />
