@@ -669,6 +669,26 @@ impl StateManager {
         self.revision.fetch_add(1, Ordering::Release);
     }
 
+    /// Refresh the welcome banner's model-scoped fields after a `/model`
+    /// switch or `/load` rebuild. Only provider/model/max_tokens change
+    /// across a model swap — everything else (tool counts, skills, cwd)
+    /// is session-wide. Broadcasts so live Views (web banner) re-render;
+    /// no-op if the welcome banner was never set.
+    pub fn update_welcome_for_model(
+        &self,
+        provider_name: String,
+        model: String,
+        max_tokens: usize,
+    ) {
+        let mut state = self.state.write().unwrap();
+        if let Some(w) = state.welcome.as_mut() {
+            w.provider_name = provider_name;
+            w.model = model;
+            w.max_tokens = max_tokens;
+            self.notify_update(&state);
+        }
+    }
+
     /// Mark the next broadcast as final (called before final agent response)
     pub fn set_final_broadcast(&self, final_flag: bool) {
         let mut state = self.state.write().unwrap();
@@ -2164,6 +2184,49 @@ mod tests {
         let state = sm.get_state();
         assert!(state.chat.messages.is_empty());
         assert!(state.todo.items.is_empty());
+    }
+
+    #[test]
+    fn test_update_welcome_for_model_patches_model_fields() {
+        let sm = StateManager::new();
+        sm.set_welcome(WelcomeState {
+            provider_name: "openrouter".to_string(),
+            model: "anthropic/claude-3.7-sonnet".to_string(),
+            max_tokens: 8192,
+            builtin_tools_count: 11,
+            mcp_tools_count: 2,
+            skills_count: 5,
+            searxng_enabled: true,
+            searxng_url: None,
+            cost_tracking_enabled: true,
+            compaction_enabled: true,
+            compaction_threshold: 0.8,
+            compaction_keep_recent: 5,
+            conversation_persistence_enabled: true,
+            cwd: std::path::PathBuf::from("/tmp"),
+        });
+
+        sm.update_welcome_for_model(
+            "openrouter".to_string(),
+            "anthropic/claude-opus-4".to_string(),
+            16384,
+        );
+
+        let w = sm.get_state().welcome.expect("welcome set");
+        // Model-scoped fields reflect the switch.
+        assert_eq!(w.model, "anthropic/claude-opus-4");
+        assert_eq!(w.max_tokens, 16384);
+        // Session-wide fields are preserved.
+        assert_eq!(w.skills_count, 5);
+        assert_eq!(w.mcp_tools_count, 2);
+    }
+
+    #[test]
+    fn test_update_welcome_for_model_noop_when_unset() {
+        let sm = StateManager::new();
+        // No welcome set yet — must not panic and must stay None.
+        sm.update_welcome_for_model("p".to_string(), "m".to_string(), 1);
+        assert!(sm.get_state().welcome.is_none());
     }
 
     #[test]

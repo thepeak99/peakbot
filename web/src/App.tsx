@@ -12,6 +12,7 @@ import { BgPanel } from "./components/BgPanel";
 import { BashPanel } from "./components/BashPanel";
 import { Composer } from "./components/Composer";
 import { TopBar } from "./components/TopBar";
+import { ConversationsPicker } from "./components/ConversationsPicker";
 import { useAgent } from "./useAgent";
 import {
   adaptBashPanel,
@@ -24,7 +25,16 @@ import {
 } from "./adapt";
 
 export function App() {
-  const { connected, state, error, send } = useAgent();
+  const {
+    connected,
+    state,
+    models,
+    activeAlias,
+    conversations,
+    commands,
+    error,
+    send,
+  } = useAgent();
 
   // Keep the transcript pinned to the newest message.
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -34,6 +44,7 @@ export function App() {
   }, [messageCount, state?.is_running]);
 
   const isRunning = state?.is_running ?? false;
+  const hasTranscript = messageCount > 0;
   const stats = state ? adaptStats(state) : null;
   const welcome = state ? adaptWelcome(state) : null;
   const bash = state ? adaptBashPanel(state.bash_panel) : null;
@@ -42,7 +53,15 @@ export function App() {
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-zinc-950 text-zinc-100">
-      <TopBar stats={stats} isRunning={isRunning} connected={connected} />
+      <TopBar
+        stats={stats}
+        isRunning={isRunning}
+        connected={connected}
+        models={models}
+        activeAlias={stats?.modelAlias || activeAlias}
+        hasTranscript={hasTranscript}
+        onSwitchModel={(alias) => send({ type: "switch_model", alias })}
+      />
 
       {error && (
         <div className="bg-red-950/70 px-4 py-1.5 text-center text-xs text-red-300">
@@ -66,12 +85,19 @@ export function App() {
           <Composer
             isRunning={isRunning}
             connected={connected}
+            commands={commands}
             onSend={(text) => send({ type: "send_message", text })}
             onStop={() => send({ type: "stop" })}
           />
         </main>
 
         <aside className="hidden w-72 shrink-0 flex-col gap-5 overflow-y-auto border-l border-zinc-800 bg-zinc-950/60 p-4 lg:flex">
+          <ConversationsPicker
+            conversations={conversations}
+            hasTranscript={hasTranscript}
+            onOpen={() => send({ type: "request_conversations" })}
+            onLoad={(id) => send({ type: "send_message", text: `/load ${id}` })}
+          />
           {stats && state && (
             <StatsPanel stats={stats} context={adaptContext(state)} />
           )}

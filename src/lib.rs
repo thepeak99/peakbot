@@ -1318,6 +1318,15 @@ impl AgentRunner {
         // (mcp_servers, searxng, context, retry, …) stays put.
         config.provider = resolved.provider_config.clone();
 
+        // Keep the welcome banner's model-scoped fields in sync so live
+        // Views (web banner) show the model just switched to, not the
+        // boot model. TUI's banner is a static string — unaffected.
+        sm_for_provider.update_welcome_for_model(
+            resolved.provider_name.clone(),
+            resolved.model_name.clone(),
+            config.max_tokens() as usize,
+        );
+
         // Re-init the context manager with the pre-validated compaction
         // model so compaction thresholds match the new context window.
         let cm = ContextManager::new(

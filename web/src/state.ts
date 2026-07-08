@@ -142,6 +142,14 @@ export interface ConversationSummary {
   model: string;
 }
 
+// Served by `GET /commands` (src/ui/ui_trait.rs::SlashCommand). The single
+// source of truth for the composer's slash palette; fetched once on load.
+export interface SlashCommand {
+  name: string;
+  description: string;
+  takes_args: boolean;
+}
+
 export type OutboundMessage =
   | { type: "ready" }
   | { type: "models_available"; active: string; models: ModelInfo[] }
