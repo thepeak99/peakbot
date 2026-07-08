@@ -1,4 +1,5 @@
 .PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
+        web \
         release release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android release-publish
 
@@ -89,6 +90,14 @@ $(OUTPUT_DIR)/$(ANDROID_BIN): Dockerfile.android
 	@chmod +x $(OUTPUT_DIR)/$(ANDROID_BIN)
 	@echo "✅ Built: $(OUTPUT_DIR)/$(ANDROID_BIN)"
 	@ls -lh $(OUTPUT_DIR)/$(ANDROID_BIN)
+
+## web: Build the web UI (web/dist/) — required for `peakbot --web` to serve the real SPA.
+##        CI and Docker builds run the Node stage automatically; this is for local dev.
+web:
+	@command -v node >/dev/null 2>&1 || { echo "❌ node not found — install Node.js 22+"; exit 1; }
+	@command -v npm >/dev/null 2>&1 || { echo "❌ npm not found — install Node.js 22+"; exit 1; }
+	cd web && npm install && npm run build
+	@touch web/dist/.gitkeep   # Vite's emptyOutDir wipes it each build; keep the tracked placeholder
 
 ## clean: Remove output artifacts
 clean:

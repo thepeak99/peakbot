@@ -21,6 +21,13 @@ struct Cli {
     /// go to stderr.
     #[arg(long)]
     stdio: bool,
+
+    /// Run the web UI in a browser instead of the terminal UI. Phase 0
+    /// ships the static shell (SPA + asset pipeline); Phase 1 adds live
+    /// chat over WebSocket. The address is fixed (loopback only) for now;
+    /// `--port` / `--bind` flags are Phase 4.
+    #[arg(long)]
+    web: bool,
 }
 
 /// Check if the provider has an API key configured.
@@ -333,14 +340,14 @@ async fn main() -> Result<()> {
         cwd: std::env::current_dir().unwrap_or_default(),
     });
 
-    use peakbot::ui::{ReplUi, StdioUi, build_models_snapshot};
+    use peakbot::ui::{ReplUi, StdioUi, WebUi, build_models_snapshot};
 
     let runner_handle = tokio::spawn(async move {
         runner.run_loop(action_receiver).await;
     });
 
-    // Both Views share the Model/Controller seam; `--stdio` only swaps the
-    // View for the NDJSON frontend.
+    // Three Views share the Model/Controller seam: `--stdio` is the NDJSON
+    // frontend, `--web` is the browser SPA, default is the REPL.
     if cli.stdio {
         let mut ui = StdioUi::new(
             state_manager.clone(),
@@ -348,6 +355,18 @@ async fn main() -> Result<()> {
             build_models_snapshot(&model_registry),
             boot_alias.clone(),
         );
+        ui.init().await?;
+        ui.run().await?;
+        ui.shutdown().await?;
+    } else if cli.web {
+        // Web UI owns the lifecycle of the whole process: the agent loop
+        // runs in the background, the HTTP server runs in the foreground
+        // until Ctrl+C, then we tear down. Phase 0 serves only the static
+        // bundle; Phase 1 moves agent control onto WebSocket connections.
+        let addr: std::net::SocketAddr = peakbot::ui::DEFAULT_WEB_ADDR
+            .parse()
+            .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal");
+        let mut ui = WebUi::new(addr);
         ui.init().await?;
         ui.run().await?;
         ui.shutdown().await?;

@@ -22,6 +22,9 @@ pub mod repl;
 // NDJSON stdio UI (`peakbot --stdio`)
 pub mod stdio;
 
+// Web UI (`peakbot --web`) — Phase 0: static shell only. See module docs.
+pub mod web;
+
 // Re-export commonly used types
 pub use app_state::*;
 pub use ui_trait::*;
@@ -29,3 +32,4 @@ pub use ui_trait::*;
 // Re-export UI implementations
 pub use repl::*;
 pub use stdio::{StdioUi, build_models_snapshot};
+pub use web::{DEFAULT_WEB_ADDR, WebUi};

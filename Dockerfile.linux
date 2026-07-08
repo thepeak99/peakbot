@@ -16,6 +16,18 @@ ENV TARGET=${TARGET}
 RUN rustup target add ${TARGET} \
     && rustup target list --installed
 
+# ── Web UI build (Node) ────────────────────────────────────────────────
+# Produces /web/dist with the SPA bundle. The Rust build copies this
+# into the crate root so `rust-embed` inlines it. `release` builds
+# embed the bytes; `cargo run` (debug) reads from disk — same artefact,
+# either path works.
+FROM node:22 AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 # Copy manifests first for better layer caching
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
@@ -28,7 +40,11 @@ RUN mkdir -p src && \
 RUN cargo build --target ${TARGET} --release && \
     rm -rf target/${TARGET}/deps/*.rlib target/${TARGET}/deps/*.d
 
-# Copy actual source
+# Copy actual source. build.rs MUST be in the COPY set — the dummy-main
+# dep-cache layer doesn't run it, and a new build.rs would otherwise
+# silently never execute. `web/dist` is the Node-built SPA bundle.
+COPY build.rs ./
+COPY --from=web /web/dist ./web/dist
 COPY src/ src/
 
 # Build the actual binary (touch main.rs so cargo rebuilds the bin crate; deps stay cached)

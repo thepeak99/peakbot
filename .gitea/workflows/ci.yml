@@ -30,6 +30,22 @@ jobs:
           git checkout --detach FETCH_HEAD
       - name: Install rustfmt + clippy
         run: rustup component add rustfmt clippy
+      # Frontend gate first so `web/dist/` is populated before the Rust
+      # build inlines it via rust-embed. webui.md §4.3: CI must run a
+      # real Node frontend gate; the build.rs stub is only a node-free
+      # convenience for backend-only contributors and never ships here.
+      - name: Install Node.js 22
+        run: |
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs
+      - name: Frontend gate
+        run: |
+          cd web
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm test --if-present
+          npm run build
       - name: Rust checks
         run: |
           cargo fmt --all -- --check
