@@ -1,1 +1,81 @@
 @import "tailwindcss";
+/* Syntax highlighting for fenced code in the markdown transcript
+   (rehype-highlight emits highlight.js class names). */
+@import "highlight.js/styles/github-dark.css";
+
+/* Minimal spacing/typography for rendered markdown (react-markdown output).
+   Tailwind's preflight resets element styles, so restore the essentials the
+   transcript needs without pulling in the full @tailwindcss/typography plugin. */
+.markdown-body > *:first-child {
+  margin-top: 0;
+}
+.markdown-body > *:last-child {
+  margin-bottom: 0;
+}
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body pre,
+.markdown-body blockquote,
+.markdown-body table {
+  margin: 0.5rem 0;
+}
+.markdown-body ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+}
+.markdown-body ol {
+  list-style: decimal;
+  padding-left: 1.25rem;
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  margin: 0.75rem 0 0.35rem;
+  font-weight: 600;
+  line-height: 1.25;
+}
+.markdown-body h1 {
+  font-size: 1.15rem;
+}
+.markdown-body h2 {
+  font-size: 1.05rem;
+}
+.markdown-body h3 {
+  font-size: 1rem;
+}
+.markdown-body a {
+  color: #38bdf8;
+  text-decoration: underline;
+}
+.markdown-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: rgb(39 39 42 / 0.7);
+  padding: 0.1em 0.35em;
+  border-radius: 0.25rem;
+}
+.markdown-body pre {
+  background: rgb(24 24 27 / 0.9);
+  padding: 0.75rem 0.9rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+}
+.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.82rem;
+}
+.markdown-body blockquote {
+  border-left: 3px solid rgb(63 63 70);
+  padding-left: 0.75rem;
+  color: rgb(161 161 170);
+}
+.markdown-body table {
+  border-collapse: collapse;
+}
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid rgb(63 63 70);
+  padding: 0.3rem 0.5rem;
+}

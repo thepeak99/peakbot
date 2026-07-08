@@ -1,4 +1,7 @@
-import type { ChatMessage, MessageRole } from "../mock";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import type { ChatMessage, MessageRole } from "../types";
 
 // Per-role visual treatment. Mirrors the TUI's role glyphs/colours so the
 // web transcript reads the same way (src/ui/app_state.rs MessageRole +
@@ -49,6 +52,13 @@ function isMonospace(role: MessageRole): boolean {
   return role === "toolCall" || role === "toolResult";
 }
 
+// Agent replies, compaction summaries, and tool results are markdown text;
+// user input and system/toolCall lines stay literal so they can't inject
+// markup (react-markdown renders no raw HTML by default — kept that way).
+function isMarkdown(role: MessageRole): boolean {
+  return role === "agent" || role === "summary" || role === "toolResult";
+}
+
 export function Message({ message }: { message: ChatMessage }) {
   const meta = ROLE_META[message.role];
   return (
@@ -68,13 +78,21 @@ export function Message({ message }: { message: ChatMessage }) {
         )}
         <span className="ml-auto tabular-nums text-zinc-600">{message.timestamp}</span>
       </div>
-      <div
-        className={`whitespace-pre-wrap break-words text-sm leading-relaxed text-zinc-200 ${
-          isMonospace(message.role) ? "font-mono text-[13px] text-zinc-300" : ""
-        }`}
-      >
-        {message.content}
-      </div>
+      {isMarkdown(message.role) ? (
+        <div className="markdown-body text-sm leading-relaxed text-zinc-200">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+            {message.content}
+          </ReactMarkdown>
+        </div>
+      ) : (
+        <div
+          className={`whitespace-pre-wrap break-words text-sm leading-relaxed text-zinc-200 ${
+            isMonospace(message.role) ? "font-mono text-[13px] text-zinc-300" : ""
+          }`}
+        >
+          {message.content}
+        </div>
+      )}
     </div>
   );
 }

@@ -3,12 +3,10 @@
 use anyhow::Result;
 use clap::Parser;
 use peakbot::{
-    AgentRunner, Config, FileStorage, ShellKind, SubAgentRegistry, TodoTool, Ui, UiAction,
-    build_system_prompt, create_provider, get_config_file_path, load_default_skills,
-    load_mcp_servers, print_no_shell_warning,
+    Config, FileStorage, ShellKind, SubAgentRegistry, Ui, build_system_prompt,
+    get_config_file_path, load_default_skills, load_mcp_servers, print_no_shell_warning,
 };
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -136,40 +134,25 @@ async fn main() -> Result<()> {
     // Load MCP servers
     let mcp_handles = load_mcp_servers(&config).await?;
     let mcp_tools_count = mcp_handles.len(); // Keep count before moving handles
-    // Wrap the handles in an Arc so the AgentRunner's RebuildContext
-    // can re-derive the tools list across `/model` switches without
-    // restarting the underlying subprocesses. McpTool: Clone (rig 0.33)
-    // makes the per-build tool list cheap.
+    // Wrap the handles in an Arc so each session can re-derive its tools
+    // list without restarting the underlying subprocesses. McpTool: Clone
+    // (rig 0.33) makes the per-session tool list cheap. See session.rs.
     let mcp_handles_arc = Arc::new(mcp_handles);
-    let mcp_tools = if mcp_handles_arc.is_empty() {
-        None
-    } else {
-        let mut all_tools = Vec::new();
-        for handle in mcp_handles_arc.iter() {
-            use rig_core::tool::ToolDyn;
-            let tools: Vec<Box<dyn ToolDyn>> = handle
-                .tools()
-                .iter()
-                .cloned()
-                .map(|t| Box::new(t) as Box<dyn ToolDyn>)
-                .collect();
-            all_tools.extend(tools);
-        }
-        Some(all_tools)
-    };
 
     let searxng_config = config
         .searxng_enabled()
         .then_some(config.searxng.clone())
         .flatten();
 
-    // Create conversation storage if enabled
-    let state_manager = if config.conversation_enabled() {
+    // Create shared conversation storage if enabled. One storage instance
+    // is shared by every session — it writes distinct files per
+    // conversation id (see session::SessionDeps).
+    let storage: Option<Arc<dyn peakbot::ConversationStorage>> = if config.conversation_enabled() {
         let storage_dir = config.conversation_storage_dir();
         match FileStorage::new(storage_dir.clone()) {
             Ok(storage) => {
                 tracing::info!("Conversation storage enabled at: {:?}", storage_dir);
-                peakbot::StateManager::new_arc_with_storage(Arc::new(storage))
+                Some(Arc::new(storage))
             }
             Err(e) => {
                 tracing::warn!(
@@ -178,20 +161,17 @@ async fn main() -> Result<()> {
                     storage_dir,
                     e
                 );
-                peakbot::StateManager::new_arc()
+                None
             }
         }
     } else {
-        peakbot::StateManager::new_arc()
+        None
     };
 
-    let todo_tool = TodoTool::new(state_manager.clone());
-
-    // Pipeline
+    // Pipeline. Shared across sessions via Arc.
     let pipeline_registry = if config.pipeline_enabled() {
         let pipeline_config = config.pipeline().unwrap();
-
-        Some(SubAgentRegistry::new(pipeline_config))
+        Some(Arc::new(SubAgentRegistry::new(pipeline_config)))
     } else {
         None
     };
@@ -211,10 +191,9 @@ async fn main() -> Result<()> {
     // with a misleading "OpenRouter API key not configured" error.
     let boot_provider_config = config.resolve_and_mirror_boot_provider(&model_registry);
 
-    // Apply the detected shell (detection ran earlier so the system prompt
-    // could reference it). On Windows with no shell, warn the user.
+    // Log the detected shell here; each session applies it to its own
+    // StateManager via the factory. On Windows with no shell, warn once.
     if let Some(ref sk) = shell_kind {
-        state_manager.set_shell(sk.executable().to_string());
         tracing::info!("Detected shell: {} ({})", sk.name(), sk.executable());
     } else {
         print_no_shell_warning();
@@ -243,111 +222,59 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    let (agent, provider_info, event_receiver, session_hook) = create_provider(
-        &boot_provider_config,
-        mcp_tools,
-        &system_prompt,
-        searxng_config.as_ref(),
-        config.agent_max_turns,
-        Some(todo_tool.clone()),
-        &config.bash,
-        pipeline_registry.as_ref(),
-        state_manager.clone(),
-        shell_kind.as_ref(),
-        vector_store.as_ref(),
-    )?;
-
-    tracing::info!(
-        "Using provider: {} with model: {}",
-        provider_info.name,
-        provider_info.model
-    );
-
-    // StateManager is already created above and shared with TodoTool.
-    // Stamp the wire identity `(provider_name, model)` and the alias
-    // (the active entry from the registry) so `/model` / `/load` /
-    // status bar all see consistent values from boot. The wire id is
-    // what gets persisted on conversations; the alias is display-only.
-    state_manager.set_model(provider_info.model.clone());
-    let (boot_provider_name, boot_alias) = match model_registry.default_alias() {
-        Some(a) => match model_registry.resolve(a) {
-            Some(rm) => (rm.provider_name.clone(), rm.alias.clone()),
-            None => (String::new(), a.to_string()),
-        },
-        None => (String::new(), "default".to_string()),
-    };
-    state_manager.set_provider_name(boot_provider_name);
-    state_manager.set_model_alias(boot_alias.clone());
-
-    // Channel: View → Controller
-    let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
-
-    // Build the rebuild context so /model can rebuild between turns
-    // without restarting the process. MCP handles, system prompt,
-    // builtins config, and the registry are all kept alive here.
-    let rebuild_ctx = peakbot::RebuildContext {
-        registry: model_registry.clone(),
+    // Build the shared, immutable session deps once. Each session (the
+    // single TUI/stdio session, or one per web-socket connection) is built
+    // from these via `create_session`. `Arc` so the web UI can hand a clone
+    // to every connection handler. See `src/session.rs`.
+    let session_deps = Arc::new(peakbot::SessionDeps {
+        config: config.clone(),
+        model_registry: model_registry.clone(),
         system_prompt: system_prompt.clone(),
-        mcp_handles: mcp_handles_arc.clone(),
-        searxng_config: config.searxng.clone(),
-        max_turns: config.agent_max_turns,
-        todo_tool: Some(todo_tool),
-        bash_config: config.bash.clone(),
-        pipeline_registry: pipeline_registry.clone().map(Arc::new),
-        shell_kind,
-        vector_store,
-    };
-
-    // Resolve the boot model's context_size (from config or auto-detected).
-    // This value drives ContextManager compaction thresholds.
-    let boot_context_size = model_registry
-        .default_alias()
-        .and_then(|a| model_registry.resolve(a))
-        .map(|rm| rm.context_size)
-        .unwrap_or_else(|| {
-            tracing::warn!("No default model in registry, using auto-detect for context_size");
-            peakbot::auto_detect_context_size(provider_info.model.as_str())
-        });
-
-    // Create AgentRunner (Controller)
-    let mut runner = AgentRunner::new(
-        agent,
-        config.clone(),
-        provider_info.clone(),
         skills,
-        event_receiver,
-        Some(state_manager.clone()),
-        session_hook,
-        boot_context_size,
-    )?
-    .with_rebuild_context(rebuild_ctx);
-
-    // Set up welcome banner state
-    state_manager.set_welcome(peakbot::ui::app_state::WelcomeState {
-        provider_name: provider_info.name.clone(),
-        model: provider_info.model.clone(),
-        max_tokens: config.max_tokens() as usize,
-        builtin_tools_count: 11, // file_create, file_str_replace, file_insert, file_read, bash, list_directory, fetch_url, fetch_page, think, todo, search
+        mcp_handles: mcp_handles_arc.clone(),
+        searxng_config,
+        pipeline_registry,
+        vector_store,
+        shell_kind,
+        boot_provider_config,
+        storage,
         mcp_tools_count,
         skills_count,
-        searxng_enabled: config.searxng_enabled(),
-        searxng_url: config.searxng.as_ref().map(|s| s.base_url.clone()),
-        cost_tracking_enabled: config.supports_pricing() && config.cost_tracking,
-        compaction_enabled: config.context.enabled,
-        compaction_threshold: config.context.threshold,
-        compaction_keep_recent: config.context.keep_recent,
-        conversation_persistence_enabled: config.conversation_enabled(),
-        cwd: std::env::current_dir().unwrap_or_default(),
     });
 
     use peakbot::ui::{ReplUi, StdioUi, WebUi, build_models_snapshot};
 
-    let runner_handle = tokio::spawn(async move {
-        runner.run_loop(action_receiver).await;
-    });
+    // The web UI builds one session per WebSocket connection, so it takes
+    // the deps and never boots a single shared session. The TUI and stdio
+    // Views are single-session: build one, drive it, drop it (teardown).
+    if cli.web {
+        let addr: std::net::SocketAddr = peakbot::ui::DEFAULT_WEB_ADDR
+            .parse()
+            .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal");
+        let active_alias = model_registry
+            .default_alias()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let mut ui = WebUi::new(
+            addr,
+            session_deps.clone(),
+            build_models_snapshot(&model_registry),
+            active_alias,
+        );
+        ui.init().await?;
+        ui.run().await?;
+        ui.shutdown().await?;
+        return Ok(());
+    }
 
-    // Three Views share the Model/Controller seam: `--stdio` is the NDJSON
-    // frontend, `--web` is the browser SPA, default is the REPL.
+    // Single session for the TUI / stdio Views.
+    let session = peakbot::create_session(&session_deps)?;
+    let state_manager = session.state_manager.clone();
+    let action_sender = session.action_sender.clone();
+    let boot_alias = session.model_alias.clone();
+
+    // Two single-session Views share the Model/Controller seam: `--stdio`
+    // is the NDJSON frontend, default is the REPL.
     if cli.stdio {
         let mut ui = StdioUi::new(
             state_manager.clone(),
@@ -355,18 +282,6 @@ async fn main() -> Result<()> {
             build_models_snapshot(&model_registry),
             boot_alias.clone(),
         );
-        ui.init().await?;
-        ui.run().await?;
-        ui.shutdown().await?;
-    } else if cli.web {
-        // Web UI owns the lifecycle of the whole process: the agent loop
-        // runs in the background, the HTTP server runs in the foreground
-        // until Ctrl+C, then we tear down. Phase 0 serves only the static
-        // bundle; Phase 1 moves agent control onto WebSocket connections.
-        let addr: std::net::SocketAddr = peakbot::ui::DEFAULT_WEB_ADDR
-            .parse()
-            .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal");
-        let mut ui = WebUi::new(addr);
         ui.init().await?;
         ui.run().await?;
         ui.shutdown().await?;
@@ -380,8 +295,10 @@ async fn main() -> Result<()> {
         ui.shutdown().await?;
     }
 
-    runner_handle.abort();
-    let _ = runner_handle.await;
+    // Dropping the session drops its `action_sender`, which unwinds the
+    // controller's event loop, aborts the agent loop, and kills any bg
+    // PTY children — the clean teardown path (see session::Session).
+    drop(session);
 
     Ok(())
 }

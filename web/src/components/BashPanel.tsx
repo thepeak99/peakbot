@@ -1,4 +1,4 @@
-import type { BashPanel as BashPanelData } from "../mock";
+import type { BashPanel as BashPanelData } from "../types";
 
 // Foreground `bash` output panel. Mirrors BashPanelState (src/ui/app_state.rs)
 // — the bottom strip that surfaces the running/last `bash` invocation with a

@@ -1,4 +1,4 @@
-import type { BgProcess } from "../mock";
+import type { BgProcess } from "../types";
 
 // Background-process list. Mirrors BgState / BgSummary (src/ui/app_state.rs)
 // — the `🛰 N bg` counter's expanded view.

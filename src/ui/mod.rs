@@ -16,13 +16,16 @@ pub mod app_state;
 pub mod emoji_normalize;
 pub mod ui_trait;
 
+// Shared duplex wire protocol (stdio + web Views).
+pub mod wire;
+
 // REPL UI
 pub mod repl;
 
 // NDJSON stdio UI (`peakbot --stdio`)
 pub mod stdio;
 
-// Web UI (`peakbot --web`) — Phase 0: static shell only. See module docs.
+// Web UI (`peakbot --web`) — Phase 1: static shell + live WebSocket. See module docs.
 pub mod web;
 
 // Re-export commonly used types
@@ -31,5 +34,6 @@ pub use ui_trait::*;
 
 // Re-export UI implementations
 pub use repl::*;
-pub use stdio::{StdioUi, build_models_snapshot};
+pub use stdio::StdioUi;
 pub use web::{DEFAULT_WEB_ADDR, WebUi};
+pub use wire::build_models_snapshot;

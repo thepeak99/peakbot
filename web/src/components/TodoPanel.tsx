@@ -1,4 +1,4 @@
-import type { TodoItem, TodoStatus } from "../mock";
+import type { TodoItem, TodoStatus } from "../types";
 
 const STATUS_META: Record<TodoStatus, { glyph: string; cls: string }> = {
   completed: { glyph: "✔", cls: "text-emerald-400" },

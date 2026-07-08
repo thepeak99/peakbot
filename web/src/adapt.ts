@@ -1,0 +1,144 @@
+// Adapter — the single boundary that maps the wire `AppState` (state.ts)
+// into the camelCase view model (types.ts) the components render. All
+// field-name and enum translation lives here; components stay clean.
+
+import type {
+  AppState,
+  WireBashPanel,
+  WireChatMessage,
+  WireRole,
+  WireTodoStatus,
+} from "./state";
+import type {
+  BashPanel,
+  BgProcess,
+  ChatMessage,
+  ContextUsage,
+  MessageRole,
+  SessionStats,
+  TodoItem,
+  TodoStatus,
+  Welcome,
+} from "./types";
+
+const ROLE_MAP: Record<WireRole, MessageRole> = {
+  user: "user",
+  agent: "agent",
+  system: "system",
+  toolcall: "toolCall",
+  toolresult: "toolResult",
+  summary: "summary",
+};
+
+const TODO_STATUS_MAP: Record<WireTodoStatus, TodoStatus> = {
+  pending: "pending",
+  in_progress: "inProgress",
+  completed: "completed",
+  cancelled: "cancelled",
+};
+
+/** ISO 8601 → local "HH:MM". Falls back to the raw string on parse failure. */
+function toClock(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+export function adaptMessage(m: WireChatMessage): ChatMessage {
+  // ToolCall/ToolResult carry structured fields; the `content` already holds
+  // the display string the TUI renders, so we pass it through verbatim.
+  return {
+    role: ROLE_MAP[m.role] ?? "system",
+    content: m.content,
+    timestamp: toClock(m.timestamp),
+    toolName: m.tool_name ?? undefined,
+    fromBackground: m.source?.kind === "background",
+  };
+}
+
+export function adaptStats(s: AppState): SessionStats {
+  return {
+    inputTokens: s.stats.total_input_tokens,
+    outputTokens: s.stats.total_output_tokens,
+    apiCalls: s.stats.total_api_calls,
+    costUsd: s.stats.total_cost,
+    modelAlias: s.stats.model_alias,
+    model: s.stats.model,
+    provider: s.stats.provider_name,
+  };
+}
+
+export function adaptContext(s: AppState): ContextUsage {
+  return {
+    currentUsage: s.context.current_usage,
+    windowSize: s.context.window_size,
+    compactionThreshold: s.context.compaction_threshold,
+  };
+}
+
+export function adaptTodos(s: AppState): TodoItem[] {
+  return s.todo.items.map((t) => ({
+    id: t.id,
+    text: t.content,
+    status: TODO_STATUS_MAP[t.status] ?? "pending",
+  }));
+}
+
+export function adaptBg(s: AppState): BgProcess[] {
+  return s.bg.recent_summaries.map((b) => ({
+    id: b.id,
+    command: b.command,
+    label: b.label ?? undefined,
+    status: b.status === "running" ? "running" : "exited",
+    exitCode: b.exit_code ?? undefined,
+  }));
+}
+
+/** Whole seconds → "MM:SS". */
+function fmtDuration(totalSecs: number): string {
+  const m = Math.floor(totalSecs / 60);
+  const s = totalSecs % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+/** Returns null when the panel is idle (hidden). */
+export function adaptBashPanel(p: WireBashPanel): BashPanel | null {
+  switch (p.kind) {
+    case "idle":
+      return null;
+    case "running":
+      return {
+        command: p.command,
+        status: "running",
+        pid: p.pid,
+        elapsed: "", // renderer computes from started_at if desired
+        tail: p.tail,
+      };
+    case "finished":
+      return {
+        command: p.command,
+        status: "finished",
+        elapsed: fmtDuration(p.duration_secs),
+        exitCode: p.exit_code,
+        tail: p.tail,
+      };
+  }
+}
+
+export function adaptWelcome(s: AppState): Welcome | null {
+  const w = s.welcome;
+  if (!w) return null;
+  return {
+    provider: w.provider_name,
+    model: w.model,
+    maxTokens: w.max_tokens,
+    builtinTools: w.builtin_tools_count,
+    mcpTools: w.mcp_tools_count,
+    skills: w.skills_count,
+    searxngEnabled: w.searxng_enabled,
+    costTracking: w.cost_tracking_enabled,
+    compactionEnabled: w.compaction_enabled,
+    compactionThreshold: w.compaction_threshold,
+    cwd: w.cwd,
+  };
+}

@@ -33,7 +33,7 @@ Skills are organized in folders. Each folder contains a `SKILL.md` file describi
 "#;
 
 /// Registry of loaded skills
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SkillRegistry {
     /// Full skill data, indexed by skill name
     skills: HashMap<String, Skill>,

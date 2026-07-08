@@ -1,4 +1,4 @@
-import type { Welcome } from "../mock";
+import type { Welcome } from "../types";
 
 function Pill({ label, value }: { label: string; value: string }) {
   return (
