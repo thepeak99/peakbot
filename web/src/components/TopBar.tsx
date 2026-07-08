@@ -1,16 +1,26 @@
 import type { SessionStats } from "../types";
+import type { ModelInfo } from "../state";
+import { ModelSwitcher } from "./ModelSwitcher";
 
-// Top status bar. Model alias, the working spinner (AppState.is_running),
+// Top status bar. Model switcher, the working spinner (AppState.is_running),
 // a compact tokens/cost readout mirroring the TUI status line, and a
 // connection indicator.
 export function TopBar({
   stats,
   isRunning,
   connected,
+  models,
+  activeAlias,
+  hasTranscript,
+  onSwitchModel,
 }: {
   stats: SessionStats | null;
   isRunning: boolean;
   connected: boolean;
+  models: ModelInfo[];
+  activeAlias: string;
+  hasTranscript: boolean;
+  onSwitchModel: (alias: string) => void;
 }) {
   return (
     <header className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur">
@@ -19,17 +29,12 @@ export function TopBar({
         <span className="font-semibold text-zinc-100">PeakBot</span>
       </div>
 
-      {stats && (
-        <button
-          disabled
-          className="flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300"
-          title="Model switcher (Phase 2)"
-        >
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-          {stats.modelAlias}
-          <span className="text-zinc-600">▾</span>
-        </button>
-      )}
+      <ModelSwitcher
+        models={models}
+        activeAlias={activeAlias}
+        hasTranscript={hasTranscript}
+        onSwitch={onSwitchModel}
+      />
 
       {isRunning && (
         <span className="flex items-center gap-1.5 text-xs text-amber-400">

@@ -12,6 +12,7 @@ import type {
   ConversationSummary,
   InboundMessage,
   ModelInfo,
+  SlashCommand,
 } from "./state";
 
 export interface AgentConnection {
@@ -20,6 +21,7 @@ export interface AgentConnection {
   models: ModelInfo[];
   activeAlias: string;
   conversations: ConversationSummary[];
+  commands: SlashCommand[];
   error: string | null;
   send: (msg: InboundMessage) => void;
 }
@@ -35,6 +37,7 @@ export function useAgent(): AgentConnection {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [activeAlias, setActiveAlias] = useState("");
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -46,6 +49,22 @@ export function useAgent(): AgentConnection {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
+  }, []);
+
+  // Slash-command list is a global constant — fetch it once, not per WS
+  // connection. On failure the palette is simply empty (a typed command
+  // still dispatches server-side).
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/commands")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((cmds: SlashCommand[]) => {
+        if (!cancelled) setCommands(cmds);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -111,5 +130,5 @@ export function useAgent(): AgentConnection {
     };
   }, []);
 
-  return { connected, state, models, activeAlias, conversations, error, send };
+  return { connected, state, models, activeAlias, conversations, commands, error, send };
 }

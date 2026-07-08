@@ -24,6 +24,7 @@
 
 use crate::session::SessionDeps;
 use crate::ui::Ui;
+use crate::ui::ui_trait::builtin_commands;
 use crate::ui::wire::{InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot};
 use crate::{StateManager, UiAction};
 use anyhow::Result;
@@ -103,6 +104,7 @@ impl Ui for WebUi {
     async fn run(&mut self) -> Result<()> {
         let app: Router = Router::new()
             .route("/ws", get(ws_handler))
+            .route("/commands", get(commands_handler))
             .with_state(self.ws_state.clone())
             .fallback(static_handler);
 
@@ -129,6 +131,27 @@ impl Ui for WebUi {
 /// for the connection's lifetime.
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsState>) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+/// `GET /commands` — the slash-command list as JSON, the single source of
+/// truth [`builtin_commands`]. Read-only; the frontend fetches it once to
+/// populate the composer's slash palette. Not a WS frame, so `stdio` (which
+/// doesn't render a palette) is untouched. Hand-rolled (like `serve_asset`)
+/// to avoid pulling axum's `json` feature into all four platform builds.
+async fn commands_handler() -> Response {
+    match serde_json::to_vec(&builtin_commands()) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            Body::from(bytes),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialise commands: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 /// Drive one browser connection: build a fresh session, then run the
@@ -364,5 +387,28 @@ mod tests {
             .unwrap();
         let resp = static_handler(req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn commands_route_returns_builtin_commands() {
+        let app: Router = Router::new().route("/commands", get(commands_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/commands"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()[reqwest::header::CONTENT_TYPE],
+            "application/json"
+        );
+        let cmds: Vec<crate::ui::ui_trait::SlashCommand> = resp.json().await.unwrap();
+        // Same list, same order as the source of truth.
+        assert_eq!(cmds.len(), builtin_commands().len());
+        assert_eq!(cmds[0].name, "help");
     }
 }
