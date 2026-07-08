@@ -21,6 +21,9 @@ export function ConversationsPicker({
   onLoad: (id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  // The list arrives async after onOpen(); show a loading hint until it does
+  // instead of prematurely flashing "No saved conversations."
+  const [loading, setLoading] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -32,9 +35,17 @@ export function ConversationsPicker({
     return () => document.removeEventListener("mousedown", onClick);
   }, [open]);
 
+  // A fresh `conversations` reference means the requested list landed.
+  useEffect(() => {
+    setLoading(false);
+  }, [conversations]);
+
   const toggle = () => {
     setOpen((o) => {
-      if (!o) onOpen(); // refresh the list each time it opens
+      if (!o) {
+        setLoading(true);
+        onOpen(); // refresh the list each time it opens
+      }
       return !o;
     });
   };
@@ -66,7 +77,12 @@ export function ConversationsPicker({
 
       {open && (
         <div className="absolute left-0 top-full z-20 mt-1 max-h-96 w-80 overflow-y-auto rounded-md border border-zinc-800 bg-zinc-900 py-1 shadow-xl">
-          {conversations.length === 0 ? (
+          {loading ? (
+            <div className="flex items-center gap-2 px-3 py-2 text-xs text-zinc-500">
+              <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-600 border-t-zinc-300" />
+              Loading conversations…
+            </div>
+          ) : conversations.length === 0 ? (
             <div className="px-3 py-2 text-xs text-zinc-500">
               No saved conversations.
             </div>
