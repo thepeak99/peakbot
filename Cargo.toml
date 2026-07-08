@@ -49,9 +49,19 @@ portable-pty = "0.9"
 
 # MCP OAuth 2.1 (#19, src/mcp_auth.rs): one-shot localhost callback listener.
 # The `query` extractor URL-decodes auto (Linear `%3A`-encodes the auth code).
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+# `ws` feature is for `peakbot --web` WebSocket transport (Phase 1, src/ui/web/).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "ws"] }
 # Cross-platform browser launcher (xdg-open / open / cmd /c start).
 open = "5"
+# `rust-embed` embeds `web/dist/` at compile time. `release` builds inline
+# the bytes; `cargo run` (debug) reads from disk so UI changes don't need a
+# rebuild — matches the "frontend lives in a separate tool" model.
+# `axum-embed` 0.1.0 is axum-0.7-only and unmaintained; we use the `axum`
+# feature of `rust-embed` 8.x for first-party axum 0.8 support, plus a
+# ~15-line hand-rolled handler that adds SPA fallback (route → index.html).
+# ETag/304 + compression are deferred to Phase 4 (remote access).
+rust-embed = "8"
+mime_guess = "2"
 # Required to impl rmcp's `#[async_trait] CredentialStore`.
 async-trait = "0.1"
 

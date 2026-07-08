@@ -1,0 +1,157 @@
+// Wire types — an exact mirror of the serialized Rust `AppState`
+// (src/ui/app_state.rs) and the `src/ui/wire.rs` protocol envelopes.
+// Field names match serde output verbatim (snake_case, lowercase enums).
+// The adapter (`adapt.ts`) maps these into the camelCase view types the
+// components consume.
+
+export type WireRole =
+  | "user"
+  | "agent"
+  | "system"
+  | "toolcall"
+  | "toolresult"
+  | "summary";
+
+export interface WireMessageSource {
+  kind: "human" | "background";
+  proc_ids?: number[];
+}
+
+export interface WireChatMessage {
+  role: WireRole;
+  content: string;
+  timestamp: string; // ISO 8601
+  tool_name?: string;
+  tool_args?: string;
+  tool_result?: string;
+  call_id?: string;
+  compacted?: boolean;
+  source?: WireMessageSource;
+}
+
+export interface WireChat {
+  messages: WireChatMessage[];
+  auto_scroll: boolean;
+  scroll_offset: number;
+}
+
+export type WireTodoStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "cancelled";
+
+export interface WireTodoItem {
+  id: number;
+  content: string;
+  status: WireTodoStatus;
+}
+
+export interface WireTodo {
+  visible: boolean;
+  items: WireTodoItem[];
+}
+
+export interface WireStats {
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_api_calls: number;
+  total_cost: number;
+  model: string;
+  provider_name: string;
+  model_alias: string;
+}
+
+export interface WireContext {
+  current_usage: number;
+  window_size: number;
+  compaction_enabled: boolean;
+  compaction_threshold: number;
+}
+
+export interface WireWelcome {
+  provider_name: string;
+  model: string;
+  max_tokens: number;
+  builtin_tools_count: number;
+  mcp_tools_count: number;
+  skills_count: number;
+  searxng_enabled: boolean;
+  searxng_url?: string | null;
+  cost_tracking_enabled: boolean;
+  compaction_enabled: boolean;
+  compaction_threshold: number;
+  compaction_keep_recent: number;
+  conversation_persistence_enabled: boolean;
+  cwd: string;
+}
+
+export interface WireBgSummary {
+  id: number;
+  command: string;
+  label?: string | null;
+  status: string;
+  exit_code?: number | null;
+}
+
+export interface WireBg {
+  running_count: number;
+  recent_summaries: WireBgSummary[];
+}
+
+// BashPanelState is an internally-tagged enum (`kind`).
+export type WireBashPanel =
+  | { kind: "idle" }
+  | { kind: "running"; command: string; pid: number; started_at: string; tail: string[] }
+  | { kind: "finished"; command: string; exit_code: number; duration_secs: number; tail: string[] };
+
+export interface WireConversationMeta {
+  id?: string;
+  name?: string;
+}
+
+export interface AppState {
+  chat: WireChat;
+  todo: WireTodo;
+  stats: WireStats;
+  context: WireContext;
+  conversation: WireConversationMeta | null;
+  is_running: boolean;
+  is_loading: boolean;
+  welcome: WireWelcome | null;
+  status_message?: string | null;
+  exit_requested: boolean;
+  bg: WireBg;
+  bash_panel: WireBashPanel;
+}
+
+// ── Protocol envelopes (src/ui/wire.rs) ───────────────────────────────
+
+export interface ModelInfo {
+  alias: string;
+  provider_name: string;
+  model_name: string;
+  context_size: number;
+}
+
+export interface ConversationSummary {
+  id: string;
+  name: string;
+  updated_at: string;
+  message_count: number;
+  model: string;
+}
+
+export type OutboundMessage =
+  | { type: "ready" }
+  | { type: "models_available"; active: string; models: ModelInfo[] }
+  | { type: "state"; state: AppState }
+  | { type: "conversations_list"; items: ConversationSummary[] }
+  | { type: "error"; message: string };
+
+export type InboundMessage =
+  | { type: "send_message"; text: string }
+  | { type: "stop" }
+  | { type: "switch_model"; alias: string }
+  | { type: "request_conversations" }
+  | { type: "shutdown" };
