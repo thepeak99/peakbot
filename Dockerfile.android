@@ -16,6 +16,20 @@
 #   podman build -f Dockerfile.android --output type=local,dest=./output .
 #   docker build -f Dockerfile.android --output type=local,dest=./output .
 
+# ── Web UI build (Node) ────────────────────────────────────────────────
+# Stage `web`: produces /web/dist with the SPA bundle. The rust build copies
+# this into the crate root so `rust-embed` inlines it.
+FROM node:22 AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# ── Rust build ─────────────────────────────────────────────────────────
+# Stage `builder`: owns the entire cargo build, including the final binary
+# that the scratch stage exports. This stage MUST be referenced by the final
+# `COPY --from=`, otherwise BuildKit will prune it along with the binary.
 FROM ghcr.io/rust-lang/rust:1.91-bookworm AS builder
 
 # arm64-v8a covers essentially every modern Android phone.
@@ -46,32 +60,20 @@ RUN rustup target add ${TARGET} \
     && rustup target list --installed \
     && cargo install cargo-ndk --locked
 
-# ── Web UI build (Node) ────────────────────────────────────────────────
-FROM node:22 AS web
-WORKDIR /web
-COPY web/package.json web/package-lock.json* ./
-RUN npm ci
-COPY web/ ./
-RUN npm run build
-
-# Copy manifests first for better layer caching
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 
-# Create dummy main.rs for dependency caching
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs
 
-# Build dependencies only (faster layer caching)
 RUN cargo ndk -t ${TARGET} build --release && \
     rm -rf target/${TARGET}/deps/*.rlib target/${TARGET}/deps/*.d
 
-# Copy actual source. build.rs MUST be in the COPY set.
+# build.rs MUST be in the COPY set.
 COPY build.rs ./
 COPY --from=web /web/dist ./web/dist
 COPY src/ src/
 
-# Build the actual binary (touch main.rs so cargo rebuilds the bin crate; deps stay cached)
 RUN touch src/main.rs && \
     cargo ndk -t ${TARGET} build --release
 
