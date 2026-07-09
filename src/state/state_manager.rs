@@ -958,6 +958,27 @@ impl StateManager {
     pub fn create_conversation(&self, name: String, provider_name: String, model: String) {
         let conv = Conversation::new(name, provider_name, model);
         *self.current_conversation.lock().unwrap() = Some(conv);
+        self.mirror_conversation_to_state();
+    }
+
+    /// Mirror the current conversation's identity into `AppState.conversation`
+    /// so Views (the web UI) can read the live conversation id — the sticky
+    /// `?convo=` URL binding depends on it. Derived truth, refreshed at every
+    /// identity change (create / load). `None` when no conversation is set.
+    fn mirror_conversation_to_state(&self) {
+        let meta = self.current_conversation.lock().unwrap().as_ref().map(|c| {
+            let mut cs = crate::ui::app_state::ConversationState::new(
+                c.id.to_string(),
+                c.title.clone().unwrap_or_else(|| c.name.clone()),
+                c.model.clone(),
+            );
+            cs.message_count = c.messages.len();
+            cs.updated_at = c.updated_at.with_timezone(&chrono::Local);
+            cs
+        });
+        let mut state = self.state.write().unwrap();
+        state.conversation = meta;
+        self.notify_update(&state);
     }
 
     /// Mint the boot conversation from the active wire id, but only if none
@@ -1008,6 +1029,9 @@ impl StateManager {
             // to defaults so a stale Finished frame (or a lingering
             // ClosedByUser override) doesn't bleed across.
             self.reset_bash_panel();
+            // Publish the loaded conversation's identity so the web URL
+            // binding (`?convo=`) reflects the resumed conversation.
+            self.mirror_conversation_to_state();
         }
         Ok(())
     }
@@ -2401,6 +2425,41 @@ mod tests {
         // With async mpsc, initial state is sent via try_send
         let state = sm.get_state();
         assert!(state.chat.messages.is_empty());
+    }
+
+    /// The sticky-session web URL binding reads `AppState.conversation.id`;
+    /// it must be populated on create and refreshed on load (issue: it was
+    /// always `None`, so the `?convo=` URL never synced).
+    #[test]
+    fn conversation_state_mirrors_current_conversation() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage);
+
+        // Fresh manager: no conversation → no mirror.
+        assert!(sm.get_state().conversation.is_none());
+
+        // Create → mirror populated with the new id.
+        sm.create_conversation("Session A".into(), "prov".into(), "model-a".into());
+        let a_id = sm.get_current_conversation_id().expect("A id");
+        let mirror = sm.get_state().conversation.expect("mirror after create");
+        assert_eq!(mirror.id, a_id.to_string());
+        assert_eq!(mirror.model, "model-a");
+        sm.save_conversation();
+
+        // Move to B, then load A back → mirror must follow to A's id.
+        sm.create_conversation("Session B".into(), "prov".into(), "model-b".into());
+        assert_ne!(
+            sm.get_state().conversation.expect("B mirror").id,
+            a_id.to_string()
+        );
+        sm.load_conversation(a_id).expect("load A");
+        assert_eq!(
+            sm.get_state().conversation.expect("A mirror after load").id,
+            a_id.to_string(),
+            "loaded conversation id must be mirrored into AppState"
+        );
     }
 
     #[test]

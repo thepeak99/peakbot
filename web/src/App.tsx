@@ -34,6 +34,7 @@ export function App() {
     commands,
     error,
     send,
+    switchConvo,
   } = useAgent();
 
   // Keep the transcript pinned to the newest message.
@@ -73,7 +74,7 @@ export function App() {
         <main className="flex min-w-0 flex-1 flex-col">
           <section className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
             <div className="mx-auto max-w-3xl space-y-3">
-              {welcome && <WelcomeBanner welcome={welcome} />}
+              {welcome && messageCount === 0 && <WelcomeBanner welcome={welcome} />}
               {state?.chat.messages.map((m, i) => (
                 <Message key={i} message={adaptMessage(m)} />
               ))}
@@ -96,7 +97,7 @@ export function App() {
             conversations={conversations}
             hasTranscript={hasTranscript}
             onOpen={() => send({ type: "request_conversations" })}
-            onLoad={(id) => send({ type: "send_message", text: `/load ${id}` })}
+            onLoad={(id) => switchConvo(id)}
             onKill={(id) => send({ type: "kill_session", convo: id })}
           />
           {stats && state && (
