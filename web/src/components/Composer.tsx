@@ -9,7 +9,8 @@
 // trailing space for commands that take args); the user still presses Enter
 // to send, so nothing auto-fires.
 //
-// Images: paste or drag-drop an image file to attach it. Attachments show as
+// Images: paste, drag-drop, or click the 📎 clip button to attach image files.
+// Attachments show as
 // removable chips above the input and are kept OUT of the visible textarea
 // (a multi-MB data URL there would be unreadable and would break the palette
 // query). On submit each becomes a `[img:data:<mime>;base64,…]` token appended
@@ -17,7 +18,7 @@
 // like a `[img:/path]` token. Over-size files are rejected client-side before
 // they hit the wire; a non-vision model is rejected server-side.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { SlashCommand } from "../state";
 
 // Mirror of vision.rs MAX_IMAGE_BYTES — fail fast before shipping a doomed frame.
@@ -53,6 +54,7 @@ export function Composer({
   const [images, setImages] = useState<PendingImage[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Palette shows only while typing a bare command name (`/foo`, no space).
   const query = text.startsWith("/") && !text.includes(" ") ? text.slice(1) : null;
@@ -101,6 +103,11 @@ export function Composer({
 
   const removeImage = (id: string) =>
     setImages((prev) => prev.filter((i) => i.id !== id));
+
+  const onPickFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
+    void addFiles(Array.from(e.target.files ?? []));
+    e.target.value = ""; // reset so re-picking the same file fires onChange again
+  };
 
   const submit = () => {
     const trimmed = text.trim();
@@ -170,7 +177,7 @@ export function Composer({
   };
 
   const placeholder = connected
-    ? "Send a message…  (Enter to send, Shift+Enter for newline, paste an image to attach)"
+    ? "Send a message…  (Enter to send, Shift+Enter for newline, 📎/paste/drag to attach an image)"
     : "Connecting…";
 
   const canSend = connected && (!!text.trim() || images.length > 0);
@@ -241,6 +248,34 @@ export function Composer({
             )}
 
             <div className="flex items-end gap-2">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                onChange={onPickFiles}
+                className="hidden"
+              />
+              <button
+                type="button"
+                disabled={!connected}
+                onClick={() => fileInputRef.current?.click()}
+                title="Attach images"
+                aria-label="Attach images"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-5 w-5"
+                >
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                </svg>
+              </button>
               <textarea
                 rows={1}
                 disabled={!connected}
@@ -285,7 +320,9 @@ export function Composer({
             <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Shift+Enter</kbd> newline
           </span>
           <span>
-            <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">paste</kbd> an image
+            <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">📎</kbd> or{" "}
+            <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">paste</kbd> /{" "}
+            <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">drag</kbd> an image
           </span>
         </div>
       </div>
