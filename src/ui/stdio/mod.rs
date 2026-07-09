@@ -200,7 +200,9 @@ async fn run_stdin_loop(
                 }
             }
             Ok(InboundMessage::RequestConversations) => {
-                let items = build_conversations_snapshot(&state_manager);
+                // stdio is single-session with no registry — no conversation
+                // is "active" in the sticky-session sense.
+                let items = build_conversations_snapshot(&state_manager, &Default::default());
                 if out_tx
                     .send(OutboundMessage::ConversationsList { items })
                     .is_err()
@@ -208,6 +210,9 @@ async fn run_stdin_loop(
                     break;
                 }
             }
+            // Sticky-session frames are web-only (no registry over stdio) —
+            // accept and ignore so the shared enum stays exhaustive.
+            Ok(InboundMessage::Attach { .. }) | Ok(InboundMessage::KillSession { .. }) => {}
             Ok(InboundMessage::Shutdown) => {
                 // `/exit` sets `exit_requested`, which unwinds the state loop
                 // and lets `main` tear down cleanly.

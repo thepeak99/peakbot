@@ -960,6 +960,30 @@ impl StateManager {
         *self.current_conversation.lock().unwrap() = Some(conv);
     }
 
+    /// Mint the boot conversation from the active wire id, but only if none
+    /// is current. Idempotent — a no-op once a conversation exists, so a
+    /// pre-created (or resumed) session suppresses it. `model_fallback`
+    /// covers callers that never stamped a model (test harnesses).
+    pub fn ensure_boot_conversation(&self, model_fallback: &str) {
+        if self.has_current_conversation() {
+            return;
+        }
+        let name = format!(
+            "Conversation {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M")
+        );
+        let provider_name = self.get_provider_name();
+        let model = {
+            let m = self.get_model();
+            if m.is_empty() {
+                model_fallback.to_string()
+            } else {
+                m
+            }
+        };
+        self.create_conversation(name, provider_name, model);
+    }
+
     /// List all saved conversations
     pub fn list_conversations(&self) -> Option<Vec<ConversationSummary>> {
         self.storage.as_ref().and_then(|s| s.list().ok())
@@ -2322,6 +2346,51 @@ mod tests {
         assert_eq!(
             state.context.current_usage, 2000,
             "AppState.context.current_usage must follow last_input_tokens"
+        );
+    }
+
+    /// `ensure_boot_conversation` mints exactly one conversation from the
+    /// stamped wire identity when none exists.
+    #[test]
+    fn ensure_boot_conversation_mints_from_wire_identity() {
+        let sm = StateManager::new_arc();
+        sm.set_provider_name("openrouter".into());
+        sm.set_model("anthropic/claude-3.7-sonnet".into());
+        assert!(!sm.has_current_conversation());
+
+        sm.ensure_boot_conversation("fallback-model");
+
+        let conv = sm.get_current_conversation().expect("minted");
+        assert_eq!(conv.provider_name, "openrouter");
+        assert_eq!(conv.model, "anthropic/claude-3.7-sonnet");
+    }
+
+    /// Idempotent: a second call does not replace an existing conversation
+    /// (so a pre-created or resumed session is never clobbered).
+    #[test]
+    fn ensure_boot_conversation_is_idempotent() {
+        let sm = StateManager::new_arc();
+        sm.set_model("m".into());
+        sm.ensure_boot_conversation("fallback");
+        let id = sm.get_current_conversation_id().expect("first mint");
+
+        sm.ensure_boot_conversation("fallback");
+        assert_eq!(
+            sm.get_current_conversation_id(),
+            Some(id),
+            "second call must not mint a new conversation"
+        );
+    }
+
+    /// The fallback model is used only when no model was stamped (harness path).
+    #[test]
+    fn ensure_boot_conversation_uses_fallback_when_model_empty() {
+        let sm = StateManager::new_arc();
+        // No set_model → get_model() is empty → fallback applies.
+        sm.ensure_boot_conversation("fallback-model");
+        assert_eq!(
+            sm.get_current_conversation().expect("minted").model,
+            "fallback-model"
         );
     }
 

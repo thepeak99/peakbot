@@ -2,9 +2,13 @@
 // (state.ts `OutboundMessage`), and exposes the latest `AppState`, the
 // model list, connection status, and a `send` for inbound messages.
 //
-// Under Option C (webui.md §10) each connection is a fresh agent session,
-// so a reconnect yields a *new* transcript — restore prior history with
-// `/load <id>`, not by reattaching.
+// Sticky sessions (issue #118): the conversation id rides in the URL
+// (`?convo=…`). On connect the client sends `attach {convo}`; the server
+// binds to (or resumes / mints) that session and replies `attached {convo}`.
+// A reconnect re-sends the same id, so a dropped socket rejoins the *same*
+// live session instead of starting a fresh transcript. The URL is kept in
+// sync with the session's current conversation so refresh/bookmark/share all
+// land on the same session.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
@@ -31,6 +35,19 @@ function wsUrl(): string {
   return `${proto}//${window.location.host}/ws`;
 }
 
+/** The `?convo=` id from the address bar, or `null` if absent. */
+function convoFromUrl(): string | null {
+  return new URLSearchParams(window.location.search).get("convo");
+}
+
+/** Write `convo` into the address bar without a navigation (idempotent). */
+function setConvoInUrl(convo: string): void {
+  const url = new URL(window.location.href);
+  if (url.searchParams.get("convo") === convo) return;
+  url.searchParams.set("convo", convo);
+  window.history.replaceState(null, "", url);
+}
+
 export function useAgent(): AgentConnection {
   const [connected, setConnected] = useState(false);
   const [state, setState] = useState<AppState | null>(null);
@@ -43,6 +60,9 @@ export function useAgent(): AgentConnection {
   const wsRef = useRef<WebSocket | null>(null);
   const backoffRef = useRef(500); // ms, capped below
   const closedByUs = useRef(false);
+  // The conversation this client is bound to. Seeded from the URL, updated by
+  // `attached` and by conversation changes; re-sent verbatim on reconnect.
+  const convoRef = useRef<string | null>(convoFromUrl());
 
   const send = useCallback((msg: InboundMessage) => {
     const ws = wsRef.current;
@@ -79,6 +99,8 @@ export function useAgent(): AgentConnection {
         setConnected(true);
         setError(null);
         backoffRef.current = 500;
+        // First frame binds this socket to a session (or reconnects to it).
+        ws.send(JSON.stringify({ type: "attach", convo: convoRef.current }));
       };
 
       ws.onmessage = (ev) => {
@@ -91,12 +113,25 @@ export function useAgent(): AgentConnection {
         switch (msg.type) {
           case "ready":
             break;
+          case "attached":
+            convoRef.current = msg.convo;
+            setConvoInUrl(msg.convo);
+            break;
           case "models_available":
             setModels(msg.models);
             setActiveAlias(msg.active);
             break;
           case "state":
             setState(msg.state);
+            // Keep the URL on the session's current conversation, which
+            // `/model` / `/load` / `/new` move under us.
+            {
+              const id = msg.state?.conversation?.id;
+              if (id && id !== convoRef.current) {
+                convoRef.current = id;
+                setConvoInUrl(id);
+              }
+            }
             break;
           case "conversations_list":
             setConversations(msg.items);

@@ -302,7 +302,7 @@ async fn main() -> Result<()> {
     }
 
     // Single session for the TUI / stdio Views.
-    let session = peakbot::create_session(&session_deps)?;
+    let session = peakbot::create_session(&session_deps, None)?;
     let state_manager = session.state_manager.clone();
     let action_sender = session.action_sender.clone();
     let boot_alias = session.model_alias.clone();

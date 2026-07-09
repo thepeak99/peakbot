@@ -49,10 +49,15 @@ use axum::{
     routing::get,
 };
 use futures::{SinkExt, StreamExt};
+use registry::SessionRegistry;
 use rust_embed::RustEmbed;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
+use uuid::Uuid;
+
+mod registry;
 
 /// Port the web UI listens on. Fixed for now (`--port` flag is Phase 4).
 /// See `webui.md` §3 decision 1.
@@ -70,14 +75,16 @@ const STUB_INDEX_HTML: &str = include_str!("../../../build/stub_index.html");
 #[folder = "web/dist/"]
 struct Assets;
 
-/// Shared state handed to every WebSocket connection: the immutable
-/// session deps (one session is built per connection) plus the one-shot
-/// model-picker snapshot.
+/// Shared state handed to every WebSocket connection: the session registry
+/// (sticky sessions keyed by conversation id) plus the one-shot model-picker
+/// snapshot. `deps` lives inside the registry.
 #[derive(Clone)]
 struct WsState {
-    deps: Arc<SessionDeps>,
+    registry: SessionRegistry,
     models: Arc<Vec<ModelInfo>>,
     active_alias: Arc<str>,
+    /// Idle-session TTL for the reaper (from `config.web`).
+    session_ttl: Duration,
 }
 
 /// `peakbot --web` — serves the embedded SPA and a `/ws` endpoint. `run`
@@ -88,6 +95,8 @@ pub struct WebUi {
     ws_state: WsState,
     /// Shared secret guarding every route. `None` = open (loopback default).
     token: Option<Arc<str>>,
+    /// How often the reaper scans for expired sessions.
+    reaper_tick: Duration,
 }
 
 impl WebUi {
@@ -98,14 +107,17 @@ impl WebUi {
         active_alias: String,
         token: Option<String>,
     ) -> Self {
+        let web = deps.config.web.clone();
         Self {
             addr,
             ws_state: WsState {
-                deps,
+                registry: SessionRegistry::new(deps),
                 models: Arc::new(models),
                 active_alias: active_alias.into(),
+                session_ttl: Duration::from_secs(web.session_ttl_secs),
             },
             token: token.map(Into::into),
+            reaper_tick: Duration::from_secs(web.reaper_tick_secs),
         }
     }
 
@@ -154,6 +166,20 @@ impl Ui for WebUi {
         let url = self.entry_url();
         eprintln!("🌐 PeakBot web UI: {url}  (Ctrl+C to quit)");
         self.maybe_open_browser(&url);
+
+        // Reaper: periodically expire sessions idle (no sockets) past the TTL.
+        // A detached task tied to the process lifetime — the registry it holds
+        // is the same one every connection shares.
+        let reaper_registry = self.ws_state.registry.clone();
+        let ttl = self.ws_state.session_ttl;
+        let tick = self.reaper_tick;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick);
+            loop {
+                interval.tick().await;
+                reaper_registry.reap(ttl);
+            }
+        });
 
         // The View owns its own shutdown signal — Ctrl+C ends the graceful
         // drain. No injected channel: the signal concern lives here, not
@@ -257,28 +283,13 @@ async fn commands_handler() -> Response {
     }
 }
 
-/// Drive one browser connection: build a fresh session, then run the
-/// `StdioUi` three-task shape (writer sink, state broadcast, inbound
-/// reader) over WS frames. When the socket closes or `/exit` sets
-/// `exit_requested`, the session is dropped — which tears down its
-/// controller loop and kills its bg PTY children.
+/// Drive one browser connection. The first frame must be `Attach`, which
+/// binds the socket to a session in the registry (sharing an active one,
+/// resuming a persisted one, or minting fresh). The socket then runs the
+/// `StdioUi` three-task shape (writer sink, state broadcast, inbound reader)
+/// over WS frames. On close it **detaches** — the session survives for other
+/// sockets and for reconnect, and only expires via the reaper or a kill.
 async fn handle_socket(socket: WebSocket, state: WsState) {
-    // Build this connection's session. On failure, send one error frame
-    // and drop the socket.
-    let session = match crate::create_session(&state.deps) {
-        Ok(s) => s,
-        Err(e) => {
-            let (mut sink, _) = socket.split();
-            let msg = OutboundMessage::Error {
-                message: format!("failed to start session: {e}"),
-            };
-            if let Ok(txt) = serde_json::to_string(&msg) {
-                let _ = sink.send(Message::Text(txt.into())).await;
-            }
-            return;
-        }
-    };
-
     let (mut ws_sink, mut ws_stream) = socket.split();
 
     // Sole owner of the WS sink — every outbound frame funnels through
@@ -300,7 +311,46 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         let _ = ws_sink.close().await;
     });
 
-    // `ready` precedes `models_available`.
+    // Read the handshake frame. The client always sends `Attach` first; a
+    // non-attach first frame attaches fresh and is then processed normally so
+    // nothing is silently dropped. A socket that closes before any frame just
+    // unwinds (writer drops on scope exit).
+    let (want, leftover) = match read_first_frame(&mut ws_stream).await {
+        Some(text) => match serde_json::from_str::<InboundMessage>(&text) {
+            Ok(InboundMessage::Attach { convo }) => {
+                (convo.and_then(|s| Uuid::parse_str(&s).ok()), None)
+            }
+            _ => (None, Some(text)),
+        },
+        None => return,
+    };
+
+    // Bind to a session. On failure, send one error frame and drop the socket.
+    let registered = match state.registry.attach(want) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = out_tx.send(OutboundMessage::Error {
+                message: format!("failed to start session: {e}"),
+            });
+            drop(out_tx);
+            let _ = writer_task.await;
+            return;
+        }
+    };
+    // Stable detach handle (the session's creation id, which never changes
+    // even when `/model` moves the session to a new conversation).
+    let session_key = registered.session.conversation_id;
+    // The conversation the socket actually bound to — the live id (equals the
+    // creation id on a fresh attach; the current id on a reused session).
+    let convo_id = registered
+        .live_convo()
+        .unwrap_or(registered.session.conversation_id);
+
+    // Report the real id (may differ from `want` on a resume→fresh fallback),
+    // then the usual handshake: `attached` → `ready` → `models_available`.
+    let _ = out_tx.send(OutboundMessage::Attached {
+        convo: convo_id.to_string(),
+    });
     let _ = out_tx.send(OutboundMessage::Ready);
     if !state.models.is_empty() {
         let _ = out_tx.send(OutboundMessage::ModelsAvailable {
@@ -309,11 +359,23 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         });
     }
 
-    // Inbound reader: parse WS frames → UiAction, answering
-    // `request_conversations` off-band (not a UiAction), matching stdio.
-    let action_sender = session.action_sender.clone();
-    let sm_for_reader = session.state_manager.clone();
+    let action_sender = registered.session.action_sender.clone();
+    let sm_for_reader = registered.session.state_manager.clone();
+    let registry_for_reader = state.registry.clone();
     let reader_tx = out_tx.clone();
+
+    // Process a non-attach handshake frame before the reader loop starts.
+    if let Some(frame) = leftover {
+        dispatch_inbound(
+            &frame,
+            &action_sender,
+            &reader_tx,
+            &sm_for_reader,
+            &registry_for_reader,
+        );
+    }
+
+    // Inbound reader: parse WS frames → UiAction / off-band replies.
     let reader_task = tokio::spawn(async move {
         while let Some(frame) = ws_stream.next().await {
             let text = match frame {
@@ -326,7 +388,13 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
             if trimmed.is_empty() {
                 continue;
             }
-            if !dispatch_inbound(trimmed, &action_sender, &reader_tx, &sm_for_reader) {
+            if !dispatch_inbound(
+                trimmed,
+                &action_sender,
+                &reader_tx,
+                &sm_for_reader,
+                &registry_for_reader,
+            ) {
                 break;
             }
         }
@@ -334,7 +402,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
 
     // State broadcast: push every AppState snapshot to the client until the
     // session requests exit or the writer drops.
-    let mut state_rx = session.state_manager.subscribe();
+    let mut state_rx = registered.session.state_manager.subscribe();
     while let Some(app_state) = state_rx.recv().await {
         let exit = app_state.exit_requested;
         if out_tx
@@ -350,22 +418,39 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         }
     }
 
-    // Teardown: stop the reader, drain the writer, then drop the session
-    // (unwinds its controller loop + kills its bg PTY children).
+    // Teardown: stop the reader, drain the writer, then detach. The session
+    // stays alive in the registry for other sockets / reconnect; it only ends
+    // via the reaper (idle TTL) or an explicit kill.
     reader_task.abort();
     drop(out_tx);
     let _ = writer_task.await;
-    drop(session);
+    state.registry.detach(session_key);
+}
+
+/// Await the first text frame of a connection, skipping non-text control
+/// frames. Returns `None` if the socket closes first.
+async fn read_first_frame(
+    ws_stream: &mut futures::stream::SplitStream<WebSocket>,
+) -> Option<String> {
+    while let Some(frame) = ws_stream.next().await {
+        match frame {
+            Ok(Message::Text(t)) => return Some(t.to_string()),
+            Ok(Message::Close(_)) | Err(_) => return None,
+            Ok(_) => continue,
+        }
+    }
+    None
 }
 
 /// Parse one inbound line and dispatch it. Returns `false` when the loop
 /// should stop (channel closed or `shutdown` received). Mirrors
-/// `stdio::run_stdin_loop`'s match arms.
+/// `stdio::run_stdin_loop`'s match arms, plus the sticky-session frames.
 fn dispatch_inbound(
     line: &str,
     action_sender: &UnboundedSender<UiAction>,
     out_tx: &UnboundedSender<OutboundMessage>,
     state_manager: &StateManager,
+    registry: &SessionRegistry,
 ) -> bool {
     match serde_json::from_str::<InboundMessage>(line) {
         Ok(InboundMessage::SendMessage { text }) => {
@@ -376,11 +461,19 @@ fn dispatch_inbound(
             action_sender.send(UiAction::SwitchModel(alias)).is_ok()
         }
         Ok(InboundMessage::RequestConversations) => {
-            let items = build_conversations_snapshot(state_manager);
+            let items = build_conversations_snapshot(state_manager, &registry.active_ids());
             out_tx
                 .send(OutboundMessage::ConversationsList { items })
                 .is_ok()
         }
+        Ok(InboundMessage::KillSession { convo }) => {
+            if let Ok(id) = Uuid::parse_str(&convo) {
+                registry.kill(id);
+            }
+            true
+        }
+        // Re-attach mid-stream is a client bug; ignore rather than reset.
+        Ok(InboundMessage::Attach { .. }) => true,
         Ok(InboundMessage::Shutdown) => {
             let _ = action_sender.send(UiAction::SendMessage("/exit".to_string()));
             false

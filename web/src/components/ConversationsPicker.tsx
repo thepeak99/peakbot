@@ -14,11 +14,13 @@ export function ConversationsPicker({
   hasTranscript,
   onOpen,
   onLoad,
+  onKill,
 }: {
   conversations: ConversationSummary[];
   hasTranscript: boolean;
   onOpen: () => void;
   onLoad: (id: string) => void;
+  onKill: (id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   // The list arrives async after onOpen(); show a loading hint until it does
@@ -63,6 +65,16 @@ export function ConversationsPicker({
     onLoad(c.id);
   };
 
+  const kill = (c: ConversationSummary) => {
+    if (
+      window.confirm(
+        `Kill the live session for "${c.name}"? Anyone connected to it will be disconnected.`,
+      )
+    ) {
+      onKill(c.id);
+    }
+  };
+
   return (
     <div className="relative" ref={ref}>
       <button
@@ -88,21 +100,53 @@ export function ConversationsPicker({
             </div>
           ) : (
             conversations.map((c, i) => (
-              <button
+              <div
                 key={c.id}
-                onClick={() => load(c)}
-                className="flex w-full items-baseline gap-2 px-3 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-800"
+                className={`group flex items-center gap-1 px-1 ${
+                  c.active
+                    ? "bg-emerald-950/40 hover:bg-emerald-900/40"
+                    : "hover:bg-zinc-800"
+                }`}
               >
-                <span className="w-4 shrink-0 text-right tabular-nums text-zinc-600">
-                  {i + 1}
-                </span>
-                <span className="flex min-w-0 flex-col">
-                  <span className="truncate font-medium">{c.name}</span>
-                  <span className="text-[10px] text-zinc-500">
-                    {c.message_count} msgs · {c.model}
+                <button
+                  onClick={() => load(c)}
+                  className="flex min-w-0 flex-1 items-baseline gap-2 px-2 py-1.5 text-left text-xs text-zinc-200"
+                >
+                  <span className="w-4 shrink-0 text-right tabular-nums text-zinc-600">
+                    {i + 1}
                   </span>
-                </span>
-              </button>
+                  <span className="flex min-w-0 flex-col">
+                    <span className="flex items-center gap-1.5">
+                      {c.active && (
+                        <span
+                          className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"
+                          title="Live session"
+                        />
+                      )}
+                      <span
+                        className={`truncate ${
+                          c.active ? "font-semibold text-emerald-200" : "font-medium"
+                        }`}
+                      >
+                        {c.name}
+                      </span>
+                    </span>
+                    <span className="text-[10px] text-zinc-500">
+                      {c.message_count} msgs · {c.model}
+                      {c.active && " · live"}
+                    </span>
+                  </span>
+                </button>
+                {c.active && (
+                  <button
+                    onClick={() => kill(c)}
+                    title="Kill this live session"
+                    className="shrink-0 rounded px-1.5 py-1 text-xs text-zinc-500 opacity-0 hover:bg-red-900/50 hover:text-red-300 group-hover:opacity-100"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
             ))
           )}
         </div>
