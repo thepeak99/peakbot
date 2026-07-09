@@ -176,6 +176,27 @@ cargo test --test integration
 cargo test -- --nocapture
 ```
 
+### Web UI dev mode
+
+The web UI (`peakbot --web`) ships as an embedded React + Vite bundle. For
+iterating on it, `make dev` runs both halves with hot reload:
+
+```bash
+make dev
+```
+
+This starts the backend under `cargo watch` (on `127.0.0.1:7823`) and the Vite
+dev server (on `localhost:5173`) together. **Open http://localhost:5173** — Vite
+serves the app with HMR and proxies the `/ws` WebSocket to the backend.
+
+- Editing a file under `web/src/` hot-swaps in the browser in <1s (no full reload).
+- Editing Rust rebuilds and restarts the backend (~seconds), which drops the live
+  WebSocket session — the browser reconnects on its own.
+- Requires `cargo install cargo-watch` and Node.js 22+.
+
+Production is unchanged: `make web` builds the static bundle that `cargo run -- --web`
+embeds and serves on `:7823`. `make dev` touches no Rust code paths.
+
 ### Pre-commit Gate
 
 Before committing, run:
