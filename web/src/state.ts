@@ -43,7 +43,7 @@ export type WireTodoStatus =
 
 export interface WireTodoItem {
   id: number;
-  content: string;
+  text: string;
   status: WireTodoStatus;
 }
 
