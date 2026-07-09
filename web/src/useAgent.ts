@@ -40,34 +40,19 @@ function wsUrl(): string {
   return `${proto}//${window.location.host}/ws`;
 }
 
-/** The `?convo=` id from the address bar, or `null` if absent. */
+/** The `?convo=` id from the address bar, or `null` if absent. The URL is the
+ * *only* binding: a new window with no `?convo=` starts a fresh conversation;
+ * a refresh, reopened same-URL tab, or shared link rejoins the same session. */
 function convoFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get("convo");
 }
 
-/** localStorage key remembering the last conversation this browser was on. */
-const LAST_CONVO_KEY = "peakbot:last-convo";
-
-/** Seed the bound conversation: explicit URL selection wins; otherwise fall
- * back to the last one this browser used so a freshly-opened tab rejoins the
- * same live session instead of minting a new one. */
-function seedConvo(): string | null {
-  return convoFromUrl() ?? localStorage.getItem(LAST_CONVO_KEY);
-}
-
-/** Persist `convo` to the address bar (shareable) and localStorage (this
- * browser's resume point). Idempotent. */
-function rememberConvo(convo: string): void {
+/** Write `convo` into the address bar without a navigation (idempotent). */
+function setConvoInUrl(convo: string): void {
   const url = new URL(window.location.href);
-  if (url.searchParams.get("convo") !== convo) {
-    url.searchParams.set("convo", convo);
-    window.history.replaceState(null, "", url);
-  }
-  try {
-    localStorage.setItem(LAST_CONVO_KEY, convo);
-  } catch {
-    // localStorage may be unavailable (private mode); URL binding still works.
-  }
+  if (url.searchParams.get("convo") === convo) return;
+  url.searchParams.set("convo", convo);
+  window.history.replaceState(null, "", url);
 }
 
 export function useAgent(): AgentConnection {
@@ -83,10 +68,9 @@ export function useAgent(): AgentConnection {
   const connectRef = useRef<() => void>(() => {});
   const backoffRef = useRef(500); // ms, capped below
   const closedByUs = useRef(false);
-  // The conversation this client is bound to. Seeded from the URL (explicit
-  // selection) or localStorage (this browser's resume point), updated by
-  // `attached`/state, re-sent verbatim on reconnect.
-  const convoRef = useRef<string | null>(seedConvo());
+  // The conversation this client is bound to. Seeded from the URL (the only
+  // binding), updated by `attached`/state, re-sent verbatim on reconnect.
+  const convoRef = useRef<string | null>(convoFromUrl());
 
   const send = useCallback((msg: InboundMessage) => {
     const ws = wsRef.current;
@@ -139,7 +123,7 @@ export function useAgent(): AgentConnection {
             break;
           case "attached":
             convoRef.current = msg.convo;
-            rememberConvo(msg.convo);
+            setConvoInUrl(msg.convo);
             break;
           case "models_available":
             setModels(msg.models);
@@ -147,13 +131,13 @@ export function useAgent(): AgentConnection {
             break;
           case "state":
             setState(msg.state);
-            // Keep the URL + resume point on the session's current
-            // conversation, which `/model` / `/new` move under us.
+            // Keep the URL on the session's current conversation, which
+            // `/model` / `/new` move under us.
             {
               const id = msg.state?.conversation?.id;
               if (id && id !== convoRef.current) {
                 convoRef.current = id;
-                rememberConvo(id);
+                setConvoInUrl(id);
               }
             }
             break;
@@ -197,7 +181,7 @@ export function useAgent(): AgentConnection {
   const switchConvo = useCallback((id: string) => {
     if (id === convoRef.current) return;
     convoRef.current = id;
-    rememberConvo(id);
+    setConvoInUrl(id);
     backoffRef.current = 500;
     const ws = wsRef.current;
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
