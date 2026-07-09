@@ -20,6 +20,20 @@
 #     --build-arg TARGET=x86_64-apple-darwin \
 #     --output type=local,dest=./output .
 
+# ── Web UI build (Node) ────────────────────────────────────────────────
+# Stage `web`: produces /web/dist with the SPA bundle. The rust build copies
+# this into the crate root so `rust-embed` inlines it.
+FROM node:22 AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# ── Rust build ─────────────────────────────────────────────────────────
+# Stage `builder`: owns the entire cargo build, including the final binary
+# that the scratch stage exports. This stage MUST be referenced by the final
+# `COPY --from=`, otherwise BuildKit will prune it along with the binary.
 FROM ghcr.io/rust-cross/cargo-zigbuild:latest AS builder
 
 # Default to a universal2 fat binary; override with --build-arg TARGET=...
@@ -31,15 +45,6 @@ ENV TARGET=${TARGET}
 RUN rustup target add x86_64-apple-darwin aarch64-apple-darwin \
     && rustup target list --installed
 
-# ── Web UI build (Node) ────────────────────────────────────────────────
-FROM node:22 AS web
-WORKDIR /web
-COPY web/package.json web/package-lock.json* ./
-RUN npm ci
-COPY web/ ./
-RUN npm run build
-
-# Copy manifests first for better layer caching
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 
