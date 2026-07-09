@@ -28,6 +28,11 @@ export interface AgentConnection {
   commands: SlashCommand[];
   error: string | null;
   send: (msg: InboundMessage) => void;
+  /** Switch this client to another conversation by re-attaching: bind the new
+   * id and reconnect the socket. Shares the live session if one is active,
+   * else resumes it from disk — the same handshake as first load, so no
+   * `/load` (which would clear background processes). */
+  switchConvo: (id: string) => void;
 }
 
 function wsUrl(): string {
@@ -35,7 +40,9 @@ function wsUrl(): string {
   return `${proto}//${window.location.host}/ws`;
 }
 
-/** The `?convo=` id from the address bar, or `null` if absent. */
+/** The `?convo=` id from the address bar, or `null` if absent. The URL is the
+ * *only* binding: a new window with no `?convo=` starts a fresh conversation;
+ * a refresh, reopened same-URL tab, or shared link rejoins the same session. */
 function convoFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get("convo");
 }
@@ -58,10 +65,11 @@ export function useAgent(): AgentConnection {
   const [error, setError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const connectRef = useRef<() => void>(() => {});
   const backoffRef = useRef(500); // ms, capped below
   const closedByUs = useRef(false);
-  // The conversation this client is bound to. Seeded from the URL, updated by
-  // `attached` and by conversation changes; re-sent verbatim on reconnect.
+  // The conversation this client is bound to. Seeded from the URL (the only
+  // binding), updated by `attached`/state, re-sent verbatim on reconnect.
   const convoRef = useRef<string | null>(convoFromUrl());
 
   const send = useCallback((msg: InboundMessage) => {
@@ -124,7 +132,7 @@ export function useAgent(): AgentConnection {
           case "state":
             setState(msg.state);
             // Keep the URL on the session's current conversation, which
-            // `/model` / `/load` / `/new` move under us.
+            // `/model` / `/new` move under us.
             {
               const id = msg.state?.conversation?.id;
               if (id && id !== convoRef.current) {
@@ -156,6 +164,7 @@ export function useAgent(): AgentConnection {
       };
     };
 
+    connectRef.current = connect;
     connect();
 
     return () => {
@@ -165,5 +174,34 @@ export function useAgent(): AgentConnection {
     };
   }, []);
 
-  return { connected, state, models, activeAlias, conversations, commands, error, send };
+  // Re-attach to another conversation: bind the id, then reconnect. Closing
+  // the old socket detaches from (but does not kill) its session; the fresh
+  // connect's `attach` frame joins the target — sharing it if live, resuming
+  // it from disk if not.
+  const switchConvo = useCallback((id: string) => {
+    if (id === convoRef.current) return;
+    convoRef.current = id;
+    setConvoInUrl(id);
+    backoffRef.current = 500;
+    const ws = wsRef.current;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      // onclose auto-reconnects (closedByUs is false) and re-sends `attach`
+      // with the new convoRef.
+      ws.close();
+    } else {
+      connectRef.current();
+    }
+  }, []);
+
+  return {
+    connected,
+    state,
+    models,
+    activeAlias,
+    conversations,
+    commands,
+    error,
+    send,
+    switchConvo,
+  };
 }

@@ -7,3 +7,7 @@ output
 .release-version
 .peakbot/vectors.db
 bg-cooldown-plan.md
+
+# Browser-automation test artifacts (playwright-cli)
+.playwright/
+.playwright-cli/

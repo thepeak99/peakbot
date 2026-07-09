@@ -62,7 +62,11 @@ export function Composer({
     query === null
       ? []
       : commands.filter((c) => c.name.startsWith(query.toLowerCase()));
-  const showPalette = connected && !isRunning && !dismissed && matches.length > 0;
+  // The palette is a client-side autocomplete over the statically-fetched
+  // command list — it must NOT depend on the live socket, or it blinks out
+  // during the reconnect that `switchConvo` deliberately triggers (sticky
+  // sessions). Sending is still gated on `connected` in `submit()`.
+  const showPalette = !isRunning && !dismissed && matches.length > 0;
   const sel = Math.min(selected, matches.length - 1);
 
   const addFiles = async (files: File[]) => {

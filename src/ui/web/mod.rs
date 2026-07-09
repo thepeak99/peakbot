@@ -376,7 +376,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     }
 
     // Inbound reader: parse WS frames → UiAction / off-band replies.
-    let reader_task = tokio::spawn(async move {
+    let mut reader_task = tokio::spawn(async move {
         while let Some(frame) = ws_stream.next().await {
             let text = match frame {
                 Ok(Message::Text(t)) => t.to_string(),
@@ -401,20 +401,33 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     });
 
     // State broadcast: push every AppState snapshot to the client until the
-    // session requests exit or the writer drops.
+    // session requests exit, the writer drops, or the client disconnects.
+    // Selecting on `reader_task` is what makes a client-initiated close
+    // *prompt*: without it this loop parks on `state_rx.recv()` and only
+    // notices the gone socket on the next failed `out_tx.send`, so an idle
+    // session's close handshake would hang until a TCP timeout (~10s) — which
+    // stalls every convo-switch reconnect and tab-close teardown. When the
+    // reader ends (Close frame or stream end) we break at once, dropping
+    // `out_tx` so the writer closes the sink and the handshake completes in ms.
     let mut state_rx = registered.session.state_manager.subscribe();
-    while let Some(app_state) = state_rx.recv().await {
-        let exit = app_state.exit_requested;
-        if out_tx
-            .send(OutboundMessage::State {
-                state: Box::new(app_state),
-            })
-            .is_err()
-        {
-            break; // writer/socket gone
-        }
-        if exit {
-            break;
+    loop {
+        tokio::select! {
+            maybe_state = state_rx.recv() => {
+                let Some(app_state) = maybe_state else { break };
+                let exit = app_state.exit_requested;
+                if out_tx
+                    .send(OutboundMessage::State {
+                        state: Box::new(app_state),
+                    })
+                    .is_err()
+                {
+                    break; // writer/socket gone
+                }
+                if exit {
+                    break;
+                }
+            }
+            _ = &mut reader_task => break, // client disconnected
         }
     }
 
