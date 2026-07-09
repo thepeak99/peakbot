@@ -19,8 +19,18 @@
 //! first-party `axum` feature of `rust-embed` 8.x plus a small
 //! hand-rolled `IntoResponse` for `EmbeddedFile` to get the right
 //! `Content-Type` (mime_guess) and SPA fallback. ETag/304 + compression
-//! are deferred to Phase 4 (remote access); for loopback the browser
-//! doesn't care.
+//! are intentionally omitted: the single-operator remote case (Phase 4)
+//! loads the bundle once over a fast link, so the hand-rolled negotiation
+//! they'd require isn't worth the complexity.
+//!
+//! ## Remote access (Phase 4)
+//!
+//! `--bind` may listen beyond loopback; then a shared secret (`--token` /
+//! `PEAKBOT_WEB_TOKEN`) is mandatory (enforced in `main`). When a token is
+//! set, [`require_token`] gates *every* route: the browser presents it once
+//! as `?token=…`, the middleware sets a `peakbot_token` cookie, and all
+//! later asset / `/commands` / `/ws` requests authenticate via that cookie —
+//! so the frontend needs no token-threading code.
 
 use crate::session::SessionDeps;
 use crate::ui::Ui;
@@ -34,6 +44,7 @@ use axum::{
     extract::State,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::{Request, StatusCode, header},
+    middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -69,12 +80,14 @@ struct WsState {
     active_alias: Arc<str>,
 }
 
-/// `peakbot --web` — serves the embedded SPA and a `/ws` endpoint on a
-/// fixed loopback port. `run` blocks on the axum server until Ctrl+C
-/// triggers graceful shutdown.
+/// `peakbot --web` — serves the embedded SPA and a `/ws` endpoint. `run`
+/// blocks on the axum server until Ctrl+C triggers graceful shutdown. When
+/// `token` is set, every route is gated by [`require_token`].
 pub struct WebUi {
     addr: SocketAddr,
     ws_state: WsState,
+    /// Shared secret guarding every route. `None` = open (loopback default).
+    token: Option<Arc<str>>,
 }
 
 impl WebUi {
@@ -83,6 +96,7 @@ impl WebUi {
         deps: Arc<SessionDeps>,
         models: Vec<ModelInfo>,
         active_alias: String,
+        token: Option<String>,
     ) -> Self {
         Self {
             addr,
@@ -91,6 +105,27 @@ impl WebUi {
                 models: Arc::new(models),
                 active_alias: active_alias.into(),
             },
+            token: token.map(Into::into),
+        }
+    }
+
+    /// The URL a browser should open. When a token is set it rides as a
+    /// `?token=…` query so the first request establishes the auth cookie.
+    fn entry_url(&self) -> String {
+        match &self.token {
+            Some(t) => format!("http://{}/?token={}", self.addr, t),
+            None => format!("http://{}/", self.addr),
+        }
+    }
+
+    /// Auto-open the browser only for a local, interactive session: a
+    /// loopback bind with no SSH context. Remote / SSH sessions just get the
+    /// printed URL (opening would target the wrong machine — same heuristic
+    /// as the MCP OAuth flow).
+    fn maybe_open_browser(&self, url: &str) {
+        let local = self.addr.ip().is_loopback() && std::env::var_os("SSH_CONNECTION").is_none();
+        if local {
+            let _ = open::that(url);
         }
     }
 }
@@ -102,14 +137,23 @@ impl Ui for WebUi {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let app: Router = Router::new()
+        let mut app: Router = Router::new()
             .route("/ws", get(ws_handler))
             .route("/commands", get(commands_handler))
             .with_state(self.ws_state.clone())
             .fallback(static_handler);
 
+        // Gate every route behind the shared secret when one is configured.
+        // Open by default (loopback); `main` guarantees a token exists before
+        // a non-loopback bind ever reaches here.
+        if let Some(token) = &self.token {
+            app = app.layer(from_fn_with_state(token.clone(), require_token));
+        }
+
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
-        eprintln!("🌐 PeakBot web UI: http://{}  (Ctrl+C to quit)", self.addr);
+        let url = self.entry_url();
+        eprintln!("🌐 PeakBot web UI: {url}  (Ctrl+C to quit)");
+        self.maybe_open_browser(&url);
 
         // The View owns its own shutdown signal — Ctrl+C ends the graceful
         // drain. No injected channel: the signal concern lives here, not
@@ -125,6 +169,65 @@ impl Ui for WebUi {
     async fn shutdown(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Name of the cookie the browser carries after the first token-bearing
+/// request, so subsequent asset / `/commands` / `/ws` requests authenticate
+/// without the token in the URL.
+const TOKEN_COOKIE: &str = "peakbot_token";
+
+/// Gate every route behind the shared secret. Installed only when a token is
+/// configured. Accepts the token from the `?token=…` query (browser first
+/// load) or the `peakbot_token` cookie (every request after). A query-borne
+/// match sets the cookie so the token leaves the URL after one hop.
+async fn require_token(State(token): State<Arc<str>>, req: Request<Body>, next: Next) -> Response {
+    let via_query = token_from_query(req.uri().query()).is_some_and(|t| ct_eq(t, &token));
+    let ok = via_query || token_from_cookie(&req).is_some_and(|t| ct_eq(t, &token));
+
+    if !ok {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+
+    let mut resp = next.run(req).await;
+    if via_query {
+        // `HttpOnly` keeps JS from reading it; `SameSite=Strict` blocks
+        // cross-site carriage. No `Secure` — the server is plain HTTP.
+        let cookie = format!("{TOKEN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict");
+        if let Ok(v) = header::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().insert(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
+/// Extract the `token` value from a URL query string, if present.
+fn token_from_query(query: Option<&str>) -> Option<&str> {
+    query?.split('&').find_map(|kv| kv.strip_prefix("token="))
+}
+
+/// Extract the `peakbot_token` value from the request's `Cookie` header.
+fn token_from_cookie(req: &Request<Body>) -> Option<&str> {
+    req.headers()
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|c| c.trim().strip_prefix(&format!("{TOKEN_COOKIE}=")))
+}
+
+/// Constant-time byte comparison. Length is allowed to leak (a token's length
+/// is not the secret); the byte contents are compared in constant time so a
+/// network timing side-channel can't recover the secret one byte at a time.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// `GET /ws` — upgrade to a WebSocket, then run one independent session
@@ -410,5 +513,112 @@ mod tests {
         // Same list, same order as the source of truth.
         assert_eq!(cmds.len(), builtin_commands().len());
         assert_eq!(cmds[0].name, "help");
+    }
+
+    // --- Phase 4: token auth ---
+
+    /// Spawn `/commands` behind the token layer on a random loopback port.
+    async fn spawn_gated(token: &str) -> std::net::SocketAddr {
+        let secret: Arc<str> = token.into();
+        let app: Router = Router::new()
+            .route("/commands", get(commands_handler))
+            .layer(from_fn_with_state(secret, require_token));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        addr
+    }
+
+    /// A client that doesn't follow redirects, so each request carries
+    /// exactly what we set — the auth path is tested honestly. reqwest keeps
+    /// no cookie store by default, so Set-Cookie is never auto-replayed.
+    fn bare_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn gated_rejects_missing_token() {
+        let addr = spawn_gated("s3cret").await;
+        let resp = bare_client()
+            .get(format!("http://{addr}/commands"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn gated_rejects_wrong_token() {
+        let addr = spawn_gated("s3cret").await;
+        let resp = bare_client()
+            .get(format!("http://{addr}/commands?token=nope"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn gated_accepts_query_and_sets_cookie() {
+        let addr = spawn_gated("s3cret").await;
+        let resp = bare_client()
+            .get(format!("http://{addr}/commands?token=s3cret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cookie = resp.headers()[reqwest::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("peakbot_token=s3cret"), "cookie: {cookie}");
+        assert!(cookie.contains("HttpOnly"), "cookie: {cookie}");
+    }
+
+    #[tokio::test]
+    async fn gated_accepts_cookie_without_resetting_it() {
+        let addr = spawn_gated("s3cret").await;
+        let resp = bare_client()
+            .get(format!("http://{addr}/commands"))
+            .header(reqwest::header::COOKIE, "peakbot_token=s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Cookie-authed requests don't re-issue Set-Cookie.
+        assert!(!resp.headers().contains_key(reqwest::header::SET_COOKIE));
+    }
+
+    #[test]
+    fn ct_eq_matches_only_identical_strings() {
+        assert!(ct_eq("abc", "abc"));
+        assert!(!ct_eq("abc", "abd"));
+        assert!(!ct_eq("abc", "abcd")); // length mismatch
+        assert!(!ct_eq("", "x"));
+    }
+
+    #[test]
+    fn token_extractors_pick_the_right_field() {
+        assert_eq!(token_from_query(Some("token=xyz")), Some("xyz"));
+        assert_eq!(token_from_query(Some("a=1&token=xyz&b=2")), Some("xyz"));
+        assert_eq!(token_from_query(Some("nope=1")), None);
+        assert_eq!(token_from_query(None), None);
+
+        let req = |cookie: &str| {
+            Request::builder()
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(token_from_cookie(&req("peakbot_token=xyz")), Some("xyz"));
+        assert_eq!(
+            token_from_cookie(&req("other=1; peakbot_token=xyz")),
+            Some("xyz")
+        );
+        assert_eq!(token_from_cookie(&req("other=1")), None);
     }
 }

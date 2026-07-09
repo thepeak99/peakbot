@@ -571,6 +571,7 @@ mcp_servers:
 | `AGENT_MAX_TURNS` | Max tool turns per message |
 | `MCP_SERVERS` | JSON array of MCP server configs |
 | `SEARXNG_BASE_URL` | SearXNG base URL |
+| `PEAKBOT_WEB_TOKEN` | Shared secret guarding `peakbot --web` (fallback for `--token`). Required when `--bind` targets a non-loopback address. |
 
 ### REPL Commands
 
@@ -591,6 +592,34 @@ mcp_servers:
 | Max tool turns | 50 | Tool calls per prompt |
 | Output truncation | 10,000 chars | File tool output limit |
 | Bash timeout | 30s | Shell command timeout |
+
+### Web UI (`peakbot --web`)
+
+`peakbot --web` serves the embedded SPA + live chat over WebSocket (each
+browser tab drives its own independent agent session). CLI flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--web` | off | Run the web UI instead of the terminal UI. Binds loopback. On a local, non-SSH session it auto-opens your browser. |
+| `--bind <host:port>` | `127.0.0.1:7823` | Listen address. A non-loopback bind **requires** a token, else PeakBot refuses to start. |
+| `--token <secret>` | — | Shared secret guarding every route (assets, `/commands`, `/ws`). Falls back to `PEAKBOT_WEB_TOKEN` (preferred — keeps the secret out of shell history). |
+
+**Auth model.** When a token is set, the browser presents it once as
+`?token=…`; the server sets a `peakbot_token` cookie and all later requests —
+including the same-origin `/ws` upgrade — authenticate via that cookie (no
+frontend token-threading). The token in the URL lands in browser history, so
+it is designed to appear there only once (the cookie takes over). This is a
+single-operator shared secret, not a user system — see `webui.md` §8 non-goals.
+
+```bash
+# Local (loopback, no auth, auto-opens browser)
+peakbot --web
+
+# Remote access (token required for non-loopback)
+PEAKBOT_WEB_TOKEN=$(openssl rand -hex 16) peakbot --web --bind 0.0.0.0:7823
+# then open  http://<host>:7823/?token=<the-secret>
+```
+
 
 ## Extending
 
