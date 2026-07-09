@@ -32,6 +32,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 /// Process-wide inputs shared by every session. Built once in `main`,
 /// borrowed by each [`create_session`] call. The heavy handles
@@ -71,6 +72,10 @@ pub struct Session {
     pub action_sender: UnboundedSender<UiAction>,
     /// The active model alias, bound to this session's conversation.
     pub model_alias: String,
+    /// The conversation id this session is bound to — the registry key for
+    /// sticky web sessions. Minted (fresh) or adopted (resume) synchronously
+    /// in [`create_session`], so it is known the instant the session exists.
+    pub conversation_id: Uuid,
     /// The `run_loop` task. Private so only the factory spawns it; kept
     /// alive for the session's lifetime. It exits on its own when
     /// `action_sender` drops.
@@ -79,10 +84,15 @@ pub struct Session {
 
 /// Build one independent session and spawn its controller loop.
 ///
+/// `resume`: when `Some(id)`, adopt an existing persisted conversation
+/// (sticky-session reconnect); when `None`, mint a fresh one. Either way the
+/// conversation is initialised **synchronously** before the controller loop
+/// spawns, so [`Session::conversation_id`] is immediately valid.
+///
 /// Mirrors the historical `main` boot block: fresh `StateManager`,
 /// per-session `TodoTool`, `create_provider`, `AgentRunner::new` +
 /// `with_rebuild_context`, welcome state, then `tokio::spawn(run_loop)`.
-pub fn create_session(deps: &SessionDeps) -> Result<Session> {
+pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Session> {
     // Per-session Model. Storage (if any) is shared — it writes distinct
     // files per conversation id.
     let state_manager = match &deps.storage {
@@ -141,6 +151,20 @@ pub fn create_session(deps: &SessionDeps) -> Result<Session> {
     };
     state_manager.set_provider_name(boot_provider_name);
     state_manager.set_model_alias(boot_alias.clone());
+
+    // Initialise the conversation synchronously so `conversation_id` is valid
+    // before the controller loop spawns. `resume` best-effort adopts a
+    // persisted conversation; `ensure_boot_conversation` is idempotent, so it
+    // mints a fresh one iff the resume didn't produce a current conversation
+    // (unknown id, disabled storage, or `None`). The result is total: a
+    // current conversation always exists afterwards.
+    if let Some(id) = resume {
+        let _ = state_manager.load_conversation(id);
+    }
+    state_manager.ensure_boot_conversation(provider_info.model.as_str());
+    let conversation_id = state_manager
+        .get_current_conversation_id()
+        .expect("ensure_boot_conversation guarantees a current conversation");
 
     // Resolve the boot model's context_size (config or auto-detected);
     // drives ContextManager compaction thresholds.
@@ -205,6 +229,7 @@ pub fn create_session(deps: &SessionDeps) -> Result<Session> {
         state_manager,
         action_sender,
         model_alias: boot_alias,
+        conversation_id,
         _run_handle: run_handle,
     })
 }

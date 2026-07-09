@@ -676,28 +676,14 @@ impl AgentRunner {
                     msg_tx.send(QueueMessage::StopMarker).await.ok();
                 }
             };
-        // Initialize conversation in StateManager (single source of truth).
-        // The active wire identity (provider_name + model) was stamped by
-        // `main.rs` on the StateManager just before run_loop fired; we
-        // read it back here so saved conversations carry the right
-        // re-activation key. Falls back to the legacy `config_model`
-        // wire id with empty provider_name if the state hasn't been
-        // primed (test harnesses, mostly).
+        // Ensure a boot conversation exists. Idempotent: `create_session`
+        // already minted (fresh) or loaded (resume) one synchronously before
+        // spawning this loop, so this only fires for callers that bypass the
+        // factory (test harnesses). The active wire identity (provider_name +
+        // model) was stamped on the StateManager before run_loop; we read it
+        // back so saved conversations carry the right re-activation key.
         if let Some(ref sm) = state_manager {
-            let name = format!(
-                "Conversation {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M")
-            );
-            let provider_name = sm.get_provider_name();
-            let model = {
-                let m = sm.get_model();
-                if m.is_empty() {
-                    config_model.clone()
-                } else {
-                    m
-                }
-            };
-            sm.create_conversation(name, provider_name, model);
+            sm.ensure_boot_conversation(&config_model);
         }
 
         while let Some(action) = action_receiver.recv().await {

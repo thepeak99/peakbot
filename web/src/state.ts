@@ -140,6 +140,7 @@ export interface ConversationSummary {
   updated_at: string;
   message_count: number;
   model: string;
+  active: boolean;
 }
 
 // Served by `GET /commands` (src/ui/ui_trait.rs::SlashCommand). The single
@@ -152,14 +153,17 @@ export interface SlashCommand {
 
 export type OutboundMessage =
   | { type: "ready" }
+  | { type: "attached"; convo: string }
   | { type: "models_available"; active: string; models: ModelInfo[] }
   | { type: "state"; state: AppState }
   | { type: "conversations_list"; items: ConversationSummary[] }
   | { type: "error"; message: string };
 
 export type InboundMessage =
+  | { type: "attach"; convo: string | null }
   | { type: "send_message"; text: string }
   | { type: "stop" }
   | { type: "switch_model"; alias: string }
   | { type: "request_conversations" }
+  | { type: "kill_session"; convo: string }
   | { type: "shutdown" };

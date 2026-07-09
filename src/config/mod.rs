@@ -298,6 +298,40 @@ pub struct Config {
     /// When absent, both tools are skipped entirely (not registered).
     #[serde(default)]
     pub vector_db: Option<VectorDbConfig>,
+
+    /// Web UI (`peakbot --web`) settings — sticky-session expiry.
+    #[serde(default)]
+    pub web: WebConfig,
+}
+
+/// Web UI settings. Only the sticky-session reaper is configurable; all
+/// fields default, so an absent `web:` block is fine.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// Kill a session this many seconds after its last socket detaches
+    /// (default: 1800 = 30 min).
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// How often the reaper scans for expired sessions (default: 60 s).
+    #[serde(default = "default_reaper_tick_secs")]
+    pub reaper_tick_secs: u64,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            session_ttl_secs: default_session_ttl_secs(),
+            reaper_tick_secs: default_reaper_tick_secs(),
+        }
+    }
+}
+
+fn default_session_ttl_secs() -> u64 {
+    1800
+}
+fn default_reaper_tick_secs() -> u64 {
+    60
 }
 
 /// Multi-agent pipeline configuration
@@ -1236,6 +1270,7 @@ impl Default for Config {
             retry: RetryConfig::default(),
             pipeline: None,
             vector_db: None,
+            web: WebConfig::default(),
         }
     }
 }

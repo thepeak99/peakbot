@@ -97,6 +97,7 @@ export function App() {
             hasTranscript={hasTranscript}
             onOpen={() => send({ type: "request_conversations" })}
             onLoad={(id) => send({ type: "send_message", text: `/load ${id}` })}
+            onKill={(id) => send({ type: "kill_session", convo: id })}
           />
           {stats && state && (
             <StatsPanel stats={stats} context={adaptContext(state)} />

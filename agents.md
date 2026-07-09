@@ -595,14 +595,32 @@ mcp_servers:
 
 ### Web UI (`peakbot --web`)
 
-`peakbot --web` serves the embedded SPA + live chat over WebSocket (each
-browser tab drives its own independent agent session). CLI flags:
+`peakbot --web` serves the embedded SPA + live chat over WebSocket. CLI flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--web` | off | Run the web UI instead of the terminal UI. Binds loopback. On a local, non-SSH session it auto-opens your browser. |
 | `--bind <host:port>` | `127.0.0.1:7823` | Listen address. A non-loopback bind **requires** a token, else PeakBot refuses to start. |
 | `--token <secret>` | — | Shared secret guarding every route (assets, `/commands`, `/ws`). Falls back to `PEAKBOT_WEB_TOKEN` (preferred — keeps the secret out of shell history). |
+
+**Sticky sessions (issue #118).** A conversation is addressed in the URL as
+`?convo=<uuid>`, and a live agent session (StateManager + controller loop)
+stays bound to that conversation independently of any socket. A dropped
+WebSocket (refresh, network blip, server restart) re-attaches to the **same**
+running session on reconnect — transcript, todos, and stats survive. Multiple
+tabs on the same `?convo=` URL share one session and see the same state. A
+session is "active" while a socket-independent live session exists for it
+(registry membership, never persisted); the conversations picker marks active
+rows and can kill one for everyone attached. Idle sessions (no sockets
+attached) are reaped after `web.session_ttl_secs`. The session registry is
+**web-only** — the terminal (`--stdio`, REPL) Views remain single-session. See
+`src/ui/web/registry.rs`.
+
+```yaml
+web:
+  session_ttl_secs: 1800   # kill idle-unattached sessions after 30 min (default)
+  reaper_tick_secs: 60     # how often the reaper scans (default)
+```
 
 **Auth model.** When a token is set, the browser presents it once as
 `?token=…`; the server sets a `peakbot_token` cookie and all later requests —
