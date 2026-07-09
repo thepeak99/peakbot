@@ -79,7 +79,7 @@ export function adaptContext(s: AppState): ContextUsage {
 export function adaptTodos(s: AppState): TodoItem[] {
   return s.todo.items.map((t) => ({
     id: t.id,
-    text: t.content,
+    text: t.text,
     status: TODO_STATUS_MAP[t.status] ?? "pending",
   }));
 }

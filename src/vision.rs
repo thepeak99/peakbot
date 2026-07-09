@@ -5,8 +5,9 @@
 //! ## Entry points
 //!
 //! - [`parse_attachments_inline`] — strips `[img:TOKEN]` tokens from a user
-//!   buffer and resolves them to [`ImageAttachment`]s. TOKEN is a path when it
-//!   starts with `/`, `~`, or `./`; otherwise it must contain `://` (URL).
+//!   buffer and resolves them to [`ImageAttachment`]s. TOKEN is a `data:` URI
+//!   (browser paste/drop, decoded to `Base64`), a path when it starts with
+//!   `/`, `~`, or `./`, or otherwise a URL (must contain `://`).
 //! - [`load_image_from_path`] — direct path → attachment, enforcing
 //!   [`MAX_IMAGE_BYTES`] and media-type inference.
 //! - [`model_supports_vision`] — model name → whether image input is accepted.
@@ -96,6 +97,66 @@ pub fn media_type_from_extension(ext: &str) -> Option<ImageMediaType> {
     }
 }
 
+/// Detect `ImageMediaType` from an image MIME type (e.g. `"image/png"`).
+/// Mirrors [`media_type_from_extension`] for the `data:` URI grammar, where
+/// the media type is spelled as a MIME rather than a file extension.
+pub fn media_type_from_mime(mime: &str) -> Option<ImageMediaType> {
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some(ImageMediaType::PNG),
+        "image/jpeg" | "image/jpg" => Some(ImageMediaType::JPEG),
+        "image/gif" => Some(ImageMediaType::GIF),
+        "image/webp" => Some(ImageMediaType::WEBP),
+        _ => None,
+    }
+}
+
+/// Decode a `data:<mime>;base64,<payload>` URI into a `Base64` attachment.
+///
+/// Only base64-encoded image data URIs are accepted — the browser always
+/// produces these for `FileReader.readAsDataURL` / canvas exports. A missing
+/// `;base64`, missing comma, unsupported MIME, or bad base64 is an
+/// [`AttachmentError::InvalidToken`]; oversize payloads are
+/// [`AttachmentError::TooLarge`] (checked on the decoded bytes).
+fn load_image_from_data_uri(token: &str) -> Result<ImageAttachment, AttachmentError> {
+    let invalid = || AttachmentError::InvalidToken(token.to_string());
+
+    let body = token.strip_prefix("data:").ok_or_else(invalid)?;
+    let (header, payload) = body.split_once(',').ok_or_else(invalid)?;
+    let mime = header.strip_suffix(";base64").ok_or_else(invalid)?;
+    let media_type = media_type_from_mime(mime)
+        .ok_or_else(|| AttachmentError::UnsupportedMediaType(mime.to_string()))?;
+
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| invalid())?;
+
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(AttachmentError::TooLarge {
+            path: PathBuf::from("<pasted image>"),
+            size: bytes.len(),
+            max: MAX_IMAGE_BYTES,
+        });
+    }
+
+    Ok(ImageAttachment {
+        display_name: format!("pasted.{}", extension_for(&media_type)),
+        source: ImageSource::Base64 { bytes, media_type },
+        detail: None,
+    })
+}
+
+/// Canonical extension for a media type — used only to name pasted images.
+fn extension_for(media_type: &ImageMediaType) -> &'static str {
+    match media_type {
+        ImageMediaType::PNG => "png",
+        ImageMediaType::JPEG => "jpg",
+        ImageMediaType::GIF => "gif",
+        ImageMediaType::WEBP => "webp",
+        _ => "img",
+    }
+}
+
 /// Load an image from disk. Infers media type from the extension, enforces
 /// [`MAX_IMAGE_BYTES`], and returns a `Base64` attachment.
 pub fn load_image_from_path(path: &Path) -> Result<ImageAttachment, AttachmentError> {
@@ -150,6 +211,7 @@ pub fn load_image_from_path(path: &Path) -> Result<ImageAttachment, AttachmentEr
 /// Parse inline `[img:TOKEN]` tokens out of a user input buffer.
 ///
 /// Token resolution:
+/// - `data:<mime>;base64,<payload>` → inline bytes (`Base64`) — browser paste/drop.
 /// - Starts with `/`, `~`, or `./` → filesystem path (loaded as `Base64`).
 /// - Contains `://` → URL (`ImageSource::Url`).
 /// - Anything else → [`AttachmentError::InvalidToken`].
@@ -198,7 +260,9 @@ pub fn parse_attachments_inline(
 }
 
 fn resolve_token(token: &str) -> Result<ImageAttachment, AttachmentError> {
-    if token.starts_with('/') || token.starts_with("./") {
+    if token.starts_with("data:") {
+        load_image_from_data_uri(token)
+    } else if token.starts_with('/') || token.starts_with("./") {
         load_image_from_path(Path::new(token))
     } else if let Some(rest) = token.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -419,6 +483,79 @@ mod tests {
         assert_eq!(text, "look ");
         assert_eq!(atts.len(), 1);
         assert!(matches!(atts[0].source, ImageSource::Url(_)));
+    }
+
+    #[test]
+    fn media_type_from_mime_recognizes_image_mimes() {
+        assert_eq!(media_type_from_mime("image/png"), Some(ImageMediaType::PNG));
+        assert_eq!(
+            media_type_from_mime("image/jpeg"),
+            Some(ImageMediaType::JPEG)
+        );
+        assert_eq!(
+            media_type_from_mime("IMAGE/JPG"),
+            Some(ImageMediaType::JPEG)
+        );
+        assert_eq!(media_type_from_mime("image/gif"), Some(ImageMediaType::GIF));
+        assert_eq!(
+            media_type_from_mime("image/webp"),
+            Some(ImageMediaType::WEBP)
+        );
+        assert_eq!(media_type_from_mime("image/heic"), None);
+        assert_eq!(media_type_from_mime("text/plain"), None);
+    }
+
+    #[test]
+    fn parse_attachments_inline_decodes_data_uri() {
+        use base64::Engine;
+        let raw = b"the-real-png-bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let input = format!("see [img:data:image/png;base64,{b64}] here");
+        let (text, atts) = parse_attachments_inline(&input).expect("parse");
+        assert_eq!(text, "see  here");
+        assert_eq!(atts.len(), 1);
+        match &atts[0].source {
+            ImageSource::Base64 { bytes, media_type } => {
+                assert_eq!(bytes, raw);
+                assert_eq!(*media_type, ImageMediaType::PNG);
+            }
+            _ => panic!("expected Base64 variant"),
+        }
+        assert_eq!(atts[0].display_name, "pasted.png");
+    }
+
+    #[test]
+    fn parse_attachments_inline_data_uri_too_large() {
+        use base64::Engine;
+        let big = vec![0u8; MAX_IMAGE_BYTES + 1];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&big);
+        let input = format!("[img:data:image/png;base64,{b64}]");
+        let err = parse_attachments_inline(&input).expect_err("should error");
+        assert!(matches!(err, AttachmentError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn parse_attachments_inline_data_uri_unsupported_mime() {
+        // Well-formed base64, but a MIME we don't accept.
+        let input = "[img:data:image/heic;base64,AAAA]";
+        let err = parse_attachments_inline(input).expect_err("should error");
+        assert!(matches!(err, AttachmentError::UnsupportedMediaType(_)));
+    }
+
+    #[test]
+    fn parse_attachments_inline_data_uri_malformed() {
+        // No comma, no `;base64`, and bad base64 all collapse to InvalidToken.
+        for input in [
+            "[img:data:image/png;base64]",       // no comma
+            "[img:data:image/png,AAAA]",         // not base64-tagged
+            "[img:data:image/png;base64,@@@@@]", // bad base64 payload
+        ] {
+            let err = parse_attachments_inline(input).expect_err("should error");
+            assert!(
+                matches!(err, AttachmentError::InvalidToken(_)),
+                "expected InvalidToken for {input}"
+            );
+        }
     }
 
     #[test]
