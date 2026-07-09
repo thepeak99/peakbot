@@ -638,6 +638,36 @@ PEAKBOT_WEB_TOKEN=$(openssl rand -hex 16) peakbot --web --bind 0.0.0.0:7823
 # then open  http://<host>:7823/?token=<the-secret>
 ```
 
+### Testing & debugging the Web UI
+
+The web UI is a JS SPA that talks to PeakBot over WebSocket. When iterating on
+`src/ui/web/` or chasing a UI-only bug (layout, render, asset 404, WS
+handshake, sticky-session reattach), load the [`playwright-cli`](.agents/skills/playwright-cli/SKILL.md)
+skill — it is the recommended way to drive a real browser against
+`peakbot --web`. It captures accessibility snapshots (better than screenshots
+for verifying structure), records console + page error logs under
+`.playwright-cli/`, and traces `/ws` traffic so you can confirm messages flow
+on reconnect.
+
+Typical loop:
+
+```bash
+# 1. start the web build (separate terminal — leave running)
+make dev                   # backend on :7823, Vite HMR on :5173
+
+# 2. drive a headless browser from the agent
+playwright-cli open http://localhost:5173/?token=$PEAKBOT_WEB_TOKEN
+playwright-cli snapshot     # see refs (e15, …) for every interactive element
+playwright-cli click e15
+playwright-cli console      # last console + page errors
+```
+
+For token-gated binds, prefer `PEAKBOT_WEB_TOKEN` over `--token` so the secret
+stays out of shell history. When a WS bug is suspected, replay the run with
+`playwright-cli` tracing on — it surfaces handshake, reattach, and close
+frames that the server log alone doesn't show. For pure server-side WS work
+(no UI), `websocat ws://localhost:7823/ws` is still the lightest probe.
+
 
 ## Extending
 
