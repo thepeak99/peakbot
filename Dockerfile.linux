@@ -39,8 +39,12 @@ RUN cargo build --target ${TARGET} --release && \
 
 # build.rs MUST be in the COPY set — the dummy-main dep-cache layer doesn't
 # run it, and a new build.rs would otherwise silently never execute.
+# `build/` is required because build.rs uses `include_str!("build/stub_index.html")`
+# at compile time (the fail-safe stub for node-free builds); without it the
+# build script itself fails to compile.
 # web/dist is the Node-built SPA bundle.
 COPY build.rs ./
+COPY build/ build/
 COPY --from=web /web/dist ./web/dist
 COPY src/ src/
 
