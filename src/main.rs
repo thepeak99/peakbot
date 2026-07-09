@@ -20,12 +20,26 @@ struct Cli {
     #[arg(long)]
     stdio: bool,
 
-    /// Run the web UI in a browser instead of the terminal UI. Phase 0
-    /// ships the static shell (SPA + asset pipeline); Phase 1 adds live
-    /// chat over WebSocket. The address is fixed (loopback only) for now;
-    /// `--port` / `--bind` flags are Phase 4.
+    /// Run the web UI in a browser instead of the terminal UI. Serves the
+    /// embedded SPA + live chat over WebSocket; each browser tab drives its
+    /// own independent agent session. Binds loopback by default.
     #[arg(long)]
     web: bool,
+
+    /// Address the `--web` server listens on (`host:port`). Defaults to
+    /// loopback (`127.0.0.1:7823`). Binding beyond loopback requires
+    /// `--token`/`PEAKBOT_WEB_TOKEN` — an unauthenticated agent must never
+    /// be exposed to the network.
+    #[arg(long, value_name = "ADDR", requires = "web")]
+    bind: Option<std::net::SocketAddr>,
+
+    /// Shared secret guarding the `--web` server. When set, every request
+    /// (assets, `/commands`, `/ws`) must present it via `?token=…` (first
+    /// load, which then sets a cookie) or the `peakbot_token` cookie.
+    /// Falls back to the `PEAKBOT_WEB_TOKEN` env var (preferred — keeps the
+    /// secret out of shell history and `ps`).
+    #[arg(long, value_name = "SECRET", requires = "web")]
+    token: Option<String>,
 }
 
 /// Check if the provider has an API key configured.
@@ -248,9 +262,28 @@ async fn main() -> Result<()> {
     // the deps and never boots a single shared session. The TUI and stdio
     // Views are single-session: build one, drive it, drop it (teardown).
     if cli.web {
-        let addr: std::net::SocketAddr = peakbot::ui::DEFAULT_WEB_ADDR
-            .parse()
-            .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal");
+        // Resolve the bind address (default loopback) and the shared secret
+        // (flag > env). Parse-at-the-boundary: validate here, then trust the
+        // Option<token> inside WebUi.
+        let addr: std::net::SocketAddr = cli.bind.unwrap_or_else(|| {
+            peakbot::ui::DEFAULT_WEB_ADDR
+                .parse()
+                .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal")
+        });
+        let token = cli
+            .token
+            .or_else(|| std::env::var("PEAKBOT_WEB_TOKEN").ok())
+            .filter(|t| !t.trim().is_empty());
+
+        // An agent that can run shell commands must never be reachable on a
+        // non-loopback address without a secret. Make the footgun impossible.
+        if !addr.ip().is_loopback() && token.is_none() {
+            anyhow::bail!(
+                "refusing to bind the web UI to non-loopback {addr} without a token — \
+                 set --token or PEAKBOT_WEB_TOKEN"
+            );
+        }
+
         let active_alias = model_registry
             .default_alias()
             .map(|a| a.to_string())
@@ -260,6 +293,7 @@ async fn main() -> Result<()> {
             session_deps.clone(),
             build_models_snapshot(&model_registry),
             active_alias,
+            token,
         );
         ui.init().await?;
         ui.run().await?;
