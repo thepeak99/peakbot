@@ -187,6 +187,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         bash_config: deps.config.bash.clone(),
         pipeline_registry: deps.pipeline_registry.clone(),
         shell_kind: deps.shell_kind.clone(),
+        skills: deps.skills.clone(),
         vector_store: deps.vector_store.clone(),
     };
 

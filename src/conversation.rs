@@ -199,6 +199,13 @@ pub struct Conversation {
     pub provider_name: String,
     /// Wire id of the model used (e.g. `anthropic/claude-3.7-sonnet`).
     pub model: String,
+    /// Working directory this conversation was rooted in. A third axis
+    /// of conversation identity alongside `(provider_name, model)`:
+    /// `/cd` rewrites it, `/load` re-activates it (best-effort — a path
+    /// that no longer exists is skipped with a warning). Defaults to
+    /// empty for pre-cwd files, which then simply don't chdir on load.
+    #[serde(default)]
+    pub cwd: String,
     /// Additional metadata (token count, cost, etc.)
     pub metadata: ConversationMetadata,
     /// Todo list persisted with this conversation
@@ -216,6 +223,12 @@ impl Conversation {
     /// be renamed in `config.yaml` without breaking saved conversations.
     pub fn new(name: String, provider_name: String, model: String) -> Self {
         let now = Utc::now();
+        // cwd is captured at creation time — after any `/cd` chdir has
+        // already run — so it always reflects the tree this conversation
+        // is actually rooted in.
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Conversation {
             id: Uuid::new_v4(),
             name,
@@ -225,6 +238,7 @@ impl Conversation {
             messages: Vec::new(),
             provider_name,
             model,
+            cwd,
             metadata: ConversationMetadata::default(),
             todos: crate::tools::todo::TodoList::new(),
         }
@@ -511,6 +525,39 @@ mod tests {
         let conv: Conversation = serde_json::from_str(json).unwrap();
         assert_eq!(conv.provider_name, "");
         assert_eq!(conv.model, "anthropic/claude-3.7-sonnet");
+    }
+
+    /// Pre-cwd conversation files have no `cwd` field. Loading them
+    /// must default it to the empty string — `/load` then simply skips
+    /// the chdir and stays in the current tree rather than failing.
+    #[test]
+    fn pre_cwd_file_without_cwd_loads_with_empty_cwd() {
+        let json = r#"{
+            "id": "10da8b9d-f242-4786-9c75-c3fbc2530f1f",
+            "name": "Old convo",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "messages": [],
+            "provider_name": "openrouter",
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {"message_count": 0}
+        }"#;
+        let conv: Conversation = serde_json::from_str(json).unwrap();
+        assert_eq!(conv.cwd, "");
+    }
+
+    /// A new conversation captures the process cwd and round-trips it
+    /// through serde without loss.
+    #[test]
+    fn new_conversation_persists_cwd() {
+        let conv = Conversation::new("Test".into(), "openrouter".into(), "m".into());
+        let expected = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert_eq!(conv.cwd, expected);
+        let json = serde_json::to_string(&conv).unwrap();
+        let parsed: Conversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cwd, expected);
     }
 
     /// New conversations carry both `provider_name` and `model` —

@@ -48,6 +48,19 @@ pub enum UiAction {
     /// and rebuilds with the chosen alias's `ProviderConfig`. See
     /// `multi-model.md` and `process_command_internal::"/model"`.
     SwitchModel(String),
+
+    /// Change the working directory and start a fresh conversation. Sent
+    /// by the View after the user confirms the `/cd <path>` dialog (or
+    /// directly, with no dialog, when the current conversation is empty).
+    /// The path is already validated (exists, is a dir, canonicalised)
+    /// against the filesystem before this action is emitted.
+    ///
+    /// The agent loop dequeues this between turns, `set_current_dir`s to
+    /// the new path, rebuilds the system prompt (so cwd/agents.md refresh)
+    /// and the `DynAgent` on the *same* model, then runs the same reset
+    /// semantics as `/new`. Independent of `SwitchModel` — the two axes
+    /// don't disturb each other.
+    ChangeCwd(String),
 }
 
 /// Actions that can be performed on a TODO item (used by TodoState in app_state)
@@ -109,6 +122,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("export", "Export a conversation (json|markdown)", true),
         SlashCommand::new("rename", "Rename the current conversation", true),
         SlashCommand::new("model", "List models, or switch with /model <alias>", true),
+        SlashCommand::new(
+            "cd",
+            "Show the working directory, or change it with /cd <path>",
+            true,
+        ),
         SlashCommand::new("bg", "List background processes (bash_bg)", false),
         SlashCommand::new("stop", "Stop the agent (interrupt current task)", false),
         SlashCommand::new("exit", "Quit PeakBot (no confirmation)", false),
@@ -312,6 +330,7 @@ mod tests {
                 "export",
                 "rename",
                 "model",
+                "cd",
                 "bg",
                 "stop",
                 "exit",
@@ -345,6 +364,7 @@ mod tests {
         assert!(by_name("delete"));
         assert!(by_name("export"));
         assert!(by_name("rename"));
+        assert!(by_name("cd"));
     }
 
     #[test]
@@ -387,8 +407,8 @@ mod tests {
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        // "c" matches: context, compact, conversations
-        assert_eq!(names, vec!["context", "compact", "conversations"]);
+        // "c" matches: context, compact, conversations, cd
+        assert_eq!(names, vec!["context", "compact", "conversations", "cd"]);
     }
 
     #[test]

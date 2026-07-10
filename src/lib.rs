@@ -94,6 +94,12 @@ enum QueueMessage {
     /// before the action is sent). The agent loop dequeues this between
     /// turns and runs `rebuild_agent_for_alias`.
     SwitchModel(String),
+    /// Change the working directory and restart on a fresh conversation.
+    /// Carries the validated, canonicalised path (validation happens in
+    /// the View before the action is sent). Dequeued between turns and
+    /// handled by `handle_change_cwd`. Same rebuild seam as SwitchModel,
+    /// different axis. See ticket #124.
+    ChangeCwd(String),
     /// One or more `bash_bg` processes have output ready. Payload is
     /// empty — the agent loop drains every bg buffer in one pass.
     /// Multiple notifications coalesce naturally (the drain returns
@@ -332,6 +338,10 @@ pub struct RebuildContext {
     pub pipeline_registry: Option<Arc<crate::pipeline::SubAgentRegistry>>,
     /// Detected shell kind — OS-level, so it persists across `/model` switches.
     pub shell_kind: Option<crate::tools::ShellKind>,
+    /// Skill registry — needed to rebuild the system prompt when `/cd`
+    /// changes the working directory (the prompt embeds both the cwd and
+    /// the skills section). Persists across switches like `shell_kind`.
+    pub skills: crate::skills::SkillRegistry,
     /// Shared vector store (doc_index / doc_search), if configured. Cheap to
     /// clone (Arc-backed); persists across `/model` switches like the MCP
     /// handles, since the DB handle is provider-independent.
@@ -786,6 +796,17 @@ impl AgentRunner {
                     }
                     msg_tx.send(QueueMessage::SwitchModel(alias)).await.ok();
                 }
+
+                UiAction::ChangeCwd(path) => {
+                    // Same shape as SwitchModel — forward the validated
+                    // path to the agent loop (sole owner of the agent
+                    // handle) and count it as pending input so the status
+                    // bar shows activity until the rebuild completes.
+                    if let Some(ref sm) = state_manager {
+                        sm.increment_pending_input();
+                    }
+                    msg_tx.send(QueueMessage::ChangeCwd(path)).await.ok();
+                }
             }
         }
     }
@@ -815,7 +836,7 @@ impl AgentRunner {
         initial_event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
         session_hook_cell: SharedSessionHook,
         provider_info_cell: SharedProviderInfo,
-        rebuild_ctx: Option<RebuildContext>,
+        mut rebuild_ctx: Option<RebuildContext>,
         compaction_model: Option<Arc<CompactionModel>>,
     ) {
         use std::sync::atomic::Ordering;
@@ -868,6 +889,7 @@ impl AgentRunner {
                     Some(QueueMessage::UserMessage { .. })
                     | Some(QueueMessage::Command(_))
                     | Some(QueueMessage::SwitchModel(_))
+                    | Some(QueueMessage::ChangeCwd(_))
                     | Some(QueueMessage::BackgroundOutputReady) => {
                         // Discarded — pending counter was already zeroed by
                         // the event loop's drain trigger. (SwitchModel is
@@ -1038,7 +1060,7 @@ impl AgentRunner {
                             &session_hook_cell,
                             &provider_info_cell,
                             &mut event_processor,
-                            rebuild_ctx.as_ref(),
+                            rebuild_ctx.as_mut(),
                         )
                         .await;
                     }
@@ -1096,6 +1118,38 @@ impl AgentRunner {
                             completion_tx.send(CompletionResult::CommandDone).ok();
                         }
                     }
+                }
+
+                Some(QueueMessage::ChangeCwd(path)) => {
+                    // Same rebuild seam as SwitchModel, different axis:
+                    // chdir + rebuild the system prompt + rebuild the
+                    // agent on the *current* model, then reset the
+                    // conversation like /new. The View already validated
+                    // the path; we re-validate defensively.
+                    if let Some(ref sm) = state_manager {
+                        sm.set_running(true);
+                    }
+                    let outcome = Self::handle_change_cwd(
+                        &path,
+                        &mut agent,
+                        &mut config,
+                        &state_manager,
+                        &session_hook_cell,
+                        &provider_info_cell,
+                        &mut event_processor,
+                        rebuild_ctx.as_mut(),
+                    )
+                    .await;
+                    if let Some(ref sm) = state_manager {
+                        sm.decrement_pending_input();
+                        sm.set_running(false);
+                    }
+                    if let Err(msg) = outcome
+                        && let Some(ref sm) = state_manager
+                    {
+                        sm.add_system_message(format!("❌ /cd: {msg}"));
+                    }
+                    completion_tx.send(CompletionResult::CommandDone).ok();
                 }
 
                 None => {
@@ -1197,6 +1251,114 @@ impl AgentRunner {
             "🔁 New conversation on {} ({} · {})",
             resolved.alias, resolved.provider_name, resolved.model_name
         ));
+
+        Ok(())
+    }
+
+    /// Change the working directory and rebuild on a fresh conversation.
+    /// The cwd sibling of [`Self::handle_switch_model`] — same reset +
+    /// rebuild seam, different axis.
+    ///
+    /// Sequence (order matters — see the "process-global mutation" note):
+    /// 1. `clear_bg()` first, so no `bash_bg` reader thread straddles the
+    ///    chdir with a half-old, half-new view of the tree.
+    /// 2. `set_current_dir(path)` — the load-bearing act. Everything the
+    ///    prompt derives from the cwd (`build_system_prompt` reads
+    ///    `current_dir()` + `./agents.md`) and the `bash` tool's inherited
+    ///    cwd flip here.
+    /// 3. Rebuild the system prompt and store it back into
+    ///    `ctx.system_prompt`, so a later `/model` switch keeps the new
+    ///    cwd (the two axes are independent — ticket #124).
+    /// 4. Rebuild the agent on the *current* model, then reset the
+    ///    conversation like `/new`.
+    ///
+    /// The View pre-validated `path`; we re-validate defensively (config
+    /// or the filesystem may have changed under us).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_change_cwd(
+        path: &str,
+        agent_slot: &mut Arc<DynAgent>,
+        config: &mut Config,
+        state_manager: &Option<Arc<StateManager>>,
+        session_hook_cell: &SharedSessionHook,
+        provider_info_cell: &SharedProviderInfo,
+        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
+        rebuild_ctx: Option<&mut RebuildContext>,
+    ) -> Result<(), String> {
+        let Some(ctx) = rebuild_ctx else {
+            return Err(
+                "model registry not configured (legacy single-provider boot — restart with a \
+                 `providers:` block to enable /cd)"
+                    .to_string(),
+            );
+        };
+        // Re-validate: the path must still be an existing directory.
+        let target = std::path::Path::new(path);
+        if !target.is_dir() {
+            return Err(format!("not a directory: {path}"));
+        }
+        // Resolve the *current* model — /cd keeps the model, only the cwd
+        // changes. Prefer the active alias; fall back to the wire id.
+        let sm = state_manager
+            .clone()
+            .ok_or_else(|| "state manager required for /cd".to_string())?;
+        let resolved = ctx
+            .registry
+            .resolve(&sm.get_model_alias())
+            .or_else(|| {
+                ctx.registry
+                    .find_by_wire_id(&sm.get_provider_name(), &sm.get_model())
+            })
+            .ok_or_else(|| "current model not found in registry".to_string())?
+            .clone();
+
+        // Kill bg processes BEFORE the chdir so no reader thread straddles
+        // it — they were rooted in the old tree anyway (ticket #124).
+        sm.clear_bg();
+
+        // The load-bearing mutation. Process-global; safe here because we
+        // run between turns (no tool in flight) and just cleared bg.
+        std::env::set_current_dir(target)
+            .map_err(|e| format!("failed to change directory to {path}: {e}"))?;
+
+        // Rebuild the prompt against the new cwd + refreshed agents.md and
+        // persist it into ctx so subsequent /model switches keep the cwd.
+        ctx.system_prompt = build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref());
+
+        Self::rebuild_agent_for_resolved(
+            &resolved,
+            agent_slot,
+            config,
+            &sm,
+            session_hook_cell,
+            provider_info_cell,
+            event_processor,
+            state_manager,
+            ctx,
+        )
+        .await?;
+
+        // Reset conversation-scoped state — same path as /new and /model.
+        // `create_conversation` captures the new cwd into the metadata
+        // (Conversation::new reads current_dir, which we just changed).
+        sm.clear_chat();
+        sm.reset_stats();
+        sm.clear_all_todos();
+        sm.reset_bash_panel();
+        let convo_name = format!(
+            "Conversation {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M")
+        );
+        sm.create_conversation(
+            convo_name,
+            resolved.provider_name.clone(),
+            resolved.model_name.clone(),
+        );
+        sm.set_model(resolved.model_name.clone());
+        sm.set_provider_name(resolved.provider_name.clone());
+        sm.set_model_alias(resolved.alias.clone());
+
+        sm.add_system_message(format!("📁 New conversation in {path}"));
 
         Ok(())
     }
@@ -1366,7 +1528,7 @@ impl AgentRunner {
         session_hook_cell: &SharedSessionHook,
         provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
-        rebuild_ctx: Option<&RebuildContext>,
+        rebuild_ctx: Option<&mut RebuildContext>,
     ) {
         let Some(sm) = state_manager else { return };
         let Some(ctx) = rebuild_ctx else { return };
@@ -1376,8 +1538,40 @@ impl AgentRunner {
         };
         let saved_provider = conv.provider_name.clone();
         let saved_model = conv.model.clone();
-        // No-op if the running agent is already on this wire id.
-        if sm.get_provider_name() == saved_provider && sm.get_model() == saved_model {
+        let saved_cwd = conv.cwd.clone();
+
+        let wire_id_changed =
+            sm.get_provider_name() != saved_provider || sm.get_model() != saved_model;
+
+        // Restore the saved cwd best-effort: only if it's non-empty (pre-cwd
+        // files default to ""), actually differs, and still exists. A gone
+        // path is warned about, not fatal — the load already succeeded.
+        let current_cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut cwd_changed = false;
+        if !saved_cwd.is_empty() && saved_cwd != current_cwd {
+            if std::path::Path::new(&saved_cwd).is_dir() {
+                if let Err(e) = std::env::set_current_dir(&saved_cwd) {
+                    sm.add_system_message(format!(
+                        "⚠ /load: could not restore working directory {saved_cwd}: {e}"
+                    ));
+                } else {
+                    // Kill bg processes rooted in the previous tree, then
+                    // refresh the prompt for the restored cwd/agents.md.
+                    sm.clear_bg();
+                    ctx.system_prompt = build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref());
+                    cwd_changed = true;
+                }
+            } else {
+                sm.add_system_message(format!(
+                    "⚠ /load: saved working directory no longer exists: {saved_cwd}"
+                ));
+            }
+        }
+
+        // Nothing to rebuild if neither axis moved.
+        if !wire_id_changed && !cwd_changed {
             return;
         }
         let Some(resolved) = ctx.registry.find_by_wire_id(&saved_provider, &saved_model) else {
@@ -2204,6 +2398,30 @@ impl AgentRunner {
                     sm.add_system_message(
                         "❌ /model: not available in this build. Configure a `providers:` \
                          block in config.yaml and restart. See `multi-model.md`."
+                            .to_string(),
+                    );
+                }
+            }
+            _ if cmd_lower.trim_end() == "/cd" => {
+                // Bare /cd — print the current working directory for
+                // orientation. Pure read; works in every View.
+                if let Some(sm) = state_manager {
+                    let cwd = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    sm.add_system_message(cwd);
+                }
+            }
+            _ if cmd_lower.starts_with("/cd ") => {
+                // The View should have intercepted `/cd <path>` (validate
+                // + confirm + emit ChangeCwd). Reaching here means no
+                // registry is attached (legacy single-provider boot or a
+                // non-REPL View) — emit a helpful diagnostic rather than a
+                // silent no-op.
+                if let Some(sm) = state_manager {
+                    sm.add_system_message(
+                        "❌ /cd: not available in this build. Configure a `providers:` \
+                         block in config.yaml and restart."
                             .to_string(),
                     );
                 }

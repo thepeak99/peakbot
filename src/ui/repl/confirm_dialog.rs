@@ -55,6 +55,13 @@ pub enum ConfirmAction {
         /// looks anything up.
         provider_descriptor: String,
     },
+    /// Change the working directory and start a new conversation.
+    /// View dispatches `UiAction::ChangeCwd(path)` on confirm.
+    ChangeCwd {
+        /// Canonicalised absolute path, already validated (exists + dir)
+        /// at the call site.
+        path: String,
+    },
 }
 
 /// Centered modal confirmation dialog. View-owned state.
@@ -102,6 +109,20 @@ impl ConfirmDialog {
             action: ConfirmAction::SwitchModel {
                 alias: alias.to_string(),
                 provider_descriptor: provider_descriptor.to_string(),
+            },
+        }
+    }
+
+    /// Build a `/cd` change-directory confirmation dialog.
+    pub fn change_cwd(path: &str) -> Self {
+        Self {
+            title: "CHANGE DIRECTORY?".into(),
+            question: format!("Switch to {path}? Starts a new conversation."),
+            yes_label: "Yes, switch".into(),
+            no_label: "No, stay".into(),
+            yes_selected: false,
+            action: ConfirmAction::ChangeCwd {
+                path: path.to_string(),
             },
         }
     }
@@ -238,6 +259,16 @@ mod tests {
                 assert_eq!(alias, "oai-gpt4");
                 assert_eq!(provider_descriptor, "openai · gpt-4o");
             }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert!(!d.yes_selected, "default-deny");
+    }
+
+    #[test]
+    fn change_cwd_dialog_carries_path() {
+        let d = ConfirmDialog::change_cwd("/tmp/project");
+        match &d.action {
+            ConfirmAction::ChangeCwd { path } => assert_eq!(path, "/tmp/project"),
             other => panic!("wrong variant: {other:?}"),
         }
         assert!(!d.yes_selected, "default-deny");
