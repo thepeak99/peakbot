@@ -35,7 +35,9 @@
 use crate::session::SessionDeps;
 use crate::ui::Ui;
 use crate::ui::ui_trait::builtin_commands;
-use crate::ui::wire::{InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot};
+use crate::ui::wire::{
+    InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot, build_dir_listing,
+};
 use crate::{StateManager, UiAction};
 use anyhow::Result;
 use axum::{
@@ -473,6 +475,10 @@ fn dispatch_inbound(
         Ok(InboundMessage::SwitchModel { alias }) => {
             action_sender.send(UiAction::SwitchModel(alias)).is_ok()
         }
+        Ok(InboundMessage::SwitchCwd { path }) => {
+            action_sender.send(UiAction::ChangeCwd(path)).is_ok()
+        }
+        Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
             let items = build_conversations_snapshot(state_manager, &registry.active_ids());
             out_tx

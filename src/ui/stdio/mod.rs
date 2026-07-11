@@ -54,7 +54,9 @@
 //! onto an MPSC; a single writer task drains it and serialises to
 //! stdout. NDJSON line atomicity is preserved by construction.
 
-use crate::ui::wire::{InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot};
+use crate::ui::wire::{
+    InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot, build_dir_listing,
+};
 use crate::{StateManager, Ui, UiAction};
 use anyhow::Result;
 use std::sync::Arc;
@@ -196,6 +198,16 @@ async fn run_stdin_loop(
             }
             Ok(InboundMessage::SwitchModel { alias }) => {
                 if action_sender.send(UiAction::SwitchModel(alias)).is_err() {
+                    break;
+                }
+            }
+            Ok(InboundMessage::SwitchCwd { path }) => {
+                if action_sender.send(UiAction::ChangeCwd(path)).is_err() {
+                    break;
+                }
+            }
+            Ok(InboundMessage::ListDir { path }) => {
+                if out_tx.send(build_dir_listing(&path)).is_err() {
                     break;
                 }
             }

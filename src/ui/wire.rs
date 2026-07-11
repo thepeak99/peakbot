@@ -13,6 +13,8 @@
 //! {"type":"send_message","text":"hello"}   // slash commands ride this too
 //! {"type":"stop"}
 //! {"type":"switch_model","alias":"sonnet"}
+//! {"type":"switch_cwd","path":"~/proj"}    // maps to UiAction::ChangeCwd
+//! {"type":"list_dir","path":"~/proj"}      // browse for the cwd picker
 //! {"type":"request_conversations"}
 //! {"type":"kill_session","convo":"aabbcc-…"}
 //! {"type":"shutdown"}
@@ -26,6 +28,7 @@
 //! {"type":"models_available","active":"sonnet","models":[...]}
 //! {"type":"state","state":{...AppState...}}
 //! {"type":"conversations_list","items":[...]}
+//! {"type":"dir_listing","path":"…","parent":"…","entries":[...],"error":null}
 //! {"type":"error","message":"..."}
 //! ```
 
@@ -52,6 +55,19 @@ pub(crate) enum InboundMessage {
     Stop,
     SwitchModel {
         alias: String,
+    },
+    /// Commit a new working directory (the cwd picker's "Use this
+    /// directory"). Maps to [`crate::ui::ui_trait::UiAction::ChangeCwd`] —
+    /// same reset-and-rebuild seam as `/cd`. The backend re-resolves and
+    /// validates `path`; the client never canonicalises.
+    SwitchCwd {
+        path: String,
+    },
+    /// Browse a directory for the cwd picker. Answered with a one-shot
+    /// [`OutboundMessage::DirListing`] — a transient request/response, not
+    /// session state (see that variant's note).
+    ListDir {
+        path: String,
     },
     RequestConversations,
     /// End an active session for *everyone* attached to it (dropdown "kill").
@@ -86,6 +102,71 @@ pub fn build_models_snapshot(registry: &ModelRegistry) -> Vec<ModelInfo> {
             context_size: rm.context_size,
         })
         .collect()
+}
+
+/// One entry in a [`OutboundMessage::DirListing`]. Directories drive
+/// navigation; files are shown greyed (this is a *folder* picker).
+#[derive(Debug, Serialize)]
+pub(crate) struct DirEntryWire {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// Build a `dir_listing` reply for `path`. Resolves via the shared `/cd`
+/// resolver (expands `~`, canonicalises, validates it's a directory), then
+/// reads the entries. Any failure is folded into the returned frame's
+/// `error` (empty `entries`), so the picker renders it inline rather than
+/// dropping the frame. Directories sort first, then case-insensitive by
+/// name. Hidden entries (leading `.`) are omitted — the picker is for
+/// choosing a project cwd, not a file manager.
+pub(crate) fn build_dir_listing(path: &str) -> OutboundMessage {
+    let resolved = match crate::ui::repl::repl_impl::resolve_cd_path(path) {
+        Ok(p) => p,
+        Err(e) => {
+            return OutboundMessage::DirListing {
+                path: path.to_string(),
+                parent: None,
+                entries: Vec::new(),
+                error: Some(e),
+            };
+        }
+    };
+    let dir = std::path::Path::new(&resolved);
+    let parent = dir.parent().map(|p| p.to_string_lossy().into_owned());
+
+    let mut entries: Vec<DirEntryWire> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    return None;
+                }
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                Some(DirEntryWire { name, is_dir })
+            })
+            .collect(),
+        Err(e) => {
+            return OutboundMessage::DirListing {
+                path: resolved,
+                parent,
+                entries: Vec::new(),
+                error: Some(format!("cannot read directory: {e}")),
+            };
+        }
+    };
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    OutboundMessage::DirListing {
+        path: resolved,
+        parent,
+        entries,
+        error: None,
+    }
 }
 
 /// Trimmed subset of `ConversationSummary` for a dropdown picker
@@ -127,6 +208,19 @@ pub(crate) enum OutboundMessage {
     State { state: Box<AppState> },
     /// Reply to `request_conversations`; empty when no storage is configured.
     ConversationsList { items: Vec<ConversationSummaryWire> },
+    /// One-shot answer to `list_dir` — a transient request/response for the
+    /// cwd picker's directory browser. Deliberately **not** part of
+    /// `AppState`: browsing is ephemeral UI state, not session state, so it
+    /// rides a side-channel rather than the state broadcast. `error` folds
+    /// the failure inline (no such dir, permission denied) so the modal
+    /// renders it in place; when `Some`, `entries` is empty. `parent` is
+    /// `None` at the filesystem root.
+    DirListing {
+        path: String,
+        parent: Option<String>,
+        entries: Vec<DirEntryWire>,
+        error: Option<String>,
+    },
     /// A non-fatal protocol or parse error.
     Error { message: String },
 }
@@ -157,6 +251,56 @@ pub(crate) fn build_conversations_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_cwd_and_list_dir_parse() {
+        let sc: InboundMessage =
+            serde_json::from_str(r#"{"type":"switch_cwd","path":"~/p"}"#).unwrap();
+        assert!(matches!(sc, InboundMessage::SwitchCwd { path } if path == "~/p"));
+
+        let ld: InboundMessage =
+            serde_json::from_str(r#"{"type":"list_dir","path":"/tmp"}"#).unwrap();
+        assert!(matches!(ld, InboundMessage::ListDir { path } if path == "/tmp"));
+    }
+
+    #[test]
+    fn build_dir_listing_lists_subdirs_and_folds_error() {
+        let tmp = std::env::temp_dir().join(format!("pb_dl_{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("sub_b")).unwrap();
+        std::fs::create_dir_all(tmp.join("sub_a")).unwrap();
+        std::fs::write(tmp.join("a_file.txt"), b"x").unwrap();
+        std::fs::create_dir_all(tmp.join(".hidden")).unwrap();
+
+        let ok = build_dir_listing(tmp.to_str().unwrap());
+        match ok {
+            OutboundMessage::DirListing {
+                entries,
+                error,
+                parent,
+                ..
+            } => {
+                assert!(error.is_none());
+                assert!(parent.is_some(), "a temp subdir always has a parent");
+                let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+                assert!(!names.contains(&".hidden"), "hidden entries omitted");
+                // Dirs sort first, then case-insensitive name.
+                assert_eq!(names, vec!["sub_a", "sub_b", "a_file.txt"]);
+            }
+            _ => panic!("expected DirListing"),
+        }
+
+        // A non-existent path folds the error inline (frame still returned).
+        let bad = build_dir_listing("/no/such/dir/anywhere/xyz");
+        match bad {
+            OutboundMessage::DirListing { error, entries, .. } => {
+                assert!(error.is_some());
+                assert!(entries.is_empty());
+            }
+            _ => panic!("expected DirListing"),
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 
     #[test]
     fn attach_parses_with_and_without_convo() {

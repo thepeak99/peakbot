@@ -143,6 +143,20 @@ export interface ConversationSummary {
   active: boolean;
 }
 
+// One entry in a `dir_listing` reply (src/ui/wire.rs DirEntryWire).
+export interface DirEntry {
+  name: string;
+  is_dir: boolean;
+}
+
+// A `dir_listing` reply payload (the frame minus its `type` tag).
+export interface DirListing {
+  path: string;
+  parent: string | null;
+  entries: DirEntry[];
+  error: string | null;
+}
+
 // Served by `GET /commands` (src/ui/ui_trait.rs::SlashCommand). The single
 // source of truth for the composer's slash palette; fetched once on load.
 export interface SlashCommand {
@@ -157,6 +171,13 @@ export type OutboundMessage =
   | { type: "models_available"; active: string; models: ModelInfo[] }
   | { type: "state"; state: AppState }
   | { type: "conversations_list"; items: ConversationSummary[] }
+  | {
+      type: "dir_listing";
+      path: string;
+      parent: string | null;
+      entries: DirEntry[];
+      error: string | null;
+    }
   | { type: "error"; message: string };
 
 export type InboundMessage =
@@ -164,6 +185,8 @@ export type InboundMessage =
   | { type: "send_message"; text: string }
   | { type: "stop" }
   | { type: "switch_model"; alias: string }
+  | { type: "switch_cwd"; path: string }
+  | { type: "list_dir"; path: string }
   | { type: "request_conversations" }
   | { type: "kill_session"; convo: string }
   | { type: "shutdown" };
