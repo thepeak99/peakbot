@@ -3,6 +3,13 @@
 // commands ride send_message — the backend classifies them. Disabled until
 // the WebSocket connects.
 //
+// **Mobile / touch:** on a coarse-pointer device (phone, tablet, or laptop in
+// tablet mode) Enter inserts a newline — the on-screen return key is one
+// mis-press away from sending a half-typed message, so the only path to send
+// is the button. Desktop (fine pointer) keeps Enter-to-send. The check is on
+// the *primary* input device, not the viewport width, so a Surface in laptop
+// mode with a keyboard attached still gets Enter-to-send.
+//
 // A slash palette (fed by `GET /commands`, the single source of truth) opens
 // while the input is a bare `/name` prefix. It's a flat filtered list — pick
 // with ↑/↓ + Enter/Tab, dismiss with Esc. Accepting fills the input (adding a
@@ -20,6 +27,7 @@
 
 import { useRef, useState } from "react";
 import type { SlashCommand } from "../state";
+import { useMediaQuery } from "../useMediaQuery";
 
 // Mirror of vision.rs MAX_IMAGE_BYTES — fail fast before shipping a doomed frame.
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -54,6 +62,10 @@ export function Composer({
   const [images, setImages] = useState<PendingImage[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
+  // True when the primary input is a touch device (phone, tablet, laptop in
+  // tablet mode). Gates Enter-to-send so an accidental tap on the on-screen
+  // return key never fires a half-typed message.
+  const touchInput = useMediaQuery("(pointer: coarse)");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Palette shows only while typing a bare command name (`/foo`, no space).
@@ -163,7 +175,11 @@ export function Composer({
         setSelected((s) => (s - 1 + matches.length) % matches.length);
         return;
       }
-      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !touchInput)) {
+        // On desktop Enter accepts the highlighted match (and then the user
+        // presses Enter again to send). On touch we deliberately let Enter
+        // fall through to insert a newline — the user picks a suggestion
+        // with a tap, the keyboard's return key is too easy to mis-press.
         e.preventDefault();
         accept(matches[sel]);
         return;
@@ -174,14 +190,18 @@ export function Composer({
         return;
       }
     }
-    if (e.key === "Enter" && !e.shiftKey) {
+    // Enter sends only on desktop (fine pointer / keyboard). On touch the
+    // return key inserts a newline — sending is button-only, by design.
+    if (e.key === "Enter" && !e.shiftKey && !touchInput) {
       e.preventDefault();
       submit();
     }
   };
 
   const placeholder = connected
-    ? "Send a message…  (Enter to send, Shift+Enter for newline, 📎/paste/drag to attach an image)"
+    ? touchInput
+      ? "Send a message…  (tap Send, 📎/paste/drag to attach an image)"
+      : "Send a message…  (Enter to send, Shift+Enter for newline, 📎/paste/drag to attach an image)"
     : "Connecting…";
 
   const canSend = connected && (!!text.trim() || images.length > 0);
@@ -313,10 +333,16 @@ export function Composer({
         {attachError && (
           <div className="mt-1.5 px-1 text-[11px] text-red-400">{attachError}</div>
         )}
-        <div className="mt-1.5 flex items-center gap-3 px-1 text-[11px] text-zinc-600">
-          <span>
-            <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Enter</kbd> to send
-          </span>
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-zinc-600">
+          {touchInput ? (
+            <span>
+              <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Send</kbd> to dispatch
+            </span>
+          ) : (
+            <span>
+              <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Enter</kbd> to send
+            </span>
+          )}
           <span>
             <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">/</kbd> for commands
           </span>
