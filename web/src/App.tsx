@@ -17,6 +17,7 @@ import { WelcomeBanner } from "./components/WelcomeBanner";
 import { BashPanel } from "./components/BashPanel";
 import { Composer } from "./components/Composer";
 import { TopBar } from "./components/TopBar";
+import { BottomBar } from "./components/BottomBar";
 import { Sidebar } from "./components/Sidebar";
 import { useAgent } from "./useAgent";
 import { useMediaQuery } from "./useMediaQuery";
@@ -153,6 +154,16 @@ export function App() {
           />
         </aside>
       </div>
+
+      <BottomBar
+        models={models}
+        activeAlias={stats?.modelAlias || activeAlias}
+        hasTranscript={hasTranscript}
+        cwd={welcome?.cwd ?? null}
+        dirListing={dirListing}
+        send={send}
+        onSwitchModel={(alias) => send({ type: "switch_model", alias })}
+      />
 
       {/* Mobile/tablet drawer — only mounted on small viewports. The backdrop
           closes on click; the panel itself can be scrolled independently. */}

@@ -32,11 +32,15 @@ export function CwdPicker({
   hasTranscript,
   dirListing,
   send,
+  // Anchor the small-screen picker panel to the bottom of the viewport
+  // (instead of the top) when the chip lives in the mobile bottom bar.
+  dropUp = false,
 }: {
   cwd: string;
   hasTranscript: boolean;
   dirListing: DirListing | null;
   send: (msg: InboundMessage) => void;
+  dropUp?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -106,7 +110,13 @@ export function CwdPicker({
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-20 mt-1 w-80 rounded-md border border-zinc-800 bg-zinc-900 shadow-xl max-sm:fixed max-sm:inset-x-2 max-sm:top-[3.75rem] max-sm:mt-0 max-sm:w-auto">
+        <div
+          className={`absolute left-0 top-full z-20 mt-1 w-80 rounded-md border border-zinc-800 bg-zinc-900 shadow-xl max-sm:fixed max-sm:inset-x-2 max-sm:mt-0 max-sm:w-auto ${
+            dropUp
+              ? "max-sm:bottom-[3.75rem] max-sm:top-auto"
+              : "max-sm:top-[3.75rem]"
+          }`}
+        >
           {/* Current browse path + up. */}
           <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2">
             <button

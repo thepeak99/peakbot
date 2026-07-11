@@ -13,11 +13,15 @@ export function ModelSwitcher({
   activeAlias,
   hasTranscript,
   onSwitch,
+  // Open the dropdown upward instead of downward. Set when the chip lives in
+  // the mobile bottom bar, where a downward menu would clip off-screen.
+  dropUp = false,
 }: {
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
   onSwitch: (alias: string) => void;
+  dropUp?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -61,7 +65,13 @@ export function ModelSwitcher({
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-20 mt-1 max-h-80 w-72 overflow-y-auto rounded-md border border-zinc-800 bg-zinc-900 py-1 shadow-xl">
+        <div
+          className={`absolute left-0 z-20 max-h-80 w-72 overflow-y-auto rounded-md border border-zinc-800 bg-zinc-900 py-1 shadow-xl max-sm:fixed max-sm:inset-x-2 max-sm:mt-0 max-sm:mb-0 max-sm:w-auto ${
+            dropUp
+              ? "bottom-full mb-1 max-sm:bottom-[3.75rem] max-sm:top-auto"
+              : "top-full mt-1 max-sm:top-[3.75rem]"
+          }`}
+        >
           {models.map((m) => (
             <button
               key={m.alias}

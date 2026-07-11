@@ -65,21 +65,25 @@ export function TopBar({
         <span className="font-semibold text-zinc-100">PeakBot</span>
       </div>
 
-      <ModelSwitcher
-        models={models}
-        activeAlias={activeAlias}
-        hasTranscript={hasTranscript}
-        onSwitch={onSwitchModel}
-      />
-
-      {cwd && (
-        <CwdPicker
-          cwd={cwd}
+      {/* Model + working-dir chips. On mobile they move to the BottomBar to
+          de-crowd the header, so hide them here below lg. */}
+      <div className="hidden items-center gap-3 lg:flex">
+        <ModelSwitcher
+          models={models}
+          activeAlias={activeAlias}
           hasTranscript={hasTranscript}
-          dirListing={dirListing}
-          send={send}
+          onSwitch={onSwitchModel}
         />
-      )}
+
+        {cwd && (
+          <CwdPicker
+            cwd={cwd}
+            hasTranscript={hasTranscript}
+            dirListing={dirListing}
+            send={send}
+          />
+        )}
+      </div>
 
       {isRunning && (
         <span className="flex items-center gap-1.5 text-xs text-amber-400">
