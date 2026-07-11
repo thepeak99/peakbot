@@ -118,6 +118,58 @@ pub fn chat_pane_content_width(main_width: u16, select_mode: bool) -> u16 {
     }
 }
 
+/// Resolve a `/cd` argument to a canonical, absolute directory path.
+///
+/// Expands a leading `~`/`~/` to `$HOME`, resolves relative paths against
+/// the current cwd, then canonicalises. Returns a human-readable error
+/// (no filesystem mutation) when the path doesn't exist or isn't a
+/// directory — the caller surfaces it as a system message and never
+/// dispatches the switch. Pure enough to unit-test against a temp dir.
+pub fn resolve_cd_path(arg: &str) -> Result<String, String> {
+    let arg = arg.trim();
+    let expanded: std::path::PathBuf = if arg == "~" {
+        std::path::PathBuf::from(std::env::var("HOME").map_err(|_| "$HOME is not set".to_string())?)
+    } else if let Some(rest) = arg.strip_prefix("~/") {
+        let home = std::env::var("HOME").map_err(|_| "$HOME is not set".to_string())?;
+        std::path::PathBuf::from(home).join(rest)
+    } else {
+        std::path::PathBuf::from(arg)
+    };
+    // canonicalize() resolves relative paths against the process cwd and
+    // fails on a non-existent path — exactly the "clear error before any
+    // mutation" guarantee we want.
+    let canonical = expanded
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve `{arg}`: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("not a directory: {}", canonical.display()));
+    }
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+/// Render a directory path for a tight, single-line surface (the status
+/// bar). Abbreviates a `$HOME` prefix to `~`, then — if still wider than
+/// `max_cells` characters — keeps the trailing segment (the part the user
+/// cares about) behind a leading `…`. Never widens; a short path is
+/// returned unchanged.
+pub fn abbreviate_path(path: &std::path::Path, max_cells: usize) -> String {
+    let full = path.to_string_lossy();
+    let shortened = match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && full.starts_with(&home) => {
+            format!("~{}", &full[home.len()..])
+        }
+        _ => full.into_owned(),
+    };
+    let count = shortened.chars().count();
+    if count <= max_cells {
+        return shortened;
+    }
+    // Keep the tail (leaf dir) — a leading `…` costs one cell.
+    let keep = max_cells.saturating_sub(1);
+    let tail: String = shortened.chars().skip(count - keep).collect();
+    format!("…{tail}")
+}
+
 /// UI state for rendering — what the user sees and interacts with
 /// Extracted from ReplUi to keep orchestration separate from rendering state
 pub struct UiState {
@@ -955,11 +1007,17 @@ impl ReplUi {
         // The `⏳ N queued` hint lives in the working title of the input
         // block (see `build_input_paragraph`), not here — that's where the
         // user's eye is during a busy turn. Status bar stays for tokens /
-        // cost / model / context only.
-        let status_text = format!(
+        // cost / model / context / cwd only.
+        let mut status_text = format!(
             "Tokens: {} │ Calls: {} │ Cost: ${} │ Context: {:.1}% │ Model: {}",
             tokens_str, stats.total_api_calls, cost_str, context_pct, stats.model,
         );
+        // cwd lives on the welcome banner (stamped at boot, refreshed on
+        // /cd). Absent only before the banner is set — omit rather than
+        // guess.
+        if let Some(w) = &state.welcome {
+            status_text.push_str(&format!(" │ 📁 {}", abbreviate_path(&w.cwd, 48)));
+        }
 
         let paragraph = Paragraph::new(status_text)
             .style(Style::default().fg(Color::LightCyan))
@@ -1283,6 +1341,9 @@ impl ReplUi {
             ConfirmAction::SwitchModel { alias, .. } => {
                 let _ = self.action_sender.send(UiAction::SwitchModel(alias));
             }
+            ConfirmAction::ChangeCwd { path } => {
+                let _ = self.action_sender.send(UiAction::ChangeCwd(path));
+            }
         }
     }
 
@@ -1355,6 +1416,73 @@ impl ReplUi {
         true
     }
 
+    /// Pre-submission interceptor for `/cd <path>`. Mirrors
+    /// [`Self::try_intercept_model_command`]:
+    ///
+    /// - Bare `/cd` (no arg) — falls through to the controller, which
+    ///   prints the current working directory (orientation).
+    /// - `/cd <path>` that doesn't resolve to an existing directory —
+    ///   emits an error system message; nothing further. **No state is
+    ///   mutated** (the chdir happens later, in the agent loop).
+    /// - `/cd <path>` resolving to the **current** cwd — emits an
+    ///   "Already in X." system message; no destructive reset.
+    /// - Valid + different, **empty** chat — sends
+    ///   `UiAction::ChangeCwd(path)` directly (no confirmation).
+    /// - Valid + different, **non-empty** chat — opens a
+    ///   [`ConfirmDialog::change_cwd`]; the `UiAction` is dispatched by
+    ///   `commit_confirm_dialog` on confirm.
+    ///
+    /// Returns `true` if the submission was fully consumed.
+    fn try_intercept_cd_command(&mut self, msg: &str) -> bool {
+        let trimmed = msg.trim();
+        if trimmed.eq_ignore_ascii_case("/cd") {
+            // No arg — defer to the controller's "print cwd" handler.
+            return false;
+        }
+        let Some(rest) = trimmed
+            .strip_prefix("/cd ")
+            .or_else(|| trimmed.strip_prefix("/CD "))
+        else {
+            return false;
+        };
+        let arg = rest.trim();
+        if arg.is_empty() {
+            return false; // treat as bare `/cd`
+        }
+        let resolved = match resolve_cd_path(arg) {
+            Ok(p) => p,
+            Err(e) => {
+                self.state_manager
+                    .add_system_message(format!("❌ /cd: {e}"));
+                return true;
+            }
+        };
+        // Same as the current working directory?
+        let current = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if resolved == current {
+            self.state_manager
+                .add_system_message(format!("Already in {resolved}."));
+            return true;
+        }
+        let chat_empty = self.state_manager.get_state().chat.messages.is_empty();
+        if chat_empty {
+            let _ = self.action_sender.send(UiAction::ChangeCwd(resolved));
+        } else {
+            self.confirm_dialog = Some(ConfirmDialog::change_cwd(&resolved));
+        }
+        true
+    }
+
+    /// Combined pre-submission interceptor for the session-switch
+    /// commands (`/model`, `/cd`). Each is a `/new` + rebuild on a
+    /// different axis; they share the confirm-on-non-empty-chat shape.
+    /// Returns `true` if either consumed the submission.
+    fn try_intercept_switch_command(&mut self, msg: &str) -> bool {
+        self.try_intercept_model_command(msg) || self.try_intercept_cd_command(msg)
+    }
+
     fn handle_keyboard_input(&mut self, key: KeyEvent) {
         match key.code {
             // Toggle todo panel with Ctrl+T
@@ -1421,7 +1549,7 @@ impl ReplUi {
                     // Second tap → submit + exit (mirrors plain-Enter submit).
                     let msg = self.ui_state.input_buffer.clone();
                     self.multiline_mode = false;
-                    if !msg.trim().is_empty() && !self.try_intercept_model_command(&msg) {
+                    if !msg.trim().is_empty() && !self.try_intercept_switch_command(&msg) {
                         let _ = self.action_sender.send(UiAction::SendMessage(msg));
                     }
                     self.ui_state.clear_input();
@@ -1649,7 +1777,7 @@ impl ReplUi {
             }
             KeyCode::Enter => {
                 let msg = self.ui_state.input_buffer.clone();
-                if !msg.trim().is_empty() && !self.try_intercept_model_command(&msg) {
+                if !msg.trim().is_empty() && !self.try_intercept_switch_command(&msg) {
                     let _ = self.action_sender.send(UiAction::SendMessage(msg));
                 }
                 self.ui_state.clear_input();
@@ -1955,10 +2083,10 @@ impl ReplUi {
                 let completed = format!("/{} {}", command, item.value);
                 if submit {
                     // Route through the View-side interceptor — single
-                    // source of truth for `/model <alias>` semantics
-                    // (confirm dialog on non-empty chat, "Already on X"
-                    // on same alias, etc).
-                    let intercepted = self.try_intercept_model_command(&completed);
+                    // source of truth for `/model <alias>` / `/cd <path>`
+                    // semantics (confirm dialog on non-empty chat,
+                    // "Already on X" on same target, etc).
+                    let intercepted = self.try_intercept_switch_command(&completed);
                     if !intercepted {
                         // Defensive fallthrough: registry was attached
                         // when the popup was built, so this path isn't
@@ -3858,6 +3986,192 @@ mod model_popup_tests {
         );
         let action = rx.try_recv().expect("a UiAction should be sent");
         assert_eq!(action, UiAction::SwitchModel("opus".to_string()));
+    }
+
+    // === /cd interceptor ==============================================
+
+    /// A real, distinct directory the tests can `/cd` into. Uses the
+    /// system temp dir canonicalised (macOS symlinks /tmp → /private/tmp,
+    /// so we compare against the canonical form the interceptor produces).
+    fn a_real_other_dir() -> String {
+        let tmp = std::env::temp_dir();
+        tmp.canonicalize()
+            .unwrap_or(tmp)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn resolve_cd_path_rejects_nonexistent() {
+        assert!(resolve_cd_path("/no/such/dir/anywhere/xyz").is_err());
+    }
+
+    #[test]
+    fn resolve_cd_path_canonicalises_existing_dir() {
+        let tmp = std::env::temp_dir();
+        let expected = tmp.canonicalize().unwrap().to_string_lossy().into_owned();
+        let got = resolve_cd_path(&tmp.to_string_lossy()).expect("temp dir resolves");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn resolve_cd_path_expands_tilde() {
+        // `~` should expand to $HOME and resolve, when HOME is a real dir.
+        if let Ok(home) = std::env::var("HOME")
+            && std::path::Path::new(&home).is_dir()
+        {
+            let got = resolve_cd_path("~").expect("~ resolves");
+            let expected = std::path::Path::new(&home)
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn abbreviate_path_returns_short_path_unchanged() {
+        let p = std::path::Path::new("/tmp/proj");
+        assert_eq!(abbreviate_path(p, 48), "/tmp/proj");
+    }
+
+    #[test]
+    fn abbreviate_path_tail_truncates_long_path() {
+        // A path longer than the budget keeps the tail behind a leading `…`.
+        let p = std::path::Path::new("/aaaa/bbbb/cccc/dddd/eeee/ffff/leaf");
+        let got = abbreviate_path(p, 12);
+        assert_eq!(got.chars().count(), 12, "abbreviated to the budget: {got}");
+        assert!(got.starts_with('…'), "leading ellipsis: {got}");
+        assert!(got.ends_with("leaf"), "keeps the leaf dir: {got}");
+    }
+
+    #[test]
+    fn abbreviate_path_home_becomes_tilde() {
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
+        {
+            let p = std::path::PathBuf::from(&home).join("workspace");
+            assert_eq!(abbreviate_path(&p, 48), "~/workspace");
+        }
+    }
+
+    #[test]
+    fn status_bar_shows_cwd_when_welcome_set() {
+        use crate::ui::app_state::{AppState, WelcomeState};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let state = AppState {
+            welcome: Some(WelcomeState {
+                provider_name: "p".into(),
+                model: "m".into(),
+                max_tokens: 1,
+                builtin_tools_count: 0,
+                mcp_tools_count: 0,
+                skills_count: 0,
+                searxng_enabled: false,
+                searxng_url: None,
+                cost_tracking_enabled: false,
+                compaction_enabled: false,
+                compaction_threshold: 0.0,
+                compaction_keep_recent: 0,
+                conversation_persistence_enabled: false,
+                cwd: std::path::PathBuf::from("/tmp/peakbot-cwd-test"),
+            }),
+            ..Default::default()
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                ReplUi::render_status_bar(f, area, &state);
+            })
+            .unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            rendered.contains("peakbot-cwd-test"),
+            "status bar must show the cwd; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn cd_bare_falls_through_to_controller() {
+        // Bare `/cd` is NOT consumed by the interceptor — the controller
+        // prints the cwd. `try_intercept_cd_command` returns false.
+        let (mut ui, _rx) = harness_no_registry();
+        assert!(!ui.try_intercept_cd_command("/cd"));
+    }
+
+    #[test]
+    fn cd_nonexistent_path_errors_without_dispatch() {
+        let (mut ui, mut rx) = harness_no_registry();
+        let consumed = ui.try_intercept_cd_command("/cd /no/such/dir/anywhere/xyz");
+        assert!(consumed, "an invalid /cd is still consumed (error shown)");
+        assert!(
+            rx.try_recv().is_err(),
+            "no action dispatched for an invalid path"
+        );
+        assert!(ui.confirm_dialog.is_none(), "no dialog for an invalid path");
+    }
+
+    #[test]
+    fn cd_same_dir_is_noop() {
+        let (mut ui, mut rx) = harness_no_registry();
+        let here = std::env::current_dir().unwrap();
+        let consumed = ui.try_intercept_cd_command(&format!("/cd {}", here.display()));
+        assert!(consumed);
+        assert!(
+            rx.try_recv().is_err(),
+            "/cd into the current dir dispatches nothing"
+        );
+        assert!(ui.confirm_dialog.is_none());
+    }
+
+    #[test]
+    fn cd_valid_empty_chat_dispatches_directly() {
+        let (mut ui, mut rx) = harness_no_registry();
+        let target = a_real_other_dir();
+        // Skip if temp_dir happens to be the cwd (won't be in CI, but be safe).
+        let here = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if target == here {
+            return;
+        }
+        let consumed = ui.try_intercept_cd_command(&format!("/cd {target}"));
+        assert!(consumed);
+        assert!(ui.confirm_dialog.is_none(), "empty chat → no dialog");
+        match rx.try_recv().expect("a ChangeCwd action should be sent") {
+            UiAction::ChangeCwd(p) => assert_eq!(p, target),
+            other => panic!("wrong action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cd_valid_nonempty_chat_opens_confirm_dialog() {
+        let (mut ui, mut rx) = harness_no_registry();
+        let target = a_real_other_dir();
+        let here = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if target == here {
+            return;
+        }
+        ui.state_manager.add_user_message("a previous turn".into());
+        let consumed = ui.try_intercept_cd_command(&format!("/cd {target}"));
+        assert!(consumed);
+        assert!(
+            rx.try_recv().is_err(),
+            "non-empty chat → wait for confirmation, no action yet"
+        );
+        match ui.confirm_dialog.as_ref().map(|d| &d.action) {
+            Some(ConfirmAction::ChangeCwd { path }) => assert_eq!(path, &target),
+            other => panic!("expected ChangeCwd confirm dialog, got {other:?}"),
+        }
     }
 
     #[test]
