@@ -106,7 +106,7 @@ export function CwdPicker({
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-20 mt-1 w-80 rounded-md border border-zinc-800 bg-zinc-900 shadow-xl">
+        <div className="absolute left-0 top-full z-20 mt-1 w-80 rounded-md border border-zinc-800 bg-zinc-900 shadow-xl max-sm:fixed max-sm:inset-x-2 max-sm:top-[3.75rem] max-sm:mt-0 max-sm:w-auto">
           {/* Current browse path + up. */}
           <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2">
             <button
