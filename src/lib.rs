@@ -1221,16 +1221,7 @@ impl AgentRunner {
         // metadata so /load on the freshly-reset convo (after the next
         // prompt) restores the right model. The alias is *also* set on
         // AppState for status-bar display, but is NOT persisted.
-        sm_for_provider.clear_chat();
-        sm_for_provider.reset_stats();
-        sm_for_provider.clear_all_todos();
-        // Kill any bg processes — they were rooted in the previous
-        // conversation. See `bash-background.md` edge-case table.
-        sm_for_provider.clear_bg();
-        // Foreground bash panel is conversation-scoped — restore
-        // (state, visibility) to defaults so the model swap looks
-        // like a fresh chat in every panel surface.
-        sm_for_provider.reset_bash_panel();
+        sm_for_provider.reset_conversation_state();
         let convo_name = format!(
             "Conversation {}",
             chrono::Local::now().format("%Y-%m-%d %H:%M")
@@ -1325,6 +1316,10 @@ impl AgentRunner {
         // persist it into ctx so subsequent /model switches keep the cwd.
         ctx.system_prompt = build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref());
 
+        // Refresh the welcome banner's cwd so the status bar / web banner
+        // reflect the new directory (welcome was stamped once at boot).
+        sm.update_welcome_cwd(target.to_path_buf());
+
         Self::rebuild_agent_for_resolved(
             &resolved,
             agent_slot,
@@ -1339,12 +1334,11 @@ impl AgentRunner {
         .await?;
 
         // Reset conversation-scoped state — same path as /new and /model.
+        // bg was already killed above (before the chdir); the unified
+        // reset's clear_bg is a no-op on the now-empty registry.
         // `create_conversation` captures the new cwd into the metadata
         // (Conversation::new reads current_dir, which we just changed).
-        sm.clear_chat();
-        sm.reset_stats();
-        sm.clear_all_todos();
-        sm.reset_bash_panel();
+        sm.reset_conversation_state();
         let convo_name = format!(
             "Conversation {}",
             chrono::Local::now().format("%Y-%m-%d %H:%M")
@@ -2131,28 +2125,11 @@ impl AgentRunner {
                 // Create new conversation via StateManager (single source of truth).
                 //
                 // `create_conversation` alone only swaps the current-conversation
-                // slot; the derived views (chat.messages, session stats, todo
-                // list) are untouched. Without also clearing them the agent's
-                // next turn still sees the prior history via
-                // `get_agent_history()`, the token/cost counters keep
-                // accumulating, AND the previous conversation's todos linger
-                // in the side panel — i.e. /new would lie about starting
-                // fresh. Clear all three explicitly.
+                // slot; the derived views (chat, stats, todos, bg, bash panel)
+                // survive. `reset_conversation_state` clears them all so /new
+                // doesn't lie about starting fresh.
                 if let Some(sm) = state_manager {
-                    sm.clear_chat();
-                    sm.reset_stats();
-                    sm.clear_all_todos();
-                    // Background processes belong to the previous
-                    // conversation — /new severs that context, so the
-                    // processes go with it. See `bash-background.md`
-                    // edge-case table.
-                    sm.clear_bg();
-                    // Foreground bash panel is conversation-scoped too
-                    // — a lingering Finished frame from the previous
-                    // chat or a ClosedByUser override would be stale
-                    // and misleading. Restore (state, visibility) to
-                    // defaults.
-                    sm.reset_bash_panel();
+                    sm.reset_conversation_state();
                     let name = format!(
                         "Conversation {}",
                         chrono::Local::now().format("%Y-%m-%d %H:%M")

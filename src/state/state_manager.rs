@@ -671,8 +671,8 @@ impl StateManager {
 
     /// Refresh the welcome banner's model-scoped fields after a `/model`
     /// switch or `/load` rebuild. Only provider/model/max_tokens change
-    /// across a model swap — everything else (tool counts, skills, cwd)
-    /// is session-wide. Broadcasts so live Views (web banner) re-render;
+    /// across a model swap — the rest (tool counts, skills) is
+    /// session-wide. Broadcasts so live Views (web banner) re-render;
     /// no-op if the welcome banner was never set.
     pub fn update_welcome_for_model(
         &self,
@@ -685,6 +685,17 @@ impl StateManager {
             w.provider_name = provider_name;
             w.model = model;
             w.max_tokens = max_tokens;
+            self.notify_update(&state);
+        }
+    }
+
+    /// Refresh the welcome banner's cwd after a `/cd`. Broadcasts so live
+    /// Views (status bar, web banner) reflect the new directory; no-op if
+    /// the welcome banner was never set.
+    pub fn update_welcome_cwd(&self, cwd: std::path::PathBuf) {
+        let mut state = self.state.write().unwrap();
+        if let Some(w) = state.welcome.as_mut() {
+            w.cwd = cwd;
             self.notify_update(&state);
         }
     }
@@ -727,6 +738,28 @@ impl StateManager {
         let mut state = self.state.write().unwrap();
         state.chat.clear();
         self.notify_update(&state);
+    }
+
+    /// Reset every piece of conversation-scoped state to a fresh-chat
+    /// baseline: chat history, session stats, todo list, background
+    /// processes, and the foreground bash panel.
+    ///
+    /// This is the single source of truth for "start fresh" — `/new`,
+    /// `/model`, and `/cd` all call it so a new surface added here (a
+    /// future panel, a counter) can never be forgotten by one of them.
+    /// It deliberately does NOT create the new conversation or emit the
+    /// announcement banner — those differ per command (name, wire id,
+    /// wording) and stay at the call site.
+    ///
+    /// `clear_bg` is idempotent on an empty registry, so callers that
+    /// must kill bg earlier for ordering reasons (e.g. `/cd` before its
+    /// process-global `set_current_dir`) may still call this safely.
+    pub fn reset_conversation_state(&self) {
+        self.clear_chat();
+        self.reset_stats();
+        self.clear_all_todos();
+        self.clear_bg();
+        self.reset_bash_panel();
     }
 
     /// Replace all chat messages with the given list.
@@ -2275,6 +2308,51 @@ mod tests {
         // No welcome set yet — must not panic and must stay None.
         sm.update_welcome_for_model("p".to_string(), "m".to_string(), 1);
         assert!(sm.get_state().welcome.is_none());
+    }
+
+    #[test]
+    fn test_update_welcome_cwd_patches_cwd() {
+        let sm = StateManager::new();
+        sm.set_welcome(WelcomeState {
+            provider_name: "p".into(),
+            model: "m".into(),
+            max_tokens: 1,
+            builtin_tools_count: 0,
+            mcp_tools_count: 0,
+            skills_count: 0,
+            searxng_enabled: false,
+            searxng_url: None,
+            cost_tracking_enabled: false,
+            compaction_enabled: false,
+            compaction_threshold: 0.0,
+            compaction_keep_recent: 0,
+            conversation_persistence_enabled: false,
+            cwd: std::path::PathBuf::from("/old"),
+        });
+        sm.update_welcome_cwd(std::path::PathBuf::from("/new/dir"));
+        let w = sm.get_state().welcome.expect("welcome set");
+        assert_eq!(w.cwd, std::path::PathBuf::from("/new/dir"));
+    }
+
+    #[test]
+    fn test_reset_conversation_state_clears_all_surfaces() {
+        let sm = StateManager::new();
+        // Seed chat + todos so we can prove they're cleared.
+        sm.add_user_message("hello".to_string());
+        sm.add_todos(vec!["task".to_string()]);
+        assert!(!sm.get_state().chat.messages.is_empty());
+        assert!(!sm.get_todo_list().list().is_empty());
+
+        sm.reset_conversation_state();
+
+        assert!(
+            sm.get_state().chat.messages.is_empty(),
+            "chat must be cleared"
+        );
+        assert!(
+            sm.get_todo_list().list().is_empty(),
+            "todos must be cleared"
+        );
     }
 
     #[test]

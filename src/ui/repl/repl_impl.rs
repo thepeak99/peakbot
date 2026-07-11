@@ -147,6 +147,29 @@ pub fn resolve_cd_path(arg: &str) -> Result<String, String> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
+/// Render a directory path for a tight, single-line surface (the status
+/// bar). Abbreviates a `$HOME` prefix to `~`, then — if still wider than
+/// `max_cells` characters — keeps the trailing segment (the part the user
+/// cares about) behind a leading `…`. Never widens; a short path is
+/// returned unchanged.
+pub fn abbreviate_path(path: &std::path::Path, max_cells: usize) -> String {
+    let full = path.to_string_lossy();
+    let shortened = match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && full.starts_with(&home) => {
+            format!("~{}", &full[home.len()..])
+        }
+        _ => full.into_owned(),
+    };
+    let count = shortened.chars().count();
+    if count <= max_cells {
+        return shortened;
+    }
+    // Keep the tail (leaf dir) — a leading `…` costs one cell.
+    let keep = max_cells.saturating_sub(1);
+    let tail: String = shortened.chars().skip(count - keep).collect();
+    format!("…{tail}")
+}
+
 /// UI state for rendering — what the user sees and interacts with
 /// Extracted from ReplUi to keep orchestration separate from rendering state
 pub struct UiState {
@@ -984,11 +1007,17 @@ impl ReplUi {
         // The `⏳ N queued` hint lives in the working title of the input
         // block (see `build_input_paragraph`), not here — that's where the
         // user's eye is during a busy turn. Status bar stays for tokens /
-        // cost / model / context only.
-        let status_text = format!(
+        // cost / model / context / cwd only.
+        let mut status_text = format!(
             "Tokens: {} │ Calls: {} │ Cost: ${} │ Context: {:.1}% │ Model: {}",
             tokens_str, stats.total_api_calls, cost_str, context_pct, stats.model,
         );
+        // cwd lives on the welcome banner (stamped at boot, refreshed on
+        // /cd). Absent only before the banner is set — omit rather than
+        // guess.
+        if let Some(w) = &state.welcome {
+            status_text.push_str(&format!(" │ 📁 {}", abbreviate_path(&w.cwd, 48)));
+        }
 
         let paragraph = Paragraph::new(status_text)
             .style(Style::default().fg(Color::LightCyan))
@@ -3999,6 +4028,72 @@ mod model_popup_tests {
                 .into_owned();
             assert_eq!(got, expected);
         }
+    }
+
+    #[test]
+    fn abbreviate_path_returns_short_path_unchanged() {
+        let p = std::path::Path::new("/tmp/proj");
+        assert_eq!(abbreviate_path(p, 48), "/tmp/proj");
+    }
+
+    #[test]
+    fn abbreviate_path_tail_truncates_long_path() {
+        // A path longer than the budget keeps the tail behind a leading `…`.
+        let p = std::path::Path::new("/aaaa/bbbb/cccc/dddd/eeee/ffff/leaf");
+        let got = abbreviate_path(p, 12);
+        assert_eq!(got.chars().count(), 12, "abbreviated to the budget: {got}");
+        assert!(got.starts_with('…'), "leading ellipsis: {got}");
+        assert!(got.ends_with("leaf"), "keeps the leaf dir: {got}");
+    }
+
+    #[test]
+    fn abbreviate_path_home_becomes_tilde() {
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
+        {
+            let p = std::path::PathBuf::from(&home).join("workspace");
+            assert_eq!(abbreviate_path(&p, 48), "~/workspace");
+        }
+    }
+
+    #[test]
+    fn status_bar_shows_cwd_when_welcome_set() {
+        use crate::ui::app_state::{AppState, WelcomeState};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let state = AppState {
+            welcome: Some(WelcomeState {
+                provider_name: "p".into(),
+                model: "m".into(),
+                max_tokens: 1,
+                builtin_tools_count: 0,
+                mcp_tools_count: 0,
+                skills_count: 0,
+                searxng_enabled: false,
+                searxng_url: None,
+                cost_tracking_enabled: false,
+                compaction_enabled: false,
+                compaction_threshold: 0.0,
+                compaction_keep_recent: 0,
+                conversation_persistence_enabled: false,
+                cwd: std::path::PathBuf::from("/tmp/peakbot-cwd-test"),
+            }),
+            ..Default::default()
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                ReplUi::render_status_bar(f, area, &state);
+            })
+            .unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            rendered.contains("peakbot-cwd-test"),
+            "status bar must show the cwd; got:\n{rendered}"
+        );
     }
 
     #[test]

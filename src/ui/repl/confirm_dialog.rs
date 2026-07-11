@@ -133,14 +133,81 @@ impl ConfirmDialog {
     }
 }
 
+/// Greedily wrap `text` to at most `width` display cells per line,
+/// breaking on whitespace where possible and hard-breaking any single
+/// run longer than `width` (a filesystem path has no spaces). Returns at
+/// least one line so the caller always has a question row to render.
+///
+/// Width is approximated by `char` count — adequate for the ASCII-ish
+/// questions and paths this dialog shows; the popup border gives a cell
+/// of slack either way.
+fn wrap_question(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut line_len = 0usize;
+
+    let push_line = |lines: &mut Vec<String>, line: &mut String, line_len: &mut usize| {
+        lines.push(std::mem::take(line));
+        *line_len = 0;
+    };
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        // A word wider than the line: flush, then hard-break it in chunks.
+        if word_len > width {
+            if line_len > 0 {
+                push_line(&mut lines, &mut line, &mut line_len);
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            line = chunk;
+            line_len = line.chars().count();
+            continue;
+        }
+        // A space is needed before the word unless the line is empty.
+        let needed = if line_len == 0 {
+            word_len
+        } else {
+            line_len + 1 + word_len
+        };
+        if needed > width {
+            push_line(&mut lines, &mut line, &mut line_len);
+            line.push_str(word);
+            line_len = word_len;
+        } else {
+            if line_len > 0 {
+                line.push(' ');
+                line_len += 1;
+            }
+            line.push_str(word);
+            line_len += word_len;
+        }
+    }
+    lines.push(line);
+    lines
+}
+
 /// Render any [`ConfirmDialog`] as a centered overlay.
 ///
 /// Visual layout matches the original `render_quit_confirm` exactly so
 /// the existing 80×24 / 120×40 / 60×15 quit-confirm snapshots stay
 /// stable across the refactor.
 pub fn render_confirm_dialog(f: &mut Frame, area: Rect, dialog: &ConfirmDialog) {
-    let popup_width = 50;
-    let popup_height = 9;
+    let popup_width: u16 = 50;
+    // Wrap the question to the popup's inner width so a long path (or any
+    // long question) never gets clipped at the border. Short questions
+    // (quit, /model) wrap to exactly one line — geometry and snapshots are
+    // unchanged; only long questions grow the popup vertically.
+    let inner_width = (popup_width as usize).saturating_sub(2);
+    let q_lines = wrap_question(&dialog.question, inner_width);
+    // Base height (9) held one question line; add a row per extra line.
+    let popup_height = 9u16.saturating_add(q_lines.len().saturating_sub(1) as u16);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -196,21 +263,29 @@ pub fn render_confirm_dialog(f: &mut Frame, area: Rect, dialog: &ConfirmDialog) 
     let warning_indent = (popup_width as usize).saturating_sub(warning_inner_width) / 2;
     let warning = format!("{}⚠  {}  ⚠", " ".repeat(warning_indent), dialog.title);
 
-    // Centered question.
-    let q_indent = (popup_width as usize).saturating_sub(dialog.question.chars().count()) / 2;
-    let question_line = format!("{}{}", " ".repeat(q_indent), dialog.question);
+    // Centered question — one centered `Line` per wrapped row so a long
+    // path stacks inside the popup instead of clipping at the border.
+    let question_lines: Vec<Line> = q_lines
+        .iter()
+        .map(|q| {
+            let indent = (popup_width as usize).saturating_sub(q.chars().count()) / 2;
+            Line::from(vec![Span::raw(format!("{}{}", " ".repeat(indent), q))])
+        })
+        .collect();
 
     let hint = "      ←/→ to switch  ·  Enter to confirm  ·  Esc to cancel";
     let btn_padding = " ".repeat(btn_left_padding);
 
-    let content = vec![
+    let mut content = vec![
         Line::from(vec![Span::raw("")]),
         Line::from(vec![Span::styled(
             warning,
             Style::default().fg(Color::LightRed),
         )]),
         Line::from(vec![Span::raw("")]),
-        Line::from(vec![Span::raw(question_line)]),
+    ];
+    content.extend(question_lines);
+    content.extend([
         Line::from(vec![Span::raw("")]),
         Line::from(vec![
             Span::raw(btn_padding),
@@ -224,7 +299,7 @@ pub fn render_confirm_dialog(f: &mut Frame, area: Rect, dialog: &ConfirmDialog) 
             Style::default().fg(Color::DarkGray),
         )]),
         Line::from(vec![Span::raw("")]),
-    ];
+    ]);
 
     let paragraph = Paragraph::new(content)
         .style(Style::default().fg(Color::White))
@@ -282,5 +357,56 @@ mod tests {
         assert!(d.yes_selected);
         d.toggle_selection();
         assert!(!d.yes_selected);
+    }
+
+    #[test]
+    fn wrap_question_short_stays_one_line() {
+        // Existing quit/model questions fit — must stay a single line so
+        // popup geometry (and the golden snapshots) are unchanged.
+        let q = "Are you sure you want to quit PeakBot?";
+        let lines = wrap_question(q, 48);
+        assert_eq!(lines, vec![q.to_string()]);
+    }
+
+    #[test]
+    fn wrap_question_hard_breaks_long_path() {
+        // A long path has no spaces — it must hard-break rather than
+        // overflow a single line.
+        let q = "Switch to /aaaa/bbbb/cccc/dddd/eeee/ffff/gggg/hhhh/iiii/jjjj/kkkk? \
+                 Starts a new conversation.";
+        let lines = wrap_question(q, 48);
+        assert!(lines.len() > 1, "long question must wrap: {lines:?}");
+        for l in &lines {
+            assert!(
+                l.chars().count() <= 48,
+                "no line exceeds the inner width: {l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_long_cwd_question_is_not_clipped() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // The whole point of ticket #145 feedback: a long /cd path must
+        // appear in full inside the dialog, not truncated at the border.
+        let path = "/very/long/directory/path/that/would/overflow/the/fixed/popup/leafdir";
+        let dialog = ConfirmDialog::change_cwd(path);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render_confirm_dialog(f, f.area(), &dialog))
+            .unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        // Every path segment must survive the wrap — including the leaf,
+        // which the old fixed-width single-line render clipped away.
+        for segment in ["very", "overflow", "leafdir"] {
+            assert!(
+                rendered.contains(segment),
+                "path segment `{segment}` was clipped:\n{rendered}"
+            );
+        }
     }
 }
