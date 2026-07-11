@@ -12,6 +12,12 @@ export default defineConfig({
   // separately on :7823. Proxy the WebSocket so the browser talks to one
   // origin and never hits CORS. Matches DEFAULT_WEB_ADDR in src/ui/web/mod.rs.
   server: {
+    // Pin the port so `make dev` is predictable — fail loudly if 5173 is
+    // taken rather than silently drifting to 5174 (which leaves the URL we
+    // print unreachable). `open` targets Vite's HMR port, not the backend.
+    port: 5173,
+    strictPort: true,
+    open: true,
     proxy: {
       "/ws": { target: "ws://127.0.0.1:7823", ws: true },
     },

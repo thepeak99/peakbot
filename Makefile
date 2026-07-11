@@ -109,7 +109,7 @@ dev:
 	cd web && npm install
 	@echo "→ web (HMR): http://localhost:5173   backend: http://127.0.0.1:7823"
 	@trap 'kill 0' INT TERM; \
-	cargo watch -x 'run -- --web' & \
+	PEAKBOT_NO_OPEN=1 cargo watch -x 'run -- --web' & \
 	( cd web && npm run dev ) & \
 	wait
 
