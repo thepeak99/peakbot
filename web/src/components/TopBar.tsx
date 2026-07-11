@@ -17,6 +17,7 @@ export function TopBar({
   dirListing,
   send,
   onSwitchModel,
+  onToggleSidebar,
 }: {
   stats: SessionStats | null;
   isRunning: boolean;
@@ -28,9 +29,37 @@ export function TopBar({
   dirListing: DirListing | null;
   send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
+  // Hamburger button. When provided the button is rendered (it is hidden on
+  // lg+ via CSS); App only supplies it on viewports where the sidebar needs
+  // toggling.
+  onToggleSidebar?: () => void;
 }) {
   return (
     <header className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur">
+      {onToggleSidebar && (
+        <button
+          type="button"
+          onClick={onToggleSidebar}
+          aria-label="Toggle sidebar"
+          title="Toggle sidebar"
+          className="-ml-1 flex h-8 w-8 items-center justify-center rounded-md text-zinc-300 hover:bg-zinc-800 lg:hidden"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="h-5 w-5"
+            aria-hidden="true"
+          >
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="18" x2="21" y2="18" />
+          </svg>
+        </button>
+      )}
       <div className="flex items-center gap-2">
         <span className="text-base">✦</span>
         <span className="font-semibold text-zinc-100">PeakBot</span>
