@@ -135,8 +135,12 @@ impl WebUi {
     /// Auto-open the browser only for a local, interactive session: a
     /// loopback bind with no SSH context. Remote / SSH sessions just get the
     /// printed URL (opening would target the wrong machine — same heuristic
-    /// as the MCP OAuth flow).
+    /// as the MCP OAuth flow). `PEAKBOT_NO_OPEN` suppresses it entirely — set
+    /// by `make dev`, where Vite (:5173) owns the browser, not the backend.
     fn maybe_open_browser(&self, url: &str) {
+        if std::env::var_os("PEAKBOT_NO_OPEN").is_some() {
+            return;
+        }
         let local = self.addr.ip().is_loopback() && std::env::var_os("SSH_CONNECTION").is_none();
         if local {
             let _ = open::that(url);
