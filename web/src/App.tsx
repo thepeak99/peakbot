@@ -123,8 +123,8 @@ export function App() {
 
       <div className="flex min-h-0 flex-1">
         <main className="flex min-w-0 flex-1 flex-col">
-          <section className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-            <div className="mx-auto max-w-3xl space-y-3">
+          <section className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 md:px-8">
+            <div className="mx-auto max-w-5xl space-y-3">
               {welcome && messageCount === 0 && <WelcomeBanner welcome={welcome} />}
               {state?.chat.messages.map((m, i) => (
                 <Message key={i} message={adaptMessage(m)} />

@@ -11,3 +11,6 @@ bg-cooldown-plan.md
 # Browser-automation test artifacts (playwright-cli)
 .playwright/
 .playwright-cli/
+
+# Local scratch dir (test config + vector db)
+.test/
