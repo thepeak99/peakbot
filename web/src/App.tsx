@@ -95,7 +95,7 @@ export function App() {
   }, [sidebarOpen]);
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-zinc-950 text-zinc-100">
+    <div className="flex h-dvh w-screen flex-col overflow-hidden bg-zinc-950 text-zinc-100">
       <TopBar
         stats={stats}
         isRunning={isRunning}
