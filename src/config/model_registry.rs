@@ -112,6 +112,20 @@ pub struct ResolvedModel {
     pub context_size: usize,
 }
 
+/// Which model a session boots on, plus whether a resumed conversation's
+/// saved model was unavailable. Returned by [`ModelRegistry::resolve_boot`].
+#[derive(Debug)]
+pub struct BootSelection<'a> {
+    /// The chosen model. `None` only when the registry is empty (legacy
+    /// single-provider boot) — the caller then falls back to its
+    /// pre-resolved boot provider config.
+    pub model: Option<&'a ResolvedModel>,
+    /// `Some((provider, model))` iff a complete saved wire id was requested
+    /// on resume but no longer exists in the registry, so `model` fell back
+    /// to the default. Drives a user-facing "not available" note.
+    pub unavailable: Option<(String, String)>,
+}
+
 /// Errors raised while validating a `ModelRegistry` from a config.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RegistryError {
@@ -295,6 +309,39 @@ impl ModelRegistry {
         self.by_alias
             .values()
             .find(|m| m.provider_name == provider_name && m.model_name == model_name)
+    }
+
+    /// Pick the model a session should boot on.
+    ///
+    /// `saved_wire_id` is the `(provider_name, model)` of a conversation
+    /// being resumed (`None` for a fresh session). A resumed conversation
+    /// boots on the model it was saved with — the same re-activation the
+    /// REPL `/load` performs — falling back to the default when that model
+    /// is no longer in the registry (renamed/removed in config).
+    /// [`BootSelection::unavailable`] reports that fallback so the caller
+    /// can tell the user instead of downgrading silently. Pre-v5 files
+    /// (empty `provider_name`) can't be re-activated and fall through to
+    /// the default without a note.
+    pub fn resolve_boot(&self, saved_wire_id: Option<(&str, &str)>) -> BootSelection<'_> {
+        let default = self.default_alias().and_then(|a| self.resolve(a));
+        match saved_wire_id {
+            Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+                match self.find_by_wire_id(provider, model) {
+                    Some(rm) => BootSelection {
+                        model: Some(rm),
+                        unavailable: None,
+                    },
+                    None => BootSelection {
+                        model: default,
+                        unavailable: Some((provider.to_string(), model.to_string())),
+                    },
+                }
+            }
+            _ => BootSelection {
+                model: default,
+                unavailable: None,
+            },
+        }
     }
 
     /// All declared aliases sorted alphabetically — for `/model` listing
@@ -874,6 +921,62 @@ models:
         assert!(
             reg.find_by_wire_id("no-such-provider", "anthropic/claude-opus-4")
                 .is_none()
+        );
+    }
+
+    // ── resolve_boot ─────────────────────────────────────────────────────
+
+    /// A fresh session (`None`) boots the registry default, no warning.
+    #[test]
+    fn resolve_boot_fresh_session_uses_default() {
+        let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
+
+        let boot = reg.resolve_boot(None);
+        assert_eq!(boot.model.expect("default present").alias, "sonnet");
+        assert!(boot.unavailable.is_none());
+    }
+
+    /// Resuming a conversation saved on a non-default model boots on THAT
+    /// model (the bug fix), not the default. No warning.
+    #[test]
+    fn resolve_boot_resumes_saved_non_default_model() {
+        let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
+
+        let boot = reg.resolve_boot(Some(("openrouter", "anthropic/claude-opus-4")));
+        assert_eq!(
+            boot.model.expect("saved model present").alias,
+            "opus",
+            "resumed conversation must boot on its saved model, not the default"
+        );
+        assert!(boot.unavailable.is_none());
+    }
+
+    /// Resuming a conversation whose saved model is gone from the registry
+    /// falls back to the default AND reports the unavailable wire id.
+    #[test]
+    fn resolve_boot_unavailable_saved_model_falls_back_with_note() {
+        let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
+
+        let boot = reg.resolve_boot(Some(("patchnotes", "ghost/model-9")));
+        assert_eq!(boot.model.expect("falls back to default").alias, "sonnet");
+        assert_eq!(
+            boot.unavailable,
+            Some(("patchnotes".to_string(), "ghost/model-9".to_string()))
+        );
+    }
+
+    /// Pre-v5 files carry an empty `provider_name` — they can't be
+    /// re-activated by wire id, so they fall through to the default
+    /// SILENTLY (no note for ancient data).
+    #[test]
+    fn resolve_boot_pre_v5_empty_provider_is_silent_default() {
+        let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
+
+        let boot = reg.resolve_boot(Some(("", "anthropic/claude-opus-4")));
+        assert_eq!(boot.model.expect("default present").alias, "sonnet");
+        assert!(
+            boot.unavailable.is_none(),
+            "pre-v5 files must not raise an availability warning"
         );
     }
 }
