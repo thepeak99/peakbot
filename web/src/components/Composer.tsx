@@ -198,11 +198,9 @@ export function Composer({
     }
   };
 
-  const placeholder = connected
-    ? touchInput
-      ? "Send a message…  (tap Send, 📎/paste/drag to attach an image)"
-      : "Send a message…  (Enter to send, Shift+Enter for newline, 📎/paste/drag to attach an image)"
-    : "Connecting…";
+  // Single placeholder, no embedded instructions. Touch/desktop parity —
+  // gestures and key bindings live in the hint row below (desktop only).
+  const placeholder = connected ? "Type a message…" : "Connecting…";
 
   const canSend = connected && (!!text.trim() || images.length > 0);
 
@@ -333,7 +331,9 @@ export function Composer({
         {attachError && (
           <div className="mt-1.5 px-1 text-[11px] text-red-400">{attachError}</div>
         )}
-        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-zinc-600">
+        {/* Hints are desktop-only — on touch screens they eat vertical real
+            estate under the composer for no benefit. */}
+        <div className="mt-1.5 hidden flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-zinc-600 lg:flex">
           {touchInput ? (
             <span>
               <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Send</kbd> to dispatch

@@ -6,7 +6,8 @@
 // Layout has a fixed `<lg` threshold:
 //   - lg+ (≥1024px): the sidebar is the static right-rail aside.
 //   - <lg:  the sidebar is hidden, behind a hamburger in the top bar that
-//           opens a slide-in drawer with a backdrop.
+//           opens a full-viewport drawer (no max-w, no backdrop — the aside
+//           is the whole viewport, closed via the X button or Escape).
 //
 // The two Sidebar instances are independent (each has its own dropdown-open
 // state); only one is ever on-screen at a time, so this costs nothing.
@@ -105,8 +106,10 @@ export function App() {
         hasTranscript={hasTranscript}
         cwd={welcome?.cwd ?? null}
         dirListing={dirListing}
+        conversations={conversations}
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
+        onLoadConversation={(id) => switchConvo(id)}
         onToggleSidebar={
           smallViewport ? () => setSidebarOpen((o) => !o) : undefined
         }
@@ -141,21 +144,12 @@ export function App() {
         </main>
 
         <aside className="hidden w-72 shrink-0 flex-col gap-5 overflow-y-auto border-l border-zinc-800 bg-zinc-950/60 p-4 lg:flex">
-          <Sidebar
-            conversations={conversations}
-            hasTranscript={hasTranscript}
-            stats={stats}
-            context={context}
-            todos={todos}
-            bg={bg}
-            onOpenConversations={() => send({ type: "request_conversations" })}
-            onLoadConversation={(id) => switchConvo(id)}
-            onKillSession={(id) => send({ type: "kill_session", convo: id })}
-          />
+          <Sidebar stats={stats} context={context} todos={todos} bg={bg} />
         </aside>
       </div>
 
       <BottomBar
+        conversations={conversations}
         models={models}
         activeAlias={stats?.modelAlias || activeAlias}
         hasTranscript={hasTranscript}
@@ -163,56 +157,42 @@ export function App() {
         dirListing={dirListing}
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
+        onLoadConversation={(id) => switchConvo(id)}
       />
 
-      {/* Mobile/tablet drawer — only mounted on small viewports. The backdrop
-          closes on click; the panel itself can be scrolled independently. */}
+      {/* Mobile/tablet drawer — full viewport so the left edge meets the
+          screen edge. Closed via the X button or Escape. */}
       {smallViewport && sidebarOpen && (
-        <div className="fixed inset-0 z-40 lg:hidden">
-          <div
-            className="absolute inset-0 bg-black/60"
-            onClick={() => setSidebarOpen(false)}
-            aria-hidden="true"
-          />
-          <aside className="absolute inset-y-0 right-0 flex w-full max-w-sm flex-col gap-5 overflow-y-auto border-l border-zinc-800 bg-zinc-950 p-4 shadow-2xl">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-zinc-100">Sidebar</h2>
-              <button
-                type="button"
-                onClick={() => setSidebarOpen(false)}
-                aria-label="Close sidebar"
-                title="Close (Esc)"
-                className="flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  className="h-5 w-5"
-                  aria-hidden="true"
-                >
-                  <line x1="6" y1="6" x2="18" y2="18" />
-                  <line x1="18" y1="6" x2="6" y2="18" />
-                </svg>
-              </button>
+        <aside className="fixed inset-0 z-40 flex flex-col gap-5 overflow-y-auto bg-zinc-950 p-4 lg:hidden">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-base">✦</span>
+              <span className="font-semibold text-zinc-100">PeakBot</span>
             </div>
-            <Sidebar
-              conversations={conversations}
-              hasTranscript={hasTranscript}
-              stats={stats}
-              context={context}
-              todos={todos}
-              bg={bg}
-              onOpenConversations={() => send({ type: "request_conversations" })}
-              onLoadConversation={(id) => switchConvo(id)}
-              onKillSession={(id) => send({ type: "kill_session", convo: id })}
-              onConvoOpened={() => setSidebarOpen(false)}
-            />
-          </aside>
-        </div>
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(false)}
+              aria-label="Close sidebar"
+              title="Close (Esc)"
+              className="flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-5 w-5"
+                aria-hidden="true"
+              >
+                <line x1="6" y1="6" x2="18" y2="18" />
+                <line x1="18" y1="6" x2="6" y2="18" />
+              </svg>
+            </button>
+          </div>
+          <Sidebar stats={stats} context={context} todos={todos} bg={bg} />
+        </aside>
       )}
     </div>
   );
