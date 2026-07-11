@@ -1,11 +1,17 @@
 import type { SessionStats } from "../types";
-import type { DirListing, InboundMessage, ModelInfo } from "../state";
+import type {
+  ConversationSummary,
+  DirListing,
+  InboundMessage,
+  ModelInfo,
+} from "../state";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { CwdPicker } from "./CwdPicker";
+import { ConversationsPicker } from "./ConversationsPicker";
 
-// Top status bar. Model switcher, the working spinner (AppState.is_running),
-// a compact tokens/cost readout mirroring the TUI status line, and a
-// connection indicator.
+// Top status bar. Sessions trio (conversations + model + cwd) live here on
+// lg+ and migrate to the BottomBar on smaller screens. Right side carries the
+// working spinner, tokens/cost readout, and connection indicator.
 export function TopBar({
   stats,
   isRunning,
@@ -15,8 +21,10 @@ export function TopBar({
   hasTranscript,
   cwd,
   dirListing,
+  conversations,
   send,
   onSwitchModel,
+  onLoadConversation,
   onToggleSidebar,
 }: {
   stats: SessionStats | null;
@@ -27,8 +35,10 @@ export function TopBar({
   hasTranscript: boolean;
   cwd: string | null;
   dirListing: DirListing | null;
+  conversations: ConversationSummary[];
   send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
+  onLoadConversation: (id: string) => void;
   // Hamburger button. When provided the button is rendered (it is hidden on
   // lg+ via CSS); App only supplies it on viewports where the sidebar needs
   // toggling.
@@ -65,9 +75,17 @@ export function TopBar({
         <span className="font-semibold text-zinc-100">PeakBot</span>
       </div>
 
-      {/* Model + working-dir chips. On mobile they move to the BottomBar to
-          de-crowd the header, so hide them here below lg. */}
+      {/* Sessions trio — conversations + model + cwd. On mobile they move
+          to the BottomBar to de-crowd the header, so hide them here below lg. */}
       <div className="hidden items-center gap-3 lg:flex">
+        <ConversationsPicker
+          conversations={conversations}
+          hasTranscript={hasTranscript}
+          onOpen={() => send({ type: "request_conversations" })}
+          onLoad={onLoadConversation}
+          onKill={(id) => send({ type: "kill_session", convo: id })}
+        />
+
         <ModelSwitcher
           models={models}
           activeAlias={activeAlias}

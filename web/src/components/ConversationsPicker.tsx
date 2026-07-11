@@ -15,12 +15,16 @@ export function ConversationsPicker({
   onOpen,
   onLoad,
   onKill,
+  // Open the dropdown upward instead of downward. Set when the chip lives in
+  // the mobile bottom bar, where a downward menu would clip off-screen.
+  dropUp = false,
 }: {
   conversations: ConversationSummary[];
   hasTranscript: boolean;
   onOpen: () => void;
   onLoad: (id: string) => void;
   onKill: (id: string) => void;
+  dropUp?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   // The list arrives async after onOpen(); show a loading hint until it does
@@ -88,7 +92,13 @@ export function ConversationsPicker({
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-20 mt-1 max-h-96 w-80 overflow-y-auto rounded-md border border-zinc-800 bg-zinc-900 py-1 shadow-xl">
+        <div
+          className={`absolute left-0 z-20 max-h-96 w-80 overflow-y-auto rounded-md border border-zinc-800 bg-zinc-900 py-1 shadow-xl max-sm:fixed max-sm:inset-x-2 max-sm:mt-0 max-sm:mb-0 max-sm:w-auto ${
+            dropUp
+              ? "bottom-full mb-1 max-sm:bottom-[3.75rem] max-sm:top-auto"
+              : "top-full mt-1 max-sm:top-[3.75rem]"
+          }`}
+        >
           {loading ? (
             <div className="flex items-center gap-2 px-3 py-2 text-xs text-zinc-500">
               <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-600 border-t-zinc-300" />

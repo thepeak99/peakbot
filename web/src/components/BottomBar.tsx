@@ -1,11 +1,20 @@
-import type { DirListing, InboundMessage, ModelInfo } from "../state";
+import type {
+  ConversationSummary,
+  DirListing,
+  InboundMessage,
+  ModelInfo,
+} from "../state";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { CwdPicker } from "./CwdPicker";
+import { ConversationsPicker } from "./ConversationsPicker";
 
-// Mobile-only bottom bar. Holds the model switcher and working-dir chips that
-// the TopBar hides below lg, keeping them visible without crowding the header.
-// Both chips open upward (`dropUp`) so their menus don't clip off-screen.
+// Bottom status bar — mobile-only (hidden on lg+). Houses the conversations
+// picker, the model switcher, and the cwd picker so all three
+// session-affecting controls are reachable without opening a drawer.
+// Menus open upward (`dropUp`) so they don't clip off the bottom of the
+// viewport.
 export function BottomBar({
+  conversations,
   models,
   activeAlias,
   hasTranscript,
@@ -13,7 +22,9 @@ export function BottomBar({
   dirListing,
   send,
   onSwitchModel,
+  onLoadConversation,
 }: {
+  conversations: ConversationSummary[];
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
@@ -21,9 +32,18 @@ export function BottomBar({
   dirListing: DirListing | null;
   send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
+  onLoadConversation: (id: string) => void;
 }) {
   return (
-    <footer className="flex items-center gap-3 border-t border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur lg:hidden">
+    <footer className="flex items-center gap-2 border-t border-zinc-800 bg-zinc-950/80 px-3 py-2 backdrop-blur lg:hidden">
+      <ConversationsPicker
+        conversations={conversations}
+        hasTranscript={hasTranscript}
+        onOpen={() => send({ type: "request_conversations" })}
+        onLoad={onLoadConversation}
+        onKill={(id) => send({ type: "kill_session", convo: id })}
+        dropUp
+      />
       <ModelSwitcher
         models={models}
         activeAlias={activeAlias}
