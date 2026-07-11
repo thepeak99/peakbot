@@ -32,6 +32,7 @@ export function App() {
     activeAlias,
     conversations,
     commands,
+    dirListing,
     error,
     send,
     switchConvo,
@@ -61,6 +62,9 @@ export function App() {
         models={models}
         activeAlias={stats?.modelAlias || activeAlias}
         hasTranscript={hasTranscript}
+        cwd={welcome?.cwd ?? null}
+        dirListing={dirListing}
+        send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
       />
 

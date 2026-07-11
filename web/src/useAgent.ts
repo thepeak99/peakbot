@@ -14,6 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   AppState,
   ConversationSummary,
+  DirListing,
   InboundMessage,
   ModelInfo,
   SlashCommand,
@@ -26,6 +27,10 @@ export interface AgentConnection {
   activeAlias: string;
   conversations: ConversationSummary[];
   commands: SlashCommand[];
+  /** Latest `dir_listing` reply for the cwd picker (request/response over the
+   * socket, not part of AppState — browsing is ephemeral). `null` until the
+   * first `list_dir` is answered. */
+  dirListing: DirListing | null;
   error: string | null;
   send: (msg: InboundMessage) => void;
   /** Switch this client to another conversation by re-attaching: bind the new
@@ -62,6 +67,7 @@ export function useAgent(): AgentConnection {
   const [activeAlias, setActiveAlias] = useState("");
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [commands, setCommands] = useState<SlashCommand[]>([]);
+  const [dirListing, setDirListing] = useState<DirListing | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -144,6 +150,14 @@ export function useAgent(): AgentConnection {
           case "conversations_list":
             setConversations(msg.items);
             break;
+          case "dir_listing":
+            setDirListing({
+              path: msg.path,
+              parent: msg.parent,
+              entries: msg.entries,
+              error: msg.error,
+            });
+            break;
           case "error":
             setError(msg.message);
             break;
@@ -200,6 +214,7 @@ export function useAgent(): AgentConnection {
     activeAlias,
     conversations,
     commands,
+    dirListing,
     error,
     send,
     switchConvo,

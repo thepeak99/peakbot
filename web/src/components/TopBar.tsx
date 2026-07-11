@@ -1,6 +1,7 @@
 import type { SessionStats } from "../types";
-import type { ModelInfo } from "../state";
+import type { DirListing, InboundMessage, ModelInfo } from "../state";
 import { ModelSwitcher } from "./ModelSwitcher";
+import { CwdPicker } from "./CwdPicker";
 
 // Top status bar. Model switcher, the working spinner (AppState.is_running),
 // a compact tokens/cost readout mirroring the TUI status line, and a
@@ -12,6 +13,9 @@ export function TopBar({
   models,
   activeAlias,
   hasTranscript,
+  cwd,
+  dirListing,
+  send,
   onSwitchModel,
 }: {
   stats: SessionStats | null;
@@ -20,6 +24,9 @@ export function TopBar({
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
+  cwd: string | null;
+  dirListing: DirListing | null;
+  send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
 }) {
   return (
@@ -35,6 +42,15 @@ export function TopBar({
         hasTranscript={hasTranscript}
         onSwitch={onSwitchModel}
       />
+
+      {cwd && (
+        <CwdPicker
+          cwd={cwd}
+          hasTranscript={hasTranscript}
+          dirListing={dirListing}
+          send={send}
+        />
+      )}
 
       {isRunning && (
         <span className="flex items-center gap-1.5 text-xs text-amber-400">
