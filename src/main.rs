@@ -190,20 +190,14 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Create provider — context window resolution lives in the registry
-    // (per-model `context_size:` OR `auto_detect_context_size` against
-    // the wire id). The provider itself doesn't need to know the value;
-    // `ContextManager` is the single consumer downstream.
-    //
-    // Boot path: `resolve_and_mirror_boot_provider` looks up the active
-    // model in the registry, copies its provider config into
-    // `config.provider`, and hands back the resolved value. The mirror
-    // keeps the invariant that `config.provider` == active provider,
-    // matching the `/model` switch path at `lib.rs:1082`. Without it,
-    // `AgentRunner::new`'s compaction-model construction reads the
-    // stale `OpenRouterConfig::default()` (api_key=None) and falls over
-    // with a misleading "OpenRouter API key not configured" error.
-    let boot_provider_config = config.resolve_and_mirror_boot_provider(&model_registry);
+    // Mirror the registry's boot provider into `config.provider` so
+    // `AgentRunner::new`'s compaction-model construction reads the active
+    // provider, not the stale `OpenRouterConfig::default()` (api_key=None)
+    // that would fail with a misleading "OpenRouter API key not configured".
+    // Matches the `/model` switch path at `lib.rs:1082`. The return value is
+    // unused — each session derives its own provider from the resolved boot
+    // model; only the `config.provider` side-effect matters here.
+    config.resolve_and_mirror_boot_provider(&model_registry);
 
     // Log the detected shell here; each session applies it to its own
     // StateManager via the factory. On Windows with no shell, warn once.
@@ -250,7 +244,6 @@ async fn main() -> Result<()> {
         pipeline_registry,
         vector_store,
         shell_kind,
-        boot_provider_config,
         storage,
         mcp_tools_count,
         skills_count,

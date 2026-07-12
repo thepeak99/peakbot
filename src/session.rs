@@ -25,8 +25,8 @@ use crate::config::{Config, ModelRegistry, SearXngConfig};
 use crate::tools::ShellKind;
 use crate::ui::app_state::WelcomeState;
 use crate::{
-    AgentRunner, McpServerHandle, ProviderConfig, RebuildContext, SkillRegistry, StateManager,
-    SubAgentRegistry, TodoTool, UiAction, auto_detect_context_size, create_provider,
+    AgentRunner, McpServerHandle, RebuildContext, SkillRegistry, StateManager, SubAgentRegistry,
+    TodoTool, UiAction, create_provider,
 };
 use anyhow::Result;
 use std::sync::Arc;
@@ -53,9 +53,6 @@ pub struct SessionDeps {
     pub pipeline_registry: Option<Arc<SubAgentRegistry>>,
     pub vector_store: Option<crate::vector::VectorStore>,
     pub shell_kind: Option<ShellKind>,
-    /// The active provider config, already resolved from the registry's
-    /// default alias. Fed to `create_provider` for each session.
-    pub boot_provider_config: ProviderConfig,
     /// Shared conversation storage (writes distinct files per conversation
     /// id), or `None` when persistence is disabled. Cloned into each
     /// session's `StateManager`.
@@ -116,23 +113,21 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
             .as_ref()
             .map(|(p, m)| (p.as_str(), m.as_str())),
     );
-    let (boot_provider_config, boot_provider_name, boot_alias, boot_context_size) = match boot.model
-    {
-        Some(rm) => (
-            rm.provider_config.clone(),
-            rm.provider_name.clone(),
-            rm.alias.clone(),
-            Some(rm.context_size),
-        ),
-        // Empty registry (legacy single-provider boot): use the
-        // pre-resolved boot config, no alias/provider identity.
-        None => (
-            deps.boot_provider_config.clone(),
-            String::new(),
-            "default".to_string(),
-            None,
-        ),
-    };
+    // `build_model_registry` always yields a default (multi-model requires
+    // `default_model`; the legacy single-provider path synthesises a
+    // `default` alias), so a config-built registry always resolves a boot
+    // model. The `Option` is `resolve_boot`'s honest registry-layer contract
+    // — assert `create_session`'s stronger precondition here.
+    let boot_model = boot
+        .model
+        .expect("a config-built ModelRegistry always has a default model");
+    let boot_provider_config = &boot_model.provider_config;
+    let boot_provider_name = boot_model.provider_name.clone();
+    let boot_alias = boot_model.alias.clone();
+    // Context size for the booted model, eagerly resolved at registry-build
+    // time (config override or auto-detected). Drives ContextManager
+    // compaction thresholds.
+    let context_size = boot_model.context_size;
 
     // Each session clones the MCP tools list from the shared handles (not
     // the subprocesses). `McpTool: Clone` makes this cheap.
@@ -154,7 +149,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     };
 
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
-        &boot_provider_config,
+        boot_provider_config,
         mcp_tools,
         &deps.system_prompt,
         deps.searxng_config.as_ref(),
@@ -197,11 +192,6 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
              loaded on '{boot_alias}' instead."
         ));
     }
-
-    // Context size for the booted model (config or auto-detected); drives
-    // ContextManager compaction thresholds.
-    let context_size =
-        boot_context_size.unwrap_or_else(|| auto_detect_context_size(provider_info.model.as_str()));
 
     let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
 
