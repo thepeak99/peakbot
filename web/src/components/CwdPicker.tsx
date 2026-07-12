@@ -101,12 +101,12 @@ export function CwdPicker({
     <div className="relative" ref={ref}>
       <button
         onClick={openPicker}
-        className="flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
+        className="flex min-w-0 max-w-[40vw] items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
         title={cwd}
       >
-        <span className="text-zinc-500">📁</span>
-        <span className="font-medium">{basename(cwd)}</span>
-        <span className="text-zinc-600">▾</span>
+        <span className="shrink-0 text-zinc-500">📁</span>
+        <span className="truncate font-medium">{basename(cwd)}</span>
+        <span className="shrink-0 text-zinc-600">▾</span>
       </button>
 
       {open && (

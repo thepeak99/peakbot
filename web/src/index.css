@@ -3,26 +3,26 @@
    (rehype-highlight emits highlight.js class names). */
 @import "highlight.js/styles/github-dark.css";
 
-/* Dark scrollbars to match the zinc-950 background. WebKit (Chrome/Edge/Safari)
-   needs explicit pseudo-element rules; Firefox uses the standard
-   scrollbar-color / scrollbar-width shorthands. */
+/* Slim, subtle scrollbars tuned to the zinc UI. Firefox uses the standard
+   scrollbar-color / -width shorthands; WebKit (Chrome/Edge/Safari) needs the
+   pseudo-element rules. Thumb is a translucent zinc that lifts on hover. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgb(63 63 70) transparent;
+  scrollbar-color: rgb(63 63 70 / 0.6) transparent;
 }
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgb(63 63 70);
-  border-radius: 5px;
+  background: rgb(63 63 70 / 0.6);
+  border-radius: 9999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgb(82 82 91);
+  background: rgb(82 82 91 / 0.85);
 }
 
 /* Minimal spacing/typography for rendered markdown (react-markdown output).

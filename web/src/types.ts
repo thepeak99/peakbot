@@ -51,6 +51,17 @@ export interface BgProcess {
   exitCode?: number;
 }
 
+// A file the agent touched this session, derived from file-edit tool calls
+// in the transcript (#126). `edits` counts how many times it was written.
+export interface FileEdit {
+  path: string;
+  edits: number;
+  /** Latest-action kind, with precedence created > modified > read. A file
+   * that was ever created stays "created"; a read-then-edited file is
+   * "modified"; a file only ever read is "read". */
+  kind: "created" | "modified" | "read";
+}
+
 export interface BashPanel {
   command: string;
   status: "running" | "finished";
