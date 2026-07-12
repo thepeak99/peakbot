@@ -25,8 +25,8 @@ use crate::config::{Config, ModelRegistry, SearXngConfig};
 use crate::tools::ShellKind;
 use crate::ui::app_state::WelcomeState;
 use crate::{
-    AgentRunner, McpServerHandle, ProviderConfig, RebuildContext, SkillRegistry, StateManager,
-    SubAgentRegistry, TodoTool, UiAction, auto_detect_context_size, create_provider,
+    AgentRunner, McpServerHandle, RebuildContext, SkillRegistry, StateManager, SubAgentRegistry,
+    TodoTool, UiAction, create_provider,
 };
 use anyhow::Result;
 use std::sync::Arc;
@@ -53,9 +53,6 @@ pub struct SessionDeps {
     pub pipeline_registry: Option<Arc<SubAgentRegistry>>,
     pub vector_store: Option<crate::vector::VectorStore>,
     pub shell_kind: Option<ShellKind>,
-    /// The active provider config, already resolved from the registry's
-    /// default alias. Fed to `create_provider` for each session.
-    pub boot_provider_config: ProviderConfig,
     /// Shared conversation storage (writes distinct files per conversation
     /// id), or `None` when persistence is disabled. Cloned into each
     /// session's `StateManager`.
@@ -106,6 +103,28 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
 
     let todo_tool = TodoTool::new(state_manager.clone());
 
+    // Pick the model to boot on. A resumed conversation boots on the model
+    // it was saved with (mirrors the REPL `/load` re-activation); a fresh
+    // session boots the registry default. The saved wire id is peeked
+    // without loading — the same preflight `/load` uses.
+    let saved_wire_id = resume.and_then(|id| state_manager.peek_conversation_wire_id(id).ok());
+    let boot = deps.model_registry.resolve_boot(
+        saved_wire_id
+            .as_ref()
+            .map(|(p, m)| (p.as_str(), m.as_str())),
+    );
+    // A resumed conversation boots on its saved model; a fresh session on
+    // the registry default. `resolve_boot` guarantees a model (a config-built
+    // registry always has a default), so there is no None case to handle.
+    let boot_model = boot.model;
+    let boot_provider_config = &boot_model.provider_config;
+    let boot_provider_name = boot_model.provider_name.clone();
+    let boot_alias = boot_model.alias.clone();
+    // Context size for the booted model, eagerly resolved at registry-build
+    // time (config override or auto-detected). Drives ContextManager
+    // compaction thresholds.
+    let context_size = boot_model.context_size;
+
     // Each session clones the MCP tools list from the shared handles (not
     // the subprocesses). `McpTool: Clone` makes this cheap.
     let mcp_tools = if deps.mcp_handles.is_empty() {
@@ -126,7 +145,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     };
 
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
-        &deps.boot_provider_config,
+        boot_provider_config,
         mcp_tools,
         &deps.system_prompt,
         deps.searxng_config.as_ref(),
@@ -140,15 +159,8 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     )?;
 
     // Stamp the wire identity `(provider_name, model)` and the display
-    // alias, derived from the registry's default entry.
+    // alias for the booted model (resumed model or registry default).
     state_manager.set_model(provider_info.model.clone());
-    let (boot_provider_name, boot_alias) = match deps.model_registry.default_alias() {
-        Some(a) => match deps.model_registry.resolve(a) {
-            Some(rm) => (rm.provider_name.clone(), rm.alias.clone()),
-            None => (String::new(), a.to_string()),
-        },
-        None => (String::new(), "default".to_string()),
-    };
     state_manager.set_provider_name(boot_provider_name);
     state_manager.set_model_alias(boot_alias.clone());
 
@@ -166,14 +178,16 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         .get_current_conversation_id()
         .expect("ensure_boot_conversation guarantees a current conversation");
 
-    // Resolve the boot model's context_size (config or auto-detected);
-    // drives ContextManager compaction thresholds.
-    let context_size = deps
-        .model_registry
-        .default_alias()
-        .and_then(|a| deps.model_registry.resolve(a))
-        .map(|rm| rm.context_size)
-        .unwrap_or_else(|| auto_detect_context_size(provider_info.model.as_str()));
+    // A resumed conversation whose saved model is gone from the registry
+    // boots on the default instead — tell the user rather than downgrade
+    // silently (the REPL `/load` rejects; a session boot must produce an
+    // agent, so it falls back and notes it).
+    if let Some((provider, model)) = boot.unavailable {
+        state_manager.add_system_message(format!(
+            "⚠ Model '{provider}/{model}' from this conversation is no longer available; \
+             loaded on '{boot_alias}' instead."
+        ));
+    }
 
     let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
 
