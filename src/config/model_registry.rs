@@ -116,10 +116,10 @@ pub struct ResolvedModel {
 /// saved model was unavailable. Returned by [`ModelRegistry::resolve_boot`].
 #[derive(Debug)]
 pub struct BootSelection<'a> {
-    /// The chosen model. `None` only when the registry is empty (legacy
-    /// single-provider boot) — the caller then falls back to its
-    /// pre-resolved boot provider config.
-    pub model: Option<&'a ResolvedModel>,
+    /// The chosen model — always present. `resolve_boot` requires a
+    /// registry with a default (every config-built registry has one), so
+    /// there is always a model to boot on.
+    pub model: &'a ResolvedModel,
     /// `Some((provider, model))` iff a complete saved wire id was requested
     /// on resume but no longer exists in the registry, so `model` fell back
     /// to the default. Drives a user-facing "not available" note.
@@ -322,13 +322,23 @@ impl ModelRegistry {
     /// can tell the user instead of downgrading silently. Pre-v5 files
     /// (empty `provider_name`) can't be re-activated and fall through to
     /// the default without a note.
+    ///
+    /// # Panics
+    /// Requires a registry with a default model — every config-built
+    /// registry has one (multi-model requires `default_model`; the legacy
+    /// single-provider path synthesises a `default` alias). A session
+    /// cannot boot with zero models, so this is a genuine precondition of
+    /// the boot decision, not a general registry operation.
     pub fn resolve_boot(&self, saved_wire_id: Option<(&str, &str)>) -> BootSelection<'_> {
-        let default = self.default_alias().and_then(|a| self.resolve(a));
+        let default = self
+            .default_alias()
+            .and_then(|a| self.resolve(a))
+            .expect("resolve_boot requires a registry with a default model");
         match saved_wire_id {
             Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
                 match self.find_by_wire_id(provider, model) {
                     Some(rm) => BootSelection {
-                        model: Some(rm),
+                        model: rm,
                         unavailable: None,
                     },
                     None => BootSelection {
@@ -932,7 +942,7 @@ models:
         let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
 
         let boot = reg.resolve_boot(None);
-        assert_eq!(boot.model.expect("default present").alias, "sonnet");
+        assert_eq!(boot.model.alias, "sonnet");
         assert!(boot.unavailable.is_none());
     }
 
@@ -944,8 +954,7 @@ models:
 
         let boot = reg.resolve_boot(Some(("openrouter", "anthropic/claude-opus-4")));
         assert_eq!(
-            boot.model.expect("saved model present").alias,
-            "opus",
+            boot.model.alias, "opus",
             "resumed conversation must boot on its saved model, not the default"
         );
         assert!(boot.unavailable.is_none());
@@ -958,7 +967,7 @@ models:
         let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
 
         let boot = reg.resolve_boot(Some(("patchnotes", "ghost/model-9")));
-        assert_eq!(boot.model.expect("falls back to default").alias, "sonnet");
+        assert_eq!(boot.model.alias, "sonnet");
         assert_eq!(
             boot.unavailable,
             Some(("patchnotes".to_string(), "ghost/model-9".to_string()))
@@ -973,7 +982,7 @@ models:
         let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
 
         let boot = reg.resolve_boot(Some(("", "anthropic/claude-opus-4")));
-        assert_eq!(boot.model.expect("default present").alias, "sonnet");
+        assert_eq!(boot.model.alias, "sonnet");
         assert!(
             boot.unavailable.is_none(),
             "pre-v5 files must not raise an availability warning"

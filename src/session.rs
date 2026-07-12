@@ -113,14 +113,10 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
             .as_ref()
             .map(|(p, m)| (p.as_str(), m.as_str())),
     );
-    // `build_model_registry` always yields a default (multi-model requires
-    // `default_model`; the legacy single-provider path synthesises a
-    // `default` alias), so a config-built registry always resolves a boot
-    // model. The `Option` is `resolve_boot`'s honest registry-layer contract
-    // — assert `create_session`'s stronger precondition here.
-    let boot_model = boot
-        .model
-        .expect("a config-built ModelRegistry always has a default model");
+    // A resumed conversation boots on its saved model; a fresh session on
+    // the registry default. `resolve_boot` guarantees a model (a config-built
+    // registry always has a default), so there is no None case to handle.
+    let boot_model = boot.model;
     let boot_provider_config = &boot_model.provider_config;
     let boot_provider_name = boot_model.provider_name.clone();
     let boot_alias = boot_model.alias.clone();
