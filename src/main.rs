@@ -277,10 +277,7 @@ async fn main() -> Result<()> {
             );
         }
 
-        let active_alias = model_registry
-            .default_alias()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "default".to_string());
+        let active_alias = model_registry.default_alias().to_string();
         let mut ui = WebUi::new(
             addr,
             session_deps.clone(),
