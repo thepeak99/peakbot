@@ -154,16 +154,19 @@ pub enum RegistryError {
 
     #[error("default_model is required when at least one model is declared")]
     MissingDefault,
+
+    #[error("no models declared — a registry must contain at least one model")]
+    EmptyRegistry,
 }
 
 /// Resolved alias → model lookup, plus the boot default.
 ///
 /// Built once at config load via [`ModelRegistry::build`]; thereafter
 /// looked up by alias on `/model` and `/load`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ModelRegistry {
     by_alias: HashMap<String, ResolvedModel>,
-    default_alias: Option<String>,
+    default_alias: String,
 }
 
 impl ModelRegistry {
@@ -252,22 +255,16 @@ impl ModelRegistry {
                         },
                     });
                 }
-                Some(d.to_string())
+                d.to_string()
             }
-            _ if !by_alias.is_empty() => return Err(RegistryError::MissingDefault),
-            _ => None,
+            _ if by_alias.is_empty() => return Err(RegistryError::EmptyRegistry),
+            _ => return Err(RegistryError::MissingDefault),
         };
 
         Ok(Self {
             by_alias,
             default_alias,
         })
-    }
-
-    /// Empty registry — used when no `providers:` block was declared
-    /// and the legacy single-provider config path is in effect.
-    pub fn empty() -> Self {
-        Self::default()
     }
 
     /// Whether any models were declared.
@@ -280,9 +277,10 @@ impl ModelRegistry {
         self.by_alias.len()
     }
 
-    /// The boot alias (`default_model:`).
-    pub fn default_alias(&self) -> Option<&str> {
-        self.default_alias.as_deref()
+    /// The boot alias (`default_model:`). Always present — a registry
+    /// cannot be built without at least one model and a resolved default.
+    pub fn default_alias(&self) -> &str {
+        &self.default_alias
     }
 
     /// Look up a model by alias.
@@ -331,8 +329,7 @@ impl ModelRegistry {
     /// the boot decision, not a general registry operation.
     pub fn resolve_boot(&self, saved_wire_id: Option<(&str, &str)>) -> BootSelection<'_> {
         let default = self
-            .default_alias()
-            .and_then(|a| self.resolve(a))
+            .resolve(self.default_alias())
             .expect("resolve_boot requires a registry with a default model");
         match saved_wire_id {
             Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
@@ -533,7 +530,7 @@ mod tests {
         let reg = ModelRegistry::build(&providers, Some("sonnet")).expect("should build");
 
         assert_eq!(reg.len(), 4);
-        assert_eq!(reg.default_alias(), Some("sonnet"));
+        assert_eq!(reg.default_alias(), "sonnet");
         assert!(reg.contains("sonnet"));
         assert!(reg.contains("opus"));
         assert!(reg.contains("oai-gpt4"));
@@ -635,10 +632,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_with_no_default_is_fine() {
-        let reg = ModelRegistry::build(&[], None).expect("empty + None should work");
-        assert!(reg.is_empty());
-        assert_eq!(reg.default_alias(), None);
+    fn empty_registry_is_rejected() {
+        let err = ModelRegistry::build(&[], None).unwrap_err();
+        assert_eq!(err, RegistryError::EmptyRegistry);
     }
 
     #[test]

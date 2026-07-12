@@ -590,20 +590,13 @@ impl Config {
     /// `/model` switch path already maintains this invariant at
     /// `lib.rs:1082`; boot must match.
     ///
-    /// When no registry default alias exists (pure legacy single-
-    /// provider config), `self.provider` is already authoritative — this
-    /// is a no-op that returns its clone.
-    ///
     /// *(simplicity is the key — one field tracks the active provider)*
     pub fn resolve_and_mirror_boot_provider(&mut self, registry: &ModelRegistry) -> ProviderConfig {
-        let resolved = match registry.default_alias() {
-            Some(alias) => registry
-                .resolve(alias)
-                .expect("default_alias is guaranteed to resolve by ModelRegistry::build")
-                .provider_config
-                .clone(),
-            None => self.provider.clone(),
-        };
+        let resolved = registry
+            .resolve(registry.default_alias())
+            .expect("default_alias is guaranteed to resolve by ModelRegistry::build")
+            .provider_config
+            .clone();
         self.provider = resolved.clone();
         resolved
     }
@@ -1600,7 +1593,7 @@ provider:
             .build_model_registry()
             .expect("legacy synth should always succeed for default config");
 
-        assert_eq!(reg.default_alias(), Some("default"));
+        assert_eq!(reg.default_alias(), "default");
         assert!(reg.contains("default"));
         assert_eq!(reg.len(), 1);
     }
@@ -1628,7 +1621,7 @@ provider:
             ..Config::default()
         };
         let reg = config.build_model_registry().expect("should build");
-        assert_eq!(reg.default_alias(), Some("sonnet"));
+        assert_eq!(reg.default_alias(), "sonnet");
         assert!(reg.contains("sonnet"));
         // Legacy `provider:` block is *not* synthesised when providers
         // list is non-empty.
