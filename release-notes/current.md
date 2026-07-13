@@ -43,6 +43,10 @@ This file is the working draft for the next release. When a version is tagged, t
 - Web UI: a "⏳ N queued" counter in the top bar shows how many messages are
   queued while the agent is busy (#123, counter only — per-message deletion
   still pending a queue refactor).
+- Web UI: a **＋** button next to the conversations chip opens a fresh
+  conversation in a new browser tab (new tab with no `?convo=` mints a new
+  server session; same origin so the auth cookie carries). Present on both
+  desktop (top bar) and mobile (bottom bar).
 - Web UI: light/dark theme toggle in the top bar (☀/🌙, next to the notify
   bell). Dark remains the default; light mirrors the same semantic zinc ramp
   by remapping the zinc CSS variables under an `html.light` class, so every
