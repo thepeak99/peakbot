@@ -43,6 +43,14 @@ This file is the working draft for the next release. When a version is tagged, t
 - Web UI: a "⏳ N queued" counter in the top bar shows how many messages are
   queued while the agent is busy (#123, counter only — per-message deletion
   still pending a queue refactor).
+- Web UI: light/dark theme toggle in the top bar (☀/🌙, next to the notify
+  bell). Dark remains the default; light mirrors the same semantic zinc ramp
+  by remapping the zinc CSS variables under an `html.light` class, so every
+  panel, border, and text tone flips with zero per-component changes. The
+  choice persists in `localStorage` and falls back to your OS
+  `prefers-color-scheme` on first visit; an inline head script applies it
+  before first paint to avoid a flash. Fenced code blocks stay dark in both
+  themes by design.
 - Web UI: mobile layout fixes (#117) — full-width root to avoid horizontal
   overflow, the drawer no longer overlaps the mobile bottom bar, header/footer
   heights aligned with the drawer, iOS safe-area padding on the bottom bar,

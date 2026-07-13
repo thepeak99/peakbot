@@ -4,6 +4,21 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content" />
     <title>PeakBot</title>
+    <script>
+      // Apply the saved (or OS-preferred) theme before first paint to avoid a
+      // flash. useTheme.ts mirrors this same decision into React state.
+      (function () {
+        try {
+          var t = localStorage.getItem("peakbot-theme");
+          if (t !== "light" && t !== "dark") {
+            t = matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+          }
+          if (t === "light") document.documentElement.classList.add("light");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body class="bg-zinc-950 text-zinc-100">
     <div id="root"></div>
