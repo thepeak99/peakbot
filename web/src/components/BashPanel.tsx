@@ -1,12 +1,14 @@
 import { useEffect, useRef } from "react";
 import type { BashPanel as BashPanelData } from "../types";
 
-// Foreground `bash` output panel. Mirrors BashPanelState (src/ui/app_state.rs)
-// — the bottom strip that surfaces the running/last `bash` invocation. Green
-// header while running, exit-code glyph when finished. The output is a
-// scrollable buffer: it auto-follows the tail on new lines, but pausing the
-// follow the moment the user scrolls up so they can read history undisturbed
-// (auto-follow resumes when they scroll back to the bottom).
+// Foreground `bash` output for the drawer "Bash" tab. Mirrors BashPanelState
+// (src/ui/app_state.rs) — the running/last `bash` invocation. Green header
+// while running, exit-code glyph when finished. The output is a scrollable
+// buffer: it auto-follows the tail on new lines, pausing the follow the moment
+// the user scrolls up so they can read history undisturbed (auto-follow
+// resumes when they scroll back to the bottom). Only the latest `bash` command
+// is tracked by the backend — background (`bash_bg`) processes and their
+// history live in the "Tasks" tab.
 export function BashPanel({ panel }: { panel: BashPanelData }) {
   const running = panel.status === "running";
   const preRef = useRef<HTMLPreElement>(null);
@@ -27,8 +29,8 @@ export function BashPanel({ panel }: { panel: BashPanelData }) {
   }, [body]);
 
   return (
-    <div className="border-t border-zinc-800 bg-black/40">
-      <div className="flex items-center gap-2 border-b border-zinc-800/70 px-4 py-1.5 text-xs">
+    <div className="overflow-hidden rounded-lg border border-zinc-800 bg-black/40">
+      <div className="flex items-center gap-2 border-b border-zinc-800/70 px-3 py-1.5 text-xs">
         <span className={running ? "text-emerald-400" : "text-zinc-400"}>
           {running ? "▶" : panel.exitCode === 0 ? "✓" : "✗"}
         </span>
@@ -43,7 +45,7 @@ export function BashPanel({ panel }: { panel: BashPanelData }) {
       <pre
         ref={preRef}
         onScroll={onScroll}
-        className="max-h-48 overflow-y-auto px-4 py-2 font-mono text-[11px] leading-relaxed text-zinc-400"
+        className="max-h-[70vh] overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-zinc-400"
       >
         {body}
       </pre>

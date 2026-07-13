@@ -13,17 +13,30 @@ This file is the working draft for the next release. When a version is tagged, t
   session (create/edit), derived live from the transcript's file-edit tool
   calls (#126, list-only).
 - Web UI: tab handles now show a pointer cursor on hover (desktop a11y).
-- Web UI: the message composer is now taller by default and auto-grows with
-  its content — a roomy resting height (larger on desktop, smaller on mobile),
-  expanding line-by-line up to a cap, past which it scrolls internally.
+- Web UI: the message composer now rests at a single row and grows line-by-line
+  with its content up to a cap (past which it scrolls) — reclaims the vertical
+  space the previous multi-row resting height ate, especially on mobile.
 - Web UI: slimmer, subtler scrollbars tuned to the zinc theme (translucent
   grey thumb that lifts on hover).
-- Web UI: the foreground `bash` panel output is now a scrollable buffer that
-  auto-follows the tail and pauses following when you scroll up to read
-  history (#121). The backend now mirrors up to 500 tail lines to the panel;
-  the terminal UI still clips to its fixed 5-row height.
+- Web UI: the foreground `bash` output moved out of the fixed strip above the
+  composer into its own **Bash** drawer tab — expand it when you want, and it
+  no longer eats vertical space or gets pushed off by new messages (#121). The
+  output is still a scrollable buffer that auto-follows the tail and pauses
+  following when you scroll up to read history; a handle badge marks a running
+  command. The backend mirrors up to 500 tail lines to the panel; the terminal
+  UI still clips to its fixed 5-row height.
+- Web UI: the drawer's tab handle rail no longer overlaps transcript text or
+  the composer's Send button on mobile/tablet — the conversation column reserves
+  the rail's width, while the message input spans the full width. A small gap
+  now sits between the content and the rail so the transcript scrollbar reads as
+  separate from the tabs.
+- Web UI: tapping/clicking outside the open drawer closes it (in addition to
+  Escape) on mobile/tablet only — on desktop the drawer stays put as a
+  persistent side rail, so a stray click in the conversation won't dismiss it.
 - Web UI: browser notification when a task finishes while the tab is not
   focused — opt-in per session via a bell toggle in the top bar (#119).
+  Enabling it now fires a one-off confirmation notification so you get instant
+  feedback that it works (real pings only fire when the tab is backgrounded).
 - Web UI: the **Files** tab now shows a per-file kind badge (created /
   modified / read) and a "Copy for git add" button that copies the changed
   paths, newline-joined, for staging (#126).

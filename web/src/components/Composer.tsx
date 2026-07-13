@@ -33,12 +33,10 @@ import { useMediaQuery } from "../useMediaQuery";
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_IMAGES = 8;
 
-// Composer height budget. The textarea grows with its content between a
-// generous resting min-height (bigger on desktop, where vertical space is
-// cheap) and a hard cap, past which it scrolls. Values are px.
-const MIN_H_DESKTOP = 96; // ~3× the old single-row height — roomy by default
-const MIN_H_MOBILE = 64; // ~2× — phones have less vertical room to spare
-const MAX_H = 192; // ~6× — beyond this the textarea scrolls internally
+// Composer height budget. The textarea rests at a single row and grows with
+// its content up to a hard cap, past which it scrolls internally. Values are px.
+const MIN_H = 40; // one text row — roughly line-height + vertical padding
+const MAX_H = 192; // ~6 rows — beyond this the textarea scrolls internally
 
 type PendingImage = { id: string; name: string; dataUrl: string };
 
@@ -73,21 +71,18 @@ export function Composer({
   // tablet mode). Gates Enter-to-send so an accidental tap on the on-screen
   // return key never fires a half-typed message.
   const touchInput = useMediaQuery("(pointer: coarse)");
-  const isDesktop = useMediaQuery("(min-width: 1024px)"); // lg breakpoint
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const minH = isDesktop ? MIN_H_DESKTOP : MIN_H_MOBILE;
-
-  // Grow the textarea with its content between `minH` and `MAX_H`; past the
-  // cap it scrolls. Runs on every value/breakpoint change and after submit
-  // clears the field, so the box always snaps back to its resting height.
+  // Grow the textarea with its content between `MIN_H` (one row) and `MAX_H`;
+  // past the cap it scrolls. Runs on every value change and after submit clears
+  // the field, so the box always snaps back to its single-row resting height.
   useLayoutEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${Math.min(Math.max(el.scrollHeight, minH), MAX_H)}px`;
-  }, [text, minH]);
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, MIN_H), MAX_H)}px`;
+  }, [text]);
 
   // Palette shows only while typing a bare command name (`/foo`, no space).
   const query = text.startsWith("/") && !text.includes(" ") ? text.slice(1) : null;
@@ -328,7 +323,7 @@ export function Composer({
                 onKeyDown={onKeyDown}
                 onPaste={onPaste}
                 placeholder={placeholder}
-                style={{ minHeight: minH, maxHeight: MAX_H }}
+                style={{ minHeight: MIN_H, maxHeight: MAX_H }}
                 className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed"
               />
               {isRunning ? (

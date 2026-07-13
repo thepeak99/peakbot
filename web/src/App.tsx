@@ -93,6 +93,16 @@ export function App() {
       content: <BgPanel processes={bg} />,
       badge: runningBg,
     },
+    {
+      id: "bash",
+      label: "Bash",
+      content: bash ? (
+        <BashPanel panel={bash} />
+      ) : (
+        <p className="text-sm text-zinc-600">No bash command yet.</p>
+      ),
+      badge: bash?.status === "running" ? 1 : undefined,
+    },
   ];
 
   return (
@@ -124,7 +134,7 @@ export function App() {
 
       <div className="flex min-h-0 flex-1">
         <main className="flex min-w-0 flex-1 flex-col">
-          <section className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 md:px-8">
+          <section className="min-h-0 flex-1 overflow-y-auto mr-12 px-4 py-4 sm:px-6 md:px-8">
             <div className="mx-auto max-w-5xl space-y-3">
               {welcome && messageCount === 0 && <WelcomeBanner welcome={welcome} />}
               {state?.chat.messages.map((m, i) => (
@@ -134,7 +144,6 @@ export function App() {
             </div>
           </section>
 
-          {bash && <BashPanel panel={bash} />}
           <Composer
             isRunning={isRunning}
             connected={connected}

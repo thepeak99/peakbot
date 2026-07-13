@@ -12,6 +12,7 @@
 // the body and the body's own width always match on any viewport.
 
 import { useEffect, useState, type ReactNode } from "react";
+import { useMediaQuery } from "../useMediaQuery";
 
 export interface DrawerTab {
   id: string;
@@ -35,6 +36,10 @@ export function TabbedDrawer({
   defaultTab?: string | null;
 }) {
   const [active, setActive] = useState<string | null>(defaultTab);
+  // Tap-outside-to-close is a touch affordance. On desktop the drawer is a
+  // slim side rail you keep open while working — closing it on any stray click
+  // in the transcript would be surprising, so it's mobile/tablet only.
+  const isDesktop = useMediaQuery("(min-width: 1024px)");
 
   // Escape closes the drawer.
   useEffect(() => {
@@ -53,14 +58,26 @@ export function TabbedDrawer({
   const toggle = (id: string) => setActive((cur) => (cur === id ? null : id));
 
   return (
-    <aside
-      className="fixed right-0 top-14 bottom-14 z-40 flex items-start transition-transform duration-300 ease-out lg:bottom-0"
-      style={{
-        ["--drawer-w" as string]: `min(${width}px, 94vw)`,
-        transform: open ? "translateX(0)" : "translateX(var(--drawer-w))",
-      }}
-      aria-label="Side panels"
-    >
+    <>
+      {/* Tap/click outside the drawer closes it — mobile/tablet only. On
+          desktop the drawer stays a persistent side rail. Transparent overlay
+          sits below the drawer (z-30 < z-40) so the handle rail and body stay
+          clickable; everything else routes its click here. */}
+      {open && !isDesktop && (
+        <div
+          className="fixed inset-0 z-30"
+          onClick={() => setActive(null)}
+          aria-hidden
+        />
+      )}
+      <aside
+        className="fixed right-0 top-14 bottom-14 z-40 flex items-start transition-transform duration-300 ease-out lg:bottom-0"
+        style={{
+          ["--drawer-w" as string]: `min(${width}px, 94vw)`,
+          transform: open ? "translateX(0)" : "translateX(var(--drawer-w))",
+        }}
+        aria-label="Side panels"
+      >
       {/* Handle rail — first flex child, so it sits left of the body and stays
           flush to the viewport edge when the body is pushed off-screen. */}
       <div role="tablist" className="flex flex-col gap-1.5 pt-1">
@@ -107,6 +124,7 @@ export function TabbedDrawer({
       >
         {activeTab?.content}
       </div>
-    </aside>
+      </aside>
+    </>
   );
 }
