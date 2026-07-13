@@ -143,7 +143,10 @@ impl WebUi {
         }
         let local = self.addr.ip().is_loopback() && std::env::var_os("SSH_CONNECTION").is_none();
         if local {
-            let _ = open::that(url);
+            // Detached: `open::that` waits on the spawned handler (xdg-open),
+            // which can block forever — that stalls the async runtime before
+            // `axum::serve` is ever reached, leaving the bound port dead.
+            let _ = open::that_detached(url);
         }
     }
 }
