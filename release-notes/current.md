@@ -4,6 +4,11 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- Release: `make release-bump` now fast-forwards the current branch to
+  `origin/<branch>` (fetch + `git merge --ff-only`) before cutting the release
+  branch, and fails loud if local has diverged. This keeps the release PR head a
+  clean descendant of master, avoiding the Gitea "stuck `mergeable:false` / 405"
+  merge failure hit during the 0.13.3 release.
 - Web UI: replaced the static right-rail sidebar (plus its separate mobile
   hamburger drawer) with a single `TabbedDrawer` — vertical tab handles pinned
   to the right edge that slide a shared drawer body in/out. One responsive

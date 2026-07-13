@@ -133,7 +133,7 @@ release: release-bump release-tag release-build-linux release-build-windows rele
 	@echo ""
 	@echo "🎉 Release $$(grep '^version' Cargo.toml | head -1 | cut -d'\"' -f2) complete!"
 
-## release-bump: Update Cargo.toml + Cargo.lock, commit
+## release-bump: Sync branch with origin (ff-only), update Cargo.toml + Cargo.lock, commit
 release-bump:
 	@set -eu; \
 	if [ -z "$(VERSION)" ]; then \
@@ -152,6 +152,12 @@ release-bump:
 	if [ -z "$${ALLOW_DIRTY:-}" ] && [ -n "$$(git status --porcelain | grep -v '^?? ')" ]; then \
 	  echo "❌ Working tree has uncommitted changes (set ALLOW_DIRTY=1 to override):"; \
 	  git status --short; exit 1; \
+	fi; \
+	branch=$$(git rev-parse --abbrev-ref HEAD); \
+	echo "🔄 Syncing $$branch with origin (fast-forward only)..."; \
+	git fetch origin "$$branch"; \
+	if ! git merge --ff-only "origin/$$branch"; then \
+	  echo "❌ Local $$branch has diverged from origin/$$branch — a release branch cut here would not be a descendant of the base, and the merge would stick (see the 0.13.3 post-mortem). Reconcile ('git pull --rebase' or reset) and retry."; exit 1; \
 	fi; \
 	echo "📝 Bumping version to $$v..."; \
 	awk -v v="$$v" '/^\[package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml; \
