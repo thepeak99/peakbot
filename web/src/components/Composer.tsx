@@ -25,13 +25,18 @@
 // like a `[img:/path]` token. Over-size files are rejected client-side before
 // they hit the wire; a non-vision model is rejected server-side.
 
-import { useRef, useState } from "react";
+import { useRef, useState, useLayoutEffect } from "react";
 import type { SlashCommand } from "../state";
 import { useMediaQuery } from "../useMediaQuery";
 
 // Mirror of vision.rs MAX_IMAGE_BYTES — fail fast before shipping a doomed frame.
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_IMAGES = 8;
+
+// Composer height budget. The textarea rests at a single row and grows with
+// its content up to a hard cap, past which it scrolls internally. Values are px.
+const MIN_H = 40; // one text row — roughly line-height + vertical padding
+const MAX_H = 192; // ~6 rows — beyond this the textarea scrolls internally
 
 type PendingImage = { id: string; name: string; dataUrl: string };
 
@@ -67,6 +72,17 @@ export function Composer({
   // return key never fires a half-typed message.
   const touchInput = useMediaQuery("(pointer: coarse)");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Grow the textarea with its content between `MIN_H` (one row) and `MAX_H`;
+  // past the cap it scrolls. Runs on every value change and after submit clears
+  // the field, so the box always snaps back to its single-row resting height.
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, MIN_H), MAX_H)}px`;
+  }, [text]);
 
   // Palette shows only while typing a bare command name (`/foo`, no space).
   const query = text.startsWith("/") && !text.includes(" ") ? text.slice(1) : null;
@@ -299,6 +315,7 @@ export function Composer({
                 </svg>
               </button>
               <textarea
+                ref={textareaRef}
                 rows={1}
                 disabled={!connected}
                 value={text}
@@ -306,7 +323,8 @@ export function Composer({
                 onKeyDown={onKeyDown}
                 onPaste={onPaste}
                 placeholder={placeholder}
-                className="max-h-40 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed"
+                style={{ minHeight: MIN_H, maxHeight: MAX_H }}
+                className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed"
               />
               {isRunning ? (
                 <button

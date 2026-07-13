@@ -33,11 +33,12 @@ const PANEL_UPDATE_DEBOUNCE: Duration = Duration::from_millis(200);
 const POST_KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// Tail rows mirrored into the live panel via
-/// [`StateManager::update_bash_panel_tail`]. Must match the panel's
-/// `TAIL_ROWS` constant (slice 2 renderer); kept private here so a
-/// future panel resize doesn't ripple into the tool layer — the
-/// renderer pads / clips its own input.
-const PANEL_TAIL_ROWS: usize = 5;
+/// [`StateManager::update_bash_panel_tail`]. Sized for the **web** panel,
+/// which renders a scrollable buffer (issue #121); the TUI renderer clips
+/// this to its own fixed `TAIL_ROWS` (5) at draw time, so a larger value
+/// here only affects how much scrollback the web UI can show — it never
+/// changes the terminal panel's height.
+const PANEL_TAIL_ROWS: usize = 500;
 
 /// Session-unique counter for generating output filenames
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);

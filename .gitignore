@@ -14,3 +14,4 @@ bg-cooldown-plan.md
 
 # Local scratch dir (test config + vector db)
 .test/
+memory.md

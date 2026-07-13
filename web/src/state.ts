@@ -118,6 +118,10 @@ export interface AppState {
   conversation: WireConversationMeta | null;
   is_running: boolean;
   is_loading: boolean;
+  /** Messages typed during a busy turn, queued but not yet dequeued by the
+   * agent loop. Drives the "⏳ N queued" hint (issue #123 — counter only;
+   * per-message deletion needs a queue refactor still to come). */
+  pending_input_count?: number;
   welcome: WireWelcome | null;
   status_message?: string | null;
   exit_requested: boolean;

@@ -8,6 +8,8 @@ import type {
 import { ModelSwitcher } from "./ModelSwitcher";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
+import { NotifyToggle } from "./NotifyToggle";
+import type { NotifyPermission } from "../useTaskNotifications";
 
 // Top status bar. Sessions trio (conversations + model + cwd) live here on
 // lg+ and migrate to the BottomBar on smaller screens. Right side carries the
@@ -16,6 +18,7 @@ export function TopBar({
   stats,
   isRunning,
   connected,
+  pendingInput,
   models,
   activeAlias,
   hasTranscript,
@@ -25,11 +28,14 @@ export function TopBar({
   send,
   onSwitchModel,
   onLoadConversation,
-  onToggleSidebar,
+  notifyEnabled,
+  notifyPermission,
+  onToggleNotify,
 }: {
   stats: SessionStats | null;
   isRunning: boolean;
   connected: boolean;
+  pendingInput: number;
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
@@ -39,37 +45,12 @@ export function TopBar({
   send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
   onLoadConversation: (id: string) => void;
-  // Hamburger button. When provided the button is rendered (it is hidden on
-  // lg+ via CSS); App only supplies it on viewports where the sidebar needs
-  // toggling.
-  onToggleSidebar?: () => void;
+  notifyEnabled: boolean;
+  notifyPermission: NotifyPermission;
+  onToggleNotify: () => void;
 }) {
   return (
-    <header className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur">
-      {onToggleSidebar && (
-        <button
-          type="button"
-          onClick={onToggleSidebar}
-          aria-label="Toggle sidebar"
-          title="Toggle sidebar"
-          className="-ml-1 flex h-8 w-8 items-center justify-center rounded-md text-zinc-300 hover:bg-zinc-800 lg:hidden"
-        >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="h-5 w-5"
-            aria-hidden="true"
-          >
-            <line x1="3" y1="6" x2="21" y2="6" />
-            <line x1="3" y1="12" x2="21" y2="12" />
-            <line x1="3" y1="18" x2="21" y2="18" />
-          </svg>
-        </button>
-      )}
+    <header className="flex min-h-14 items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur">
       <div className="flex items-center gap-2">
         <span className="text-base">✦</span>
         <span className="font-semibold text-zinc-100">PeakBot</span>
@@ -110,6 +91,15 @@ export function TopBar({
         </span>
       )}
 
+      {pendingInput > 0 && (
+        <span
+          className="flex items-center gap-1 rounded bg-zinc-800/80 px-1.5 py-0.5 text-xs text-zinc-400"
+          title={`${pendingInput} message${pendingInput === 1 ? "" : "s"} queued while the agent is busy`}
+        >
+          ⏳ {pendingInput} queued
+        </span>
+      )}
+
       <div className="ml-auto flex items-center gap-4 font-mono text-[11px] tabular-nums text-zinc-500">
         {stats && (
           <>
@@ -117,6 +107,11 @@ export function TopBar({
             <span>${stats.costUsd.toFixed(4)}</span>
           </>
         )}
+        <NotifyToggle
+          enabled={notifyEnabled}
+          permission={notifyPermission}
+          onToggle={onToggleNotify}
+        />
         <span
           className={`flex items-center gap-1.5 rounded px-1.5 py-0.5 ${
             connected ? "text-emerald-400" : "text-zinc-500"

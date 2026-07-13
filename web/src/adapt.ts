@@ -14,6 +14,7 @@ import type {
   BgProcess,
   ChatMessage,
   ContextUsage,
+  FileEdit,
   MessageRole,
   SessionStats,
   TodoItem,
@@ -92,6 +93,54 @@ export function adaptBg(s: AppState): BgProcess[] {
     status: b.status === "running" ? "running" : "exited",
     exitCode: b.exit_code ?? undefined,
   }));
+}
+
+// File tools whose `path` arg we surface in the Files tab. Writes (create /
+// str_replace / insert) drive the created/modified kinds; file_read only ever
+// yields the "read" kind, and any write outranks it.
+const FILE_WRITE_TOOLS = new Set([
+  "file_create",
+  "file_str_replace",
+  "file_insert",
+]);
+const FILE_TOOLS = new Set([...FILE_WRITE_TOOLS, "file_read"]);
+
+/**
+ * Derive the list of files the agent touched this session from the transcript
+ * (#126). No new backend state — the path lives in each file tool call's
+ * `tool_args` JSON. Order is first-touch; `edits` counts write operations
+ * (reads don't count as edits). `kind` follows created > modified > read.
+ */
+export function adaptFiles(s: AppState): FileEdit[] {
+  const byPath = new Map<string, FileEdit>();
+  for (const m of s.chat.messages) {
+    if (m.role !== "toolcall" || !m.tool_name) continue;
+    if (!FILE_TOOLS.has(m.tool_name)) continue;
+    let path: unknown;
+    try {
+      path = JSON.parse(m.tool_args ?? "{}").path;
+    } catch {
+      continue; // malformed args — skip rather than crash the panel
+    }
+    if (typeof path !== "string" || path.length === 0) continue;
+
+    const isWrite = FILE_WRITE_TOOLS.has(m.tool_name);
+    const isCreate = m.tool_name === "file_create";
+    const existing = byPath.get(path);
+    if (existing) {
+      if (isWrite) existing.edits += 1;
+      // Precedence: a create is sticky; else a write upgrades read → modified.
+      if (isCreate) existing.kind = "created";
+      else if (isWrite && existing.kind === "read") existing.kind = "modified";
+    } else {
+      byPath.set(path, {
+        path,
+        edits: isWrite ? 1 : 0,
+        kind: isCreate ? "created" : isWrite ? "modified" : "read",
+      });
+    }
+  }
+  return [...byPath.values()];
 }
 
 /** Whole seconds → "MM:SS". */
