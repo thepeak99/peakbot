@@ -2288,6 +2288,7 @@ mod tests {
             compaction_keep_recent: 5,
             conversation_persistence_enabled: true,
             cwd: std::path::PathBuf::from("/tmp"),
+            peakbot_version: "test".to_string(),
         });
 
         sm.update_welcome_for_model(
@@ -2331,6 +2332,7 @@ mod tests {
             compaction_keep_recent: 0,
             conversation_persistence_enabled: false,
             cwd: std::path::PathBuf::from("/old"),
+            peakbot_version: String::new(),
         });
         sm.update_welcome_cwd(std::path::PathBuf::from("/new/dir"));
         let w = sm.get_state().welcome.expect("welcome set");

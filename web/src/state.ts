@@ -84,6 +84,8 @@ export interface WireWelcome {
   compaction_keep_recent: number;
   conversation_persistence_enabled: boolean;
   cwd: string;
+  /** Optional so old wire snapshots (pre-v0.14) parse cleanly. */
+  peakbot_version?: string;
 }
 
 export interface WireBgSummary {

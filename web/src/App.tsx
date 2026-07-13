@@ -73,7 +73,13 @@ export function App() {
       id: "session",
       label: "Session",
       content:
-        stats && context ? <StatsPanel stats={stats} context={context} /> : null,
+        stats && context ? (
+          <StatsPanel
+            stats={stats}
+            context={context}
+            peakbotVersion={welcome?.peakbotVersion}
+          />
+        ) : null,
     },
     {
       id: "todo",

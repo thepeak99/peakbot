@@ -189,5 +189,6 @@ export function adaptWelcome(s: AppState): Welcome | null {
     compactionEnabled: w.compaction_enabled,
     compactionThreshold: w.compaction_threshold,
     cwd: w.cwd,
+    peakbotVersion: w.peakbot_version ?? "",
   };
 }

@@ -1,5 +1,13 @@
 //! PeakBot library - Core functionality for connecting to MCP servers and managing tools.
 
+/// PeakBot binary version, baked in at compile time. The single source of truth
+/// for "what is this?" — the TUI welcome banner, the system prompt the model
+/// sees, and the `WelcomeState` payload sent over the WebSocket wire all read
+/// from this one constant. Adding a duplicate `env!("CARGO_PKG_VERSION")`
+/// literal anywhere else in the crate is a regression: any of the three sites
+/// could drift from the binary the user actually runs.
+pub const PEAKBOOT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod bg_processes;
 mod config;
 mod context_manager;
@@ -220,7 +228,7 @@ pub fn build_system_prompt(skills: &SkillRegistry, shell_kind: Option<&ShellKind
         "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n- **Operating System**: {}\n- **PeakBot Binary Path**: {}\n{}",
         cwd,
         current_time,
-        env!("CARGO_PKG_VERSION"),
+        PEAKBOOT_VERSION,
         os,
         binary_path,
         shell_line(shell_kind),

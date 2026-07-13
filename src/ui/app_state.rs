@@ -1263,6 +1263,12 @@ pub struct WelcomeState {
     pub compaction_keep_recent: usize,
     pub conversation_persistence_enabled: bool,
     pub cwd: std::path::PathBuf,
+    /// PeakBot version this binary was built from (matches the TUI
+    /// welcome banner). `#[serde(default)]` keeps older wire snapshots
+    /// (pre-v0.14) parsing cleanly — the field reads back as `""` until
+    /// the next boot populates it.
+    #[serde(default)]
+    pub peakbot_version: String,
 }
 
 #[cfg(test)]

@@ -4,6 +4,19 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- Web UI: the **Session** tab now shows the running PeakBot version (e.g.
+  `peakbot v0.13.3`) as a new row above the token counters. The value
+  flows from `WelcomeState::peakbot_version` through the wire, so the
+  displayed version always matches the serving binary — not a stale
+  frontend bundle.
+- Web UI: the **welcome banner** now shows the running PeakBot version
+  (e.g. `v0.13.3`) as a chip next to the `ready` badge. Same source —
+  the Session tab and the welcome banner agree by construction.
+- Internal: introduced a single `crate::PEAKBOOT_VERSION` constant as the
+  sole source of truth for the binary version. The system prompt sent to
+  the model, the TUI welcome banner, and the `WelcomeState` wire payload
+  all read from this one identifier — no more duplicate
+  `env!("CARGO_PKG_VERSION")` literals scattered across the crate.
 - Release: `make release-bump` now fast-forwards the current branch to
   `origin/<branch>` (fetch + `git merge --ff-only`) before cutting the release
   branch, and fails loud if local has diverged. This keeps the release PR head a
