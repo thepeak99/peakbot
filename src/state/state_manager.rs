@@ -447,7 +447,7 @@ impl StateManager {
         };
 
         // Sync to UI
-        self.sync_todo_to_ui(&self.todo_list.lock().unwrap());
+        self.sync_todo_to_ui();
 
         // Auto-show todo panel when first task is added
         if was_empty && result.is_new {
@@ -475,10 +475,9 @@ impl StateManager {
 
         let results = {
             let mut list = self.todo_list.lock().unwrap();
-            let results = list.add_many(tasks);
-            self.sync_todo_to_ui(&list);
-            results
+            list.add_many(tasks)
         };
+        self.sync_todo_to_ui();
 
         // Separate new and existing tasks
         let new_tasks: Vec<_> = results.iter().filter(|r| r.is_new).collect();
@@ -519,12 +518,11 @@ impl StateManager {
     pub fn update_todo_status(&self, id: usize, status: TodoStatus) -> String {
         let result = {
             let mut list = self.todo_list.lock().unwrap();
-            let result = list.update_status(id, status.clone());
-            if result.is_some() {
-                self.sync_todo_to_ui(&list);
-            }
-            result
+            list.update_status(id, status.clone())
         };
+        if result.is_some() {
+            self.sync_todo_to_ui();
+        }
         match result {
             Some(item) => format!("Updated task #{} to {}", item.id, item.status),
             None => format!("Task #{} not found", id),
@@ -535,12 +533,11 @@ impl StateManager {
     pub fn remove_todo(&self, id: usize) -> String {
         let result = {
             let mut list = self.todo_list.lock().unwrap();
-            let result = list.remove(id);
-            if result.is_some() {
-                self.sync_todo_to_ui(&list);
-            }
-            result
+            list.remove(id)
         };
+        if result.is_some() {
+            self.sync_todo_to_ui();
+        }
         match result {
             Some(item) => format!("Removed task #{}: {}", item.id, item.task),
             None => format!("Task #{} not found", id),
@@ -591,10 +588,9 @@ impl StateManager {
     pub fn clear_completed_todos(&self) -> String {
         let cleared = {
             let mut list = self.todo_list.lock().unwrap();
-            let cleared = list.clear_completed();
-            self.sync_todo_to_ui(&list);
-            cleared
+            list.clear_completed()
         };
+        self.sync_todo_to_ui();
         format!(
             "Cleared {} finished tasks (completed and cancelled)",
             cleared
@@ -613,13 +609,20 @@ impl StateManager {
         {
             let mut list = self.todo_list.lock().unwrap();
             *list = TodoList::new();
-            self.sync_todo_to_ui(&list);
         }
+        self.sync_todo_to_ui();
     }
 
-    /// Sync todo list to UI state
-    fn sync_todo_to_ui(&self, list: &TodoList) {
-        let items: Vec<TodoItem> = list.list().iter().map(TodoItem::from).collect();
+    /// Sync todo list to UI state. Lock order: `todo_list` → `state`
+    /// (load-bearing — `todo_list` is a leaf; see
+    /// `update_todo_and_persist_current_do_not_deadlock`). Snapshots under
+    /// the `todo_list` lock and releases it before acquiring `state.write`,
+    /// mirroring `sync_stats_to_ui`.
+    fn sync_todo_to_ui(&self) {
+        let items: Vec<TodoItem> = {
+            let list = self.todo_list.lock().unwrap();
+            list.list().iter().map(TodoItem::from).collect()
+        };
 
         let mut state = self.state.write().unwrap();
         state.todo.items = items;
@@ -1316,7 +1319,7 @@ impl StateManager {
             // the loaded conversation instead of the previous session's totals.
             self.sync_stats_to_ui();
             // Push restored todos into AppState so the UI panel reflects them.
-            self.sync_todo_to_ui(&self.todo_list.lock().unwrap());
+            self.sync_todo_to_ui();
             // Auto-show todo panel when loaded conversation has todos
             if !self.todo_list.lock().unwrap().list().is_empty() {
                 self.show_todo_panel();
@@ -3967,6 +3970,112 @@ mod tests {
         // Sanity: both producers must have made forward progress. If either
         // counter is zero something else is wrong and we shouldn't pretend
         // the test exercised the race.
+        assert!(
+            count_a.load(Ordering::Relaxed) > 0,
+            "producer A made no progress"
+        );
+        assert!(
+            count_b.load(Ordering::Relaxed) > 0,
+            "producer B made no progress"
+        );
+    }
+
+    /// Regression for the `todo_list ↔ state` lock-order inversion (the
+    /// second occurrence of the class the test above guards for `stats`).
+    ///
+    /// - `sync_to_conversation` (agent loop, via `persist_current`) takes
+    ///   `state.read` and, still holding it, reaches for `todo_list`.
+    /// - `update_todo_status` (todo tool) used to take `todo_list` and, still
+    ///   holding it, call `sync_todo_to_ui` → `state.write`.
+    ///
+    /// Crossed on a multi-threaded runtime, `state.write` blocks behind the
+    /// held `state.read` while `todo_list` blocks the reader path waiting for
+    /// it — the same A→B vs B→A deadlock. The fix makes `todo_list` a leaf:
+    /// `sync_todo_to_ui` snapshots under `todo_list` and drops it before
+    /// `state.write` (mirroring `sync_stats_to_ui`). With the bug present this
+    /// deadlocks; with the fix it completes in milliseconds.
+    ///
+    /// Watchdog discipline matches the sibling test: pure `AtomicU64`
+    /// polling, touching none of the involved locks, aborting on a frozen
+    /// counter.
+    #[test]
+    fn update_todo_and_persist_current_do_not_deadlock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let sm = Arc::new(StateManager::new());
+        sm.create_conversation(
+            "todo-deadlock-probe".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+        );
+        sm.add_user_message("hello".to_string());
+        // Seed a todo so update_todo_status actually mutates and syncs,
+        // walking its full todo_list → state.write chain.
+        sm.add_todos(vec!["task one".to_string()]);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let count_a = Arc::new(AtomicU64::new(0));
+        let count_b = Arc::new(AtomicU64::new(0));
+
+        // Producer A: agent loop persisting (state.read → … → todo_list).
+        let sm_a = sm.clone();
+        let stop_a = stop.clone();
+        let count_a_t = count_a.clone();
+        let t_a = thread::spawn(move || {
+            while !stop_a.load(Ordering::Relaxed) {
+                sm_a.add_assistant_message("reply".to_string());
+                count_a_t.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Producer B: todo tool mutating (todo_list → state.write via
+        // sync_todo_to_ui) — the inverted-order path.
+        let sm_b = sm.clone();
+        let stop_b = stop.clone();
+        let count_b_t = count_b.clone();
+        let t_b = thread::spawn(move || {
+            while !stop_b.load(Ordering::Relaxed) {
+                sm_b.update_todo_status(1, TodoStatus::InProgress);
+                sm_b.update_todo_status(1, TodoStatus::Pending);
+                count_b_t.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let stop_w = stop.clone();
+        let count_a_w = count_a.clone();
+        let count_b_w = count_b.clone();
+        let _watchdog = thread::spawn(move || {
+            let mut last_a = 0u64;
+            let mut last_b = 0u64;
+            let mut stuck_since: Option<Instant> = None;
+            while !stop_w.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(50));
+                let now_a = count_a_w.load(Ordering::Relaxed);
+                let now_b = count_b_w.load(Ordering::Relaxed);
+                if now_a == last_a && now_b == last_b {
+                    let since = stuck_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(2) {
+                        eprintln!(
+                            "deadlock detected: counters frozen at A={now_a}, B={now_b} for >2s"
+                        );
+                        std::process::abort();
+                    }
+                } else {
+                    stuck_since = None;
+                    last_a = now_a;
+                    last_b = now_b;
+                }
+            }
+        });
+
+        thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        t_a.join().expect("producer A must not panic");
+        t_b.join().expect("producer B must not panic");
+
         assert!(
             count_a.load(Ordering::Relaxed) > 0,
             "producer A made no progress"
