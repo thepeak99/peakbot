@@ -110,11 +110,16 @@ export function CwdPicker({
       </button>
 
       {open && (
+        // Direction is chosen by `dropUp` (down by default, up when the chip
+        // lives in the bottom bar); the `max-sm:` prefix only widens the panel
+        // and anchors it on phones. Placing it in the base class would silently
+        // no-op `dropUp` on tablets, where the host swaps but the breakpoint
+        // prefix does not.
         <div
-          className={`absolute left-0 top-full z-20 mt-1 w-80 rounded-md border border-zinc-800 bg-zinc-900 shadow-xl max-sm:fixed max-sm:inset-x-2 max-sm:mt-0 max-sm:w-auto ${
+          className={`absolute left-0 z-20 w-80 rounded-md border border-zinc-800 bg-zinc-900 shadow-xl max-sm:fixed max-sm:inset-x-2 max-sm:mt-0 max-sm:mb-0 max-sm:w-auto ${
             dropUp
-              ? "max-sm:bottom-[3.75rem] max-sm:top-auto"
-              : "max-sm:top-[3.75rem]"
+              ? "bottom-full mb-1 max-sm:bottom-[3.75rem] max-sm:top-auto"
+              : "top-full mt-1 max-sm:top-[3.75rem]"
           }`}
         >
           {/* Current browse path + up. */}

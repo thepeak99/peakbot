@@ -59,3 +59,7 @@ This file is the working draft for the next release. When a version is tagged, t
   overflow, the drawer no longer overlaps the mobile bottom bar, header/footer
   heights aligned with the drawer, iOS safe-area padding on the bottom bar,
   and the cwd trigger truncates instead of pushing the bar off-screen.
+- Web UI: the cwd picker dropdown now opens upward on tablets too (640–1023px),
+  not just phones — previously it pinned downward because the `top-full mt-1`
+  base class overrode the `dropUp` prop on intermediate widths. Pattern now
+  matches `ModelSwitcher` and `ConversationsPicker`.
