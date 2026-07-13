@@ -79,8 +79,14 @@ export function ConversationsPicker({
     }
   };
 
+  // A fresh browser tab with no `?convo=` starts a brand-new conversation
+  // (the server mints the session). Same-origin, so the auth cookie carries.
+  const openNewTab = () => {
+    window.open(window.location.pathname, "_blank", "noopener");
+  };
+
   return (
-    <div className="relative" ref={ref}>
+    <div className="relative flex items-center gap-1.5" ref={ref}>
       <button
         onClick={toggle}
         className="flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
@@ -89,6 +95,15 @@ export function ConversationsPicker({
         <span className="text-zinc-500">☰</span>
         conversations
         <span className="text-zinc-600">▾</span>
+      </button>
+
+      <button
+        onClick={openNewTab}
+        title="Open a new conversation in a new tab"
+        aria-label="Open a new conversation in a new tab"
+        className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 text-sm text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+      >
+        +
       </button>
 
       {open && (

@@ -9,6 +9,7 @@ import { ModelSwitcher } from "./ModelSwitcher";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
 import { NotifyToggle } from "./NotifyToggle";
+import { ThemeToggle } from "./ThemeToggle";
 import type { NotifyPermission } from "../useTaskNotifications";
 
 // Top status bar. Sessions trio (conversations + model + cwd) live here on
@@ -107,6 +108,7 @@ export function TopBar({
             <span>${stats.costUsd.toFixed(4)}</span>
           </>
         )}
+        <ThemeToggle />
         <NotifyToggle
           enabled={notifyEnabled}
           permission={notifyPermission}

@@ -3,6 +3,35 @@
    (rehype-highlight emits highlight.js class names). */
 @import "highlight.js/styles/github-dark.css";
 
+/* Light theme. The whole UI speaks a single semantic zinc ramp
+   (950 = app bg … 100 = brightest text). Light mode just mirrors that
+   ramp — remapping the zinc CSS variables Tailwind's utilities reference,
+   so no component classes change. Dark is the default (no class). */
+html.light {
+  --color-zinc-950: oklch(98.5% 0 0); /* was 50  — app background */
+  --color-zinc-900: oklch(96.7% 0.001 286.375); /* was 100 — surfaces */
+  --color-zinc-800: oklch(92% 0.004 286.32); /* was 200 — borders  */
+  --color-zinc-700: oklch(87.1% 0.006 286.286); /* was 300 */
+  --color-zinc-600: oklch(70.5% 0.015 286.067); /* was 400 */
+  --color-zinc-500: oklch(55.2% 0.016 285.938); /* mid — muted text (unchanged) */
+  --color-zinc-400: oklch(44.2% 0.017 285.786); /* was 600 */
+  --color-zinc-300: oklch(37% 0.013 285.805); /* was 700 */
+  --color-zinc-200: oklch(27.4% 0.006 286.033); /* was 800 */
+  --color-zinc-100: oklch(21% 0.006 285.885); /* was 900 — bright text */
+  --color-zinc-50: oklch(14.1% 0.005 285.823); /* was 950 */
+}
+
+/* Fenced code blocks stay dark-on-dark in both themes (paired with the
+   github-dark highlight theme) — a light-mode dark code block reads as
+   intentional. Only the inline-code chip needs a light tweak so it isn't
+   a dark smudge on a light line. */
+html.light .markdown-body code {
+  background: rgb(0 0 0 / 0.06);
+}
+html.light .markdown-body a {
+  color: #0369a1; /* sky-700 — the dark #38bdf8 is too pale on white */
+}
+
 /* Slim, subtle scrollbars tuned to the zinc UI. Firefox uses the standard
    scrollbar-color / -width shorthands; WebKit (Chrome/Edge/Safari) needs the
    pseudo-element rules. Thumb is a translucent zinc that lifts on hover. */
