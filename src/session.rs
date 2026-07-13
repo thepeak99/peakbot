@@ -25,8 +25,8 @@ use crate::config::{Config, ModelRegistry, SearXngConfig};
 use crate::tools::ShellKind;
 use crate::ui::app_state::WelcomeState;
 use crate::{
-    AgentRunner, McpServerHandle, RebuildContext, SkillRegistry, StateManager, SubAgentRegistry,
-    TodoTool, UiAction, create_provider,
+    AgentRunner, McpServerHandle, PEAKBOT_VERSION, RebuildContext, SkillRegistry, StateManager,
+    SubAgentRegistry, TodoTool, UiAction, create_provider,
 };
 use anyhow::Result;
 use std::sync::Arc;
@@ -234,6 +234,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         compaction_keep_recent: deps.config.context.keep_recent,
         conversation_persistence_enabled: deps.config.conversation_enabled(),
         cwd: std::env::current_dir().unwrap_or_default(),
+        peakbot_version: PEAKBOT_VERSION.to_string(),
     });
 
     let run_handle = tokio::spawn(async move {

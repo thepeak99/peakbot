@@ -11,6 +11,10 @@ function Pill({ label, value }: { label: string; value: string }) {
 
 // The one-time startup banner. Mirrors WelcomeState (src/ui/app_state.rs):
 // provider/model, tool + skill counts, and the feature toggles the TUI prints.
+//
+// The version badge in the header reads `WelcomeState::peakbot_version`, the
+// same field the Session tab shows. Both flow from `crate::PEAKBOT_VERSION`
+// at startup, so this string always matches the binary that served the page.
 export function WelcomeBanner({ welcome }: { welcome: Welcome }) {
   return (
     <div className="rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900/80 to-zinc-950/40 p-4">
@@ -20,6 +24,14 @@ export function WelcomeBanner({ welcome }: { welcome: Welcome }) {
         <span className="rounded bg-emerald-950/60 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
           ready
         </span>
+        {welcome.peakbotVersion && (
+          <span
+            className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400"
+            title={`PeakBot v${welcome.peakbotVersion}`}
+          >
+            v{welcome.peakbotVersion}
+          </span>
+        )}
       </div>
       <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs sm:grid-cols-3">
         <Pill label="provider" value={welcome.provider} />

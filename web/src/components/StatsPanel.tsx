@@ -21,9 +21,14 @@ function Row({ label, value }: { label: string; value: string }) {
 export function StatsPanel({
   stats,
   context,
+  peakbotVersion,
 }: {
   stats: SessionStats;
   context: ContextUsage;
+  /** PeakBot binary version (e.g. "0.13.3"). Populated from
+   * `WelcomeState::peakbot_version` in AppState; empty until the first
+   * wire snapshot that includes the field lands. */
+  peakbotVersion?: string;
 }) {
   const pct = context.windowSize
     ? (context.currentUsage / context.windowSize) * 100
@@ -40,6 +45,7 @@ export function StatsPanel({
         </h3>
         <div className="space-y-1 text-xs">
           <Row label="model" value={stats.modelAlias} />
+          {peakbotVersion && <Row label="peakbot" value={`v${peakbotVersion}`} />}
           <Row label="in" value={fmtTokens(stats.inputTokens)} />
           <Row label="out" value={fmtTokens(stats.outputTokens)} />
           <Row label="calls" value={String(stats.apiCalls)} />

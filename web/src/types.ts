@@ -83,4 +83,7 @@ export interface Welcome {
   compactionEnabled: boolean;
   compactionThreshold: number;
   cwd: string;
+  /** PeakBot binary version (e.g. "0.13.3"). Empty when the backend
+   * hasn't populated it yet (pre-v0.14 wire snapshot). */
+  peakbotVersion: string;
 }
