@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time;
 
-use crate::PEAKBOOT_VERSION;
+use crate::PEAKBOT_VERSION;
 use crate::state::StateManager;
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState};
@@ -576,7 +576,7 @@ impl ReplUi {
     /// bottom border via [`Self::chat_block`], not here — they're
     /// permanently visible once the transcript fills.
     ///
-    /// The version string reads [`crate::PEAKBOOT_VERSION`] — the same
+    /// The version string reads [`crate::PEAKBOT_VERSION`] — the same
     /// constant the system prompt and the `WelcomeState` wire payload
     /// pull from. Keeping all three on one identifier is the point: a
     /// patched binary always agrees with itself about what is running.
@@ -590,7 +590,7 @@ impl ReplUi {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("v{PEAKBOOT_VERSION}"),
+                    format!("v{PEAKBOT_VERSION}"),
                     Style::default().fg(Color::LightYellow),
                 ),
             ]),

@@ -13,7 +13,7 @@ function Pill({ label, value }: { label: string; value: string }) {
 // provider/model, tool + skill counts, and the feature toggles the TUI prints.
 //
 // The version badge in the header reads `WelcomeState::peakbot_version`, the
-// same field the Session tab shows. Both flow from `crate::PEAKBOOT_VERSION`
+// same field the Session tab shows. Both flow from `crate::PEAKBOT_VERSION`
 // at startup, so this string always matches the binary that served the page.
 export function WelcomeBanner({ welcome }: { welcome: Welcome }) {
   return (

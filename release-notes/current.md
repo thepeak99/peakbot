@@ -4,6 +4,9 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- Internal: fix typo — `crate::PEAKBOOT_VERSION` renamed to
+  `crate::PEAKBOT_VERSION` across the crate so the constant matches the
+  product name (and every other identifier in the codebase).
 - Web UI: the **Session** tab now shows the running PeakBot version (e.g.
   `peakbot v0.13.3`) as a new row above the token counters. The value
   flows from `WelcomeState::peakbot_version` through the wire, so the
@@ -12,7 +15,7 @@ This file is the working draft for the next release. When a version is tagged, t
 - Web UI: the **welcome banner** now shows the running PeakBot version
   (e.g. `v0.13.3`) as a chip next to the `ready` badge. Same source —
   the Session tab and the welcome banner agree by construction.
-- Internal: introduced a single `crate::PEAKBOOT_VERSION` constant as the
+- Internal: introduced a single `crate::PEAKBOT_VERSION` constant as the
   sole source of truth for the binary version. The system prompt sent to
   the model, the TUI welcome banner, and the `WelcomeState` wire payload
   all read from this one identifier — no more duplicate
