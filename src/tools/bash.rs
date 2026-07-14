@@ -73,6 +73,11 @@ pub struct BashTool {
     /// `None` in test paths and when the agent is built without a panel —
     /// the tool still runs, just without the live UI side-effects.
     state_manager: Option<Arc<StateManager>>,
+    /// The per-session working directory every call is spawned in. Set
+    /// explicitly at construction (defaults to the process cwd via `new`/
+    /// `Default`); an in-command `cd` dies with the child, so each call
+    /// starts fresh here.
+    session_cwd: PathBuf,
 }
 
 impl Default for BashTool {
@@ -81,6 +86,7 @@ impl Default for BashTool {
             shell: "/bin/sh".to_string(),
             env: None,
             state_manager: None,
+            session_cwd: std::env::current_dir().unwrap_or_default(),
         }
     }
 }
@@ -93,7 +99,16 @@ impl BashTool {
             shell,
             env,
             state_manager: None,
+            session_cwd: std::env::current_dir().unwrap_or_default(),
         }
+    }
+
+    /// Root every spawned child at `dir` (the per-session working directory).
+    /// Each call is a fresh `sh -c` rooted here; an in-command `cd` dies with
+    /// the child.
+    pub fn with_session_cwd(mut self, dir: PathBuf) -> Self {
+        self.session_cwd = dir;
+        self
     }
 
     /// Attach a state manager so this tool drives the live bash panel
@@ -316,7 +331,8 @@ impl Tool for BashTool {
         let mut handle = pty_runner::spawn(
             SpawnParams {
                 command: args.command.clone(),
-                cwd: None,
+                cwd: (!self.session_cwd.as_os_str().is_empty())
+                    .then(|| self.session_cwd.to_string_lossy().into_owned()),
                 env: self.env.clone(),
                 shell: self.shell.clone(),
                 capture_cap: BASH_CAPTURE_CAP,

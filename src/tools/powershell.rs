@@ -40,6 +40,11 @@ pub struct PowerShellTool {
     /// Optional environment variables to set for the command
     #[serde(default)]
     env: Option<HashMap<String, String>>,
+    /// The per-session working directory every call is spawned in. Set
+    /// explicitly at construction (defaults to the process cwd via `new`/
+    /// `Default`). Construction-time state, never (de)serialized.
+    #[serde(skip)]
+    session_cwd: PathBuf,
 }
 
 impl Default for PowerShellTool {
@@ -47,6 +52,7 @@ impl Default for PowerShellTool {
         Self {
             shell: "pwsh".to_string(),
             env: None,
+            session_cwd: std::env::current_dir().unwrap_or_default(),
         }
     }
 }
@@ -54,7 +60,17 @@ impl Default for PowerShellTool {
 impl PowerShellTool {
     /// Create a new PowerShellTool with the given executable and environment variables.
     pub fn new(shell: String, env: Option<HashMap<String, String>>) -> Self {
-        Self { shell, env }
+        Self {
+            shell,
+            env,
+            session_cwd: std::env::current_dir().unwrap_or_default(),
+        }
+    }
+
+    /// Root every spawned child at `dir` (the per-session working directory).
+    pub fn with_session_cwd(mut self, dir: PathBuf) -> Self {
+        self.session_cwd = dir;
+        self
     }
 
     /// Detect if the command appears to be doing file editing.
@@ -252,6 +268,13 @@ impl Tool for PowerShellTool {
             for (key, value) in env_vars {
                 cmd.env(key, value);
             }
+        }
+
+        // Root the child at the per-session cwd. Guard the empty degenerate
+        // (only if `current_dir()` failed at construction) so we never
+        // `chdir("")`; then the child inherits the process cwd.
+        if !self.session_cwd.as_os_str().is_empty() {
+            cmd.current_dir(&self.session_cwd);
         }
 
         let child = cmd.spawn().map_err(|e| {
