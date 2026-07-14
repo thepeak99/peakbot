@@ -994,14 +994,25 @@ impl StateManager {
     // ── Conversation Management ────────────────────────────────────────────────
 
     /// Create a new conversation with the active model's full wire
-    /// identity, and set it as current.
+    /// identity and the directory it is rooted in, and set it as current.
     ///
     /// `(provider_name, model)` is the persisted re-activation key for
     /// `/load` — see [`Conversation::new`]. Boot, `/new`, and `/model`
     /// switch all funnel through here so saved files always carry the
     /// stable wire id.
-    pub fn create_conversation(&self, name: String, provider_name: String, model: String) {
-        let conv = Conversation::new(name, provider_name, model);
+    ///
+    /// `cwd` is the directory tree this conversation is bound to —
+    /// the per-session `session_cwd` for normal mints, or the new
+    /// target for `/cd`. The conversation is persisted 1:1 with this
+    /// path; `/load` reapplies it.
+    pub fn create_conversation(
+        &self,
+        name: String,
+        provider_name: String,
+        model: String,
+        cwd: String,
+    ) {
+        let conv = Conversation::new(name, provider_name, model, cwd);
         *self.current_conversation.lock().unwrap() = Some(conv);
         self.mirror_conversation_to_state();
     }
@@ -1047,7 +1058,10 @@ impl StateManager {
                 m
             }
         };
-        self.create_conversation(name, provider_name, model);
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.create_conversation(name, provider_name, model, cwd);
     }
 
     /// List all saved conversations
@@ -2457,7 +2471,12 @@ mod tests {
         let sm = StateManager::new_arc_with_storage(storage);
 
         // Session A: create, accumulate stats, save.
-        sm.create_conversation("Session A".into(), "test-prov".into(), "test-model".into());
+        sm.create_conversation(
+            "Session A".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
         sm.add_request(1234, 567, 0.42);
         sm.add_request(2000, 800, 0.10); // cost accumulates → 0.52
         let conv_a_id = sm.get_current_conversation_id().expect("convo A id");
@@ -2467,7 +2486,12 @@ mod tests {
         // what the buggy /load would leave behind in the status bar.
         sm.clear_history();
         sm.reset_stats();
-        sm.create_conversation("Session B".into(), "test-prov".into(), "test-model".into());
+        sm.create_conversation(
+            "Session B".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
         sm.add_request(99, 99, 9.99);
 
         // Load A back. Its stats should override the session-B stats.
@@ -2539,6 +2563,47 @@ mod tests {
         );
     }
 
+    /// `create_conversation` persists the caller-supplied cwd argument
+    /// (Phase 5 — `cwd` is now an explicit constructor parameter, not
+    /// an implicit `std::env::current_dir()` read). The persisted value
+    /// is the exact string passed in, not whatever the process cwd is.
+    #[test]
+    fn create_conversation_persists_explicit_cwd() {
+        let sm = StateManager::new_arc();
+        sm.set_provider_name("openrouter".into());
+        sm.set_model("anthropic/claude-3.7-sonnet".into());
+
+        let explicit = "/explicit/cwd/from/the/caller";
+        sm.create_conversation(
+            "Test".into(),
+            "openrouter".into(),
+            "anthropic/claude-3.7-sonnet".into(),
+            explicit.into(),
+        );
+
+        let conv = sm.get_current_conversation().expect("minted");
+        assert_eq!(conv.cwd, explicit);
+    }
+
+    /// `create_conversation` with the empty string persists empty (the
+    /// same default `#[serde(default)]` provides for pre-cwd files).
+    #[test]
+    fn create_conversation_persists_empty_cwd() {
+        let sm = StateManager::new_arc();
+        sm.set_provider_name("openrouter".into());
+        sm.set_model("m".into());
+
+        sm.create_conversation(
+            "Test".into(),
+            "openrouter".into(),
+            "m".into(),
+            String::new(),
+        );
+
+        let conv = sm.get_current_conversation().expect("minted");
+        assert_eq!(conv.cwd, "");
+    }
+
     #[test]
     fn test_subscribe_initial_state() {
         let sm = StateManager::new();
@@ -2562,7 +2627,12 @@ mod tests {
         assert!(sm.get_state().conversation.is_none());
 
         // Create → mirror populated with the new id.
-        sm.create_conversation("Session A".into(), "prov".into(), "model-a".into());
+        sm.create_conversation(
+            "Session A".into(),
+            "prov".into(),
+            "model-a".into(),
+            String::new(),
+        );
         let a_id = sm.get_current_conversation_id().expect("A id");
         let mirror = sm.get_state().conversation.expect("mirror after create");
         assert_eq!(mirror.id, a_id.to_string());
@@ -2570,7 +2640,12 @@ mod tests {
         sm.save_conversation();
 
         // Move to B, then load A back → mirror must follow to A's id.
-        sm.create_conversation("Session B".into(), "prov".into(), "model-b".into());
+        sm.create_conversation(
+            "Session B".into(),
+            "prov".into(),
+            "model-b".into(),
+            String::new(),
+        );
         assert_ne!(
             sm.get_state().conversation.expect("B mirror").id,
             a_id.to_string()
@@ -2817,6 +2892,7 @@ mod tests {
             "test".to_string(),
             "test-prov".to_string(),
             "test-model".to_string(),
+            String::new(),
         );
         conv.add_user_message("List files".to_string());
         conv.add_tool_call(
@@ -2975,7 +3051,7 @@ mod tests {
             ];
         }
 
-        let conv = Conversation::new("test".into(), "prov".into(), "model".into());
+        let conv = Conversation::new("test".into(), "prov".into(), "model".into(), String::new());
         *sm.current_conversation.lock().unwrap() = Some(conv);
 
         // Save, wipe the live chat, reload — the real persistence path.
@@ -3057,8 +3133,12 @@ mod tests {
         // Build a conversation with an orphan ToolCall (no matching
         // ToolResult). This simulates a file truncated mid-write or
         // hand-edited.
-        let mut conv =
-            Conversation::new("test".into(), "test-provider".into(), "test-model".into());
+        let mut conv = Conversation::new(
+            "test".into(),
+            "test-provider".into(),
+            "test-model".into(),
+            String::new(),
+        );
         conv.add_user_message("hello".into());
         conv.add_tool_call("bash".into(), "{}".into(), Some("call_1".into()));
         // No matching ToolResult!
@@ -3095,7 +3175,8 @@ mod tests {
         }
 
         // Build a conversation and set it as current
-        let mut conv = Conversation::new("test".into(), "prov".into(), "model".into());
+        let mut conv =
+            Conversation::new("test".into(), "prov".into(), "model".into(), String::new());
         conv.add_user_message("hello".into());
         *sm.current_conversation.lock().unwrap() = Some(conv);
 
@@ -3163,7 +3244,8 @@ mod tests {
         let sm = StateManager::new();
 
         // Build a conversation that has todos
-        let mut conv = Conversation::new("test".into(), "prov".into(), "model".into());
+        let mut conv =
+            Conversation::new("test".into(), "prov".into(), "model".into(), String::new());
         conv.add_user_message("hello".into());
         conv.todos.add("Task from saved convo".into());
         *sm.current_conversation.lock().unwrap() = Some(conv);
@@ -3183,7 +3265,8 @@ mod tests {
     fn sync_from_conversation_without_todos_keeps_panel_hidden() {
         let sm = StateManager::new();
 
-        let mut conv = Conversation::new("test".into(), "prov".into(), "model".into());
+        let mut conv =
+            Conversation::new("test".into(), "prov".into(), "model".into(), String::new());
         conv.add_user_message("hello".into());
         *sm.current_conversation.lock().unwrap() = Some(conv);
 
@@ -3925,6 +4008,7 @@ mod tests {
             "deadlock-probe".to_string(),
             "test-prov".to_string(),
             "test-model".to_string(),
+            String::new(),
         );
         // Seed at least one user/assistant message so sync_to_conversation
         // has something non-trivial to copy under the locks.
@@ -4050,6 +4134,7 @@ mod tests {
             "todo-deadlock-probe".to_string(),
             "test-prov".to_string(),
             "test-model".to_string(),
+            String::new(),
         );
         sm.add_user_message("hello".to_string());
         // Seed a todo so update_todo_status actually mutates and syncs,
@@ -4188,6 +4273,7 @@ mod tests {
             "Original Name".to_string(),
             "test-prov".to_string(),
             "test-model".to_string(),
+            String::new(),
         );
         sm.add_user_message("hello".to_string());
         sm.add_assistant_message("hi".to_string());
@@ -4226,6 +4312,7 @@ mod tests {
             "Original".to_string(),
             "test-prov".to_string(),
             "test-model".to_string(),
+            String::new(),
         );
         // Simulate an auto-generated title
         {
@@ -4264,6 +4351,7 @@ mod tests {
             "Test".to_string(),
             "test-prov".to_string(),
             "test-model".to_string(),
+            String::new(),
         );
 
         // Simulate a first turn with tool calls: 4 messages total
@@ -4304,6 +4392,7 @@ mod tests {
             "Test".to_string(),
             "test-prov".to_string(),
             "test-model".to_string(),
+            String::new(),
         );
         sm.add_user_message("hello".to_string());
         sm.add_assistant_message("hi".to_string());
