@@ -765,7 +765,8 @@ impl StateManager {
     ///
     /// `clear_bg` is idempotent on an empty registry, so callers that
     /// must kill bg earlier for ordering reasons (e.g. `/cd` before its
-    /// process-global `set_current_dir`) may still call this safely.
+    /// session-cwd flip on `state_manager.session_cwd`) may still call
+    /// this safely.
     pub fn reset_conversation_state(&self) {
         self.clear_chat();
         self.reset_stats();
@@ -2321,6 +2322,7 @@ impl Default for StateManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_new_state_manager() {
@@ -2411,6 +2413,60 @@ mod tests {
         let target = std::path::PathBuf::from("/some/session/dir");
         sm.set_session_cwd(target.clone());
         assert_eq!(sm.session_cwd(), target);
+    }
+
+    /// Phase 8 contract for `/cd` and `/load` at the SM level. The handlers
+    /// mutate `sm.session_cwd` and persist a new `cwd` on the freshly-minted
+    /// conversation — *without* touching the process-global cwd. This test
+    /// exercises the same SM-level operations the handlers do and asserts
+    /// (a) the SM's `session_cwd` reflects the new value, (b) the new
+    /// conversation's persisted `cwd` reflects it too, and (c) the process
+    /// cwd is byte-for-byte unchanged across the whole sequence. The grep
+    /// test `no_set_current_dir_in_src` (in `tests/scenarios`) is the
+    /// source-level lock for the same invariant.
+    #[test]
+    fn test_cd_handlers_never_mutate_process_cwd() {
+        use crate::storage::InMemoryStorage;
+
+        let storage: Arc<dyn crate::storage::ConversationStorage> =
+            Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        // Seed at the process cwd so the seed value is whatever the test
+        // process happens to be in — the point is the *delta*.
+        sm.set_session_cwd(std::env::current_dir().unwrap());
+
+        let process_cwd_before = std::env::current_dir().unwrap();
+        let target = std::path::PathBuf::from("/new/session/tree/for/cd");
+
+        // Same operations `/cd` performs: flip the SM's session_cwd, mint
+        // a new conversation persisting the new cwd, stamp wire identity.
+        sm.set_session_cwd(target.clone());
+        sm.create_conversation(
+            "after /cd".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            target.to_string_lossy().into_owned(),
+        );
+
+        // (a) SM reflects the new session cwd.
+        assert_eq!(
+            sm.session_cwd(),
+            target,
+            "SM.session_cwd must reflect the post-/cd value"
+        );
+        // (b) The new conversation persists the new cwd.
+        let conv = sm.get_current_conversation().expect("current conversation");
+        assert_eq!(
+            PathBuf::from(&conv.cwd),
+            target,
+            "freshly-minted conversation's cwd must equal the new session cwd"
+        );
+        // (c) The process-global cwd is byte-for-byte unchanged.
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            process_cwd_before,
+            "session-cwd flip must not mutate the process-global cwd"
+        );
     }
 
     /// `peek_conversation_cwd` returns the saved cwd without loading the

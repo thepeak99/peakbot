@@ -47,3 +47,13 @@ This file is the working draft for the next release. When a version is tagged, t
   per-session system prompt is built inside `create_session` from the
   resolved `session_cwd` — the only place the cwd is allowed to flow into
   the prompt. No behaviour change.
+- `/cd` and `/load` no longer mutate the process-global cwd. Both commands
+  now flip `state_manager.session_cwd` (per-session) and rebuild the agent
+  on the new tree. Rule 4 of `make-paths-great-again` is now enforced in
+  code: the source-tree grep test `no_set_current_dir_in_src` is the lock,
+  and `test_cd_handlers_never_mutate_process_cwd` proves the SM-level
+  contract. Two web sessions in different trees now stay race-free with
+  no shared global touched; the process cwd is the inherited launch dir
+  and is irrelevant to correctness. `/new` and `/model` (and bare `/cd`)
+  also read the session cwd from the SM instead of `current_dir()`, so
+  every conversation-mint site is now a single source of truth.
