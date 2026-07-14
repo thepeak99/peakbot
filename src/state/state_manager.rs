@@ -1914,6 +1914,13 @@ impl StateManager {
         reg.list()
     }
 
+    /// Number of bg PTY children still running under this session. Feeds the
+    /// web reaper's quiescence check (#158): a session with a live bg child
+    /// is "working" and must not be reaped even with no sockets attached.
+    pub fn bg_running_count(&self) -> usize {
+        self.bg.lock().unwrap().running_count()
+    }
+
     /// Kill every background process (called on `/new`, `/model`, `/load`
     /// rebuild paths). Idempotent — empty registry is a no-op.
     pub fn clear_bg(&self) {

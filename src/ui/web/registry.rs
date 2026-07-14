@@ -32,48 +32,80 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-/// Attached-socket count + idle window for one session — the reaper's input.
+/// Attached-socket count + idle clock for one session — the reaper's input.
 /// Split out from the session so the expiry decision is unit-testable without
 /// building a full [`Session`] (which needs a live provider).
+///
+/// A session is *quiescent* when three things are all true: no socket is
+/// attached, the agent is not processing a turn, and no `bash_bg` child is
+/// alive under it (#158). The idle clock runs from the moment the session
+/// becomes quiescent — the reaper samples the live agent/bg signals on each
+/// tick and arms `quiescent_since` itself, so no turn-lifecycle events have to
+/// be pushed into this web-only registry.
 struct AttachState {
     /// Number of sockets currently attached.
     attached: AtomicUsize,
-    /// When `attached` last fell to zero — the start of the idle window the
-    /// reaper measures against the TTL. `None` while a socket is attached.
-    idle_since: Mutex<Option<Instant>>,
+    /// When the session last became fully quiescent — the start of the idle
+    /// window the reaper measures against the TTL. `None` whenever the session
+    /// is non-quiescent (a socket attached, the agent working, or a bg child
+    /// alive). Owned and armed by the reaper tick, not by socket edges.
+    quiescent_since: Mutex<Option<Instant>>,
 }
 
 impl AttachState {
     fn new() -> Self {
         Self {
             attached: AtomicUsize::new(0),
-            idle_since: Mutex::new(None),
+            quiescent_since: Mutex::new(None),
         }
     }
 
-    /// A socket attached: bump the count and clear any idle window.
+    /// A socket attached: bump the count. The reaper clears the idle clock on
+    /// its next tick (it samples `attached`), so no arming is needed here.
     fn mark_attached(&self) {
         self.attached.fetch_add(1, Ordering::AcqRel);
-        *self.idle_since.lock().unwrap() = None;
     }
 
-    /// A socket detached: drop the count; when it hits zero, start the idle
-    /// window so the reaper can expire the session after the TTL.
+    /// A socket detached: drop the count. The reaper arms the idle clock on
+    /// its next tick iff the session is also agent-idle and bg-idle.
     fn mark_detached(&self) {
-        if self.attached.fetch_sub(1, Ordering::AcqRel) == 1 {
-            *self.idle_since.lock().unwrap() = Some(Instant::now());
-        }
+        self.attached.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// `true` when no socket is attached and the idle window exceeds `ttl`.
-    fn is_expired(&self, ttl: Duration) -> bool {
-        self.attached.load(Ordering::Acquire) == 0
-            && matches!(*self.idle_since.lock().unwrap(), Some(t) if t.elapsed() >= ttl)
+    /// Sample the session's liveness and decide whether to reap it, arming or
+    /// clearing the idle clock as a side effect. Pure in its inputs
+    /// (`agent_running`, `bg_running`, `now`, `ttl`) plus the atomic socket
+    /// count, so the reaper tick is fully testable without a live session.
+    ///
+    /// - non-quiescent → clear the clock, never expire;
+    /// - just became quiescent → start the clock, don't expire yet (honours
+    ///   "the idle clock starts when the agent finishes");
+    /// - quiescent for ≥ `ttl` → expire.
+    fn expire_check(
+        &self,
+        agent_running: bool,
+        bg_running: bool,
+        now: Instant,
+        ttl: Duration,
+    ) -> bool {
+        let quiescent = self.attached.load(Ordering::Acquire) == 0 && !agent_running && !bg_running;
+        let mut since = self.quiescent_since.lock().unwrap();
+        if !quiescent {
+            *since = None;
+            return false;
+        }
+        match *since {
+            None => {
+                *since = Some(now);
+                false
+            }
+            Some(t) => now.duration_since(t) >= ttl,
+        }
     }
 }
 
 /// A live session plus the registry bookkeeping (attached-socket count and
-/// idle timestamp) that decides when it expires.
+/// idle clock) that decides when it expires.
 pub(crate) struct RegisteredSession {
     /// Stable internal handle for the session's whole life. The session's
     /// *conversation* id can change under it (`/model`, `/load`, `/new` mint a
@@ -106,8 +138,16 @@ impl RegisteredSession {
         self.attach.mark_detached();
     }
 
-    fn is_expired(&self, ttl: Duration) -> bool {
-        self.attach.is_expired(ttl)
+    /// Reaper hook: sample this session's live agent/bg activity and decide
+    /// whether it has been quiescent long enough to reap. Reads `is_running`
+    /// and `bg_running_count` off the state manager here (derive, don't
+    /// duplicate) so the registry never has to be told when a turn or bg child
+    /// starts or ends.
+    fn expire_check(&self, now: Instant, ttl: Duration) -> bool {
+        let agent_running = self.session.state_manager.is_running();
+        let bg_running = self.session.state_manager.bg_running_count() > 0;
+        self.attach
+            .expire_check(agent_running, bg_running, now, ttl)
     }
 
     /// Signal a graceful exit — the teardown path that runs `clear_bg`.
@@ -206,12 +246,14 @@ impl SessionRegistry {
             .collect()
     }
 
-    /// Kill every session idle (zero sockets) longer than `ttl`.
+    /// Kill every session that has been fully quiescent (no sockets, agent
+    /// idle, no live bg children) longer than `ttl`.
     pub fn reap(&self, ttl: Duration) {
+        let now = Instant::now();
         let mut map = self.inner.map.lock().unwrap();
         let expired: Vec<Uuid> = map
             .iter()
-            .filter(|(_, s)| s.is_expired(ttl))
+            .filter(|(_, s)| s.expire_check(now, ttl))
             .map(|(key, _)| *key)
             .collect();
         for key in expired {
@@ -226,48 +268,119 @@ impl SessionRegistry {
 mod tests {
     use super::*;
 
+    // `expire_check` is the reaper's per-tick decision. These tests drive it
+    // directly with explicit (agent_running, bg_running, now, ttl) inputs — no
+    // live Session needed. `now` is threaded so we can advance time without
+    // sleeping. Quiescent = no sockets AND agent idle AND no bg children.
+
+    fn idle(s: &AttachState, now: Instant, ttl: Duration) -> bool {
+        s.expire_check(false, false, now, ttl)
+    }
+
     #[test]
-    fn fresh_attach_state_is_not_expired() {
+    fn fresh_state_becomes_quiescent_then_expires_after_ttl() {
         let s = AttachState::new();
-        // No socket ever attached, no idle window → never expires.
-        assert!(!s.is_expired(Duration::ZERO));
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(600);
+        // No socket ever attached, agent idle, no bg → quiescent. First tick
+        // arms the clock but must NOT reap (clock starts now).
+        assert!(!idle(&s, t0, ttl), "first quiescent tick arms, never reaps");
+        // Not yet past ttl.
+        assert!(!idle(&s, t0 + Duration::from_secs(599), ttl));
+        // Past ttl → reap.
+        assert!(idle(&s, t0 + Duration::from_secs(600), ttl));
     }
 
     #[test]
     fn attached_session_never_expires() {
         let s = AttachState::new();
         s.mark_attached();
-        assert!(!s.is_expired(Duration::ZERO), "an attached session is live");
-    }
-
-    #[test]
-    fn last_detach_arms_idle_window() {
-        let s = AttachState::new();
-        s.mark_attached();
-        s.mark_attached(); // two sockets
-        s.mark_detached(); // one left → still live
-        assert!(!s.is_expired(Duration::ZERO));
-        s.mark_detached(); // last one gone → idle window armed
+        let t0 = Instant::now();
         assert!(
-            s.is_expired(Duration::ZERO),
-            "zero-ttl idle session is immediately expired"
-        );
-        assert!(
-            !s.is_expired(Duration::from_secs(3600)),
-            "a fresh idle window is not yet past a long ttl"
+            !idle(&s, t0 + Duration::from_secs(10_000), t0.elapsed()),
+            "an attached session is live regardless of ttl"
         );
     }
 
     #[test]
-    fn reattach_clears_idle_window() {
+    fn running_agent_never_expires_even_with_no_sockets() {
+        let s = AttachState::new();
+        let t0 = Instant::now();
+        let ttl = Duration::ZERO;
+        // No sockets, but the agent is working → not quiescent, never reaped.
+        assert!(!s.expire_check(true, false, t0, ttl));
+        assert!(!s.expire_check(true, false, t0 + Duration::from_secs(10_000), ttl));
+    }
+
+    #[test]
+    fn live_bg_child_never_expires_even_with_no_sockets() {
+        let s = AttachState::new();
+        let t0 = Instant::now();
+        let ttl = Duration::ZERO;
+        // No sockets, agent idle, but a bg child is alive → not quiescent.
+        assert!(!s.expire_check(false, true, t0, ttl));
+        assert!(!s.expire_check(false, true, t0 + Duration::from_secs(10_000), ttl));
+    }
+
+    #[test]
+    fn clock_starts_when_agent_finishes_not_when_socket_detached() {
+        // The load-bearing correctness case: socket drops at t0 while the
+        // agent keeps working for 20 minutes, then finishes. The idle clock
+        // must start at t_finish, not t0 — so the session gets a full ttl of
+        // grace after the agent goes idle.
         let s = AttachState::new();
         s.mark_attached();
-        s.mark_detached(); // idle armed
-        assert!(s.is_expired(Duration::ZERO));
-        s.mark_attached(); // someone reconnected
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(600);
+
+        s.mark_detached(); // socket gone at t0
+        // Agent still running for 20 min → never quiescent, clock stays unset.
+        assert!(!s.expire_check(true, false, t0 + Duration::from_secs(1200), ttl));
+        // Agent finishes at t0+1200 → first quiescent tick arms, doesn't reap.
+        let t_finish = t0 + Duration::from_secs(1200);
         assert!(
-            !s.is_expired(Duration::ZERO),
-            "reattach revives the session"
+            !idle(&s, t_finish, ttl),
+            "clock arms at finish, no instant reap"
         );
+        // Only ttl AFTER the finish does it expire.
+        assert!(!idle(&s, t_finish + Duration::from_secs(599), ttl));
+        assert!(idle(&s, t_finish + Duration::from_secs(600), ttl));
+    }
+
+    #[test]
+    fn reattach_before_ttl_resets_the_clock() {
+        let s = AttachState::new();
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(600);
+        // Quiescent, clock armed at t0.
+        assert!(!idle(&s, t0, ttl));
+        // Someone reconnects → next tick sees attached>0, clears the clock.
+        s.mark_attached();
+        assert!(!s.expire_check(false, false, t0 + Duration::from_secs(1200), ttl));
+        // They leave again → clock restarts from this tick, not t0.
+        s.mark_detached();
+        let t_reidle = t0 + Duration::from_secs(1200);
+        assert!(
+            !idle(&s, t_reidle, ttl),
+            "reidle arms fresh, no instant reap"
+        );
+        assert!(idle(&s, t_reidle + Duration::from_secs(600), ttl));
+    }
+
+    #[test]
+    fn agent_restart_mid_window_resets_the_clock() {
+        // Quiescent clock armed, then a bg drain re-engages the agent before
+        // ttl elapses → the clock must reset, not carry over.
+        let s = AttachState::new();
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(600);
+        assert!(!idle(&s, t0, ttl)); // armed
+        // Agent picks up work at t0+300 → clears the clock.
+        assert!(!s.expire_check(true, false, t0 + Duration::from_secs(300), ttl));
+        // Back to idle at t0+400 → fresh arm, so t0+400+600 is the deadline.
+        let t_reidle = t0 + Duration::from_secs(400);
+        assert!(!idle(&s, t_reidle, ttl));
+        assert!(!idle(&s, t_reidle + Duration::from_secs(599), ttl));
+        assert!(idle(&s, t_reidle + Duration::from_secs(600), ttl));
     }
 }

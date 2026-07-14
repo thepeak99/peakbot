@@ -4,6 +4,20 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Web sessions now stay alive while the agent is working, and expire only
+  when fully idle (#158).** A `peakbot --web` session used to be reaped purely
+  on its attached-socket count: closing the tab mid-turn (a long tool round, a
+  slow `bash_bg`, a long stream) could kill the agent in flight, while a
+  finished-but-tab-open session never expired. Reaping now keys off *quiescence*
+  — no sockets attached **and** the agent not processing a turn **and** no live
+  `bash_bg` children under the session. Any of those three keeps the session
+  live and resets the idle clock; only when all three go quiet does the
+  `web.session_ttl_secs` clock start (default lowered to **600 s / 10 min**).
+  The reaper samples the live agent/bg signals on each tick — no turn-lifecycle
+  events are pushed into the web-only registry, and no duplicate "agent running"
+  state is introduced (it derives from `StateManager::is_running`). Reopening a
+  tab mid-run reattaches to the still-running agent.
+
 - File tools (`file_create`, `file_str_replace`, `file_insert`, `file_read`,
   `list_directory`, `pdf_read`) and `doc_index` now accept **relative paths**,
   not just absolute ones. Relative paths resolve against the session working
