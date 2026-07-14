@@ -34,22 +34,23 @@ pub enum DocIndexError {
 }
 
 /// Indexing tool over the shared vector store. `session_cwd` is the base for
-/// relative path resolution; `None` (tests) falls back to the process cwd.
+/// relative path resolution; the default empty path leaves relatives anchored
+/// at the process cwd (tests).
 #[derive(Clone)]
 pub struct DocIndexTool {
     store: VectorStore,
-    session_cwd: Option<PathBuf>,
+    session_cwd: PathBuf,
 }
 
 impl DocIndexTool {
     pub fn new(store: VectorStore) -> Self {
         Self {
             store,
-            session_cwd: None,
+            session_cwd: PathBuf::new(),
         }
     }
 
-    pub fn with_session_cwd(mut self, session_cwd: Option<PathBuf>) -> Self {
+    pub fn with_session_cwd(mut self, session_cwd: PathBuf) -> Self {
         self.session_cwd = session_cwd;
         self
     }
@@ -93,7 +94,7 @@ impl Tool for DocIndexTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let root = resolve_against(self.session_cwd.as_deref(), &args.path);
+        let root = resolve_against(&self.session_cwd, &args.path);
         if !root.exists() {
             return Err(DocIndexError::NotFound(args.path));
         }
@@ -215,8 +216,7 @@ mod tests {
             },
         };
         let store = VectorStore::open(&config).unwrap();
-        let tool =
-            DocIndexTool::new(store).with_session_cwd(Some(session_dir.path().to_path_buf()));
+        let tool = DocIndexTool::new(store).with_session_cwd(session_dir.path().to_path_buf());
 
         // Relative path — must resolve under session_dir and be found.
         let args: DocIndexArgs = serde_json::from_value(serde_json::json!({

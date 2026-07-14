@@ -23,11 +23,11 @@ pub struct FileStrReplaceArgs {
 /// Replace-text tool. `session_cwd` is the base for relative path resolution.
 #[derive(Default)]
 pub struct FileStrReplaceTool {
-    session_cwd: Option<PathBuf>,
+    session_cwd: PathBuf,
 }
 
 impl FileStrReplaceTool {
-    pub fn new(session_cwd: Option<PathBuf>) -> Self {
+    pub fn new(session_cwd: PathBuf) -> Self {
         Self { session_cwd }
     }
 }
@@ -85,7 +85,7 @@ If editing fails, read the file first with `file_read` to get exact content, the
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(self.session_cwd.as_deref(), &args.path);
+        let resolved = resolve_against(&self.session_cwd, &args.path);
         let result = run(
             &resolved.to_string_lossy(),
             &args.old_str,

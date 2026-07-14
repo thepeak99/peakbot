@@ -40,15 +40,16 @@ pub struct PdfReadArgs {
 }
 
 /// PDF-read tool. `session_cwd` is the base for relative path resolution;
-/// `None` (tests / no state manager) falls back to the process cwd.
+/// the `Default` empty path leaves relatives anchored at the process cwd
+/// (tests / no state manager).
 #[derive(Serialize, Deserialize, Default)]
 pub struct PdfReadTool {
     #[serde(skip)]
-    session_cwd: Option<PathBuf>,
+    session_cwd: PathBuf,
 }
 
 impl PdfReadTool {
-    pub fn new(session_cwd: Option<PathBuf>) -> Self {
+    pub fn new(session_cwd: PathBuf) -> Self {
         Self { session_cwd }
     }
 }
@@ -104,7 +105,7 @@ impl Tool for PdfReadTool {
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(self.session_cwd.as_deref(), &args.path);
+        let resolved = resolve_against(&self.session_cwd, &args.path);
         let path = resolved.as_path();
 
         if !path.exists() {

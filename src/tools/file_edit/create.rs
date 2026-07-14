@@ -16,14 +16,15 @@ pub struct FileCreateArgs {
 }
 
 /// Create-a-file tool. `session_cwd` is the directory relative paths resolve
-/// against; `None` (tests / no state manager) falls back to the process cwd.
+/// against; the `Default` empty path leaves relatives anchored at the process
+/// cwd (tests / no state manager).
 #[derive(Default)]
 pub struct FileCreateTool {
-    session_cwd: Option<PathBuf>,
+    session_cwd: PathBuf,
 }
 
 impl FileCreateTool {
-    pub fn new(session_cwd: Option<PathBuf>) -> Self {
+    pub fn new(session_cwd: PathBuf) -> Self {
         Self { session_cwd }
     }
 }
@@ -74,7 +75,7 @@ and editing it later."
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(self.session_cwd.as_deref(), &args.path);
+        let resolved = resolve_against(&self.session_cwd, &args.path);
         let result = run(&resolved.to_string_lossy(), args.file_text.as_deref());
 
         match &result {

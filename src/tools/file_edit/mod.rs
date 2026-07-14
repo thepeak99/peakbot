@@ -17,21 +17,17 @@ pub use str_replace::FileStrReplaceTool;
 
 pub(crate) const SNIPPET_CONTEXT_LINES: usize = 4;
 
-/// Resolve a raw path argument against an optional session base directory.
+/// Resolve a raw path argument against the session base directory.
 ///
-/// Absolute paths pass through untouched. A relative path is joined onto
-/// `base` (the session cwd) when present; with no base it stays relative and
-/// resolves against the process cwd — the std default, used only in test/no-
-/// state-manager paths. No `canonicalize`: plain `join`, no symlink rewriting.
-pub fn resolve_against(base: Option<&Path>, raw: &str) -> PathBuf {
+/// Absolute paths pass through untouched; a relative path is joined onto
+/// `base` (the session cwd). No `canonicalize`: plain `join`, no symlink
+/// rewriting.
+pub fn resolve_against(base: &Path, raw: &str) -> PathBuf {
     let p = Path::new(raw);
     if p.is_absolute() {
         return p.to_path_buf();
     }
-    match base {
-        Some(b) => b.join(p),
-        None => p.to_path_buf(),
-    }
+    base.join(p)
 }
 
 /// Level of matching that was used to find the text
@@ -289,7 +285,7 @@ mod tests {
     fn resolve_absolute_passes_through() {
         let base = Path::new("/session/dir");
         assert_eq!(
-            resolve_against(Some(base), "/etc/hosts"),
+            resolve_against(base, "/etc/hosts"),
             PathBuf::from("/etc/hosts")
         );
     }
@@ -298,16 +294,8 @@ mod tests {
     fn resolve_relative_joins_base() {
         let base = Path::new("/session/dir");
         assert_eq!(
-            resolve_against(Some(base), "sub/file.txt"),
+            resolve_against(base, "sub/file.txt"),
             PathBuf::from("/session/dir/sub/file.txt")
-        );
-    }
-
-    #[test]
-    fn resolve_relative_no_base_stays_relative() {
-        assert_eq!(
-            resolve_against(None, "sub/file.txt"),
-            PathBuf::from("sub/file.txt")
         );
     }
 

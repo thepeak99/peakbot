@@ -468,10 +468,10 @@ where
         None => BashBgTool::default(),
     };
 
-    // Path tools resolve relative args against the session cwd. Phase 1 wires
-    // `None` (⇒ process cwd, unchanged behaviour); Phase 3 will source the real
+    // Path tools resolve relative args against the session cwd. Phase 1 uses
+    // the process cwd (unchanged behaviour); Phase 3 will source the real
     // `session_cwd` from the state manager here.
-    let session_cwd: Option<std::path::PathBuf> = None;
+    let session_cwd: std::path::PathBuf = std::env::current_dir().unwrap_or_default();
 
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
         gate(Box::new(FileCreateTool::new(session_cwd.clone()))),

@@ -22,11 +22,11 @@ pub struct FileInsertArgs {
 /// Insert-at-line tool. `session_cwd` is the base for relative path resolution.
 #[derive(Default)]
 pub struct FileInsertTool {
-    session_cwd: Option<PathBuf>,
+    session_cwd: PathBuf,
 }
 
 impl FileInsertTool {
-    pub fn new(session_cwd: Option<PathBuf>) -> Self {
+    pub fn new(session_cwd: PathBuf) -> Self {
         Self { session_cwd }
     }
 }
@@ -79,7 +79,7 @@ after line N. Returns an error if `insert_line` exceeds the file's line count."
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(self.session_cwd.as_deref(), &args.path);
+        let resolved = resolve_against(&self.session_cwd, &args.path);
         let result = run(
             &resolved.to_string_lossy(),
             args.insert_line,

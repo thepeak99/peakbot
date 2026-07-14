@@ -26,15 +26,16 @@ pub struct FileReadArgs {
 }
 
 /// Read-a-file tool. `session_cwd` is the base for relative path resolution;
-/// `None` (tests / no state manager) falls back to the process cwd.
+/// the `Default` empty path leaves relatives anchored at the process cwd
+/// (tests / no state manager).
 #[derive(Serialize, Deserialize, Default)]
 pub struct FileReadTool {
     #[serde(skip)]
-    session_cwd: Option<PathBuf>,
+    session_cwd: PathBuf,
 }
 
 impl FileReadTool {
-    pub fn new(session_cwd: Option<PathBuf>) -> Self {
+    pub fn new(session_cwd: PathBuf) -> Self {
         Self { session_cwd }
     }
 }
@@ -83,7 +84,7 @@ impl Tool for FileReadTool {
         );
 
         let start_time = std::time::Instant::now();
-        let path = resolve_against(self.session_cwd.as_deref(), &args.path);
+        let path = resolve_against(&self.session_cwd, &args.path);
         let path = path.as_path();
 
         if !path.exists() {
@@ -164,7 +165,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("note.txt"), "hello from session dir").unwrap();
 
-        let tool = FileReadTool::new(Some(dir.path().to_path_buf()));
+        let tool = FileReadTool::new(dir.path().to_path_buf());
         let args: FileReadArgs = serde_json::from_value(serde_json::json!({
             "path": "note.txt"
         }))
@@ -174,11 +175,11 @@ mod tests {
         assert!(out.contains("hello from session dir"), "got: {out}");
     }
 
-    // With no session_cwd, a relative path resolves against the process cwd
-    // (std default) — the test/no-state-manager fallback.
+    // With the default empty base, a relative path resolves against the
+    // process cwd (std default) — the test/no-state-manager fallback.
     #[tokio::test]
-    async fn no_session_cwd_uses_process_cwd() {
-        let tool = FileReadTool::new(None);
+    async fn default_base_uses_process_cwd() {
+        let tool = FileReadTool::default();
         let args: FileReadArgs = serde_json::from_value(serde_json::json!({
             "path": "definitely-not-a-real-file-xyz.txt"
         }))
