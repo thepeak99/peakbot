@@ -294,7 +294,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn conv(name: &str) -> Conversation {
-        Conversation::new(name.to_string(), "test".to_string(), "model".to_string())
+        Conversation::new(
+            name.to_string(),
+            "test".to_string(),
+            "model".to_string(),
+            String::new(),
+        )
     }
 
     #[test]

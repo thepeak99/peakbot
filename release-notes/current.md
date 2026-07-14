@@ -24,3 +24,12 @@ This file is the working draft for the next release. When a version is tagged, t
   passed directory (previously they agreed only because both read the process
   cwd). No behaviour change — every call site passes the same directory the
   process was in.
+- `Conversation::new` and `StateManager::create_conversation` now take `cwd`
+  explicitly as the last argument. The implicit `std::env::current_dir()` read
+  inside `Conversation::new` is gone; every caller (`ensure_boot_conversation`,
+  `/new`, `/model`, `/cd`) passes its own value, behaviour-preserving today.
+  This makes the directory a first-class constructor field and lets later
+  changes wire the real per-session value without touching every mint site
+  again. The empty string is still a valid value (and what the in-memory
+  `ConversationManager::create_new` continues to forward, matching its
+  historical behaviour).

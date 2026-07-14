@@ -1240,6 +1240,9 @@ impl AgentRunner {
             convo_name,
             resolved.provider_name.clone(),
             resolved.model_name.clone(),
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         );
         sm_for_provider.set_model(resolved.model_name.clone());
         sm_for_provider.set_provider_name(resolved.provider_name.clone());
@@ -1346,8 +1349,8 @@ impl AgentRunner {
         // Reset conversation-scoped state — same path as /new and /model.
         // bg was already killed above (before the chdir); the unified
         // reset's clear_bg is a no-op on the now-empty registry.
-        // `create_conversation` captures the new cwd into the metadata
-        // (Conversation::new reads current_dir, which we just changed).
+        // `create_conversation` persists the new cwd into the metadata
+        // so /load re-activates this tree.
         sm.reset_conversation_state();
         let convo_name = format!(
             "Conversation {}",
@@ -1357,6 +1360,7 @@ impl AgentRunner {
             convo_name,
             resolved.provider_name.clone(),
             resolved.model_name.clone(),
+            target.to_string_lossy().into_owned(),
         );
         sm.set_model(resolved.model_name.clone());
         sm.set_provider_name(resolved.provider_name.clone());
@@ -2162,7 +2166,14 @@ impl AgentRunner {
                             m
                         }
                     };
-                    sm.create_conversation(name, provider_name, model);
+                    sm.create_conversation(
+                        name,
+                        provider_name,
+                        model,
+                        std::env::current_dir()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    );
                     sm.add_system_message("Started a new conversation.".to_string());
                 } else {
                     tracing::warn!("State manager not available for /new command");
@@ -2985,6 +2996,7 @@ mod tests {
                 (*name).to_string(),
                 provider_name.clone(),
                 model_wire_id.clone(),
+                String::new(),
             );
             conv.updated_at = Utc::now() - chrono::Duration::hours(*hours_ago);
             storage.save(&conv).expect("seed save");
@@ -3204,6 +3216,7 @@ mod tests {
             "Stranger".to_string(),
             "ghost-provider".to_string(),
             "ghost-model".to_string(),
+            String::new(),
         );
         conv.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
         storage.save(&conv).expect("seed save");
@@ -3294,7 +3307,12 @@ mod tests {
         // (`openrouter` + Config default model) so the wire-id check
         // accepts it and `/load` reaches the success branch.
         let model = Config::default().model().to_string();
-        let mut conv = Conversation::new("Saved".to_string(), "openrouter".to_string(), model);
+        let mut conv = Conversation::new(
+            "Saved".to_string(),
+            "openrouter".to_string(),
+            model,
+            String::new(),
+        );
         conv.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
         storage.save(&conv).expect("seed save");
         let saved_id = conv.id;
@@ -3351,7 +3369,12 @@ mod tests {
         // Save under the legacy synth identity (provider "openrouter",
         // default model). The alias was "default" at save time —
         // but we don't even care, we never wrote it.
-        let mut conv = Conversation::new("Saved".to_string(), "openrouter".to_string(), model);
+        let mut conv = Conversation::new(
+            "Saved".to_string(),
+            "openrouter".to_string(),
+            model,
+            String::new(),
+        );
         conv.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
         storage.save(&conv).expect("seed save");
         let saved_id = conv.id;
@@ -3504,6 +3527,7 @@ mod tests {
             "old one".to_string(),
             "test-prov".to_string(),
             "test-model".to_string(),
+            String::new(),
         );
         let old_id = sm
             .get_current_conversation_id()

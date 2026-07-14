@@ -214,21 +214,21 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    /// Create a new conversation with the given name and the active
-    /// model's full wire identity.
+    /// Create a new conversation with the given name, the active model's
+    /// full wire identity, and the directory this conversation is rooted in.
     ///
     /// Both `provider_name` and `model` are required: together they form
     /// the stable key `/load` uses to re-activate the right model. The
     /// alias the user sees is *not* persisted — it's UI sugar that can
     /// be renamed in `config.yaml` without breaking saved conversations.
-    pub fn new(name: String, provider_name: String, model: String) -> Self {
+    ///
+    /// `cwd` is the directory tree this conversation is bound to. It is
+    /// the caller's responsibility to pass the value the session will
+    /// actually operate in (the per-session `session_cwd`, or for `/cd`
+    /// the new target). The conversation is persisted 1:1 with this path
+    /// — `/load` reapplies it as the session's working tree.
+    pub fn new(name: String, provider_name: String, model: String, cwd: String) -> Self {
         let now = Utc::now();
-        // cwd is captured at creation time — after any `/cd` chdir has
-        // already run — so it always reflects the tree this conversation
-        // is actually rooted in.
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
         Conversation {
             id: Uuid::new_v4(),
             name,
@@ -358,6 +358,7 @@ mod tests {
             "Test".to_string(),
             "openrouter".to_string(),
             "claude-3".to_string(),
+            String::new(),
         );
         assert_eq!(conv.name, "Test");
         assert_eq!(conv.provider_name, "openrouter");
@@ -371,6 +372,7 @@ mod tests {
             "Test".to_string(),
             "openrouter".to_string(),
             "claude-3".to_string(),
+            String::new(),
         );
 
         conv.add_user_message("Hello".to_string());
@@ -403,6 +405,7 @@ mod tests {
             "Test".to_string(),
             "openrouter".to_string(),
             "claude-3".to_string(),
+            String::new(),
         );
         conv.add_user_message("Hello".to_string());
         conv.add_assistant_message("Hi!".to_string());
@@ -422,6 +425,7 @@ mod tests {
             "Test".to_string(),
             "openrouter".to_string(),
             "claude-3".to_string(),
+            String::new(),
         );
         conv.add_user_message("List files".to_string());
         conv.add_tool_call(
@@ -546,18 +550,26 @@ mod tests {
         assert_eq!(conv.cwd, "");
     }
 
-    /// A new conversation captures the process cwd and round-trips it
-    /// through serde without loss.
+    /// `Conversation::new` persists the caller's `cwd` argument
+    /// (Phase 5 — `cwd` is now an explicit constructor parameter, not
+    /// an implicit `std::env::current_dir()` read). The persisted value
+    /// round-trips through serde without loss, and a value different
+    /// from the process cwd is preserved verbatim — proving the
+    /// constructor does not silently re-read the process cwd.
     #[test]
     fn new_conversation_persists_cwd() {
-        let conv = Conversation::new("Test".into(), "openrouter".into(), "m".into());
-        let expected = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        assert_eq!(conv.cwd, expected);
+        let explicit = "/this/path/was/passed/explicitly/by/the/caller";
+        let conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "m".into(),
+            explicit.into(),
+        );
+        assert_eq!(conv.cwd, explicit);
+
         let json = serde_json::to_string(&conv).unwrap();
         let parsed: Conversation = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.cwd, expected);
+        assert_eq!(parsed.cwd, explicit);
     }
 
     /// New conversations carry both `provider_name` and `model` —
@@ -569,6 +581,7 @@ mod tests {
             "Test".into(),
             "openrouter".into(),
             "anthropic/claude-3.7-sonnet".into(),
+            String::new(),
         );
         let json = serde_json::to_string(&conv).unwrap();
         let parsed: Conversation = serde_json::from_str(&json).unwrap();
@@ -585,6 +598,7 @@ mod tests {
             "Test".into(),
             "openrouter".into(),
             "anthropic/claude-3.7-sonnet".into(),
+            String::new(),
         );
         let json = serde_json::to_string(&conv).unwrap();
         assert!(
@@ -602,6 +616,7 @@ mod tests {
             "Conversation 2026-05-18".into(),
             "openrouter".into(),
             "claude-3.7-sonnet".into(),
+            String::new(),
         );
         assert!(conv.title.is_none());
         assert!(!conv.has_title());
@@ -614,6 +629,7 @@ mod tests {
             "Conversation 2026-05-18".into(),
             "openrouter".into(),
             "claude-3.7-sonnet".into(),
+            String::new(),
         );
         let before = conv.updated_at;
         conv.set_title("Fix bug in auth".into());
@@ -629,6 +645,7 @@ mod tests {
             "Conversation 2026-05-18".into(),
             "openrouter".into(),
             "claude-3.7-sonnet".into(),
+            String::new(),
         );
         conv.set_title("First title".into());
         conv.set_title("Second title".into());
@@ -642,6 +659,7 @@ mod tests {
             "Conversation 2026-05-18".into(),
             "openrouter".into(),
             "claude-3.7-sonnet".into(),
+            String::new(),
         );
         conv.set_title("A".repeat(200));
         assert!(conv.title.is_none());
@@ -654,6 +672,7 @@ mod tests {
             "Conversation 2026-05-18 10:00".into(),
             "openrouter".into(),
             "claude-3.7-sonnet".into(),
+            String::new(),
         );
         conv.set_title("Fix sudo bug".into());
         let summary = ConversationSummary::from(&conv);
@@ -668,6 +687,7 @@ mod tests {
             "Conversation 2026-05-18 10:00".into(),
             "openrouter".into(),
             "claude-3.7-sonnet".into(),
+            String::new(),
         );
         let summary = ConversationSummary::from(&conv);
         assert_eq!(summary.name, "Conversation 2026-05-18 10:00");
@@ -681,6 +701,7 @@ mod tests {
             "Test".into(),
             "openrouter".into(),
             "claude-3.7-sonnet".into(),
+            String::new(),
         );
         conv.set_title("Rust async patterns".into());
         let json = serde_json::to_string(&conv).unwrap();
@@ -710,7 +731,7 @@ mod tests {
     /// The `compacted` flag and `Summary` variant round-trip through serde.
     #[test]
     fn compacted_flag_and_summary_roundtrip() {
-        let mut conv = Conversation::new("t".into(), "prov".into(), "model".into());
+        let mut conv = Conversation::new("t".into(), "prov".into(), "model".into(), String::new());
         let mut old = Message::user("old".into());
         if let Message::User {
             ref mut compacted, ..
@@ -773,7 +794,7 @@ mod tests {
     #[test]
     fn uncompacted_message_omits_compacted_key() {
         let conv = {
-            let mut c = Conversation::new("t".into(), "prov".into(), "model".into());
+            let mut c = Conversation::new("t".into(), "prov".into(), "model".into(), String::new());
             c.add_user_message("hi".into());
             c
         };

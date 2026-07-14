@@ -41,6 +41,12 @@ impl<S: ConversationStorage> ConversationManager<S> {
     }
 
     /// Create a new conversation
+    ///
+    /// `cwd` is captured from the process working directory at call time,
+    /// matching the historical implicit behavior (`Conversation::new`
+    /// previously did this read itself). Callers that need to mint a
+    /// conversation rooted in a specific directory should use
+    /// `StateManager::create_conversation`, which takes `cwd` explicitly.
     pub fn create_new(
         &mut self,
         name: String,
@@ -52,7 +58,10 @@ impl<S: ConversationStorage> ConversationManager<S> {
             self.enforce_max_conversations()?;
         }
 
-        let conv = Conversation::new(name, provider_name, model);
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let conv = Conversation::new(name, provider_name, model, cwd);
 
         self.current_conversation = Some(conv);
 
