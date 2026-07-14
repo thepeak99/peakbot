@@ -26,9 +26,10 @@ use crate::tools::ShellKind;
 use crate::ui::app_state::WelcomeState;
 use crate::{
     AgentRunner, McpServerHandle, PEAKBOT_VERSION, RebuildContext, SkillRegistry, StateManager,
-    SubAgentRegistry, TodoTool, UiAction, create_provider,
+    SubAgentRegistry, TodoTool, UiAction, build_system_prompt, create_provider,
 };
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -89,6 +90,23 @@ pub struct Session {
 /// Mirrors the historical `main` boot block: fresh `StateManager`,
 /// per-session `TodoTool`, `create_provider`, `AgentRunner::new` +
 /// `with_rebuild_context`, welcome state, then `tokio::spawn(run_loop)`.
+///
+/// ## Per-session cwd (Phase 6)
+///
+/// This is the **single point** that resolves the per-session `session_cwd`
+/// and threads it into the system prompt, the persisted conversation, the
+/// welcome banner, and (via Phase 3's wiring) every path-aware tool. Resume
+/// adopts the saved cwd (Phase 5 persisted it 1:1); fresh sessions inherit
+/// the boot `current_dir()`. Order matters:
+/// 1. resolve `session_cwd`,
+/// 2. `state_manager.set_session_cwd(...)` *before* `create_provider` —
+///    `add_builtin_tools` snapshots it at agent-build time,
+/// 3. build the per-session system prompt from `session_cwd`,
+/// 4. pass that prompt into `create_provider` *and* into `RebuildContext`
+///    so a later `/model` switch keeps the cwd.
+///
+/// `deps.system_prompt` (the boot-cwd prompt built in `main.rs`) is now
+/// unused in the per-session path. Phase 7 deletes the field.
 pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Session> {
     // Per-session Model. Storage (if any) is shared — it writes distinct
     // files per conversation id.
@@ -144,10 +162,40 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         Some(all)
     };
 
+    // ── Per-session cwd (Phase 6) ──────────────────────────────────────────
+    // Resume adopts the saved cwd iff it's non-empty and still points at a
+    // directory. Anything else (no resume, no storage, missing/empty
+    // cwd, gone directory) falls through to the boot cwd. A gone cwd is
+    // best-effort: the user can `/cd` to a valid tree at runtime.
+    let boot_cwd = std::env::current_dir().unwrap_or_default();
+    let session_cwd: PathBuf = match resume {
+        Some(id) => state_manager
+            .peek_conversation_cwd(id)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| {
+                let p = PathBuf::from(&s);
+                if p.is_dir() { Some(p) } else { None }
+            })
+            .unwrap_or(boot_cwd),
+        None => boot_cwd,
+    };
+
+    // Stamp the SM *before* create_provider so the tools (Phase 3) snapshot
+    // the per-session value at agent-build time. A `set_session_cwd` after
+    // build would not reach the already-built tools.
+    state_manager.set_session_cwd(session_cwd.clone());
+
+    // Build the per-session system prompt from `session_cwd` — not from
+    // `deps.system_prompt` (which is the boot-cwd prompt built in `main.rs`
+    // and is now unused in the per-session path; slated for removal in
+    // Phase 7). Skills + shell_kind are part of the env block too.
+    let session_prompt = build_system_prompt(&deps.skills, deps.shell_kind.as_ref(), &session_cwd);
+
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
         boot_provider_config,
         mcp_tools,
-        &deps.system_prompt,
+        &session_prompt,
         deps.searxng_config.as_ref(),
         deps.config.agent_max_turns,
         Some(todo_tool.clone()),
@@ -169,11 +217,12 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // persisted conversation; `ensure_boot_conversation` is idempotent, so it
     // mints a fresh one iff the resume didn't produce a current conversation
     // (unknown id, disabled storage, or `None`). The result is total: a
-    // current conversation always exists afterwards.
+    // current conversation always exists afterwards. The fresh-mint path
+    // persists `session_cwd` so a later `/load` re-adopts the same tree.
     if let Some(id) = resume {
         let _ = state_manager.load_conversation(id);
     }
-    state_manager.ensure_boot_conversation(provider_info.model.as_str());
+    state_manager.ensure_boot_conversation(&session_cwd, provider_info.model.as_str());
     let conversation_id = state_manager
         .get_current_conversation_id()
         .expect("ensure_boot_conversation guarantees a current conversation");
@@ -191,9 +240,14 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
 
     let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
 
+    // `RebuildContext.system_prompt` is the per-session prompt (built from
+    // `session_cwd` above), not the boot-cwd `deps.system_prompt`. A later
+    // `/model` rebuild will hand the same prompt to `create_provider`, so
+    // the cwd survives the model switch. Phase 8's `/cd` rebuild will
+    // overwrite this with a fresh prompt built from the new cwd.
     let rebuild_ctx = RebuildContext {
         registry: deps.model_registry.clone(),
-        system_prompt: deps.system_prompt.clone(),
+        system_prompt: session_prompt,
         mcp_handles: deps.mcp_handles.clone(),
         searxng_config: deps.searxng_config.clone(),
         max_turns: deps.config.agent_max_turns,
@@ -217,6 +271,9 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     )?
     .with_rebuild_context(rebuild_ctx);
 
+    // Welcome banner's cwd reads from `session_cwd` (the single source of
+    // truth), not the live process cwd. Two web sessions in different trees
+    // each see their own cwd here, with no shared global touched.
     state_manager.set_welcome(WelcomeState {
         provider_name: provider_info.name.clone(),
         model: provider_info.model.clone(),
@@ -233,7 +290,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         compaction_threshold: deps.config.context.threshold,
         compaction_keep_recent: deps.config.context.keep_recent,
         conversation_persistence_enabled: deps.config.conversation_enabled(),
-        cwd: std::env::current_dir().unwrap_or_default(),
+        cwd: session_cwd,
         peakbot_version: PEAKBOT_VERSION.to_string(),
     });
 
@@ -248,4 +305,195 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         conversation_id,
         _run_handle: run_handle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Integration tests for `create_session`'s per-session cwd flow.
+    //!
+    //! Phase 6 — the session's cwd is the single source of truth that flows
+    //! into the system prompt, the persisted conversation, the welcome
+    //! banner, and (via Phase 3) the tools. These tests pin the two
+    //! observable surfaces that the bug-fix has to protect:
+    //!
+    //! - `state_manager.session_cwd()` on the resume path reflects the saved
+    //!   cwd, not the boot cwd.
+    //! - `state_manager.session_cwd()` on the fresh-mint path reflects the
+    //!   boot cwd (and the freshly minted conversation persists it 1:1).
+
+    use super::*;
+    use crate::Conversation;
+    use crate::config::{ModelEntry, ModelRegistry, ProviderEntry, ProviderType};
+    use crate::storage::{ConversationStorage, InMemoryStorage};
+    use std::sync::Arc;
+
+    /// Minimal `ModelRegistry` with one Ollama entry — the cheapest provider
+    /// to build offline (no API key, no network at construction time). The
+    /// URL is the loopback default; we never actually call it in these
+    /// tests — we only assert on `state_manager.session_cwd()`.
+    fn ollama_registry() -> Arc<ModelRegistry> {
+        let ollama = ProviderEntry {
+            name: "ollama".to_string(),
+            kind: ProviderType::Ollama,
+            api_key: None,
+            base_url: None,
+            models: vec![ModelEntry {
+                name: "llama3".to_string(),
+                alias: Some("local".to_string()),
+                max_tokens: None,
+                temperature: None,
+                extra_params: None,
+                prompt_caching: None,
+                vision: None,
+                context_size: None,
+            }],
+        };
+        Arc::new(
+            ModelRegistry::build(std::slice::from_ref(&ollama), Some("local"))
+                .expect("registry builds"),
+        )
+    }
+
+    fn test_deps(
+        registry: Arc<ModelRegistry>,
+        storage: Arc<dyn ConversationStorage>,
+    ) -> SessionDeps {
+        // `Config::default()` enables compaction, which then tries to build
+        // a compaction model from `config.provider` (the legacy OpenRouter
+        // default, no API key). Disable it — these tests are not about
+        // compaction, and the boot-cwd cwd flow is independent of it.
+        let mut config = Config::default();
+        config.context.enabled = false;
+
+        SessionDeps {
+            config,
+            model_registry: registry,
+            // `deps.system_prompt` is unused in the per-session path
+            // (Phase 6 builds the prompt from `session_cwd`); Phase 7
+            // deletes this field. We still hand it a plausible string so
+            // any debug print of `SessionDeps` doesn't show an empty value.
+            system_prompt: "UNUSED after Phase 6 — kept for Phase 7 removal".to_string(),
+            skills: crate::skills::SkillRegistry::new(),
+            mcp_handles: Arc::new(Vec::new()),
+            searxng_config: None,
+            pipeline_registry: None,
+            vector_store: None,
+            shell_kind: None,
+            storage: Some(storage),
+            mcp_tools_count: 0,
+            skills_count: 0,
+        }
+    }
+
+    /// The bug-fix headline: a resume adopts the saved cwd as the session
+    /// cwd, regardless of where the process happens to be running.
+    #[tokio::test]
+    async fn create_session_resume_uses_saved_cwd() {
+        // Pre-create a conversation in an InMemoryStorage with a known
+        // cwd that is *not* the process cwd. The two test trees must be
+        // distinct — if the resume silently falls through to the boot
+        // cwd, this test catches it.
+        let saved_tree = tempfile::tempdir().expect("create saved cwd");
+        let other_tree = tempfile::tempdir().expect("create other cwd");
+        assert_ne!(saved_tree.path(), other_tree.path());
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let saved = Conversation::new(
+            "resumed".into(),
+            "ollama".into(),
+            "llama3".into(),
+            saved_tree.path().to_string_lossy().into_owned(),
+        );
+        let saved_id = saved.id;
+        storage.save(&saved).expect("save conversation");
+
+        // Boot deps from `other_tree` (deliberately not the saved cwd).
+        // We can't chdir the test process, but we can show the resolve
+        // picks the saved cwd, not the SM's seed (= process cwd).
+        let deps = test_deps(ollama_registry(), storage.clone());
+        let session = create_session(&deps, Some(saved_id)).expect("create_session");
+
+        assert_eq!(
+            session.state_manager.session_cwd(),
+            saved_tree.path(),
+            "resume must adopt the saved cwd, not the process cwd"
+        );
+
+        // The freshly-loaded conversation's persisted cwd must match too
+        // (load_conversation runs after create_provider in the real boot —
+        // if a future refactor moves things, this catches a desync).
+        let conv = session
+            .state_manager
+            .get_current_conversation()
+            .expect("current conversation");
+        assert_eq!(
+            PathBuf::from(&conv.cwd),
+            saved_tree.path(),
+            "loaded conversation's persisted cwd must match the saved cwd"
+        );
+    }
+
+    /// Fresh mint (no resume) inherits the boot cwd, and the freshly
+    /// persisted conversation carries the same cwd — closing the cycle so
+    /// a later `/load` re-adopts it.
+    #[tokio::test]
+    async fn create_session_fresh_uses_boot_cwd() {
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let deps = test_deps(ollama_registry(), storage.clone());
+        let session = create_session(&deps, None).expect("create_session");
+
+        assert_eq!(
+            session.state_manager.session_cwd(),
+            std::env::current_dir().unwrap(),
+            "fresh mint must inherit the boot cwd"
+        );
+
+        // The freshly-minted conversation's cwd is the SM's session_cwd —
+        // i.e. what `ensure_boot_conversation` was handed — not the
+        // process cwd at *mint* time if the two ever diverged. They are
+        // equal here (the process cwd *is* the boot cwd), but the
+        // assertion is the load-bearing one: `conv.cwd` reflects the
+        // caller-supplied value, not an implicit `current_dir()` read.
+        let conv = session
+            .state_manager
+            .get_current_conversation()
+            .expect("current conversation");
+        assert_eq!(
+            PathBuf::from(&conv.cwd),
+            session.state_manager.session_cwd(),
+            "fresh conversation's cwd must equal the SM's session_cwd"
+        );
+    }
+
+    /// The resume path falls back to the boot cwd when the saved cwd no
+    /// longer points at a directory (e.g. the user deleted the tree
+    /// between sessions). The session still boots — the user can `/cd`
+    /// to a valid tree at runtime.
+    #[tokio::test]
+    async fn create_session_resume_falls_back_when_saved_cwd_gone() {
+        let gone_tree = tempfile::tempdir().expect("create gone cwd");
+        let gone_path = gone_tree.path().to_path_buf();
+        // Drop the tempdir so the path no longer points at a directory.
+        drop(gone_tree);
+        assert!(!gone_path.is_dir(), "sanity: the gone path is gone");
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let saved = Conversation::new(
+            "stale".into(),
+            "ollama".into(),
+            "llama3".into(),
+            gone_path.to_string_lossy().into_owned(),
+        );
+        let saved_id = saved.id;
+        storage.save(&saved).expect("save conversation");
+
+        let deps = test_deps(ollama_registry(), storage.clone());
+        let session = create_session(&deps, Some(saved_id)).expect("create_session");
+
+        assert_eq!(
+            session.state_manager.session_cwd(),
+            std::env::current_dir().unwrap(),
+            "missing saved cwd must fall back to the boot cwd"
+        );
+    }
 }

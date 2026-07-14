@@ -702,8 +702,11 @@ impl AgentRunner {
         // factory (test harnesses). The active wire identity (provider_name +
         // model) was stamped on the StateManager before run_loop; we read it
         // back so saved conversations carry the right re-activation key.
+        // `cwd` is the SM-owned session cwd (set in `create_session` before
+        // run_loop is spawned; falls back to the Phase 3 seed — process cwd —
+        // for the test-harness bypass path).
         if let Some(ref sm) = state_manager {
-            sm.ensure_boot_conversation(&config_model);
+            sm.ensure_boot_conversation(&sm.session_cwd(), &config_model);
         }
 
         while let Some(action) = action_receiver.recv().await {

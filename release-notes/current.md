@@ -33,3 +33,13 @@ This file is the working draft for the next release. When a version is tagged, t
   again. The empty string is still a valid value (and what the in-memory
   `ConversationManager::create_new` continues to forward, matching its
   historical behaviour).
+- `create_session` now resolves and freezes the per-session `session_cwd`
+  exactly once at construction: resume adopts the saved cwd (must exist and
+  be a directory), fresh mints inherit the boot `current_dir()`. That single
+  value flows into the system prompt (built from it, not from
+  `SessionDeps.system_prompt`), the persisted conversation (so `/load`
+  re-adopts the same tree), the welcome banner, and — via Phase 3 — every
+  path-aware tool. Two web sessions in different directories now stay
+  correct with no process-global cwd mutation. The frozen
+  `SessionDeps.system_prompt` field is now unused in the per-session path
+  and is slated for removal in the next phase.
