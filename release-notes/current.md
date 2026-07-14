@@ -40,6 +40,10 @@ This file is the working draft for the next release. When a version is tagged, t
   `SessionDeps.system_prompt`), the persisted conversation (so `/load`
   re-adopts the same tree), the welcome banner, and — via Phase 3 — every
   path-aware tool. Two web sessions in different directories now stay
-  correct with no process-global cwd mutation. The frozen
-  `SessionDeps.system_prompt` field is now unused in the per-session path
-  and is slated for removal in the next phase.
+  correct with no process-global cwd mutation.
+- The vestigial `SessionDeps.system_prompt` field is removed. The boot-cwd
+  prompt used to live on `SessionDeps` (built once in `main.rs` and reused
+  by every web session); Phase 6 made it dead and now it is gone. The
+  per-session system prompt is built inside `create_session` from the
+  resolved `session_cwd` — the only place the cwd is allowed to flow into
+  the prompt. No behaviour change.

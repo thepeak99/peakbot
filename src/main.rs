@@ -3,8 +3,8 @@
 use anyhow::Result;
 use clap::Parser;
 use peakbot::{
-    Config, FileStorage, ShellKind, SubAgentRegistry, Ui, build_system_prompt,
-    get_config_file_path, load_default_skills, load_mcp_servers, print_no_shell_warning,
+    Config, FileStorage, ShellKind, SubAgentRegistry, Ui, get_config_file_path,
+    load_default_skills, load_mcp_servers, print_no_shell_warning,
 };
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -130,8 +130,6 @@ async fn main() -> Result<()> {
     // told which syntax + shell tool to use (#82). On Windows with no shell
     // found, warn and continue; other tools still work.
     let shell_kind = ShellKind::detect();
-    let boot_cwd = std::env::current_dir().unwrap_or_default();
-    let system_prompt = build_system_prompt(&skills, shell_kind.as_ref(), &boot_cwd);
 
     // Build the model registry. Two paths:
     // - `providers:` list declared → multi-model, `/model` enabled.
@@ -238,7 +236,6 @@ async fn main() -> Result<()> {
     let session_deps = Arc::new(peakbot::SessionDeps {
         config: config.clone(),
         model_registry: model_registry.clone(),
-        system_prompt: system_prompt.clone(),
         skills,
         mcp_handles: mcp_handles_arc.clone(),
         searxng_config,
