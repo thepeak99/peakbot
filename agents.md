@@ -611,14 +611,20 @@ running session on reconnect — transcript, todos, and stats survive. Multiple
 tabs on the same `?convo=` URL share one session and see the same state. A
 session is "active" while a socket-independent live session exists for it
 (registry membership, never persisted); the conversations picker marks active
-rows and can kill one for everyone attached. Idle sessions (no sockets
-attached) are reaped after `web.session_ttl_secs`. The session registry is
-**web-only** — the terminal (`--stdio`, REPL) Views remain single-session. See
-`src/ui/web/registry.rs`.
+rows and can kill one for everyone attached. A session is reaped only once it
+is **fully idle** — no sockets attached, the agent not processing a turn, *and*
+no live `bash_bg` children under it — for `web.session_ttl_secs` (#158). Any of
+those three keeps it live and resets the idle clock, so closing the tab
+mid-turn (or while a long `bash_bg` runs) never reaps the running agent; the
+clock only starts once all three go quiet. The reaper samples the live
+agent/bg signals on each tick — it is not told when a turn starts or ends,
+keeping the registry web-only. The terminal (`--stdio`, REPL) Views remain
+single-session. See `src/ui/web/registry.rs`.
 
 ```yaml
 web:
-  session_ttl_secs: 1800   # kill idle-unattached sessions after 30 min (default)
+  session_ttl_secs: 600    # reap a fully-idle session (no sockets, agent idle,
+                           # no live bash_bg) after 10 min (default)
   reaper_tick_secs: 60     # how often the reaper scans (default)
 ```
 

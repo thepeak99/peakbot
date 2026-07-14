@@ -309,8 +309,10 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WebConfig {
-    /// Kill a session this many seconds after its last socket detaches
-    /// (default: 1800 = 30 min).
+    /// Kill a session this many seconds after it becomes fully idle — no
+    /// sockets attached, the agent not processing a turn, and no live
+    /// `bash_bg` children under it (#158). Any of those three makes the
+    /// session live and resets the clock. (Default: 600 = 10 min.)
     #[serde(default = "default_session_ttl_secs")]
     pub session_ttl_secs: u64,
     /// How often the reaper scans for expired sessions (default: 60 s).
@@ -328,7 +330,7 @@ impl Default for WebConfig {
 }
 
 fn default_session_ttl_secs() -> u64 {
-    1800
+    600
 }
 fn default_reaper_tick_secs() -> u64 {
     60
