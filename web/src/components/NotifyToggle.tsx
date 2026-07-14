@@ -17,7 +17,11 @@ export function NotifyToggle({
   if (permission === "unsupported") return null;
 
   const blocked = permission === "denied";
-  const on = enabled && permission === "granted";
+  // `on` reflects user intent (the click) — not whether the browser has granted
+  // permission yet. The first click on a fresh tab lights the bell even while
+  // the permission prompt is still open; the browser prompt resolves in parallel
+  // and either flips the bell functional or shows the disabled/blocked state.
+  const on = enabled;
   const title = blocked
     ? "Notifications blocked in browser settings"
     : on
