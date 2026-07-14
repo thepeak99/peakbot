@@ -187,19 +187,21 @@ const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 /// `**Shell**:` line to the environment block so the model uses the right
 /// syntax and the right shell tool name. On a PowerShell host this also
 /// overrides the bash-centric guidance baked into the static prompt.
-pub fn build_system_prompt(skills: &SkillRegistry, shell_kind: Option<&ShellKind>) -> String {
+pub fn build_system_prompt(
+    skills: &SkillRegistry,
+    shell_kind: Option<&ShellKind>,
+    cwd: &std::path::Path,
+) -> String {
     let mut prompt = SYSTEM_PROMPT.to_string();
 
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "Unknown".to_string());
+    let cwd_display = cwd.to_string_lossy().to_string();
 
     let current_time = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
 
-    // Load agents.md with case-insensitive filename matching
-    let agents_md_content = std::fs::read_dir(".")
+    // Load agents.md from the session cwd (case-insensitive filename match).
+    let agents_md_content = std::fs::read_dir(cwd)
         .ok()
         .and_then(|entries| {
             entries
@@ -226,7 +228,7 @@ pub fn build_system_prompt(skills: &SkillRegistry, shell_kind: Option<&ShellKind
 
     let env_info = format!(
         "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n- **Operating System**: {}\n- **PeakBot Binary Path**: {}\n{}",
-        cwd,
+        cwd_display,
         current_time,
         PEAKBOT_VERSION,
         os,
@@ -1322,7 +1324,7 @@ impl AgentRunner {
 
         // Rebuild the prompt against the new cwd + refreshed agents.md and
         // persist it into ctx so subsequent /model switches keep the cwd.
-        ctx.system_prompt = build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref());
+        ctx.system_prompt = build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref(), target);
 
         // Refresh the welcome banner's cwd so the status bar / web banner
         // reflect the new directory (welcome was stamped once at boot).
@@ -1562,7 +1564,11 @@ impl AgentRunner {
                     // Kill bg processes rooted in the previous tree, then
                     // refresh the prompt for the restored cwd/agents.md.
                     sm.clear_bg();
-                    ctx.system_prompt = build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref());
+                    ctx.system_prompt = build_system_prompt(
+                        &ctx.skills,
+                        ctx.shell_kind.as_ref(),
+                        std::path::Path::new(&saved_cwd),
+                    );
                     cwd_changed = true;
                 }
             } else {
@@ -2846,7 +2852,7 @@ mod tests {
         let ps = ShellKind::PowerShell {
             path: "pwsh.exe".to_string(),
         };
-        let prompt = build_system_prompt(&skills, Some(&ps));
+        let prompt = build_system_prompt(&skills, Some(&ps), &std::env::current_dir().unwrap());
         assert!(
             prompt.contains("**Shell**: powershell"),
             "PowerShell env line missing from prompt"
@@ -2867,7 +2873,7 @@ mod tests {
         let bash = ShellKind::Bash {
             path: "/bin/sh".to_string(),
         };
-        let prompt = build_system_prompt(&skills, Some(&bash));
+        let prompt = build_system_prompt(&skills, Some(&bash), &std::env::current_dir().unwrap());
         assert!(
             prompt.contains("**Shell**: bash"),
             "bash env line missing from prompt"
@@ -2876,6 +2882,35 @@ mod tests {
             !prompt.contains("PowerShell syntax"),
             "bash host must not carry PowerShell guidance"
         );
+    }
+
+    #[test]
+    fn system_prompt_stamps_passed_cwd_and_reads_its_agents_md() {
+        // A temp dir that is NOT the process cwd, carrying its own agents.md.
+        let dir = std::env::temp_dir().join(format!(
+            "peakbot-prompt-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-CONTENT").unwrap();
+
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, &dir);
+
+        assert!(
+            prompt.contains(&dir.to_string_lossy().to_string()),
+            "env block must stamp the passed cwd, not the process cwd"
+        );
+        assert!(
+            prompt.contains("SENTINEL-AGENTS-CONTENT"),
+            "agents.md must be read from the passed cwd"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

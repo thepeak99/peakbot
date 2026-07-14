@@ -130,7 +130,8 @@ async fn main() -> Result<()> {
     // told which syntax + shell tool to use (#82). On Windows with no shell
     // found, warn and continue; other tools still work.
     let shell_kind = ShellKind::detect();
-    let system_prompt = build_system_prompt(&skills, shell_kind.as_ref());
+    let boot_cwd = std::env::current_dir().unwrap_or_default();
+    let system_prompt = build_system_prompt(&skills, shell_kind.as_ref(), &boot_cwd);
 
     // Build the model registry. Two paths:
     // - `providers:` list declared → multi-model, `/model` enabled.
