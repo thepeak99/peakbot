@@ -91,3 +91,11 @@ This file is the working draft for the next release. When a version is tagged, t
   directory. The runtime has accepted relative paths since the file-tool
   rework and has run shells in the session cwd since the per-session
   wiring landed; this is the moment the prompt and the runtime agree.
+- The notifications bell now lights up the moment you click it. Previously
+  the visual was gated on `enabled && permission === "granted"`, so the
+  first click on a fresh tab (when permission is `"default"` and the
+  browser prompt is still pending) left the bell looking off; if the
+  prompt was dismissed instead of granted, it stayed off forever even
+  though `enabled` was true. Now the bell reflects user intent
+  immediately — the capability layer is communicated in the tooltip /
+  disabled-blocked variant, not in the affordance.
