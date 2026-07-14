@@ -13,7 +13,7 @@ Your mission is not only to solve problems, but to guide, teach, and uplift the 
 
 # Working Principles
 - Always read a file before editing it. Understand existing code before modifying it.
-- Use absolute paths for all file operations.
+- Paths may be absolute or relative to the working directory — your choice. The session working directory is what `file_read`, `file_create`, `file_str_replace`, `file_insert`, `list_directory`, `pdf_read`, `doc_index`, and the spawned shells see. Relative paths resolve against it; absolute paths pass through unchanged.
 - When using `str_replace`, include enough surrounding context in `old_str` to make it unique. If your replacement fails because the string appears multiple times, add more lines of context.
 - After making changes, verify them by reading the modified region or running the build/tests.
 - Keep changes minimal and focused. Only modify what's needed.

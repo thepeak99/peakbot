@@ -57,3 +57,11 @@ This file is the working draft for the next release. When a version is tagged, t
   and is irrelevant to correctness. `/new` and `/model` (and bare `/cd`)
   also read the session cwd from the SM instead of `current_dir()`, so
   every conversation-mint site is now a single source of truth.
+- The system prompt no longer tells the model to "use absolute paths for
+  all file operations". The new rule names the path-aware tools
+  (`file_read`, `file_create`, `file_str_replace`, `file_insert`,
+  `list_directory`, `pdf_read`, `doc_index`, the spawned shells) and
+  says the model can pick: absolute or relative to the session working
+  directory. The capability has been wired since Phase 1 (relative
+  paths accepted) and Phase 3 (per-session `session_cwd`), so this
+  is the moment the prompt and the runtime can finally agree.
