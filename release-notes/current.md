@@ -4,6 +4,15 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Web favicon now reflects agent state.** While the agent is working the
+  favicon is replaced with a small spinning yellow arc (~15 fps, ~16 px)
+  rendered from a canvas and pushed back into `<link rel="icon">`; when the
+  agent goes idle the original `/favicon.svg` is restored. The animation
+  uses `setInterval` and a `useEffect` cleanup so it tears down on unmount
+  and on every toggle — the previous shape leaked a re-scheduling rAF
+  chain on every `isRunning → false` because the captured ID was consumed
+  by the first frame.
+
 - **Loaded conversations now show each message's original timestamp, not the
   load time (#162).** Two symmetric clobbers on the same axis discarded the
   persisted `timestamp`: on load, `sync_from_conversation` dropped it (`..`) and

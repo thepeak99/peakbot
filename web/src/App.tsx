@@ -22,6 +22,7 @@ import { BgPanel } from "./components/BgPanel";
 import { FilesPanel } from "./components/FilesPanel";
 import { useAgent } from "./useAgent";
 import { useTaskNotifications } from "./useTaskNotifications";
+import { useFavicon } from "./useFavicon";
 import {
   adaptBashPanel,
   adaptBg,
@@ -47,14 +48,17 @@ export function App() {
     switchConvo,
   } = useAgent();
 
+  // Swap favicon to a spinning loader while the agent is working
+  const isRunning = state?.is_running ?? false;
+  useFavicon(isRunning);
+
   // Keep the transcript pinned to the newest message.
   const bottomRef = useRef<HTMLDivElement>(null);
   const messageCount = state?.chat.messages.length ?? 0;
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messageCount, state?.is_running]);
+  }, [messageCount, isRunning]);
 
-  const isRunning = state?.is_running ?? false;
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
   const stats = state ? adaptStats(state) : null;
