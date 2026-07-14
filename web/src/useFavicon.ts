@@ -1,32 +1,23 @@
 // Dynamically swap the favicon to a spinning yellow arc while the agent is
 // working, and restore the original icon when idle.
 
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 
 const TICK_MS = 66;
 
 export function useFavicon(isRunning: boolean) {
-  const cancelRef = useRef<(() => void) | null>(null);
-
   useEffect(() => {
-    // Always tear down the previous run before starting a new one.
-    cancelRef.current?.();
-    cancelRef.current = null;
-
-    const setHref = (href: string, type?: string) => {
+    if (!isRunning) {
+      // Replace the single existing <link rel="icon"> in place so the browser
+      // re-reads it and the count never grows across toggles. The HTML
+      // <link rel="icon"> stays the source of truth for the idle href.
+      const existing = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
+      const href = existing?.href ?? "/favicon.svg";
+      existing?.remove();
       const link = document.createElement("link");
       link.rel = "icon";
-      if (type) link.type = type;
       link.href = href;
       document.head.appendChild(link);
-      return link;
-    };
-
-    if (!isRunning) {
-      // Adopt the existing favicon's href if one is already on the page so the
-      // HTML <link rel="icon"> stays the single source of truth.
-      const existing = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
-      setHref(existing?.href ?? "/favicon.svg");
       return;
     }
 
@@ -34,7 +25,10 @@ export function useFavicon(isRunning: boolean) {
     canvas.width = 16;
     canvas.height = 16;
     const ctx = canvas.getContext("2d")!;
-    const link = setHref("", "image/png");
+    const link = document.createElement("link");
+    link.rel = "icon";
+    link.type = "image/png";
+    document.head.appendChild(link);
 
     let angle = 0;
     const id = window.setInterval(() => {
@@ -49,11 +43,11 @@ export function useFavicon(isRunning: boolean) {
       angle = (angle + 0.15) % (Math.PI * 2);
     }, TICK_MS);
 
-    const cancel = () => {
+    // React runs this cleanup before the next effect and on unmount, so the
+    // animated link and its interval are always torn down — no ref needed.
+    return () => {
       clearInterval(id);
       link.remove();
     };
-    cancelRef.current = cancel;
-    return cancel;
   }, [isRunning]);
 }
