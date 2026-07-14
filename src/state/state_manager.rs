@@ -1301,17 +1301,23 @@ impl StateManager {
                 .iter()
                 .map(|msg| match msg {
                     ConvMsg::User {
-                        content, compacted, ..
+                        content,
+                        compacted,
+                        timestamp,
                     } => {
                         let mut m = ChatMessage::user(content.clone());
                         m.compacted = *compacted;
+                        m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
                     ConvMsg::Assistant {
-                        content, compacted, ..
+                        content,
+                        compacted,
+                        timestamp,
                     } => {
                         let mut m = ChatMessage::agent(content.clone());
                         m.compacted = *compacted;
+                        m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
                     ConvMsg::ToolCall {
@@ -1319,10 +1325,11 @@ impl StateManager {
                         arguments,
                         call_id,
                         compacted,
-                        ..
+                        timestamp,
                     } => {
                         let mut m = ChatMessage::tool_call(tool_name, arguments, call_id.clone());
                         m.compacted = *compacted;
+                        m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
                     ConvMsg::ToolResult {
@@ -1331,14 +1338,19 @@ impl StateManager {
                         result,
                         call_id,
                         compacted,
-                        ..
+                        timestamp,
                     } => {
                         let mut m =
                             ChatMessage::tool_result(tool_name, arguments, result, call_id.clone());
                         m.compacted = *compacted;
+                        m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
-                    ConvMsg::Summary { content, .. } => ChatMessage::summary(content.clone()),
+                    ConvMsg::Summary { content, timestamp } => {
+                        let mut m = ChatMessage::summary(content.clone());
+                        m.timestamp = timestamp.with_timezone(&chrono::Local);
+                        m
+                    }
                 })
                 .collect();
 
@@ -1388,12 +1400,12 @@ impl StateManager {
                     MessageRole::User => Some(ConvMsg::User {
                         content: msg.content.clone(),
                         compacted: msg.compacted,
-                        timestamp: chrono::Utc::now(),
+                        timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                     }),
                     MessageRole::Agent => Some(ConvMsg::Assistant {
                         content: msg.content.clone(),
                         compacted: msg.compacted,
-                        timestamp: chrono::Utc::now(),
+                        timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                     }),
                     MessageRole::ToolCall => {
                         let tool_name = msg.tool_name.clone()?;
@@ -1403,7 +1415,7 @@ impl StateManager {
                             arguments,
                             call_id: msg.call_id.clone(),
                             compacted: msg.compacted,
-                            timestamp: chrono::Utc::now(),
+                            timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                         })
                     }
                     MessageRole::ToolResult => {
@@ -1416,12 +1428,12 @@ impl StateManager {
                             result,
                             call_id: msg.call_id.clone(),
                             compacted: msg.compacted,
-                            timestamp: chrono::Utc::now(),
+                            timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                         })
                     }
                     MessageRole::Summary => Some(ConvMsg::Summary {
                         content: msg.content.clone(),
-                        timestamp: chrono::Utc::now(),
+                        timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                     }),
                     MessageRole::System => None,
                 })
@@ -3370,6 +3382,74 @@ mod tests {
             let mut list = sm.todo_list.lock().unwrap();
             let result = list.add("Third task".into());
             assert_eq!(result.id, 3, "next_id must survive roundtrip");
+        }
+    }
+
+    /// Loading a conversation preserves each message's original timestamp
+    /// (converted UTC→Local for display) instead of stamping the load time.
+    /// Also covers the save half: sync_to_conversation must carry the live
+    /// timestamp through rather than clobbering it with Utc::now().
+    #[test]
+    fn sync_preserves_original_message_timestamps() {
+        use crate::conversation::Message as ConvMsg;
+        use chrono::{DateTime, Local, TimeZone, Utc};
+
+        // Two known, distinct times well in the past so they can never be
+        // confused with Local::now() / Utc::now().
+        let t_user: DateTime<Utc> = Utc.with_ymd_and_hms(2021, 3, 4, 8, 15, 0).unwrap();
+        let t_agent: DateTime<Utc> = Utc.with_ymd_and_hms(2021, 3, 4, 8, 16, 30).unwrap();
+
+        // ── Load half ──────────────────────────────────────────────────
+        // Build a conversation whose messages carry the known timestamps.
+        let mut conv =
+            Conversation::new("test".into(), "prov".into(), "model".into(), String::new());
+        conv.messages.push(ConvMsg::User {
+            content: "hello".into(),
+            compacted: false,
+            timestamp: t_user,
+        });
+        conv.messages.push(ConvMsg::Assistant {
+            content: "hi there".into(),
+            compacted: false,
+            timestamp: t_agent,
+        });
+
+        let sm = StateManager::new();
+        *sm.current_conversation.lock().unwrap() = Some(conv);
+        sm.sync_from_conversation();
+
+        let state = sm.get_state();
+        assert_eq!(state.chat.messages.len(), 2);
+        assert_eq!(
+            state.chat.messages[0].timestamp,
+            t_user.with_timezone(&Local),
+            "user message must keep its original timestamp, not the load time"
+        );
+        assert_eq!(
+            state.chat.messages[1].timestamp,
+            t_agent.with_timezone(&Local),
+            "agent message must keep its original timestamp, not the load time"
+        );
+
+        // ── Save half ──────────────────────────────────────────────────
+        // Saving must carry the live ChatMessage timestamp back into the
+        // persisted Message, not overwrite it with the save time.
+        sm.sync_to_conversation();
+        let guard = sm.current_conversation.lock().unwrap();
+        let saved = guard.as_ref().unwrap();
+        match &saved.messages[0] {
+            ConvMsg::User { timestamp, .. } => assert_eq!(
+                *timestamp, t_user,
+                "save must preserve the original timestamp, not stamp Utc::now()"
+            ),
+            other => panic!("expected User, got {other:?}"),
+        }
+        match &saved.messages[1] {
+            ConvMsg::Assistant { timestamp, .. } => assert_eq!(
+                *timestamp, t_agent,
+                "save must preserve the original timestamp, not stamp Utc::now()"
+            ),
+            other => panic!("expected Assistant, got {other:?}"),
         }
     }
 

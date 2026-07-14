@@ -4,6 +4,18 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Loaded conversations now show each message's original timestamp, not the
+  load time (#162).** Two symmetric clobbers on the same axis discarded the
+  persisted `timestamp`: on load, `sync_from_conversation` dropped it (`..`) and
+  the `ChatMessage` constructors stamped `Local::now()`; on save,
+  `sync_to_conversation` overwrote it with a fresh `Utc::now()` (so a long
+  conversation drifted every message forward to the last autosave). Both paths
+  now carry the timestamp through — save converts the live `DateTime<Local>` to
+  UTC for storage, load converts stored UTC back to local for display — so a
+  `/load`ed transcript renders when each message was originally sent. No serde
+  default was added on the persisted `timestamp` fields: a timestamp-less file
+  still fails to deserialize loudly rather than masking a write-side bug.
+
 - **Web sessions now stay alive while the agent is working, and expire only
   when fully idle (#158).** A `peakbot --web` session used to be reaped purely
   on its attached-socket count: closing the tab mid-turn (a long tool round, a
