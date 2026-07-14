@@ -1,6 +1,6 @@
 //! `file_str_replace`: replace exact text in an existing file.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
@@ -9,7 +9,7 @@ use serde_json::json;
 
 use super::{
     FileEditError, MatchLevel, MatchResult, SNIPPET_CONTEXT_LINES, format_lines_numbered,
-    progressive_match, read_file, validate_path_exists, write_file,
+    progressive_match, read_file, resolve_against, validate_path_exists, write_file,
 };
 
 #[derive(Deserialize)]
@@ -20,8 +20,17 @@ pub struct FileStrReplaceArgs {
     replace_all: Option<bool>,
 }
 
+/// Replace-text tool. `session_cwd` is the base for relative path resolution.
 #[derive(Default)]
-pub struct FileStrReplaceTool;
+pub struct FileStrReplaceTool {
+    session_cwd: Option<PathBuf>,
+}
+
+impl FileStrReplaceTool {
+    pub fn new(session_cwd: Option<PathBuf>) -> Self {
+        Self { session_cwd }
+    }
+}
 
 impl Tool for FileStrReplaceTool {
     const NAME: &'static str = "file_str_replace";
@@ -47,7 +56,7 @@ If editing fails, read the file first with `file_read` to get exact content, the
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to the file."
+                        "description": "Path to the file (absolute, or relative to the working directory)."
                     },
                     "old_str": {
                         "type": "string",
@@ -76,8 +85,9 @@ If editing fails, read the file first with `file_read` to get exact content, the
         );
 
         let start_time = std::time::Instant::now();
+        let resolved = resolve_against(self.session_cwd.as_deref(), &args.path);
         let result = run(
-            &args.path,
+            &resolved.to_string_lossy(),
             &args.old_str,
             args.new_str.as_deref(),
             args.replace_all.unwrap_or(false),

@@ -1,13 +1,13 @@
 //! `file_create`: create a new file (fails if it already exists).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{FileEditError, write_file};
+use super::{FileEditError, resolve_against, write_file};
 
 #[derive(Deserialize)]
 pub struct FileCreateArgs {
@@ -15,8 +15,18 @@ pub struct FileCreateArgs {
     file_text: Option<String>,
 }
 
+/// Create-a-file tool. `session_cwd` is the directory relative paths resolve
+/// against; `None` (tests / no state manager) falls back to the process cwd.
 #[derive(Default)]
-pub struct FileCreateTool;
+pub struct FileCreateTool {
+    session_cwd: Option<PathBuf>,
+}
+
+impl FileCreateTool {
+    pub fn new(session_cwd: Option<PathBuf>) -> Self {
+        Self { session_cwd }
+    }
+}
 
 impl Tool for FileCreateTool {
     const NAME: &'static str = "file_create";
@@ -27,10 +37,10 @@ impl Tool for FileCreateTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Create a new file at an absolute path. Fails if the file already exists \
+            description: "Create a new file. Fails if the file already exists \
                 — use `file_str_replace` to edit existing files.\n\n\
 PREFER THIS TOOL OVER BASH for creating files because:\n\
-- Validates the path is absolute up front\n\
+- Path may be absolute or relative to the working directory\n\
 - Auto-creates missing parent directories\n\
 - Safer: refuses to clobber existing files\n\
 - Works across all platforms\n\n\
@@ -43,7 +53,7 @@ and editing it later."
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to the file to create."
+                        "description": "Path to the file to create (absolute, or relative to the working directory)."
                     },
                     "file_text": {
                         "type": "string",
@@ -64,7 +74,8 @@ and editing it later."
         );
 
         let start_time = std::time::Instant::now();
-        let result = run(&args.path, args.file_text.as_deref());
+        let resolved = resolve_against(self.session_cwd.as_deref(), &args.path);
+        let result = run(&resolved.to_string_lossy(), args.file_text.as_deref());
 
         match &result {
             Ok(output) => tracing::info!(
@@ -91,13 +102,6 @@ and editing it later."
 /// Core logic, factored out so the tests can drive it without going through the Rig Tool trait.
 pub(crate) fn run(path: &str, file_text: Option<&str>) -> Result<String, FileEditError> {
     let path = Path::new(path);
-
-    if !path.is_absolute() {
-        return Err(FileEditError::Validation(format!(
-            "Path '{}' is not absolute. Use an absolute path starting with '/'.",
-            path.display()
-        )));
-    }
 
     let (file_text, recommendation) = match file_text {
         None => (String::new(), true),

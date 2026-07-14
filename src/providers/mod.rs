@@ -468,14 +468,19 @@ where
         None => BashBgTool::default(),
     };
 
+    // Path tools resolve relative args against the session cwd. Phase 1 wires
+    // `None` (⇒ process cwd, unchanged behaviour); Phase 3 will source the real
+    // `session_cwd` from the state manager here.
+    let session_cwd: Option<std::path::PathBuf> = None;
+
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
-        gate(Box::new(FileCreateTool)),
-        gate(Box::new(FileStrReplaceTool)),
-        gate(Box::new(FileInsertTool)),
-        gate(Box::new(FileReadTool)),
-        gate(Box::new(PdfReadTool)),
+        gate(Box::new(FileCreateTool::new(session_cwd.clone()))),
+        gate(Box::new(FileStrReplaceTool::new(session_cwd.clone()))),
+        gate(Box::new(FileInsertTool::new(session_cwd.clone()))),
+        gate(Box::new(FileReadTool::new(session_cwd.clone()))),
+        gate(Box::new(PdfReadTool::new(session_cwd.clone()))),
         gate(Box::new(bash_bg_tool)),
-        gate(Box::new(ListDirectoryTool)),
+        gate(Box::new(ListDirectoryTool::new(session_cwd.clone()))),
         gate(Box::new(FetchUrlTool)),
         gate(Box::new(FetchPageTool)),
         gate(Box::new(todo)),
@@ -499,9 +504,9 @@ where
 
     // Conditionally add the vector tools when a store is configured.
     if let Some(store) = vector_store {
-        tools.push(gate(Box::new(crate::tools::DocIndexTool::new(
-            store.clone(),
-        ))));
+        tools.push(gate(Box::new(
+            crate::tools::DocIndexTool::new(store.clone()).with_session_cwd(session_cwd.clone()),
+        )));
         tools.push(gate(Box::new(crate::tools::DocSearchTool::new(
             store.clone(),
         ))));
@@ -1004,12 +1009,12 @@ pub fn create_mock_agent(
     let todo = TodoTool::new(state_manager.clone());
 
     let agent = agent_builder
-        .tool(FileCreateTool)
-        .tool(FileStrReplaceTool)
-        .tool(FileInsertTool)
-        .tool(FileReadTool)
+        .tool(FileCreateTool::default())
+        .tool(FileStrReplaceTool::default())
+        .tool(FileInsertTool::default())
+        .tool(FileReadTool::default())
         .tool(bash_tool)
-        .tool(ListDirectoryTool)
+        .tool(ListDirectoryTool::default())
         .tool(FetchUrlTool)
         .tool(FetchPageTool)
         .tool(ThinkTool)
