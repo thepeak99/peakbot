@@ -9,6 +9,8 @@ use serde::Deserialize;
 
 use crate::vector::{IndexOutcome, IndexReport, VectorStore, VectorStoreError, is_supported};
 
+use crate::tools::file_edit::resolve_against;
+
 #[derive(Debug, Deserialize)]
 pub struct DocIndexArgs {
     /// File or directory to index.
@@ -31,15 +33,26 @@ pub enum DocIndexError {
     Store(#[from] VectorStoreError),
 }
 
-/// Indexing tool over the shared vector store.
+/// Indexing tool over the shared vector store. `session_cwd` is the base for
+/// relative path resolution; the default empty path leaves relatives anchored
+/// at the process cwd (tests).
 #[derive(Clone)]
 pub struct DocIndexTool {
     store: VectorStore,
+    session_cwd: PathBuf,
 }
 
 impl DocIndexTool {
     pub fn new(store: VectorStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            session_cwd: PathBuf::new(),
+        }
+    }
+
+    pub fn with_session_cwd(mut self, session_cwd: PathBuf) -> Self {
+        self.session_cwd = session_cwd;
+        self
     }
 }
 
@@ -62,7 +75,7 @@ impl Tool for DocIndexTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to the file or directory to index."
+                        "description": "Path to the file or directory to index (absolute, or relative to the working directory)."
                     },
                     "recursive": {
                         "type": "boolean",
@@ -81,7 +94,7 @@ impl Tool for DocIndexTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let root = PathBuf::from(&args.path);
+        let root = resolve_against(&self.session_cwd, &args.path);
         if !root.exists() {
             return Err(DocIndexError::NotFound(args.path));
         }
@@ -178,5 +191,53 @@ mod tests {
 
         let deep = collect_files(dir.path(), true);
         assert_eq!(deep.len(), 2);
+    }
+
+    // A relative `path` resolves against the injected session_cwd. Uses an
+    // *unsupported* extension so `call()` completes without ever hitting the
+    // embeddings endpoint (no network) — the resolution is what's under test.
+    #[tokio::test]
+    async fn resolves_relative_against_session_cwd() {
+        use crate::config::{EmbeddingsConfig, VectorDbConfig};
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let session_dir = tempfile::tempdir().unwrap();
+        // An unsupported file living under the session dir.
+        std::fs::write(session_dir.path().join("probe.unsupported"), "x").unwrap();
+
+        let config = VectorDbConfig {
+            enabled: true,
+            db_path: db_dir.path().join("v.db").display().to_string(),
+            embeddings: EmbeddingsConfig {
+                base_url: "http://unused.invalid".into(),
+                api_key: None,
+                model: "test".into(),
+                dimensions: 3,
+            },
+        };
+        let store = VectorStore::open(&config).unwrap();
+        let tool = DocIndexTool::new(store).with_session_cwd(session_dir.path().to_path_buf());
+
+        // Relative path — must resolve under session_dir and be found.
+        let args: DocIndexArgs = serde_json::from_value(serde_json::json!({
+            "path": "probe.unsupported"
+        }))
+        .unwrap();
+        let out = tool
+            .call(args)
+            .await
+            .expect("relative path should resolve + be found");
+        assert!(out.contains("1 unsupported"), "got: {out}");
+
+        // A relative path that does NOT exist under session_dir is NotFound —
+        // proving resolution is anchored to session_cwd, not the process cwd.
+        let missing: DocIndexArgs = serde_json::from_value(serde_json::json!({
+            "path": "nope.unsupported"
+        }))
+        .unwrap();
+        assert!(matches!(
+            tool.call(missing).await,
+            Err(DocIndexError::NotFound(_))
+        ));
     }
 }

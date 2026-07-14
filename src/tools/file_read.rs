@@ -1,9 +1,10 @@
+use crate::tools::file_edit::resolve_against;
 use crate::utils::strings::truncate_with_suffix;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::Path;
+use std::path::PathBuf;
 
 const MAX_OUTPUT_CHARS: usize = 50_000;
 const TRUNCATION_NOTICE: &str =
@@ -24,8 +25,20 @@ pub struct FileReadArgs {
     end_line: Option<usize>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct FileReadTool;
+/// Read-a-file tool. `session_cwd` is the base for relative path resolution;
+/// the `Default` empty path leaves relatives anchored at the process cwd
+/// (tests / no state manager).
+#[derive(Serialize, Deserialize, Default)]
+pub struct FileReadTool {
+    #[serde(skip)]
+    session_cwd: PathBuf,
+}
+
+impl FileReadTool {
+    pub fn new(session_cwd: PathBuf) -> Self {
+        Self { session_cwd }
+    }
+}
 
 impl Tool for FileReadTool {
     const NAME: &'static str = "file_read";
@@ -43,7 +56,7 @@ impl Tool for FileReadTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to the file to read"
+                        "description": "Path to the file to read (absolute, or relative to the working directory)"
                     },
                     "start_line": {
                         "type": "integer",
@@ -71,14 +84,9 @@ impl Tool for FileReadTool {
         );
 
         let start_time = std::time::Instant::now();
-        let path = Path::new(&args.path);
+        let path = resolve_against(&self.session_cwd, &args.path);
+        let path = path.as_path();
 
-        if !path.is_absolute() {
-            return Err(FileReadError::Validation(format!(
-                "Path '{}' is not absolute. Use an absolute path starting with '/'.",
-                args.path
-            )));
-        }
         if !path.exists() {
             return Err(FileReadError::Validation(format!(
                 "File '{}' does not exist.",
@@ -142,5 +150,46 @@ fn maybe_truncate(s: &str) -> String {
         truncate_with_suffix(s, MAX_OUTPUT_CHARS, TRUNCATION_NOTICE)
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // A relative path resolves against the injected session_cwd, NOT the
+    // process cwd — the core Phase-1 guarantee.
+    #[tokio::test]
+    async fn resolves_relative_against_session_cwd() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), "hello from session dir").unwrap();
+
+        let tool = FileReadTool::new(dir.path().to_path_buf());
+        let args: FileReadArgs = serde_json::from_value(serde_json::json!({
+            "path": "note.txt"
+        }))
+        .unwrap();
+
+        let out = tool.call(args).await.expect("relative read should resolve");
+        assert!(out.contains("hello from session dir"), "got: {out}");
+    }
+
+    // With the default empty base, a relative path resolves against the
+    // process cwd (std default) — the test/no-state-manager fallback.
+    #[tokio::test]
+    async fn default_base_uses_process_cwd() {
+        let tool = FileReadTool::default();
+        let args: FileReadArgs = serde_json::from_value(serde_json::json!({
+            "path": "definitely-not-a-real-file-xyz.txt"
+        }))
+        .unwrap();
+        // Resolves against the process cwd and simply doesn't exist — proves
+        // no "not absolute" rejection fires anymore.
+        let err = tool.call(args).await.unwrap_err();
+        assert!(
+            matches!(err, FileReadError::Validation(ref m) if m.contains("does not exist")),
+            "expected does-not-exist, got: {err}"
+        );
     }
 }

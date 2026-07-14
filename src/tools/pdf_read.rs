@@ -1,9 +1,10 @@
+use crate::tools::file_edit::resolve_against;
 use crate::utils::strings::truncate_with_suffix;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::Path;
+use std::path::PathBuf;
 
 const MAX_OUTPUT_CHARS: usize = 50_000;
 const TRUNCATION_NOTICE: &str =
@@ -38,8 +39,20 @@ pub struct PdfReadArgs {
     format: Format,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct PdfReadTool;
+/// PDF-read tool. `session_cwd` is the base for relative path resolution;
+/// the `Default` empty path leaves relatives anchored at the process cwd
+/// (tests / no state manager).
+#[derive(Serialize, Deserialize, Default)]
+pub struct PdfReadTool {
+    #[serde(skip)]
+    session_cwd: PathBuf,
+}
+
+impl PdfReadTool {
+    pub fn new(session_cwd: PathBuf) -> Self {
+        Self { session_cwd }
+    }
+}
 
 impl Tool for PdfReadTool {
     const NAME: &'static str = "pdf_read";
@@ -60,7 +73,7 @@ impl Tool for PdfReadTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to the PDF file to read"
+                        "description": "Path to the PDF file to read (absolute, or relative to the working directory)"
                     },
                     "start_page": {
                         "type": "integer",
@@ -92,14 +105,9 @@ impl Tool for PdfReadTool {
         );
 
         let start_time = std::time::Instant::now();
-        let path = Path::new(&args.path);
+        let resolved = resolve_against(&self.session_cwd, &args.path);
+        let path = resolved.as_path();
 
-        if !path.is_absolute() {
-            return Err(PdfReadError::Validation(format!(
-                "Path '{}' is not absolute. Use an absolute path starting with '/'.",
-                args.path
-            )));
-        }
         if !path.exists() {
             return Err(PdfReadError::Validation(format!(
                 "File '{}' does not exist.",
@@ -196,7 +204,7 @@ trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n401\n%%EOF\n";
     }
 
     async fn run(args: PdfReadArgs) -> Result<String, PdfReadError> {
-        PdfReadTool.call(args).await
+        PdfReadTool::default().call(args).await
     }
 
     #[tokio::test]

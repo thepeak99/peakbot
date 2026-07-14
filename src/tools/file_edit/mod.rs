@@ -5,7 +5,7 @@
 //! state, no undo stack: the previous `undo_edit` capability was
 //! writer-only dead code and was removed in the split refactor.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod create;
 mod insert;
@@ -16,6 +16,19 @@ pub use insert::FileInsertTool;
 pub use str_replace::FileStrReplaceTool;
 
 pub(crate) const SNIPPET_CONTEXT_LINES: usize = 4;
+
+/// Resolve a raw path argument against the session base directory.
+///
+/// Absolute paths pass through untouched; a relative path is joined onto
+/// `base` (the session cwd). No `canonicalize`: plain `join`, no symlink
+/// rewriting.
+pub fn resolve_against(base: &Path, raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    base.join(p)
+}
 
 /// Level of matching that was used to find the text
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,12 +77,6 @@ pub enum FileEditError {
 // ── IO helpers ────────────────────────────────────────────────────────
 
 pub(crate) fn validate_path_exists(path: &Path) -> Result<(), FileEditError> {
-    if !path.is_absolute() {
-        return Err(FileEditError::Validation(format!(
-            "Path '{}' is not absolute. Use an absolute path starting with '/'.",
-            path.display()
-        )));
-    }
     if !path.exists() {
         return Err(FileEditError::Validation(format!(
             "Path '{}' does not exist.",
@@ -272,6 +279,26 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    // ── resolve_against ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_absolute_passes_through() {
+        let base = Path::new("/session/dir");
+        assert_eq!(
+            resolve_against(base, "/etc/hosts"),
+            PathBuf::from("/etc/hosts")
+        );
+    }
+
+    #[test]
+    fn resolve_relative_joins_base() {
+        let base = Path::new("/session/dir");
+        assert_eq!(
+            resolve_against(base, "sub/file.txt"),
+            PathBuf::from("/session/dir/sub/file.txt")
+        );
+    }
+
     // ── create ─────────────────────────────────────────────────────────
 
     #[test]
@@ -286,12 +313,15 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_relative_path() {
-        let err = create::run("relative.txt", Some("x")).unwrap_err();
-        assert!(
-            matches!(err, FileEditError::Validation(ref msg) if msg.contains("not absolute")),
-            "expected validation error about absolute path, got: {err}"
-        );
+    fn create_allows_relative_path() {
+        // Relative paths are now legal — the "not absolute" rejection is gone.
+        // Resolution against the session cwd happens at the `call()` boundary;
+        // `run()` itself is path-agnostic. Driven here with an absolute temp
+        // path so the test is hermetic; the point is no rejection fires.
+        let dir = tempdir().unwrap();
+        let abs = dir.path().join("relative-create-probe.txt");
+        create::run(abs.to_str().unwrap(), Some("x")).expect("relative paths are allowed now");
+        assert_eq!(std::fs::read_to_string(&abs).unwrap(), "x");
     }
 
     #[test]

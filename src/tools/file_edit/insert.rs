@@ -1,6 +1,6 @@
 //! `file_insert`: insert text at a specific line in an existing file.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
@@ -8,8 +8,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{
-    FileEditError, SNIPPET_CONTEXT_LINES, format_lines_numbered, read_file, validate_path_exists,
-    write_file,
+    FileEditError, SNIPPET_CONTEXT_LINES, format_lines_numbered, read_file, resolve_against,
+    validate_path_exists, write_file,
 };
 
 #[derive(Deserialize)]
@@ -19,8 +19,17 @@ pub struct FileInsertArgs {
     insert_text: String,
 }
 
+/// Insert-at-line tool. `session_cwd` is the base for relative path resolution.
 #[derive(Default)]
-pub struct FileInsertTool;
+pub struct FileInsertTool {
+    session_cwd: PathBuf,
+}
+
+impl FileInsertTool {
+    pub fn new(session_cwd: PathBuf) -> Self {
+        Self { session_cwd }
+    }
+}
 
 impl Tool for FileInsertTool {
     const NAME: &'static str = "file_insert";
@@ -44,7 +53,7 @@ after line N. Returns an error if `insert_line` exceeds the file's line count."
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to the file."
+                        "description": "Path to the file (absolute, or relative to the working directory)."
                     },
                     "insert_line": {
                         "type": "integer",
@@ -70,7 +79,12 @@ after line N. Returns an error if `insert_line` exceeds the file's line count."
         );
 
         let start_time = std::time::Instant::now();
-        let result = run(&args.path, args.insert_line, &args.insert_text);
+        let resolved = resolve_against(&self.session_cwd, &args.path);
+        let result = run(
+            &resolved.to_string_lossy(),
+            args.insert_line,
+            &args.insert_text,
+        );
 
         match &result {
             Ok(output) => tracing::info!(
