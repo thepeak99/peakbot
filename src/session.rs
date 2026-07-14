@@ -90,13 +90,13 @@ pub struct Session {
 /// per-session `TodoTool`, `create_provider`, `AgentRunner::new` +
 /// `with_rebuild_context`, welcome state, then `tokio::spawn(run_loop)`.
 ///
-/// ## Per-session cwd (Phase 6)
+/// ## Per-session cwd
 ///
 /// This is the **single point** that resolves the per-session `session_cwd`
 /// and threads it into the system prompt, the persisted conversation, the
-/// welcome banner, and (via Phase 3's wiring) every path-aware tool. Resume
-/// adopts the saved cwd (Phase 5 persisted it 1:1); fresh sessions inherit
-/// the boot `current_dir()`. Order matters:
+/// welcome banner, and every path-aware tool. Resume adopts the saved
+/// cwd (it was persisted on the conversation at mint time); fresh
+/// sessions inherit the boot `current_dir()`. Order matters:
 /// 1. resolve `session_cwd`,
 /// 2. `state_manager.set_session_cwd(...)` *before* `create_provider` —
 ///    `add_builtin_tools` snapshots it at agent-build time,
@@ -158,7 +158,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         Some(all)
     };
 
-    // ── Per-session cwd (Phase 6) ──────────────────────────────────────────
+    // ── Per-session cwd ──────────────────────────────────────────────────────
     // Resume adopts the saved cwd iff it's non-empty and still points at a
     // directory. Anything else (no resume, no storage, missing/empty
     // cwd, gone directory) falls through to the boot cwd. A gone cwd is
@@ -177,8 +177,8 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         None => boot_cwd,
     };
 
-    // Stamp the SM *before* create_provider so the tools (Phase 3) snapshot
-    // the per-session value at agent-build time. A `set_session_cwd` after
+    // Stamp the SM *before* create_provider so the tools snapshot the
+    // per-session value at agent-build time. A `set_session_cwd` after
     // build would not reach the already-built tools.
     state_manager.set_session_cwd(session_cwd.clone());
 
@@ -238,8 +238,8 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // `RebuildContext.system_prompt` is the per-session prompt (built from
     // `session_cwd` above). A later `/model` rebuild will hand the same
     // prompt to `create_provider`, so the cwd survives the model switch.
-    // Phase 8's `/cd` rebuild will overwrite this with a fresh prompt
-    // built from the new cwd.
+    // A `/cd` rebuild overwrites this with a fresh prompt built from the
+    // new cwd.
     let rebuild_ctx = RebuildContext {
         registry: deps.model_registry.clone(),
         system_prompt: session_prompt,
@@ -306,10 +306,10 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
 mod tests {
     //! Integration tests for `create_session`'s per-session cwd flow.
     //!
-    //! Phase 6 — the session's cwd is the single source of truth that flows
-    //! into the system prompt, the persisted conversation, the welcome
-    //! banner, and (via Phase 3) the tools. These tests pin the two
-    //! observable surfaces that the bug-fix has to protect:
+    //! The session's cwd is the single source of truth that flows into
+    //! the system prompt, the persisted conversation, the welcome
+    //! banner, and every path-aware tool. These tests pin the two
+    //! observable surfaces that the contract has to protect:
     //!
     //! - `state_manager.session_cwd()` on the resume path reflects the saved
     //!   cwd, not the boot cwd.

@@ -11,7 +11,7 @@ mod context_tests;
 mod e2e_tests;
 mod event_tests;
 mod message_roundtrip;
-mod paths_phase8_no_set_current_dir;
+mod no_set_current_dir;
 mod persistence_tests;
 mod powershell_tests;
 mod queued_input_tests;

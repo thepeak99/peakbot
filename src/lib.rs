@@ -703,8 +703,8 @@ impl AgentRunner {
         // model) was stamped on the StateManager before run_loop; we read it
         // back so saved conversations carry the right re-activation key.
         // `cwd` is the SM-owned session cwd (set in `create_session` before
-        // run_loop is spawned; falls back to the Phase 3 seed — process cwd —
-        // for the test-harness bypass path).
+        // run_loop is spawned; for the test-harness bypass path the SM
+        // seeds it from `current_dir()` at construction).
         if let Some(ref sm) = state_manager {
             sm.ensure_boot_conversation(&sm.session_cwd(), &config_model);
         }
@@ -1264,7 +1264,7 @@ impl AgentRunner {
     /// The cwd sibling of [`Self::handle_switch_model`] — same reset +
     /// rebuild seam, different axis.
     ///
-    /// Sequence (order matters — see `make-paths-great-again.md`):
+    /// Sequence (order matters):
     /// 1. `clear_bg()` first, so no `bash_bg` reader thread straddles the
     ///    session-cwd flip with a half-old, half-new view of the tree.
     /// 2. `state_manager.set_session_cwd(target)` — the load-bearing act.
@@ -1277,7 +1277,8 @@ impl AgentRunner {
     ///    cwd (the two axes are independent — ticket #124).
     /// 4. Rebuild the agent on the *current* model, then reset the
     ///    conversation like `/new`. Tools snapshot the new
-    ///    `session_cwd` at agent-build time (Phase 3 wiring).
+    ///    `session_cwd` at agent-build time, so the rebuild order is
+    ///    `set_session_cwd` first, rebuild second.
     ///
     /// The View pre-validated `path`; we re-validate defensively (config
     /// or the filesystem may have changed under us).
@@ -1325,10 +1326,9 @@ impl AgentRunner {
         sm.clear_bg();
 
         // The load-bearing act. Per-session only — no `set_current_dir`,
-        // so two web sessions in different trees stay race-free
-        // (make-paths-great-again §4). Must run BEFORE the agent
-        // rebuild below, because `add_builtin_tools` snapshots
-        // `sm.session_cwd()` at build time.
+        // so two web sessions in different trees stay race-free. Must run
+        // BEFORE the agent rebuild below, because `add_builtin_tools`
+        // snapshots `sm.session_cwd()` at build time.
         sm.set_session_cwd(target.to_path_buf());
 
         // Rebuild the prompt against the new cwd + refreshed agents.md and
@@ -1561,8 +1561,8 @@ impl AgentRunner {
         // files default to ""), still exists, and actually differs from the
         // current session cwd. The comparison is against `sm.session_cwd()`
         // (the per-session source of truth), not the process-global cwd —
-        // rule 4 of make-paths-great-again. A gone path is warned about,
-        // not fatal — the load already succeeded.
+        // every change is per-session. A gone path is warned about, not
+        // fatal — the load already succeeded.
         let current_session_cwd = sm.session_cwd();
         let mut cwd_changed = false;
         if !saved_cwd.is_empty() {
@@ -1588,9 +1588,9 @@ impl AgentRunner {
                 ));
             }
         }
-        // An empty `saved_cwd` (pre-Phase-5 sentinel) keeps the SM's
-        // current session_cwd — it is the authoritative value for that
-        // conversation.
+        // An empty `saved_cwd` (from a pre-cwd conversation file) keeps
+        // the SM's current session_cwd — it is the authoritative value
+        // for that conversation.
 
         // Nothing to rebuild if neither axis moved.
         if !wire_id_changed && !cwd_changed {
@@ -2416,7 +2416,7 @@ impl AgentRunner {
                 // Bare /cd — print the session's working directory for
                 // orientation. Pure read; works in every View. Use the
                 // per-session cwd, not the process-global — the two can
-                // differ in web sessions after `/cd` (rule 4).
+                // differ in web sessions after `/cd`.
                 if let Some(sm) = state_manager {
                     sm.add_system_message(sm.session_cwd().to_string_lossy().into_owned());
                 }

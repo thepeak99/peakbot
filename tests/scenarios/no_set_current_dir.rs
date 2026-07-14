@@ -1,9 +1,8 @@
-//! Rule 4 lock for `make-paths-great-again`: the process-global cwd is
-//! never mutated anywhere in `src/`. The session cwd is per-session
-//! (held by `StateManager.session_cwd`); the shell tools spawn each call
-//! with `cmd.cwd(session_cwd)`. `set_current_dir` is a forbidden
-//! process-global mutation that would race concurrent web sessions
-//! sharing one process.
+//! The process-global cwd is never mutated anywhere in `src/`. The
+//! session cwd is per-session (held by `StateManager.session_cwd`); the
+//! shell tools spawn each call with `cmd.cwd(session_cwd)`.
+//! `set_current_dir` is a forbidden process-global mutation that would
+//! race concurrent web sessions sharing one process.
 //!
 //! If you legitimately need to chdir a child process, use
 //! `std::process::Command::current_dir(...)` — that's the right
@@ -17,8 +16,8 @@ use std::path::Path;
 const FORBIDDEN: &str = "set_current_dir";
 
 /// Walks `src/` and counts non-comment, non-doc occurrences of
-/// `set_current_dir`. The call site must be **zero** — any nonzero
-/// count is a rule-4 violation.
+/// `set_current_dir`. The call site count must be **zero** — any
+/// nonzero count is a violation of the per-session-only cwd rule.
 ///
 /// Comment/doc mentions are filtered by inspecting the line content:
 /// only Rust comments and the doc-comment markers `///` and `//` are
@@ -52,8 +51,8 @@ fn no_set_current_dir_in_src() {
     });
     assert!(
         offenders.is_empty(),
-        "rule 4 of make-paths-great-again: zero `set_current_dir` calls \
-         in src/. Offending lines:\n  {}",
+        "process-global cwd is forbidden in src/ — every cwd change \
+         must go through `state_manager.session_cwd`. Offending lines:\n  {}",
         offenders.join("\n  ")
     );
 }

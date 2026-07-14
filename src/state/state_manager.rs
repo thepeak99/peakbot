@@ -2415,8 +2415,8 @@ mod tests {
         assert_eq!(sm.session_cwd(), target);
     }
 
-    /// Phase 8 contract for `/cd` and `/load` at the SM level. The handlers
-    /// mutate `sm.session_cwd` and persist a new `cwd` on the freshly-minted
+    /// Contract for `/cd` and `/load` at the SM level. The handlers mutate
+    /// `sm.session_cwd` and persist a new `cwd` on the freshly-minted
     /// conversation — *without* touching the process-global cwd. This test
     /// exercises the same SM-level operations the handlers do and asserts
     /// (a) the SM's `session_cwd` reflects the new value, (b) the new
@@ -2709,9 +2709,9 @@ mod tests {
     }
 
     /// `create_conversation` persists the caller-supplied cwd argument
-    /// (Phase 5 — `cwd` is now an explicit constructor parameter, not
-    /// an implicit `std::env::current_dir()` read). The persisted value
-    /// is the exact string passed in, not whatever the process cwd is.
+    /// (`cwd` is an explicit constructor parameter, not an implicit
+    /// `std::env::current_dir()` read). The persisted value is the exact
+    /// string passed in, not whatever the process cwd is.
     #[test]
     fn create_conversation_persists_explicit_cwd() {
         let sm = StateManager::new_arc();
