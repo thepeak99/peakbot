@@ -18,3 +18,9 @@ This file is the working draft for the next release. When a version is tagged, t
   state manager) rather than read from the process environment at each tool
   build. No behaviour change yet — this wiring lets a later change vary the
   directory per session without touching the process-global cwd.
+- The system prompt now takes the working directory explicitly instead of
+  reading the process environment. The `# Environment Information → Current
+  Working Directory` line and the `agents.md` lookup are now governed by one
+  passed directory (previously they agreed only because both read the process
+  cwd). No behaviour change — every call site passes the same directory the
+  process was in.
