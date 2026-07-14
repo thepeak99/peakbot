@@ -1041,7 +1041,13 @@ impl StateManager {
     /// is current. Idempotent — a no-op once a conversation exists, so a
     /// pre-created (or resumed) session suppresses it. `model_fallback`
     /// covers callers that never stamped a model (test harnesses).
-    pub fn ensure_boot_conversation(&self, model_fallback: &str) {
+    ///
+    /// `cwd` is the per-session `session_cwd` the caller has already
+    /// resolved (resume → saved cwd, or boot cwd). It is persisted into
+    /// the conversation 1:1 — `/load` re-applies it on the next session.
+    /// Mandatory `&Path` (no `Option`): the caller's job to know the
+    /// session's cwd by the time this fires.
+    pub fn ensure_boot_conversation(&self, cwd: &std::path::Path, model_fallback: &str) {
         if self.has_current_conversation() {
             return;
         }
@@ -1058,10 +1064,12 @@ impl StateManager {
                 m
             }
         };
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.create_conversation(name, provider_name, model, cwd);
+        self.create_conversation(
+            name,
+            provider_name,
+            model,
+            cwd.to_string_lossy().into_owned(),
+        );
     }
 
     /// List all saved conversations
@@ -1110,6 +1118,20 @@ impl StateManager {
             .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
         let conv = storage.load(id)?;
         Ok((conv.provider_name, conv.model))
+    }
+
+    /// Peek at a saved conversation's persisted `cwd` without loading
+    /// it. Used by `create_session` to resolve the per-session
+    /// `session_cwd` on the resume path — the conversation is loaded
+    /// only *after* the agent is built, so tools snapshot the right
+    /// value. Pre-cwd files return `""`; the caller treats that as
+    /// "no saved cwd" and falls back to the boot cwd.
+    pub fn peek_conversation_cwd(&self, id: Uuid) -> anyhow::Result<String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
+        Ok(storage.load(id)?.cwd)
     }
 
     /// Get the current conversation ID
@@ -2391,6 +2413,69 @@ mod tests {
         assert_eq!(sm.session_cwd(), target);
     }
 
+    /// `peek_conversation_cwd` returns the saved cwd without loading the
+    /// conversation. The current slot stays untouched — important because
+    /// `create_session` calls this on the resume path *before* building the
+    /// agent, and a partial-state teardown there would be a real desync.
+    #[test]
+    fn test_peek_conversation_cwd_returns_saved_cwd() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let saved = Conversation::new(
+            "peeking".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            "/saved/cwd/from/conversation".into(),
+        );
+        let id = saved.id;
+        storage.save(&saved).unwrap();
+
+        // No current conversation yet — peek must still succeed.
+        assert!(!sm.has_current_conversation());
+        assert_eq!(
+            sm.peek_conversation_cwd(id).unwrap(),
+            "/saved/cwd/from/conversation"
+        );
+        assert!(
+            !sm.has_current_conversation(),
+            "peek must not load the conversation"
+        );
+    }
+
+    /// `peek_conversation_cwd` is an Err (not a panic) when storage is
+    /// disabled — the caller falls back to the boot cwd.
+    #[test]
+    fn test_peek_conversation_cwd_no_storage_errors() {
+        let sm = StateManager::new();
+        let bogus = Uuid::new_v4();
+        assert!(sm.peek_conversation_cwd(bogus).is_err());
+    }
+
+    /// Pre-cwd files persist `cwd = ""`. `peek_conversation_cwd` returns
+    /// that empty string verbatim — the caller (`create_session`) treats
+    /// it as "no saved cwd" and falls back to the boot cwd.
+    #[test]
+    fn test_peek_conversation_cwd_returns_empty_for_pre_cwd_files() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let pre_cwd = Conversation::new(
+            "legacy".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(), // pre-cwd file
+        );
+        let id = pre_cwd.id;
+        storage.save(&pre_cwd).unwrap();
+
+        assert_eq!(sm.peek_conversation_cwd(id).unwrap(), "");
+    }
+
     #[test]
     fn test_reset_conversation_state_clears_all_surfaces() {
         let sm = StateManager::new();
@@ -2519,7 +2604,8 @@ mod tests {
     }
 
     /// `ensure_boot_conversation` mints exactly one conversation from the
-    /// stamped wire identity when none exists.
+    /// stamped wire identity when none exists. The caller-supplied cwd is
+    /// persisted verbatim — no internal `current_dir()` read.
     #[test]
     fn ensure_boot_conversation_mints_from_wire_identity() {
         let sm = StateManager::new_arc();
@@ -2527,11 +2613,12 @@ mod tests {
         sm.set_model("anthropic/claude-3.7-sonnet".into());
         assert!(!sm.has_current_conversation());
 
-        sm.ensure_boot_conversation("fallback-model");
+        sm.ensure_boot_conversation(std::path::Path::new("/caller/passed/cwd"), "fallback-model");
 
         let conv = sm.get_current_conversation().expect("minted");
         assert_eq!(conv.provider_name, "openrouter");
         assert_eq!(conv.model, "anthropic/claude-3.7-sonnet");
+        assert_eq!(conv.cwd, "/caller/passed/cwd");
     }
 
     /// Idempotent: a second call does not replace an existing conversation
@@ -2540,15 +2627,17 @@ mod tests {
     fn ensure_boot_conversation_is_idempotent() {
         let sm = StateManager::new_arc();
         sm.set_model("m".into());
-        sm.ensure_boot_conversation("fallback");
+        sm.ensure_boot_conversation(std::path::Path::new("/first/cwd"), "fallback");
         let id = sm.get_current_conversation_id().expect("first mint");
 
-        sm.ensure_boot_conversation("fallback");
+        sm.ensure_boot_conversation(std::path::Path::new("/second/cwd"), "fallback");
         assert_eq!(
             sm.get_current_conversation_id(),
             Some(id),
             "second call must not mint a new conversation"
         );
+        // The second call's cwd must not have replaced the first.
+        assert_eq!(sm.get_current_conversation().unwrap().cwd, "/first/cwd");
     }
 
     /// The fallback model is used only when no model was stamped (harness path).
@@ -2556,7 +2645,7 @@ mod tests {
     fn ensure_boot_conversation_uses_fallback_when_model_empty() {
         let sm = StateManager::new_arc();
         // No set_model → get_model() is empty → fallback applies.
-        sm.ensure_boot_conversation("fallback-model");
+        sm.ensure_boot_conversation(std::path::Path::new("/cwd"), "fallback-model");
         assert_eq!(
             sm.get_current_conversation().expect("minted").model,
             "fallback-model"
