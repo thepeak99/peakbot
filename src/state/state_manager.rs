@@ -77,6 +77,14 @@ pub struct StateManager {
     /// Injected by `main.rs` after shell detection. Empty until set.
     shell: RwLock<String>,
 
+    // ── Per-session working directory ─────────────────────────────────────────
+    /// The directory every path-aware tool resolves against and every shell
+    /// spawns in. Single source of truth for the session's cwd — never mutated
+    /// process-globally (no `set_current_dir`). Changed only at session
+    /// boundaries (construction, `/cd`, `/load`), after which the agent is
+    /// rebuilt so its tools re-snapshot this value.
+    session_cwd: RwLock<std::path::PathBuf>,
+
     // ── Rendering Coalescence ─────────────────────────────────────────────────
     /// Monotonic counter for render coalescence — see `slow-messages.md` §4.4.
     revision: AtomicU64,
@@ -117,6 +125,7 @@ impl StateManager {
             bg_notify_tx: RwLock::new(None),
             bash_stdin_tx: RwLock::new(None),
             shell: RwLock::new(String::new()),
+            session_cwd: RwLock::new(std::env::current_dir().unwrap_or_default()),
             revision: AtomicU64::new(0),
         }
     }
@@ -1794,6 +1803,21 @@ impl StateManager {
         *guard = shell;
     }
 
+    /// The session's working directory — the single source of truth that
+    /// path-aware tools resolve against and shells spawn in. Cloned per read
+    /// (tools snapshot it at agent-build time; reads are rare).
+    pub fn session_cwd(&self) -> std::path::PathBuf {
+        self.session_cwd.read().unwrap().clone()
+    }
+
+    /// Replace the session's working directory. Called only at session
+    /// boundaries (construction, `/cd`, `/load`); the caller rebuilds the
+    /// agent afterwards so its tools re-snapshot the new value. Never mutates
+    /// the process-global cwd.
+    pub fn set_session_cwd(&self, cwd: std::path::PathBuf) {
+        *self.session_cwd.write().unwrap() = cwd;
+    }
+
     /// Spawn a new background process. Returns the [`BgListEntry`] for
     /// the freshly-registered process (id, pid, etc.) so callers can
     /// surface it to the model immediately.
@@ -2337,6 +2361,20 @@ mod tests {
         sm.update_welcome_cwd(std::path::PathBuf::from("/new/dir"));
         let w = sm.get_state().welcome.expect("welcome set");
         assert_eq!(w.cwd, std::path::PathBuf::from("/new/dir"));
+    }
+
+    #[test]
+    fn test_session_cwd_defaults_to_process_cwd() {
+        let sm = StateManager::new();
+        assert_eq!(sm.session_cwd(), std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn test_set_session_cwd_replaces_value() {
+        let sm = StateManager::new();
+        let target = std::path::PathBuf::from("/some/session/dir");
+        sm.set_session_cwd(target.clone());
+        assert_eq!(sm.session_cwd(), target);
     }
 
     #[test]
