@@ -40,12 +40,11 @@ pub struct PowerShellTool {
     /// Optional environment variables to set for the command
     #[serde(default)]
     env: Option<HashMap<String, String>>,
-    /// Per-session working directory the child is spawned in. `Some(dir)` roots
-    /// every call at `dir`; `None` inherits the process cwd (test path / no
-    /// session). Kept `Option` — unlike the file tools' `PathBuf`, this feeds a
-    /// *spawn* cwd where an empty path is not "inherit" but an invalid directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    session_cwd: Option<PathBuf>,
+    /// The per-session working directory every call is spawned in. Set
+    /// explicitly at construction (defaults to the process cwd via `new`/
+    /// `Default`). Construction-time state, never (de)serialized.
+    #[serde(skip)]
+    session_cwd: PathBuf,
 }
 
 impl Default for PowerShellTool {
@@ -53,7 +52,7 @@ impl Default for PowerShellTool {
         Self {
             shell: "pwsh".to_string(),
             env: None,
-            session_cwd: None,
+            session_cwd: std::env::current_dir().unwrap_or_default(),
         }
     }
 }
@@ -64,14 +63,13 @@ impl PowerShellTool {
         Self {
             shell,
             env,
-            session_cwd: None,
+            session_cwd: std::env::current_dir().unwrap_or_default(),
         }
     }
 
     /// Root every spawned child at `dir` (the per-session working directory).
-    /// Omit for the process-cwd-inheriting default (test path).
     pub fn with_session_cwd(mut self, dir: PathBuf) -> Self {
-        self.session_cwd = Some(dir);
+        self.session_cwd = dir;
         self
     }
 
@@ -272,9 +270,11 @@ impl Tool for PowerShellTool {
             }
         }
 
-        // Root the child at the per-session cwd; `None` inherits the process cwd.
-        if let Some(ref dir) = self.session_cwd {
-            cmd.current_dir(dir);
+        // Root the child at the per-session cwd. Guard the empty degenerate
+        // (only if `current_dir()` failed at construction) so we never
+        // `chdir("")`; then the child inherits the process cwd.
+        if !self.session_cwd.as_os_str().is_empty() {
+            cmd.current_dir(&self.session_cwd);
         }
 
         let child = cmd.spawn().map_err(|e| {

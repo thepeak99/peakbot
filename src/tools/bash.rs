@@ -73,12 +73,11 @@ pub struct BashTool {
     /// `None` in test paths and when the agent is built without a panel —
     /// the tool still runs, just without the live UI side-effects.
     state_manager: Option<Arc<StateManager>>,
-    /// Per-session working directory the child is spawned in. `Some(dir)` roots
-    /// every call at `dir` (an in-command `cd` dies with the child); `None`
-    /// inherits the process cwd (test path / no session). Kept `Option` — unlike
-    /// the file tools' `PathBuf`, this feeds a *spawn* cwd where an empty path is
-    /// not "inherit" but an invalid directory.
-    session_cwd: Option<PathBuf>,
+    /// The per-session working directory every call is spawned in. Set
+    /// explicitly at construction (defaults to the process cwd via `new`/
+    /// `Default`); an in-command `cd` dies with the child, so each call
+    /// starts fresh here.
+    session_cwd: PathBuf,
 }
 
 impl Default for BashTool {
@@ -87,7 +86,7 @@ impl Default for BashTool {
             shell: "/bin/sh".to_string(),
             env: None,
             state_manager: None,
-            session_cwd: None,
+            session_cwd: std::env::current_dir().unwrap_or_default(),
         }
     }
 }
@@ -100,15 +99,15 @@ impl BashTool {
             shell,
             env,
             state_manager: None,
-            session_cwd: None,
+            session_cwd: std::env::current_dir().unwrap_or_default(),
         }
     }
 
     /// Root every spawned child at `dir` (the per-session working directory).
     /// Each call is a fresh `sh -c` rooted here; an in-command `cd` dies with
-    /// the child. Omit for the process-cwd-inheriting default (test path).
+    /// the child.
     pub fn with_session_cwd(mut self, dir: PathBuf) -> Self {
-        self.session_cwd = Some(dir);
+        self.session_cwd = dir;
         self
     }
 
@@ -332,10 +331,8 @@ impl Tool for BashTool {
         let mut handle = pty_runner::spawn(
             SpawnParams {
                 command: args.command.clone(),
-                cwd: self
-                    .session_cwd
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned()),
+                cwd: (!self.session_cwd.as_os_str().is_empty())
+                    .then(|| self.session_cwd.to_string_lossy().into_owned()),
                 env: self.env.clone(),
                 shell: self.shell.clone(),
                 capture_cap: BASH_CAPTURE_CAP,
