@@ -14,3 +14,7 @@ This file is the working draft for the next release. When a version is tagged, t
   an in-command `cd` no longer leaks into later calls. The directory is a
   mandatory value set at construction (currently the process launch dir; a
   later change wires the real per-session value).
+- The session working directory is now owned by a single source of truth (the
+  state manager) rather than read from the process environment at each tool
+  build. No behaviour change yet — this wiring lets a later change vary the
+  directory per session without touching the process-global cwd.

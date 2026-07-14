@@ -432,10 +432,13 @@ where
     // Use provided tool or create a new one (with optional StateManager)
     let todo = todo_tool.unwrap_or_default();
 
-    // Path + shell tools resolve/spawn against the session cwd. Phase 1–2 use
-    // the process cwd (unchanged behaviour); Phase 3 will source the real
-    // `session_cwd` from the state manager here.
-    let session_cwd: std::path::PathBuf = std::env::current_dir().unwrap_or_default();
+    // Path + shell tools resolve/spawn against the session cwd, owned by the
+    // state manager (single source of truth). Without one (tests), fall back to
+    // the process cwd — unchanged behaviour.
+    let session_cwd: std::path::PathBuf = match state_manager.as_ref() {
+        Some(sm) => sm.session_cwd(),
+        None => std::env::current_dir().unwrap_or_default(),
+    };
 
     // Register exactly ONE shell tool based on the detected environment.
     // The model only sees the tool that matches the actual shell available.
