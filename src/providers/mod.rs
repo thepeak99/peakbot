@@ -432,21 +432,27 @@ where
     // Use provided tool or create a new one (with optional StateManager)
     let todo = todo_tool.unwrap_or_default();
 
+    // Path + shell tools resolve/spawn against the session cwd. Phase 1–2 use
+    // the process cwd (unchanged behaviour); Phase 3 will source the real
+    // `session_cwd` from the state manager here.
+    let session_cwd: std::path::PathBuf = std::env::current_dir().unwrap_or_default();
+
     // Register exactly ONE shell tool based on the detected environment.
     // The model only sees the tool that matches the actual shell available.
     // If no shell is detected (e.g. Windows with nothing installed), no
     // shell tool is registered at all.
     let shell_tool = match shell_kind {
-        Some(ShellKind::PowerShell { path }) => Some(EitherTool::PowerShell(PowerShellTool::new(
-            path.clone(),
-            bash_config.env.clone(),
-        ))),
+        Some(ShellKind::PowerShell { path }) => Some(EitherTool::PowerShell(
+            PowerShellTool::new(path.clone(), bash_config.env.clone())
+                .with_session_cwd(session_cwd.clone()),
+        )),
         Some(ShellKind::Bash { path }) => {
             // Wire the live panel (slice 3 of make-term-great-again.md)
             // when a state manager is available. Without one, the tool
             // still runs PTY-backed but skips the UI side-effects —
             // the same shape `BashBgTool` uses.
-            let bash = BashTool::new(path.clone(), bash_config.env.clone());
+            let bash = BashTool::new(path.clone(), bash_config.env.clone())
+                .with_session_cwd(session_cwd.clone());
             let bash = match state_manager.clone() {
                 Some(sm) => bash.with_state_manager(sm),
                 None => bash,
@@ -467,11 +473,6 @@ where
         Some(sm) => BashBgTool::new_with_env(sm, bash_config.env.clone()),
         None => BashBgTool::default(),
     };
-
-    // Path tools resolve relative args against the session cwd. Phase 1 uses
-    // the process cwd (unchanged behaviour); Phase 3 will source the real
-    // `session_cwd` from the state manager here.
-    let session_cwd: std::path::PathBuf = std::env::current_dir().unwrap_or_default();
 
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
         gate(Box::new(FileCreateTool::new(session_cwd.clone()))),

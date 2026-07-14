@@ -40,6 +40,12 @@ pub struct PowerShellTool {
     /// Optional environment variables to set for the command
     #[serde(default)]
     env: Option<HashMap<String, String>>,
+    /// Per-session working directory the child is spawned in. `Some(dir)` roots
+    /// every call at `dir`; `None` inherits the process cwd (test path / no
+    /// session). Kept `Option` — unlike the file tools' `PathBuf`, this feeds a
+    /// *spawn* cwd where an empty path is not "inherit" but an invalid directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_cwd: Option<PathBuf>,
 }
 
 impl Default for PowerShellTool {
@@ -47,6 +53,7 @@ impl Default for PowerShellTool {
         Self {
             shell: "pwsh".to_string(),
             env: None,
+            session_cwd: None,
         }
     }
 }
@@ -54,7 +61,18 @@ impl Default for PowerShellTool {
 impl PowerShellTool {
     /// Create a new PowerShellTool with the given executable and environment variables.
     pub fn new(shell: String, env: Option<HashMap<String, String>>) -> Self {
-        Self { shell, env }
+        Self {
+            shell,
+            env,
+            session_cwd: None,
+        }
+    }
+
+    /// Root every spawned child at `dir` (the per-session working directory).
+    /// Omit for the process-cwd-inheriting default (test path).
+    pub fn with_session_cwd(mut self, dir: PathBuf) -> Self {
+        self.session_cwd = Some(dir);
+        self
     }
 
     /// Detect if the command appears to be doing file editing.
@@ -252,6 +270,11 @@ impl Tool for PowerShellTool {
             for (key, value) in env_vars {
                 cmd.env(key, value);
             }
+        }
+
+        // Root the child at the per-session cwd; `None` inherits the process cwd.
+        if let Some(ref dir) = self.session_cwd {
+            cmd.current_dir(dir);
         }
 
         let child = cmd.spawn().map_err(|e| {

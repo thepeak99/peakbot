@@ -488,3 +488,42 @@ async fn bash_panel_and_tool_result_share_the_same_bytes() {
         ),
     }
 }
+
+/// Phase 2 of `make-paths-great-again.md`: the child spawns in the
+/// per-session cwd, not the process cwd. We root the tool at a fresh
+/// temp dir (distinct from the process cwd) and assert `pwd -P` reports
+/// it. `-P` resolves symlinks so the comparison holds on macOS
+/// (`/tmp` → `/private/tmp`) and any symlinked temp root.
+#[tokio::test]
+async fn bash_spawns_in_session_cwd() {
+    use rig_core::tool::ToolDyn;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    // Canonicalize so the expected path matches `pwd -P` (physical) output.
+    let session_cwd = dir.path().canonicalize().expect("canonicalize temp dir");
+
+    let tool = BashTool::default().with_session_cwd(session_cwd.clone());
+    let payload = serde_json::to_string(&json!({
+        "thought": "phase 2: bash runs in the session cwd",
+        "command": "pwd -P",
+        "timeout_seconds": 5,
+        "tail": 0,
+    }))
+    .expect("serialize");
+    let out = ToolDyn::call(&tool, payload).await.expect("call");
+
+    let expected = session_cwd.to_string_lossy();
+    assert!(
+        out.contains(expected.as_ref()),
+        "child should run in the session cwd `{}`, but `pwd -P` reported:\n{}",
+        expected,
+        out
+    );
+    // The process cwd (repo root) must NOT be where the child ran —
+    // proves the spawn cwd, not the inherited one, took effect.
+    let proc_cwd = std::env::current_dir().expect("process cwd");
+    assert_ne!(
+        session_cwd, proc_cwd,
+        "test precondition: temp dir must differ from the process cwd"
+    );
+}
