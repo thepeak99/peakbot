@@ -55,11 +55,13 @@ pub enum UiAction {
     /// The path is already validated (exists, is a dir, canonicalised)
     /// against the filesystem before this action is emitted.
     ///
-    /// The agent loop dequeues this between turns, `set_current_dir`s to
-    /// the new path, rebuilds the system prompt (so cwd/agents.md refresh)
-    /// and the `DynAgent` on the *same* model, then runs the same reset
+    /// The agent loop dequeues this between turns, updates
+    /// `state_manager.session_cwd` (per-session — no `set_current_dir`),
+    /// rebuilds the system prompt (so cwd/agents.md refresh) and the
+    /// `DynAgent` on the *same* model, then runs the same reset
     /// semantics as `/new`. Independent of `SwitchModel` — the two axes
-    /// don't disturb each other.
+    /// don't disturb each other. Two web sessions in different trees
+    /// stay race-free because nothing is mutated at the process level.
     ChangeCwd(String),
 }
 

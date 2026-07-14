@@ -551,11 +551,11 @@ mod tests {
     }
 
     /// `Conversation::new` persists the caller's `cwd` argument
-    /// (Phase 5 — `cwd` is now an explicit constructor parameter, not
-    /// an implicit `std::env::current_dir()` read). The persisted value
-    /// round-trips through serde without loss, and a value different
-    /// from the process cwd is preserved verbatim — proving the
-    /// constructor does not silently re-read the process cwd.
+    /// (`cwd` is an explicit constructor parameter, not an implicit
+    /// `std::env::current_dir()` read). The persisted value round-trips
+    /// through serde without loss, and a value different from the
+    /// process cwd is preserved verbatim — proving the constructor does
+    /// not silently re-read the process cwd.
     #[test]
     fn new_conversation_persists_cwd() {
         let explicit = "/this/path/was/passed/explicitly/by/the/caller";

@@ -489,11 +489,11 @@ async fn bash_panel_and_tool_result_share_the_same_bytes() {
     }
 }
 
-/// Phase 2 of `make-paths-great-again.md`: the child spawns in the
-/// per-session cwd, not the process cwd. We root the tool at a fresh
-/// temp dir (distinct from the process cwd) and assert `pwd -P` reports
-/// it. `-P` resolves symlinks so the comparison holds on macOS
-/// (`/tmp` → `/private/tmp`) and any symlinked temp root.
+/// The child spawns in the per-session cwd, not the process cwd. We
+/// root the tool at a fresh temp dir (distinct from the process cwd)
+/// and assert `pwd -P` reports it. `-P` resolves symlinks so the
+/// comparison holds on macOS (`/tmp` → `/private/tmp`) and any
+/// symlinked temp root.
 #[tokio::test]
 async fn bash_spawns_in_session_cwd() {
     use rig_core::tool::ToolDyn;
@@ -504,7 +504,7 @@ async fn bash_spawns_in_session_cwd() {
 
     let tool = BashTool::default().with_session_cwd(session_cwd.clone());
     let payload = serde_json::to_string(&json!({
-        "thought": "phase 2: bash runs in the session cwd",
+        "thought": "bash runs in the session cwd",
         "command": "pwd -P",
         "timeout_seconds": 5,
         "tail": 0,

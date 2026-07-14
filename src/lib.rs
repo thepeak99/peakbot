@@ -703,8 +703,8 @@ impl AgentRunner {
         // model) was stamped on the StateManager before run_loop; we read it
         // back so saved conversations carry the right re-activation key.
         // `cwd` is the SM-owned session cwd (set in `create_session` before
-        // run_loop is spawned; falls back to the Phase 3 seed — process cwd —
-        // for the test-harness bypass path).
+        // run_loop is spawned; for the test-harness bypass path the SM
+        // seeds it from `current_dir()` at construction).
         if let Some(ref sm) = state_manager {
             sm.ensure_boot_conversation(&sm.session_cwd(), &config_model);
         }
@@ -1243,9 +1243,7 @@ impl AgentRunner {
             convo_name,
             resolved.provider_name.clone(),
             resolved.model_name.clone(),
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            sm_for_provider.session_cwd().to_string_lossy().into_owned(),
         );
         sm_for_provider.set_model(resolved.model_name.clone());
         sm_for_provider.set_provider_name(resolved.provider_name.clone());
@@ -1266,18 +1264,21 @@ impl AgentRunner {
     /// The cwd sibling of [`Self::handle_switch_model`] — same reset +
     /// rebuild seam, different axis.
     ///
-    /// Sequence (order matters — see the "process-global mutation" note):
+    /// Sequence (order matters):
     /// 1. `clear_bg()` first, so no `bash_bg` reader thread straddles the
-    ///    chdir with a half-old, half-new view of the tree.
-    /// 2. `set_current_dir(path)` — the load-bearing act. Everything the
-    ///    prompt derives from the cwd (`build_system_prompt` reads
-    ///    `current_dir()` + `./agents.md`) and the `bash` tool's inherited
-    ///    cwd flip here.
+    ///    session-cwd flip with a half-old, half-new view of the tree.
+    /// 2. `state_manager.set_session_cwd(target)` — the load-bearing act.
+    ///    Everything the prompt derives from the cwd and the
+    ///    path-aware tools' `session_cwd` flip here, **without** mutating
+    ///    the process-global cwd. Two web sessions in different trees
+    ///    stay correct because nothing they share is mutated.
     /// 3. Rebuild the system prompt and store it back into
     ///    `ctx.system_prompt`, so a later `/model` switch keeps the new
     ///    cwd (the two axes are independent — ticket #124).
     /// 4. Rebuild the agent on the *current* model, then reset the
-    ///    conversation like `/new`.
+    ///    conversation like `/new`. Tools snapshot the new
+    ///    `session_cwd` at agent-build time, so the rebuild order is
+    ///    `set_session_cwd` first, rebuild second.
     ///
     /// The View pre-validated `path`; we re-validate defensively (config
     /// or the filesystem may have changed under us).
@@ -1319,14 +1320,16 @@ impl AgentRunner {
             .ok_or_else(|| "current model not found in registry".to_string())?
             .clone();
 
-        // Kill bg processes BEFORE the chdir so no reader thread straddles
-        // it — they were rooted in the old tree anyway (ticket #124).
+        // Kill bg processes BEFORE the session-cwd flip so no reader
+        // thread straddles it — they were rooted in the old tree anyway
+        // (ticket #124).
         sm.clear_bg();
 
-        // The load-bearing mutation. Process-global; safe here because we
-        // run between turns (no tool in flight) and just cleared bg.
-        std::env::set_current_dir(target)
-            .map_err(|e| format!("failed to change directory to {path}: {e}"))?;
+        // The load-bearing act. Per-session only — no `set_current_dir`,
+        // so two web sessions in different trees stay race-free. Must run
+        // BEFORE the agent rebuild below, because `add_builtin_tools`
+        // snapshots `sm.session_cwd()` at build time.
+        sm.set_session_cwd(target.to_path_buf());
 
         // Rebuild the prompt against the new cwd + refreshed agents.md and
         // persist it into ctx so subsequent /model switches keep the cwd.
@@ -1555,35 +1558,39 @@ impl AgentRunner {
             sm.get_provider_name() != saved_provider || sm.get_model() != saved_model;
 
         // Restore the saved cwd best-effort: only if it's non-empty (pre-cwd
-        // files default to ""), actually differs, and still exists. A gone
-        // path is warned about, not fatal — the load already succeeded.
-        let current_cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // files default to ""), still exists, and actually differs from the
+        // current session cwd. The comparison is against `sm.session_cwd()`
+        // (the per-session source of truth), not the process-global cwd —
+        // every change is per-session. A gone path is warned about, not
+        // fatal — the load already succeeded.
+        let current_session_cwd = sm.session_cwd();
         let mut cwd_changed = false;
-        if !saved_cwd.is_empty() && saved_cwd != current_cwd {
-            if std::path::Path::new(&saved_cwd).is_dir() {
-                if let Err(e) = std::env::set_current_dir(&saved_cwd) {
-                    sm.add_system_message(format!(
-                        "⚠ /load: could not restore working directory {saved_cwd}: {e}"
-                    ));
-                } else {
+        if !saved_cwd.is_empty() {
+            let target = std::path::PathBuf::from(&saved_cwd);
+            if target.is_dir() {
+                if target != current_session_cwd {
                     // Kill bg processes rooted in the previous tree, then
                     // refresh the prompt for the restored cwd/agents.md.
+                    // Per-session only — no `set_current_dir`, so the
+                    // process-global cwd is untouched and concurrent web
+                    // sessions in other trees stay race-free.
                     sm.clear_bg();
-                    ctx.system_prompt = build_system_prompt(
-                        &ctx.skills,
-                        ctx.shell_kind.as_ref(),
-                        std::path::Path::new(&saved_cwd),
-                    );
+                    sm.set_session_cwd(target.clone());
+                    ctx.system_prompt =
+                        build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref(), &target);
+                    sm.update_welcome_cwd(target);
                     cwd_changed = true;
                 }
+                // else: already on the right tree — no work, no rebuild.
             } else {
                 sm.add_system_message(format!(
                     "⚠ /load: saved working directory no longer exists: {saved_cwd}"
                 ));
             }
         }
+        // An empty `saved_cwd` (from a pre-cwd conversation file) keeps
+        // the SM's current session_cwd — it is the authoritative value
+        // for that conversation.
 
         // Nothing to rebuild if neither axis moved.
         if !wire_id_changed && !cwd_changed {
@@ -2173,9 +2180,7 @@ impl AgentRunner {
                         name,
                         provider_name,
                         model,
-                        std::env::current_dir()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
+                        sm.session_cwd().to_string_lossy().into_owned(),
                     );
                     sm.add_system_message("Started a new conversation.".to_string());
                 } else {
@@ -2408,13 +2413,12 @@ impl AgentRunner {
                 }
             }
             _ if cmd_lower.trim_end() == "/cd" => {
-                // Bare /cd — print the current working directory for
-                // orientation. Pure read; works in every View.
+                // Bare /cd — print the session's working directory for
+                // orientation. Pure read; works in every View. Use the
+                // per-session cwd, not the process-global — the two can
+                // differ in web sessions after `/cd`.
                 if let Some(sm) = state_manager {
-                    let cwd = std::env::current_dir()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    sm.add_system_message(cwd);
+                    sm.add_system_message(sm.session_cwd().to_string_lossy().into_owned());
                 }
             }
             _ if cmd_lower.starts_with("/cd ") => {

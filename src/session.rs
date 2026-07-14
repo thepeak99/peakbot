@@ -45,7 +45,6 @@ pub struct SessionDeps {
     /// so each `AgentRunner` reads a stable provider for its compaction model.
     pub config: Config,
     pub model_registry: Arc<ModelRegistry>,
-    pub system_prompt: String,
     pub skills: SkillRegistry,
     /// One set of MCP subprocesses shared by all sessions; each session
     /// clones the *tools list*, not the processes.
@@ -91,22 +90,19 @@ pub struct Session {
 /// per-session `TodoTool`, `create_provider`, `AgentRunner::new` +
 /// `with_rebuild_context`, welcome state, then `tokio::spawn(run_loop)`.
 ///
-/// ## Per-session cwd (Phase 6)
+/// ## Per-session cwd
 ///
 /// This is the **single point** that resolves the per-session `session_cwd`
 /// and threads it into the system prompt, the persisted conversation, the
-/// welcome banner, and (via Phase 3's wiring) every path-aware tool. Resume
-/// adopts the saved cwd (Phase 5 persisted it 1:1); fresh sessions inherit
-/// the boot `current_dir()`. Order matters:
+/// welcome banner, and every path-aware tool. Resume adopts the saved
+/// cwd (it was persisted on the conversation at mint time); fresh
+/// sessions inherit the boot `current_dir()`. Order matters:
 /// 1. resolve `session_cwd`,
 /// 2. `state_manager.set_session_cwd(...)` *before* `create_provider` —
 ///    `add_builtin_tools` snapshots it at agent-build time,
 /// 3. build the per-session system prompt from `session_cwd`,
 /// 4. pass that prompt into `create_provider` *and* into `RebuildContext`
 ///    so a later `/model` switch keeps the cwd.
-///
-/// `deps.system_prompt` (the boot-cwd prompt built in `main.rs`) is now
-/// unused in the per-session path. Phase 7 deletes the field.
 pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Session> {
     // Per-session Model. Storage (if any) is shared — it writes distinct
     // files per conversation id.
@@ -162,7 +158,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         Some(all)
     };
 
-    // ── Per-session cwd (Phase 6) ──────────────────────────────────────────
+    // ── Per-session cwd ──────────────────────────────────────────────────────
     // Resume adopts the saved cwd iff it's non-empty and still points at a
     // directory. Anything else (no resume, no storage, missing/empty
     // cwd, gone directory) falls through to the boot cwd. A gone cwd is
@@ -181,15 +177,14 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         None => boot_cwd,
     };
 
-    // Stamp the SM *before* create_provider so the tools (Phase 3) snapshot
-    // the per-session value at agent-build time. A `set_session_cwd` after
+    // Stamp the SM *before* create_provider so the tools snapshot the
+    // per-session value at agent-build time. A `set_session_cwd` after
     // build would not reach the already-built tools.
     state_manager.set_session_cwd(session_cwd.clone());
 
-    // Build the per-session system prompt from `session_cwd` — not from
-    // `deps.system_prompt` (which is the boot-cwd prompt built in `main.rs`
-    // and is now unused in the per-session path; slated for removal in
-    // Phase 7). Skills + shell_kind are part of the env block too.
+    // Build the per-session system prompt from `session_cwd` — the only
+    // place the cwd flows into the prompt. Skills + shell_kind are part
+    // of the env block too.
     let session_prompt = build_system_prompt(&deps.skills, deps.shell_kind.as_ref(), &session_cwd);
 
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
@@ -241,10 +236,10 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
 
     // `RebuildContext.system_prompt` is the per-session prompt (built from
-    // `session_cwd` above), not the boot-cwd `deps.system_prompt`. A later
-    // `/model` rebuild will hand the same prompt to `create_provider`, so
-    // the cwd survives the model switch. Phase 8's `/cd` rebuild will
-    // overwrite this with a fresh prompt built from the new cwd.
+    // `session_cwd` above). A later `/model` rebuild will hand the same
+    // prompt to `create_provider`, so the cwd survives the model switch.
+    // A `/cd` rebuild overwrites this with a fresh prompt built from the
+    // new cwd.
     let rebuild_ctx = RebuildContext {
         registry: deps.model_registry.clone(),
         system_prompt: session_prompt,
@@ -311,10 +306,10 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
 mod tests {
     //! Integration tests for `create_session`'s per-session cwd flow.
     //!
-    //! Phase 6 — the session's cwd is the single source of truth that flows
-    //! into the system prompt, the persisted conversation, the welcome
-    //! banner, and (via Phase 3) the tools. These tests pin the two
-    //! observable surfaces that the bug-fix has to protect:
+    //! The session's cwd is the single source of truth that flows into
+    //! the system prompt, the persisted conversation, the welcome
+    //! banner, and every path-aware tool. These tests pin the two
+    //! observable surfaces that the contract has to protect:
     //!
     //! - `state_manager.session_cwd()` on the resume path reflects the saved
     //!   cwd, not the boot cwd.
@@ -368,11 +363,6 @@ mod tests {
         SessionDeps {
             config,
             model_registry: registry,
-            // `deps.system_prompt` is unused in the per-session path
-            // (Phase 6 builds the prompt from `session_cwd`); Phase 7
-            // deletes this field. We still hand it a plausible string so
-            // any debug print of `SessionDeps` doesn't show an empty value.
-            system_prompt: "UNUSED after Phase 6 — kept for Phase 7 removal".to_string(),
             skills: crate::skills::SkillRegistry::new(),
             mcp_handles: Arc::new(Vec::new()),
             searxng_config: None,
