@@ -4,6 +4,15 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Web favicon now reflects agent state.** While the agent is working the
+  favicon is replaced with a small spinning yellow arc (~15 fps, ~16 px)
+  rendered from a canvas and pushed back into `<link rel="icon">`; when the
+  agent goes idle the original `/favicon.svg` is restored. The animation
+  uses `setInterval` and a `useEffect` cleanup so it tears down on unmount
+  and on every toggle — the previous shape leaked a re-scheduling rAF
+  chain on every `isRunning → false` because the captured ID was consumed
+  by the first frame.
+
 - **Web sessions now stay alive while the agent is working, and expire only
   when fully idle (#158).** A `peakbot --web` session used to be reaped purely
   on its attached-socket count: closing the tab mid-turn (a long tool round, a

@@ -6,7 +6,6 @@ output
 !release-notes/**/*.md
 .release-version
 .peakbot/vectors.db
-bg-cooldown-plan.md
 
 # Browser-automation test artifacts (playwright-cli)
 .playwright/
@@ -15,3 +14,5 @@ bg-cooldown-plan.md
 # Local scratch dir (test config + vector db)
 .test/
 memory.md
+
+scripts
