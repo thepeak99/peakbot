@@ -1,28 +1,19 @@
-//! Retry helpers for the provider layer.
+//! Transient-error classification and backoff for the provider layer.
 //!
-//! Wraps the existing (broken — see #111) retry loop in
-//! `crate::lib::process_message_internal`. All upstream LLM providers in
-//! `rig-core` strip the HTTP status from their error variants, converting
-//! any non-2xx into `CompletionError::ProviderError(text)` or
-//! `ResponseError(text)` (verified by grep on the upstream crate). We
-//! therefore detect transient failures by:
+//! `rig-core` strips the HTTP status from its error variants, folding any
+//! non-2xx into `CompletionError::ProviderError(text)` / `ResponseError(text)`
+//! (#111). With no status on the wire, transience is detected by:
 //!   * `CompletionError::HttpError(_)` — always transient (transport-level)
-//!   * `CompletionError::ProviderError(msg)` / `ResponseError(msg)` —
-//!     transient iff `msg` matches known transient markers (429, rate limit,
-//!     5xx, server-side markers). Substring matching is fragile; a proper
-//!     fix requires an upstream patch to preserve the status code.
+//!   * `ProviderError(msg)` / `ResponseError(msg)` — transient iff `msg`
+//!     matches a known marker (see `TRANSIENT_MESSAGE_MARKERS`).
+//!
+//! Substring matching is fragile — a localized or reworded rate-limit that
+//! omits every marker classifies as *permanent* and the turn is lost. A
+//! robust fix needs an upstream patch preserving the status code.
 
 use crate::config::RetryConfig;
 use rig_core::completion::{CompletionError, PromptError};
 use std::time::Duration;
-
-/// HTTP statuses that are worth retrying. Mirrors `fetch_page`'s policy
-/// (408/425/429/5xx). Only used when the status code is available — see
-/// `is_transient_completion_error` for the rig-error path.
-#[allow(dead_code)] // Exported for future use when rig (or a future http_client wrapper) surfaces status in error variants.
-pub fn transient_status_code(status: u16) -> bool {
-    matches!(status, 408 | 425 | 429) || (500..600).contains(&status)
-}
 
 /// Substring markers in `ProviderError`/`ResponseError` messages that
 /// indicate a transient (retryable) upstream failure. The list is
@@ -43,12 +34,12 @@ const TRANSIENT_MESSAGE_MARKERS: &[&str] = &[
     "gateway timeout",
     "temporarily unavailable",
     "overloaded",
-    "capacity",
+    "at capacity",
 ];
 
 /// Whether a `CompletionError` is worth retrying. See module docs for why
 /// we fall back to message-substring matching.
-pub fn is_transient_completion_error(err: &CompletionError) -> bool {
+fn is_transient_completion_error(err: &CompletionError) -> bool {
     match err {
         // Transport-level errors (TCP reset, TLS, timeout) are always transient.
         CompletionError::HttpError(_) => true,
@@ -105,23 +96,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transient_status_codes_retry() {
-        for code in [408u16, 425, 429, 500, 502, 503, 504, 524, 599] {
-            assert!(transient_status_code(code), "{code} should be transient");
-        }
-    }
-
-    #[test]
-    fn permanent_status_codes_do_not_retry() {
-        for code in [200u16, 301, 400, 401, 403, 404, 410, 422] {
-            assert!(
-                !transient_status_code(code),
-                "{code} should not be transient"
-            );
-        }
-    }
-
-    #[test]
     fn http_error_is_always_transient() {
         assert!(is_transient_completion_error(&CompletionError::HttpError(
             rig_core::http_client::Error::StreamEnded
@@ -154,6 +128,7 @@ mod tests {
             "Context length exceeded",
             "Bad request: missing field",
             "Forbidden: quota exhausted permanently",
+            "Insufficient capacity for this model",
         ];
         for msg in permanent {
             let e = CompletionError::ProviderError(msg.to_string());

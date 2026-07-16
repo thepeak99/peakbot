@@ -100,13 +100,6 @@ This file is the working draft for the next release. When a version is tagged, t
   directory. The runtime has accepted relative paths since the file-tool
   rework and has run shells in the session cwd since the per-session
   wiring landed; this is the moment the prompt and the runtime agree.
-- The notifications bell now lights up the moment you click it. Previously
-  the visual was gated on `enabled && permission === "granted"`, so the
-  first click on a fresh tab (when permission is `"default"` and the
-  browser prompt is still pending) left the bell looking off; if the
-  prompt was dismissed instead of granted, it stayed off forever even
-  though `enabled` was true. Now the bell reflects user intent
-  immediately — the capability layer is communicated in the tooltip /
 - **LLM requests now retry with exponential backoff on transient failures (#111).**
   The retry loop in `process_message_internal` previously incremented a counter
   and looped immediately — no sleep, no classification, the configured
@@ -126,7 +119,9 @@ This file is the working draft for the next release. When a version is tagged, t
   the status bar when non-zero) tells the user the agent is silently
   waiting on a flaky upstream instead of wondering why their turn took
   12 seconds. Retry-After header support and per-model retry config are
-  explicitly out of scope for this change.
+  explicitly out of scope for this change. The transient-marker list
+  requires `at capacity` (not bare `capacity`) so a permanent
+  "insufficient capacity" quota error is not retried.
 - The notifications bell now lights up the moment you click it. Previously
   the visual was gated on `enabled && permission === "granted"`, so the
   first click on a fresh tab (when permission is `"default"` and the

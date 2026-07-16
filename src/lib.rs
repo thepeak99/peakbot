@@ -1814,14 +1814,9 @@ impl AgentRunner {
                 }
 
                 Err(_e) => {
-                    // See #111. The previous implementation here did three
-                    // wrong things: retried every error (including 401/403/
-                    // 404/MaxTurnsError), never slept, and ignored the
-                    // configured backoff fields. Fix all three at once:
-                    //   * classify the error as transient before deciding
-                    //     to retry (a deterministic 401 stays fatal);
-                    //   * sleep with exponential backoff;
-                    //   * always log the error that triggered the retry.
+                    // Only transient failures (rate limits, 5xx, transport
+                    // drops) are worth retrying; a deterministic 401 / bad
+                    // request / MaxTurnsError bails immediately. See #111.
                     if !crate::providers::retry::is_transient_prompt_error(&_e) {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
