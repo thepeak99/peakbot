@@ -1018,6 +1018,12 @@ impl ReplUi {
             "Tokens: {} │ Calls: {} │ Cost: ${} │ Context: {:.1}% │ Model: {}",
             tokens_str, stats.total_api_calls, cost_str, context_pct, stats.model,
         );
+        // Retries only show when non-zero — keeps the bar quiet on healthy
+        // upstreams. When the agent is silently waiting on a flaky upstream,
+        // the user can see "↻ 2" and know what's happening.
+        if stats.retries > 0 {
+            status_text.push_str(&format!(" │ ↻ {}", stats.retries));
+        }
         // cwd lives on the welcome banner (stamped at boot, refreshed on
         // /cd). Absent only before the banner is set — omit rather than
         // guess.

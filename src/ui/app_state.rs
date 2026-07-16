@@ -950,6 +950,14 @@ pub struct SessionState {
     /// `provider_name + model` for re-activation.
     #[serde(default)]
     pub model_alias: String,
+
+    /// Number of LLM requests that hit a transient error and were retried
+    /// with exponential backoff. Lives in `SessionState` (not persisted)
+    /// because it's a *current session* signal — a user `/load`ing a
+    /// different conversation expects this to reset, the way tokens and
+    /// cost do on /load.
+    #[serde(default)]
+    pub retries: u64,
 }
 
 impl SessionState {

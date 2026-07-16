@@ -7,6 +7,48 @@ use crate::harness::TestHarness;
 use peakbot::ContextConfig;
 use peakbot::mock::{MockResponse, Usage};
 
+/// Retry counter plumbing (see #111). Three calls to `inc_retries` must
+/// surface as `retries: 3` on `get_stats()`, and `reset_stats()` must
+/// zero them — mirroring how the backoff loop in
+/// `process_message_internal` bumps the counter on every transient
+/// failure it chooses to retry.
+#[tokio::test]
+async fn retry_counter_increments_and_resets() {
+    let harness = TestHarness::new();
+
+    assert_eq!(harness.get_stats().retries, 0, "fresh harness starts at 0");
+
+    harness.state_manager.inc_retries();
+    harness.state_manager.inc_retries();
+    harness.state_manager.inc_retries();
+
+    assert_eq!(harness.get_stats().retries, 3);
+
+    harness.state_manager.reset_stats();
+    assert_eq!(
+        harness.get_stats().retries,
+        0,
+        "reset_stats must zero retries"
+    );
+}
+
+/// /stats summary must include the retry counter when non-zero. This is
+/// the user-visible feedback path described in #111 step 4 — the user
+/// should be able to tell that the agent is silently waiting on a flaky
+/// upstream.
+#[tokio::test]
+async fn retry_counter_appears_in_summary() {
+    let harness = TestHarness::new();
+    harness.state_manager.inc_retries();
+    harness.state_manager.inc_retries();
+
+    let summary = harness.get_stats().summary();
+    assert!(
+        summary.contains("Retried Requests: 2"),
+        "summary must surface retries, got: {summary}"
+    );
+}
+
 /// Verify that ContextManager uses last_request's input_tokens for threshold
 /// comparison, not cumulative sum of all requests.
 ///

@@ -107,4 +107,31 @@ This file is the working draft for the next release. When a version is tagged, t
   prompt was dismissed instead of granted, it stayed off forever even
   though `enabled` was true. Now the bell reflects user intent
   immediately — the capability layer is communicated in the tooltip /
+- **LLM requests now retry with exponential backoff on transient failures (#111).**
+  The retry loop in `process_message_internal` previously incremented a counter
+  and looped immediately — no sleep, no classification, the configured
+  `initial_delay_ms` / `max_delay_ms` / `backoff_factor` were ignored, and
+  every error (including deterministic 401/403/404) was retried. It now
+  classifies errors as transient (via a new `providers::retry` module) and
+  sleeps with `initial_delay_ms * backoff_factor^attempt`, capped at
+  `max_delay_ms`, plus up to ~250 ms of jitter. Permanent failures (401,
+  context-length errors, `MaxTurnsError`, `ToolError`, etc.) bail
+  immediately with a system message naming the error — no wasted
+  round-trips, no silent hangs. Transient classification relies on
+  message-substring matching because every `rig-core` provider strips the
+  HTTP status from its error variant (the only data we have on the wire);
+  a clean fix needs an upstream patch to preserve status. The existing
+  `RetryConfig` is now actually used; no new deps, no per-model override
+  yet. A new `Retried Requests` counter in `/stats` (rendered as `↻ N` in
+  the status bar when non-zero) tells the user the agent is silently
+  waiting on a flaky upstream instead of wondering why their turn took
+  12 seconds. Retry-After header support and per-model retry config are
+  explicitly out of scope for this change.
+- The notifications bell now lights up the moment you click it. Previously
+  the visual was gated on `enabled && permission === "granted"`, so the
+  first click on a fresh tab (when permission is `"default"` and the
+  browser prompt is still pending) left the bell looking off; if the
+  prompt was dismissed instead of granted, it stayed off forever even
+  though `enabled` was true. Now the bell reflects user intent
+  immediately — the capability layer is communicated in the tooltip /
   disabled-blocked variant, not in the affordance.
