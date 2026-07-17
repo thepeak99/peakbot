@@ -4,6 +4,22 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Skill-load failures are now surfaced in both the TUI and web UI, and
+  local `.agents/skills` are resolved against the session working directory.**
+  Previously a skill that failed to parse (bad YAML frontmatter, invalid
+  name/description, unreadable directory) was only logged via `tracing` and
+  silently went missing — the user had no signal. Skill loading now returns
+  the failures alongside the registry, and they are emitted as system
+  messages (rendered identically in the ratatui REPL and the web SPA) at
+  session creation and after every `/new`/`/model`/`/cd`/`/load` re-scan.
+  A single broken skill is skipped, never aborting the scan. Separately, the
+  local skills directory was resolved against the *process* cwd, which — after
+  the per-session cwd refactor (the process cwd never moves) — meant a `/cd`
+  or `/load` into another tree re-scanned the wrong directory and missed that
+  project's local skills. Skill discovery now takes an explicit session cwd:
+  boot reads the launch dir, and per-session verbs pass the state manager's
+  `session_cwd`, so local skills track the session's actual directory.
+
 - **Config + skills now hot-reload on session verbs (#159).** Editing
   `config.yaml` (master + per-repo `.peakbot/config.yaml`) or skills under
   `.agents/skills` no longer requires a restart: `/new`, `/model`, `/cd`, and

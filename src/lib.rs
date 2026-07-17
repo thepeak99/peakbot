@@ -1456,10 +1456,13 @@ impl AgentRunner {
             }
         }
 
-        // Re-scan skills; keep previous on failure so a transient FS error
-        // doesn't strip the prompt's skills section.
-        if let Ok(skills) = load_default_skills() {
-            ctx.skills = skills;
+        // Re-scan skills against the session cwd and surface any load failures
+        // as system messages, so `/cd`/`/load`/`/new`/`/model` report a broken
+        // skill instead of silently dropping it.
+        let (skills, skill_warnings) = load_default_skills(&sm.session_cwd());
+        ctx.skills = skills;
+        for warning in skill_warnings {
+            sm.add_system_message(warning);
         }
 
         // Commit. `config.provider` is preserved across the swap — the

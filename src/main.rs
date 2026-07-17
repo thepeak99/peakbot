@@ -123,7 +123,14 @@ async fn main() -> Result<()> {
     }
 
     let mut config = loaded.config;
-    let skills = load_default_skills()?;
+    // Load skills relative to the boot cwd (an allowed mint-site read of the
+    // process cwd). Warnings are surfaced later as system messages by the
+    // session factory; per-session verbs re-scan against the session cwd.
+    let boot_cwd = std::env::current_dir().unwrap_or_default();
+    let (skills, skill_warnings) = load_default_skills(&boot_cwd);
+    for w in &skill_warnings {
+        tracing::warn!("{w}");
+    }
     let skills_count = skills.len(); // Keep count before moving skills
 
     // Detect the shell first — the system prompt needs it so the model is
@@ -237,6 +244,7 @@ async fn main() -> Result<()> {
         config: config.clone(),
         model_registry: model_registry.clone(),
         skills,
+        skill_warnings,
         mcp_handles: mcp_handles_arc.clone(),
         searxng_config,
         pipeline_registry,
