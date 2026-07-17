@@ -10,6 +10,8 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod retry;
+
 use crate::config::{
     AnthropicCaching, AnthropicConfig, BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig,
     OpenRouterConfig, ProviderConfig, SearXngConfig,

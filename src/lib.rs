@@ -1814,16 +1814,41 @@ impl AgentRunner {
                 }
 
                 Err(_e) => {
-                    if retry_count == config.retry().max_retries {
+                    // Only transient failures (rate limits, 5xx, transport
+                    // drops) are worth retrying; a deterministic 401 / bad
+                    // request / MaxTurnsError bails immediately. See #111.
+                    if !crate::providers::retry::is_transient_prompt_error(&_e) {
+                        if let Some(sm) = state_manager {
+                            sm.set_status(None);
+                            sm.add_system_message(format!("❌ LLM request failed: {_e}"));
+                        }
+                        return CompletionResult::Error;
+                    }
+                    if retry_count >= config.retry().max_retries {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
                             sm.add_system_message("❌ Max number of retries exceeded".to_string());
                         }
                         return CompletionResult::Error;
                     }
+                    let delay = crate::providers::retry::backoff_delay(retry_count, config.retry());
+                    tracing::warn!(
+                        target: "peakbot",
+                        attempt = retry_count + 1,
+                        max_retries = config.retry().max_retries,
+                        backoff_ms = delay.as_millis(),
+                        error = %_e,
+                        "LLM request failed transiently; backing off before retry"
+                    );
                     if let Some(sm) = state_manager {
-                        sm.set_status(Some(format!("Retrying (attempt {})...", retry_count + 1)));
+                        sm.set_status(Some(format!(
+                            "Retrying (attempt {}/{}) after {:.1}s…",
+                            retry_count + 1,
+                            config.retry().max_retries,
+                            delay.as_secs_f64()
+                        )));
                     }
+                    tokio::time::sleep(delay).await;
                     retry_count += 1;
                 }
             }
