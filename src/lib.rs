@@ -1224,7 +1224,9 @@ impl AgentRunner {
 
         // Re-read config + skills first so a newly-added alias resolves and
         // a new system prompt / registry is in play before we switch.
-        Self::reload_session_config(config, ctx, &sm_for_provider);
+        // Warnings are surfaced *after* the conversation reset below so
+        // `reset_conversation_state()` can't wipe them from the chat.
+        let reload_warnings = Self::reload_session_config(config, ctx, &sm_for_provider);
 
         let Some(resolved) = ctx.registry.resolve(alias) else {
             let available = ctx.registry.aliases_sorted().join(", ");
@@ -1274,6 +1276,12 @@ impl AgentRunner {
             "🔁 New conversation on {} ({} · {})",
             resolved.alias, resolved.provider_name, resolved.model_name
         ));
+
+        // Surface reload/skill warnings now — after the reset — so they
+        // persist in the fresh conversation instead of being cleared.
+        for warning in reload_warnings {
+            sm_for_provider.add_system_message(warning);
+        }
 
         Ok(())
     }
@@ -1332,7 +1340,8 @@ impl AgentRunner {
         // Re-read config + skills before resolving so a config edit lands
         // on this /cd. The prompt is rebuilt again below against the new
         // cwd; this refreshes the registry + skills the resolve relies on.
-        Self::reload_session_config(config, ctx, &sm);
+        // Warnings are surfaced after the conversation reset below.
+        let reload_warnings = Self::reload_session_config(config, ctx, &sm);
 
         let resolved = ctx
             .registry
@@ -1398,6 +1407,11 @@ impl AgentRunner {
 
         sm.add_system_message(format!("📁 New conversation in {path}"));
 
+        // Surface reload/skill warnings after the reset so they persist.
+        for warning in reload_warnings {
+            sm.add_system_message(warning);
+        }
+
         Ok(())
     }
 
@@ -1417,19 +1431,25 @@ impl AgentRunner {
     /// "restart to apply" warning: `mcp_servers` / `vector_db` (live
     /// subprocesses / DB handle), `web.*` (read once by the reaper), and
     /// `pipeline` (a built sub-agent registry, not raw config).
+    ///
+    /// Returns the warnings to surface (reload failure, boot-only diffs,
+    /// skill-load failures) rather than emitting them here — the caller
+    /// owns *when* they land, so a following `reset_conversation_state()`
+    /// (as `/model` and `/cd` do) can't wipe them from the chat.
     fn reload_session_config(
         config: &mut Config,
         ctx: &mut RebuildContext,
         sm: &Arc<StateManager>,
-    ) {
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
         // Boundary parse — keep previous config on any failure.
         let fresh = match Config::reload() {
             Ok(c) => c,
             Err(reason) => {
-                sm.add_system_message(format!(
+                warnings.push(format!(
                     "⚠ config reload failed: {reason} — keeping previous config."
                 ));
-                return;
+                return warnings;
             }
         };
         // Registry is the post-boot source of truth; a bad `default_model`
@@ -1437,10 +1457,10 @@ impl AgentRunner {
         let new_registry = match fresh.build_model_registry() {
             Ok(r) => r,
             Err(e) => {
-                sm.add_system_message(format!(
+                warnings.push(format!(
                     "⚠ config reload: model registry invalid ({e}) — keeping previous config."
                 ));
-                return;
+                return warnings;
             }
         };
 
@@ -1452,18 +1472,16 @@ impl AgentRunner {
             ("pipeline", config.pipeline != fresh.pipeline),
         ] {
             if changed {
-                sm.add_system_message(format!("⚠ {label} change ignored — restart to apply."));
+                warnings.push(format!("⚠ {label} change ignored — restart to apply."));
             }
         }
 
-        // Re-scan skills against the session cwd and surface any load failures
-        // as system messages, so `/cd`/`/load`/`/new`/`/model` report a broken
-        // skill instead of silently dropping it.
+        // Re-scan skills against the session cwd and collect any load failures
+        // so `/cd`/`/load`/`/new`/`/model` report a broken skill instead of
+        // silently dropping it.
         let (skills, skill_warnings) = load_default_skills(&sm.session_cwd());
         ctx.skills = skills;
-        for warning in skill_warnings {
-            sm.add_system_message(warning);
-        }
+        warnings.extend(skill_warnings);
 
         // Commit. `config.provider` is preserved across the swap — the
         // resolve step owns it, and this is the invariant the regression
@@ -1476,6 +1494,8 @@ impl AgentRunner {
         ctx.searxng_config = config.searxng.clone();
         ctx.max_turns = config.agent_max_turns;
         ctx.bash_config = config.bash.clone();
+
+        warnings
     }
 
     /// Rebuild the live `DynAgent` against a `ResolvedModel` — the
@@ -1652,8 +1672,12 @@ impl AgentRunner {
         // config/skill edit lands on this /load. Refreshes the registry the
         // find-by-wire-id below relies on, plus skills/system prompt (the
         // prompt may be rebuilt again below if the saved cwd differs).
+        // The conversation was already loaded by the /load handler, so
+        // warnings are safe to surface immediately.
         let sm_arc = sm.clone();
-        Self::reload_session_config(config, ctx, &sm_arc);
+        for warning in Self::reload_session_config(config, ctx, &sm_arc) {
+            sm.add_system_message(warning);
+        }
 
         let Some(conv) = sm.get_current_conversation() else {
             return;
@@ -1756,7 +1780,11 @@ impl AgentRunner {
         let Some(ctx) = rebuild_ctx else { return };
         let sm_arc = sm.clone();
 
-        Self::reload_session_config(config, ctx, &sm_arc);
+        // `/new` already reset to a fresh conversation before this runs, so
+        // reload/skill warnings are safe to surface immediately.
+        for warning in Self::reload_session_config(config, ctx, &sm_arc) {
+            sm.add_system_message(warning);
+        }
 
         // Re-resolve the active model against the fresh registry. Prefer
         // the active alias; fall back to the wire id. A removed alias
@@ -2136,22 +2164,6 @@ impl AgentRunner {
                 // /stats and /context are correctly silent: the data they
                 // expose is rendered ambiently in the status bar (see
                 // `ui::repl::repl_impl`). Nothing to do here.
-            }
-            "/config" => {
-                if let Some(sm) = state_manager {
-                    let path = crate::config::get_config_file_path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<no platform config dir>".to_string());
-                    sm.add_system_message(format!(
-                        "Config: {path}\n\
-                         Session verbs (/new, /model, /cd, /load) re-read config + skills.\n\
-                         Reload-safe: providers/default_model, skills + system prompt, \
-                         searxng, bash.env, agent_max_turns, cost_tracking, context, retry, memory.\n\
-                         Boot-only (edit → restart): mcp_servers, vector_db, web.*, pipeline, provider."
-                    ));
-                } else {
-                    tracing::warn!("State manager not available for /config command");
-                }
             }
             "/compact" => {
                 // /compact is an ACTION, not a data-display command.
@@ -3067,30 +3079,6 @@ mod tests {
                 cmd.description
             );
         }
-    }
-
-    #[tokio::test]
-    async fn config_command_emits_reload_safe_and_boot_only_lists() {
-        let sm = StateManager::new_arc();
-        let config = Config::default();
-
-        AgentRunner::process_command_internal("/config", &Some(sm.clone()), &config).await;
-
-        let state = sm.get_state();
-        let body = state
-            .chat
-            .messages
-            .iter()
-            .find(|m| matches!(m.role, crate::ui::MessageRole::System))
-            .map(|m| m.content.clone())
-            .expect("/config must emit a system message");
-
-        assert!(body.contains("Config:"), "must show the config path line");
-        assert!(body.contains("Reload-safe"), "must list reload-safe keys");
-        assert!(
-            body.contains("Boot-only") && body.contains("mcp_servers"),
-            "must warn which keys are boot-only"
-        );
     }
 
     // --- system-prompt shell awareness (#82) ---------------------------------

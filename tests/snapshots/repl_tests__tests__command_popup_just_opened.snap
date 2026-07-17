@@ -17,9 +17,9 @@ expression: "lines.join(\"\\n\")"
 │  /help  List available commands                          │                    
 │  /stats  Show session statistics (tokens, cost)          │                    
 │  /context  Show context usage status                     │                    
-│  /config  Show config path + which keys reload on sessio…│                    
 │  /compact  Force context compaction                      │                    
 │  /conversations  List saved conversations                │                    
 │  /reset  Reset session statistics                        │                    
 │  /new  Start a new conversation                          │                    
+│  /save  Save the current conversation                    │                    
 └───────────── ↑/↓ · Tab complete · Enter run · Esc cancel ┘

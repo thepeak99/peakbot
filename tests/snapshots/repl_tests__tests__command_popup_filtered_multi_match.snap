@@ -16,9 +16,9 @@ expression: "lines.join(\"\\n\")"
                                                                                 
                                                                                 
                                                                                 
+                                                                                
 ┌ Commands ────────────────────────────────────────────────┐                    
 │  /context  Show context usage status                     │                    
-│  /config  Show config path + which keys reload on sessio…│                    
 │  /compact  Force context compaction                      │                    
 │  /conversations  List saved conversations                │                    
 │  /cd <args>  Show the working directory, or change it wi…│                    

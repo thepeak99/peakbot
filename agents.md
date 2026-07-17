@@ -346,8 +346,7 @@ Editing `config.yaml` (master + per-repo `.peakbot/config.yaml`) or skills
 under `.agents/skills` no longer requires a restart. Each of the four session
 verbs re-reads config and re-scans skills for the *running session* before it
 rebuilds the agent — reload is per-session (it never mutates the process-wide
-`SessionDeps` shared across web tabs). `/config` prints the config path plus
-the key lists below.
+`SessionDeps` shared across web tabs).
 
 Failures are handled at the boundary and never crash the session: malformed
 YAML or an invalid `default_model` warns (`⚠ config reload failed … — keeping
@@ -608,7 +607,6 @@ mcp_servers:
 |---------|-------------|
 | `/stats` | Show session statistics (tokens, cost) |
 | `/context` | Show context usage status |
-| `/config` | Show config path + which keys reload on session verbs |
 | `/compact` | Force context compaction |
 | `/bg` | List background processes (`bash_bg` registry) |
 | `exit` | Quit the REPL |

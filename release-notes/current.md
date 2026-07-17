@@ -160,4 +160,14 @@ This file is the working draft for the next release. When a version is tagged, t
   prompt was dismissed instead of granted, it stayed off forever even
   though `enabled` was true. Now the bell reflects user intent
   immediately — the capability layer is communicated in the tooltip /
-  disabled-blocked variant, not in the affordance.
+  disabled-blocked variant, not in the affordance.- Removed the `/config` command. It emitted a wall of text that provided no
+  actionable value in the UI; the config path and reload-safe/boot-only key
+  lists live in `agents.md`. Dropped from the slash-command popup, `/help`, the
+  dispatcher, and the docs.
+- Fixed skill/config-reload warnings vanishing on `/model` and `/cd`. Those
+  verbs surfaced a broken-skill (or boot-only-change) warning *before* resetting
+  the conversation, so `reset_conversation_state()` immediately wiped it and the
+  user never saw it. `reload_session_config` now returns its warnings instead of
+  emitting them inline; each caller surfaces them *after* any conversation reset,
+  so the message survives. `/new` and `/load` (which reset earlier) are
+  unchanged in behaviour.
