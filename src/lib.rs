@@ -2160,10 +2160,66 @@ impl AgentRunner {
                     tracing::warn!("State manager not available for /reset command");
                 }
             }
-            "/stats" | "/context" => {
-                // /stats and /context are correctly silent: the data they
-                // expose is rendered ambiently in the status bar (see
-                // `ui::repl::repl_impl`). Nothing to do here.
+            "/stats" => {
+                if let Some(sm) = state_manager {
+                    let stats = sm.get_stats();
+                    let state = sm.get_state();
+                    let model_display = if state.stats.model_alias.is_empty() {
+                        state.stats.model.clone()
+                    } else {
+                        state.stats.model_alias.clone()
+                    };
+                    let msg = format!(
+                        "## Session Statistics\n\n\
+                         **Model:** {}\n\
+                         **API Calls:** {}\n\
+                         **Total Cost:** ${:.4}\n\
+                         **Input Tokens (last request):** {}\n\
+                         **Output Tokens (last request):** {}\n\
+                         **Cumulative Input Tokens:** {}",
+                        model_display,
+                        stats.total_api_calls,
+                        stats.total_cost,
+                        stats.total_input_tokens,
+                        stats.total_output_tokens,
+                        stats.cumulative_input_tokens(),
+                    );
+                    sm.add_system_message(msg);
+                } else {
+                    tracing::warn!("State manager not available for /stats command");
+                }
+            }
+            "/context" => {
+                if let Some(sm) = state_manager {
+                    let state = sm.get_state();
+                    let needs = sm.needs_compaction();
+                    let usage_pct = state.context.usage_percentage();
+                    let msg = format!(
+                        "## Context Usage\n\n\
+                         **Messages:** {}\n\
+                         **Context Tokens:** {} / {} ({:.1}%)\n\
+                         **Compaction:** {}\n\
+                         **Threshold:** {:.0}%{}",
+                        state.chat.messages.len(),
+                        state.context.current_usage,
+                        state.context.window_size,
+                        usage_pct,
+                        if state.context.compaction_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        state.context.compaction_threshold * 100.0,
+                        if needs {
+                            " — ⚠️ threshold reached"
+                        } else {
+                            ""
+                        },
+                    );
+                    sm.add_system_message(msg);
+                } else {
+                    tracing::warn!("State manager not available for /context command");
+                }
             }
             "/compact" => {
                 // /compact is an ACTION, not a data-display command.
