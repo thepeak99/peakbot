@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
 import type { ChatMessage, MessageRole } from "../types";
 
@@ -53,10 +54,13 @@ function isMonospace(role: MessageRole): boolean {
 }
 
 // Agent replies, compaction summaries, system banners, and tool results are
-// markdown text; user input and toolCall lines stay literal. System banners
-// carry deliberate markup (e.g. the backticked path in a `/cd` error is meant
-// to render as inline code) and are our own strings, not user-controlled —
-// safe because react-markdown renders no raw HTML by default (kept that way).
+// markdown text; user input and toolCall lines stay literal. remark-breaks
+// makes single newlines render as line breaks, matching the TUI's SoftBreak
+// handling — so multi-line banners like /stats and /context don't collapse
+// onto one line. System banners carry deliberate markup (e.g. the backticked
+// path in a `/cd` error is meant to render as inline code) and are our own
+// strings, not user-controlled — safe because react-markdown renders no raw
+// HTML by default (kept that way).
 function isMarkdown(role: MessageRole): boolean {
   return (
     role === "agent" ||
@@ -87,7 +91,7 @@ export function Message({ message }: { message: ChatMessage }) {
       </div>
       {isMarkdown(message.role) ? (
         <div className="markdown-body text-sm leading-relaxed text-zinc-200">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+          <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} rehypePlugins={[rehypeHighlight]}>
             {message.content}
           </ReactMarkdown>
         </div>

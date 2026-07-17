@@ -4,6 +4,16 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Fixed multi-line system banners (like `/stats` and `/context`) collapsing
+  onto a single line in the web UI.** The banners are Markdown with each field
+  on its own line separated by a single newline. The TUI renders a `SoftBreak`
+  as a line break, so they looked correct there; the web's `react-markdown`
+  follows CommonMark, where a lone newline inside a paragraph is just
+  whitespace — collapsing every field onto one line. The web `Message`
+  component now runs the `remark-breaks` plugin, so single newlines render as
+  `<br>`, matching the TUI's behaviour. Fixes `/stats` and `/context` and any
+  other soft-break banner at once, with no change to the message strings.
+
 - **System messages are now Markdown-rendered in both the REPL and the web
   UI.** Previously only agent replies went through the `MarkdownRenderer`;
   system banners fell through to the plain renderer, so deliberate markup —
