@@ -107,21 +107,16 @@ This file is the working draft for the next release. When a version is tagged, t
   every error (including deterministic 401/403/404) was retried. It now
   classifies errors as transient (via a new `providers::retry` module) and
   sleeps with `initial_delay_ms * backoff_factor^attempt`, capped at
-  `max_delay_ms`, plus up to ~250 ms of jitter. Permanent failures (401,
-  context-length errors, `MaxTurnsError`, `ToolError`, etc.) bail
-  immediately with a system message naming the error — no wasted
-  round-trips, no silent hangs. Transient classification relies on
-  message-substring matching because every `rig-core` provider strips the
-  HTTP status from its error variant (the only data we have on the wire);
-  a clean fix needs an upstream patch to preserve status. The existing
-  `RetryConfig` is now actually used; no new deps, no per-model override
-  yet. A new `Retried Requests` counter in `/stats` (rendered as `↻ N` in
-  the status bar when non-zero) tells the user the agent is silently
-  waiting on a flaky upstream instead of wondering why their turn took
-  12 seconds. Retry-After header support and per-model retry config are
-  explicitly out of scope for this change. The transient-marker list
-  requires `at capacity` (not bare `capacity`) so a permanent
-  "insufficient capacity" quota error is not retried.
+  `max_delay_ms`. Permanent failures (401, context-length errors,
+  `MaxTurnsError`, `ToolError`, etc.) bail immediately with a system message
+  naming the error — no wasted round-trips, no silent hangs. The status line
+  reports each attempt live (`Retrying (attempt 2/3) after 4.0s…`). Transient
+  classification relies on message-substring matching because every `rig-core`
+  provider strips the HTTP status from its error variant (the only data we have
+  on the wire); a clean fix needs an upstream patch to preserve status. The
+  existing `RetryConfig` is now actually used; no new deps, no per-model
+  override yet. Retry-After header support and per-model retry config are
+  explicitly out of scope for this change.
 - The notifications bell now lights up the moment you click it. Previously
   the visual was gated on `enabled && permission === "granted"`, so the
   first click on a fresh tab (when permission is `"default"` and the

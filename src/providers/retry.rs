@@ -16,25 +16,20 @@ use rig_core::completion::{CompletionError, PromptError};
 use std::time::Duration;
 
 /// Substring markers in `ProviderError`/`ResponseError` messages that
-/// indicate a transient (retryable) upstream failure. The list is
-/// deliberately conservative — false positives cost a 30s sleep, false
-/// negatives cost the user their turn.
+/// indicate a transient (retryable) upstream failure. Deliberately short:
+/// the reliable signal is `HttpError` (transport-level, always transient);
+/// this list is a best-effort fallback for the case where rig has folded an
+/// HTTP status into a string. Every marker is a maintenance liability, so we
+/// keep only the high-confidence ones and let false negatives fail the turn
+/// rather than guess at every vendor's prose.
 const TRANSIENT_MESSAGE_MARKERS: &[&str] = &[
     "429",
     "rate limit",
-    "too many requests",
-    " 500 ",
-    " 502 ",
-    " 503 ",
-    " 504 ",
-    " 524 ",
-    "server error",
-    "service unavailable",
-    "bad gateway",
-    "gateway timeout",
-    "temporarily unavailable",
+    "500",
+    "502",
+    "503",
+    "504",
     "overloaded",
-    "at capacity",
 ];
 
 /// Whether a `CompletionError` is worth retrying. See module docs for why
@@ -71,24 +66,16 @@ pub fn is_transient_prompt_error(err: &PromptError) -> bool {
 }
 
 /// Backoff for the given attempt (0-indexed): `initial_delay_ms *
-/// backoff_factor^attempt`, capped at `max_delay_ms`, plus up to ~250ms
-/// of cheap nano-derived jitter so concurrent callers don't synchronize.
-/// No `rand` dependency — same trick `fetch_page` uses.
+/// backoff_factor^attempt`, capped at `max_delay_ms`. No jitter: this is a
+/// single interactive agent retrying its own turn, not a fleet of clients
+/// that could stampede a recovering upstream — there's no herd to spread out.
 pub fn backoff_delay(attempt: u32, cfg: &RetryConfig) -> Duration {
     // Clamp attempt to keep `2^attempt` bounded; we cap the result with
     // `max_delay_ms` anyway, but the multiplication has to not overflow.
     let capped_attempt = attempt.min(32);
     let factor = cfg.backoff_factor.powi(capped_attempt as i32);
     let base_ms = (cfg.initial_delay_ms as f64 * factor) as u64;
-    let base = Duration::from_millis(base_ms).min(Duration::from_millis(cfg.max_delay_ms));
-
-    // Cheap, dependency-free jitter: low bits of the wall clock in nanos.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let jitter = Duration::from_millis((nanos % 250) as u64);
-    base + jitter
+    Duration::from_millis(base_ms).min(Duration::from_millis(cfg.max_delay_ms))
 }
 
 #[cfg(test)]
@@ -107,11 +94,10 @@ mod tests {
         let transient = [
             "HTTP 429 Too Many Requests",
             "rate limit exceeded, slow down",
-            "Too Many Requests, please retry",
-            " 500 Internal Server Error",
-            " 502 Bad Gateway",
-            " 503 Service Unavailable",
-            " 504 Gateway Timeout",
+            "status:500 Internal Server Error",
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "504 Gateway Timeout",
             "The server is overloaded, try again",
         ];
         for msg in transient {
@@ -128,7 +114,6 @@ mod tests {
             "Context length exceeded",
             "Bad request: missing field",
             "Forbidden: quota exhausted permanently",
-            "Insufficient capacity for this model",
         ];
         for msg in permanent {
             let e = CompletionError::ProviderError(msg.to_string());
@@ -178,27 +163,15 @@ mod tests {
             backoff_factor: 2.0,
         };
 
-        // attempt 0: 1000ms ± jitter
-        // attempt 1: 2000ms ± jitter
-        // attempt 2: 4000ms ± jitter
-        // attempt 3: 8000ms (would be 8000 = max, fits)
-        // attempt 4+: clamped to max_delay_ms
-        let jitter = Duration::from_millis(250);
-        let within = |d: Duration, base_ms: u64| {
-            let lo = Duration::from_millis(base_ms);
-            let hi = lo + jitter;
-            d >= lo && d < hi
-        };
-
-        assert!(within(backoff_delay(0, &cfg), 1000));
-        assert!(within(backoff_delay(1, &cfg), 2000));
-        assert!(within(backoff_delay(2, &cfg), 4000));
-        assert!(within(backoff_delay(3, &cfg), 8000));
+        let ms = |n| Duration::from_millis(n);
+        assert_eq!(backoff_delay(0, &cfg), ms(1000));
+        assert_eq!(backoff_delay(1, &cfg), ms(2000));
+        assert_eq!(backoff_delay(2, &cfg), ms(4000));
+        assert_eq!(backoff_delay(3, &cfg), ms(8000)); // == max, fits
+        assert_eq!(backoff_delay(4, &cfg), ms(8000)); // clamped to max
 
         // attempt 100 would overflow 2^100 — must not panic, must clamp.
-        let d = backoff_delay(100, &cfg);
-        assert!(d >= Duration::from_millis(8000));
-        assert!(d < Duration::from_millis(8000) + jitter);
+        assert_eq!(backoff_delay(100, &cfg), ms(8000));
     }
 
     #[test]
@@ -209,9 +182,7 @@ mod tests {
             max_delay_ms: 100,
             backoff_factor: 2.0,
         };
-        // 0 * anything = 0; result is bounded by jitter (<250ms) which is
-        // > max_delay_ms — confirm we still cap at max_delay_ms.
-        let d = backoff_delay(5, &cfg);
-        assert!(d <= Duration::from_millis(100) + Duration::from_millis(250));
+        // 0 * anything = 0 — no delay, no panic.
+        assert_eq!(backoff_delay(5, &cfg), Duration::from_millis(0));
     }
 }

@@ -1847,10 +1847,6 @@ impl AgentRunner {
                             config.retry().max_retries,
                             delay.as_secs_f64()
                         )));
-                        // Surface the retry in /stats so the user can see
-                        // it happening rather than wondering why the turn
-                        // is taking 12 seconds.
-                        sm.inc_retries();
                     }
                     tokio::time::sleep(delay).await;
                     retry_count += 1;

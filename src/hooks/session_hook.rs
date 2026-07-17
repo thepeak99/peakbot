@@ -64,10 +64,6 @@ pub struct SessionStats {
     pub total_api_calls: u64,
     /// Total cost in USD
     pub total_cost: f64,
-    /// Total number of retried LLM requests (transient failures that the
-    /// backoff loop recovered from). Surfaced in `/stats` so the user can
-    /// see when the agent is silently waiting on a rate-limited upstream.
-    pub retries: u64,
     /// Per-request history for debugging
     requests: Vec<RequestStats>,
 }
@@ -98,9 +94,8 @@ impl SessionStats {
     /// Get a summary string of the session stats
     pub fn summary(&self) -> String {
         format!(
-            "Total API Calls: {}\nRetried Requests: {}\nTotal Input Tokens: {}\nTotal Output Tokens: {}\nTotal Tokens: {}\nTotal Cost: ${:.4}",
+            "Total API Calls: {}\nTotal Input Tokens: {}\nTotal Output Tokens: {}\nTotal Tokens: {}\nTotal Cost: ${:.4}",
             self.total_api_calls,
-            self.retries,
             self.total_input_tokens,
             self.total_output_tokens,
             self.total_input_tokens + self.total_output_tokens,
@@ -122,16 +117,7 @@ impl SessionStats {
         self.total_output_tokens = 0;
         self.total_api_calls = 0;
         self.total_cost = 0.0;
-        self.retries = 0;
         self.requests.clear();
-    }
-
-    /// Bump the retry counter. Called from the backoff loop in
-    /// `process_message_internal` on every transient failure that we
-    /// choose to retry. Visible in `/stats` so the user can see when
-    /// the agent is silently waiting on a rate-limited upstream.
-    pub fn inc_retries(&mut self) {
-        self.retries += 1;
     }
 
     /// Restore stats from a persisted snapshot (e.g. after `/load`).

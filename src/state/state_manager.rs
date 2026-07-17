@@ -416,28 +416,17 @@ impl StateManager {
         self.sync_stats_to_ui();
     }
 
-    /// Bump the retry counter and push to the UI. Called from the
-    /// backoff loop in `process_message_internal` on every transient
-    /// failure we choose to retry. Visible in `/stats` and the status
-    /// bar so the user can see when the agent is silently waiting on
-    /// a rate-limited upstream.
-    pub fn inc_retries(&self) {
-        self.stats.lock().unwrap().inc_retries();
-        self.sync_stats_to_ui();
-    }
-
     /// Sync stats to AppState. Lock order: stats → state (load-bearing — see
     /// `add_request_and_persist_current_do_not_deadlock` regression test).
     fn sync_stats_to_ui(&self) {
         // Snapshot under stats lock, release before acquiring state.write.
-        let (input, output, calls, cost, retries, last_input) = {
+        let (input, output, calls, cost, last_input) = {
             let stats = self.stats.lock().unwrap();
             (
                 stats.total_input_tokens,
                 stats.total_output_tokens,
                 stats.total_api_calls,
                 stats.total_cost,
-                stats.retries,
                 // last_input_tokens is the current context size (not cumulative)
                 stats.last_input_tokens().unwrap_or(0),
             )
@@ -448,7 +437,6 @@ impl StateManager {
         state.stats.total_output_tokens = output;
         state.stats.total_api_calls = calls;
         state.stats.total_cost = cost;
-        state.stats.retries = retries;
         state.context.current_usage = last_input;
         self.notify_update(&state);
     }
