@@ -1,16 +1,18 @@
 //! Markdown rendering for chat messages.
 //!
 //! [`MarkdownRenderer`] is the width-aware [`MessageRenderer`] used for
-//! agent replies in the live REPL. Non-agent roles fall back to
-//! [`PlainRenderer`] verbatim (user input, tool output, system banners
-//! must round-trip without parsing — see `markdown-render.md` § Scope).
+//! agent replies **and** system banners in the live REPL. The remaining
+//! roles fall back to [`PlainRenderer`] verbatim (user input and tool
+//! output must round-trip without parsing — see `markdown-render.md`
+//! § Scope). System banners opt in because they carry deliberate markdown
+//! (e.g. `` `path` `` in a `/cd` error is meant to render as inline code).
 //!
 //! # Header line
 //!
-//! For agent messages, the `[HH:MM:SS] 🤖 Agent:` prefix gets its **own**
-//! `Line`. The plain renderer glues it onto the first content line, but
-//! markdown bodies can start with a block-level element (heading, code
-//! block, table) that can't share a row with a prefix span.
+//! For markdown-rendered roles, the `[HH:MM:SS] <role>:` prefix gets its
+//! **own** `Line`. The plain renderer glues it onto the first content
+//! line, but markdown bodies can start with a block-level element
+//! (heading, code block, table) that can't share a row with a prefix span.
 //!
 //! # Width
 //!
@@ -53,8 +55,8 @@ fn cell_width_of_char(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
-/// Renders agent messages as styled markdown; everything else falls
-/// through to [`PlainRenderer`].
+/// Renders agent messages and system banners as styled markdown;
+/// everything else falls through to [`PlainRenderer`].
 #[derive(Default)]
 pub struct MarkdownRenderer {
     fallback: PlainRenderer,
@@ -62,10 +64,10 @@ pub struct MarkdownRenderer {
 
 impl MessageRenderer for MarkdownRenderer {
     fn render(&self, msg: &ChatMessage, width: u16) -> Vec<Line<'static>> {
-        if msg.role != MessageRole::Agent {
-            return self.fallback.render(msg, width);
+        match msg.role {
+            MessageRole::Agent | MessageRole::System => render_markdown(msg, width),
+            _ => self.fallback.render(msg, width),
         }
-        render_agent_markdown(msg, width)
     }
 }
 
@@ -115,30 +117,35 @@ fn is_clickable_scheme(url: &str) -> bool {
     u.starts_with("http://") || u.starts_with("https://") || u.starts_with("mailto:")
 }
 
-// ─── Agent prefix line ────────────────────────────────────────────────
+// ─── Prefix line ──────────────────────────────────────────────────────
 
-/// Build the timestamp + role prefix as a standalone `Line`. Matches the
-/// PlainRenderer palette so the visual change is "the prefix moved to its
-/// own row", nothing more.
-fn agent_prefix_line(msg: &ChatMessage) -> Line<'static> {
+/// Build the timestamp + role prefix as a standalone `Line`, deriving the
+/// label and colour from the message role. Matches the [`PlainRenderer`]
+/// palette so the only visual change is "the prefix moved to its own row".
+/// The `⚙ System` label uses the VS16-stripped base glyph (U+2699 alone)
+/// exactly like `PlainRenderer` — see `garbled.md` Class A.
+fn prefix_line(msg: &ChatMessage) -> Line<'static> {
+    // Only Agent and System reach here (the gate filters the rest); the
+    // wildcard defaults to the Agent palette to stay total.
+    let (label, color) = match msg.role {
+        MessageRole::System => ("⚙ System", Color::LightYellow),
+        _ => ("🤖 Agent", Color::LightMagenta),
+    };
     let timestamp = msg.timestamp.format("%H:%M:%S").to_string();
     Line::from(vec![
         Span::raw("["),
         Span::styled(timestamp, Style::default().fg(Color::Gray)),
         Span::raw("] "),
-        Span::styled(
-            "🤖 Agent".to_string(),
-            Style::default().fg(Color::LightMagenta),
-        ),
+        Span::styled(label.to_string(), Style::default().fg(color)),
         Span::raw(":"),
     ])
 }
 
 // ─── Top-level entry ──────────────────────────────────────────────────
 
-fn render_agent_markdown(msg: &ChatMessage, width: u16) -> Vec<Line<'static>> {
+fn render_markdown(msg: &ChatMessage, width: u16) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    out.push(agent_prefix_line(msg));
+    out.push(prefix_line(msg));
 
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -955,6 +962,27 @@ mod tests {
         let md_lines = mr.render(&msg, 80);
         let plain_lines = PlainRenderer.render(&msg, 80);
         assert_eq!(md_lines.len(), plain_lines.len());
+    }
+
+    #[test]
+    fn system_role_renders_markdown_with_own_prefix() {
+        let mut msg = ChatMessage::agent("❌ /cd: `no such dir`".to_string());
+        msg.role = MessageRole::System;
+        let lines = MarkdownRenderer::default().render(&msg, 80);
+        // Prefix on its own line; backticks stripped in the body (rendered
+        // as inline code) — the whole point of markdown-rendering banners.
+        assert!(line_text(&lines[0]).contains("System"));
+        assert!(!line_text(&lines[0]).contains("/cd"));
+        let body: String = lines
+            .iter()
+            .skip(1)
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("no such dir") && !body.contains('`'),
+            "system banner backticks must render as inline code: {body}"
+        );
     }
 
     // ─── Prefix line ──────────────────────────────────────────────────

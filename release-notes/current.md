@@ -4,6 +4,35 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Fixed multi-line system banners (like `/stats` and `/context`) collapsing
+  onto a single line in the web UI.** The banners are Markdown with each field
+  on its own line separated by a single newline. The TUI renders a `SoftBreak`
+  as a line break, so they looked correct there; the web's `react-markdown`
+  follows CommonMark, where a lone newline inside a paragraph is just
+  whitespace — collapsing every field onto one line. The web `Message`
+  component now runs the `remark-breaks` plugin, so single newlines render as
+  `<br>`, matching the TUI's behaviour. Fixes `/stats` and `/context` and any
+  other soft-break banner at once, with no change to the message strings.
+
+- **System messages are now Markdown-rendered in both the REPL and the web
+  UI.** Previously only agent replies went through the `MarkdownRenderer`;
+  system banners fell through to the plain renderer, so deliberate markup —
+  like the backticked path in a `/cd` error (`` ❌ /cd: `no such dir` ``) —
+  showed its literal backticks instead of inline-code styling. The REPL
+  renderer gate now covers both `Agent` and `System` roles, and the standalone
+  prefix line was generalized to derive its label/colour from the role
+  (`🤖 Agent` / `⚙ System`) instead of hardcoding the agent header. The web SPA
+  (`Message.tsx`) `isMarkdown` gate was widened the same way so both UIs agree.
+  User input and tool-call lines still round-trip verbatim.
+
+- **Fixed `/stats` and `/context` slash commands (#46).** Both commands were
+  advertised in the command popup and `/help` output but silently did nothing
+  when invoked. `/stats` now displays session statistics (model, API calls,
+  total cost, input/output tokens, cumulative input tokens). `/context` now
+  displays context usage (message count, current tokens vs window size,
+  usage percentage, compaction status and threshold, with a warning if the
+  compaction threshold has been reached).
+
 - **Skill-load failures are now surfaced in both the TUI and web UI, and
   local `.agents/skills` are resolved against the session working directory.**
   Previously a skill that failed to parse (bad YAML frontmatter, invalid
