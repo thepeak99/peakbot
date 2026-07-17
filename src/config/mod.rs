@@ -1368,32 +1368,49 @@ impl Config {
     ///
     /// Returns `LoadedConfig` with the loaded config and metadata about what was found.
     pub fn load() -> anyhow::Result<LoadedConfig> {
-        // Step 1: Start with defaults
-        let mut config = Config::default();
-
-        // Step 2: Load and apply master config if present. A malformed
-        // master config is fatal — see `load_yaml_config` for rationale.
+        // A malformed master config is fatal — see `load_yaml_config`.
         let (master, config_file_path) = load_yaml_config()?;
         let config_file_found = master.is_some();
-        if let Some(master) = master {
-            config = master;
-            tracing::debug!("Config after master load: provider = {:?}", config.provider);
-        }
-
-        // Step 3: Load and merge per-repo config if present (top-level key override)
-        if let Some(repo_config) = load_per_repo_config() {
-            config.merge_with(repo_config);
-            tracing::debug!(
-                "Config after per-repo merge: provider = {:?}",
-                config.provider
-            );
-        }
+        let config = Self::merge_sources(master, load_per_repo_config());
 
         Ok(LoadedConfig {
             config,
             config_file_found,
             config_file_path,
         })
+    }
+
+    /// Re-read config from disk (master + per-repo merge) for a live
+    /// session, without touching process-wide `SessionDeps`. Same
+    /// precedence as [`Config::load`], but returns a bare `Config` and
+    /// maps a malformed-master error to `Err(reason)` so the caller can
+    /// keep the previous config and warn instead of crashing.
+    ///
+    /// A missing master file behaves like boot (defaults + per-repo).
+    pub fn reload() -> Result<Config, String> {
+        let master = load_yaml_config().map_err(|e| e.to_string())?.0;
+        Ok(Self::merge_sources(master, load_per_repo_config()))
+    }
+
+    /// Pure merge of the two config sources over defaults — the
+    /// testable core shared by [`Config::load`] and [`Config::reload`].
+    /// Master (if present) replaces defaults; per-repo (if present) is
+    /// merged on top with top-level key override.
+    fn merge_sources(master: Option<Config>, per_repo: Option<Config>) -> Config {
+        let mut config = master.unwrap_or_default();
+        if let Some(repo_config) = per_repo {
+            config.merge_with(repo_config);
+        }
+        config
+    }
+
+    /// Adopt every field from `fresh` **except** `provider`, which is
+    /// owned by the resolve step and must never be overwritten by a
+    /// reload. This is the single point that enforces that invariant.
+    pub fn adopt_reloaded(&mut self, fresh: Config) {
+        let saved_provider = self.provider.clone();
+        *self = fresh;
+        self.provider = saved_provider;
     }
 }
 
@@ -2206,5 +2223,67 @@ auth:
             msg.contains("scope") || msg.contains("unknown field"),
             "deserialization error must name the unknown field, got: {msg}"
         );
+    }
+
+    #[test]
+    fn merge_sources_no_master_uses_defaults_plus_repo() {
+        // Missing master file (None) → defaults, then per-repo merged on top.
+        let repo = Config {
+            agent_max_turns: 99,
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(None, Some(repo));
+        assert_eq!(merged.agent_max_turns, 99);
+    }
+
+    #[test]
+    fn merge_sources_repo_overrides_master() {
+        // Per-repo top-level keys win over master (precedence contract).
+        let master = Config {
+            agent_max_turns: 10,
+            ..Config::default()
+        };
+        let repo = Config {
+            agent_max_turns: 42,
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        assert_eq!(merged.agent_max_turns, 42);
+    }
+
+    #[test]
+    fn merge_sources_master_only_when_no_repo() {
+        // Master present, no per-repo → master survives unchanged.
+        let master = Config {
+            agent_max_turns: 7,
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), None);
+        assert_eq!(merged.agent_max_turns, 7);
+    }
+
+    #[test]
+    fn adopt_reloaded_preserves_provider_adopts_ancillary() {
+        // `provider` is owned by the resolve step: a reload must never
+        // clobber it, but must adopt every ancillary field.
+        let mut live = Config {
+            agent_max_turns: 3,
+            ..Config::default()
+        };
+        if let ProviderConfig::OpenRouter(ref mut c) = live.provider {
+            c.model = "resolve-owned-model".to_string();
+        }
+
+        let fresh = Config {
+            agent_max_turns: 77,
+            ..Config::default() // default (different) provider
+        };
+
+        live.adopt_reloaded(fresh);
+
+        // Provider is the resolve-owned one, NOT the fresh default.
+        assert_eq!(live.model(), "resolve-owned-model");
+        // Ancillary fields came from fresh.
+        assert_eq!(live.agent_max_turns, 77);
     }
 }

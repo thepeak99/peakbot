@@ -4,6 +4,26 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Config + skills now hot-reload on session verbs (#159).** Editing
+  `config.yaml` (master + per-repo `.peakbot/config.yaml`) or skills under
+  `.agents/skills` no longer requires a restart: `/new`, `/model`, `/cd`, and
+  `/load` each re-read config and re-scan skills for the running session before
+  rebuilding the agent. Reload is per-session — it never mutates the
+  process-wide `SessionDeps` shared across web tabs. Reload-safe keys take effect
+  immediately: `providers:`/`default_model` (rebuilt registry, so newly-added
+  aliases resolve), skills + system prompt, `searxng`, `bash.env`,
+  `agent_max_turns`, `cost_tracking`, `context`, `retry`, `memory`. Boot-only
+  keys are diffed and flagged (`⚠ … ignored — restart to apply.`):
+  `mcp_servers`, `vector_db`, `web.*`, `pipeline`, and the legacy `provider`
+  block (owned by the model-resolve step, never overwritten by a reload — pinned
+  by `Config::adopt_reloaded`). Failures are handled at the boundary and never
+  crash the session: malformed YAML or an invalid `default_model` warns and keeps
+  the previous config. `/new` rebuilds on your currently-active model (refreshing
+  skills/prompt/ancillary config) rather than bouncing you to `default_model`.
+  A new `/config` command prints the config path plus the reload-safe/boot-only
+  key lists, and the lying "config has been hot-reloaded under us" comment in the
+  `/model` path now describes the real reload.
+
 - **Web favicon now reflects agent state.** While the agent is working the
   favicon is replaced with a small spinning yellow arc (~15 fps, ~16 px)
   rendered from a canvas and pushed back into `<link rel="icon">`; when the

@@ -114,6 +114,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("help", "List available commands", false),
         SlashCommand::new("stats", "Show session statistics (tokens, cost)", false),
         SlashCommand::new("context", "Show context usage status", false),
+        SlashCommand::new(
+            "config",
+            "Show config path + which keys reload on session verbs",
+            false,
+        ),
         SlashCommand::new("compact", "Force context compaction", false),
         SlashCommand::new("conversations", "List saved conversations", false),
         SlashCommand::new("reset", "Reset session statistics", false),
@@ -322,6 +327,7 @@ mod tests {
                 "help",
                 "stats",
                 "context",
+                "config",
                 "compact",
                 "conversations",
                 "reset",
@@ -353,6 +359,7 @@ mod tests {
         assert!(!by_name("help"));
         assert!(!by_name("stats"));
         assert!(!by_name("context"));
+        assert!(!by_name("config"));
         assert!(!by_name("compact"));
         assert!(!by_name("conversations"));
         assert!(!by_name("reset"));
@@ -409,8 +416,11 @@ mod tests {
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        // "c" matches: context, compact, conversations, cd
-        assert_eq!(names, vec!["context", "compact", "conversations", "cd"]);
+        // "c" matches: context, config, compact, conversations, cd
+        assert_eq!(
+            names,
+            vec!["context", "config", "compact", "conversations", "cd"]
+        );
     }
 
     #[test]
