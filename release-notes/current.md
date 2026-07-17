@@ -4,6 +4,42 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Skill-load failures are now surfaced in both the TUI and web UI, and
+  local `.agents/skills` are resolved against the session working directory.**
+  Previously a skill that failed to parse (bad YAML frontmatter, invalid
+  name/description, unreadable directory) was only logged via `tracing` and
+  silently went missing — the user had no signal. Skill loading now returns
+  the failures alongside the registry, and they are emitted as system
+  messages (rendered identically in the ratatui REPL and the web SPA) at
+  session creation and after every `/new`/`/model`/`/cd`/`/load` re-scan.
+  A single broken skill is skipped, never aborting the scan. Separately, the
+  local skills directory was resolved against the *process* cwd, which — after
+  the per-session cwd refactor (the process cwd never moves) — meant a `/cd`
+  or `/load` into another tree re-scanned the wrong directory and missed that
+  project's local skills. Skill discovery now takes an explicit session cwd:
+  boot reads the launch dir, and per-session verbs pass the state manager's
+  `session_cwd`, so local skills track the session's actual directory.
+
+- **Config + skills now hot-reload on session verbs (#159).** Editing
+  `config.yaml` (master + per-repo `.peakbot/config.yaml`) or skills under
+  `.agents/skills` no longer requires a restart: `/new`, `/model`, `/cd`, and
+  `/load` each re-read config and re-scan skills for the running session before
+  rebuilding the agent. Reload is per-session — it never mutates the
+  process-wide `SessionDeps` shared across web tabs. Reload-safe keys take effect
+  immediately: `providers:`/`default_model` (rebuilt registry, so newly-added
+  aliases resolve), skills + system prompt, `searxng`, `bash.env`,
+  `agent_max_turns`, `cost_tracking`, `context`, `retry`, `memory`. Boot-only
+  keys are diffed and flagged (`⚠ … ignored — restart to apply.`):
+  `mcp_servers`, `vector_db`, `web.*`, `pipeline`, and the legacy `provider`
+  block (owned by the model-resolve step, never overwritten by a reload — pinned
+  by `Config::adopt_reloaded`). Failures are handled at the boundary and never
+  crash the session: malformed YAML or an invalid `default_model` warns and keeps
+  the previous config. `/new` rebuilds on your currently-active model (refreshing
+  skills/prompt/ancillary config) rather than bouncing you to `default_model`.
+  A new `/config` command prints the config path plus the reload-safe/boot-only
+  key lists, and the lying "config has been hot-reloaded under us" comment in the
+  `/model` path now describes the real reload.
+
 - **Web favicon now reflects agent state.** While the agent is working the
   favicon is replaced with a small spinning yellow arc (~15 fps, ~16 px)
   rendered from a canvas and pushed back into `<link rel="icon">`; when the
@@ -124,4 +160,14 @@ This file is the working draft for the next release. When a version is tagged, t
   prompt was dismissed instead of granted, it stayed off forever even
   though `enabled` was true. Now the bell reflects user intent
   immediately — the capability layer is communicated in the tooltip /
-  disabled-blocked variant, not in the affordance.
+  disabled-blocked variant, not in the affordance.- Removed the `/config` command. It emitted a wall of text that provided no
+  actionable value in the UI; the config path and reload-safe/boot-only key
+  lists live in `agents.md`. Dropped from the slash-command popup, `/help`, the
+  dispatcher, and the docs.
+- Fixed skill/config-reload warnings vanishing on `/model` and `/cd`. Those
+  verbs surfaced a broken-skill (or boot-only-change) warning *before* resetting
+  the conversation, so `reset_conversation_state()` immediately wiped it and the
+  user never saw it. `reload_session_config` now returns its warnings instead of
+  emitting them inline; each caller surfaces them *after* any conversation reset,
+  so the message survives. `/new` and `/load` (which reset earlier) are
+  unchanged in behaviour.

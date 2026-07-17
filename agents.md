@@ -340,6 +340,34 @@ indexed. See the `vector_db:` config block under
 
 PeakBot supports multiple LLM providers (OpenRouter, OpenAI, LlamaCpp, Ollama). Configuration is loaded from `config.yaml` in the platform config directory, with environment variables taking precedence.
 
+### Live reload on session verbs (`/new`, `/model`, `/cd`, `/load`)
+
+Editing `config.yaml` (master + per-repo `.peakbot/config.yaml`) or skills
+under `.agents/skills` no longer requires a restart. Each of the four session
+verbs re-reads config and re-scans skills for the *running session* before it
+rebuilds the agent — reload is per-session (it never mutates the process-wide
+`SessionDeps` shared across web tabs).
+
+Failures are handled at the boundary and never crash the session: malformed
+YAML or an invalid `default_model` warns (`⚠ config reload failed … — keeping
+previous config.`) and keeps the previously-loaded config running.
+
+`/new` reloads and rebuilds on your **currently-active** model — it refreshes
+skills, the system prompt, and ancillary config, but does *not* bounce you to
+`default_model` (that would surprise anyone who'd just `/model`-switched). To
+adopt a changed `default_model`, `/model <alias>` it, or restart.
+
+| Reload-safe (takes effect on the next session verb) | Boot-only (edit → restart; diffed and flagged with `⚠ … ignored — restart to apply.`) |
+|-----------------------------------------------------|----------------------------------------------------------------------------------------|
+| `providers:` / `default_model` (rebuilt registry — new aliases resolve) | `mcp_servers` (live subprocesses)          |
+| skills + system prompt (re-scanned)                 | `vector_db` (redb/HNSW handle)             |
+| `searxng.*`, `bash.env`, `agent_max_turns`          | `web.*` (read once by the session reaper)  |
+| `cost_tracking`, `context.*`, `retry.*`, `memory.*` | `pipeline` (a built sub-agent registry)    |
+|                                                     | `provider` (legacy block — owned by the resolve step, never overwritten by reload) |
+
+Not reloaded (rejected by design): a filesystem watcher / auto-reload on save —
+reload is explicit via the session verbs to avoid heisenbugs mid-turn.
+
 ### Multi-model with `/model`
 
 The recommended shape declares **a list of providers, each with its own list of models**, plus `default_model` to pick the boot alias. Use `/model` to list, `/model <alias>` to switch.

@@ -1,6 +1,6 @@
 ---
 source: tests/repl_tests.rs
-assertion_line: 1077
+assertion_line: 1141
 expression: "lines.join(\"\\n\")"
 ---
                                                                                 

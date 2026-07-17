@@ -46,6 +46,10 @@ pub struct SessionDeps {
     pub config: Config,
     pub model_registry: Arc<ModelRegistry>,
     pub skills: SkillRegistry,
+    /// User-facing warnings from the boot skill scan (a skill that failed to
+    /// parse, an unreadable dir). Emitted as system messages on session
+    /// creation so both the TUI and web UI surface them.
+    pub skill_warnings: Vec<String>,
     /// One set of MCP subprocesses shared by all sessions; each session
     /// clones the *tools list*, not the processes.
     pub mcp_handles: Arc<Vec<McpServerHandle>>,
@@ -233,6 +237,13 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         ));
     }
 
+    // Surface any skill-load failures from the boot scan so the user sees a
+    // broken skill instead of it silently going missing (TUI + web both
+    // render system messages).
+    for warning in &deps.skill_warnings {
+        state_manager.add_system_message(warning.clone());
+    }
+
     let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
 
     // `RebuildContext.system_prompt` is the per-session prompt (built from
@@ -364,6 +375,7 @@ mod tests {
             config,
             model_registry: registry,
             skills: crate::skills::SkillRegistry::new(),
+            skill_warnings: Vec::new(),
             mcp_handles: Arc::new(Vec::new()),
             searxng_config: None,
             pipeline_registry: None,

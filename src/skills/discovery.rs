@@ -2,7 +2,6 @@
 
 use crate::skills::parser::parse_skill_file;
 use crate::skills::types::Skill;
-use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -67,18 +66,40 @@ impl SkillRegistry {
         self.skills.is_empty()
     }
 
-    /// Load all skills from a directory
-    pub fn load_from_directory(&mut self, dir: &Path) -> Result<()> {
+    /// Load all skills from a directory, appending a user-facing line to
+    /// `warnings` for every skill that fails to parse (so the UI can surface
+    /// it) — a single bad skill never aborts the scan.
+    pub fn load_from_directory(&mut self, dir: &Path, warnings: &mut Vec<String>) {
         if !dir.is_dir() {
             tracing::debug!("Skills directory does not exist: {}", dir.display());
-            return Ok(());
+            return;
         }
 
         tracing::info!("Loading skills from: {}", dir.display());
 
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("Failed to read skills directory {}: {}", dir.display(), e);
+                warnings.push(format!(
+                    "⚠ Skill directory unreadable: {} — {e}",
+                    dir.display()
+                ));
+                return;
+            }
+        };
+
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    warnings.push(format!(
+                        "⚠ Skill entry unreadable in {}: {e}",
+                        dir.display()
+                    ));
+                    continue;
+                }
+            };
 
             if !path.is_dir() {
                 continue;
@@ -98,11 +119,10 @@ impl SkillRegistry {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse skill in {}: {}", path.display(), e);
+                    warnings.push(format!("⚠ Skill load failed: {} — {e}", path.display()));
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Generate a system prompt section with available skills
@@ -130,8 +150,11 @@ impl SkillRegistry {
 }
 
 /// Get the default skills directories to search
-/// On Linux: ~/.agents/skills and ./.agents/skills (in current workdir)
-pub fn get_default_skills_dirs() -> Vec<PathBuf> {
+/// On Linux: ~/.agents/skills (global) and `<session_cwd>/.agents/skills` (local).
+/// The local dir is resolved against the caller-supplied session cwd, not the
+/// process cwd — after `/cd`/`/load` the process cwd never moves (see the
+/// per-session cwd refactor), so the session value is the only correct base.
+pub fn get_default_skills_dirs(session_cwd: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     // 1. Global skills directory: ~/.agents/skills
@@ -140,25 +163,23 @@ pub fn get_default_skills_dirs() -> Vec<PathBuf> {
         dirs.push(global_skills);
     }
 
-    // 2. Local skills directory: ./.agents/skills (in current workdir)
-    if let Ok(cwd) = std::env::current_dir() {
-        let local_skills = cwd.join(".agents").join("skills");
-        dirs.push(local_skills);
-    }
+    // 2. Local skills directory: <session_cwd>/.agents/skills
+    dirs.push(session_cwd.join(".agents").join("skills"));
 
     dirs
 }
 
-/// Load skills from all default locations
-pub fn load_default_skills() -> Result<SkillRegistry> {
+/// Load skills from all default locations relative to `session_cwd`.
+/// Returns the populated registry plus any user-facing load warnings (a bad
+/// skill is skipped, never fatal) so callers can surface them in the UI.
+pub fn load_default_skills(session_cwd: &Path) -> (SkillRegistry, Vec<String>) {
     let mut registry = SkillRegistry::new();
+    let mut warnings = Vec::new();
 
-    for dir in get_default_skills_dirs() {
+    for dir in get_default_skills_dirs(session_cwd) {
         if dir.exists() {
             tracing::info!("Checking for skills in: {}", dir.display());
-            if let Err(e) = registry.load_from_directory(&dir) {
-                tracing::warn!("Error loading skills from {}: {}", dir.display(), e);
-            }
+            registry.load_from_directory(&dir, &mut warnings);
         }
     }
 
@@ -168,5 +189,50 @@ pub fn load_default_skills() -> Result<SkillRegistry> {
         tracing::info!("Loaded {} skill(s)", registry.len());
     }
 
-    Ok(registry)
+    (registry, warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_skill(dir: &Path, name: &str, content: &str) {
+        let skill_dir = dir.join(name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+    }
+
+    #[test]
+    fn load_from_directory_warns_on_broken_skill_and_keeps_valid_ones() {
+        let tmp = TempDir::new().unwrap();
+        write_skill(
+            tmp.path(),
+            "good-skill",
+            "---\nname: good-skill\ndescription: A valid skill\n---\n# Body\n",
+        );
+        // Missing frontmatter delimiter → parse failure.
+        write_skill(tmp.path(), "broken-skill", "no frontmatter here\n");
+
+        let mut registry = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        registry.load_from_directory(tmp.path(), &mut warnings);
+
+        assert!(registry.get("good-skill").is_some());
+        assert_eq!(registry.len(), 1, "broken skill must be skipped");
+        assert_eq!(warnings.len(), 1, "broken skill must produce one warning");
+        assert!(warnings[0].contains("broken-skill"));
+    }
+
+    #[test]
+    fn get_default_skills_dirs_uses_session_cwd_for_local() {
+        let session_cwd = Path::new("/tmp/some/session/dir");
+        let dirs = get_default_skills_dirs(session_cwd);
+        assert!(
+            dirs.iter()
+                .any(|d| d == &session_cwd.join(".agents").join("skills")),
+            "local skills dir must resolve against the session cwd, not the process cwd"
+        );
+    }
 }

@@ -1076,6 +1076,21 @@ impl AgentRunner {
                             rebuild_ctx.as_mut(),
                         )
                         .await;
+                    } else if lcmd == "/new" {
+                        // `/new` reset to a fresh conversation on the
+                        // active model; rebuild the agent so config/skill
+                        // edits take effect. Keeps the current model — it
+                        // does not switch to `default_model`.
+                        Self::refresh_agent_after_new(
+                            &mut agent,
+                            &mut config,
+                            &state_manager,
+                            &session_hook_cell,
+                            &provider_info_cell,
+                            &mut event_processor,
+                            rebuild_ctx.as_mut(),
+                        )
+                        .await;
                     }
                     if let Some(ref sm) = state_manager {
                         sm.set_running(false);
@@ -1095,13 +1110,12 @@ impl AgentRunner {
                 }
 
                 Some(QueueMessage::SwitchModel(alias)) => {
-                    // Per the locked plan in `multi-model.md`: `/model`
-                    // is `/new` + boot the agent against a different
-                    // ProviderConfig. The View has already validated
-                    // the alias before sending the `UiAction`, so we
-                    // trust it here — but we still re-resolve in case
-                    // the config has been hot-reloaded under us, and
-                    // emit a clean error if so.
+                    // `/model` is `/new` + boot the agent against a
+                    // different ProviderConfig. The View validated the
+                    // alias against its snapshot, but `handle_switch_model`
+                    // re-reads config first (picking up newly-added
+                    // aliases) and re-resolves, emitting a clean error if
+                    // the alias vanished under a reload.
                     if let Some(ref sm) = state_manager {
                         sm.set_running(true);
                     }
@@ -1113,7 +1127,7 @@ impl AgentRunner {
                         &session_hook_cell,
                         &provider_info_cell,
                         &mut event_processor,
-                        rebuild_ctx.as_ref(),
+                        rebuild_ctx.as_mut(),
                     )
                     .await;
                     if let Some(ref sm) = state_manager {
@@ -1195,7 +1209,7 @@ impl AgentRunner {
         session_hook_cell: &SharedSessionHook,
         provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
-        rebuild_ctx: Option<&RebuildContext>,
+        rebuild_ctx: Option<&mut RebuildContext>,
     ) -> Result<(), String> {
         let Some(ctx) = rebuild_ctx else {
             return Err(
@@ -1204,15 +1218,21 @@ impl AgentRunner {
                     .to_string(),
             );
         };
+        let sm_for_provider = state_manager
+            .clone()
+            .ok_or_else(|| "state manager required for /model".to_string())?;
+
+        // Re-read config + skills first so a newly-added alias resolves and
+        // a new system prompt / registry is in play before we switch.
+        // Warnings are surfaced *after* the conversation reset below so
+        // `reset_conversation_state()` can't wipe them from the chat.
+        let reload_warnings = Self::reload_session_config(config, ctx, &sm_for_provider);
+
         let Some(resolved) = ctx.registry.resolve(alias) else {
             let available = ctx.registry.aliases_sorted().join(", ");
             return Err(format!("unknown alias `{alias}`. Available: {available}"));
         };
         let resolved = resolved.clone();
-
-        let sm_for_provider = state_manager
-            .clone()
-            .ok_or_else(|| "state manager required for /model".to_string())?;
 
         // Rebuild the agent + publish new provider info — shared with
         // `/load` (which re-activates a saved wire identity).
@@ -1256,6 +1276,12 @@ impl AgentRunner {
             "🔁 New conversation on {} ({} · {})",
             resolved.alias, resolved.provider_name, resolved.model_name
         ));
+
+        // Surface reload/skill warnings now — after the reset — so they
+        // persist in the fresh conversation instead of being cleared.
+        for warning in reload_warnings {
+            sm_for_provider.add_system_message(warning);
+        }
 
         Ok(())
     }
@@ -1310,6 +1336,13 @@ impl AgentRunner {
         let sm = state_manager
             .clone()
             .ok_or_else(|| "state manager required for /cd".to_string())?;
+
+        // Re-read config + skills before resolving so a config edit lands
+        // on this /cd. The prompt is rebuilt again below against the new
+        // cwd; this refreshes the registry + skills the resolve relies on.
+        // Warnings are surfaced after the conversation reset below.
+        let reload_warnings = Self::reload_session_config(config, ctx, &sm);
+
         let resolved = ctx
             .registry
             .resolve(&sm.get_model_alias())
@@ -1374,7 +1407,95 @@ impl AgentRunner {
 
         sm.add_system_message(format!("📁 New conversation in {path}"));
 
+        // Surface reload/skill warnings after the reset so they persist.
+        for warning in reload_warnings {
+            sm.add_system_message(warning);
+        }
+
         Ok(())
+    }
+
+    /// Re-read `config.yaml` and re-scan skills for a live session, so
+    /// YAML/skill edits take effect on a session verb (`/new`, `/model`,
+    /// `/cd`, `/load`) without a restart. Mutates `config` (ancillary
+    /// fields only — **never** `config.provider`, owned by the resolve
+    /// step) and `ctx` (registry, skills, system prompt, and the trivial
+    /// config-clone artifacts: searxng, max_turns, bash).
+    ///
+    /// Fallible edges are handled at the boundary: a malformed YAML or a
+    /// bad `default_model` (registry build error) warns and **keeps the
+    /// previous config** — the session survives. Both fallible steps run
+    /// before any mutation, so a failure leaves no partial state.
+    ///
+    /// Boot-only config is diffed and, if changed, flagged with a
+    /// "restart to apply" warning: `mcp_servers` / `vector_db` (live
+    /// subprocesses / DB handle), `web.*` (read once by the reaper), and
+    /// `pipeline` (a built sub-agent registry, not raw config).
+    ///
+    /// Returns the warnings to surface (reload failure, boot-only diffs,
+    /// skill-load failures) rather than emitting them here — the caller
+    /// owns *when* they land, so a following `reset_conversation_state()`
+    /// (as `/model` and `/cd` do) can't wipe them from the chat.
+    fn reload_session_config(
+        config: &mut Config,
+        ctx: &mut RebuildContext,
+        sm: &Arc<StateManager>,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        // Boundary parse — keep previous config on any failure.
+        let fresh = match Config::reload() {
+            Ok(c) => c,
+            Err(reason) => {
+                warnings.push(format!(
+                    "⚠ config reload failed: {reason} — keeping previous config."
+                ));
+                return warnings;
+            }
+        };
+        // Registry is the post-boot source of truth; a bad `default_model`
+        // here is recoverable — warn and keep the running registry.
+        let new_registry = match fresh.build_model_registry() {
+            Ok(r) => r,
+            Err(e) => {
+                warnings.push(format!(
+                    "⚠ config reload: model registry invalid ({e}) — keeping previous config."
+                ));
+                return warnings;
+            }
+        };
+
+        // Diff boot-only keys against the still-current config and warn.
+        for (label, changed) in [
+            ("mcp_servers", config.mcp_servers != fresh.mcp_servers),
+            ("vector_db", config.vector_db != fresh.vector_db),
+            ("web", config.web != fresh.web),
+            ("pipeline", config.pipeline != fresh.pipeline),
+        ] {
+            if changed {
+                warnings.push(format!("⚠ {label} change ignored — restart to apply."));
+            }
+        }
+
+        // Re-scan skills against the session cwd and collect any load failures
+        // so `/cd`/`/load`/`/new`/`/model` report a broken skill instead of
+        // silently dropping it.
+        let (skills, skill_warnings) = load_default_skills(&sm.session_cwd());
+        ctx.skills = skills;
+        warnings.extend(skill_warnings);
+
+        // Commit. `config.provider` is preserved across the swap — the
+        // resolve step owns it, and this is the invariant the regression
+        // test pins (see `Config::adopt_reloaded`).
+        config.adopt_reloaded(fresh);
+
+        ctx.registry = Arc::new(new_registry);
+        ctx.system_prompt =
+            build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref(), &sm.session_cwd());
+        ctx.searxng_config = config.searxng.clone();
+        ctx.max_turns = config.agent_max_turns;
+        ctx.bash_config = config.bash.clone();
+
+        warnings
     }
 
     /// Rebuild the live `DynAgent` against a `ResolvedModel` — the
@@ -1547,6 +1668,17 @@ impl AgentRunner {
         let Some(sm) = state_manager else { return };
         let Some(ctx) = rebuild_ctx else { return };
 
+        // Re-read config + skills before resolving the saved wire id, so a
+        // config/skill edit lands on this /load. Refreshes the registry the
+        // find-by-wire-id below relies on, plus skills/system prompt (the
+        // prompt may be rebuilt again below if the saved cwd differs).
+        // The conversation was already loaded by the /load handler, so
+        // warnings are safe to surface immediately.
+        let sm_arc = sm.clone();
+        for warning in Self::reload_session_config(config, ctx, &sm_arc) {
+            sm.add_system_message(warning);
+        }
+
         let Some(conv) = sm.get_current_conversation() else {
             return;
         };
@@ -1624,6 +1756,68 @@ impl AgentRunner {
         sm.set_model(resolved.model_name);
         sm.set_model_alias(resolved.alias);
     }
+
+    /// After `/new` has reset to a fresh conversation on the *active*
+    /// model, re-read config + skills and rebuild the agent on that same
+    /// model, so YAML/skill edits take effect on the new conversation
+    /// without a restart. `/new` deliberately keeps your current model
+    /// (it does not bounce you to `default_model`).
+    ///
+    /// No-op when the registry/state manager isn't available. If the
+    /// active alias was removed from config, the rebuild is skipped and
+    /// the session keeps running on the previous agent.
+    #[allow(clippy::too_many_arguments)]
+    async fn refresh_agent_after_new(
+        agent_slot: &mut Arc<DynAgent>,
+        config: &mut Config,
+        state_manager: &Option<Arc<StateManager>>,
+        session_hook_cell: &SharedSessionHook,
+        provider_info_cell: &SharedProviderInfo,
+        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
+        rebuild_ctx: Option<&mut RebuildContext>,
+    ) {
+        let Some(sm) = state_manager else { return };
+        let Some(ctx) = rebuild_ctx else { return };
+        let sm_arc = sm.clone();
+
+        // `/new` already reset to a fresh conversation before this runs, so
+        // reload/skill warnings are safe to surface immediately.
+        for warning in Self::reload_session_config(config, ctx, &sm_arc) {
+            sm.add_system_message(warning);
+        }
+
+        // Re-resolve the active model against the fresh registry. Prefer
+        // the active alias; fall back to the wire id. A removed alias
+        // means the model vanished from config — keep the old agent.
+        let Some(resolved) = ctx
+            .registry
+            .resolve(&sm.get_model_alias())
+            .or_else(|| {
+                ctx.registry
+                    .find_by_wire_id(&sm.get_provider_name(), &sm.get_model())
+            })
+            .cloned()
+        else {
+            return;
+        };
+
+        if let Err(e) = Self::rebuild_agent_for_resolved(
+            &resolved,
+            agent_slot,
+            config,
+            &sm_arc,
+            session_hook_cell,
+            provider_info_cell,
+            event_processor,
+            state_manager,
+            ctx,
+        )
+        .await
+        {
+            sm.add_system_message(format!("❌ /new: failed to rebuild agent: {e}"));
+        }
+    }
+
     /// Process an AgentEvent and update StateManager accordingly.
     ///
     /// This is the Controller's responsibility — it decides how domain events
