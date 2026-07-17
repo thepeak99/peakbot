@@ -4,6 +4,17 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **System messages are now Markdown-rendered in both the REPL and the web
+  UI.** Previously only agent replies went through the `MarkdownRenderer`;
+  system banners fell through to the plain renderer, so deliberate markup —
+  like the backticked path in a `/cd` error (`` ❌ /cd: `no such dir` ``) —
+  showed its literal backticks instead of inline-code styling. The REPL
+  renderer gate now covers both `Agent` and `System` roles, and the standalone
+  prefix line was generalized to derive its label/colour from the role
+  (`🤖 Agent` / `⚙ System`) instead of hardcoding the agent header. The web SPA
+  (`Message.tsx`) `isMarkdown` gate was widened the same way so both UIs agree.
+  User input and tool-call lines still round-trip verbatim.
+
 - **Fixed `/stats` and `/context` slash commands (#46).** Both commands were
   advertised in the command popup and `/help` output but silently did nothing
   when invoked. `/stats` now displays session statistics (model, API calls,
