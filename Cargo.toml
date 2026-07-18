@@ -28,6 +28,7 @@ http = "1"
 chrono = "0.4"
 directories-next = "2"
 dirs = "6"
+gethostname = "1"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
@@ -51,6 +52,15 @@ portable-pty = "0.9"
 # The `query` extractor URL-decodes auto (Linear `%3A`-encodes the auth code).
 # `ws` feature is for `peakbot --web` WebSocket transport (Phase 1, src/ui/web/).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "ws"] }
+# `peakbot --web --tls`: serve HTTPS with a self-signed CA PeakBot owns end to
+# end. `axum-server` handles the rustls acceptor (incl. WS upgrades + graceful
+# shutdown); `rcgen` mints the CA + leaf. Both route through the aws-lc-rs
+# provider reqwest already links — no OpenSSL, so the cross-builds stay clean.
+# `rustls` is promoted to a top-level dep (was android-only) because src/ui/web/
+# tls.rs needs `ServerConfig` on every target.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # Cross-platform browser launcher (xdg-open / open / cmd /c start).
 open = "5"
 # `rust-embed` embeds `web/dist/` at compile time. `release` builds inline
@@ -85,11 +95,10 @@ docx-lite = "0.2"
 # Chunk hashing for idempotent re-index.
 sha2 = "0.10"
 
-# Android-only TLS: reqwest 0.13's `rustls-platform-verifier` panics at runtime
-# on Android (needs a JVM Context, reqwest#2968), so src/http.rs roots TLS in the
-# bundled Mozilla certs. aws_lc_rs is already linked via reqwest's `rustls`.
+# Android-only TLS roots: reqwest 0.13's `rustls-platform-verifier` panics at
+# runtime on Android (needs a JVM Context, reqwest#2968), so src/http.rs roots
+# TLS in the bundled Mozilla certs. `rustls` itself is a top-level dep above.
 [target.'cfg(target_os = "android")'.dependencies]
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 webpki-roots = "1"
 
 [dev-dependencies]

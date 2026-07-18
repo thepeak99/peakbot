@@ -60,6 +60,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use uuid::Uuid;
 
 mod registry;
+pub mod tls;
 
 /// Port the web UI listens on. Fixed for now (`--port` flag is Phase 4).
 /// See `webui.md` §3 decision 1.
@@ -97,6 +98,11 @@ pub struct WebUi {
     ws_state: WsState,
     /// Shared secret guarding every route. `None` = open (loopback default).
     token: Option<Arc<str>>,
+    /// Serve over HTTPS with PeakBot's built-in CA when true.
+    tls: bool,
+    /// Extra SAN names/IPs to add to the TLS leaf (from `--tls-name`), on top
+    /// of the auto-discovered loopback, LAN IP, and `<hostname>.local`.
+    extra_sans: Vec<String>,
     /// How often the reaper scans for expired sessions.
     reaper_tick: Duration,
 }
@@ -108,6 +114,8 @@ impl WebUi {
         models: Vec<ModelInfo>,
         active_alias: String,
         token: Option<String>,
+        tls: bool,
+        extra_sans: Vec<String>,
     ) -> Self {
         let web = deps.config.web.clone();
         Self {
@@ -119,6 +127,8 @@ impl WebUi {
                 session_ttl: Duration::from_secs(web.session_ttl_secs),
             },
             token: token.map(Into::into),
+            tls,
+            extra_sans,
             reaper_tick: Duration::from_secs(web.reaper_tick_secs),
         }
     }
@@ -126,9 +136,10 @@ impl WebUi {
     /// The URL a browser should open. When a token is set it rides as a
     /// `?token=…` query so the first request establishes the auth cookie.
     fn entry_url(&self) -> String {
+        let scheme = if self.tls { "https" } else { "http" };
         match &self.token {
-            Some(t) => format!("http://{}/?token={}", self.addr, t),
-            None => format!("http://{}/", self.addr),
+            Some(t) => format!("{scheme}://{}/?token={}", self.addr, t),
+            None => format!("{scheme}://{}/", self.addr),
         }
     }
 
@@ -171,10 +182,12 @@ impl Ui for WebUi {
             app = app.layer(from_fn_with_state(token.clone(), require_token));
         }
 
-        let listener = tokio::net::TcpListener::bind(self.addr).await?;
-        let url = self.entry_url();
-        eprintln!("🌐 PeakBot web UI: {url}  (Ctrl+C to quit)");
-        self.maybe_open_browser(&url);
+        // The CA download is merged AFTER the token layer, so it stays
+        // reachable without a token — a CA *public* cert is not a secret, and
+        // the phone needs it before it can trust anything.
+        if self.tls {
+            app = app.merge(Router::new().route("/peakbot-ca.crt", get(ca_cert_handler)));
+        }
 
         // Reaper: periodically expire sessions idle (no sockets) past the TTL.
         // A detached task tied to the process lifetime — the registry it holds
@@ -190,9 +203,26 @@ impl Ui for WebUi {
             }
         });
 
-        // The View owns its own shutdown signal — Ctrl+C ends the graceful
-        // drain. No injected channel: the signal concern lives here, not
-        // in `main`.
+        if self.tls {
+            self.serve_tls(app).await
+        } else {
+            self.serve_plain(app).await
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl WebUi {
+    /// Serve plain HTTP with a Ctrl+C graceful shutdown.
+    async fn serve_plain(&self, app: Router) -> Result<()> {
+        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        let url = self.entry_url();
+        eprintln!("🌐 PeakBot web UI: {url}  (Ctrl+C to quit)");
+        self.maybe_open_browser(&url);
+
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -201,8 +231,65 @@ impl Ui for WebUi {
         Ok(())
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
+    /// Serve HTTPS with PeakBot's built-in CA. Mints a leaf for this machine's
+    /// SANs, prints the CA-install URL, and drains gracefully on Ctrl+C.
+    async fn serve_tls(&self, app: Router) -> Result<()> {
+        let tls_dir = tls::default_tls_dir()?;
+        let sans = tls::local_sans(self.addr, &self.extra_sans);
+        let server_config = tls::server_config(&tls_dir, &sans)?;
+
+        let url = self.entry_url();
+        eprintln!("🔒 PeakBot web UI (HTTPS): {url}  (Ctrl+C to quit)");
+        let host = tls::primary_lan_host(self.addr);
+        eprintln!(
+            "📲 Install the CA on your phone once: https://{host}:{}/peakbot-ca.crt",
+            self.addr.port()
+        );
+        eprintln!(
+            "   iOS: after installing, enable it under Settings → General → About → Certificate Trust Settings."
+        );
+        eprintln!("   CA stored at {}", tls_dir.display());
+        self.maybe_open_browser(&url);
+
+        let handle = axum_server::Handle::new();
+        let shutdown = handle.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown.graceful_shutdown(Some(Duration::from_secs(3)));
+        });
+
+        let rustls_cfg =
+            axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+        axum_server::bind_rustls(self.addr, rustls_cfg)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await?;
         Ok(())
+    }
+}
+
+/// Serves the CA public certificate at `/peakbot-ca.crt` — tokenless on
+/// purpose. The correct MIME + attachment disposition makes phones offer to
+/// install it directly. A CA public cert carries no secret; only its private
+/// key (never served, `0600` on disk) can sign.
+async fn ca_cert_handler() -> Response {
+    match tls::default_tls_dir().and_then(|dir| tls::ca_cert_pem(&dir)) {
+        Ok(pem) => (
+            [
+                (header::CONTENT_TYPE, "application/x-x509-ca-cert"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"peakbot-ca.crt\"",
+                ),
+            ],
+            pem,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("CA certificate unavailable: {e}"),
+        )
+            .into_response(),
     }
 }
 

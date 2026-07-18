@@ -318,6 +318,11 @@ pub struct WebConfig {
     /// How often the reaper scans for expired sessions (default: 60 s).
     #[serde(default = "default_reaper_tick_secs")]
     pub reaper_tick_secs: u64,
+    /// Serve the web UI over HTTPS using PeakBot's built-in CA (default: false).
+    /// Install the CA on your device once to get a trusted padlock; a fresh
+    /// leaf is minted each boot. The `--tls` flag overrides this.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 impl Default for WebConfig {
@@ -325,6 +330,7 @@ impl Default for WebConfig {
         Self {
             session_ttl_secs: default_session_ttl_secs(),
             reaper_tick_secs: default_reaper_tick_secs(),
+            tls: false,
         }
     }
 }
