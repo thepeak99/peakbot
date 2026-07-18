@@ -630,6 +630,8 @@ mcp_servers:
 | `--web` | off | Run the web UI instead of the terminal UI. Binds loopback. On a local, non-SSH session it auto-opens your browser. |
 | `--bind <host:port>` | `127.0.0.1:7823` | Listen address. A non-loopback bind **requires** a token, else PeakBot refuses to start. |
 | `--token <secret>` | — | Shared secret guarding every route (assets, `/commands`, `/ws`). Falls back to `PEAKBOT_WEB_TOKEN` (preferred — keeps the secret out of shell history). |
+| `--tls` | off | Serve over HTTPS with PeakBot's built-in CA (batteries included). Overrides `web.tls`. See [HTTPS](#https-with-a-built-in-ca-tls) below. |
+| `--tls-name <NAME>` | — | Add an extra DNS name or IP to the HTTPS certificate. Repeatable. Augments the auto SANs (loopback, LAN IP, `<hostname>.local`) — never replaces them. Requires `--tls`. |
 
 **Sticky sessions (issue #118).** A conversation is addressed in the URL as
 `?convo=<uuid>`, and a live agent session (StateManager + controller loop)
@@ -654,7 +656,67 @@ web:
   session_ttl_secs: 600    # reap a fully-idle session (no sockets, agent idle,
                            # no live bash_bg) after 10 min (default)
   reaper_tick_secs: 60     # how often the reaper scans (default)
+  tls: false               # serve HTTPS with the built-in CA (default false)
 ```
+
+### HTTPS with a built-in CA (`--tls`)
+
+`peakbot --web --tls` (or `web.tls: true`) serves the UI over HTTPS with PeakBot
+owning the whole PKI — batteries included, no OpenSSL, no manual certs.
+
+**How it works.** On first use PeakBot self-signs a long-lived **CA** and stores
+it in `dirs::cache_dir()/peakbot/tls/` (`ca-cert.pem` + `ca-key.pem`, the key
+`0600` — same home and guarantee as the mcp-auth credential store). Every boot it
+mints a fresh **leaf** signed by that CA, whose SANs follow the machine's current
+addresses: `localhost`, `127.0.0.1`, `::1`, the primary LAN IP, any concrete bind
+IP, and the machine's mDNS **`<hostname>.local`** name (derived from the system
+hostname's first label). The `.local` name is the most durable handle — it
+survives DHCP lease changes that shuffle the LAN IP, so a phone bookmarked at
+`https://mymachine.local:7823` keeps working. Add further names with
+**`--tls-name <NAME>`** (repeatable; DNS or IP, classified automatically) — these
+augment the auto SANs, never replace them. You install the CA on your phone
+**once**; every leaf it signs is then trusted, so a changing LAN IP needs no phone
+action. The CA is generated once and
+**never silently regenerated** (that would break every device that trusts it) — to
+rotate, delete the `tls/` directory. Implementation: `src/ui/web/tls.rs`
+(`rcgen` + `rustls`/`aws-lc-rs`, both routed through the provider `reqwest`
+already links; `rcgen`'s heavy `x509-parser` feature is deliberately avoided —
+the CA identity is fixed, so the issuer is rebuilt from the persisted key alone).
+
+**Installing the CA on a phone.** PeakBot serves the CA public certificate at the
+**tokenless** route `GET /peakbot-ca.crt` (MIME `application/x-x509-ca-cert`, so
+phones offer to install it directly). This route is intentionally exempt from the
+token gate — a CA *public* cert carries no secret; only its private key (never
+served) can sign. On boot PeakBot prints the CA-install URL using the LAN IP:
+
+```
+🔒 PeakBot web UI (HTTPS): https://127.0.0.1:7823/  (Ctrl+C to quit)
+📲 Install the CA on your phone once: https://192.168.1.42:7823/peakbot-ca.crt
+   iOS: after installing, enable it under Settings → General → About → Certificate Trust Settings.
+   CA stored at /home/you/.cache/peakbot/tls
+```
+
+> **Mobile trust caveats.** Browsers (Chrome/Safari) honour user-installed CAs, so
+> browsing to the PeakBot UI works. (Android 7+'s "apps ignore user CAs by default"
+> restriction is for *native apps*, not browsers.) On **iOS** installing the
+> profile is a two-step: install it, then enable it under *Settings → General →
+> About → Certificate Trust Settings*.
+
+TLS **complements** the token, it does not replace it: a non-loopback bind still
+requires a token. BYO-cert config and a QR-on-boot are deliberate non-goals for
+now (YAGNI).
+
+```bash
+# Local HTTPS (loopback)
+peakbot --web --tls
+
+# Add extra names to the cert (e.g. a router-assigned hostname + a static IP)
+peakbot --web --tls --tls-name peakbot.lan --tls-name 10.0.0.9
+
+# Remote HTTPS (token still required for non-loopback)
+PEAKBOT_WEB_TOKEN=$(openssl rand -hex 16) peakbot --web --tls --bind 0.0.0.0:7823
+```
+
 
 **Auth model.** When a token is set, the browser presents it once as
 `?token=…`; the server sets a `peakbot_token` cookie and all later requests —

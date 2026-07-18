@@ -40,6 +40,21 @@ struct Cli {
     /// secret out of shell history and `ps`).
     #[arg(long, value_name = "SECRET", requires = "web")]
     token: Option<String>,
+
+    /// Serve the `--web` UI over HTTPS using PeakBot's built-in CA. On first use
+    /// PeakBot self-signs a CA (in the OS cache dir) and prints the URL to
+    /// install it on your phone; every boot mints a fresh leaf whose SANs follow
+    /// this machine's addresses. Overrides `web.tls` in config.
+    #[arg(long, requires = "web")]
+    tls: bool,
+
+    /// Add an extra name (DNS or IP) to the HTTPS certificate, repeatable.
+    /// The leaf already covers loopback, this machine's LAN IP, and its mDNS
+    /// `<hostname>.local` name automatically; use this for any additional host
+    /// a client might dial (e.g. `--tls-name peakbot.lan --tls-name 10.0.0.9`).
+    /// Only meaningful with `--tls`.
+    #[arg(long = "tls-name", value_name = "NAME", requires = "tls")]
+    tls_name: Vec<String>,
 }
 
 /// Check if the provider has an API key configured.
@@ -284,12 +299,16 @@ async fn main() -> Result<()> {
         }
 
         let active_alias = model_registry.default_alias().to_string();
+        // Flag overrides config, same precedent as the token resolution above.
+        let tls = cli.tls || session_deps.config.web.tls;
         let mut ui = WebUi::new(
             addr,
             session_deps.clone(),
             build_models_snapshot(&model_registry),
             active_alias,
             token,
+            tls,
+            cli.tls_name.clone(),
         );
         ui.init().await?;
         ui.run().await?;
