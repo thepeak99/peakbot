@@ -11,8 +11,26 @@
 // notification so the user gets immediate feedback that it works — otherwise,
 // since real pings only fire when the tab is backgrounded, enabling the toggle
 // looks like it "did nothing".
+//
+// Mobile browsers reject the `new Notification()` constructor with
+// `TypeError: Illegal constructor` — they require a service worker's
+// `showNotification()`. We register a notification-only SW (see public/sw.js)
+// and prefer it, falling back to the constructor on desktop when no SW is
+// ready. Without this, the bell "did nothing" on mobile: it lit up and
+// permission was granted, but every ping threw and was silently swallowed.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+
+// Registration of the notification service worker, resolved once ready.
+let swRegistration: ServiceWorkerRegistration | null = null;
+if (typeof navigator !== "undefined" && "serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {
+    /* registration failed (insecure context, etc.) — desktop fallback covers it */
+  });
+  void navigator.serviceWorker.ready.then((reg) => {
+    swRegistration = reg;
+  });
+}
 
 export type NotifyPermission = "unsupported" | "default" | "granted" | "denied";
 
@@ -21,13 +39,22 @@ function currentPermission(): NotifyPermission {
   return Notification.permission as NotifyPermission;
 }
 
-// Fire-and-forget notification; swallows the throw some browsers raise outside
-// a secure context (http:// on a non-localhost host).
+// Fire-and-forget notification. Prefers the service worker's
+// `showNotification()` (required on mobile), falling back to the
+// `new Notification()` constructor on desktop when no SW is ready. Swallows
+// the throw some browsers raise outside a secure context.
 function notify(title: string, body: string) {
+  const options: NotificationOptions = { body, tag: "peakbot-task" };
+  if (swRegistration) {
+    swRegistration.showNotification(title, options).catch(() => {
+      /* mobile with no fallback — nothing more we can do */
+    });
+    return;
+  }
   try {
-    new Notification(title, { body, tag: "peakbot-task" });
+    new Notification(title, options);
   } catch {
-    /* insecure context or blocked — nothing we can do */
+    /* insecure context, blocked, or mobile constructor rejection */
   }
 }
 
