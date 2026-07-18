@@ -16,17 +16,23 @@ export function NotifyToggle({
 }) {
   if (permission === "unsupported") return null;
 
-  const blocked = permission === "denied";
+  // Both `denied` (user/site blocked it) and `insecure` (plain-HTTP origin, e.g.
+  // a phone on the LAN) make the bell unusable — but for different reasons, so
+  // the tooltip must say which.
+  const insecure = permission === "insecure";
+  const blocked = permission === "denied" || insecure;
   // `on` reflects user intent (the click) — not whether the browser has granted
   // permission yet. The first click on a fresh tab lights the bell even while
   // the permission prompt is still open; the browser prompt resolves in parallel
   // and either flips the bell functional or shows the disabled/blocked state.
-  const on = enabled;
-  const title = blocked
-    ? "Notifications blocked in browser settings"
-    : on
-      ? "Notify me when a task finishes (on) — click to disable"
-      : "Notify me when a task finishes (off) — click to enable";
+  const on = enabled && !blocked;
+  const title = insecure
+    ? "Notifications need HTTPS or localhost — this connection is insecure (open over HTTPS or a tunnel)"
+    : blocked
+      ? "Notifications blocked in browser settings"
+      : on
+        ? "Notify me when a task finishes (on) — click to disable"
+        : "Notify me when a task finishes (off) — click to enable";
 
   return (
     <button

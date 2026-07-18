@@ -21,9 +21,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-// Registration of the notification service worker, resolved once ready.
+// Registration of the notification service worker, resolved once ready. Skipped
+// on insecure origins where the browser refuses to register it anyway.
 let swRegistration: ServiceWorkerRegistration | null = null;
-if (typeof navigator !== "undefined" && "serviceWorker" in navigator) {
+if (
+  typeof navigator !== "undefined" &&
+  "serviceWorker" in navigator &&
+  (typeof window === "undefined" || window.isSecureContext !== false)
+) {
   navigator.serviceWorker.register("/sw.js").catch(() => {
     /* registration failed (insecure context, etc.) — desktop fallback covers it */
   });
@@ -32,10 +37,20 @@ if (typeof navigator !== "undefined" && "serviceWorker" in navigator) {
   });
 }
 
-export type NotifyPermission = "unsupported" | "default" | "granted" | "denied";
+export type NotifyPermission = "unsupported" | "insecure" | "default" | "granted" | "denied";
+
+// `localhost`/HTTPS are secure contexts; a phone reaching us over a LAN IP on
+// plain HTTP is not. Browsers hard-gate both the Notification permission prompt
+// and service-worker registration to secure contexts, so on an insecure origin
+// the bell can never be enabled — we report `insecure` so the UI can say why
+// (rather than the misleading "blocked in settings").
+function isSecureContext(): boolean {
+  return typeof window === "undefined" || window.isSecureContext !== false;
+}
 
 function currentPermission(): NotifyPermission {
   if (typeof Notification === "undefined") return "unsupported";
+  if (!isSecureContext()) return "insecure";
   return Notification.permission as NotifyPermission;
 }
 
