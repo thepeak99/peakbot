@@ -1,26 +1,24 @@
 //! Registry for managing and creating sub-agents.
 //!
 //! The registry resolves each role's `model:` alias against the shared
-//! [`ModelRegistry`] at construction (parse at the boundary), then provides
-//! a factory that builds a fresh `DynAgent` per delegation.
+//! [`ModelRegistry`] at construction (parse at the boundary) and stores the
+//! resolved roles. Building a live sub-agent from a role is done by
+//! [`crate::pipeline::SubAgentDeps`], which owns the orchestrator's build
+//! context (tools, env, event sink) — the registry itself stays lean.
 
-use crate::config::{ModelRegistry, PipelineConfig, ProviderConfig, ResolvedModel};
-use crate::hooks::SessionHook;
-use crate::providers::{DynAgent, ProviderInfo};
-use rig_core::client::completion::CompletionClient;
-use rig_core::providers::openrouter;
+use crate::config::{ModelRegistry, PipelineConfig, ResolvedModel};
 use std::collections::HashMap;
 
 /// A role resolved against the model registry, ready to build.
 ///
 /// Holds the resolved model (wire id + credentials via `provider_config`)
-/// plus the role's prompt and optional bash env. The env is plumbed here
-/// in Phase 2 and consumed when the sub-agent is built.
+/// plus the role's prompt and optional bash env, merged into the sub-agent's
+/// bash tool when it is built.
 #[derive(Clone, Debug)]
-struct ResolvedRole {
-    model: ResolvedModel,
-    prompt: String,
-    env: Option<HashMap<String, String>>,
+pub(crate) struct ResolvedRole {
+    pub(crate) model: ResolvedModel,
+    pub(crate) prompt: String,
+    pub(crate) env: Option<HashMap<String, String>>,
 }
 
 /// A registry of sub-agents with factory methods.
@@ -77,160 +75,6 @@ impl SubAgentRegistry {
         Ok(Self { roles })
     }
 
-    /// Create a fresh agent instance for a role.
-    pub fn create_agent(&self, name: &str) -> Result<(DynAgent, ProviderInfo), SubAgentError> {
-        let role = self
-            .roles
-            .get(name)
-            .ok_or_else(|| SubAgentError::UnknownAgent(name.to_string()))?;
-
-        let model = role.model.model_name.clone();
-
-        // Transitional: build the client by matching the resolved
-        // `provider_config`. Phase 4 replaces this whole body with the
-        // shared `create_provider`/`add_builtin_tools` path (which also
-        // wires the TEE hook and the full toolset).
-        match &role.model.provider_config {
-            ProviderConfig::OpenRouter(c) => {
-                let client = openrouter::Client::builder()
-                    .http_client(crate::http::client())
-                    .api_key(c.api_key.as_deref().unwrap_or_default())
-                    .build()
-                    .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?;
-
-                let (hook, _receiver) = SessionHook::with_channel();
-                let agent = client
-                    .agent(&model)
-                    .preamble(&role.prompt)
-                    .max_tokens(c.max_tokens)
-                    .default_max_turns(50)
-                    .hook(hook)
-                    .build();
-
-                Ok((
-                    DynAgent::OpenRouter(agent),
-                    ProviderInfo {
-                        name: "openrouter".to_string(),
-                        model: model.clone(),
-                        supports_pricing: true,
-                        supports_vision: crate::vision::model_supports_vision(&model),
-                    },
-                ))
-            }
-            ProviderConfig::OpenAI(c) => {
-                let client = rig_core::providers::openai::Client::builder()
-                    .http_client(crate::http::client())
-                    .api_key(c.api_key.as_deref().unwrap_or_default())
-                    .base_url(&c.base_url)
-                    .build()
-                    .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?;
-
-                let (hook, _receiver) = SessionHook::with_channel();
-                let agent = client
-                    .agent(&model)
-                    .preamble(&role.prompt)
-                    .max_tokens(c.max_tokens)
-                    .default_max_turns(50)
-                    .hook(hook)
-                    .build();
-
-                Ok((
-                    DynAgent::OpenAI(agent),
-                    ProviderInfo {
-                        name: "openai".to_string(),
-                        model: model.clone(),
-                        supports_pricing: true,
-                        supports_vision: crate::vision::model_supports_vision(&model),
-                    },
-                ))
-            }
-            ProviderConfig::Anthropic(c) => {
-                let client = rig_core::providers::anthropic::Client::builder()
-                    .http_client(crate::http::client())
-                    .api_key(c.api_key.as_deref().unwrap_or_default())
-                    .base_url(&c.base_url)
-                    .build()
-                    .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?;
-
-                let (hook, _receiver) = SessionHook::with_channel();
-                let agent = client
-                    .agent(&model)
-                    .preamble(&role.prompt)
-                    .max_tokens(c.max_tokens)
-                    .default_max_turns(50)
-                    .hook(hook)
-                    .build();
-
-                Ok((
-                    DynAgent::Anthropic(agent),
-                    ProviderInfo {
-                        name: "anthropic".to_string(),
-                        model: model.clone(),
-                        supports_pricing: false,
-                        supports_vision: crate::providers::supports_vision_for("anthropic", &model),
-                    },
-                ))
-            }
-            ProviderConfig::LlamaCpp(c) => {
-                let client = rig_core::providers::openai::Client::builder()
-                    .http_client(crate::http::client())
-                    .api_key(c.api_key.as_deref().unwrap_or_default())
-                    .base_url(&c.base_url)
-                    .build()
-                    .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?
-                    .completions_api();
-
-                let (hook, _receiver) = SessionHook::with_channel();
-                let agent = client
-                    .agent(&model)
-                    .preamble(&role.prompt)
-                    .max_tokens(c.max_tokens)
-                    .default_max_turns(50)
-                    .hook(hook)
-                    .build();
-
-                Ok((
-                    DynAgent::LlamaCpp(agent),
-                    ProviderInfo {
-                        name: "llamacpp".to_string(),
-                        model: model.clone(),
-                        supports_pricing: true,
-                        supports_vision: crate::vision::model_supports_vision(&model),
-                    },
-                ))
-            }
-            ProviderConfig::Ollama(c) => {
-                use rig_core::providers::ollama;
-
-                let client = ollama::Client::builder()
-                    .http_client(crate::http::client())
-                    .base_url(&c.base_url)
-                    .api_key(rig_core::client::Nothing)
-                    .build()
-                    .map_err(|e| SubAgentError::ClientCreation(e.to_string()))?;
-
-                let mut builder = client
-                    .agent(&model)
-                    .preamble(&role.prompt)
-                    .default_max_turns(50);
-                if let Some(temp) = c.temperature {
-                    builder = builder.temperature(temp as f64);
-                }
-                let agent = builder.build();
-
-                Ok((
-                    DynAgent::Ollama(agent),
-                    ProviderInfo {
-                        name: "ollama".to_string(),
-                        model: model.clone(),
-                        supports_pricing: false,
-                        supports_vision: crate::vision::model_supports_vision(&model),
-                    },
-                ))
-            }
-        }
-    }
-
     /// Check if a role exists in the registry.
     pub fn has_agent(&self, name: &str) -> bool {
         self.roles.contains_key(name)
@@ -241,29 +85,16 @@ impl SubAgentRegistry {
         self.roles.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Get the prompt for a role (useful for documentation).
-    pub fn get_agent_prompt(&self, name: &str) -> Option<&str> {
-        self.roles.get(name).map(|r| r.prompt.as_str())
-    }
-
-    /// The resolved model for a role (test/introspection helper).
-    #[cfg(test)]
-    fn resolved_model(&self, name: &str) -> Option<&ResolvedModel> {
-        self.roles.get(name).map(|r| &r.model)
-    }
-
-    /// The bash env for a role — consumed when the sub-agent is built.
-    pub fn role_env(&self, name: &str) -> Option<&HashMap<String, String>> {
-        self.roles.get(name).and_then(|r| r.env.as_ref())
+    /// The resolved role (model + prompt + env) for a name — consumed by the
+    /// sub-agent build path.
+    pub(crate) fn role(&self, name: &str) -> Option<&ResolvedRole> {
+        self.roles.get(name)
     }
 }
 
 /// Errors that can occur when working with sub-agents
 #[derive(Debug, thiserror::Error)]
 pub enum SubAgentError {
-    #[error("Unknown agent: {0}")]
-    UnknownAgent(String),
-
     #[error("Role name cannot be empty")]
     EmptyRoleName,
 
@@ -276,12 +107,6 @@ pub enum SubAgentError {
         alias: String,
         available: String,
     },
-
-    #[error("Failed to create client: {0}")]
-    ClientCreation(String),
-
-    #[error("Failed to build agent: {0}")]
-    AgentBuild(String),
 }
 
 #[cfg(test)]
@@ -349,7 +174,7 @@ mod tests {
         let cfg = pipeline_with(vec![("reviewer", role(Some("sonnet"), "review"))]);
         let reg = SubAgentRegistry::new(&cfg, &registry()).expect("registry builds");
 
-        let resolved = reg.resolved_model("reviewer").expect("role resolved");
+        let resolved = &reg.role("reviewer").expect("role resolved").model;
         assert_eq!(resolved.alias, "sonnet");
         assert_eq!(resolved.model_name, "anthropic/claude-3.7-sonnet");
     }
@@ -360,7 +185,7 @@ mod tests {
         let cfg = pipeline_with(vec![("researcher", role(None, "research"))]);
         let reg = SubAgentRegistry::new(&cfg, &registry()).expect("registry builds");
 
-        let resolved = reg.resolved_model("researcher").expect("role resolved");
+        let resolved = &reg.role("researcher").expect("role resolved").model;
         assert_eq!(resolved.alias, "flash", "default_model is `flash`");
     }
 
@@ -396,8 +221,8 @@ mod tests {
         assert!(matches!(err, SubAgentError::EmptyRoleName));
     }
 
-    /// The role's `env:` is stored through construction (Phase 4 merges it
-    /// into the sub-agent's bash env; Phase 2 only plumbs it).
+    /// The role's `env:` is stored through construction (merged into the
+    /// sub-agent's bash env when it is built).
     #[test]
     fn role_env_is_stored_through_construction() {
         let mut def = role(Some("flash"), "research");
@@ -409,7 +234,8 @@ mod tests {
         let reg = SubAgentRegistry::new(&cfg, &registry()).expect("registry builds");
 
         assert_eq!(
-            reg.role_env("researcher")
+            reg.role("researcher")
+                .and_then(|r| r.env.as_ref())
                 .and_then(|e| e.get("REVIEW_STRICT"))
                 .map(String::as_str),
             Some("1"),

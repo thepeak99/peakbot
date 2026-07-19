@@ -198,6 +198,7 @@ pub fn create_provider(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
@@ -218,6 +219,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                active_sub_agent_hook,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -239,6 +241,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                active_sub_agent_hook,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -260,6 +263,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                active_sub_agent_hook,
             )?;
             Ok((
                 DynAgent::Anthropic(agent),
@@ -281,6 +285,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                active_sub_agent_hook,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -302,6 +307,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                active_sub_agent_hook,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -426,6 +432,7 @@ fn add_builtin_tools<M, P>(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     register_view_image: bool,
+    sub_agent_wiring: Option<SubAgentWiring>,
 ) -> rig_core::agent::AgentBuilder<M, P, rig_core::agent::WithBuilderTools>
 where
     M: rig_core::completion::CompletionModel,
@@ -433,6 +440,10 @@ where
 {
     // Use provided tool or create a new one (with optional StateManager)
     let todo = todo_tool.unwrap_or_default();
+
+    // Keep a clone for the delegate tool (built at the end) — `state_manager`
+    // is moved into `bash_bg` below.
+    let sm_for_delegate = state_manager.clone();
 
     // Path + shell tools resolve/spawn against the session cwd, owned by the
     // state manager (single source of truth). Without one (tests), fall back to
@@ -524,13 +535,42 @@ where
         tools.push(gate(Box::new(crate::tools::ViewImageTool)));
     }
 
-    // Add DelegateTool if pipeline is enabled
-    if let Some(registry) = pipeline_registry {
-        let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(registry.clone()));
+    // Add DelegateTool if pipeline is enabled. It needs the same build
+    // context the orchestrator had (to spawn fresh sub-agents), captured here
+    // where that context is in scope. `sub_agent_wiring` carries the extra
+    // pieces (event sink, active-hook cell, max_turns) not already passed;
+    // the rest are cloned from this call's args. Requires a `state_manager`
+    // (sub-agents need session cwd + bg registry) — without one the delegate
+    // tool is simply not registered.
+    if let (Some(registry), Some(wiring), Some(sm)) =
+        (pipeline_registry, sub_agent_wiring, sm_for_delegate)
+    {
+        let deps = crate::pipeline::SubAgentDeps {
+            registry: Arc::new(registry.clone()),
+            searxng: searxng_config.cloned(),
+            bash_config: bash_config.clone(),
+            state_manager: sm,
+            shell_kind: shell_kind.cloned(),
+            vector_store: vector_store.cloned(),
+            max_turns: wiring.max_turns,
+            event_sink: wiring.event_sink,
+            active_hook: wiring.active_hook,
+        };
+        let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(deps));
         tools.push(gate(Box::new(delegate_tool)));
     }
 
     builder.tools(tools)
+}
+
+/// The extra sub-agent build context threaded into [`add_builtin_tools`] that
+/// it doesn't already receive as direct args: the orchestrator's event sink
+/// (sub-agent events TEE here tagged `SubAgent`), the active-hook cell (for
+/// `/stop` routing), and `max_turns`.
+pub(crate) struct SubAgentWiring {
+    pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
+    pub active_hook: crate::pipeline::ActiveSubAgentHook,
+    pub max_turns: usize,
 }
 
 /// Internal enum to hold either a Bash or PowerShell tool for registration.
@@ -563,6 +603,7 @@ fn create_openrouter_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -594,7 +635,7 @@ fn create_openrouter_agent(
 
     // Create session hook with stats tracking + compaction gate
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
+    let hook = SessionHook::with_context_tracking(Some(sender.clone()), session_stats)
         .with_state_manager(&state_manager);
 
     // Build agent with system prompt, hook, and built-in tools
@@ -616,6 +657,11 @@ fn create_openrouter_agent(
         shell_kind,
         vector_store,
         false,
+        Some(SubAgentWiring {
+            event_sink: Some(sender),
+            active_hook: active_sub_agent_hook,
+            max_turns,
+        }),
     );
 
     // Add MCP tools and build
@@ -650,6 +696,7 @@ fn create_anthropic_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -678,7 +725,7 @@ fn create_anthropic_agent(
     let supports_vision = resolve_supports_vision(config.vision, "anthropic", &model);
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
+    let hook = SessionHook::with_context_tracking(Some(sender.clone()), session_stats)
         .with_state_manager(&state_manager);
 
     let completion_model = client.completion_model(&model);
@@ -707,6 +754,11 @@ fn create_anthropic_agent(
         shell_kind,
         vector_store,
         supports_vision,
+        Some(SubAgentWiring {
+            event_sink: Some(sender),
+            active_hook: active_sub_agent_hook,
+            max_turns,
+        }),
     );
 
     let agent = if let Some(tools) = mcp_tools {
@@ -738,6 +790,7 @@ fn create_ollama_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -769,7 +822,9 @@ fn create_ollama_agent(
         agent_builder = agent_builder.temperature(temp as f64);
     }
 
-    // Add built-in tools (including optional SearchTool and TodoTool)
+    // Add built-in tools (including optional SearchTool and TodoTool).
+    // Ollama has no event channel, so delegated sub-agents can't TEE their
+    // events here — `event_sink` is `None`; `/stop` still routes via the cell.
     let agent_builder = add_builtin_tools(
         agent_builder,
         searxng_config,
@@ -780,6 +835,11 @@ fn create_ollama_agent(
         shell_kind,
         vector_store,
         false,
+        Some(SubAgentWiring {
+            event_sink: None,
+            active_hook: active_sub_agent_hook,
+            max_turns,
+        }),
     );
 
     // Add MCP tools and build
@@ -812,6 +872,7 @@ fn create_openai_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -845,7 +906,7 @@ fn create_openai_agent(
 
     // Create session hook with stats tracking + compaction gate
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
+    let hook = SessionHook::with_context_tracking(Some(sender.clone()), session_stats)
         .with_state_manager(&state_manager);
 
     // Build agent with system prompt, hook, and built-in tools
@@ -867,6 +928,11 @@ fn create_openai_agent(
         shell_kind,
         vector_store,
         false,
+        Some(SubAgentWiring {
+            event_sink: Some(sender),
+            active_hook: active_sub_agent_hook,
+            max_turns,
+        }),
     );
 
     // Add MCP tools and build
@@ -899,6 +965,7 @@ fn create_llamacpp_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -928,7 +995,7 @@ fn create_llamacpp_agent(
 
     // Create session hook with stats tracking + compaction gate
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
+    let hook = SessionHook::with_context_tracking(Some(sender.clone()), session_stats)
         .with_state_manager(&state_manager);
 
     // Build agent with system prompt, hook, and built-in tools
@@ -957,6 +1024,11 @@ fn create_llamacpp_agent(
         shell_kind,
         vector_store,
         false,
+        Some(SubAgentWiring {
+            event_sink: Some(sender),
+            active_hook: active_sub_agent_hook,
+            max_turns,
+        }),
     );
 
     // Add MCP tools and build
@@ -1043,6 +1115,210 @@ pub fn create_mock_agent(
         Arc::new(hook),
         model_clone,
     ))
+}
+
+/// Build a fresh sub-agent [`DynAgent`] for a delegation.
+///
+/// Shares [`add_builtin_tools`] with the orchestrator path — a sub-agent gets
+/// the **full built-in toolset** (session-cwd + bg registry come from the
+/// shared `state_manager`), *minus* `delegate` itself (`pipeline_registry` is
+/// always `None` — no nested delegation in v1).
+///
+/// The hook is **events-only** (`SessionHook::new(sink).with_source(...)`) —
+/// no `with_context_tracking`/`with_state_manager`, so it neither tracks the
+/// orchestrator's context size nor gates in-loop compaction (the sub-agent
+/// runs on a fresh, concise-by-prompt history). Its `ToolCall`/`ToolResult`/
+/// `CompletionResponse` events flow to the orchestrator's shared receiver
+/// tagged `SubAgent { role }`, so cost rolls up and turns are TEE'd to the
+/// transcript. Returns the hook so the caller can register it as the active
+/// sub-agent hook for stop routing.
+///
+/// **Ollama is hookless by type** (`DynAgent::Ollama` carries `()`), so a role
+/// on an Ollama model ignores `sink`/`source`: no event TEE, no cost roll-up,
+/// no stop for that lane. This matches Ollama's existing no-cost-tracking
+/// behaviour — a documented degradation, not a silent surprise.
+pub(crate) fn build_sub_agent(
+    config: &ProviderConfig,
+    preamble: &str,
+    sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
+    role: &str,
+    searxng_config: Option<&SearXngConfig>,
+    max_turns: usize,
+    bash_config: &BashConfig,
+    state_manager: Arc<StateManager>,
+    shell_kind: Option<&ShellKind>,
+    vector_store: Option<&crate::vector::VectorStore>,
+) -> Result<(DynAgent, Arc<SessionHook>)> {
+    // Events-only lane-tagged hook. No compaction gate (fresh context).
+    let hook = SessionHook::new(sink).with_source(crate::ui::app_state::MessageSource::SubAgent {
+        role: role.to_string(),
+    });
+
+    // A sub-agent never sees `delegate` (no nested delegation) and gets a
+    // fresh todo list (the visible todo panel is an orchestrator affordance).
+    let no_pipeline: Option<&crate::pipeline::SubAgentRegistry> = None;
+
+    match config {
+        ProviderConfig::OpenRouter(c) => {
+            let api_key = c
+                .api_key
+                .clone()
+                .context("OpenRouter API key not configured for sub-agent")?;
+            let client = openrouter::Client::builder()
+                .http_client(crate::http::client())
+                .api_key(&api_key)
+                .build()
+                .context("Failed to create OpenRouter client for sub-agent")?;
+            let builder = client
+                .agent(&c.model)
+                .preamble(preamble)
+                .max_tokens(c.max_tokens)
+                .default_max_turns(max_turns)
+                .hook(hook.clone());
+            let builder = add_builtin_tools(
+                builder,
+                searxng_config,
+                None,
+                bash_config,
+                no_pipeline,
+                Some(state_manager),
+                shell_kind,
+                vector_store,
+                false,
+                None,
+            );
+            Ok((DynAgent::OpenRouter(builder.build()), Arc::new(hook)))
+        }
+        ProviderConfig::OpenAI(c) => {
+            let api_key = c
+                .api_key
+                .clone()
+                .context("OpenAI API key not configured for sub-agent")?;
+            let client = openai::Client::builder()
+                .http_client(crate::http::client())
+                .api_key(&api_key)
+                .base_url(&c.base_url)
+                .build()
+                .context("Failed to create OpenAI client for sub-agent")?;
+            let builder = client
+                .agent(&c.model)
+                .preamble(preamble)
+                .max_tokens(c.max_tokens)
+                .default_max_turns(max_turns)
+                .hook(hook.clone());
+            let builder = add_builtin_tools(
+                builder,
+                searxng_config,
+                None,
+                bash_config,
+                no_pipeline,
+                Some(state_manager),
+                shell_kind,
+                vector_store,
+                false,
+                None,
+            );
+            Ok((DynAgent::OpenAI(builder.build()), Arc::new(hook)))
+        }
+        ProviderConfig::Anthropic(c) => {
+            let api_key = c.api_key.clone().unwrap_or_default();
+            let client = anthropic::Client::builder()
+                .http_client(crate::http::client())
+                .api_key(&api_key)
+                .base_url(&c.base_url)
+                .build()
+                .context("Failed to create Anthropic client for sub-agent")?;
+            let supports_vision = resolve_supports_vision(c.vision, "anthropic", &c.model);
+            let completion_model = client.completion_model(&c.model);
+            let completion_model = match c.prompt_caching {
+                AnthropicCaching::Off => completion_model,
+                AnthropicCaching::Manual => completion_model.with_prompt_caching(),
+                AnthropicCaching::Auto => completion_model.with_automatic_caching(),
+                AnthropicCaching::Auto1h => completion_model.with_automatic_caching_1h(),
+            };
+            let builder = AgentBuilder::new(completion_model)
+                .preamble(preamble)
+                .max_tokens(c.max_tokens)
+                .default_max_turns(max_turns)
+                .hook(hook.clone());
+            let builder = add_builtin_tools(
+                builder,
+                searxng_config,
+                None,
+                bash_config,
+                no_pipeline,
+                Some(state_manager),
+                shell_kind,
+                vector_store,
+                supports_vision,
+                None,
+            );
+            Ok((DynAgent::Anthropic(builder.build()), Arc::new(hook)))
+        }
+        ProviderConfig::LlamaCpp(c) => {
+            let api_key = c.api_key.clone().unwrap_or_default();
+            let client = openai::Client::builder()
+                .http_client(crate::http::client())
+                .api_key(&api_key)
+                .base_url(&c.base_url)
+                .build()
+                .context("Failed to create LlamaCpp client for sub-agent")?
+                .completions_api();
+            let mut builder = client
+                .agent(&c.model)
+                .preamble(preamble)
+                .max_tokens(c.max_tokens)
+                .default_max_turns(max_turns)
+                .hook(hook.clone());
+            if let Some(extra) = c.extra_params.clone() {
+                builder = builder.additional_params(extra);
+            }
+            let builder = add_builtin_tools(
+                builder,
+                searxng_config,
+                None,
+                bash_config,
+                no_pipeline,
+                Some(state_manager),
+                shell_kind,
+                vector_store,
+                false,
+                None,
+            );
+            Ok((DynAgent::LlamaCpp(builder.build()), Arc::new(hook)))
+        }
+        ProviderConfig::Ollama(c) => {
+            // Ollama's DynAgent variant carries no hook — `sink`/`source` are
+            // dropped for this lane (see the fn doc). The agent still runs and
+            // returns its output; only TEE/cost/stop are unavailable.
+            let client = ollama::Client::builder()
+                .http_client(crate::http::client())
+                .base_url(&c.base_url)
+                .api_key(rig_core::client::Nothing)
+                .build()
+                .context("Failed to create Ollama client for sub-agent")?;
+            let mut builder = client
+                .agent(&c.model)
+                .preamble(preamble)
+                .default_max_turns(max_turns);
+            if let Some(temp) = c.temperature {
+                builder = builder.temperature(temp as f64);
+            }
+            let builder = add_builtin_tools(
+                builder,
+                searxng_config,
+                None,
+                bash_config,
+                no_pipeline,
+                Some(state_manager),
+                shell_kind,
+                vector_store,
+                false,
+                None,
+            );
+            Ok((DynAgent::Ollama(builder.build()), Arc::new(hook)))
+        }
+    }
 }
 
 #[cfg(test)]

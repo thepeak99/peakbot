@@ -524,6 +524,16 @@ impl SessionHook {
         self.stop_requested.store(true, Ordering::SeqCst);
     }
 
+    /// Whether a stop has been requested and not yet consumed by the loop.
+    pub fn is_stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
+    }
+
+    /// The lane this hook stamps on its emitted events.
+    pub fn source(&self) -> &MessageSource {
+        &self.source
+    }
+
     /// Get a clone of the current session stats
     pub fn get_stats(&self) -> SessionStats {
         self.stats.lock().unwrap().clone()
