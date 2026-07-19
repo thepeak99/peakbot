@@ -1591,6 +1591,10 @@ impl StateManager {
             .iter()
             .enumerate()
             .filter(|(_, msg)| !msg.compacted)
+            // Isolation boundary: a sub-agent's internal turns live in the
+            // transcript (for display + persistence) but must NEVER enter the
+            // orchestrator model's context. Removing this line leaks them.
+            .filter(|(_, msg)| msg.source.is_orchestrator_lane())
             .filter(|(i, _)| Some(*i) != skip_last_idx)
             .map(|(_, msg)| msg)
             .filter_map(|msg| match msg.role {
@@ -3899,6 +3903,69 @@ mod tests {
         // Trailing user with attachments → excluded (matches existing behaviour).
         let history = sm.get_agent_history();
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn get_agent_history_excludes_sub_agent_lane_keeps_background() {
+        use crate::ui::app_state::{ChatMessage, MessageSource};
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage};
+
+        let sm = StateManager::new();
+
+        // Orchestrator turn (Human lane) + a delegate ToolCall/ToolResult (Human lane).
+        sm.add_user_message("orchestrate this".to_string());
+        sm.add_assistant_message("delegating".to_string());
+
+        // A sub-agent's internal turns land in the transcript tagged SubAgent.
+        // They must NEVER reach the orchestrator wire history.
+        sm.update_chat(
+            ChatMessage::agent("sub-agent thinking".to_string()).with_source(
+                MessageSource::SubAgent {
+                    role: "researcher".to_string(),
+                },
+            ),
+        );
+        sm.update_chat(ChatMessage::tool_call("bash", "{}", None).with_source(
+            MessageSource::SubAgent {
+                role: "researcher".to_string(),
+            },
+        ));
+
+        // A background synthetic turn IS orchestrator-lane input and must survive.
+        sm.update_chat(ChatMessage::user_from_background(
+            "bg output".to_string(),
+            vec![1],
+        ));
+
+        // Trailing assistant so the background user turn is not stripped as "trailing user".
+        sm.add_assistant_message("done".to_string());
+
+        let history = sm.get_agent_history();
+
+        // No sub-agent content leaked into the orchestrator wire.
+        let leaked = history.iter().any(|m| match m {
+            RigMessage::Assistant { content, .. } => content.iter().any(|c| match c {
+                AssistantContent::Text(t) => t.text.contains("sub-agent thinking"),
+                _ => false,
+            }),
+            _ => false,
+        });
+        assert!(
+            !leaked,
+            "sub-agent turn leaked into orchestrator wire history"
+        );
+
+        // The background turn survived the lane filter.
+        let has_bg = history.iter().any(|m| match m {
+            RigMessage::User { content } => content.iter().any(|c| {
+                matches!(c, rig_core::completion::message::UserContent::Text(t) if t.text.contains("bg output"))
+            }),
+            _ => false,
+        });
+        assert!(
+            has_bg,
+            "background turn was wrongly filtered from orchestrator wire history"
+        );
     }
 
     #[test]

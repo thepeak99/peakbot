@@ -239,6 +239,6 @@ async fn bg_drain_appends_synthetic_user_message_with_background_source() {
         MessageSource::Background { proc_ids } => {
             assert_eq!(proc_ids, &vec![entry.id]);
         }
-        MessageSource::Human => panic!("synthetic turn must carry Background source"),
+        other => panic!("synthetic turn must carry Background source, got {other:?}"),
     }
 }

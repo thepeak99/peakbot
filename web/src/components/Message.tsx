@@ -87,6 +87,11 @@ export function Message({ message }: { message: ChatMessage }) {
             🛰 bg
           </span>
         )}
+        {message.subAgentRole && (
+          <span className="rounded bg-cyan-950/60 px-1.5 py-0.5 text-[10px] text-cyan-300">
+            🧩 {message.subAgentRole}
+          </span>
+        )}
         <span className="ml-auto tabular-nums text-zinc-600">{message.timestamp}</span>
       </div>
       {isMarkdown(message.role) ? (

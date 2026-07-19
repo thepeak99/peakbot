@@ -80,29 +80,34 @@ fn fmt_bytes(n: usize) -> String {
 
 impl MessageRenderer for PlainRenderer {
     fn render(&self, msg: &ChatMessage, _width: u16) -> Vec<Line<'static>> {
-        // Bg-driven synthetic user turns get a distinct prefix and colour
-        // so the user can tell at a glance whether a "user" line came from
-        // them or from a background process.
-        let bg_override = match (&msg.role, &msg.source) {
-            (MessageRole::User, crate::ui::app_state::MessageSource::Background { .. }) => {
-                Some(("🛰 Background", Color::LightBlue))
+        use crate::ui::app_state::MessageSource;
+        // Non-human lanes get a distinct prefix + colour so the user can tell
+        // at a glance who produced a turn. Sub-agent turns key on `source`
+        // (any role — Agent/ToolCall/ToolResult), not on the User role.
+        let lane_override = match &msg.source {
+            MessageSource::Background { .. } if msg.role == MessageRole::User => {
+                Some(("🛰 Background".to_string(), Color::LightBlue))
             }
+            MessageSource::SubAgent { role } => Some((format!("🧩 {role}"), Color::LightCyan)),
             _ => None,
         };
-        let (prefix, color) = match bg_override {
-            Some(o) => o,
-            None => match msg.role {
-                MessageRole::User => ("👤 User", Color::LightGreen),
-                MessageRole::Agent => ("🤖 Agent", Color::LightMagenta),
-                // VS16 stripped from "⚙️" → "⚙" — the base symbol U+2699 alone
-                // matches what `unicode-width` reports (1 cell) AND what every
-                // terminal advances by, so the column drift is gone.
-                // See `garbled.md` Class A.
-                MessageRole::System => ("⚙ System", Color::LightYellow),
-                MessageRole::ToolCall => ("🔧 Tool", Color::Cyan),
-                MessageRole::ToolResult => ("📋 Result", Color::Blue),
-                MessageRole::Summary => ("📝 Summary", Color::DarkGray),
-            },
+        let (prefix, color) = match lane_override {
+            Some((p, c)) => (p, c),
+            None => {
+                let (p, c) = match msg.role {
+                    MessageRole::User => ("👤 User", Color::LightGreen),
+                    MessageRole::Agent => ("🤖 Agent", Color::LightMagenta),
+                    // VS16 stripped from "⚙️" → "⚙" — the base symbol U+2699 alone
+                    // matches what `unicode-width` reports (1 cell) AND what every
+                    // terminal advances by, so the column drift is gone.
+                    // See `garbled.md` Class A.
+                    MessageRole::System => ("⚙ System", Color::LightYellow),
+                    MessageRole::ToolCall => ("🔧 Tool", Color::Cyan),
+                    MessageRole::ToolResult => ("📋 Result", Color::Blue),
+                    MessageRole::Summary => ("📝 Summary", Color::DarkGray),
+                };
+                (p.to_string(), c)
+            }
         };
 
         let timestamp = msg.timestamp.format("%H:%M:%S").to_string();
