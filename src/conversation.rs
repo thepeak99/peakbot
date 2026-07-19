@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn pre_existing_file_without_field_defaults_false() {
-        // A pre-Fix-G JSON has no `pipeline_enabled` key at all; serde default
+        // A JSON that has no `pipeline_enabled` key at all; serde default
         // must fill in `false` (least astonishment — old convos had no pipeline).
         let json = r#"{
             "id": "00000000-0000-0000-0000-000000000000",
