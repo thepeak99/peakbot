@@ -176,7 +176,7 @@ impl TodoList {
         (pending, in_progress, completed, cancelled)
     }
 
-    // ── Mutate-and-render helpers (Fix C) ──────────────────────────────────
+    // ── Mutate-and-render helpers ───────────────────────────────────
     // These own the user-facing strings the `todo` tool returns. `StateManager`
     // delegates to them and layers its UI side-effects (panel show / sync) on
     // top; a sub-agent's standalone `TodoTool` calls them directly on its own
@@ -294,7 +294,7 @@ pub enum TodoError {
 
 /// The todo tool — a stateless controller.
 ///
-/// Two backends (Fix C):
+/// Two backends:
 /// - [`TodoBackend::Panel`]: the orchestrator's tool. Delegates to the
 ///   session `StateManager`, which owns the visible todo panel and drives its
 ///   UI side-effects (auto-show, sync).
@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(result.task, "Test task");
     }
 
-    // === Fix C: standalone (sub-agent) todo is functional AND isolated =====
+    // ── standalone (sub-agent) todo is functional AND isolated ────────────────
 
     /// The default `TodoTool` (a sub-agent's, via `unwrap_or_default()`) works
     /// end-to-end — `add` then `list` succeed without the old
@@ -579,19 +579,22 @@ mod tests {
 
         // `a` adds a task — must succeed (no StateManager error).
         let added = a
-            .call(TodoArgs::add(vec!["ship fix C".to_string()]))
+            .call(TodoArgs::add(vec!["alpha-only-task".to_string()]))
             .await
             .expect("standalone add must not error");
-        assert!(added.contains("ship fix C"), "add echoes the task: {added}");
+        assert!(
+            added.contains("alpha-only-task"),
+            "add echoes the task: {added}"
+        );
 
         // `a` lists it back.
         let listed_a = a.call(TodoArgs::list()).await.expect("list must not error");
-        assert!(listed_a.contains("ship fix C"));
+        assert!(listed_a.contains("alpha-only-task"));
 
         // `b` is a *separate* list — `a`'s task is not visible in `b`.
         let listed_b = b.call(TodoArgs::list()).await.expect("list must not error");
         assert!(
-            !listed_b.contains("ship fix C"),
+            !listed_b.contains("alpha-only-task"),
             "each standalone tool must own an isolated list; got: {listed_b}"
         );
         assert!(listed_b.contains("No tasks"), "b starts empty: {listed_b}");

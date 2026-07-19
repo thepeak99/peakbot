@@ -715,7 +715,7 @@ impl MessageSource {
         !matches!(self, MessageSource::SubAgent { .. })
     }
 
-    /// Stable label for per-lane stats aggregation (Fix F). Every
+    /// Stable label for per-lane stats aggregation. Every
     /// orchestrator-lane turn (Human/Background) buckets under
     /// `"orchestrator"`; a sub-agent buckets under its role name. This is the
     /// key `SessionStats` groups tokens/cost by, and the label the `/stats`

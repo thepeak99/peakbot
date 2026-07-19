@@ -120,7 +120,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     }
 
     // Boot-only session fact, stamped onto every conversation this session
-    // mints so a reloaded pipeline conversation is recognisable (Fix G).
+    // mints so a reloaded pipeline conversation is recognisable.
     state_manager.set_pipeline_enabled(deps.config.pipeline_enabled());
 
     let todo_tool = TodoTool::new(state_manager.clone());

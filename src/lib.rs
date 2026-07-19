@@ -1878,12 +1878,12 @@ impl AgentRunner {
 
         match event {
             AgentEvent::CompletionResponse { content, usage, .. } => {
-                // Roll tokens/cost into session stats, keyed by lane (Fix F):
-                // the parent `/stats` sees sub-agent cost too, and can break it
+                // Roll tokens/cost into session stats, keyed by lane: the
+                // parent `/stats` sees sub-agent cost too, and can break it
                 // down per role.
                 sm.add_request(&source, usage.input_tokens, usage.output_tokens, usage.cost);
 
-                // Surface a **sub-agent's** prose on its own lane (Fix B). The
+                // Surface a **sub-agent's** prose on its own lane. The
                 // orchestrator's prose already enters via `prompt_with_history`'s
                 // return value → `add_assistant_message`, so adding it here too
                 // would double it — hence the orchestrator-lane guard. A
@@ -2243,8 +2243,8 @@ impl AgentRunner {
                         stats.total_output_tokens,
                         stats.cumulative_input_tokens(),
                     );
-                    // Per-lane breakdown (Fix F): only shown once a sub-agent
-                    // has run — a single orchestrator lane adds no information
+                    // Per-lane breakdown — only shown once a sub-agent has
+                    // run; a single orchestrator lane adds no information
                     // over the flat totals above.
                     let lanes = stats.lanes_sorted();
                     let msg = if lanes.len() > 1 {
@@ -4898,7 +4898,7 @@ headers:
         assert_eq!(last.source, MessageSource::Human);
     }
 
-    // ── Fix B: sub-agent prose surfaces on its lane ─────────────────────
+    // ── sub-agent prose surfaces on its lane ──────────────────────────────
 
     /// A sub-agent `CompletionResponse` with non-empty text produces an
     /// assistant transcript message tagged `SubAgent { role }` — so a

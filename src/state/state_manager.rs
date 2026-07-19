@@ -400,9 +400,9 @@ impl StateManager {
 
     /// Add a request's stats to the session, attributed to the producing lane.
     ///
-    /// `source` keys the per-lane breakdown (Fix F): orchestrator turns bucket
-    /// under `"orchestrator"`, a sub-agent's under its role. The flat grand
-    /// totals accumulate regardless of lane.
+    /// `source` keys the per-lane breakdown: orchestrator turns bucket under
+    /// `"orchestrator"`, a sub-agent's under its role. The flat grand totals
+    /// accumulate regardless of lane.
     pub fn add_request(&self, source: &MessageSource, input: u64, output: u64, cost: f64) {
         {
             let mut stats = self.stats.lock().unwrap();
@@ -1482,8 +1482,8 @@ impl StateManager {
     /// such return path — its final text becomes the `delegate` ToolResult, and
     /// its intermediate prose would otherwise vanish. So `process_event_for_ui`
     /// calls this with the `SubAgent { role }` lane for sub-agent
-    /// `CompletionResponse`s, surfacing that prose on its own `🧩 role` lane
-    /// (Fix B). Persistence carries the lane via Fix A.
+    /// `CompletionResponse`s, surfacing that prose on its own `🧩 role` lane.
+    /// Persistence keeps the lane on the serialized message.
     pub fn add_assistant_message_sourced(&self, source: MessageSource, content: String) {
         let msg = ChatMessage::agent(content).with_source(source);
         self.update_chat(msg);
@@ -2541,8 +2541,8 @@ mod tests {
         assert_eq!(sm.peek_conversation_cwd(id).unwrap(), "");
     }
 
-    /// Fix G: `create_conversation` stamps the session's pipeline flag onto
-    /// every conversation it mints, so the fact survives persistence/reload.
+    /// `create_conversation` stamps the session's pipeline flag onto every
+    /// conversation it mints, so the fact survives persistence/reload.
     #[test]
     fn create_conversation_stamps_pipeline_flag() {
         let sm = StateManager::new();

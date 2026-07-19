@@ -49,8 +49,6 @@ pub struct RequestStats {
     pub cost: f64,
 }
 
-/// Per-lane accumulated stats (Fix F).
-///
 /// One bucket per lane label (`"orchestrator"` or a sub-agent role). Mirrors
 /// the flat totals' semantics: input/output tokens are the LAST request's on
 /// that lane (overwritten), api_calls + cost accumulate. Lets `/stats` break
@@ -86,7 +84,7 @@ pub struct SessionStats {
     pub total_cost: f64,
     /// Per-request history for debugging
     requests: Vec<RequestStats>,
-    /// Per-lane breakdown, keyed by lane label (Fix F). Empty until the
+    /// Per-lane breakdown, keyed by lane label. Empty until the
     /// first lane-attributed request; the flat totals above are the
     /// authoritative grand total and are never derived from this map.
     lanes: std::collections::HashMap<String, LaneStats>,
@@ -98,7 +96,7 @@ impl SessionStats {
         Self::default()
     }
 
-    /// Add a request's stats to the session, attributed to a lane (Fix F).
+    /// Add a request's stats to the session, attributed to a lane.
     ///
     /// Token counts (input/output) are overwritten per request — only the most recent
     /// request's token usage is tracked. This mirrors rig's per-request usage reporting.
@@ -497,7 +495,7 @@ mod tests {
         );
     }
 
-    /// Fix F: per-lane aggregation keeps a bucket per lane while the flat
+    /// Per-lane aggregation keeps a bucket per lane while the flat
     /// grand total still accumulates across all lanes. Two lanes → two
     /// buckets, orchestrator sorted first.
     #[test]
@@ -578,7 +576,7 @@ impl SessionHook {
     /// `self` for chaining. Defaults to [`MessageSource::Human`]; a sub-agent
     /// hook sets [`MessageSource::SubAgent`] so its `ToolCall`/`ToolResult`/
     /// `CompletionResponse` events reach the shared receiver tagged with the
-    /// role (see `pipeline-overhaul-plan.md` Phase 3).
+    /// role.
     pub fn with_source(mut self, source: MessageSource) -> Self {
         self.source = source;
         self

@@ -1357,9 +1357,9 @@ mod tests {
 
     #[test]
     fn wire_bash_tool_severs_sub_agent_panel() {
-        // Fix D: the orchestrator (`wire_panel = true`) drives the live bash
-        // panel; a sub-agent (`wire_panel = false`) must not — its shell output
-        // would otherwise bleed into the orchestrator's panel.
+        // The orchestrator (`wire_panel = true`) drives the live bash
+        // panel; a sub-agent (`wire_panel = false`) must not — its shell
+        // output would otherwise bleed into the orchestrator's panel.
         let path = "/bin/bash".to_string();
         let mk = || BashTool::new(path.clone(), None);
         let sm = Arc::new(StateManager::new());

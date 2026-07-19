@@ -642,7 +642,7 @@ mod tests {
         );
     }
 
-    // === Fix G: conversation-global pipeline_enabled marker ===
+    // ── conversation-global pipeline_enabled marker ────────────────────────
 
     #[test]
     fn pipeline_enabled_roundtrips_and_defaults_false() {
@@ -886,7 +886,7 @@ mod tests {
         );
     }
 
-    // === Fix A: message source (lane) persistence =====================
+    // ── message source (lane) persistence ──────────────────────────────
 
     /// A message's `source` lane survives the REAL serialize→deserialize
     /// round-trip: a `SubAgent { role }` assistant turn and a `Background`
