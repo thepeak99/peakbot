@@ -191,6 +191,12 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // of the env block too.
     let session_prompt = build_system_prompt(&deps.skills, deps.shell_kind.as_ref(), &session_cwd);
 
+    // Session-owned cell for the currently-running sub-agent hook (D6 stop
+    // routing). Created once here, shared with the boot agent's DelegateTool
+    // (via create_provider) and every `/model`-rebuilt agent (via AgentRunner),
+    // and read by the `/stop` dispatcher.
+    let active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook = Default::default();
+
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
         boot_provider_config,
         mcp_tools,
@@ -203,6 +209,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         state_manager.clone(),
         deps.shell_kind.as_ref(),
         deps.vector_store.as_ref(),
+        active_sub_agent_hook.clone(),
     )?;
 
     // Stamp the wire identity `(provider_name, model)` and the display
@@ -274,6 +281,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         Some(state_manager.clone()),
         session_hook,
         context_size,
+        active_sub_agent_hook,
     )?
     .with_rebuild_context(rebuild_ctx);
 

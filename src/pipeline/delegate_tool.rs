@@ -1,244 +1,120 @@
-//! DelegateTool - allows the entrypoint agent to delegate tasks to sub-agents.
+//! `DelegateTool` — lets the orchestrator delegate one task to one sub-agent.
 //!
-//! This tool implements the `Tool` trait and provides a way for the main agent
-//! to call specialized sub-agents defined in the pipeline configuration.
+//! The tool surface is deliberately minimal: `delegate(role, task) -> string`.
+//! Sequential-only is enforced *structurally* — there is no parallel mode to
+//! express. The orchestrator sequences by calling `delegate` repeatedly.
+//!
+//! A delegation runs the role's agent to completion on a **fresh** history
+//! (pure agents-as-tools: role preamble + the one task + its own tool loop),
+//! then returns the final text. The orchestrator's wire history records only
+//! `ToolCall(delegate, {role, task})` + `ToolResult(final_text)` — the
+//! sub-agent's internal turns never enter the orchestrator's context (they are
+//! TEE'd to the shared transcript tagged `SubAgent { role }`, and filtered out
+//! of the orchestrator wire by `get_agent_history`).
 
+use crate::config::{BashConfig, SearXngConfig};
+use crate::hooks::SessionHook;
+use crate::hooks::events::SourcedEvent;
+use crate::pipeline::ActiveSubAgentHook;
 use crate::pipeline::registry::SubAgentRegistry;
+use crate::state::StateManager;
+use crate::tools::ShellKind;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::time::timeout;
+use tokio::sync::mpsc;
 
-/// Default timeout for delegation (2 minutes)
-const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+/// Build context a sub-agent needs, captured where the orchestrator agent is
+/// constructed (inside `add_builtin_tools`). A per-delegation fresh agent
+/// genuinely needs the same build inputs the orchestrator had — searxng, the
+/// bash env, the session `StateManager` (session cwd + bg registry), the
+/// detected shell, the vector store, `max_turns` — plus the event sink to TEE
+/// its turns and the active-hook cell for stop routing.
+#[derive(Clone)]
+pub struct SubAgentDeps {
+    pub registry: Arc<SubAgentRegistry>,
+    pub searxng: Option<SearXngConfig>,
+    pub bash_config: BashConfig,
+    pub state_manager: Arc<StateManager>,
+    pub shell_kind: Option<ShellKind>,
+    pub vector_store: Option<crate::vector::VectorStore>,
+    pub max_turns: usize,
+    /// The orchestrator's event sink. Sub-agent events are pushed here tagged
+    /// `SubAgent { role }`. `None` under Ollama (hookless) — see `build_sub_agent`.
+    pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
+    /// The cell holding the currently-running sub-agent hook, for `/stop`.
+    pub active_hook: ActiveSubAgentHook,
+}
 
-/// Default delegation mode
-const DEFAULT_MODE: &str = "series";
+/// Merge a role's `env:` over a base bash env. Role keys win; base-only keys
+/// are kept. Returns a fresh `BashConfig` with the merged env — the base is
+/// not mutated (delegations must not leak env into the orchestrator's bash).
+fn merge_role_env(base: &BashConfig, role_env: Option<&HashMap<String, String>>) -> BashConfig {
+    let Some(role_env) = role_env else {
+        return base.clone();
+    };
+    let mut merged = base.env.clone().unwrap_or_default();
+    for (k, v) in role_env {
+        merged.insert(k.clone(), v.clone());
+    }
+    BashConfig { env: Some(merged) }
+}
 
-/// Tool for delegating tasks to sub-agents
+/// Fire `request_stop` on the active sub-agent hook, if a delegation is
+/// running. A no-op when the cell is empty. Called by the `/stop` dispatcher
+/// alongside the orchestrator hook so a stop lands on the innermost running
+/// agent; the whole turn then unwinds out (D6).
+pub fn fire_stop(active: &ActiveSubAgentHook) {
+    if let Some(hook) = active.lock().unwrap().as_ref() {
+        hook.request_stop();
+    }
+}
+
+/// RAII guard: registers the running sub-agent hook in the shared cell on
+/// construction and clears it on drop — so the cell is cleared even if the
+/// sub-agent run panics or returns early.
+struct ActiveHookGuard<'a> {
+    cell: &'a ActiveSubAgentHook,
+}
+
+impl<'a> ActiveHookGuard<'a> {
+    fn set(cell: &'a ActiveSubAgentHook, hook: Arc<SessionHook>) -> Self {
+        *cell.lock().unwrap() = Some(hook);
+        Self { cell }
+    }
+}
+
+impl Drop for ActiveHookGuard<'_> {
+    fn drop(&mut self) {
+        *self.cell.lock().unwrap() = None;
+    }
+}
+
+/// Tool for delegating a task to a sub-agent.
 #[derive(Clone)]
 pub struct DelegateTool {
-    /// Registry of available sub-agents
-    registry: Arc<SubAgentRegistry>,
+    deps: Arc<SubAgentDeps>,
 }
 
 impl DelegateTool {
-    /// Create a new delegate tool
-    pub fn new(registry: Arc<SubAgentRegistry>) -> Self {
-        Self { registry }
+    pub fn new(deps: Arc<SubAgentDeps>) -> Self {
+        Self { deps }
     }
 
-    /// Create a new delegate tool with custom timeout
-    ///
-    /// Note: The timeout_seconds parameter is accepted for API compatibility
-    /// but the actual timeout is determined by `DEFAULT_TIMEOUT_SECONDS`.
-    pub fn with_timeout(registry: Arc<SubAgentRegistry>, timeout_seconds: u64) -> Self {
-        let _ = timeout_seconds; // Accepted for API compatibility
-        Self { registry }
+    /// Sorted role names, for the tool description + error messages.
+    fn available_roles(&self) -> Vec<String> {
+        let mut roles: Vec<String> = self
+            .deps
+            .registry
+            .list_agents()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        roles.sort();
+        roles
     }
-
-    /// Get the list of available agents for tool description
-    fn available_agents_description(&self) -> String {
-        let agents = self.registry.list_agents();
-        if agents.is_empty() {
-            "No agents configured".to_string()
-        } else {
-            agents.join(", ")
-        }
-    }
-
-    /// Run a single agent to completion
-    async fn run_single_agent(
-        &self,
-        name: &str,
-        task: &str,
-        timeout_duration: Duration,
-    ) -> Result<AgentExecutionResult, DelegateError> {
-        let start = Instant::now();
-
-        let (agent, _info) =
-            self.registry
-                .create_agent(name)
-                .map_err(|e| DelegateError::AgentCreation {
-                    agent: name.to_string(),
-                    error: e.to_string(),
-                })?;
-
-        // Run the agent with timeout
-        let result = timeout(timeout_duration, async { agent.prompt(task).await }).await;
-
-        let duration = start.elapsed();
-
-        match result {
-            Ok(Ok(response)) => {
-                tracing::info!("Agent '{}' completed successfully in {:?}", name, duration);
-
-                Ok(AgentExecutionResult {
-                    agent_name: name.to_string(),
-                    response,
-                    duration_secs: duration.as_secs_f64(),
-                    tokens_used: None,
-                    cost: None,
-                    timed_out: false,
-                })
-            }
-            Ok(Err(e)) => {
-                tracing::error!("Agent '{}' failed: {}", name, e);
-                Err(DelegateError::AgentRun {
-                    agent: name.to_string(),
-                    error: e.to_string(),
-                })
-            }
-            Err(_) => {
-                tracing::warn!("Agent '{}' timed out after {:?}", name, timeout_duration);
-                Err(DelegateError::Timeout {
-                    agent: name.to_string(),
-                    timeout_secs: timeout_duration.as_secs(),
-                })
-            }
-        }
-    }
-
-    /// Execute agents in series (one after another, passing results)
-    #[allow(dead_code)]
-    async fn execute_series(
-        &self,
-        agents: &[String],
-        initial_task: &str,
-        timeout_seconds: u64,
-    ) -> Result<String, DelegateError> {
-        let timeout_duration = Duration::from_secs(timeout_seconds);
-        let mut current_task = initial_task.to_string();
-        let mut results: Vec<AgentExecutionResult> = Vec::new();
-
-        for agent_name in agents {
-            tracing::info!("Series: Running agent '{}'", agent_name);
-
-            let result = self
-                .run_single_agent(agent_name, &current_task, timeout_duration)
-                .await?;
-
-            // Pass result to next agent
-            current_task = result.response.clone();
-            results.push(result);
-        }
-
-        Ok(Self::format_series_results_static(&results))
-    }
-
-    /// Execute agents in parallel (all at once)
-    async fn execute_parallel(
-        &self,
-        agents: &[String],
-        task: &str,
-        timeout_seconds: u64,
-    ) -> Result<String, DelegateError> {
-        let timeout_duration = Duration::from_secs(timeout_seconds);
-
-        tracing::info!("Parallel: Running {} agents simultaneously", agents.len());
-
-        // Create a tool clone for each task
-        let mut handles = Vec::new();
-
-        for agent_name in agents {
-            let agent_name = agent_name.clone();
-            let task = task.to_string();
-            let tool = self.clone();
-            let timeout = timeout_duration;
-
-            let handle =
-                tokio::spawn(
-                    async move { tool.run_single_agent(&agent_name, &task, timeout).await },
-                );
-
-            handles.push(handle);
-        }
-
-        // Wait for all to complete
-        let mut results: Vec<AgentExecutionResult> = Vec::new();
-
-        for (i, handle) in handles.into_iter().enumerate() {
-            match handle.await {
-                Ok(Ok(result)) => results.push(result),
-                Ok(Err(e)) => {
-                    tracing::error!("Agent {} failed: {}", i, e);
-                    results.push(AgentExecutionResult {
-                        agent_name: agents[i].clone(),
-                        response: format!("Error: {}", e),
-                        duration_secs: 0.0,
-                        tokens_used: None,
-                        cost: None,
-                        timed_out: true,
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("Agent {} panicked: {}", i, e);
-                    results.push(AgentExecutionResult {
-                        agent_name: agents[i].clone(),
-                        response: format!("Panic: {}", e),
-                        duration_secs: 0.0,
-                        tokens_used: None,
-                        cost: None,
-                        timed_out: true,
-                    });
-                }
-            }
-        }
-
-        Ok(Self::format_parallel_results_static(&results))
-    }
-
-    /// Format results from series execution
-    #[allow(dead_code)]
-    fn format_series_results_static(results: &[AgentExecutionResult]) -> String {
-        let mut output = String::new();
-        output.push_str("# Series Execution Results\n\n");
-
-        for (i, result) in results.iter().enumerate() {
-            output.push_str(&format!(
-                "## Step {}: {} ({}s)\n\n{}\n\n",
-                i + 1,
-                result.agent_name,
-                format_duration(result.duration_secs),
-                result.response
-            ));
-        }
-
-        output
-    }
-
-    /// Format results from parallel execution
-    fn format_parallel_results_static(results: &[AgentExecutionResult]) -> String {
-        let mut output = String::new();
-        output.push_str("# Parallel Execution Results\n\n");
-
-        for result in results {
-            output.push_str(&format!(
-                "## {} ({}s){}\n\n{}\n\n",
-                result.agent_name,
-                format_duration(result.duration_secs),
-                if result.timed_out { " [TIMED OUT]" } else { "" },
-                result.response
-            ));
-        }
-
-        output
-    }
-}
-
-/// Result from a single agent execution
-#[derive(Debug, Clone)]
-struct AgentExecutionResult {
-    agent_name: String,
-    response: String,
-    duration_secs: f64,
-    #[allow(dead_code)]
-    tokens_used: Option<u64>,
-    #[allow(dead_code)]
-    cost: Option<f64>,
-    timed_out: bool,
 }
 
 impl Tool for DelegateTool {
@@ -249,197 +125,212 @@ impl Tool for DelegateTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        let agents_list = self.available_agents_description();
-
+        let roles = self.available_roles().join(", ");
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: format!(
-                "Delegate a task to a specialized sub-agent. Use this when a task requires \
-                a different model or expertise that the current agent doesn't have. \
-                \n\n\
-                Available agents: {}\n\n\
-                Modes:\n\
-                - 'series': Task is sent to one agent after another. Each agent receives \
-                the result of the previous agent (for dependent steps like research → write → review)\n\
-                - 'parallel': Same task is sent to multiple agents simultaneously for exploration \
-                (for comparing different approaches or perspectives)\n\n\
-                Note: Each delegation starts with fresh context - the sub-agent does not have \
-                access to the conversation history.",
-                agents_list
+                "Delegate ONE task to ONE specialised sub-agent, which runs to \
+                completion with its own fresh context and returns a single result. \
+                You see only the result string — never the sub-agent's internal \
+                steps. Delegations are sequential: call `delegate` again to chain \
+                work. Each call starts fresh — the sub-agent has NO memory of prior \
+                delegations or of this conversation, so put everything it needs in \
+                `task`.\n\n\
+                Write `task` as a self-contained brief: state the objective, the \
+                expected output shape, and the boundaries (what NOT to do). Scale \
+                effort to complexity — don't delegate a one-liner you can do yourself.\n\n\
+                Available roles: {roles}"
             ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "agent": {
+                    "role": {
                         "type": "string",
-                        "description": "Name of the sub-agent to use. Available: ".to_string() + &agents_list
+                        "description": format!("Which sub-agent to run. One of: {roles}")
                     },
                     "task": {
                         "type": "string",
-                        "description": "Detailed description of the task for the sub-agent. \
-                                      Include all context needed to complete the task."
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["series", "parallel"],
-                        "default": "series",
-                        "description": "Execution mode: 'series' for sequential execution with result passing, \
-                                      'parallel' for simultaneous execution"
-                    },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "default": 120,
-                        "description": "Maximum time to wait for the sub-agent (default: 120 seconds)"
+                        "description": "Self-contained brief for the sub-agent: objective, \
+                                        expected output, and boundaries. Include ALL context — \
+                                        the sub-agent cannot see this conversation."
                     }
                 },
-                "required": ["agent", "task"]
+                "required": ["role", "task"]
             }),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // Get the agent names list before async block
-        let agents_list = self.registry.list_agents();
-        let agents_vec: Vec<String> = agents_list.into_iter().map(|s| s.to_string()).collect();
+        let deps = &self.deps;
 
-        // Validate agent exists
-        if !self.registry.has_agent(&args.agent) {
-            return Err(DelegateError::UnknownAgent {
-                agent: args.agent,
-                available: agents_vec,
-            });
-        }
+        let role = deps
+            .registry
+            .role(&args.role)
+            .ok_or_else(|| DelegateError::UnknownRole {
+                role: args.role.clone(),
+                available: self.available_roles(),
+            })?;
 
-        let timeout_seconds = args.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
-        let mode = args.mode.as_deref().unwrap_or(DEFAULT_MODE);
+        let bash_config = merge_role_env(&deps.bash_config, role.env.as_ref());
 
-        match mode {
-            "series" => {
-                // Series mode: just one agent
-                let result = self
-                    .run_single_agent(
-                        &args.agent,
-                        &args.task,
-                        Duration::from_secs(timeout_seconds),
-                    )
-                    .await?;
+        let (agent, hook) = crate::providers::build_sub_agent(
+            &role.model.provider_config,
+            &role.prompt,
+            deps.event_sink.clone(),
+            &args.role,
+            deps.searxng.as_ref(),
+            deps.max_turns,
+            &bash_config,
+            deps.state_manager.clone(),
+            deps.shell_kind.as_ref(),
+            deps.vector_store.as_ref(),
+        )
+        .map_err(|e| DelegateError::Build {
+            role: args.role.clone(),
+            error: e.to_string(),
+        })?;
 
-                Ok(format!(
-                    "# Delegation Result\n\n\
-                     Agent: {}\n\
-                     Duration: {}s\n\n\
-                     ## Response:\n\n{}",
-                    result.agent_name,
-                    format_duration(result.duration_secs),
-                    result.response
-                ))
-            }
-            "parallel" => {
-                // Parallel mode: same task to multiple agents
-                // Parse comma-separated agent list
-                let agents: Vec<String> = args
-                    .agent
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+        // Register the hook so `/stop` reaches this innermost agent. The guard
+        // clears the cell on any exit path.
+        let _guard = ActiveHookGuard::set(&deps.active_hook, hook);
 
-                if agents.len() < 2 {
-                    return Err(DelegateError::InvalidMode {
-                        mode: mode.to_string(),
-                        reason: "parallel mode requires at least 2 agents (comma-separated)"
-                            .to_string(),
-                    });
-                }
-
-                self.execute_parallel(&agents, &args.task, timeout_seconds)
-                    .await
-            }
-            _ => Err(DelegateError::InvalidMode {
-                mode: mode.to_string(),
-                reason: "use 'series' or 'parallel'".to_string(),
-            }),
-        }
+        // Fresh history — pure agents-as-tools; no memory of prior delegations.
+        let mut history = Vec::new();
+        agent
+            .prompt_with_history(args.task.as_str(), &mut history)
+            .await
+            .map_err(|e| DelegateError::Run {
+                role: args.role.clone(),
+                error: e.to_string(),
+            })
     }
 }
 
-/// Arguments for the delegate tool
+/// Arguments for the delegate tool: one role, one task.
 #[derive(Debug, Deserialize)]
 pub struct DelegateArgs {
-    /// Name of the sub-agent(s) to delegate to
-    /// For series: single agent name
-    /// For parallel: comma-separated list of agent names
-    pub agent: String,
-
-    /// Task description for the sub-agent(s)
+    /// Which sub-agent role to run.
+    pub role: String,
+    /// The self-contained task brief for the sub-agent.
     pub task: String,
-
-    /// Execution mode: "series" or "parallel"
-    #[serde(default)]
-    pub mode: Option<String>,
-
-    /// Optional timeout in seconds
-    #[serde(default)]
-    pub timeout_seconds: Option<u64>,
 }
 
-/// Errors from the delegate tool
+/// Errors from the delegate tool.
 #[derive(Debug, thiserror::Error)]
 pub enum DelegateError {
-    #[error("Unknown agent: '{agent}'. Available: {available:?}")]
-    UnknownAgent {
-        agent: String,
+    #[error("Unknown role '{role}'. Available: {available:?}")]
+    UnknownRole {
+        role: String,
         available: Vec<String>,
     },
 
-    #[error("Invalid mode: '{mode}'. {reason}")]
-    InvalidMode { mode: String, reason: String },
+    #[error("Failed to build sub-agent for role '{role}': {error}")]
+    Build { role: String, error: String },
 
-    #[error("Agent '{agent}' timed out after {timeout_secs}s")]
-    Timeout { agent: String, timeout_secs: u64 },
-
-    #[error("Failed to create agent '{agent}': {error}")]
-    AgentCreation { agent: String, error: String },
-
-    #[error("Agent '{agent}' failed: {error}")]
-    AgentRun { agent: String, error: String },
-
-    #[error("Registry error: {0}")]
-    Registry(String),
-}
-
-/// Format duration in a human-readable way
-fn format_duration(seconds: f64) -> String {
-    if seconds < 1.0 {
-        format!("{:.1}", seconds * 1000.0) + "ms"
-    } else if seconds < 60.0 {
-        format!("{:.1}s", seconds)
-    } else {
-        let mins = (seconds / 60.0) as u32;
-        let secs = seconds % 60.0;
-        format!("{}m {:.1}s", mins, secs)
-    }
+    #[error("Sub-agent '{role}' failed: {error}")]
+    Run { role: String, error: String },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::app_state::MessageSource;
 
-    #[test]
-    fn test_format_duration_ms() {
-        assert_eq!(format_duration(0.5), "500.0ms");
-        assert_eq!(format_duration(0.025), "25.0ms");
+    fn bash_with(env: &[(&str, &str)]) -> BashConfig {
+        BashConfig {
+            env: if env.is_empty() {
+                None
+            } else {
+                Some(
+                    env.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                )
+            },
+        }
     }
 
+    /// The delegate surface is exactly `{role, task}` — no `mode`, no
+    /// `timeout`, no comma-split agent list. Sequential-only is unrepresentable.
     #[test]
-    fn test_format_duration_s() {
-        assert_eq!(format_duration(5.5), "5.5s");
-        assert_eq!(format_duration(59.9), "59.9s");
+    fn delegate_args_parse_role_and_task() {
+        let args: DelegateArgs = serde_json::from_value(
+            serde_json::json!({"role": "reviewer", "task": "review the diff"}),
+        )
+        .expect("role+task parse");
+        assert_eq!(args.role, "reviewer");
+        assert_eq!(args.task, "review the diff");
     }
 
+    /// A role's `env:` overrides base keys and unions in role-only keys; base
+    /// keys the role doesn't touch survive.
     #[test]
-    fn test_format_duration_m() {
-        assert_eq!(format_duration(65.0), "1m 5.0s");
-        assert_eq!(format_duration(125.5), "2m 5.5s");
+    fn merge_role_env_overrides_and_unions() {
+        let base = bash_with(&[("SHARED", "base"), ("BASE_ONLY", "keep")]);
+        let role = HashMap::from([
+            ("SHARED".to_string(), "role".to_string()),
+            ("ROLE_ONLY".to_string(), "added".to_string()),
+        ]);
+        let merged = merge_role_env(&base, Some(&role)).env.expect("some env");
+        assert_eq!(merged.get("SHARED").map(String::as_str), Some("role"));
+        assert_eq!(merged.get("BASE_ONLY").map(String::as_str), Some("keep"));
+        assert_eq!(merged.get("ROLE_ONLY").map(String::as_str), Some("added"));
+    }
+
+    /// No role env → the base bash config is returned unchanged.
+    #[test]
+    fn merge_role_env_none_keeps_base() {
+        let base = bash_with(&[("BASE_ONLY", "keep")]);
+        let merged = merge_role_env(&base, None).env.expect("some env");
+        assert_eq!(merged.get("BASE_ONLY").map(String::as_str), Some("keep"));
+        assert_eq!(merged.len(), 1);
+    }
+
+    /// `fire_stop` requests stop on the active sub-agent hook — the mechanism
+    /// that lets `/stop` reach the innermost running agent (D6).
+    #[test]
+    fn fire_stop_requests_stop_on_active_hook() {
+        let hook = Arc::new(SessionHook::new(None));
+        let cell: ActiveSubAgentHook = Arc::new(std::sync::Mutex::new(Some(hook.clone())));
+        assert!(!hook.is_stop_requested());
+        fire_stop(&cell);
+        assert!(hook.is_stop_requested(), "stop must reach the active hook");
+    }
+
+    /// `fire_stop` is a no-op when no delegation is running (empty cell).
+    #[test]
+    fn fire_stop_none_is_noop() {
+        let cell: ActiveSubAgentHook = Arc::new(std::sync::Mutex::new(None));
+        fire_stop(&cell); // must not panic
+        assert!(cell.lock().unwrap().is_none());
+    }
+
+    /// The `ActiveHookGuard` clears the cell on drop, even on an early return
+    /// path — so a stop after a delegation ends can't hit a stale hook.
+    #[test]
+    fn active_hook_guard_clears_cell_on_drop() {
+        let cell: ActiveSubAgentHook = Arc::new(std::sync::Mutex::new(None));
+        let hook = Arc::new(SessionHook::new(None));
+        {
+            let _guard = ActiveHookGuard::set(&cell, hook);
+            assert!(cell.lock().unwrap().is_some(), "set registers the hook");
+        }
+        assert!(cell.lock().unwrap().is_none(), "drop clears the cell");
+    }
+
+    /// The events-only sub-agent hook stamps `SubAgent { role }` on its lane —
+    /// so its turns TEE to the transcript tagged with the role and its cost
+    /// rolls up. (Asserts the flavor `build_sub_agent` gives the hook.)
+    #[test]
+    fn sub_agent_hook_stamps_subagent_source() {
+        let hook = SessionHook::new(None).with_source(MessageSource::SubAgent {
+            role: "reviewer".to_string(),
+        });
+        assert_eq!(
+            hook.source(),
+            &MessageSource::SubAgent {
+                role: "reviewer".to_string()
+            }
+        );
     }
 }

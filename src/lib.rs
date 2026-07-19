@@ -394,6 +394,11 @@ pub struct AgentRunner {
     /// Cloned at construction so memory compaction can use it
     /// without reaching through StateManager.
     compaction_model: Option<Arc<CompactionModel>>,
+    /// The cell holding the sub-agent hook that is currently running inside a
+    /// `delegate` call, if any. Owned by the session (survives `/model`
+    /// rebuilds), shared with each rebuilt agent's `DelegateTool` and read by
+    /// the `/stop` dispatcher so a stop reaches the innermost running agent.
+    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 }
 
 impl AgentRunner {
@@ -409,6 +414,7 @@ impl AgentRunner {
         state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
         context_size: usize,
+        active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     ) -> anyhow::Result<Self> {
         let agent = Arc::new(agent);
 
@@ -461,6 +467,7 @@ impl AgentRunner {
             event_receiver,
             rebuild_ctx: None,
             compaction_model,
+            active_sub_agent_hook,
         })
     }
 
@@ -561,6 +568,10 @@ impl AgentRunner {
         let config_for_agent = self.config.clone();
         let event_receiver = self.event_receiver.take();
         let compaction_model = self.compaction_model.clone();
+        // Session-owned cell for the currently-running sub-agent hook. Shared
+        // with the event loop (so `/stop` reaches the innermost agent) and the
+        // agent loop (so `/model` rebuilds hand it to the fresh DelegateTool).
+        let active_sub_agent_hook = self.active_sub_agent_hook.clone();
         // Shared cells for state that swaps on `/model` rebuild. The
         // event loop reads through these so `/stop` always cancels the
         // active prompt and the multimodal-vision gate always reflects
@@ -588,6 +599,7 @@ impl AgentRunner {
             let drain_requested = drain_requested.clone();
             let session_hook_cell = session_hook_cell.clone();
             let provider_info_cell = provider_info_cell.clone();
+            let active_sub_agent_hook = active_sub_agent_hook.clone();
 
             async move {
                 Self::event_loop(
@@ -599,6 +611,7 @@ impl AgentRunner {
                     config_model,
                     provider_info_cell,
                     drain_requested,
+                    active_sub_agent_hook,
                 )
                 .await;
             }
@@ -624,6 +637,7 @@ impl AgentRunner {
                     provider_info_cell,
                     rebuild_ctx,
                     compaction_model,
+                    active_sub_agent_hook,
                 )
                 .await;
             }
@@ -664,6 +678,7 @@ impl AgentRunner {
         config_model: String,
         provider_info_cell: SharedProviderInfo,
         drain_requested: Arc<std::sync::atomic::AtomicBool>,
+        active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     ) {
         use std::sync::atomic::Ordering;
 
@@ -672,7 +687,9 @@ impl AgentRunner {
         // counter so the status bar updates immediately. Reads the
         // *currently active* SessionHook through the shared cell so it
         // always cancels the live prompt — not a stale predecessor from
-        // before a `/model` switch.
+        // before a `/model` switch. Also fires the innermost running
+        // sub-agent hook (if a `delegate` is in flight) so a stop lands on
+        // the sub-agent too — the whole turn then unwinds out (D6).
         let request_stop_and_drain =
             |state_manager: &Option<Arc<StateManager>>,
              session_hook_cell: &SharedSessionHook,
@@ -682,6 +699,7 @@ impl AgentRunner {
                 // Clone the inner Arc out of the read guard before any
                 // await — we never want the guard to span an await point.
                 let session_hook = session_hook_cell.read().unwrap().clone();
+                let active_sub_agent_hook = active_sub_agent_hook.clone();
                 let msg_tx = msg_tx.clone();
                 let drain_requested = drain_requested.clone();
                 async move {
@@ -690,6 +708,7 @@ impl AgentRunner {
                     }
                     drain_requested.store(true, Ordering::Release);
                     session_hook.request_stop();
+                    crate::pipeline::fire_stop(&active_sub_agent_hook);
                     if let Some(ref sm) = sm {
                         sm.set_pending_input_count(0);
                         sm.set_status(Some("Stop requested...".to_string()));
@@ -852,6 +871,7 @@ impl AgentRunner {
         provider_info_cell: SharedProviderInfo,
         mut rebuild_ctx: Option<RebuildContext>,
         compaction_model: Option<Arc<CompactionModel>>,
+        active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     ) {
         use std::sync::atomic::Ordering;
 
@@ -1075,6 +1095,7 @@ impl AgentRunner {
                             &provider_info_cell,
                             &mut event_processor,
                             rebuild_ctx.as_mut(),
+                            &active_sub_agent_hook,
                         )
                         .await;
                     } else if lcmd == "/new" {
@@ -1090,6 +1111,7 @@ impl AgentRunner {
                             &provider_info_cell,
                             &mut event_processor,
                             rebuild_ctx.as_mut(),
+                            &active_sub_agent_hook,
                         )
                         .await;
                     }
@@ -1129,6 +1151,7 @@ impl AgentRunner {
                         &provider_info_cell,
                         &mut event_processor,
                         rebuild_ctx.as_mut(),
+                        &active_sub_agent_hook,
                     )
                     .await;
                     if let Some(ref sm) = state_manager {
@@ -1166,6 +1189,7 @@ impl AgentRunner {
                         &provider_info_cell,
                         &mut event_processor,
                         rebuild_ctx.as_mut(),
+                        &active_sub_agent_hook,
                     )
                     .await;
                     if let Some(ref sm) = state_manager {
@@ -1211,6 +1235,7 @@ impl AgentRunner {
         provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
+        active_sub_agent_hook: &crate::pipeline::ActiveSubAgentHook,
     ) -> Result<(), String> {
         let Some(ctx) = rebuild_ctx else {
             return Err(
@@ -1247,6 +1272,7 @@ impl AgentRunner {
             event_processor,
             state_manager,
             ctx,
+            active_sub_agent_hook,
         )
         .await?;
 
@@ -1319,6 +1345,7 @@ impl AgentRunner {
         provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
+        active_sub_agent_hook: &crate::pipeline::ActiveSubAgentHook,
     ) -> Result<(), String> {
         let Some(ctx) = rebuild_ctx else {
             return Err(
@@ -1383,6 +1410,7 @@ impl AgentRunner {
             event_processor,
             state_manager,
             ctx,
+            active_sub_agent_hook,
         )
         .await?;
 
@@ -1526,6 +1554,7 @@ impl AgentRunner {
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         state_manager: &Option<Arc<StateManager>>,
         ctx: &RebuildContext,
+        active_sub_agent_hook: &crate::pipeline::ActiveSubAgentHook,
     ) -> Result<(), String> {
         // Validate compaction model *before* mutating any state. When
         // compaction is enabled, a construction failure is fatal for the
@@ -1582,6 +1611,7 @@ impl AgentRunner {
             sm_for_provider.clone(),
             ctx.shell_kind.as_ref(),
             ctx.vector_store.as_ref(),
+            active_sub_agent_hook.clone(),
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 
@@ -1665,6 +1695,7 @@ impl AgentRunner {
         provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
+        active_sub_agent_hook: &crate::pipeline::ActiveSubAgentHook,
     ) {
         let Some(sm) = state_manager else { return };
         let Some(ctx) = rebuild_ctx else { return };
@@ -1746,6 +1777,7 @@ impl AgentRunner {
             event_processor,
             state_manager,
             ctx,
+            active_sub_agent_hook,
         )
         .await
         {
@@ -1776,6 +1808,7 @@ impl AgentRunner {
         provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
+        active_sub_agent_hook: &crate::pipeline::ActiveSubAgentHook,
     ) {
         let Some(sm) = state_manager else { return };
         let Some(ctx) = rebuild_ctx else { return };
@@ -1812,6 +1845,7 @@ impl AgentRunner {
             event_processor,
             state_manager,
             ctx,
+            active_sub_agent_hook,
         )
         .await
         {
