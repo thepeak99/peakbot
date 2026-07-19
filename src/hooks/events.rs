@@ -8,6 +8,23 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::ui::app_state::MessageSource;
+
+/// An [`AgentEvent`] paired with the lane that produced it.
+///
+/// This is the channel payload: the orchestrator's hook stamps
+/// [`MessageSource::Human`]; a sub-agent's hook stamps
+/// [`MessageSource::SubAgent`]. The single receiver reads `source` to route
+/// the event — rolling cost up regardless of lane, and stamping the lane
+/// onto any transcript message it produces.
+#[derive(Debug, Clone)]
+pub struct SourcedEvent {
+    /// The lane that produced this event.
+    pub source: MessageSource,
+    /// The event itself.
+    pub event: AgentEvent,
+}
+
 /// Token usage details for a request/response cycle
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {

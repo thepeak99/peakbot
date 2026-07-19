@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 
 use crate::hooks::events::AgentEvent;
+use crate::hooks::events::SourcedEvent;
 use crate::hooks::events::TokenUsage as EventTokenUsage;
+use crate::ui::app_state::MessageSource;
 
 /// Pricing information for a model (cost per token)
 #[derive(Clone, Debug)]
@@ -452,7 +454,12 @@ mod tests {
 #[derive(Clone)] // NOTE: Clone only shallow-copies the Arc handles
 pub struct SessionHook {
     /// Channel sender for streaming events
-    event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+    event_sender: Option<mpsc::UnboundedSender<SourcedEvent>>,
+    /// The lane every emitted event is stamped with. Defaults to
+    /// [`MessageSource::Human`] (the orchestrator); a sub-agent's hook sets
+    /// [`MessageSource::SubAgent`] via [`SessionHook::with_source`] so its
+    /// events reach the shared receiver tagged with the role.
+    source: MessageSource,
     /// Reference to session stats for token tracking
     #[allow(dead_code)]
     stats: Arc<Mutex<SessionStats>>,
@@ -468,9 +475,10 @@ pub struct SessionHook {
 
 impl SessionHook {
     /// Create a new session hook
-    pub fn new(event_sender: Option<mpsc::UnboundedSender<AgentEvent>>) -> Self {
+    pub fn new(event_sender: Option<mpsc::UnboundedSender<SourcedEvent>>) -> Self {
         Self {
             event_sender,
+            source: MessageSource::Human,
             stats: Arc::new(Mutex::new(SessionStats::new())),
             stop_requested: Arc::new(AtomicBool::new(false)),
             state_manager: None,
@@ -479,15 +487,26 @@ impl SessionHook {
 
     /// Create a new session hook with shared stats tracking
     pub fn with_context_tracking(
-        event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+        event_sender: Option<mpsc::UnboundedSender<SourcedEvent>>,
         stats: Arc<Mutex<SessionStats>>,
     ) -> Self {
         Self {
             event_sender,
+            source: MessageSource::Human,
             stats,
             stop_requested: Arc::new(AtomicBool::new(false)),
             state_manager: None,
         }
+    }
+
+    /// Stamp this hook's emitted events with a lane. Builder-style; returns
+    /// `self` for chaining. Defaults to [`MessageSource::Human`]; a sub-agent
+    /// hook sets [`MessageSource::SubAgent`] so its `ToolCall`/`ToolResult`/
+    /// `CompletionResponse` events reach the shared receiver tagged with the
+    /// role (see `pipeline-overhaul-plan.md` Phase 3).
+    pub fn with_source(mut self, source: MessageSource) -> Self {
+        self.source = source;
+        self
     }
 
     /// Wire this hook to a `StateManager` so it can gate in-loop compaction
@@ -511,11 +530,12 @@ impl SessionHook {
     }
 
     /// Create a new session hook with a new event channel (backward compatible)
-    pub fn with_channel() -> (Self, mpsc::UnboundedReceiver<AgentEvent>) {
+    pub fn with_channel() -> (Self, mpsc::UnboundedReceiver<SourcedEvent>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         (
             Self {
                 event_sender: Some(sender),
+                source: MessageSource::Human,
                 stats: Arc::new(Mutex::new(SessionStats::new())),
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 state_manager: None,
@@ -615,7 +635,10 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
                 estimated_tokens: None,
                 timestamp: Utc::now(),
             };
-            let _ = sender.send(event);
+            let _ = sender.send(SourcedEvent {
+                source: self.source.clone(),
+                event,
+            });
         }
 
         // In-loop compaction gate. Only fires when a StateManager is wired.
@@ -667,7 +690,10 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
                 },
                 timestamp: Utc::now(),
             };
-            let _ = sender.send(event);
+            let _ = sender.send(SourcedEvent {
+                source: self.source.clone(),
+                event,
+            });
         }
 
         // Check for interruptions at LLM boundary (before tool execution)
@@ -701,7 +727,10 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
                 call_id: tool_call_id.or(Some(internal_call_id.to_string())),
                 timestamp: Utc::now(),
             };
-            let _ = sender.send(event);
+            let _ = sender.send(SourcedEvent {
+                source: self.source.clone(),
+                event,
+            });
         }
         ToolCallHookAction::Continue
     }
@@ -725,7 +754,10 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
                 call_id: tool_call_id.or(Some(internal_call_id.to_string())),
                 timestamp: Utc::now(),
             };
-            let _ = sender.send(event);
+            let _ = sender.send(SourcedEvent {
+                source: self.source.clone(),
+                event,
+            });
         }
         HookAction::Continue
     }

@@ -13,7 +13,7 @@ use crate::storage::{ConversationStorage, ConversationSummary};
 use crate::tools::todo::{TodoList, TodoStatus};
 use crate::ui::app_state::{
     AppState, BashPanelState, BashPanelVisibility, BgState, BgSummary, ChatMessage, ChatState,
-    ContextState, SessionState, TodoItem, TodoState, WelcomeState,
+    ContextState, MessageSource, SessionState, TodoItem, TodoState, WelcomeState,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -1520,24 +1520,38 @@ impl StateManager {
         }
     }
 
-    /// Add a tool call message to chat and persist immediately
-    pub fn add_tool_call(&self, tool_name: String, args: String, call_id: Option<String>) {
-        let msg = ChatMessage::tool_call(&tool_name, &args, call_id);
+    /// Add a tool call message to chat and persist immediately.
+    ///
+    /// `source` tags the producing lane: [`MessageSource::Human`] for the
+    /// orchestrator, [`MessageSource::SubAgent`] for a sub-agent's turn (so
+    /// the renderer labels it and `get_agent_history` filters it out of the
+    /// orchestrator wire context).
+    pub fn add_tool_call(
+        &self,
+        source: MessageSource,
+        tool_name: String,
+        args: String,
+        call_id: Option<String>,
+    ) {
+        let msg = ChatMessage::tool_call(&tool_name, &args, call_id).with_source(source);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
             tracing::error!("Failed to persist tool call: {}", e);
         }
     }
 
-    /// Add a tool result message to chat and persist immediately
+    /// Add a tool result message to chat and persist immediately.
+    ///
+    /// `source` tags the producing lane (see [`Self::add_tool_call`]).
     pub fn add_tool_result(
         &self,
+        source: MessageSource,
         tool_name: String,
         args: String,
         result: String,
         call_id: Option<String>,
     ) {
-        let msg = ChatMessage::tool_result(&tool_name, &args, &result, call_id);
+        let msg = ChatMessage::tool_result(&tool_name, &args, &result, call_id).with_source(source);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
             tracing::error!("Failed to persist tool result: {}", e);
@@ -2894,11 +2908,13 @@ mod tests {
         // Add a realistic conversation with tool calls
         sm.add_user_message("List the files".to_string());
         sm.add_tool_call(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
         );
         sm.add_tool_result(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             "file1.txt\nfile2.txt".to_string(),
@@ -2934,6 +2950,7 @@ mod tests {
 
         let sm = StateManager::new();
         sm.add_tool_call(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls -la"}"#.to_string(),
             Some("call_42".to_string()),
@@ -2970,6 +2987,7 @@ mod tests {
 
         let sm = StateManager::new();
         sm.add_tool_result(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             "file1.txt\nfile2.txt".to_string(),
@@ -3010,11 +3028,13 @@ mod tests {
 
         sm.add_user_message("List files".to_string());
         sm.add_tool_call(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
         );
         sm.add_tool_result(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             "file1.txt\nfile2.txt".to_string(),
@@ -3863,12 +3883,14 @@ mod tests {
         let sm = StateManager::new();
         sm.add_user_message("look".to_string());
         sm.add_tool_call(
+            MessageSource::Human,
             "view_image".to_string(),
             r#"{"path":"/tmp/x.png"}"#.to_string(),
             Some("call_1".to_string()),
         );
         // Exactly the shape `view_image` returns.
         sm.add_tool_result(
+            MessageSource::Human,
             "view_image".to_string(),
             r#"{"path":"/tmp/x.png"}"#.to_string(),
             r#"{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}"#.to_string(),
@@ -4149,11 +4171,13 @@ mod tests {
         sm.add_user_message("list files".to_string());
         sm.add_assistant_message("I'll run ls for you".to_string());
         sm.add_tool_call(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
         );
         sm.add_tool_result(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             "file1.txt\nfile2.txt".to_string(),
@@ -4656,11 +4680,13 @@ mod tests {
         // Simulate a first turn with tool calls: 4 messages total
         sm.add_user_message("List files".to_string());
         sm.add_tool_call(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
         );
         sm.add_tool_result(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             "file1.txt".to_string(),

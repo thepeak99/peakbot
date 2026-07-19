@@ -17,7 +17,7 @@ use crate::config::{
     OpenRouterConfig, ProviderConfig, SearXngConfig,
 };
 use crate::hooks::SessionHook;
-use crate::hooks::events::AgentEvent;
+use crate::hooks::events::SourcedEvent;
 #[cfg(feature = "mock")]
 use crate::mock::MockCompletionModel;
 use crate::state::StateManager;
@@ -201,7 +201,7 @@ pub fn create_provider(
 ) -> Result<(
     DynAgent,
     ProviderInfo,
-    Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    Option<mpsc::UnboundedReceiver<SourcedEvent>>,
     Arc<SessionHook>,
 )> {
     match config {
@@ -566,7 +566,7 @@ fn create_openrouter_agent(
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
-    mpsc::UnboundedReceiver<AgentEvent>,
+    mpsc::UnboundedReceiver<SourcedEvent>,
     SessionHook,
 )> {
     let api_key = config
@@ -653,7 +653,7 @@ fn create_anthropic_agent(
 ) -> Result<(
     Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
     ProviderInfo,
-    mpsc::UnboundedReceiver<AgentEvent>,
+    mpsc::UnboundedReceiver<SourcedEvent>,
     SessionHook,
 )> {
     // API key is optional — local Anthropic-compatible servers often need none.
@@ -815,7 +815,7 @@ fn create_openai_agent(
 ) -> Result<(
     Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
-    mpsc::UnboundedReceiver<AgentEvent>,
+    mpsc::UnboundedReceiver<SourcedEvent>,
     SessionHook,
 )> {
     let api_key = config
@@ -902,7 +902,7 @@ fn create_llamacpp_agent(
 ) -> Result<(
     Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
-    mpsc::UnboundedReceiver<AgentEvent>,
+    mpsc::UnboundedReceiver<SourcedEvent>,
     SessionHook,
 )> {
     // API key is optional for local llama.cpp instances
@@ -988,7 +988,7 @@ pub fn create_mock_agent(
 ) -> Result<(
     DynAgent,
     ProviderInfo,
-    mpsc::UnboundedReceiver<AgentEvent>,
+    mpsc::UnboundedReceiver<SourcedEvent>,
     Arc<SessionHook>,
     MockCompletionModel,
 )> {

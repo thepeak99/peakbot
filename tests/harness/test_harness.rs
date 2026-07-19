@@ -13,7 +13,7 @@ use peakbot::ContextConfig;
 use peakbot::mock::{MockCompletionModel, MockResponse, RecordedRequest};
 use peakbot::test_runner::TestRunner;
 use peakbot::ui::AppState;
-use peakbot::{AgentEvent, SessionStats, StateManager, TodoItem};
+use peakbot::{AgentEvent, SessionStats, SourcedEvent, StateManager, TodoItem};
 use rig_core::completion::message::Message;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -34,7 +34,7 @@ pub struct TestHarness {
     /// Mock completion model for simulating LLM responses
     pub mock_model: MockCompletionModel,
     /// Event receiver for collecting agent events
-    pub event_receiver: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    pub event_receiver: tokio::sync::mpsc::UnboundedReceiver<SourcedEvent>,
     /// Temp directory for file-based tests
     _temp_dir: Option<TempDir>,
     /// Internal test runner for processing messages through the full loop
@@ -180,8 +180,8 @@ impl TestHarness {
     /// Useful for verifying event emission behavior in tests.
     pub fn drain_events(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
-        while let Ok(event) = self.event_receiver.try_recv() {
-            events.push(event);
+        while let Ok(sourced) = self.event_receiver.try_recv() {
+            events.push(sourced.event);
         }
         events
     }
