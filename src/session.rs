@@ -119,6 +119,10 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         state_manager.set_shell(sk.executable().to_string());
     }
 
+    // Boot-only session fact, stamped onto every conversation this session
+    // mints so a reloaded pipeline conversation is recognisable (Fix G).
+    state_manager.set_pipeline_enabled(deps.config.pipeline_enabled());
+
     let todo_tool = TodoTool::new(state_manager.clone());
 
     // Pick the model to boot on. A resumed conversation boots on the model

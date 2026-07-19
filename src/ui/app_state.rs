@@ -714,6 +714,18 @@ impl MessageSource {
     pub fn is_orchestrator_lane(&self) -> bool {
         !matches!(self, MessageSource::SubAgent { .. })
     }
+
+    /// Stable label for per-lane stats aggregation (Fix F). Every
+    /// orchestrator-lane turn (Human/Background) buckets under
+    /// `"orchestrator"`; a sub-agent buckets under its role name. This is the
+    /// key `SessionStats` groups tokens/cost by, and the label the `/stats`
+    /// breakdown prints.
+    pub fn lane_label(&self) -> &str {
+        match self {
+            MessageSource::SubAgent { role } => role,
+            _ => "orchestrator",
+        }
+    }
 }
 
 /// Role of a message sender

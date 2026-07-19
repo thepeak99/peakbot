@@ -49,6 +49,24 @@ pub struct RequestStats {
     pub cost: f64,
 }
 
+/// Per-lane accumulated stats (Fix F).
+///
+/// One bucket per lane label (`"orchestrator"` or a sub-agent role). Mirrors
+/// the flat totals' semantics: input/output tokens are the LAST request's on
+/// that lane (overwritten), api_calls + cost accumulate. Lets `/stats` break
+/// down "how much did the reviewer cost" without conflating models.
+#[derive(Clone, Debug, Default)]
+pub struct LaneStats {
+    /// Input tokens from the LAST request on this lane (overwritten).
+    pub input_tokens: u64,
+    /// Output tokens from the LAST request on this lane (overwritten).
+    pub output_tokens: u64,
+    /// API calls made on this lane.
+    pub api_calls: u64,
+    /// Accumulated cost (USD) on this lane.
+    pub cost: f64,
+}
+
 /// Accumulated session statistics
 ///
 /// NOTE: `total_input_tokens` and `total_output_tokens` are OVERWRITTEN per
@@ -68,6 +86,10 @@ pub struct SessionStats {
     pub total_cost: f64,
     /// Per-request history for debugging
     requests: Vec<RequestStats>,
+    /// Per-lane breakdown, keyed by lane label (Fix F). Empty until the
+    /// first lane-attributed request; the flat totals above are the
+    /// authoritative grand total and are never derived from this map.
+    lanes: std::collections::HashMap<String, LaneStats>,
 }
 
 impl SessionStats {
@@ -76,12 +98,13 @@ impl SessionStats {
         Self::default()
     }
 
-    /// Add a request's stats to the session
+    /// Add a request's stats to the session, attributed to a lane (Fix F).
     ///
     /// Token counts (input/output) are overwritten per request — only the most recent
     /// request's token usage is tracked. This mirrors rig's per-request usage reporting.
-    /// API call count and total cost accumulate across all requests.
-    pub fn add_request(&mut self, input: u64, output: u64, cost: f64) {
+    /// API call count and total cost accumulate across all requests. The same
+    /// overwrite/accumulate split is applied to the `lane`'s bucket.
+    pub fn add_request(&mut self, lane: &str, input: u64, output: u64, cost: f64) {
         self.total_input_tokens = input;
         self.total_output_tokens = output;
         self.total_api_calls += 1;
@@ -91,6 +114,29 @@ impl SessionStats {
             output_tokens: output,
             cost,
         });
+
+        let bucket = self.lanes.entry(lane.to_string()).or_default();
+        bucket.input_tokens = input;
+        bucket.output_tokens = output;
+        bucket.api_calls += 1;
+        bucket.cost += cost;
+    }
+
+    /// Per-lane breakdown, sorted with `"orchestrator"` first then roles
+    /// alphabetically — a stable order for the `/stats` breakdown.
+    pub fn lanes_sorted(&self) -> Vec<(String, LaneStats)> {
+        let mut rows: Vec<(String, LaneStats)> = self
+            .lanes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        rows.sort_by(|a, b| match (a.0.as_str(), b.0.as_str()) {
+            ("orchestrator", "orchestrator") => std::cmp::Ordering::Equal,
+            ("orchestrator", _) => std::cmp::Ordering::Less,
+            (_, "orchestrator") => std::cmp::Ordering::Greater,
+            (x, y) => x.cmp(y),
+        });
+        rows
     }
 
     /// Get a summary string of the session stats
@@ -120,6 +166,7 @@ impl SessionStats {
         self.total_api_calls = 0;
         self.total_cost = 0.0;
         self.requests.clear();
+        self.lanes.clear();
     }
 
     /// Restore stats from a persisted snapshot (e.g. after `/load`).
@@ -423,8 +470,8 @@ mod tests {
     #[test]
     fn clear_last_input_tokens_zeroes_last_without_touching_cumulative() {
         let mut stats = SessionStats::new();
-        stats.add_request(500, 200, 0.05);
-        stats.add_request(800, 300, 0.08);
+        stats.add_request("orchestrator", 500, 200, 0.05);
+        stats.add_request("orchestrator", 800, 300, 0.08);
 
         // Sanity: pre-clear, last_input_tokens reflects the most recent request.
         assert_eq!(stats.last_input_tokens(), Some(800));
@@ -448,6 +495,34 @@ mod tests {
             (stats.total_cost - cost_before).abs() < f64::EPSILON,
             "total cost must not change"
         );
+    }
+
+    /// Fix F: per-lane aggregation keeps a bucket per lane while the flat
+    /// grand total still accumulates across all lanes. Two lanes → two
+    /// buckets, orchestrator sorted first.
+    #[test]
+    fn add_request_buckets_stats_per_lane() {
+        let mut stats = SessionStats::new();
+        stats.add_request("orchestrator", 100, 20, 0.01);
+        stats.add_request("reviewer", 200, 40, 0.02);
+        stats.add_request("reviewer", 300, 60, 0.03);
+
+        // Flat grand total accumulates across lanes.
+        assert_eq!(stats.total_api_calls, 3);
+        assert!((stats.total_cost - 0.06).abs() < 1e-9);
+
+        let lanes = stats.lanes_sorted();
+        assert_eq!(lanes.len(), 2);
+        // orchestrator sorts first.
+        assert_eq!(lanes[0].0, "orchestrator");
+        assert_eq!(lanes[0].1.api_calls, 1);
+        assert!((lanes[0].1.cost - 0.01).abs() < 1e-9);
+        // reviewer bucket: 2 calls, cost accumulates, tokens = LAST request.
+        assert_eq!(lanes[1].0, "reviewer");
+        assert_eq!(lanes[1].1.api_calls, 2);
+        assert!((lanes[1].1.cost - 0.05).abs() < 1e-9);
+        assert_eq!(lanes[1].1.input_tokens, 300);
+        assert_eq!(lanes[1].1.output_tokens, 60);
     }
 }
 
@@ -678,6 +753,7 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         // This is critical for ContextManager to track actual token counts
         if let Ok(mut stats) = self.stats.lock() {
             stats.add_request(
+                self.source.lane_label(),
                 input_tokens,
                 usage.output_tokens,
                 0.0, // Cost is calculated externally

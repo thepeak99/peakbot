@@ -120,6 +120,15 @@ impl BashTool {
         self
     }
 
+    /// Whether this tool drives a live bash panel. Sub-agents build their
+    /// bash tool without a state manager so their shell output never bleeds
+    /// into the orchestrator's panel — this accessor lets that invariant be
+    /// asserted directly.
+    #[cfg(test)]
+    pub(crate) fn has_state_manager(&self) -> bool {
+        self.state_manager.is_some()
+    }
+
     /// Detect if the command appears to be doing file editing
     /// Returns a warning message if file-editing patterns are detected
     fn check_file_edit_patterns(&self, command: &str) -> Option<String> {
