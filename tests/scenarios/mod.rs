@@ -13,6 +13,7 @@ mod event_tests;
 mod message_roundtrip;
 mod no_set_current_dir;
 mod persistence_tests;
+mod pipeline_tests;
 mod powershell_tests;
 mod queued_input_tests;
 mod stats_tests;
