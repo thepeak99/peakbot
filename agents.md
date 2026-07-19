@@ -272,6 +272,7 @@ vector store and the Anthropic provider are active:
 | `doc_index` *(opt-in)* | `doc_index.rs` | Parse → chunk → embed → store a file/dir into the semantic vector store. Idempotent re-index (skips unchanged files via stored `sha256`). Registered only when `vector_db:` is configured. |
 | `doc_search` *(opt-in)* | `doc_search.rs` | Embed a query and return the top-k most relevant indexed chunks with source + score. Registered only when `vector_db:` is configured. |
 | `view_image` *(Anthropic-only)* | `view_image.rs` | Load a local image file (PNG/JPEG/GIF/WEBP, ≤10 MB) into the model's vision context as a structured image tool result. Reuses `vision::load_image_from_path`. Registered **only on the Anthropic provider** — the lone rig provider whose tool-result channel delivers images (OpenRouter substitutes a placeholder, Ollama drops it, OpenAI errors). |
+| `delegate` *(opt-in)* | `pipeline/delegate_tool.rs` | `delegate(role, task) -> string`: run one sub-agent to completion on a fresh context and return its final text. Registered **only when `pipeline.enabled: true`**. Sequential by construction (no parallel mode). See [Multi-agent pipeline](#multi-agent-pipeline-orchestrator--sub-agents). |
 
 Plus optional **MCP tools** from configured servers.
 
@@ -1340,6 +1341,136 @@ for v1; sidecar storage is a speculative Phase 2 (see `one-vision.md`).
 - Dispatch path: `SubmitKind::MultimodalMessage` → `add_user_message_with_attachments`
   → `build_current_turn_message` → `prompt_with_history` (identical path to text turns)
 
+
+## Multi-agent pipeline (orchestrator + sub-agents)
+
+PeakBot can run as an **orchestrator** that delegates tasks to **sub-agents**.
+You talk to one agent in one conversation; it spawns focused sub-agents,
+each with its own fresh context, and you see every sub-agent's turns tagged by
+role. This is opt-in via the `pipeline:` config block — when it's absent or
+`enabled: false`, none of this exists and the `delegate` tool isn't registered.
+A runnable example lives under [`examples/pipeline-team/`](examples/pipeline-team/).
+
+### The model
+
+- **You talk to one agent: the orchestrator.** The orchestrator is simply your
+  normal top-level agent (whatever `default_model` resolves to). It is **not** a
+  pipeline role — never list it under `pipeline.agents`.
+- The orchestrator gets a **`delegate(role, task)`** tool. Each call runs one
+  **sub-agent** — a role defined as *(model alias, prompt)* + optional `env:` —
+  to completion on a **fresh context** (role prompt + that one task + its own
+  tool loop), then returns **one string**.
+- **Sequential only.** `delegate` runs one sub-agent at a time; the orchestrator
+  sequences by calling it again. There is no parallel mode — the single
+  role/single task tool signature makes "parallel" unrepresentable.
+- **Fresh per delegation.** A sub-agent has no memory of prior delegations or of
+  the conversation. Put everything it needs into `task`.
+
+### What each party sees (the isolation invariant)
+
+Three things that a plain single-agent chat conflates are pulled apart here:
+
+1. **Display transcript** — what you see and what is persisted. The union of the
+   orchestrator's turns *and* every sub-agent's turns, each tagged by origin
+   (`MessageSource::SubAgent { role }`).
+2. **Orchestrator wire context** — what is sent to the orchestrator model. Its
+   own turns plus each delegate `ToolCall` + the returned result string. **Never**
+   a sub-agent's internal turns.
+3. **Sub-agent wire context** — what is sent to a sub-agent model. That role's
+   prompt + the one task + its own tool round-trips. Thrown away after the call.
+
+The load-bearing guarantee: sub-agent turns are appended to the transcript for
+display/persistence but **filtered out of the orchestrator's wire history** by a
+single lane filter in `get_agent_history`
+(`msg.source.is_orchestrator_lane()`). Without it, a sub-agent's internal turns
+would leak into the orchestrator's context on the next turn and on resume. This
+is the single most important correctness check and has a dedicated regression
+test (`get_agent_history_excludes_sub_agent_lane_keeps_background`). The
+orchestrator's *own* `delegate` ToolCall/ToolResult stay on the orchestrator lane
+— that's exactly the input+output it should see.
+
+### Display: lane colouring
+
+Sub-agent turns render with a distinct prefix (`🧩 <role>`) and colour, keyed on
+`MessageSource` in `PlainRenderer` — the same mechanism `Background` turns use.
+The web UI mirrors this via the `sub_agent` wire source in `Message.tsx`.
+
+### Cost roll-up
+
+A delegation's tokens and cost roll into the parent `/stats` — sub-agent usage is
+accounted lane-agnostically at the event boundary, so delegating heavy work is
+never silently free. (Exception: **Ollama** sub-agents are hookless — Ollama has
+no event channel — so their turns are not TEE'd and their cost is not tracked.)
+
+### Config shape
+
+A role is `(model, prompt)` + optional `env:`. The `model:` names an **alias**
+from the top-level `providers:` list — the same aliases `/model` uses — resolved
+at load against the `ModelRegistry`. Omit `model:` to fall back to
+`default_model`. There are no provider/credential fields on a role; model, key,
+and base URL all come from the resolved alias.
+
+```yaml
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-or-v1-xxx
+    models:
+      - { name: anthropic/claude-3.7-sonnet, alias: sonnet, max_tokens: 8192 }
+      - { name: google/gemini-2.0-flash-001, alias: flash }
+default_model: sonnet          # ← the orchestrator you chat with
+
+pipeline:
+  enabled: true
+  agents:
+    researcher:
+      model: flash             # alias from providers: (falls back to default_model if omitted)
+      prompt: "You research codebases and the web. Return a tight brief."
+    reviewer:
+      model: sonnet
+      prompt: "You review diffs and critique."
+      env: { REVIEW_STRICT: "1" }   # optional; merged into THIS sub-agent's bash env only
+```
+
+Validation is at load (parse-at-the-boundary): an unknown alias, an empty
+prompt, or an empty role name is a clear boot-time error. `pipeline:` is
+**boot-only** — edit and restart (it's in the "ignored — restart to apply" set of
+the [reload table](#live-reload-on-session-verbs-new-model-cd-load)).
+
+### Tools & isolation (v1)
+
+- Every sub-agent receives the **full built-in toolset MINUS `delegate`** — the
+  one deliberate subtraction (no nested delegation). It can read files, run
+  `bash`/`bash_bg`, search the web, etc.
+- **No harness sandbox in v1.** A sub-agent can write and run bash. Isolation is
+  a **configuration** concern, not a safety gate — a top-level tool-disable
+  feature (planned separately) will scope which tools a role gets once it exists;
+  there is intentionally no bespoke per-role tool filter today.
+- `env:` is per-role, merged only into that sub-agent's bash tool env — it never
+  leaks into the orchestrator or other roles.
+
+### Stop during a delegation
+
+Hitting stop while a sub-agent runs aborts the **whole turn** — the sub-agent turn
+and the orchestrator turn unwind together ("stop means stop"). Stop routes to the
+innermost running hook (the sub-agent's, tracked in a shared `ActiveSubAgentHook`
+cell) *and* the orchestrator's; there is no "delegation stopped, back to
+orchestrator" resumption path.
+
+### Where it lives
+
+- `src/pipeline/delegate_tool.rs` — the `delegate` tool + `SubAgentDeps` build
+  context + stop routing.
+- `src/pipeline/registry.rs` — `SubAgentRegistry`: resolves each role's alias
+  against the `ModelRegistry` at construction.
+- `src/providers/mod.rs` — `build_sub_agent` builds a live sub-agent beside
+  `create_*_agent`, sharing `add_builtin_tools` (the real shared piece).
+- `MessageSource::SubAgent { role }` + `is_orchestrator_lane()`
+  (`src/ui/app_state.rs`); the lane filter in `get_agent_history`
+  (`src/state/state_manager.rs`).
+
+This is the concrete, config-driven form of the generic rig agents-as-tools
+pattern described under [Multi-agent patterns](#multi-agent-patterns).
 
 ## CI (Gitea Actions)
 
