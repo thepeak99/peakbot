@@ -10,5 +10,5 @@ pub mod session_hook;
 
 // Re-exports
 //pub use channel::{CostHandler, EventChannel, EventHandler, EventProcessor, create_event_channel};
-pub use events::{AgentEvent, TokenUsage};
+pub use events::{AgentEvent, SourcedEvent, TokenUsage};
 pub use session_hook::{ModelPricing, SessionHook, SessionStats, fetch_model_pricing};

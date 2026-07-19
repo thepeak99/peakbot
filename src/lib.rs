@@ -48,7 +48,8 @@ pub use conversation::{
 };
 pub use conversation_manager::{ConversationManager, ConversationManagerConfig};
 pub use hooks::{
-    AgentEvent, ModelPricing, SessionHook, SessionStats, TokenUsage, fetch_model_pricing,
+    AgentEvent, ModelPricing, SessionHook, SessionStats, SourcedEvent, TokenUsage,
+    fetch_model_pricing,
 };
 pub use pipeline::{DelegateTool, SubAgentRegistry};
 #[cfg(feature = "mock")]
@@ -384,7 +385,7 @@ pub struct AgentRunner {
     // Shared session hook for interrupt/queue state
     session_hook: Arc<SessionHook>,
     // Retained for streaming output handler (view concern, set up by main.rs)
-    event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    event_receiver: Option<mpsc::UnboundedReceiver<SourcedEvent>>,
     /// Optional rebuild deps for `/model` switching. Set by
     /// [`AgentRunner::with_rebuild_context`] from `main.rs` after
     /// construction. When `None`, `/model` is a no-op.
@@ -404,7 +405,7 @@ impl AgentRunner {
         config: Config,
         provider_info: ProviderInfo,
         skills: SkillRegistry,
-        event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+        event_receiver: Option<mpsc::UnboundedReceiver<SourcedEvent>>,
         state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
         context_size: usize,
@@ -846,7 +847,7 @@ impl AgentRunner {
         initial_agent: Arc<DynAgent>,
         mut config: Config,
         drain_requested: Arc<std::sync::atomic::AtomicBool>,
-        initial_event_receiver: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+        initial_event_receiver: Option<mpsc::UnboundedReceiver<SourcedEvent>>,
         session_hook_cell: SharedSessionHook,
         provider_info_cell: SharedProviderInfo,
         mut rebuild_ctx: Option<RebuildContext>,
@@ -1818,22 +1819,33 @@ impl AgentRunner {
         }
     }
 
-    /// Process an AgentEvent and update StateManager accordingly.
+    /// Process a `SourcedEvent` and update StateManager accordingly.
     ///
     /// This is the Controller's responsibility — it decides how domain events
     /// affect the UI state. The Model (StateManager) is passive and only holds data.
     ///
-    /// Note: This now persists ALL messages (including tool calls/results) to
-    /// StateManager, which serves as the single source of truth for persistence.
-    fn process_event_for_ui(state_manager: &Option<Arc<StateManager>>, event: AgentEvent) {
+    /// The event carries the lane that produced it (`source`). Cost/token
+    /// roll-up is **lane-agnostic** — a sub-agent's usage counts toward the
+    /// parent `/stats` exactly like the orchestrator's (the #1 research fix:
+    /// a delegation's cost must never be silent). The lane *is* honoured when
+    /// stamping the resulting transcript ChatMessage, so the renderer can
+    /// label a sub-agent's turns and `get_agent_history` can filter them out
+    /// of the orchestrator's wire context.
+    pub(crate) fn process_event_for_ui(
+        state_manager: &Option<Arc<StateManager>>,
+        sourced: SourcedEvent,
+    ) {
         let sm = match state_manager {
             Some(sm) => sm,
             None => return,
         };
 
+        let SourcedEvent { source, event } = sourced;
+
         match event {
             AgentEvent::CompletionResponse { usage, .. } => {
-                // Update stats in StateManager (single source of truth)
+                // Roll tokens/cost into the single session stats regardless
+                // of lane — the parent `/stats` sees sub-agent cost too.
                 sm.add_request(usage.input_tokens, usage.output_tokens, usage.cost);
             }
             AgentEvent::ToolCall {
@@ -1845,8 +1857,8 @@ impl AgentRunner {
                 // Indicator phase → show the tool name in the working banner
                 // (see `workin-baby.md` §6). Cleared on the matching result.
                 sm.set_status(Some(tool_name.clone()));
-                // Add to chat AND persist (StateManager handles persistence)
-                sm.add_tool_call(tool_name, arguments, call_id);
+                // Add to chat AND persist, stamped with the producing lane.
+                sm.add_tool_call(source, tool_name, arguments, call_id);
             }
             AgentEvent::ToolResult {
                 tool_name,
@@ -1857,8 +1869,8 @@ impl AgentRunner {
             } => {
                 // Back to "thinking" — the model is about to reason again.
                 sm.set_status(None);
-                // Add to chat AND persist (StateManager handles persistence)
-                sm.add_tool_result(tool_name, arguments, result, call_id);
+                // Add to chat AND persist, stamped with the producing lane.
+                sm.add_tool_result(source, tool_name, arguments, result, call_id);
             }
             AgentEvent::CompletionRequest { .. }
             | AgentEvent::SessionStart { .. }
@@ -3092,6 +3104,7 @@ pub async fn load_mcp_servers(config: &Config) -> Result<Vec<McpServerHandle>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::app_state::MessageSource;
     use std::collections::HashMap;
 
     // --- /help handler tests -------------------------------------------------
@@ -4567,11 +4580,13 @@ headers:
         sm.add_user_message("list files".to_string());
         sm.add_assistant_message("I'll run ls for you".to_string());
         sm.add_tool_call(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
         );
         sm.add_tool_result(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             "UNIQUE_TOOLRESULT_MARKER_12345".to_string(),
@@ -4665,11 +4680,13 @@ headers:
         sm.add_user_message("list files".to_string());
         sm.add_assistant_message("I'll run ls for you".to_string());
         sm.add_tool_call(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
         );
         sm.add_tool_result(
+            MessageSource::Human,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             "UNIQUE_TOOLRESULT_MARKER_12345".to_string(),
@@ -4698,5 +4715,122 @@ headers:
             history_count, 1,
             "naive get_agent_history() ALSO has the marker (the source of the duplication)"
         );
+    }
+
+    // ── Phase 3: event lane tag + cost roll-up ──────────────────────────
+    //
+    // A sub-agent's events reach the shared event channel wrapped in a
+    // `SourcedEvent` carrying its lane (`MessageSource::SubAgent { role }`).
+    // `process_event_for_ui` must (a) roll token/cost into the parent stats
+    // *regardless* of lane — the #1 research fix, a delegation's 15× cost
+    // can't be silent in `/stats` — and (b) stamp that lane onto the tool
+    // ChatMessages it produces so the transcript can label them.
+
+    /// A `CompletionResponse` from a sub-agent lane rolls its tokens and
+    /// cost into the parent session stats exactly as an orchestrator turn
+    /// would. Cost accounting is lane-agnostic.
+    #[test]
+    fn sub_agent_completion_response_rolls_cost_into_stats() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::SubAgent {
+                    role: "researcher".to_string(),
+                },
+                event: AgentEvent::CompletionResponse {
+                    content: "done".to_string(),
+                    reasoning: None,
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        total_tokens: 150,
+                        cost: 0.02,
+                    },
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let stats = sm.get_stats();
+        assert_eq!(stats.total_api_calls, 1, "sub-agent call must count");
+        assert_eq!(stats.total_input_tokens, 100);
+        assert_eq!(stats.total_output_tokens, 50);
+        assert!(
+            (stats.total_cost - 0.02).abs() < f64::EPSILON,
+            "sub-agent cost must roll into /stats, got {}",
+            stats.total_cost
+        );
+    }
+
+    /// A `ToolCall` from a sub-agent lane produces a transcript ChatMessage
+    /// stamped `MessageSource::SubAgent { role }` — the renderer keys on it.
+    #[test]
+    fn sub_agent_tool_call_is_stamped_with_sub_agent_source() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent};
+        use crate::ui::app_state::MessageRole;
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::SubAgent {
+                    role: "researcher".to_string(),
+                },
+                event: AgentEvent::ToolCall {
+                    tool_name: "bash".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                    call_id: Some("c1".to_string()),
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let msgs = sm.get_state().chat.messages;
+        let last = msgs.last().expect("a tool-call message was added");
+        assert_eq!(last.role, MessageRole::ToolCall);
+        assert_eq!(
+            last.source,
+            MessageSource::SubAgent {
+                role: "researcher".to_string()
+            },
+            "sub-agent tool call must carry its lane"
+        );
+    }
+
+    /// The orchestrator's own tool calls stay on the `Human` lane — the
+    /// default when no sub-agent source is set. Guards against a regression
+    /// that would leak the default into a non-Human lane.
+    #[test]
+    fn orchestrator_tool_call_stays_human_lane() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent};
+        use crate::ui::app_state::MessageRole;
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::Human,
+                event: AgentEvent::ToolCall {
+                    tool_name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                    call_id: None,
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let msgs = sm.get_state().chat.messages;
+        let last = msgs.last().expect("a tool-call message was added");
+        assert_eq!(last.role, MessageRole::ToolCall);
+        assert_eq!(last.source, MessageSource::Human);
     }
 }
