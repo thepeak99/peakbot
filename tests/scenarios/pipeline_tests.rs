@@ -59,7 +59,7 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
     );
 
     // The sub-agent's cost rolls into the parent stats (lane-agnostic).
-    sm.add_request(100, 50, 0.02);
+    sm.add_request(&MessageSource::Human, 100, 50, 0.02);
 
     // The delegation returns one string — recorded as the orchestrator's
     // delegate ToolResult (Human lane). This is the ONLY thing about the

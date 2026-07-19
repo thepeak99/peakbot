@@ -313,8 +313,12 @@ impl TestRunner {
         for req in hook_stats.all_requests() {
             let cost = (req.input_tokens as f64 * pricing.input_per_token)
                 + (req.output_tokens as f64 * pricing.output_per_token);
-            self.state_manager
-                .add_request(req.input_tokens, req.output_tokens, cost);
+            self.state_manager.add_request(
+                &crate::ui::app_state::MessageSource::Human,
+                req.input_tokens,
+                req.output_tokens,
+                cost,
+            );
         }
     }
 

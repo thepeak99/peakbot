@@ -175,6 +175,108 @@ impl TodoList {
             .count();
         (pending, in_progress, completed, cancelled)
     }
+
+    // ── Mutate-and-render helpers ───────────────────────────────────
+    // These own the user-facing strings the `todo` tool returns. `StateManager`
+    // delegates to them and layers its UI side-effects (panel show / sync) on
+    // top; a sub-agent's standalone `TodoTool` calls them directly on its own
+    // isolated list. One home for the format strings — necessarily-same for
+    // both backends.
+
+    /// Add a single task, returning the tool-facing status line.
+    pub fn add_one(&mut self, task: String) -> String {
+        let result = self.add(task);
+        if result.is_new {
+            format!("Added task #{}: {}", result.id, result.task)
+        } else {
+            format!("Task already exists as #{}: {}", result.id, result.task)
+        }
+    }
+
+    /// Add several tasks, returning a summary of new vs. already-existing.
+    pub fn add_batch(&mut self, tasks: Vec<String>) -> String {
+        if tasks.is_empty() {
+            return "No tasks provided.".to_string();
+        }
+        let results = self.add_many(tasks);
+        let new_tasks: Vec<_> = results.iter().filter(|r| r.is_new).collect();
+        let existing_tasks: Vec<_> = results.iter().filter(|r| !r.is_new).collect();
+
+        let mut output = String::new();
+        if !new_tasks.is_empty() {
+            let new_list: Vec<String> = new_tasks
+                .iter()
+                .map(|r| format!("#{}: {}", r.id, r.task))
+                .collect();
+            output.push_str(&format!(
+                "Added {} task(s): {}\n",
+                new_tasks.len(),
+                new_list.join(", ")
+            ));
+        }
+        if !existing_tasks.is_empty() {
+            let existing_list: Vec<String> = existing_tasks
+                .iter()
+                .map(|r| format!("#{}: {}", r.id, r.task))
+                .collect();
+            output.push_str(&format!("Already existed: {}", existing_list.join(", ")));
+        }
+        output.trim().to_string()
+    }
+
+    /// Update a task's status, returning the tool-facing status line.
+    pub fn update_one(&mut self, id: usize, status: TodoStatus) -> String {
+        match self.update_status(id, status) {
+            Some(item) => format!("Updated task #{} to {}", item.id, item.status),
+            None => format!("Task #{} not found", id),
+        }
+    }
+
+    /// Remove a task, returning the tool-facing status line.
+    pub fn remove_one(&mut self, id: usize) -> String {
+        match self.remove(id) {
+            Some(item) => format!("Removed task #{}: {}", item.id, item.task),
+            None => format!("Task #{} not found", id),
+        }
+    }
+
+    /// Clear finished tasks, returning the tool-facing status line.
+    pub fn clear_finished(&mut self) -> String {
+        let cleared = self.clear_completed();
+        format!("Cleared {cleared} finished tasks (completed and cancelled)")
+    }
+
+    /// Render the full list as the markdown block the `todo` tool returns.
+    pub fn render(&self) -> String {
+        let tasks = self.list();
+        if tasks.is_empty() {
+            return "No tasks in the todo list.".to_string();
+        }
+        let (pending, in_progress, completed, cancelled) = self.count_by_status();
+
+        let mut output = String::new();
+        output.push_str("## Todo List\n\n");
+        for item in tasks {
+            // Glyph palette mirrors `ui::repl::todo_panel`: `x` (ASCII) for
+            // cancelled to avoid kitty double-width column drift — see
+            // `garbled.md` Class B.
+            let status_icon = match item.status {
+                TodoStatus::Pending => "○",
+                TodoStatus::InProgress => "◐",
+                TodoStatus::Completed => "●",
+                TodoStatus::Cancelled => "x",
+            };
+            output.push_str(&format!(
+                "{} #{} [{}] {}\n",
+                status_icon, item.id, item.status, item.task
+            ));
+        }
+        output.push_str(&format!(
+            "\n**Summary:** {} pending, {} in progress, {} completed, {} cancelled",
+            pending, in_progress, completed, cancelled
+        ));
+        output
+    }
 }
 
 /// Errors that can occur when using the todo tool
@@ -188,24 +290,51 @@ pub enum TodoError {
 
     #[error("Task already exists: {0}")]
     DuplicateTask(String),
-
-    #[error("StateManager not set: {0}")]
-    StateManagerNotSet(String),
 }
 
-/// The todo tool - a stateless controller that delegates to StateManager.
-/// All todo state lives in StateManager; this tool just updates it.
-#[derive(Default, Clone)]
+/// The todo tool — a stateless controller.
+///
+/// Two backends:
+/// - [`TodoBackend::Panel`]: the orchestrator's tool. Delegates to the
+///   session `StateManager`, which owns the visible todo panel and drives its
+///   UI side-effects (auto-show, sync).
+/// - [`TodoBackend::Standalone`]: a sub-agent's tool. Owns a fresh isolated
+///   `TodoList` and drives no panel — the same graceful-degradation shape
+///   `bash`/`bash_bg` use when there's no `StateManager`. The panel is an
+///   orchestrator-only affordance.
+///
+/// `Default` is the standalone backend with a fresh list, so a sub-agent that
+/// reaches this tool via `todo_tool.unwrap_or_default()` gets a *working*,
+/// isolated todo — not the old broken `state_manager: None` tool that
+/// hard-errored on every call.
+#[derive(Clone)]
 pub struct TodoTool {
-    /// Reference to StateManager (single source of truth for todo state)
-    state_manager: Option<std::sync::Arc<StateManager>>,
+    backend: TodoBackend,
+}
+
+#[derive(Clone)]
+enum TodoBackend {
+    /// Orchestrator: delegate to StateManager (drives the visible panel).
+    Panel(std::sync::Arc<StateManager>),
+    /// Sub-agent: an isolated in-memory list, no panel.
+    Standalone(std::sync::Arc<std::sync::Mutex<TodoList>>),
+}
+
+impl Default for TodoTool {
+    fn default() -> Self {
+        Self {
+            backend: TodoBackend::Standalone(std::sync::Arc::new(std::sync::Mutex::new(
+                TodoList::new(),
+            ))),
+        }
+    }
 }
 
 impl TodoTool {
-    /// Create a new todo tool with a StateManager reference
+    /// Create the orchestrator's panel-backed todo tool.
     pub fn new(state_manager: std::sync::Arc<StateManager>) -> Self {
         Self {
-            state_manager: Some(state_manager),
+            backend: TodoBackend::Panel(state_manager),
         }
     }
 }
@@ -318,75 +447,109 @@ impl Tool for TodoTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let sm = self.state_manager.as_ref().ok_or_else(|| {
-            TodoError::StateManagerNotSet(
-                "StateManager not initialized. Todo tool cannot update UI state.".to_string(),
-            )
-        })?;
+        match &self.backend {
+            TodoBackend::Panel(sm) => Self::call_panel(sm, args),
+            TodoBackend::Standalone(list) => Self::call_standalone(list, args),
+        }
+    }
+}
 
+impl TodoTool {
+    /// Orchestrator backend: delegate to StateManager so the visible panel
+    /// updates. StateManager owns the UI side-effects; rendering lives on
+    /// `TodoList` (shared with the standalone backend).
+    fn call_panel(sm: &StateManager, args: TodoArgs) -> Result<String, TodoError> {
         match args.action.as_str() {
             "add" => {
                 let tasks = args.tasks.ok_or_else(|| {
                     TodoError::InvalidAction("Tasks array required for 'add' action".to_string())
                 })?;
-
                 if tasks.is_empty() {
                     return Err(TodoError::InvalidAction(
                         "Tasks array is empty for 'add' action".to_string(),
                     ));
                 }
-
-                // Use add_todo for single task, add_todos for multiple
-                // Both now return strings with info about new vs existing tasks
                 if tasks.len() == 1 {
                     Ok(sm.add_todo(tasks.into_iter().next().unwrap()))
                 } else {
                     Ok(sm.add_todos(tasks))
                 }
             }
-
             "update" => {
-                let task_id = args.task_id.ok_or_else(|| {
-                    TodoError::InvalidAction("task_id required for 'update' action".to_string())
-                })?;
-                let status_str = args.status.ok_or_else(|| {
-                    TodoError::InvalidAction("status required for 'update' action".to_string())
-                })?;
-
-                let status = match status_str.as_str() {
-                    "pending" => TodoStatus::Pending,
-                    "in_progress" => TodoStatus::InProgress,
-                    "completed" => TodoStatus::Completed,
-                    "cancelled" => TodoStatus::Cancelled,
-                    _ => {
-                        return Err(TodoError::InvalidAction(format!(
-                            "Invalid status: {}",
-                            status_str
-                        )));
-                    }
-                };
-
-                Ok(sm.update_todo_status(task_id, status))
+                let (id, status) = Self::parse_update(&args)?;
+                Ok(sm.update_todo_status(id, status))
             }
-
-            "remove" => {
-                let task_id = args.task_id.ok_or_else(|| {
-                    TodoError::InvalidAction("task_id required for 'remove' action".to_string())
-                })?;
-
-                Ok(sm.remove_todo(task_id))
-            }
-
+            "remove" => Ok(sm.remove_todo(Self::parse_id(&args, "remove")?)),
             "list" => Ok(sm.list_todos()),
-
             "clear" => Ok(sm.clear_completed_todos()),
-
-            _ => Err(TodoError::InvalidAction(format!(
-                "Unknown action: {}. Valid actions: add, update, remove, list, clear",
-                args.action
-            ))),
+            other => Err(unknown_action(other)),
         }
     }
+
+    /// Sub-agent backend: an isolated in-memory list, no panel. Uses the same
+    /// `TodoList` render/mutate helpers as the panel path — identical output,
+    /// no shared state with the orchestrator.
+    fn call_standalone(
+        list: &std::sync::Mutex<TodoList>,
+        args: TodoArgs,
+    ) -> Result<String, TodoError> {
+        let mut list = list.lock().unwrap();
+        match args.action.as_str() {
+            "add" => {
+                let tasks = args.tasks.ok_or_else(|| {
+                    TodoError::InvalidAction("Tasks array required for 'add' action".to_string())
+                })?;
+                if tasks.is_empty() {
+                    return Err(TodoError::InvalidAction(
+                        "Tasks array is empty for 'add' action".to_string(),
+                    ));
+                }
+                if tasks.len() == 1 {
+                    Ok(list.add_one(tasks.into_iter().next().unwrap()))
+                } else {
+                    Ok(list.add_batch(tasks))
+                }
+            }
+            "update" => {
+                let (id, status) = Self::parse_update(&args)?;
+                Ok(list.update_one(id, status))
+            }
+            "remove" => Ok(list.remove_one(Self::parse_id(&args, "remove")?)),
+            "list" => Ok(list.render()),
+            "clear" => Ok(list.clear_finished()),
+            other => Err(unknown_action(other)),
+        }
+    }
+
+    fn parse_id(args: &TodoArgs, action: &str) -> Result<usize, TodoError> {
+        args.task_id.ok_or_else(|| {
+            TodoError::InvalidAction(format!("task_id required for '{action}' action"))
+        })
+    }
+
+    fn parse_update(args: &TodoArgs) -> Result<(usize, TodoStatus), TodoError> {
+        let id = Self::parse_id(args, "update")?;
+        let status_str = args.status.as_ref().ok_or_else(|| {
+            TodoError::InvalidAction("status required for 'update' action".to_string())
+        })?;
+        let status = match status_str.as_str() {
+            "pending" => TodoStatus::Pending,
+            "in_progress" => TodoStatus::InProgress,
+            "completed" => TodoStatus::Completed,
+            "cancelled" => TodoStatus::Cancelled,
+            other => {
+                return Err(TodoError::InvalidAction(format!("Invalid status: {other}")));
+            }
+        };
+        Ok((id, status))
+    }
+}
+
+/// Shared "unknown action" error for both backends.
+fn unknown_action(action: &str) -> TodoError {
+    TodoError::InvalidAction(format!(
+        "Unknown action: {action}. Valid actions: add, update, remove, list, clear"
+    ))
 }
 
 #[cfg(test)]
@@ -401,6 +564,40 @@ mod tests {
         assert!(result.is_new);
         assert_eq!(result.id, 1);
         assert_eq!(result.task, "Test task");
+    }
+
+    // ── standalone (sub-agent) todo is functional AND isolated ────────────────
+
+    /// The default `TodoTool` (a sub-agent's, via `unwrap_or_default()`) works
+    /// end-to-end — `add` then `list` succeed without the old
+    /// `StateManager not set` error — and each default tool owns an *isolated*
+    /// list, so one sub-agent's todos never appear in another's.
+    #[tokio::test]
+    async fn standalone_todo_tool_works_and_is_isolated() {
+        let a = TodoTool::default();
+        let b = TodoTool::default();
+
+        // `a` adds a task — must succeed (no StateManager error).
+        let added = a
+            .call(TodoArgs::add(vec!["alpha-only-task".to_string()]))
+            .await
+            .expect("standalone add must not error");
+        assert!(
+            added.contains("alpha-only-task"),
+            "add echoes the task: {added}"
+        );
+
+        // `a` lists it back.
+        let listed_a = a.call(TodoArgs::list()).await.expect("list must not error");
+        assert!(listed_a.contains("alpha-only-task"));
+
+        // `b` is a *separate* list — `a`'s task is not visible in `b`.
+        let listed_b = b.call(TodoArgs::list()).await.expect("list must not error");
+        assert!(
+            !listed_b.contains("alpha-only-task"),
+            "each standalone tool must own an isolated list; got: {listed_b}"
+        );
+        assert!(listed_b.contains("No tasks"), "b starts empty: {listed_b}");
     }
 
     #[test]

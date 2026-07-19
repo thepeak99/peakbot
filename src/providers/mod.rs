@@ -432,6 +432,7 @@ fn add_builtin_tools<M, P>(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     register_view_image: bool,
+    wire_bash_panel: bool,
     sub_agent_wiring: Option<SubAgentWiring>,
 ) -> rig_core::agent::AgentBuilder<M, P, rig_core::agent::WithBuilderTools>
 where
@@ -464,16 +465,17 @@ where
         )),
         Some(ShellKind::Bash { path }) => {
             // Wire the live panel (slice 3 of make-term-great-again.md)
-            // when a state manager is available. Without one, the tool
-            // still runs PTY-backed but skips the UI side-effects —
-            // the same shape `BashBgTool` uses.
+            // when a state manager is available AND this agent owns the
+            // panel. Sub-agents (`wire_bash_panel = false`) skip the panel
+            // so their shell output never bleeds into the orchestrator's
+            // bash panel — they still run PTY-backed against `session_cwd`.
             let bash = BashTool::new(path.clone(), bash_config.env.clone())
                 .with_session_cwd(session_cwd.clone());
-            let bash = match state_manager.clone() {
-                Some(sm) => bash.with_state_manager(sm),
-                None => bash,
-            };
-            Some(EitherTool::Bash(bash))
+            Some(EitherTool::Bash(wire_bash_tool(
+                bash,
+                wire_bash_panel,
+                state_manager.clone(),
+            )))
         }
         None => None,
     };
@@ -561,6 +563,21 @@ where
     }
 
     builder.tools(tools)
+}
+
+/// Attach the live bash panel iff this agent owns one. The orchestrator wires
+/// its panel (`wire_panel = true`); sub-agents pass `false` so their shell
+/// output never bleeds into the orchestrator's panel. Either way the tool runs
+/// PTY-backed against the session cwd already set on `bash`.
+fn wire_bash_tool(
+    bash: BashTool,
+    wire_panel: bool,
+    state_manager: Option<Arc<StateManager>>,
+) -> BashTool {
+    match (wire_panel, state_manager) {
+        (true, Some(sm)) => bash.with_state_manager(sm),
+        _ => bash,
+    }
 }
 
 /// The extra sub-agent build context threaded into [`add_builtin_tools`] that
@@ -657,6 +674,7 @@ fn create_openrouter_agent(
         shell_kind,
         vector_store,
         false,
+        true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
@@ -754,6 +772,7 @@ fn create_anthropic_agent(
         shell_kind,
         vector_store,
         supports_vision,
+        true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
@@ -835,6 +854,7 @@ fn create_ollama_agent(
         shell_kind,
         vector_store,
         false,
+        true,
         Some(SubAgentWiring {
             event_sink: None,
             active_hook: active_sub_agent_hook,
@@ -928,6 +948,7 @@ fn create_openai_agent(
         shell_kind,
         vector_store,
         false,
+        true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
@@ -1024,6 +1045,7 @@ fn create_llamacpp_agent(
         shell_kind,
         vector_store,
         false,
+        true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
@@ -1154,8 +1176,11 @@ pub(crate) fn build_sub_agent(
         role: role.to_string(),
     });
 
-    // A sub-agent never sees `delegate` (no nested delegation) and gets a
-    // fresh todo list (the visible todo panel is an orchestrator affordance).
+    // A sub-agent never sees `delegate` (no nested delegation). It reaches the
+    // `todo` tool via `add_builtin_tools`'s `todo_tool.unwrap_or_default()`,
+    // and `TodoTool::default()` is now a working *standalone* backend with its
+    // own isolated list — so each sub-agent gets a fresh, functional todo that
+    // drives no panel (the visible panel is an orchestrator-only affordance).
     let no_pipeline: Option<&crate::pipeline::SubAgentRegistry> = None;
 
     match config {
@@ -1184,6 +1209,7 @@ pub(crate) fn build_sub_agent(
                 Some(state_manager),
                 shell_kind,
                 vector_store,
+                false,
                 false,
                 None,
             );
@@ -1215,6 +1241,7 @@ pub(crate) fn build_sub_agent(
                 Some(state_manager),
                 shell_kind,
                 vector_store,
+                false,
                 false,
                 None,
             );
@@ -1251,6 +1278,7 @@ pub(crate) fn build_sub_agent(
                 shell_kind,
                 vector_store,
                 supports_vision,
+                false,
                 None,
             );
             Ok((DynAgent::Anthropic(builder.build()), Arc::new(hook)))
@@ -1283,6 +1311,7 @@ pub(crate) fn build_sub_agent(
                 shell_kind,
                 vector_store,
                 false,
+                false,
                 None,
             );
             Ok((DynAgent::LlamaCpp(builder.build()), Arc::new(hook)))
@@ -1314,6 +1343,7 @@ pub(crate) fn build_sub_agent(
                 shell_kind,
                 vector_store,
                 false,
+                false,
                 None,
             );
             Ok((DynAgent::Ollama(builder.build()), Arc::new(hook)))
@@ -1324,6 +1354,23 @@ pub(crate) fn build_sub_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_bash_tool_severs_sub_agent_panel() {
+        // The orchestrator (`wire_panel = true`) drives the live bash
+        // panel; a sub-agent (`wire_panel = false`) must not — its shell
+        // output would otherwise bleed into the orchestrator's panel.
+        let path = "/bin/bash".to_string();
+        let mk = || BashTool::new(path.clone(), None);
+        let sm = Arc::new(StateManager::new());
+
+        // Orchestrator: panel wired.
+        assert!(wire_bash_tool(mk(), true, Some(sm.clone())).has_state_manager());
+        // Sub-agent: panel severed even with a state manager present.
+        assert!(!wire_bash_tool(mk(), false, Some(sm.clone())).has_state_manager());
+        // No state manager (test paths): nothing to wire, regardless of flag.
+        assert!(!wire_bash_tool(mk(), true, None).has_state_manager());
+    }
 
     #[test]
     fn provider_info_supports_vision_pins_detection_for_known_patterns() {

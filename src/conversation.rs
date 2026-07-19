@@ -1,5 +1,6 @@
 //! Conversation persistence - data structures for storing conversation history.
 
+use crate::ui::app_state::MessageSource;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -47,6 +48,14 @@ impl Default for ConversationMetadata {
 /// prior session; persisted so a reload restores the compacted state
 /// instead of resurrecting the full history (#59). `serde(default)`
 /// keeps pre-compaction files loading as `false`.
+///
+/// `source` records the producing lane (orchestrator vs a pipeline
+/// `SubAgent { role }`, or a `bash_bg` `Background` turn). It mirrors
+/// `ChatMessage::source` byte-for-byte: `#[serde(default,
+/// skip_serializing_if = "MessageSource::is_human")]` so every
+/// pre-lane file loads as `Human` and Human turns stay byte-identical
+/// on disk. `Summary` carries no source — a compaction summary is
+/// always an orchestrator artefact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role")]
 pub enum Message {
@@ -56,6 +65,8 @@ pub enum Message {
         content: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         compacted: bool,
+        #[serde(default, skip_serializing_if = "MessageSource::is_human")]
+        source: MessageSource,
         /// Timestamp when message was sent
         timestamp: DateTime<Utc>,
     },
@@ -65,6 +76,8 @@ pub enum Message {
         content: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         compacted: bool,
+        #[serde(default, skip_serializing_if = "MessageSource::is_human")]
+        source: MessageSource,
         /// Timestamp when message was generated
         timestamp: DateTime<Utc>,
     },
@@ -79,6 +92,8 @@ pub enum Message {
         call_id: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         compacted: bool,
+        #[serde(default, skip_serializing_if = "MessageSource::is_human")]
+        source: MessageSource,
         /// Timestamp when tool was called
         timestamp: DateTime<Utc>,
     },
@@ -95,6 +110,8 @@ pub enum Message {
         call_id: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         compacted: bool,
+        #[serde(default, skip_serializing_if = "MessageSource::is_human")]
+        source: MessageSource,
         /// Timestamp when tool was executed
         timestamp: DateTime<Utc>,
     },
@@ -114,6 +131,7 @@ impl Message {
         Message::User {
             content,
             compacted: false,
+            source: MessageSource::Human,
             timestamp: Utc::now(),
         }
     }
@@ -123,6 +141,7 @@ impl Message {
         Message::Assistant {
             content,
             compacted: false,
+            source: MessageSource::Human,
             timestamp: Utc::now(),
         }
     }
@@ -134,6 +153,7 @@ impl Message {
             arguments,
             call_id,
             compacted: false,
+            source: MessageSource::Human,
             timestamp: Utc::now(),
         }
     }
@@ -151,6 +171,7 @@ impl Message {
             result,
             call_id,
             compacted: false,
+            source: MessageSource::Human,
             timestamp: Utc::now(),
         }
     }
@@ -211,6 +232,13 @@ pub struct Conversation {
     /// Todo list persisted with this conversation
     #[serde(default)]
     pub todos: crate::tools::todo::TodoList,
+    /// Whether the multi-agent pipeline was enabled for the session that
+    /// created this conversation (config sense: `pipeline.enabled`, a
+    /// boot-only fact). Conversation-global, not per-message. Defaults to
+    /// `false` for every pre-existing file — old conversations genuinely had
+    /// no pipeline.
+    #[serde(default)]
+    pub pipeline_enabled: bool,
 }
 
 impl Conversation {
@@ -241,6 +269,7 @@ impl Conversation {
             cwd,
             metadata: ConversationMetadata::default(),
             todos: crate::tools::todo::TodoList::new(),
+            pipeline_enabled: false,
         }
     }
 
@@ -330,6 +359,11 @@ pub struct ConversationSummary {
     pub provider_name: String,
     /// Wire id of the model used (e.g. `anthropic/claude-3.7-sonnet`).
     pub model: String,
+    /// Whether the pipeline was enabled for the session that created this
+    /// conversation. Surfaced to any summary consumer (a picker badge is a
+    /// deferred frontend concern). Defaults to `false` for pre-existing files.
+    #[serde(default)]
+    pub pipeline_enabled: bool,
 }
 
 impl From<&Conversation> for ConversationSummary {
@@ -344,6 +378,7 @@ impl From<&Conversation> for ConversationSummary {
             message_count: conv.metadata.message_count,
             provider_name: conv.provider_name.clone(),
             model: conv.model.clone(),
+            pipeline_enabled: conv.pipeline_enabled,
         }
     }
 }
@@ -607,6 +642,52 @@ mod tests {
         );
     }
 
+    // ── conversation-global pipeline_enabled marker ────────────────────────
+
+    #[test]
+    fn pipeline_enabled_roundtrips_and_defaults_false() {
+        let mut conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "anthropic/claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        // Fresh conversations default to false.
+        assert!(!conv.pipeline_enabled);
+
+        // A pipeline conversation roundtrips true.
+        conv.pipeline_enabled = true;
+        let json = serde_json::to_string(&conv).unwrap();
+        let parsed: Conversation = serde_json::from_str(&json).unwrap();
+        assert!(parsed.pipeline_enabled);
+        // Summary carries the fact for downstream consumers.
+        assert!(ConversationSummary::from(&parsed).pipeline_enabled);
+
+        // A non-pipeline conversation roundtrips false.
+        conv.pipeline_enabled = false;
+        let json = serde_json::to_string(&conv).unwrap();
+        let parsed: Conversation = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.pipeline_enabled);
+        assert!(!ConversationSummary::from(&parsed).pipeline_enabled);
+    }
+
+    #[test]
+    fn pre_existing_file_without_field_defaults_false() {
+        // A JSON that has no `pipeline_enabled` key at all; serde default
+        // must fill in `false` (least astonishment — old convos had no pipeline).
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "old",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "messages": [],
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {}
+        }"#;
+        let parsed: Conversation = serde_json::from_str(json).unwrap();
+        assert!(!parsed.pipeline_enabled);
+    }
+
     // === v5: conversation title ====================
 
     /// Conversation starts with no title.
@@ -803,5 +884,94 @@ mod tests {
             !json.contains("compacted"),
             "uncompacted messages must not write the flag; got: {json}"
         );
+    }
+
+    // ── message source (lane) persistence ──────────────────────────────
+
+    /// A message's `source` lane survives the REAL serialize→deserialize
+    /// round-trip: a `SubAgent { role }` assistant turn and a `Background`
+    /// user turn come back tagged, not collapsed to `Human`. Exercises the
+    /// actual serde path (not a hand-built intermediate), per the
+    /// "symmetric persist/restore audited together" rule.
+    #[test]
+    fn message_source_lane_roundtrips_through_json() {
+        let mut conv = Conversation::new("t".into(), "prov".into(), "model".into(), String::new());
+        conv.messages.push(Message::Assistant {
+            content: "reviewed".into(),
+            compacted: false,
+            source: MessageSource::SubAgent {
+                role: "reviewer".into(),
+            },
+            timestamp: Utc::now(),
+        });
+        conv.messages.push(Message::User {
+            content: "[bg output]".into(),
+            compacted: false,
+            source: MessageSource::Background {
+                proc_ids: vec![3, 7],
+            },
+            timestamp: Utc::now(),
+        });
+
+        let json = serde_json::to_string(&conv).unwrap();
+        let loaded: Conversation = serde_json::from_str(&json).unwrap();
+
+        match &loaded.messages[0] {
+            Message::Assistant { source, .. } => assert_eq!(
+                source,
+                &MessageSource::SubAgent {
+                    role: "reviewer".into()
+                }
+            ),
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+        match &loaded.messages[1] {
+            Message::User { source, .. } => {
+                assert_eq!(
+                    source,
+                    &MessageSource::Background {
+                        proc_ids: vec![3, 7]
+                    }
+                )
+            }
+            other => panic!("expected User, got {other:?}"),
+        }
+    }
+
+    /// A `Human`-lane message must NOT write a `source`/`kind` key — Human is
+    /// the default and is skipped, keeping pre-lane files byte-identical and
+    /// avoiding schema churn on the 99% of turns that are orchestrator turns.
+    #[test]
+    fn human_source_omits_key() {
+        let mut conv = Conversation::new("t".into(), "prov".into(), "model".into(), String::new());
+        conv.add_user_message("hi".into());
+        let json = serde_json::to_string(&conv).unwrap();
+        assert!(
+            !json.contains("\"kind\""),
+            "Human-lane messages must not write a source key; got: {json}"
+        );
+    }
+
+    /// Pre-lane conversation files (no `source` field) load as `Human` via
+    /// `#[serde(default)]` — so all 1807 existing on-disk conversations
+    /// deserialize cleanly and render on the orchestrator lane.
+    #[test]
+    fn pre_lane_file_defaults_source_to_human() {
+        let json = r#"{
+            "id": "10da8b9d-f242-4786-9c75-c3fbc2530f1f",
+            "name": "Old convo",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "messages": [
+                {"role": "Assistant", "content": "hi", "timestamp": "2026-01-01T00:00:00Z"}
+            ],
+            "model": "m",
+            "metadata": {"message_count": 1}
+        }"#;
+        let conv: Conversation = serde_json::from_str(json).unwrap();
+        match &conv.messages[0] {
+            Message::Assistant { source, .. } => assert_eq!(source, &MessageSource::Human),
+            other => panic!("expected Assistant, got {other:?}"),
+        }
     }
 }

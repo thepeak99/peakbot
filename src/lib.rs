@@ -1877,10 +1877,23 @@ impl AgentRunner {
         let SourcedEvent { source, event } = sourced;
 
         match event {
-            AgentEvent::CompletionResponse { usage, .. } => {
-                // Roll tokens/cost into the single session stats regardless
-                // of lane — the parent `/stats` sees sub-agent cost too.
-                sm.add_request(usage.input_tokens, usage.output_tokens, usage.cost);
+            AgentEvent::CompletionResponse { content, usage, .. } => {
+                // Roll tokens/cost into session stats, keyed by lane: the
+                // parent `/stats` sees sub-agent cost too, and can break it
+                // down per role.
+                sm.add_request(&source, usage.input_tokens, usage.output_tokens, usage.cost);
+
+                // Surface a **sub-agent's** prose on its own lane. The
+                // orchestrator's prose already enters via `prompt_with_history`'s
+                // return value → `add_assistant_message`, so adding it here too
+                // would double it — hence the orchestrator-lane guard. A
+                // sub-agent's final answer legitimately appears twice in the
+                // transcript: once here on its `🧩 role` lane (it *said* it) and
+                // once as the orchestrator's `delegate` ToolResult (it *received*
+                // it) — distinct lanes, not a duplicate bug.
+                if !source.is_orchestrator_lane() && !content.trim().is_empty() {
+                    sm.add_assistant_message_sourced(source, content);
+                }
             }
             AgentEvent::ToolCall {
                 tool_name,
@@ -2230,6 +2243,23 @@ impl AgentRunner {
                         stats.total_output_tokens,
                         stats.cumulative_input_tokens(),
                     );
+                    // Per-lane breakdown — only shown once a sub-agent has
+                    // run; a single orchestrator lane adds no information
+                    // over the flat totals above.
+                    let lanes = stats.lanes_sorted();
+                    let msg = if lanes.len() > 1 {
+                        let rows: String = lanes
+                            .iter()
+                            .map(|(name, l)| {
+                                format!("\n| {} | {} | ${:.4} |", name, l.api_calls, l.cost)
+                            })
+                            .collect();
+                        format!(
+                            "{msg}\n\n### By lane\n\n| Lane | Calls | Cost |\n|---|---|---|{rows}"
+                        )
+                    } else {
+                        msg
+                    };
                     sm.add_system_message(msg);
                 } else {
                     tracing::warn!("State manager not available for /stats command");
@@ -4866,5 +4896,89 @@ headers:
         let last = msgs.last().expect("a tool-call message was added");
         assert_eq!(last.role, MessageRole::ToolCall);
         assert_eq!(last.source, MessageSource::Human);
+    }
+
+    // ── sub-agent prose surfaces on its lane ──────────────────────────────
+
+    /// A sub-agent `CompletionResponse` with non-empty text produces an
+    /// assistant transcript message tagged `SubAgent { role }` — so a
+    /// prose-heavy role (reviewer) is visible on its own lane, not silent.
+    #[test]
+    fn sub_agent_completion_prose_lands_on_its_lane() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
+        use crate::ui::app_state::MessageRole;
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::SubAgent {
+                    role: "reviewer".to_string(),
+                },
+                event: AgentEvent::CompletionResponse {
+                    content: "The diff looks solid; one nit on naming.".to_string(),
+                    reasoning: None,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 8,
+                        total_tokens: 18,
+                        cost: 0.0,
+                    },
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let msgs = sm.get_state().chat.messages;
+        let last = msgs.last().expect("prose message added");
+        assert_eq!(last.role, MessageRole::Agent);
+        assert_eq!(
+            last.source,
+            MessageSource::SubAgent {
+                role: "reviewer".to_string()
+            },
+            "sub-agent prose must carry its lane"
+        );
+        assert!(last.content.contains("one nit on naming"));
+    }
+
+    /// The orchestrator's own `CompletionResponse` text must NOT be added by
+    /// the event path — it already enters via `prompt_with_history`'s return
+    /// value (`add_assistant_message`). Adding it here too would double it.
+    /// Only stats move for an orchestrator-lane completion.
+    #[test]
+    fn orchestrator_completion_prose_is_not_double_added() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+
+        let before = sm.get_state().chat.messages.len();
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::Human,
+                event: AgentEvent::CompletionResponse {
+                    content: "I'll handle that.".to_string(),
+                    reasoning: None,
+                    usage: TokenUsage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                        total_tokens: 8,
+                        cost: 0.0,
+                    },
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+        let after = sm.get_state().chat.messages.len();
+        assert_eq!(
+            before, after,
+            "orchestrator completion must not add a transcript message (the return-value path owns that)"
+        );
+        // ...but stats still moved.
+        assert_eq!(sm.get_stats().total_api_calls, 1);
     }
 }

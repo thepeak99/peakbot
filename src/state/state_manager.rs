@@ -15,7 +15,7 @@ use crate::ui::app_state::{
     AppState, BashPanelState, BashPanelVisibility, BgState, BgSummary, ChatMessage, ChatState,
     ContextState, MessageSource, SessionState, TodoItem, TodoState, WelcomeState,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -88,6 +88,13 @@ pub struct StateManager {
     // ── Rendering Coalescence ─────────────────────────────────────────────────
     /// Monotonic counter for render coalescence — see `slow-messages.md` §4.4.
     revision: AtomicU64,
+
+    // ── Session facts ─────────────────────────────────────────────────────────
+    /// Whether the multi-agent pipeline is enabled for this session
+    /// (`pipeline.enabled`, boot-only). Stamped onto every conversation this
+    /// session creates so the fact survives reload. `AtomicBool` because it's
+    /// set once during session wiring and read on each mint — no lock needed.
+    pipeline_enabled: AtomicBool,
 }
 
 impl StateManager {
@@ -127,6 +134,7 @@ impl StateManager {
             shell: RwLock::new(String::new()),
             session_cwd: RwLock::new(std::env::current_dir().unwrap_or_default()),
             revision: AtomicU64::new(0),
+            pipeline_enabled: AtomicBool::new(false),
         }
     }
 
@@ -390,11 +398,15 @@ impl StateManager {
 
     // ── Stats Operations ────────────────────────────────────────────────────────
 
-    /// Add a request's stats to the session
-    pub fn add_request(&self, input: u64, output: u64, cost: f64) {
+    /// Add a request's stats to the session, attributed to the producing lane.
+    ///
+    /// `source` keys the per-lane breakdown: orchestrator turns bucket under
+    /// `"orchestrator"`, a sub-agent's under its role. The flat grand totals
+    /// accumulate regardless of lane.
+    pub fn add_request(&self, source: &MessageSource, input: u64, output: u64, cost: f64) {
         {
             let mut stats = self.stats.lock().unwrap();
-            stats.add_request(input, output, cost);
+            stats.add_request(source.lane_label(), input, output, cost);
         }
         // Sync to UI
         self.sync_stats_to_ui();
@@ -450,24 +462,21 @@ impl StateManager {
             list.list().is_empty()
         };
 
-        let result = {
+        let (msg, is_new) = {
             let mut list = self.todo_list.lock().unwrap();
-            list.add(task)
+            let before = list.list().len();
+            let msg = list.add_one(task);
+            (msg, list.list().len() > before)
         };
 
-        // Sync to UI
         self.sync_todo_to_ui();
 
         // Auto-show todo panel when first task is added
-        if was_empty && result.is_new {
+        if was_empty && is_new {
             self.show_todo_panel();
         }
 
-        if result.is_new {
-            format!("Added task #{}: {}", result.id, result.task)
-        } else {
-            format!("Task already exists as #{}: {}", result.id, result.task)
-        }
+        msg
     }
 
     /// Add multiple todo items
@@ -482,128 +491,58 @@ impl StateManager {
             list.list().is_empty()
         };
 
-        let results = {
+        let (msg, added_any) = {
             let mut list = self.todo_list.lock().unwrap();
-            list.add_many(tasks)
+            let before = list.list().len();
+            let msg = list.add_batch(tasks);
+            (msg, list.list().len() > before)
         };
         self.sync_todo_to_ui();
 
-        // Separate new and existing tasks
-        let new_tasks: Vec<_> = results.iter().filter(|r| r.is_new).collect();
-        let existing_tasks: Vec<_> = results.iter().filter(|r| !r.is_new).collect();
-
         // Auto-show todo panel when first tasks are added to empty list
-        if was_empty && !new_tasks.is_empty() {
+        if was_empty && added_any {
             self.show_todo_panel();
         }
 
-        // Build response message
-        let mut output = String::new();
-
-        if !new_tasks.is_empty() {
-            let new_list: Vec<String> = new_tasks
-                .iter()
-                .map(|r| format!("#{}: {}", r.id, r.task))
-                .collect();
-            output.push_str(&format!(
-                "Added {} task(s): {}\n",
-                new_tasks.len(),
-                new_list.join(", ")
-            ));
-        }
-
-        if !existing_tasks.is_empty() {
-            let existing_list: Vec<String> = existing_tasks
-                .iter()
-                .map(|r| format!("#{}: {}", r.id, r.task))
-                .collect();
-            output.push_str(&format!("Already existed: {}", existing_list.join(", ")));
-        }
-
-        output.trim().to_string()
+        msg
     }
 
     /// Update todo item status
     pub fn update_todo_status(&self, id: usize, status: TodoStatus) -> String {
-        let result = {
+        let (msg, existed) = {
             let mut list = self.todo_list.lock().unwrap();
-            list.update_status(id, status.clone())
+            let existed = list.get(id).is_some();
+            (list.update_one(id, status), existed)
         };
-        if result.is_some() {
+        if existed {
             self.sync_todo_to_ui();
         }
-        match result {
-            Some(item) => format!("Updated task #{} to {}", item.id, item.status),
-            None => format!("Task #{} not found", id),
-        }
+        msg
     }
 
     /// Remove a todo item
     pub fn remove_todo(&self, id: usize) -> String {
-        let result = {
+        let (msg, existed) = {
             let mut list = self.todo_list.lock().unwrap();
-            list.remove(id)
+            let existed = list.get(id).is_some();
+            (list.remove_one(id), existed)
         };
-        if result.is_some() {
+        if existed {
             self.sync_todo_to_ui();
         }
-        match result {
-            Some(item) => format!("Removed task #{}: {}", item.id, item.task),
-            None => format!("Task #{} not found", id),
-        }
+        msg
     }
 
     /// List all todo items
     pub fn list_todos(&self) -> String {
-        let list = self.todo_list.lock().unwrap();
-        let tasks = list.list();
-
-        if tasks.is_empty() {
-            return "No tasks in the todo list.".to_string();
-        }
-
-        let (pending, in_progress, completed, cancelled) = list.count_by_status();
-
-        let mut output = String::new();
-        output.push_str("## Todo List\n\n");
-
-        for item in tasks {
-            // Glyph palette mirrors `ui::repl::todo_panel`: `✗` (U+2717)
-            // replaced with ASCII `x` because kitty may render it at
-            // 2 cells while unicode-width says 1, drifting the column
-            // alignment in the rendered todo list. See `garbled.md`
-            // Class B.
-            let status_icon = match item.status {
-                TodoStatus::Pending => "○",
-                TodoStatus::InProgress => "◐",
-                TodoStatus::Completed => "●",
-                TodoStatus::Cancelled => "x",
-            };
-            output.push_str(&format!(
-                "{} #{} [{}] {}\n",
-                status_icon, item.id, item.status, item.task
-            ));
-        }
-
-        output.push_str(&format!(
-            "\n**Summary:** {} pending, {} in progress, {} completed, {} cancelled",
-            pending, in_progress, completed, cancelled
-        ));
-
-        output
+        self.todo_list.lock().unwrap().render()
     }
 
     /// Clear finished todo items (completed and cancelled)
     pub fn clear_completed_todos(&self) -> String {
-        let cleared = {
-            let mut list = self.todo_list.lock().unwrap();
-            list.clear_completed()
-        };
+        let msg = { self.todo_list.lock().unwrap().clear_finished() };
         self.sync_todo_to_ui();
-        format!(
-            "Cleared {} finished tasks (completed and cancelled)",
-            cleared
-        )
+        msg
     }
 
     /// Wipe the entire todo list and resync the UI view.
@@ -1013,9 +952,17 @@ impl StateManager {
         model: String,
         cwd: String,
     ) {
-        let conv = Conversation::new(name, provider_name, model, cwd);
+        let mut conv = Conversation::new(name, provider_name, model, cwd);
+        conv.pipeline_enabled = self.pipeline_enabled.load(Ordering::Acquire);
         *self.current_conversation.lock().unwrap() = Some(conv);
         self.mirror_conversation_to_state();
+    }
+
+    /// Record whether the multi-agent pipeline is enabled for this session.
+    /// Set once during session wiring; stamped onto every conversation this
+    /// session mints (see [`Self::create_conversation`]).
+    pub fn set_pipeline_enabled(&self, enabled: bool) {
+        self.pipeline_enabled.store(enabled, Ordering::Release);
     }
 
     /// Mirror the current conversation's identity into `AppState.conversation`
@@ -1303,20 +1250,24 @@ impl StateManager {
                     ConvMsg::User {
                         content,
                         compacted,
+                        source,
                         timestamp,
                     } => {
                         let mut m = ChatMessage::user(content.clone());
                         m.compacted = *compacted;
+                        m.source = source.clone();
                         m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
                     ConvMsg::Assistant {
                         content,
                         compacted,
+                        source,
                         timestamp,
                     } => {
                         let mut m = ChatMessage::agent(content.clone());
                         m.compacted = *compacted;
+                        m.source = source.clone();
                         m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
@@ -1325,10 +1276,12 @@ impl StateManager {
                         arguments,
                         call_id,
                         compacted,
+                        source,
                         timestamp,
                     } => {
                         let mut m = ChatMessage::tool_call(tool_name, arguments, call_id.clone());
                         m.compacted = *compacted;
+                        m.source = source.clone();
                         m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
@@ -1338,11 +1291,13 @@ impl StateManager {
                         result,
                         call_id,
                         compacted,
+                        source,
                         timestamp,
                     } => {
                         let mut m =
                             ChatMessage::tool_result(tool_name, arguments, result, call_id.clone());
                         m.compacted = *compacted;
+                        m.source = source.clone();
                         m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
@@ -1400,11 +1355,13 @@ impl StateManager {
                     MessageRole::User => Some(ConvMsg::User {
                         content: msg.content.clone(),
                         compacted: msg.compacted,
+                        source: msg.source.clone(),
                         timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                     }),
                     MessageRole::Agent => Some(ConvMsg::Assistant {
                         content: msg.content.clone(),
                         compacted: msg.compacted,
+                        source: msg.source.clone(),
                         timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                     }),
                     MessageRole::ToolCall => {
@@ -1415,6 +1372,7 @@ impl StateManager {
                             arguments,
                             call_id: msg.call_id.clone(),
                             compacted: msg.compacted,
+                            source: msg.source.clone(),
                             timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                         })
                     }
@@ -1428,6 +1386,7 @@ impl StateManager {
                             result,
                             call_id: msg.call_id.clone(),
                             compacted: msg.compacted,
+                            source: msg.source.clone(),
                             timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                         })
                     }
@@ -1513,7 +1472,20 @@ impl StateManager {
     ///
     /// Compaction is **NOT** triggered here — see [`add_user_message`].
     pub fn add_assistant_message(&self, content: String) {
-        let msg = ChatMessage::agent(content);
+        self.add_assistant_message_sourced(MessageSource::Human, content);
+    }
+
+    /// Add an assistant message tagged with the producing lane, and persist.
+    ///
+    /// The orchestrator's own prose flows through [`Self::add_assistant_message`]
+    /// (the `prompt_with_history` return value). A **sub-agent**'s prose has no
+    /// such return path — its final text becomes the `delegate` ToolResult, and
+    /// its intermediate prose would otherwise vanish. So `process_event_for_ui`
+    /// calls this with the `SubAgent { role }` lane for sub-agent
+    /// `CompletionResponse`s, surfacing that prose on its own `🧩 role` lane.
+    /// Persistence keeps the lane on the serialized message.
+    pub fn add_assistant_message_sourced(&self, source: MessageSource, content: String) {
+        let msg = ChatMessage::agent(content).with_source(source);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
             tracing::error!("Failed to persist assistant message: {}", e);
@@ -2569,6 +2541,22 @@ mod tests {
         assert_eq!(sm.peek_conversation_cwd(id).unwrap(), "");
     }
 
+    /// `create_conversation` stamps the session's pipeline flag onto every
+    /// conversation it mints, so the fact survives persistence/reload.
+    #[test]
+    fn create_conversation_stamps_pipeline_flag() {
+        let sm = StateManager::new();
+
+        // Default session: flag off → minted conversation is not a pipeline one.
+        sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
+        assert!(!sm.get_current_conversation().unwrap().pipeline_enabled);
+
+        // Session with pipeline enabled → minted conversation carries the flag.
+        sm.set_pipeline_enabled(true);
+        sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
+        assert!(sm.get_current_conversation().unwrap().pipeline_enabled);
+    }
+
     #[test]
     fn test_reset_conversation_state_clears_all_surfaces() {
         let sm = StateManager::new();
@@ -2603,7 +2591,7 @@ mod tests {
     #[test]
     fn test_add_request() {
         let sm = StateManager::new();
-        sm.add_request(100, 50, 0.123);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.123);
         let state = sm.get_state();
         assert_eq!(state.stats.total_input_tokens, 100);
         assert_eq!(state.stats.total_output_tokens, 50);
@@ -2614,8 +2602,8 @@ mod tests {
     #[test]
     fn test_stats_accumulation() {
         let sm = StateManager::new();
-        sm.add_request(100, 50, 0.10);
-        sm.add_request(200, 100, 0.20);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.10);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 200, 100, 0.20);
         let state = sm.get_state();
         // Tokens are overwritten per request (not accumulated)
         assert_eq!(state.stats.total_input_tokens, 200); // last value
@@ -2628,7 +2616,7 @@ mod tests {
     #[test]
     fn test_reset_stats() {
         let sm = StateManager::new();
-        sm.add_request(100, 50, 0.10);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.10);
         sm.reset_stats();
         let state = sm.get_state();
         assert_eq!(state.stats.total_input_tokens, 0);
@@ -2655,8 +2643,8 @@ mod tests {
             "test-model".into(),
             String::new(),
         );
-        sm.add_request(1234, 567, 0.42);
-        sm.add_request(2000, 800, 0.10); // cost accumulates → 0.52
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 1234, 567, 0.42);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 2000, 800, 0.10); // cost accumulates → 0.52
         let conv_a_id = sm.get_current_conversation_id().expect("convo A id");
         sm.save_conversation();
 
@@ -2670,7 +2658,7 @@ mod tests {
             "test-model".into(),
             String::new(),
         );
-        sm.add_request(99, 99, 9.99);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 99, 99, 9.99);
 
         // Load A back. Its stats should override the session-B stats.
         sm.load_conversation(conv_a_id).expect("load A");
@@ -2873,7 +2861,7 @@ mod tests {
         let sm = StateManager::new();
 
         // Add stats via StateManager
-        sm.add_request(100, 50, 0.01);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.01);
 
         // Get AppState and verify stats are synced
         let app_state = sm.get_state();
@@ -2889,7 +2877,7 @@ mod tests {
         let stats_arc = sm.stats_arc();
 
         // Add request first
-        sm.add_request(100, 50, 0.01);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.01);
 
         // Verify the Arc contains the updated data (testing Arc sharing)
         let stats = stats_arc.lock().unwrap();
@@ -3430,11 +3418,13 @@ mod tests {
         conv.messages.push(ConvMsg::User {
             content: "hello".into(),
             compacted: false,
+            source: crate::ui::app_state::MessageSource::Human,
             timestamp: t_user,
         });
         conv.messages.push(ConvMsg::Assistant {
             content: "hi there".into(),
             compacted: false,
+            source: crate::ui::app_state::MessageSource::Human,
             timestamp: t_agent,
         });
 
@@ -3681,7 +3671,12 @@ mod tests {
         assert_eq!(state.context.usage_percentage(), 0.0);
 
         // After a request: current_usage reflects the last input-token count.
-        sm.add_request(50_000, 1_000, 0.0);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            50_000,
+            1_000,
+            0.0,
+        );
         let state = sm.get_state();
         assert_eq!(
             state.context.current_usage, 50_000,
@@ -3695,7 +3690,12 @@ mod tests {
         );
 
         // A later request overwrites (tokens aren't cumulative — see SessionStats docs).
-        sm.add_request(100_000, 2_000, 0.0);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            100_000,
+            2_000,
+            0.0,
+        );
         let state = sm.get_state();
         assert_eq!(state.context.current_usage, 100_000);
     }
@@ -3723,7 +3723,7 @@ mod tests {
         );
 
         // Drive last_input_tokens past 80% of 1_000 = 800.
-        sm.add_request(900, 50, 0.0);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 900, 50, 0.0);
         assert!(
             sm.needs_compaction(),
             "token branch must fire when last_input_tokens > threshold"
@@ -3780,7 +3780,7 @@ mod tests {
         }
 
         // Push last_input_tokens above the threshold (600 > 500).
-        sm.add_request(600, 50, 0.0);
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 600, 50, 0.0);
         assert!(
             sm.needs_compaction(),
             "precondition: needs_compaction must be true before we compact"
@@ -4348,7 +4348,7 @@ mod tests {
         let count_a_t = count_a.clone();
         let t_a = thread::spawn(move || {
             while !stop_a.load(Ordering::Relaxed) {
-                sm_a.add_request(100, 50, 0.001);
+                sm_a.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.001);
                 count_a_t.fetch_add(1, Ordering::Relaxed);
             }
         });
