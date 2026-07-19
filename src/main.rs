@@ -203,10 +203,15 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Pipeline. Shared across sessions via Arc.
+    // Pipeline. Shared across sessions via Arc. Roles resolve their model
+    // alias against the model registry at construction (unknown alias →
+    // clear boot error).
     let pipeline_registry = if config.pipeline_enabled() {
         let pipeline_config = config.pipeline().unwrap();
-        Some(Arc::new(SubAgentRegistry::new(pipeline_config)))
+        match SubAgentRegistry::new(pipeline_config, &model_registry) {
+            Ok(reg) => Some(Arc::new(reg)),
+            Err(e) => anyhow::bail!("Invalid pipeline configuration: {e}"),
+        }
     } else {
         None
     };

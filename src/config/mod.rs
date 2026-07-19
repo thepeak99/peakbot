@@ -355,37 +355,28 @@ pub struct PipelineConfig {
     pub agents: HashMap<String, AgentDefinition>,
 }
 
-/// Definition of a sub-agent that can be delegated to
+/// Definition of a sub-agent role the orchestrator can delegate to.
+///
+/// A role names a `model:` **alias** from the top-level `providers:` list
+/// (the same aliases `/model` uses) — resolved by [`crate::pipeline::SubAgentRegistry`],
+/// which is why there are no provider/credential fields here. Model, key,
+/// and base URL all come from the resolved alias.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDefinition {
-    /// Agent type (must match a provider type)
-    #[serde(rename = "type")]
-    pub agent_type: ProviderType,
-
-    /// Model to use for this agent
-    /// If not specified, uses the default model for the provider type
+    /// Alias of the model this role runs on (from `providers:`). When
+    /// omitted, the registry falls back to `default_model`.
     #[serde(default)]
     pub model: Option<String>,
 
-    /// System prompt / preamble for this agent
+    /// System prompt / preamble for this role.
     pub prompt: String,
 
-    /// Optional: max tokens override (uses provider default if not specified)
+    /// Extra environment variables merged into this sub-agent's bash tool
+    /// env (mirrors top-level `bash.env`). Consumed when the sub-agent is
+    /// built.
     #[serde(default)]
-    pub max_tokens: Option<u64>,
-
-    /// Optional: temperature override (uses provider default if not specified)
-    #[serde(default)]
-    pub temperature: Option<f32>,
-
-    /// Optional: API key (uses main provider key if not specified)
-    #[serde(default)]
-    pub api_key: Option<String>,
-
-    /// Optional: base URL override
-    #[serde(default)]
-    pub base_url: Option<String>,
+    pub env: Option<HashMap<String, String>>,
 }
 
 impl PipelineConfig {
@@ -2291,5 +2282,64 @@ auth:
         assert_eq!(live.model(), "resolve-owned-model");
         // Ancillary fields came from fresh.
         assert_eq!(live.agent_max_turns, 77);
+    }
+
+    // ── Phase 2: pipeline role shape (alias ref + env) ───────────────────
+
+    /// The v2 role shape is `{ model?, prompt, env? }`. `model` names an
+    /// alias from `providers:` (resolved later by the registry); `env` is
+    /// optional and mirrors `bash.env`.
+    #[test]
+    fn pipeline_role_parses_alias_prompt_and_env() {
+        let yaml = r#"
+enabled: true
+agents:
+  researcher:
+    model: flash
+    prompt: "You research codebases."
+  reviewer:
+    prompt: "You review diffs."
+    env:
+      REVIEW_STRICT: "1"
+"#;
+        let cfg: PipelineConfig = serde_yaml::from_str(yaml).expect("v2 role shape must parse");
+        assert!(cfg.enabled);
+
+        let researcher = cfg.get_agent("researcher").expect("researcher present");
+        assert_eq!(researcher.model.as_deref(), Some("flash"));
+        assert_eq!(researcher.prompt, "You research codebases.");
+        assert!(researcher.env.is_none());
+
+        let reviewer = cfg.get_agent("reviewer").expect("reviewer present");
+        // model omitted → None (registry falls back to default_model).
+        assert!(reviewer.model.is_none());
+        assert_eq!(
+            reviewer
+                .env
+                .as_ref()
+                .and_then(|e| e.get("REVIEW_STRICT"))
+                .map(String::as_str),
+            Some("1"),
+        );
+    }
+
+    /// The old role shape carried provider fields (`type`, `api_key`,
+    /// `base_url`). Those are gone in v2; `deny_unknown_fields` makes a
+    /// stale config a hard, honest error rather than a silent no-op.
+    #[test]
+    fn pipeline_role_rejects_legacy_provider_fields() {
+        let yaml = r#"
+enabled: true
+agents:
+  researcher:
+    type: openrouter
+    prompt: "legacy shape"
+"#;
+        let err = serde_yaml::from_str::<PipelineConfig>(yaml)
+            .expect_err("legacy `type:` field must be rejected");
+        assert!(
+            err.to_string().contains("type") || err.to_string().contains("unknown field"),
+            "error should name the offending field, got: {err}"
+        );
     }
 }
