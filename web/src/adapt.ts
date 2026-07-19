@@ -54,6 +54,8 @@ export function adaptMessage(m: WireChatMessage): ChatMessage {
     timestamp: toClock(m.timestamp),
     toolName: m.tool_name ?? undefined,
     fromBackground: m.source?.kind === "background",
+    subAgentRole:
+      m.source?.kind === "sub_agent" ? m.source.role : undefined,
   };
 }
 

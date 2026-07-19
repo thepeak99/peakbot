@@ -425,6 +425,14 @@ impl ChatMessage {
             source: MessageSource::Human,
         }
     }
+
+    /// Tag this message with a non-default origin lane. Composes with every
+    /// role constructor (e.g. `ChatMessage::agent(t).with_source(SubAgent { role })`),
+    /// so sub-agent turns carry their role without duplicating constructors.
+    pub fn with_source(mut self, source: MessageSource) -> Self {
+        self.source = source;
+        self
+    }
 }
 
 /// Format tool call with structured output: thought intent first, then params
@@ -679,12 +687,32 @@ pub enum MessageSource {
         /// Ids of processes that contributed to this synthetic turn.
         proc_ids: Vec<u32>,
     },
+    /// A turn produced by a sub-agent running inside a `delegate` tool call.
+    /// Carries the role name so the renderer can label/colour it and so
+    /// `get_agent_history` can filter it out of the orchestrator's wire
+    /// context (see `is_orchestrator_lane`).
+    SubAgent {
+        /// The pipeline role that produced this turn.
+        role: String,
+    },
 }
 
 impl MessageSource {
     /// Borrow-cheap predicate for `skip_serializing_if`.
     pub fn is_human(&self) -> bool {
         matches!(self, MessageSource::Human)
+    }
+
+    /// True for every lane whose turns belong in the orchestrator's wire
+    /// context — i.e. everything *except* a sub-agent's internal turns.
+    /// `Background` counts as orchestrator input (it's real conversation
+    /// the orchestrator must see); only `SubAgent` is isolated.
+    ///
+    /// This is the load-bearing isolation predicate: `get_agent_history`
+    /// filters on it so a sub-agent's turns never leak into the
+    /// orchestrator model's context.
+    pub fn is_orchestrator_lane(&self) -> bool {
+        !matches!(self, MessageSource::SubAgent { .. })
     }
 }
 
@@ -1274,6 +1302,54 @@ pub struct WelcomeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Phase 1: sub-agent lane plumbing ────────────────────────────────
+
+    #[test]
+    fn human_and_background_are_orchestrator_lane() {
+        assert!(MessageSource::Human.is_orchestrator_lane());
+        assert!(
+            MessageSource::Background {
+                proc_ids: vec![1, 2]
+            }
+            .is_orchestrator_lane()
+        );
+    }
+
+    #[test]
+    fn sub_agent_is_not_orchestrator_lane() {
+        let s = MessageSource::SubAgent {
+            role: "researcher".to_string(),
+        };
+        assert!(!s.is_orchestrator_lane());
+        assert!(!s.is_human());
+    }
+
+    #[test]
+    fn with_source_tags_any_role() {
+        let role = "reviewer".to_string();
+        let want = MessageSource::SubAgent { role: role.clone() };
+
+        let agent = ChatMessage::agent("hi".into()).with_source(want.clone());
+        let call = ChatMessage::tool_call("bash", "{}", None).with_source(want.clone());
+        let result = ChatMessage::tool_result("bash", "{}", "ok", None).with_source(want.clone());
+
+        assert_eq!(agent.source, want);
+        assert_eq!(call.source, want);
+        assert_eq!(result.source, want);
+    }
+
+    #[test]
+    fn sub_agent_source_serde_roundtrip() {
+        let s = MessageSource::SubAgent {
+            role: "researcher".to_string(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        // snake_case tag so the web wire reads `m.source?.kind === "sub_agent"`.
+        assert_eq!(json, r#"{"kind":"sub_agent","role":"researcher"}"#);
+        let back: MessageSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
 
     #[test]
     fn test_truncate_str_normal() {

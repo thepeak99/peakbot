@@ -17,6 +17,9 @@ export interface ChatMessage {
   toolName?: string;
   /** background-process origin badge (mirrors MessageSource::Background) */
   fromBackground?: boolean;
+  /** sub-agent role, when this turn came from a delegated sub-agent
+   * (mirrors MessageSource::SubAgent) */
+  subAgentRole?: string;
 }
 
 export type TodoStatus = "pending" | "inProgress" | "completed" | "cancelled";

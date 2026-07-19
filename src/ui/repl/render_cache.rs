@@ -37,7 +37,7 @@ use std::sync::Arc;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::ui::app_state::{ChatMessage, MessageRole};
+use crate::ui::app_state::{ChatMessage, MessageRole, MessageSource};
 use crate::ui::repl::message_renderer::MessageRenderer;
 
 /// Cheap equality check for detecting when a message has been edited or
@@ -60,12 +60,13 @@ use crate::ui::repl::message_renderer::MessageRenderer;
 /// same number, so the prefix sums settle and `dirty` is reported
 /// correctly. Cost is one cheap re-render per message per resize, which
 /// is acceptable per the markdown-render plan.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Fingerprint {
     role: MessageRole,
     content_len: usize,
     compacted: bool,
     attachments_len: usize,
+    source: MessageSource,
     width: u16,
 }
 
@@ -76,6 +77,7 @@ impl Fingerprint {
             content_len: msg.content.len(),
             compacted: msg.compacted,
             attachments_len: msg.attachments.len(),
+            source: msg.source.clone(),
             width,
         }
     }
@@ -547,6 +549,22 @@ mod tests {
         assert!(
             Fingerprint::of(&msg, 80) != Fingerprint::of(&msg, 120),
             "width must be part of the fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_source_lane_changes() {
+        // Same role + same content bytes, different lane. Without `source`
+        // in the fingerprint, two adjacent messages of equal length in
+        // different lanes would cache-collide and render the wrong colour.
+        let orchestrator = ChatMessage::agent("same content".to_string());
+        let sub_agent =
+            ChatMessage::agent("same content".to_string()).with_source(MessageSource::SubAgent {
+                role: "researcher".to_string(),
+            });
+        assert!(
+            Fingerprint::of(&orchestrator, 80) != Fingerprint::of(&sub_agent, 80),
+            "source lane must be part of the fingerprint"
         );
     }
 }

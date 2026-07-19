@@ -13,8 +13,9 @@ export type WireRole =
   | "summary";
 
 export interface WireMessageSource {
-  kind: "human" | "background";
+  kind: "human" | "background" | "sub_agent";
   proc_ids?: number[];
+  role?: string; // present when kind === "sub_agent"
 }
 
 export interface WireChatMessage {
