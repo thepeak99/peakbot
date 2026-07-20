@@ -34,6 +34,7 @@ import {
   adaptStats,
   adaptTodos,
   adaptWelcome,
+  deriveSubAgentRoster,
   filterMessagesByView,
 } from "./adapt";
 
@@ -81,6 +82,9 @@ export function App() {
   const visibleMessages = state
     ? filterMessagesByView(state.chat.messages, effectiveView)
     : [];
+
+  // Sub-agent roster derived live from the transcript (Phase 2). Zero backend.
+  const roster = state ? deriveSubAgentRoster(state.chat.messages) : [];
 
   const stats = state ? adaptStats(state) : null;
   const welcome = state ? adaptWelcome(state) : null;
@@ -143,8 +147,10 @@ export function App() {
           onToggleEnabled={setAgentsEnabled}
           active={view}
           onSelect={setView}
+          roster={roster}
         />
       ),
+      badge: agentsEnabled ? roster.length : undefined,
     },
   ];
 

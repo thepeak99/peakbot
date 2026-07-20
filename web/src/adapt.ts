@@ -194,6 +194,23 @@ export function filterMessagesByView(
   );
 }
 
+// Phase-2 roster. Scan the transcript for distinct sub-agent roles and count
+// each one's turns. Zero backend — the roles come from `source.role` already on
+// every message (same derive-from-transcript pattern as adaptFiles). Order is
+// first-appearance so the list is stable as new turns land.
+export function deriveSubAgentRoster(
+  messages: WireChatMessage[],
+): { role: string; count: number }[] {
+  const byRole = new Map<string, number>();
+  for (const m of messages) {
+    if (m.source?.kind !== "sub_agent") continue;
+    const role = m.source.role;
+    if (!role) continue;
+    byRole.set(role, (byRole.get(role) ?? 0) + 1);
+  }
+  return [...byRole.entries()].map(([role, count]) => ({ role, count }));
+}
+
 export function adaptWelcome(s: AppState): Welcome | null {
   const w = s.welcome;
   if (!w) return null;
