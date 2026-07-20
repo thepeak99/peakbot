@@ -9,7 +9,9 @@ const STATUS_META: Record<TodoStatus, { glyph: string; cls: string }> = {
 
 // The TODO side panel. Mirrors the TUI's todo_panel: glyph + strike-through
 // per status, a done/total count. Items are derived from the watched lane's
-// transcript (see todosFromMessages), so every lane surfaces its own todos.
+// transcript (see todosFromMessages), so every lane surfaces its own todos. In
+// the global view each item carries a `lane` label, shown as a pill so you can
+// tell which agent owns it; scoped views omit the label.
 export function TodoPanel({ items }: { items: TodoItem[] }) {
   const done = items.filter((i) => i.status === "completed").length;
   return (
@@ -23,10 +25,13 @@ export function TodoPanel({ items }: { items: TodoItem[] }) {
         </span>
       </div>
       <ul className="space-y-1 text-xs">
-        {items.map((item) => {
+        {items.map((item, i) => {
           const meta = STATUS_META[item.status];
           return (
-            <li key={item.id} className="flex items-start gap-2">
+            <li
+              key={`${item.lane ?? "_"}:${item.id}:${i}`}
+              className="flex items-start gap-2"
+            >
               <span className={`mt-px ${meta.cls}`}>{meta.glyph}</span>
               <span
                 className={
@@ -37,6 +42,11 @@ export function TodoPanel({ items }: { items: TodoItem[] }) {
                       : "text-zinc-300"
                 }
               >
+                {item.lane && (
+                  <span className="mr-1.5 rounded bg-zinc-800/80 px-1.5 py-0.5 text-[10px] text-zinc-400">
+                    {item.lane}
+                  </span>
+                )}
                 {item.text}
               </span>
             </li>

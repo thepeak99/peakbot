@@ -90,13 +90,17 @@ export function scopeStatsToView(
   view: ViewFilter,
 ): SessionStats {
   if (view === "global") return stats;
-  const lane: LaneStat | undefined = stats.lanes.find((l) => l.lane === view);
+  // A per-call view ("role#n") rolls up to its role's lane bucket — token
+  // counts aren't per-message on the wire, so a single delegation can't be
+  // costed apart from the role's aggregate (documented honest degradation).
+  const lane = laneOf(view);
+  const bucket: LaneStat | undefined = stats.lanes.find((l) => l.lane === lane);
   return {
     ...stats,
-    inputTokens: lane?.inputTokens ?? 0,
-    outputTokens: lane?.outputTokens ?? 0,
-    apiCalls: lane?.apiCalls ?? 0,
-    costUsd: lane?.costUsd ?? 0,
+    inputTokens: bucket?.inputTokens ?? 0,
+    outputTokens: bucket?.outputTokens ?? 0,
+    apiCalls: bucket?.apiCalls ?? 0,
+    costUsd: bucket?.costUsd ?? 0,
   };
 }
 
@@ -249,6 +253,36 @@ export function todosFromMessages(messages: WireChatMessage[]): TodoItem[] {
   return items;
 }
 
+/**
+ * Global-view todos: every lane's list, each item tagged with its lane so the
+ * panel can label it. Each lane has its own independent backend TodoList (own
+ * id space, own clear-resets), so we replay per lane — never on the mixed
+ * transcript, which would corrupt ids/dedupe/clear. Orchestrator first, then
+ * each delegation in call order. The `lane` tag is a display-ready label
+ * ("Orchestrator", "role", or "role · call N") — todos aren't click targets, so
+ * the pill only needs to read well. Scoped views keep using todosFromMessages
+ * (no lane tag) — this is only for "global".
+ */
+export function todosByLane(messages: WireChatMessage[]): TodoItem[] {
+  const out: TodoItem[] = [];
+  const tag = (lane: string, items: TodoItem[]) => {
+    for (const it of items) out.push({ ...it, lane });
+  };
+  tag("Orchestrator", todosFromMessages(filterMessagesByView(messages, "orchestrator")));
+  const roster = deriveSubAgentRoster(messages);
+  const callsPerRole = new Map<string, number>();
+  for (const r of roster)
+    callsPerRole.set(r.role, (callsPerRole.get(r.role) ?? 0) + 1);
+  for (const call of roster) {
+    const multi = (callsPerRole.get(call.role) ?? 0) > 1;
+    tag(
+      viewLabel(call.key, multi),
+      todosFromMessages(filterMessagesByView(messages, call.key)),
+    );
+  }
+  return out;
+}
+
 /** Whole seconds → "MM:SS". */
 function fmtDuration(totalSecs: number): string {
   const m = Math.floor(totalSecs / 60);
@@ -280,11 +314,87 @@ export function adaptBashPanel(p: WireBashPanel): BashPanel | null {
   }
 }
 
-// Phase-1 chat scoping. Given the raw wire messages and a ViewFilter, return
-// only the messages that belong to that view. Uses the `source` already on
-// every message — no backend. "global" = everything; "orchestrator" = the
-// orchestrator lane (anything not a sub-agent turn); a role string = that
-// sub-agent's turns.
+// A per-delegation view key: "<role>#<n>", 1-based per role in call order. This
+// is the composite that lets the UI address one delegation of a role that ran
+// several times. `role` and `n` are the parsed pieces.
+export interface DelegationCall {
+  key: string; // "role#n"
+  role: string;
+  n: number;
+}
+
+// Split a "role#n" view key back into its pieces. A plain role (no "#") reads
+// as call 1 — so the pre-per-call callers ("orchestrator", a bare role) still
+// resolve. Returns null for the reserved views (global/orchestrator).
+export function parseCallKey(view: ViewFilter): DelegationCall | null {
+  if (view === "global" || view === "orchestrator") return null;
+  const hash = view.lastIndexOf("#");
+  if (hash === -1) return { key: `${view}#1`, role: view, n: 1 };
+  const role = view.slice(0, hash);
+  const n = Number(view.slice(hash + 1));
+  if (!role || !Number.isInteger(n) || n < 1) return null;
+  return { key: view, role, n };
+}
+
+// The lane a view rolls up into for coarse-grained lookups (stats). A per-call
+// key "role#n" collapses to its role bucket — per-message tokens aren't on the
+// wire, so a single delegation can't be costed apart from its role's aggregate
+// (honest degradation, same as an old convo with no lane data).
+export function laneOf(view: ViewFilter): ViewFilter {
+  const call = parseCallKey(view);
+  return call ? call.role : view;
+}
+
+/**
+ * Assign each sub-agent message to a specific delegation call. Delegations are
+ * sequential and non-nested (the `delegate` tool runs one sub-agent to
+ * completion before returning), so per-call identity is fully derivable from
+ * transcript position — no backend, works on already-saved convos.
+ *
+ * A `delegate` ToolCall on the orchestrator lane opens a new call for the role
+ * named in its args, bumping that role's 1-based counter. Every following
+ * sub-agent message of that role belongs to the open call. The result maps a
+ * message's index to its "role#n" key; orchestrator-lane messages are absent.
+ */
+export function assignDelegationCalls(
+  messages: WireChatMessage[],
+): Map<number, string> {
+  const keyByIndex = new Map<number, string>();
+  const countByRole = new Map<string, number>();
+  const openCall = new Map<string, number>(); // role → current call number
+
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role === "toolcall" && m.tool_name === "delegate") {
+      let role: unknown;
+      try {
+        role = JSON.parse(m.tool_args ?? "{}").role;
+      } catch {
+        continue; // malformed delegate args — leave following turns untagged
+      }
+      if (typeof role !== "string" || role.length === 0) continue;
+      const n = (countByRole.get(role) ?? 0) + 1;
+      countByRole.set(role, n);
+      openCall.set(role, n);
+      continue;
+    }
+    if (m.source?.kind !== "sub_agent") continue;
+    const role = m.source.role;
+    if (!role) continue;
+    // Fall back to call 1 if a sub-agent turn appears with no preceding
+    // delegate ToolCall (defensive — shouldn't happen in a well-formed convo).
+    const n = openCall.get(role) ?? 1;
+    if (!openCall.has(role)) openCall.set(role, n);
+    keyByIndex.set(i, `${role}#${n}`);
+  }
+  return keyByIndex;
+}
+
+// Chat scoping. Given the raw wire messages and a ViewFilter, return only the
+// messages that belong to that view. Uses the `source` already on every message
+// — no backend. "global" = everything; "orchestrator" = the orchestrator lane
+// (anything not a sub-agent turn); a bare role = all of that role's turns; a
+// per-call key "role#n" = just that one delegation.
 export function filterMessagesByView(
   messages: WireChatMessage[],
   filter: ViewFilter,
@@ -292,26 +402,51 @@ export function filterMessagesByView(
   if (filter === "global") return messages;
   if (filter === "orchestrator")
     return messages.filter((m) => m.source?.kind !== "sub_agent");
+  const call = parseCallKey(filter);
+  if (!call) return [];
+  // A per-call key isolates one delegation; a bare role keeps its old
+  // all-turns-of-that-role behaviour.
+  if (filter.includes("#")) {
+    const keyByIndex = assignDelegationCalls(messages);
+    return messages.filter((_, i) => keyByIndex.get(i) === filter);
+  }
   return messages.filter(
-    (m) => m.source?.kind === "sub_agent" && m.source.role === filter,
+    (m) => m.source?.kind === "sub_agent" && m.source.role === call.role,
   );
 }
 
-// Phase-2 roster. Scan the transcript for distinct sub-agent roles and count
-// each one's turns. Zero backend — the roles come from `source.role` already on
-// every message (same derive-from-transcript pattern as adaptFiles). Order is
-// first-appearance so the list is stable as new turns land.
+// Roster. Return one entry per delegation call, in call order, each with its
+// composite key and turn count. A role delegated to N times yields N entries
+// (role#1 … role#N). Zero backend — derived from the transcript via
+// assignDelegationCalls. AgentsPanel renders the "#n" suffix only when a role
+// has more than one call.
 export function deriveSubAgentRoster(
   messages: WireChatMessage[],
-): { role: string; count: number }[] {
-  const byRole = new Map<string, number>();
-  for (const m of messages) {
-    if (m.source?.kind !== "sub_agent") continue;
-    const role = m.source.role;
-    if (!role) continue;
-    byRole.set(role, (byRole.get(role) ?? 0) + 1);
+): { key: string; role: string; n: number; count: number }[] {
+  const keyByIndex = assignDelegationCalls(messages);
+  const order: string[] = []; // first-appearance order of keys
+  const countByKey = new Map<string, number>();
+  for (let i = 0; i < messages.length; i++) {
+    const key = keyByIndex.get(i);
+    if (!key) continue;
+    if (!countByKey.has(key)) order.push(key);
+    countByKey.set(key, (countByKey.get(key) ?? 0) + 1);
   }
-  return [...byRole.entries()].map(([role, count]) => ({ role, count }));
+  return order.map((key) => {
+    const { role, n } = parseCallKey(key)!;
+    return { key, role, n, count: countByKey.get(key) ?? 0 };
+  });
+}
+
+// Human-facing label for a view. "orchestrator" and a single-call role read as
+// their bare name; a multi-call delegation reads "role · call N". Shared by the
+// Agents panel, the watch banner, and the per-todo lane pill.
+export function viewLabel(view: ViewFilter, multiCall = false): string {
+  if (view === "global") return "Global";
+  if (view === "orchestrator") return "Orchestrator";
+  const call = parseCallKey(view);
+  if (!call) return view;
+  return multiCall ? `${call.role} · call ${call.n}` : call.role;
 }
 
 export function adaptWelcome(s: AppState): Welcome | null {

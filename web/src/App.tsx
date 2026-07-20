@@ -35,8 +35,11 @@ import {
   deriveSubAgentRoster,
   filesFromMessages,
   filterMessagesByView,
+  laneOf,
   scopeStatsToView,
+  todosByLane,
   todosFromMessages,
+  viewLabel,
 } from "./adapt";
 
 export function App() {
@@ -76,32 +79,38 @@ export function App() {
   const [view, setView] = useState<ViewFilter>("global");
   // Without a pipeline there is only the global view.
   const effectiveView: ViewFilter = pipelineEnabled ? view : "global";
+
+  // Sub-agent roster: one entry per delegation call, in call order (Phase 2 +
+  // per-call). Zero backend — derived from the transcript. A role delegated to
+  // more than once yields several entries; the panel suffixes those "#n".
+  const roster = state ? deriveSubAgentRoster(state.chat.messages) : [];
+  const multiCall = new Set(
+    roster.filter((r) => r.n > 1).map((r) => r.role),
+  );
   const scopeLabel =
     effectiveView === "global"
       ? null
-      : effectiveView === "orchestrator"
-        ? "Orchestrator"
-        : effectiveView;
+      : viewLabel(effectiveView, multiCall.has(laneOf(effectiveView)));
 
   const visibleMessages = state
     ? filterMessagesByView(state.chat.messages, effectiveView)
     : [];
-
-  // Sub-agent roster derived live from the transcript (Phase 2). Zero backend.
-  const roster = state ? deriveSubAgentRoster(state.chat.messages) : [];
 
   const stats = state ? adaptStats(state) : null;
   // Scope the Session panel to the watched view (Global keeps grand totals).
   const scopedStats = stats ? scopeStatsToView(stats, effectiveView) : null;
   const welcome = state ? adaptWelcome(state) : null;
   const bash = state ? adaptBashPanel(state.bash_panel) : null;
-  // Todos & files both derive from the watched lane's transcript slice — one
-  // code path for every lane (orchestrator, sub-agent, agents-off). No backend
-  // todo state is read; sub-agent todos surface for free (#208-adjacent).
+  // Todos & files derive from the transcript. In the global view todos show
+  // every lane's list, each labeled by its lane (todosByLane); a scoped view
+  // shows just that lane's list, unlabeled. Files stay global-mixed by design.
   const scopedMessages = state
     ? filterMessagesByView(state.chat.messages, effectiveView)
     : [];
-  const todos = todosFromMessages(scopedMessages);
+  const todos =
+    state && effectiveView === "global"
+      ? todosByLane(state.chat.messages)
+      : todosFromMessages(scopedMessages);
   const bg = state ? adaptBg(state) : [];
   const context = state ? adaptContext(state) : null;
   const files = filesFromMessages(scopedMessages);
