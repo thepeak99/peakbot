@@ -8,7 +8,7 @@
 // body is a 288px rail, below sm it spans 94vw. Replaces the old static aside
 // + separate mobile hamburger drawer.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Message } from "./components/Message";
 import { WelcomeBanner } from "./components/WelcomeBanner";
 import { BashPanel } from "./components/BashPanel";
@@ -20,9 +20,11 @@ import { StatsPanel } from "./components/StatsPanel";
 import { TodoPanel } from "./components/TodoPanel";
 import { BgPanel } from "./components/BgPanel";
 import { FilesPanel } from "./components/FilesPanel";
+import { AgentsPanel } from "./components/AgentsPanel";
 import { useAgent } from "./useAgent";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
+import type { ViewFilter } from "./types";
 import {
   adaptBashPanel,
   adaptBg,
@@ -32,6 +34,7 @@ import {
   adaptStats,
   adaptTodos,
   adaptWelcome,
+  filterMessagesByView,
 } from "./adapt";
 
 export function App() {
@@ -61,6 +64,24 @@ export function App() {
 
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
+
+  // Phase-1 dummy: subagent watch. `agentsEnabled` toggles the list; `view`
+  // scopes the transcript (and, later, todo/stats) via the message `source`.
+  const [agentsEnabled, setAgentsEnabled] = useState(false);
+  const [view, setView] = useState<ViewFilter>("global");
+  // If watching is disabled, force the transcript back to the global view.
+  const effectiveView: ViewFilter = agentsEnabled ? view : "global";
+  const scopeLabel =
+    effectiveView === "global"
+      ? null
+      : effectiveView === "orchestrator"
+        ? "Orchestrator"
+        : effectiveView;
+
+  const visibleMessages = state
+    ? filterMessagesByView(state.chat.messages, effectiveView)
+    : [];
+
   const stats = state ? adaptStats(state) : null;
   const welcome = state ? adaptWelcome(state) : null;
   const bash = state ? adaptBashPanel(state.bash_panel) : null;
@@ -113,6 +134,18 @@ export function App() {
       ),
       badge: bash?.status === "running" ? 1 : undefined,
     },
+    {
+      id: "agents",
+      label: "Agents",
+      content: (
+        <AgentsPanel
+          enabled={agentsEnabled}
+          onToggleEnabled={setAgentsEnabled}
+          active={view}
+          onSelect={setView}
+        />
+      ),
+    },
   ];
 
   return (
@@ -147,7 +180,29 @@ export function App() {
           <section className="min-h-0 flex-1 overflow-y-auto mr-12 px-4 py-4 sm:px-6 md:px-8">
             <div className="mx-auto max-w-5xl space-y-3">
               {welcome && messageCount === 0 && <WelcomeBanner welcome={welcome} />}
-              {state?.chat.messages.map((m, i) => (
+              {scopeLabel && (
+                <div className="flex items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300">
+                  <span>
+                    👁 Watching <span className="font-medium">{scopeLabel}</span>
+                    <span className="ml-2 text-sky-500/70">
+                      {visibleMessages.length} message
+                      {visibleMessages.length === 1 ? "" : "s"}
+                    </span>
+                  </span>
+                  <button
+                    onClick={() => setView("global")}
+                    className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40"
+                  >
+                    Clear
+                  </button>
+                </div>
+              )}
+              {scopeLabel && visibleMessages.length === 0 && (
+                <p className="rounded-md border border-dashed border-zinc-800 px-3 py-6 text-center text-xs text-zinc-600">
+                  No messages from {scopeLabel} yet.
+                </p>
+              )}
+              {visibleMessages.map((m, i) => (
                 <Message key={i} message={adaptMessage(m)} />
               ))}
               <div ref={bottomRef} />

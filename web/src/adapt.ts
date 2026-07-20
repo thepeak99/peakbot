@@ -19,6 +19,7 @@ import type {
   SessionStats,
   TodoItem,
   TodoStatus,
+  ViewFilter,
   Welcome,
 } from "./types";
 
@@ -174,6 +175,23 @@ export function adaptBashPanel(p: WireBashPanel): BashPanel | null {
         tail: p.tail,
       };
   }
+}
+
+// Phase-1 chat scoping. Given the raw wire messages and a ViewFilter, return
+// only the messages that belong to that view. Uses the `source` already on
+// every message — no backend. "global" = everything; "orchestrator" = the
+// orchestrator lane (anything not a sub-agent turn); a role string = that
+// sub-agent's turns.
+export function filterMessagesByView(
+  messages: WireChatMessage[],
+  filter: ViewFilter,
+): WireChatMessage[] {
+  if (filter === "global") return messages;
+  if (filter === "orchestrator")
+    return messages.filter((m) => m.source?.kind !== "sub_agent");
+  return messages.filter(
+    (m) => m.source?.kind === "sub_agent" && m.source.role === filter,
+  );
 }
 
 export function adaptWelcome(s: AppState): Welcome | null {
