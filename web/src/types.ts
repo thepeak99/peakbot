@@ -36,6 +36,14 @@ export interface TodoItem {
   status: TodoStatus;
 }
 
+export interface LaneStat {
+  lane: string;
+  inputTokens: number;
+  outputTokens: number;
+  apiCalls: number;
+  costUsd: number;
+}
+
 export interface SessionStats {
   inputTokens: number;
   outputTokens: number;
@@ -44,6 +52,9 @@ export interface SessionStats {
   modelAlias: string;
   model: string;
   provider: string;
+  /** Per-lane breakdown (orchestrator + sub-agent roles), orchestrator first.
+   * Empty until a lane-attributed request lands. */
+  lanes: LaneStat[];
 }
 
 export interface ContextUsage {

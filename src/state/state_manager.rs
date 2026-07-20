@@ -432,7 +432,7 @@ impl StateManager {
     /// `add_request_and_persist_current_do_not_deadlock` regression test).
     fn sync_stats_to_ui(&self) {
         // Snapshot under stats lock, release before acquiring state.write.
-        let (input, output, calls, cost, last_input) = {
+        let (input, output, calls, cost, last_input, lanes) = {
             let stats = self.stats.lock().unwrap();
             (
                 stats.total_input_tokens,
@@ -441,6 +441,7 @@ impl StateManager {
                 stats.total_cost,
                 // last_input_tokens is the current context size (not cumulative)
                 stats.last_input_tokens().unwrap_or(0),
+                stats.lanes_sorted(),
             )
         };
 
@@ -449,6 +450,16 @@ impl StateManager {
         state.stats.total_output_tokens = output;
         state.stats.total_api_calls = calls;
         state.stats.total_cost = cost;
+        state.stats.lanes = lanes
+            .into_iter()
+            .map(|(lane, s)| crate::ui::app_state::LaneStat {
+                lane,
+                input_tokens: s.input_tokens,
+                output_tokens: s.output_tokens,
+                api_calls: s.api_calls,
+                cost: s.cost,
+            })
+            .collect();
         state.context.current_usage = last_input;
         self.notify_update(&state);
     }
@@ -960,9 +971,13 @@ impl StateManager {
 
     /// Record whether the multi-agent pipeline is enabled for this session.
     /// Set once during session wiring; stamped onto every conversation this
-    /// session mints (see [`Self::create_conversation`]).
+    /// session mints (see [`Self::create_conversation`]) and mirrored into the
+    /// live `AppState` so the web Agents panel can reflect the real state.
     pub fn set_pipeline_enabled(&self, enabled: bool) {
         self.pipeline_enabled.store(enabled, Ordering::Release);
+        let mut state = self.state.write().unwrap();
+        state.pipeline_enabled = enabled;
+        self.notify_update(&state);
     }
 
     /// Mirror the current conversation's identity into `AppState.conversation`
@@ -2597,6 +2612,51 @@ mod tests {
         assert_eq!(state.stats.total_output_tokens, 50);
         assert_eq!(state.stats.total_api_calls, 1);
         assert!((state.stats.total_cost - 0.123).abs() < f64::EPSILON);
+    }
+
+    /// Per-lane stats reach the live `AppState` so the web Agents panel can
+    /// scope `/stats` to a role. Orchestrator (Human) and a sub-agent role
+    /// bucket separately; the orchestrator lane sorts first.
+    #[test]
+    fn add_request_exposes_lane_breakdown_on_state() {
+        use crate::ui::app_state::MessageSource;
+        let sm = StateManager::new();
+        sm.add_request(&MessageSource::Human, 100, 40, 0.10);
+        sm.add_request(
+            &MessageSource::SubAgent {
+                role: "researcher".into(),
+            },
+            200,
+            80,
+            0.20,
+        );
+
+        let lanes = sm.get_state().stats.lanes;
+        // Orchestrator first (Human buckets under "orchestrator"), then the role.
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].lane, "orchestrator");
+        assert_eq!(lanes[0].input_tokens, 100);
+        assert!((lanes[0].cost - 0.10).abs() < f64::EPSILON);
+
+        assert_eq!(lanes[1].lane, "researcher");
+        assert_eq!(lanes[1].input_tokens, 200);
+        assert_eq!(lanes[1].api_calls, 1);
+        assert!((lanes[1].cost - 0.20).abs() < f64::EPSILON);
+    }
+
+    /// `set_pipeline_enabled` mirrors the session fact into the live `AppState`
+    /// so the web Agents panel reflects whether sub-agents are actually
+    /// available (default off).
+    #[test]
+    fn set_pipeline_enabled_reflects_on_state() {
+        let sm = StateManager::new();
+        assert!(!sm.get_state().pipeline_enabled);
+
+        sm.set_pipeline_enabled(true);
+        assert!(sm.get_state().pipeline_enabled);
+
+        sm.set_pipeline_enabled(false);
+        assert!(!sm.get_state().pipeline_enabled);
     }
 
     #[test]

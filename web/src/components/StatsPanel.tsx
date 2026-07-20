@@ -22,6 +22,7 @@ export function StatsPanel({
   stats,
   context,
   peakbotVersion,
+  scopeLabel,
 }: {
   stats: SessionStats;
   context: ContextUsage;
@@ -29,6 +30,9 @@ export function StatsPanel({
    * `WelcomeState::peakbot_version` in AppState; empty until the first
    * wire snapshot that includes the field lands. */
   peakbotVersion?: string;
+  /** When watching a single lane (a role or the orchestrator), the session
+   * rows show that lane's numbers and this label names it. Null = global. */
+  scopeLabel?: string | null;
 }) {
   const pct = context.windowSize
     ? (context.currentUsage / context.windowSize) * 100
@@ -43,6 +47,11 @@ export function StatsPanel({
         <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
           Session
         </h3>
+        {scopeLabel && (
+          <p className="mb-2 rounded border border-sky-900/60 bg-sky-950/30 px-2 py-1 text-[11px] text-sky-300">
+            scoped to <span className="font-medium">{scopeLabel}</span>
+          </p>
+        )}
         <div className="space-y-1 text-xs">
           <Row label="model" value={stats.modelAlias} />
           {peakbotVersion && <Row label="peakbot" value={`v${peakbotVersion}`} />}
