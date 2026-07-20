@@ -19,6 +19,7 @@ import type {
   SessionStats,
   TodoItem,
   TodoStatus,
+  ViewFilter,
   Welcome,
 } from "./types";
 
@@ -174,6 +175,40 @@ export function adaptBashPanel(p: WireBashPanel): BashPanel | null {
         tail: p.tail,
       };
   }
+}
+
+// Phase-1 chat scoping. Given the raw wire messages and a ViewFilter, return
+// only the messages that belong to that view. Uses the `source` already on
+// every message — no backend. "global" = everything; "orchestrator" = the
+// orchestrator lane (anything not a sub-agent turn); a role string = that
+// sub-agent's turns.
+export function filterMessagesByView(
+  messages: WireChatMessage[],
+  filter: ViewFilter,
+): WireChatMessage[] {
+  if (filter === "global") return messages;
+  if (filter === "orchestrator")
+    return messages.filter((m) => m.source?.kind !== "sub_agent");
+  return messages.filter(
+    (m) => m.source?.kind === "sub_agent" && m.source.role === filter,
+  );
+}
+
+// Phase-2 roster. Scan the transcript for distinct sub-agent roles and count
+// each one's turns. Zero backend — the roles come from `source.role` already on
+// every message (same derive-from-transcript pattern as adaptFiles). Order is
+// first-appearance so the list is stable as new turns land.
+export function deriveSubAgentRoster(
+  messages: WireChatMessage[],
+): { role: string; count: number }[] {
+  const byRole = new Map<string, number>();
+  for (const m of messages) {
+    if (m.source?.kind !== "sub_agent") continue;
+    const role = m.source.role;
+    if (!role) continue;
+    byRole.set(role, (byRole.get(role) ?? 0) + 1);
+  }
+  return [...byRole.entries()].map(([role, count]) => ({ role, count }));
 }
 
 export function adaptWelcome(s: AppState): Welcome | null {

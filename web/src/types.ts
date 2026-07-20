@@ -22,6 +22,12 @@ export interface ChatMessage {
   subAgentRole?: string;
 }
 
+// Which agent's view the UI is scoped to (chat/todo/stats). "global" = the
+// current all-agents view with badges; "orchestrator" = the top-level lane
+// only; any other string = a specific sub-agent role. Phase-1 dummy: a single
+// client-side selector, no backend.
+export type ViewFilter = "global" | "orchestrator" | string;
+
 export type TodoStatus = "pending" | "inProgress" | "completed" | "cancelled";
 
 export interface TodoItem {
