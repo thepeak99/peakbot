@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { FileEdit } from "../types";
 
 // Files the agent touched this session (#126), derived from file tool calls in
-// the transcript (see adaptFiles). Read-only list — reverting a change needs
+// the transcript (see filesFromMessages). Read-only list — reverting a change needs
 // backend undo support that doesn't exist yet, so no `[x]`. A "Copy git add"
 // affordance copies the changed (created/modified) paths for staging.
 

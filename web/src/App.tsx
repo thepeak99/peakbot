@@ -29,14 +29,14 @@ import {
   adaptBashPanel,
   adaptBg,
   adaptContext,
-  adaptFiles,
   adaptMessage,
   adaptStats,
-  adaptTodos,
   adaptWelcome,
   deriveSubAgentRoster,
+  filesFromMessages,
   filterMessagesByView,
   scopeStatsToView,
+  todosFromMessages,
 } from "./adapt";
 
 export function App() {
@@ -67,12 +67,15 @@ export function App() {
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
 
-  // Phase-1 dummy: subagent watch. `agentsEnabled` toggles the list; `view`
-  // scopes the transcript (and, later, todo/stats) via the message `source`.
-  const [agentsEnabled, setAgentsEnabled] = useState(false);
+  // Sub-agent watch. The Agents panel is gated on the backend's honest
+  // `pipeline_enabled` (a boot-only session fact), NOT a local toggle — a
+  // conversation either has the pipeline or it doesn't, and you can't switch
+  // it on/off from the UI. `view` scopes the transcript, todos, files and
+  // stats to one lane via the message `source`.
+  const pipelineEnabled = state?.pipeline_enabled ?? false;
   const [view, setView] = useState<ViewFilter>("global");
-  // If watching is disabled, force the transcript back to the global view.
-  const effectiveView: ViewFilter = agentsEnabled ? view : "global";
+  // Without a pipeline there is only the global view.
+  const effectiveView: ViewFilter = pipelineEnabled ? view : "global";
   const scopeLabel =
     effectiveView === "global"
       ? null
@@ -90,13 +93,18 @@ export function App() {
   const stats = state ? adaptStats(state) : null;
   // Scope the Session panel to the watched view (Global keeps grand totals).
   const scopedStats = stats ? scopeStatsToView(stats, effectiveView) : null;
-  const pipelineEnabled = state?.pipeline_enabled ?? false;
   const welcome = state ? adaptWelcome(state) : null;
   const bash = state ? adaptBashPanel(state.bash_panel) : null;
-  const todos = state ? adaptTodos(state) : [];
+  // Todos & files both derive from the watched lane's transcript slice — one
+  // code path for every lane (orchestrator, sub-agent, agents-off). No backend
+  // todo state is read; sub-agent todos surface for free (#208-adjacent).
+  const scopedMessages = state
+    ? filterMessagesByView(state.chat.messages, effectiveView)
+    : [];
+  const todos = todosFromMessages(scopedMessages);
   const bg = state ? adaptBg(state) : [];
   const context = state ? adaptContext(state) : null;
-  const files = state ? adaptFiles(state) : [];
+  const files = filesFromMessages(scopedMessages);
 
   const runningBg = bg.filter((p) => p.status === "running").length;
   const pendingInput = state?.pending_input_count ?? 0;
@@ -148,15 +156,13 @@ export function App() {
       label: "Agents",
       content: (
         <AgentsPanel
-          enabled={agentsEnabled}
-          onToggleEnabled={setAgentsEnabled}
+          pipelineEnabled={pipelineEnabled}
           active={view}
           onSelect={setView}
           roster={roster}
-          pipelineEnabled={pipelineEnabled}
         />
       ),
-      badge: agentsEnabled ? roster.length : undefined,
+      badge: pipelineEnabled ? roster.length : undefined,
     },
   ];
 

@@ -1335,6 +1335,22 @@ impl StateManager {
                 conv.metadata.total_api_calls,
                 conv.metadata.total_cost,
             );
+            // Rehydrate the per-lane breakdown so the Session panel can scope to
+            // a sub-agent on resume instead of reading zeros.
+            self.stats
+                .lock()
+                .unwrap()
+                .restore_lanes(conv.metadata.lanes.iter().map(|l| {
+                    (
+                        l.lane.clone(),
+                        crate::hooks::LaneStats {
+                            input_tokens: l.input_tokens,
+                            output_tokens: l.output_tokens,
+                            api_calls: l.api_calls,
+                            cost: l.cost,
+                        },
+                    )
+                }));
 
             // Restore persisted todo list
             *self.todo_list.lock().unwrap() = conv.todos.clone();
@@ -1420,6 +1436,17 @@ impl StateManager {
             conv.metadata.total_output_tokens = stats.total_output_tokens;
             conv.metadata.total_api_calls = stats.total_api_calls;
             conv.metadata.total_cost = stats.total_cost;
+            conv.metadata.lanes = stats
+                .lanes_sorted()
+                .into_iter()
+                .map(|(lane, s)| crate::conversation::LaneMetadata {
+                    lane,
+                    input_tokens: s.input_tokens,
+                    output_tokens: s.output_tokens,
+                    api_calls: s.api_calls,
+                    cost: s.cost,
+                })
+                .collect();
             drop(stats);
             // Snapshot todo list so /load restores it on a future session.
             conv.todos = self.todo_list.lock().unwrap().clone();

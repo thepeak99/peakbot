@@ -100,16 +100,16 @@ web:
 	@touch web/dist/.gitkeep   # Vite's emptyOutDir wipes it each build; keep the tracked placeholder
 
 ## dev: Hot-reload dev loop — backend (cargo watch) + web (Vite HMR) together.
-##       Open http://localhost:5173 (Vite/HMR). The backend runs on :7823 and
+##       Open http://localhost:5173 (Vite/HMR). The backend runs on :8080 and
 ##       Vite proxies /ws to it. A Rust edit rebuilds+restarts the backend
 ##       (drops the WS session, ~seconds); a web/src edit hot-swaps (<1s, no reload).
 dev:
 	@command -v cargo-watch >/dev/null 2>&1 || { echo "❌ cargo-watch not found — run: cargo install cargo-watch"; exit 1; }
 	@command -v npm >/dev/null 2>&1 || { echo "❌ npm not found — install Node.js 22+"; exit 1; }
 	cd web && npm install
-	@echo "→ web (HMR): http://localhost:5173   backend: http://127.0.0.1:7823"
+	@echo "→ web (HMR): http://localhost:5173   backend: http://127.0.0.1:8080"
 	@trap 'kill 0' INT TERM; \
-	PEAKBOT_NO_OPEN=1 cargo watch -x 'run -- --web' & \
+	PEAKBOT_NO_OPEN=1 cargo watch -x 'run -- --web --bind 127.0.0.1:8080' & \
 	( cd web && npm run dev ) & \
 	wait
 

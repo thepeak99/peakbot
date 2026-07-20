@@ -36,24 +36,21 @@ const VIEW_ENTRIES: Entry[] = [
 ];
 
 export function AgentsPanel({
-  enabled,
-  onToggleEnabled,
+  pipelineEnabled,
   active,
   onSelect,
   roster,
-  pipelineEnabled,
 }: {
-  enabled: boolean;
-  onToggleEnabled: (next: boolean) => void;
+  /** Whether the backend pipeline is enabled for this session
+   * (`pipeline.enabled`, boot-only). This is the single source of truth: a
+   * conversation either delegates or it doesn't, and it can't be toggled from
+   * the UI, so the "Enable subagents" checkbox reflects this state and is
+   * grayed out — never a lie about a capability it can't switch. */
+  pipelineEnabled: boolean;
   active: ViewFilter;
   onSelect: (filter: ViewFilter) => void;
   /** Sub-agent roles derived live from the transcript, with turn counts. */
   roster: { role: string; count: number }[];
-  /** Whether the backend pipeline is actually configured for this session
-   * (`pipeline.enabled`, boot-only). Drives the honest status line — the
-   * "Enable subagents" checkbox is a local view toggle, not a topology
-   * switch, so this is how the panel tells the truth about availability. */
-  pipelineEnabled: boolean;
 }) {
   const roleEntries: Entry[] = roster.map((r) => ({
     id: r.role,
@@ -63,7 +60,7 @@ export function AgentsPanel({
     count: r.count,
   }));
 
-  const rows = enabled ? [...VIEW_ENTRIES, ...roleEntries] : [];
+  const rows = pipelineEnabled ? [...VIEW_ENTRIES, ...roleEntries] : [];
 
   return (
     <section>
@@ -91,19 +88,23 @@ export function AgentsPanel({
         )}
       </p>
 
-      <label className="mb-3 flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+      <label
+        className="mb-3 flex items-center gap-2 text-xs text-zinc-500"
+        title="Set by config.yaml (pipeline.enabled, boot-only) — can't be toggled from the UI."
+      >
         <input
           type="checkbox"
-          checked={enabled}
-          onChange={(e) => onToggleEnabled(e.target.checked)}
-          className="h-3.5 w-3.5 cursor-pointer accent-sky-500"
+          checked={pipelineEnabled}
+          disabled
+          readOnly
+          className="h-3.5 w-3.5 cursor-not-allowed accent-sky-500"
         />
         Enable subagents
       </label>
 
-      {!enabled ? (
+      {!pipelineEnabled ? (
         <p className="text-xs text-zinc-600">
-          Enable to watch individual agents.
+          No sub-agents in this session.
         </p>
       ) : (
         <>
