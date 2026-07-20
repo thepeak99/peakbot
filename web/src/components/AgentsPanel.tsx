@@ -49,14 +49,22 @@ export function AgentsPanel({
   pipelineEnabled: boolean;
   active: ViewFilter;
   onSelect: (filter: ViewFilter) => void;
-  /** Sub-agent roles derived live from the transcript, with turn counts. */
-  roster: { role: string; count: number }[];
+  /** One entry per delegation call, in call order, with its composite key and
+   * turn count (see deriveSubAgentRoster). */
+  roster: { key: string; role: string; n: number; count: number }[];
 }) {
+  // Suffix a call with "#n" only when its role ran more than once — a
+  // single-call role reads as its bare name (no noisy "#1").
+  const callsPerRole = new Map<string, number>();
+  for (const r of roster)
+    callsPerRole.set(r.role, (callsPerRole.get(r.role) ?? 0) + 1);
+
   const roleEntries: Entry[] = roster.map((r) => ({
-    id: r.role,
-    label: r.role,
+    id: r.key,
+    label:
+      (callsPerRole.get(r.role) ?? 0) > 1 ? `${r.role} #${r.n}` : r.role,
     glyph: "🧩",
-    hint: "Sub-agent",
+    hint: "Sub-agent delegation",
     count: r.count,
   }));
 

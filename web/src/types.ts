@@ -22,10 +22,9 @@ export interface ChatMessage {
   subAgentRole?: string;
 }
 
-// Which agent's view the UI is scoped to (chat/todo/stats). "global" = the
-// current all-agents view with badges; "orchestrator" = the top-level lane
-// only; any other string = a specific sub-agent role. Phase-1 dummy: a single
-// client-side selector, no backend.
+// Which agent's view the UI is scoped to (chat/todo/stats). "global" = all
+// agents, one transcript, todos labeled by lane; "orchestrator" = the top-level
+// lane only; "role#n" = one specific delegation of a sub-agent role (per-call).
 export type ViewFilter = "global" | "orchestrator" | string;
 
 export type TodoStatus = "pending" | "inProgress" | "completed" | "cancelled";
@@ -34,6 +33,10 @@ export interface TodoItem {
   id: number;
   text: string;
   status: TodoStatus;
+  /** Display label for the lane this todo belongs to ("Orchestrator", a role,
+   * or "role · call N"). Set only in the global view (todosByLane) so the panel
+   * can label it; absent when the panel is already scoped to a single lane. */
+  lane?: string;
 }
 
 export interface LaneStat {
