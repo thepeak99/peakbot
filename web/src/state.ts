@@ -53,11 +53,23 @@ export interface WireTodo {
   items: WireTodoItem[];
 }
 
+export interface WireLaneStat {
+  lane: string;
+  input_tokens: number;
+  output_tokens: number;
+  api_calls: number;
+  cost: number;
+}
+
 export interface WireStats {
   total_input_tokens: number;
   total_output_tokens: number;
   total_api_calls: number;
   total_cost: number;
+  /** Per-lane breakdown (orchestrator + sub-agent roles). Optional so old
+   * wire snapshots parse cleanly; empty until the first lane-attributed
+   * request. */
+  lanes?: WireLaneStat[];
   model: string;
   provider_name: string;
   model_alias: string;
@@ -130,6 +142,9 @@ export interface AppState {
   exit_requested: boolean;
   bg: WireBg;
   bash_panel: WireBashPanel;
+  /** Whether the multi-agent pipeline is enabled for this session
+   * (boot-only config). Optional so old wire snapshots parse cleanly. */
+  pipeline_enabled?: boolean;
 }
 
 // ── Protocol envelopes (src/ui/wire.rs) ───────────────────────────────

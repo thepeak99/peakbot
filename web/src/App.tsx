@@ -36,6 +36,7 @@ import {
   adaptWelcome,
   deriveSubAgentRoster,
   filterMessagesByView,
+  scopeStatsToView,
 } from "./adapt";
 
 export function App() {
@@ -87,6 +88,9 @@ export function App() {
   const roster = state ? deriveSubAgentRoster(state.chat.messages) : [];
 
   const stats = state ? adaptStats(state) : null;
+  // Scope the Session panel to the watched view (Global keeps grand totals).
+  const scopedStats = stats ? scopeStatsToView(stats, effectiveView) : null;
+  const pipelineEnabled = state?.pipeline_enabled ?? false;
   const welcome = state ? adaptWelcome(state) : null;
   const bash = state ? adaptBashPanel(state.bash_panel) : null;
   const todos = state ? adaptTodos(state) : [];
@@ -102,11 +106,12 @@ export function App() {
       id: "session",
       label: "Session",
       content:
-        stats && context ? (
+        scopedStats && context ? (
           <StatsPanel
-            stats={stats}
+            stats={scopedStats}
             context={context}
             peakbotVersion={welcome?.peakbotVersion}
+            scopeLabel={scopeLabel}
           />
         ) : null,
     },
@@ -148,6 +153,7 @@ export function App() {
           active={view}
           onSelect={setView}
           roster={roster}
+          pipelineEnabled={pipelineEnabled}
         />
       ),
       badge: agentsEnabled ? roster.length : undefined,

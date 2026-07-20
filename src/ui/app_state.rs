@@ -130,6 +130,14 @@ pub struct AppState {
     /// "Producer→view orthogonality" Zen pass.
     #[serde(default)]
     pub bash_panel_visibility: BashPanelVisibility,
+
+    /// Whether the multi-agent pipeline is enabled for this session
+    /// (`pipeline.enabled`, boot-only config). Mirrors the `StateManager`'s
+    /// session-fact bool so the web Agents panel can tell the truth about
+    /// whether sub-agents are actually available — instead of a local-only
+    /// checkbox that advertises a capability it can't switch on.
+    #[serde(default)]
+    pub pipeline_enabled: bool,
 }
 
 impl AppState {
@@ -954,6 +962,24 @@ impl InputState {
     }
 }
 
+/// One lane's slice of the session stats, serialized to the web wire so the
+/// Agents panel can scope `/stats` to a single sub-agent (or the orchestrator).
+/// Mirrors [`crate::hooks::SessionStats`]'s `LaneStats`: input/output tokens are
+/// the LAST request on that lane; api_calls + cost accumulate.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LaneStat {
+    /// Lane label — `"orchestrator"` or a sub-agent role name.
+    pub lane: String,
+    /// Input tokens from the last request on this lane.
+    pub input_tokens: u64,
+    /// Output tokens from the last request on this lane.
+    pub output_tokens: u64,
+    /// API calls made on this lane.
+    pub api_calls: u64,
+    /// Accumulated cost (USD) on this lane.
+    pub cost: f64,
+}
+
 /// Session statistics state
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionState {
@@ -968,6 +994,13 @@ pub struct SessionState {
 
     /// Total cost in USD
     pub total_cost: f64,
+
+    /// Per-lane breakdown (orchestrator + each sub-agent role), sorted with
+    /// orchestrator first. Empty until the first lane-attributed request. The
+    /// flat totals above stay the authoritative grand total — this is a scoped
+    /// view for the Agents panel, never the source of the totals.
+    #[serde(default)]
+    pub lanes: Vec<LaneStat>,
 
     /// Current model name (wire id).
     pub model: String,

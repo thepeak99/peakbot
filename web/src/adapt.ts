@@ -15,6 +15,7 @@ import type {
   ChatMessage,
   ContextUsage,
   FileEdit,
+  LaneStat,
   MessageRole,
   SessionStats,
   TodoItem,
@@ -69,6 +70,33 @@ export function adaptStats(s: AppState): SessionStats {
     modelAlias: s.stats.model_alias,
     model: s.stats.model,
     provider: s.stats.provider_name,
+    lanes: (s.stats.lanes ?? []).map((l) => ({
+      lane: l.lane,
+      inputTokens: l.input_tokens,
+      outputTokens: l.output_tokens,
+      apiCalls: l.api_calls,
+      costUsd: l.cost,
+    })),
+  };
+}
+
+// Scope the stats panel to the active view. "global" keeps the grand totals;
+// "orchestrator"/"<role>" narrows the token/call/cost rows to that lane's
+// bucket, leaving model/lanes intact. A view with no lane yet (nothing ran on
+// it) reads as zeros — honest, not stale. Model identity is a session fact,
+// not a per-lane one, so it always shows the session model.
+export function scopeStatsToView(
+  stats: SessionStats,
+  view: ViewFilter,
+): SessionStats {
+  if (view === "global") return stats;
+  const lane: LaneStat | undefined = stats.lanes.find((l) => l.lane === view);
+  return {
+    ...stats,
+    inputTokens: lane?.inputTokens ?? 0,
+    outputTokens: lane?.outputTokens ?? 0,
+    apiCalls: lane?.apiCalls ?? 0,
+    costUsd: lane?.costUsd ?? 0,
   };
 }
 

@@ -41,6 +41,7 @@ export function AgentsPanel({
   active,
   onSelect,
   roster,
+  pipelineEnabled,
 }: {
   enabled: boolean;
   onToggleEnabled: (next: boolean) => void;
@@ -48,6 +49,11 @@ export function AgentsPanel({
   onSelect: (filter: ViewFilter) => void;
   /** Sub-agent roles derived live from the transcript, with turn counts. */
   roster: { role: string; count: number }[];
+  /** Whether the backend pipeline is actually configured for this session
+   * (`pipeline.enabled`, boot-only). Drives the honest status line — the
+   * "Enable subagents" checkbox is a local view toggle, not a topology
+   * switch, so this is how the panel tells the truth about availability. */
+  pipelineEnabled: boolean;
 }) {
   const roleEntries: Entry[] = roster.map((r) => ({
     id: r.role,
@@ -66,6 +72,24 @@ export function AgentsPanel({
           Agents
         </h3>
       </div>
+
+      <p
+        className={`mb-3 rounded border px-2 py-1 text-[11px] ${
+          pipelineEnabled
+            ? "border-emerald-900/60 bg-emerald-950/30 text-emerald-300"
+            : "border-zinc-800 bg-zinc-900/50 text-zinc-500"
+        }`}
+      >
+        {pipelineEnabled ? (
+          <>Pipeline active — sub-agents available this session.</>
+        ) : (
+          <>
+            Pipeline not configured. Add a{" "}
+            <code className="text-zinc-400">pipeline:</code> block to config.yaml
+            and restart to enable sub-agents.
+          </>
+        )}
+      </p>
 
       <label className="mb-3 flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
         <input
