@@ -28,6 +28,27 @@ pub struct ConversationMetadata {
     /// Cumulative cost in USD across the conversation
     #[serde(default)]
     pub total_cost: f64,
+    /// Per-lane stats snapshot (orchestrator + sub-agent roles). `#[serde(default)]`
+    /// so pre-pipeline files load with an empty breakdown — the right answer for
+    /// them. Mirrors the flat totals' overwrite/accumulate split per lane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<LaneMetadata>,
+}
+
+/// One persisted per-lane stats bucket. Serializable mirror of the hooks'
+/// `LaneStats`, kept in the metadata layer so persistence has no dependency on
+/// the non-serde runtime type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneMetadata {
+    pub lane: String,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub api_calls: u64,
+    #[serde(default)]
+    pub cost: f64,
 }
 
 impl Default for ConversationMetadata {
@@ -38,6 +59,7 @@ impl Default for ConversationMetadata {
             total_output_tokens: 0,
             total_api_calls: 0,
             total_cost: 0.0,
+            lanes: Vec::new(),
         }
     }
 }
@@ -669,6 +691,52 @@ mod tests {
         let parsed: Conversation = serde_json::from_str(&json).unwrap();
         assert!(!parsed.pipeline_enabled);
         assert!(!ConversationSummary::from(&parsed).pipeline_enabled);
+    }
+
+    // ── per-lane stats metadata ────────────────────────────────────────────
+
+    #[test]
+    fn metadata_lanes_roundtrip_and_default_empty() {
+        // Fresh metadata has no lanes and omits the field from JSON entirely.
+        let empty = ConversationMetadata::default();
+        assert!(empty.lanes.is_empty());
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(
+            !json.contains("lanes"),
+            "empty lanes must be skipped from JSON; got: {json}"
+        );
+
+        // Populated lanes survive a round-trip.
+        let meta = ConversationMetadata {
+            lanes: vec![
+                LaneMetadata {
+                    lane: "orchestrator".into(),
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    api_calls: 3,
+                    cost: 0.01,
+                },
+                LaneMetadata {
+                    lane: "reviewer".into(),
+                    input_tokens: 500,
+                    output_tokens: 40,
+                    api_calls: 5,
+                    cost: 0.05,
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: ConversationMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.lanes.len(), 2);
+        assert_eq!(parsed.lanes[1].lane, "reviewer");
+        assert_eq!(parsed.lanes[1].input_tokens, 500);
+        assert_eq!(parsed.lanes[1].api_calls, 5);
+
+        // A JSON with no `lanes` key loads with an empty breakdown.
+        let legacy = r#"{"message_count":1,"total_input_tokens":10}"#;
+        let parsed: ConversationMetadata = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.lanes.is_empty());
     }
 
     #[test]

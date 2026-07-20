@@ -7,8 +7,9 @@ const STATUS_META: Record<TodoStatus, { glyph: string; cls: string }> = {
   cancelled: { glyph: "✕", cls: "text-zinc-600 line-through" },
 };
 
-// The TODO side panel. Mirrors TodoState (src/ui/app_state.rs) and the
-// TUI's todo_panel: glyph + strike-through per status, a done/total count.
+// The TODO side panel. Mirrors the TUI's todo_panel: glyph + strike-through
+// per status, a done/total count. Items are derived from the watched lane's
+// transcript (see todosFromMessages), so every lane surfaces its own todos.
 export function TodoPanel({ items }: { items: TodoItem[] }) {
   const done = items.filter((i) => i.status === "completed").length;
   return (

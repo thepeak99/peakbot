@@ -750,7 +750,7 @@ Typical loop:
 
 ```bash
 # 1. start the web build (separate terminal — leave running)
-make dev                   # backend on :7823, Vite HMR on :5173
+make dev                   # backend on :8080, Vite HMR on :5173
 
 # 2. drive a headless browser from the agent
 playwright-cli open http://localhost:5173/?token=$PEAKBOT_WEB_TOKEN
@@ -1167,7 +1167,7 @@ Run `make help` for the full list. Day-to-day:
 | `make rebuild` | `clean` + `build` (rebuilds all four) |
 | `make help` | Print this table from `## ` doc comments in the Makefile |
 | `make web` | Build the web UI bundle (`web/dist/`) for `peakbot --web` |
-| `make dev` | Web UI dev loop: backend under `cargo watch` (`:7823`) + Vite HMR (`:5173`) together. Open `localhost:5173`; Vite proxies `/ws` to the backend. Web edits hot-swap <1s; Rust edits rebuild+restart (drops the WS session). Requires `cargo-watch` + Node 22+. Touches no Rust code paths — production is unchanged. |
+| `make dev` | Web UI dev loop: backend under `cargo watch` (`:8080`) + Vite HMR (`:5173`) together. Open `localhost:5173`; Vite proxies `/ws` to the backend. Web edits hot-swap <1s; Rust edits rebuild+restart (drops the WS session). Requires `cargo-watch` + Node 22+. Touches no Rust code paths — production is unchanged. |
 
 Non-release builds produce **unversioned** filenames (e.g. `peakbot-linux-amd64`). The release flow injects the semver via `--build-arg VERSION=$v`, which the Dockerfiles splice into the artifact name as `peakbot-<v>-<platform>`. With `VERSION` unset (the default), the conditional `${VERSION:+-${VERSION}}` substitution in each Dockerfile collapses to nothing — same `cargo build --release`, just a cleaner name.
 

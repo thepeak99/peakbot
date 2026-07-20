@@ -191,6 +191,14 @@ impl SessionStats {
         }
     }
 
+    /// Replace the per-lane breakdown wholesale (e.g. after `/load`). The flat
+    /// totals restored by [`Self::restore`] stay authoritative; this only
+    /// rehydrates the per-lane buckets so a resumed conversation can scope the
+    /// Session panel to a sub-agent instead of reading zeros.
+    pub fn restore_lanes(&mut self, lanes: impl IntoIterator<Item = (String, LaneStats)>) {
+        self.lanes = lanes.into_iter().collect();
+    }
+
     /// Get the last request's stats
     pub fn last_request(&self) -> Option<RequestStats> {
         self.requests.last().cloned()
@@ -521,6 +529,50 @@ mod tests {
         assert!((lanes[1].1.cost - 0.05).abs() < 1e-9);
         assert_eq!(lanes[1].1.input_tokens, 300);
         assert_eq!(lanes[1].1.output_tokens, 60);
+    }
+
+    /// `restore_lanes` rehydrates the per-lane breakdown wholesale (the /load
+    /// path) so a resumed conversation can scope the Session panel to a
+    /// sub-agent instead of reading zeros.
+    #[test]
+    fn restore_lanes_rehydrates_breakdown() {
+        let mut stats = SessionStats::new();
+        assert!(stats.lanes_sorted().is_empty());
+
+        stats.restore_lanes([
+            (
+                "reviewer".to_string(),
+                LaneStats {
+                    input_tokens: 500,
+                    output_tokens: 40,
+                    api_calls: 5,
+                    cost: 0.05,
+                },
+            ),
+            (
+                "orchestrator".to_string(),
+                LaneStats {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    api_calls: 3,
+                    cost: 0.01,
+                },
+            ),
+        ]);
+
+        let lanes = stats.lanes_sorted();
+        assert_eq!(lanes.len(), 2);
+        // lanes_sorted still orders orchestrator first regardless of input order.
+        assert_eq!(lanes[0].0, "orchestrator");
+        assert_eq!(lanes[1].0, "reviewer");
+        assert_eq!(lanes[1].1.input_tokens, 500);
+        assert_eq!(lanes[1].1.api_calls, 5);
+
+        // Restoring again replaces (not merges) the breakdown.
+        stats.restore_lanes([("developer".to_string(), LaneStats::default())]);
+        let lanes = stats.lanes_sorted();
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].0, "developer");
     }
 }
 

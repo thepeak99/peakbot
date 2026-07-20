@@ -185,7 +185,7 @@ iterating on it, `make dev` runs both halves with hot reload:
 make dev
 ```
 
-This starts the backend under `cargo watch` (on `127.0.0.1:7823`) and the Vite
+This starts the backend under `cargo watch` (on `127.0.0.1:8080`) and the Vite
 dev server (on `localhost:5173`) together. **Open http://localhost:5173** — Vite
 serves the app with HMR and proxies the `/ws` WebSocket to the backend.
 

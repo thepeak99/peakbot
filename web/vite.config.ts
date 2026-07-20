@@ -9,11 +9,11 @@ export default defineConfig({
     emptyOutDir: true,
   },
   // `make dev` serves the app from Vite (HMR) while the backend runs
-  // separately on :7823. Proxy the WebSocket and the `/commands` REST
-  // endpoint so the browser talks to one origin and never hits CORS —
-  // without the `/commands` proxy the SPA fallback returns index.html and
-  // the slash palette silently ends up empty. Matches DEFAULT_WEB_ADDR in
-  // src/ui/web/mod.rs.
+  // separately on :8080 (see the `dev` target in the Makefile). Proxy the
+  // WebSocket and the `/commands` REST endpoint so the browser talks to
+  // one origin and never hits CORS — without the `/commands` proxy the
+  // SPA fallback returns index.html and the slash palette silently ends
+  // up empty.
   server: {
     // Bind all interfaces so a phone on the same LAN can hit the dev server.
     host: true,
@@ -24,8 +24,8 @@ export default defineConfig({
     strictPort: true,
     open: true,
     proxy: {
-      "/ws": { target: "ws://127.0.0.1:7823", ws: true },
-      "/commands": { target: "http://127.0.0.1:7823" },
+      "/ws": { target: "ws://127.0.0.1:8080", ws: true },
+      "/commands": { target: "http://127.0.0.1:8080" },
     },
   },
 });

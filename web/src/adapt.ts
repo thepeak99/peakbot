@@ -108,14 +108,6 @@ export function adaptContext(s: AppState): ContextUsage {
   };
 }
 
-export function adaptTodos(s: AppState): TodoItem[] {
-  return s.todo.items.map((t) => ({
-    id: t.id,
-    text: t.text,
-    status: TODO_STATUS_MAP[t.status] ?? "pending",
-  }));
-}
-
 export function adaptBg(s: AppState): BgProcess[] {
   return s.bg.recent_summaries.map((b) => ({
     id: b.id,
@@ -137,14 +129,15 @@ const FILE_WRITE_TOOLS = new Set([
 const FILE_TOOLS = new Set([...FILE_WRITE_TOOLS, "file_read"]);
 
 /**
- * Derive the list of files the agent touched this session from the transcript
- * (#126). No new backend state — the path lives in each file tool call's
- * `tool_args` JSON. Order is first-touch; `edits` counts write operations
- * (reads don't count as edits). `kind` follows created > modified > read.
+ * Derive the list of files the agent touched from a transcript slice (#126).
+ * No new backend state — the path lives in each file tool call's `tool_args`
+ * JSON. Order is first-touch; `edits` counts write operations (reads don't
+ * count as edits). `kind` follows created > modified > read. Callers pass the
+ * already-scoped message slice, so this doubles as the per-lane Files view.
  */
-export function adaptFiles(s: AppState): FileEdit[] {
+export function filesFromMessages(messages: WireChatMessage[]): FileEdit[] {
   const byPath = new Map<string, FileEdit>();
-  for (const m of s.chat.messages) {
+  for (const m of messages) {
     if (m.role !== "toolcall" || !m.tool_name) continue;
     if (!FILE_TOOLS.has(m.tool_name)) continue;
     let path: unknown;
@@ -172,6 +165,88 @@ export function adaptFiles(s: AppState): FileEdit[] {
     }
   }
   return [...byPath.values()];
+}
+
+// Wire status strings the `todo` tool accepts. An update carrying anything
+// else would have errored in the real tool (no state change), so the replay
+// below treats an unknown status as a no-op — see todosFromMessages.
+const TODO_WIRE_STATUSES = new Set<WireTodoStatus>([
+  "pending",
+  "in_progress",
+  "completed",
+  "cancelled",
+]);
+
+/**
+ * Derive a lane's todo list from its transcript slice — the todo counterpart
+ * to filesFromMessages (#208-adjacent). Sub-agent lanes drive no backend todo
+ * panel, but their `todo` tool calls already TEE into the transcript tagged by
+ * role; replaying those calls reconstructs the list without any new state. The
+ * orchestrator and agents-off flows fall out as the single-lane case.
+ *
+ * This reimplements the Rust `TodoList` transition function (src/tools/todo.rs)
+ * — it never consults tool *results*. A call the real tool would have rejected
+ * (unknown id, invalid status) no-ops here for free, keeping the derivation a
+ * pure function of the call args. Callers pass the already-scoped slice.
+ */
+export function todosFromMessages(messages: WireChatMessage[]): TodoItem[] {
+  const items: TodoItem[] = [];
+  let nextId = 1;
+
+  const add = (task: string) => {
+    const lower = task.toLowerCase();
+    if (items.some((t) => t.text.toLowerCase() === lower)) return; // dedupe
+    items.push({ id: nextId++, text: task, status: "pending" });
+  };
+
+  for (const m of messages) {
+    if (m.role !== "toolcall" || m.tool_name !== "todo") continue;
+    let args: {
+      action?: string;
+      tasks?: unknown;
+      task_id?: unknown;
+      status?: unknown;
+    };
+    try {
+      args = JSON.parse(m.tool_args ?? "{}");
+    } catch {
+      continue; // malformed args — skip rather than crash the panel
+    }
+
+    switch (args.action) {
+      case "add":
+        if (Array.isArray(args.tasks)) {
+          for (const t of args.tasks) if (typeof t === "string") add(t);
+        }
+        break;
+      case "update": {
+        if (
+          typeof args.status !== "string" ||
+          !TODO_WIRE_STATUSES.has(args.status as WireTodoStatus)
+        )
+          break; // invalid status → tool would error → no-op
+        const it = items.find((t) => t.id === args.task_id);
+        if (it) it.status = TODO_STATUS_MAP[args.status as WireTodoStatus];
+        break;
+      }
+      case "remove": {
+        const idx = items.findIndex((t) => t.id === args.task_id);
+        if (idx !== -1) items.splice(idx, 1);
+        break;
+      }
+      case "clear": {
+        for (let i = items.length - 1; i >= 0; i--) {
+          const s = items[i].status;
+          if (s === "completed" || s === "cancelled") items.splice(i, 1);
+        }
+        if (items.length === 0) nextId = 1; // mirror TodoList id reset
+        break;
+      }
+      // "list" and anything else are read-only / unknown → no state change.
+    }
+  }
+
+  return items;
 }
 
 /** Whole seconds → "MM:SS". */
