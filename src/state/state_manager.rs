@@ -90,11 +90,18 @@ pub struct StateManager {
     revision: AtomicU64,
 
     // ── Session facts ─────────────────────────────────────────────────────────
-    /// Whether the multi-agent pipeline is enabled for this session
-    /// (`pipeline.enabled`, boot-only). Stamped onto every conversation this
-    /// session creates so the fact survives reload. `AtomicBool` because it's
-    /// set once during session wiring and read on each mint — no lock needed.
-    pipeline_enabled: AtomicBool,
+    /// Whether a multi-agent pipeline is *configured* for this session
+    /// (`pipeline.enabled` + at least one role, boot-only). This is the
+    /// availability fact — it only decides whether the user may opt in, not
+    /// whether sub-agents are active. `AtomicBool` because it's set once during
+    /// session wiring and read on each mint — no lock needed.
+    pipeline_available: AtomicBool,
+
+    /// Whether the user has opted this conversation into sub-agents. Default
+    /// false, mutable only before the first turn (locked after), persisted on
+    /// the conversation so a resumed opt-in rebuilds with the `delegate` tool.
+    /// The `delegate` tool registers iff `pipeline_available && this`.
+    subagents_enabled: AtomicBool,
 }
 
 impl StateManager {
@@ -134,7 +141,8 @@ impl StateManager {
             shell: RwLock::new(String::new()),
             session_cwd: RwLock::new(std::env::current_dir().unwrap_or_default()),
             revision: AtomicU64::new(0),
-            pipeline_enabled: AtomicBool::new(false),
+            pipeline_available: AtomicBool::new(false),
+            subagents_enabled: AtomicBool::new(false),
         }
     }
 
@@ -964,19 +972,55 @@ impl StateManager {
         cwd: String,
     ) {
         let mut conv = Conversation::new(name, provider_name, model, cwd);
-        conv.pipeline_enabled = self.pipeline_enabled.load(Ordering::Acquire);
+        conv.pipeline_enabled = self.pipeline_available.load(Ordering::Acquire);
+        conv.subagents_enabled = self.subagents_enabled.load(Ordering::Acquire);
         *self.current_conversation.lock().unwrap() = Some(conv);
         self.mirror_conversation_to_state();
     }
 
-    /// Record whether the multi-agent pipeline is enabled for this session.
-    /// Set once during session wiring; stamped onto every conversation this
-    /// session mints (see [`Self::create_conversation`]) and mirrored into the
-    /// live `AppState` so the web Agents panel can reflect the real state.
-    pub fn set_pipeline_enabled(&self, enabled: bool) {
-        self.pipeline_enabled.store(enabled, Ordering::Release);
+    /// Record whether a multi-agent pipeline is *configured* for this session
+    /// (availability). Set once during session wiring; stamped onto every
+    /// conversation this session mints (see [`Self::create_conversation`]) and
+    /// mirrored into the live `AppState` so the web Agents panel knows whether
+    /// to offer the opt-in.
+    pub fn set_pipeline_available(&self, available: bool) {
+        self.pipeline_available.store(available, Ordering::Release);
         let mut state = self.state.write().unwrap();
-        state.pipeline_enabled = enabled;
+        state.pipeline_available = available;
+        self.notify_update(&state);
+    }
+
+    /// Whether the user has opted this conversation into sub-agents.
+    pub fn subagents_enabled(&self) -> bool {
+        self.subagents_enabled.load(Ordering::Acquire)
+    }
+
+    /// Whether the current conversation has had a real turn (any user or agent
+    /// message). System banners don't count — a fresh session showing only a
+    /// welcome/warning is still "not started". This is the lock signal for the
+    /// sub-agent opt-in: mutable before the first turn, frozen after.
+    pub fn conversation_has_turns(&self) -> bool {
+        use crate::ui::app_state::MessageRole;
+        self.state
+            .read()
+            .unwrap()
+            .chat
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, MessageRole::User | MessageRole::Agent))
+    }
+
+    /// Set the per-conversation sub-agent opt-in. Stamps the choice onto the
+    /// current conversation (persisted on next save) and mirrors it into the
+    /// live `AppState`. The caller owns the lock-after-first-turn rule and the
+    /// agent rebuild — this only records the fact.
+    pub fn set_subagents_enabled(&self, enabled: bool) {
+        self.subagents_enabled.store(enabled, Ordering::Release);
+        if let Some(conv) = self.current_conversation.lock().unwrap().as_mut() {
+            conv.subagents_enabled = enabled;
+        }
+        let mut state = self.state.write().unwrap();
+        state.subagents_enabled = enabled;
         self.notify_update(&state);
     }
 
@@ -1046,6 +1090,22 @@ impl StateManager {
             let conv = storage.load(id)?;
             *self.current_conversation.lock().unwrap() = Some(conv);
             self.sync_from_conversation();
+            // Restore the per-conversation sub-agent opt-in from the loaded
+            // conversation so a resumed opt-in rebuilds with `delegate` and the
+            // Agents panel reflects the saved choice. `pipeline_available` is a
+            // session fact set at wiring — not restored here.
+            let restored = self
+                .current_conversation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.subagents_enabled)
+                .unwrap_or(false);
+            self.subagents_enabled.store(restored, Ordering::Release);
+            {
+                let mut state = self.state.write().unwrap();
+                state.subagents_enabled = restored;
+            }
             // Background processes are scoped to the conversation they
             // were spawned in. Loading a different conversation severs
             // that context. See `bash-background.md` edge-case table.
@@ -1081,6 +1141,19 @@ impl StateManager {
             .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
         let conv = storage.load(id)?;
         Ok((conv.provider_name, conv.model))
+    }
+
+    /// Peek at a saved conversation's persisted `subagents_enabled` opt-in
+    /// without loading it. Used by `create_session` on the resume path to
+    /// decide whether the boot agent registers the `delegate` tool — a resumed
+    /// opt-in must rebuild with sub-agents available. Pre-field files return
+    /// `false`.
+    pub fn peek_conversation_subagents_enabled(&self, id: Uuid) -> anyhow::Result<bool> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
+        Ok(storage.load(id)?.subagents_enabled)
     }
 
     /// Peek at a saved conversation's persisted `cwd` without loading
@@ -2583,20 +2656,25 @@ mod tests {
         assert_eq!(sm.peek_conversation_cwd(id).unwrap(), "");
     }
 
-    /// `create_conversation` stamps the session's pipeline flag onto every
-    /// conversation it mints, so the fact survives persistence/reload.
+    /// `create_conversation` stamps the session's pipeline availability +
+    /// sub-agent opt-in onto every conversation it mints, so both facts survive
+    /// persistence/reload.
     #[test]
-    fn create_conversation_stamps_pipeline_flag() {
+    fn create_conversation_stamps_pipeline_flags() {
         let sm = StateManager::new();
 
-        // Default session: flag off → minted conversation is not a pipeline one.
+        // Default session: unavailable + not opted in.
         sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
         assert!(!sm.get_current_conversation().unwrap().pipeline_enabled);
+        assert!(!sm.get_current_conversation().unwrap().subagents_enabled);
 
-        // Session with pipeline enabled → minted conversation carries the flag.
-        sm.set_pipeline_enabled(true);
+        // Session with a configured pipeline and an opted-in conversation →
+        // minted conversation carries both flags.
+        sm.set_pipeline_available(true);
+        sm.set_subagents_enabled(true);
         sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
         assert!(sm.get_current_conversation().unwrap().pipeline_enabled);
+        assert!(sm.get_current_conversation().unwrap().subagents_enabled);
     }
 
     #[test]
@@ -2671,19 +2749,68 @@ mod tests {
         assert!((lanes[1].cost - 0.20).abs() < f64::EPSILON);
     }
 
-    /// `set_pipeline_enabled` mirrors the session fact into the live `AppState`
-    /// so the web Agents panel reflects whether sub-agents are actually
-    /// available (default off).
+    /// The two Agents-panel facts mirror into the live `AppState`:
+    /// `pipeline_available` (config) and `subagents_enabled` (per-conversation
+    /// opt-in). Both default off.
     #[test]
-    fn set_pipeline_enabled_reflects_on_state() {
+    fn pipeline_facts_reflect_on_state() {
         let sm = StateManager::new();
-        assert!(!sm.get_state().pipeline_enabled);
+        assert!(!sm.get_state().pipeline_available);
+        assert!(!sm.get_state().subagents_enabled);
 
-        sm.set_pipeline_enabled(true);
-        assert!(sm.get_state().pipeline_enabled);
+        sm.set_pipeline_available(true);
+        assert!(sm.get_state().pipeline_available);
 
-        sm.set_pipeline_enabled(false);
-        assert!(!sm.get_state().pipeline_enabled);
+        sm.set_subagents_enabled(true);
+        assert!(sm.get_state().subagents_enabled);
+        assert!(sm.subagents_enabled());
+
+        sm.set_subagents_enabled(false);
+        assert!(!sm.get_state().subagents_enabled);
+        assert!(!sm.subagents_enabled());
+    }
+
+    /// The opt-in lock signal ignores system banners: a fresh conversation
+    /// showing only a welcome/warning is still "not started".
+    #[test]
+    fn conversation_has_turns_ignores_system_messages() {
+        let sm = StateManager::new();
+        assert!(!sm.conversation_has_turns());
+
+        sm.add_system_message("welcome banner".to_string());
+        assert!(
+            !sm.conversation_has_turns(),
+            "system banners must not count as a turn"
+        );
+
+        sm.add_user_message("hello".to_string());
+        assert!(sm.conversation_has_turns());
+    }
+
+    /// Loading a conversation restores its persisted sub-agent opt-in so a
+    /// resumed opt-in rebuilds with `delegate` and the panel reflects it.
+    #[test]
+    fn load_conversation_restores_subagents_opt_in() {
+        use crate::conversation::Conversation;
+        use crate::storage::InMemoryStorage;
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let mut conv = Conversation::new(
+            "opted-in".into(),
+            "prov".into(),
+            "model".into(),
+            String::new(),
+        );
+        conv.subagents_enabled = true;
+        let id = conv.id;
+        storage.save(&conv).unwrap();
+
+        // Session default is off; loading the opted-in conversation flips it on.
+        assert!(!sm.subagents_enabled());
+        sm.load_conversation(id).unwrap();
+        assert!(sm.subagents_enabled());
+        assert!(sm.get_state().subagents_enabled);
     }
 
     #[test]

@@ -109,6 +109,12 @@ enum QueueMessage {
     /// handled by `handle_change_cwd`. Same rebuild seam as SwitchModel,
     /// different axis. See ticket #124.
     ChangeCwd(String),
+    /// Opt the current conversation into/out of sub-agents. Carries the
+    /// desired state. Dequeued between turns and handled by
+    /// `handle_set_subagents`: rejected once the conversation has turns
+    /// (locked), else recorded, persisted, and the agent rebuilt on the same
+    /// model/cwd so the `delegate` tool matches.
+    SetSubagentsEnabled(bool),
     /// One or more `bash_bg` processes have output ready. Payload is
     /// empty — the agent loop drains every bg buffer in one pass.
     /// Multiple notifications coalesce naturally (the drain returns
@@ -147,12 +153,27 @@ enum SubmitKind {
     /// `[img:…]` parsed but failed (missing file, too large, invalid token…).
     /// Surfaces as a system error; does not reach the LLM.
     InvalidAttachment(crate::vision::AttachmentError),
+    /// `/subagents on|off` — opt this conversation into/out of sub-agents.
+    /// `Some(bool)` is a valid on/off; `None` is a bare or malformed invocation
+    /// that should print usage + current state instead of toggling.
+    SubagentsCommand(Option<bool>),
 }
 
 fn classify_submission(msg: &str) -> SubmitKind {
     let trimmed = msg.trim();
     if trimmed == "/stop" {
         return SubmitKind::StopCommand;
+    }
+    // `/subagents [on|off]` — a per-conversation toggle, not an LLM turn.
+    if let Some(rest) = trimmed
+        .strip_prefix("/subagents")
+        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    {
+        return SubmitKind::SubagentsCommand(match rest.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "1" | "yes" => Some(true),
+            "off" | "false" | "0" | "no" => Some(false),
+            _ => None,
+        });
     }
     // Preserve whitespace on commands — leading whitespace in "/ quit"
     // should not be stripped before the command handler sees it.
@@ -803,6 +824,35 @@ impl AgentRunner {
                             }
                             // Do not enqueue — the model is never called.
                         }
+                        SubmitKind::SubagentsCommand(choice) => match choice {
+                            Some(enabled) => {
+                                if let Some(ref sm) = state_manager {
+                                    sm.increment_pending_input();
+                                }
+                                msg_tx
+                                    .send(QueueMessage::SetSubagentsEnabled(enabled))
+                                    .await
+                                    .ok();
+                            }
+                            None => {
+                                // Bare or malformed — print usage + current state.
+                                if let Some(ref sm) = state_manager {
+                                    let st = sm.get_state();
+                                    let now = if st.subagents_enabled { "on" } else { "off" };
+                                    let msg = if !st.pipeline_available {
+                                        "🧩 Sub-agents: no `pipeline:` configured — nothing to \
+                                         enable. Add a pipeline block to config.yaml and restart."
+                                            .to_string()
+                                    } else {
+                                        format!(
+                                            "🧩 Sub-agents are {now} for this conversation. \
+                                             Usage: /subagents on|off (only before the first turn)."
+                                        )
+                                    };
+                                    sm.add_system_message(msg);
+                                }
+                            }
+                        },
                     }
                 }
 
@@ -839,6 +889,20 @@ impl AgentRunner {
                         sm.increment_pending_input();
                     }
                     msg_tx.send(QueueMessage::ChangeCwd(path)).await.ok();
+                }
+
+                UiAction::SetSubagentsEnabled(enabled) => {
+                    // Forward to the agent loop (sole owner of the agent
+                    // handle — the toggle may rebuild it). Counts as pending
+                    // input so the status bar shows activity until the rebuild
+                    // completes.
+                    if let Some(ref sm) = state_manager {
+                        sm.increment_pending_input();
+                    }
+                    msg_tx
+                        .send(QueueMessage::SetSubagentsEnabled(enabled))
+                        .await
+                        .ok();
                 }
             }
         }
@@ -924,6 +988,7 @@ impl AgentRunner {
                     | Some(QueueMessage::Command(_))
                     | Some(QueueMessage::SwitchModel(_))
                     | Some(QueueMessage::ChangeCwd(_))
+                    | Some(QueueMessage::SetSubagentsEnabled(_))
                     | Some(QueueMessage::BackgroundOutputReady) => {
                         // Discarded — pending counter was already zeroed by
                         // the event loop's drain trigger. (SwitchModel is
@@ -1204,6 +1269,34 @@ impl AgentRunner {
                     completion_tx.send(CompletionResult::CommandDone).ok();
                 }
 
+                Some(QueueMessage::SetSubagentsEnabled(enabled)) => {
+                    if let Some(ref sm) = state_manager {
+                        sm.set_running(true);
+                    }
+                    let outcome = Self::handle_set_subagents(
+                        enabled,
+                        &mut agent,
+                        &mut config,
+                        &state_manager,
+                        &session_hook_cell,
+                        &provider_info_cell,
+                        &mut event_processor,
+                        rebuild_ctx.as_mut(),
+                        &active_sub_agent_hook,
+                    )
+                    .await;
+                    if let Some(ref sm) = state_manager {
+                        sm.decrement_pending_input();
+                        sm.set_running(false);
+                    }
+                    if let Err(msg) = outcome
+                        && let Some(ref sm) = state_manager
+                    {
+                        sm.add_system_message(format!("❌ subagents: {msg}"));
+                    }
+                    completion_tx.send(CompletionResult::CommandDone).ok();
+                }
+
                 None => {
                     // Channel closed, exit
                     if let Some(handle) = event_processor.take() {
@@ -1309,6 +1402,81 @@ impl AgentRunner {
         for warning in reload_warnings {
             sm_for_provider.add_system_message(warning);
         }
+
+        Ok(())
+    }
+
+    /// Toggle the current conversation's sub-agent opt-in.
+    ///
+    /// The choice is locked once the conversation has real turns — flipping the
+    /// `delegate` tool mid-conversation would desync the tool list from the
+    /// wire history, so we refuse and tell the user. Before the first turn we
+    /// record the choice (persisted onto the conversation, mirrored into
+    /// `AppState`) and rebuild the agent on the *current* model/cwd so the
+    /// `delegate` tool appears or disappears. No conversation reset — unlike
+    /// `/model` and `/cd`, this doesn't start a new conversation.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_set_subagents(
+        enabled: bool,
+        agent_slot: &mut Arc<DynAgent>,
+        config: &mut Config,
+        state_manager: &Option<Arc<StateManager>>,
+        session_hook_cell: &SharedSessionHook,
+        provider_info_cell: &SharedProviderInfo,
+        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
+        rebuild_ctx: Option<&mut RebuildContext>,
+        active_sub_agent_hook: &crate::pipeline::ActiveSubAgentHook,
+    ) -> Result<(), String> {
+        let Some(ctx) = rebuild_ctx else {
+            return Err("model registry not configured — restart with a `providers:` block".into());
+        };
+        let sm = state_manager
+            .clone()
+            .ok_or_else(|| "state manager required".to_string())?;
+
+        // Locked after the first turn — the tool list is fixed once the model
+        // has seen it.
+        if sm.conversation_has_turns() {
+            return Err("locked once the conversation has started".into());
+        }
+
+        // No-op if already in the requested state (idempotent toggle).
+        if sm.subagents_enabled() == enabled {
+            return Ok(());
+        }
+
+        // Record + persist + mirror to AppState *before* the rebuild, so the
+        // rebuild seam's `subagents_enabled()` gate reads the new value.
+        sm.set_subagents_enabled(enabled);
+
+        // Rebuild the agent on the current model so `add_builtin_tools` re-runs
+        // with the delegate gate flipped. Resolve the live alias against the
+        // (freshly reloaded) registry.
+        let alias = sm.get_model_alias();
+        let Some(resolved) = ctx.registry.resolve(&alias) else {
+            return Err(format!("current model `{alias}` is no longer available"));
+        };
+        let resolved = resolved.clone();
+
+        Self::rebuild_agent_for_resolved(
+            &resolved,
+            agent_slot,
+            config,
+            &sm,
+            session_hook_cell,
+            provider_info_cell,
+            event_processor,
+            state_manager,
+            ctx,
+            active_sub_agent_hook,
+        )
+        .await?;
+
+        sm.add_system_message(if enabled {
+            "🧩 Sub-agents enabled for this conversation.".to_string()
+        } else {
+            "🧩 Sub-agents disabled for this conversation.".to_string()
+        });
 
         Ok(())
     }
@@ -1599,6 +1767,16 @@ impl AgentRunner {
             Some(all)
         };
 
+        // Sub-agents are registered iff a pipeline is configured (registry
+        // present) AND this conversation opted in. Gating here — the single
+        // rebuild seam — keeps every rebuild path (`/model`, `/cd`, the
+        // subagents toggle) honouring the opt-in without duplicating the rule.
+        let boot_registry = if sm_for_provider.subagents_enabled() {
+            ctx.pipeline_registry.as_deref()
+        } else {
+            None
+        };
+
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
             &resolved.provider_config,
             mcp_tools,
@@ -1607,7 +1785,7 @@ impl AgentRunner {
             ctx.max_turns,
             ctx.todo_tool.clone(),
             &ctx.bash_config,
-            ctx.pipeline_registry.as_deref(),
+            boot_registry,
             sm_for_provider.clone(),
             ctx.shell_kind.as_ref(),
             ctx.vector_store.as_ref(),
@@ -4215,6 +4393,52 @@ mod tests {
         assert!(matches!(
             classify_submission("TODO: /foo or /bar?"),
             SubmitKind::UserMessage(_)
+        ));
+    }
+
+    #[test]
+    fn classify_subagents_parses_on_off_and_bare() {
+        for on in [
+            "/subagents on",
+            "/subagents TRUE",
+            "/subagents 1",
+            "  /subagents yes  ",
+        ] {
+            assert!(
+                matches!(
+                    classify_submission(on),
+                    SubmitKind::SubagentsCommand(Some(true))
+                ),
+                "{on:?} should be on"
+            );
+        }
+        for off in [
+            "/subagents off",
+            "/subagents false",
+            "/subagents 0",
+            "/subagents no",
+        ] {
+            assert!(
+                matches!(
+                    classify_submission(off),
+                    SubmitKind::SubagentsCommand(Some(false))
+                ),
+                "{off:?} should be off"
+            );
+        }
+        // Bare or malformed → None (usage/status, not a toggle).
+        assert!(matches!(
+            classify_submission("/subagents"),
+            SubmitKind::SubagentsCommand(None)
+        ));
+        assert!(matches!(
+            classify_submission("/subagents wat"),
+            SubmitKind::SubagentsCommand(None)
+        ));
+        // A command that merely starts with the same letters is NOT /subagents.
+        assert!(matches!(
+            classify_submission("/subagentsx"),
+            SubmitKind::Command(_)
         ));
     }
 

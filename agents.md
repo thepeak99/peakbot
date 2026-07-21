@@ -272,7 +272,7 @@ vector store and the Anthropic provider are active:
 | `doc_index` *(opt-in)* | `doc_index.rs` | Parse → chunk → embed → store a file/dir into the semantic vector store. Idempotent re-index (skips unchanged files via stored `sha256`). Registered only when `vector_db:` is configured. |
 | `doc_search` *(opt-in)* | `doc_search.rs` | Embed a query and return the top-k most relevant indexed chunks with source + score. Registered only when `vector_db:` is configured. |
 | `view_image` *(Anthropic-only)* | `view_image.rs` | Load a local image file (PNG/JPEG/GIF/WEBP, ≤10 MB) into the model's vision context as a structured image tool result. Reuses `vision::load_image_from_path`. Registered **only on the Anthropic provider** — the lone rig provider whose tool-result channel delivers images (OpenRouter substitutes a placeholder, Ollama drops it, OpenAI errors). |
-| `delegate` *(opt-in)* | `pipeline/delegate_tool.rs` | `delegate(role, task) -> string`: run one sub-agent to completion on a fresh context and return its final text. Registered **only when `pipeline.enabled: true`**. Sequential by construction (no parallel mode). See [Multi-agent pipeline](#multi-agent-pipeline-orchestrator--sub-agents). |
+| `delegate` *(opt-in)* | `pipeline/delegate_tool.rs` | `delegate(role, task) -> string`: run one sub-agent to completion on a fresh context and return its final text. Registered **only when `pipeline.enabled: true` AND the conversation opted in** (per-conversation, default off — see [Multi-agent pipeline](#multi-agent-pipeline-orchestrator--sub-agents)). Sequential by construction (no parallel mode). |
 
 Plus optional **MCP tools** from configured servers.
 
@@ -610,6 +610,7 @@ mcp_servers:
 | `/context` | Show context usage status |
 | `/compact` | Force context compaction |
 | `/bg` | List background processes (`bash_bg` registry) |
+| `/subagents on\|off` | Enable/disable sub-agents for the current conversation (only before the first turn; requires a configured `pipeline:`) |
 | `exit` | Quit the REPL |
 
 ### Settings
@@ -1350,6 +1351,27 @@ each with its own fresh context, and you see every sub-agent's turns tagged by
 role. This is opt-in via the `pipeline:` config block — when it's absent or
 `enabled: false`, none of this exists and the `delegate` tool isn't registered.
 A runnable example lives under [`examples/pipeline-team/`](examples/pipeline-team/).
+
+### Per-conversation opt-in (default off)
+
+Configuring `pipeline:` makes sub-agents **available**, not automatically **on**.
+Each conversation opts in independently, and the choice is **off by default**:
+
+- The web **Agents** panel has an *Enable subagents* checkbox; the terminal has
+  **`/subagents on|off`**. Both route to the same seam.
+- The choice is **mutable only before the first turn** — once the conversation
+  has a real turn it is **locked** (flipping the `delegate` tool mid-conversation
+  would desync the tool list from the wire history). Start a new conversation to
+  change it.
+- Toggling reuses the agent-rebuild seam (`rebuild_agent_for_resolved`, shared
+  with `/model` and `/cd`): it rebuilds the agent on the *same* model/cwd with
+  `delegate` added or removed — no conversation reset.
+- The opt-in persists on the conversation (`subagents_enabled`, serde-default
+  false), so a resumed opt-in conversation rebuilds with `delegate`.
+- Two distinct facts drive this: `pipeline_available` (config, boot-only — is a
+  pipeline configured?) and `subagents_enabled` (per-conversation user choice).
+  The `delegate` tool registers iff **both** are true — gated in one place
+  (`session::create_session` at boot, `rebuild_agent_for_resolved` on rebuild).
 
 ### The model
 

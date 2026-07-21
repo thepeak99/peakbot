@@ -70,6 +70,12 @@ pub(crate) enum InboundMessage {
         path: String,
     },
     RequestConversations,
+    /// Opt the current conversation into/out of sub-agents (the Agents panel
+    /// checkbox). Maps to [`crate::ui::ui_trait::UiAction::SetSubagentsEnabled`].
+    /// The backend enforces the lock (rejected once the conversation has turns).
+    SetSubagents {
+        enabled: bool,
+    },
     /// End an active session for *everyone* attached to it (dropdown "kill").
     KillSession {
         convo: String,

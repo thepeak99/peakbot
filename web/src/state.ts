@@ -142,9 +142,12 @@ export interface AppState {
   exit_requested: boolean;
   bg: WireBg;
   bash_panel: WireBashPanel;
-  /** Whether the multi-agent pipeline is enabled for this session
-   * (boot-only config). Optional so old wire snapshots parse cleanly. */
-  pipeline_enabled?: boolean;
+  /** Whether a multi-agent pipeline is *configured* for this session
+   * (boot-only config availability). Optional so old wire snapshots parse. */
+  pipeline_available?: boolean;
+  /** Whether the user opted THIS conversation into sub-agents (default off,
+   * locked once the conversation has turns). Optional for old snapshots. */
+  subagents_enabled?: boolean;
 }
 
 // ── Protocol envelopes (src/ui/wire.rs) ───────────────────────────────
@@ -208,6 +211,7 @@ export type InboundMessage =
   | { type: "stop" }
   | { type: "switch_model"; alias: string }
   | { type: "switch_cwd"; path: string }
+  | { type: "set_subagents"; enabled: boolean }
   | { type: "list_dir"; path: string }
   | { type: "request_conversations" }
   | { type: "kill_session"; convo: string }
