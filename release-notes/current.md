@@ -12,3 +12,7 @@ This file is the working draft for the next release. When a version is tagged, t
   starts; it's persisted so resumed conversations keep their setting. The web
   "Enable subagents" checkbox is now a real toggle instead of a grayed-out
   mirror of the config.
+- Fixed: the web Todo panel wrongly stamped an "Orchestrator" lane pill on
+  every task in single-agent conversations (subagents disabled or never used).
+  Todos now render unlabeled — exactly as before the sub-agents feature — and
+  only carry lane pills once at least one delegation has actually run.
