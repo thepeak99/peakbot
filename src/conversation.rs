@@ -261,6 +261,13 @@ pub struct Conversation {
     /// no pipeline.
     #[serde(default)]
     pub pipeline_enabled: bool,
+    /// Whether the user opted this conversation into sub-agents (the Agents
+    /// panel checkbox). Distinct from `pipeline_enabled` (config availability):
+    /// a conversation may be created in a pipeline-configured session yet leave
+    /// this `false`. Drives whether the `delegate` tool is registered on
+    /// resume. Defaults `false` for every pre-existing file.
+    #[serde(default)]
+    pub subagents_enabled: bool,
 }
 
 impl Conversation {
@@ -292,6 +299,7 @@ impl Conversation {
             metadata: ConversationMetadata::default(),
             todos: crate::tools::todo::TodoList::new(),
             pipeline_enabled: false,
+            subagents_enabled: false,
         }
     }
 
@@ -691,6 +699,40 @@ mod tests {
         let parsed: Conversation = serde_json::from_str(&json).unwrap();
         assert!(!parsed.pipeline_enabled);
         assert!(!ConversationSummary::from(&parsed).pipeline_enabled);
+    }
+
+    #[test]
+    fn subagents_enabled_roundtrips_and_defaults_false() {
+        let mut conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "anthropic/claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        // Default off — a conversation is not opted into sub-agents by default,
+        // even when a pipeline is configured.
+        assert!(!conv.subagents_enabled);
+
+        conv.subagents_enabled = true;
+        let json = serde_json::to_string(&conv).unwrap();
+        let parsed: Conversation = serde_json::from_str(&json).unwrap();
+        assert!(parsed.subagents_enabled);
+
+        // Pre-existing files with no key default to false (independent of
+        // pipeline_enabled).
+        let legacy = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "old",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "messages": [],
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {},
+            "pipeline_enabled": true
+        }"#;
+        let parsed: Conversation = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.pipeline_enabled);
+        assert!(!parsed.subagents_enabled);
     }
 
     // ── per-lane stats metadata ────────────────────────────────────────────

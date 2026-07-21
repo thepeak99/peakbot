@@ -70,20 +70,30 @@ export function App() {
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
 
-  // Sub-agent watch. The Agents panel is gated on the backend's honest
-  // `pipeline_enabled` (a boot-only session fact), NOT a local toggle — a
-  // conversation either has the pipeline or it doesn't, and you can't switch
-  // it on/off from the UI. `view` scopes the transcript, todos, files and
-  // stats to one lane via the message `source`.
-  const pipelineEnabled = state?.pipeline_enabled ?? false;
+  // Sub-agent watch. Two distinct facts, kept apart:
+  //  * `pipelineAvailable` — is a pipeline *configured*? (boot-only config).
+  //    Decides whether the opt-in is offered at all.
+  //  * `subagentsEnabled` — did the user opt THIS conversation in? (default
+  //    off, locked once the conversation has turns). Drives whether sub-agents
+  //    actually run. `view` scopes the transcript, todos, files and stats to
+  //    one lane via the message `source`.
+  const pipelineAvailable = state?.pipeline_available ?? false;
+  const subagentsEnabled = state?.subagents_enabled ?? false;
   const [view, setView] = useState<ViewFilter>("global");
-  // Without a pipeline there is only the global view.
-  const effectiveView: ViewFilter = pipelineEnabled ? view : "global";
+  // Sub-agent views only make sense once the conversation actually opted in.
+  const effectiveView: ViewFilter =
+    pipelineAvailable && subagentsEnabled ? view : "global";
 
   // Sub-agent roster: one entry per delegation call, in call order (Phase 2 +
   // per-call). Zero backend — derived from the transcript. A role delegated to
   // more than once yields several entries; the panel suffixes those "#n".
   const roster = state ? deriveSubAgentRoster(state.chat.messages) : [];
+  // The opt-in locks once the conversation has a real turn (any user or agent
+  // message). System banners don't count — mirrors the backend's
+  // `conversation_has_turns`.
+  const conversationStarted = state
+    ? state.chat.messages.some((m) => m.role === "user" || m.role === "agent")
+    : false;
   const multiCall = new Set(
     roster.filter((r) => r.n > 1).map((r) => r.role),
   );
@@ -165,13 +175,17 @@ export function App() {
       label: "Agents",
       content: (
         <AgentsPanel
-          pipelineEnabled={pipelineEnabled}
+          pipelineAvailable={pipelineAvailable}
+          subagentsEnabled={subagentsEnabled}
+          locked={conversationStarted}
+          onToggle={(enabled) => send({ type: "set_subagents", enabled })}
           active={view}
           onSelect={setView}
           roster={roster}
         />
       ),
-      badge: pipelineEnabled ? roster.length : undefined,
+      badge:
+        pipelineAvailable && subagentsEnabled ? roster.length : undefined,
     },
   ];
 

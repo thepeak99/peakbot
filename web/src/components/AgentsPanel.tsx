@@ -36,23 +36,37 @@ const VIEW_ENTRIES: Entry[] = [
 ];
 
 export function AgentsPanel({
-  pipelineEnabled,
+  pipelineAvailable,
+  subagentsEnabled,
+  locked,
+  onToggle,
   active,
   onSelect,
   roster,
 }: {
-  /** Whether the backend pipeline is enabled for this session
-   * (`pipeline.enabled`, boot-only). This is the single source of truth: a
-   * conversation either delegates or it doesn't, and it can't be toggled from
-   * the UI, so the "Enable subagents" checkbox reflects this state and is
-   * grayed out — never a lie about a capability it can't switch. */
-  pipelineEnabled: boolean;
+  /** Whether a multi-agent pipeline is *configured* for this session
+   * (`pipeline.enabled` + roles, boot-only). Decides whether the opt-in is
+   * offered at all. */
+  pipelineAvailable: boolean;
+  /** Whether the user opted THIS conversation into sub-agents. Default off. */
+  subagentsEnabled: boolean;
+  /** True once the conversation has a real turn — the opt-in is then frozen
+   * (the agent's tool list is fixed for the life of the conversation). */
+  locked: boolean;
+  /** Toggle the opt-in. No-op while `locked` (the checkbox is disabled). */
+  onToggle: (enabled: boolean) => void;
   active: ViewFilter;
   onSelect: (filter: ViewFilter) => void;
   /** One entry per delegation call, in call order, with its composite key and
    * turn count (see deriveSubAgentRoster). */
   roster: { key: string; role: string; n: number; count: number }[];
 }) {
+  // Sub-agent views are shown only when the conversation actually opted in.
+  const active_ = pipelineAvailable && subagentsEnabled;
+  // The checkbox is interactive only when a pipeline is configured AND the
+  // conversation hasn't started yet.
+  const canToggle = pipelineAvailable && !locked;
+
   // Suffix a call with "#n" only when its role ran more than once — a
   // single-call role reads as its bare name (no noisy "#1").
   const callsPerRole = new Map<string, number>();
@@ -68,7 +82,7 @@ export function AgentsPanel({
     count: r.count,
   }));
 
-  const rows = pipelineEnabled ? [...VIEW_ENTRIES, ...roleEntries] : [];
+  const rows = active_ ? [...VIEW_ENTRIES, ...roleEntries] : [];
 
   return (
     <section>
@@ -80,13 +94,13 @@ export function AgentsPanel({
 
       <p
         className={`mb-3 rounded border px-2 py-1 text-[11px] ${
-          pipelineEnabled
+          pipelineAvailable
             ? "border-emerald-900/60 bg-emerald-950/30 text-emerald-300"
             : "border-zinc-800 bg-zinc-900/50 text-zinc-500"
         }`}
       >
-        {pipelineEnabled ? (
-          <>Pipeline active — sub-agents available this session.</>
+        {pipelineAvailable ? (
+          <>Pipeline configured — you can opt this conversation into sub-agents.</>
         ) : (
           <>
             Pipeline not configured. Add a{" "}
@@ -97,22 +111,42 @@ export function AgentsPanel({
       </p>
 
       <label
-        className="mb-3 flex items-center gap-2 text-xs text-zinc-500"
-        title="Set by config.yaml (pipeline.enabled, boot-only) — can't be toggled from the UI."
+        className={`mb-1 flex items-center gap-2 text-xs ${
+          canToggle
+            ? "cursor-pointer text-zinc-300"
+            : "text-zinc-500"
+        }`}
+        title={
+          !pipelineAvailable
+            ? "No pipeline configured (pipeline.enabled in config.yaml)."
+            : locked
+              ? "Locked — the conversation has already started."
+              : "Enable sub-agents for this conversation (before the first message)."
+        }
       >
         <input
           type="checkbox"
-          checked={pipelineEnabled}
-          disabled
-          readOnly
-          className="h-3.5 w-3.5 cursor-not-allowed accent-sky-500"
+          checked={subagentsEnabled}
+          disabled={!canToggle}
+          onChange={(e) => onToggle(e.target.checked)}
+          className={`h-3.5 w-3.5 accent-sky-500 ${
+            canToggle ? "cursor-pointer" : "cursor-not-allowed"
+          }`}
         />
         Enable subagents
       </label>
 
-      {!pipelineEnabled ? (
-        <p className="text-xs text-zinc-600">
-          No sub-agents in this session.
+      {pipelineAvailable && locked && (
+        <p className="mb-3 text-[11px] text-zinc-600">
+          Locked for this conversation — start a new one to change it.
+        </p>
+      )}
+
+      {!active_ ? (
+        <p className="mt-2 text-xs text-zinc-600">
+          {pipelineAvailable
+            ? "Sub-agents are off for this conversation."
+            : "No sub-agents in this session."}
         </p>
       ) : (
         <>

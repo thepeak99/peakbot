@@ -119,9 +119,20 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         state_manager.set_shell(sk.executable().to_string());
     }
 
-    // Boot-only session fact, stamped onto every conversation this session
-    // mints so a reloaded pipeline conversation is recognisable.
-    state_manager.set_pipeline_enabled(deps.config.pipeline_enabled());
+    // Session availability fact: is a pipeline *configured*? Stamped onto every
+    // conversation this session mints so a reloaded conversation knows a
+    // pipeline was available.
+    let pipeline_available = deps.config.pipeline_enabled();
+    state_manager.set_pipeline_available(pipeline_available);
+
+    // Per-conversation sub-agent opt-in. Default OFF for a fresh session; a
+    // resumed conversation adopts its persisted choice so it rebuilds with the
+    // `delegate` tool iff it was opted in. Stamp it *before* building the agent
+    // so the boot agent's tool list matches the choice.
+    let subagents_enabled = resume
+        .and_then(|id| state_manager.peek_conversation_subagents_enabled(id).ok())
+        .unwrap_or(false);
+    state_manager.set_subagents_enabled(subagents_enabled);
 
     let todo_tool = TodoTool::new(state_manager.clone());
 
@@ -201,6 +212,17 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // and read by the `/stop` dispatcher.
     let active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook = Default::default();
 
+    // The `delegate` tool (and thus sub-agents) is registered iff a pipeline is
+    // configured AND this conversation opted in. A fresh session defaults off,
+    // so the boot agent has no delegate until the user toggles it on (which
+    // rebuilds the agent). `RebuildContext` keeps the full registry so the
+    // toggle-rebuild can add delegate on demand.
+    let boot_registry = if pipeline_available && subagents_enabled {
+        deps.pipeline_registry.as_deref()
+    } else {
+        None
+    };
+
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
         boot_provider_config,
         mcp_tools,
@@ -209,7 +231,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         deps.config.agent_max_turns,
         Some(todo_tool.clone()),
         &deps.config.bash,
-        deps.pipeline_registry.as_deref(),
+        boot_registry,
         state_manager.clone(),
         deps.shell_kind.as_ref(),
         deps.vector_store.as_ref(),

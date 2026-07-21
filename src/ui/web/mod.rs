@@ -572,6 +572,9 @@ fn dispatch_inbound(
         Ok(InboundMessage::SwitchCwd { path }) => {
             action_sender.send(UiAction::ChangeCwd(path)).is_ok()
         }
+        Ok(InboundMessage::SetSubagents { enabled }) => action_sender
+            .send(UiAction::SetSubagentsEnabled(enabled))
+            .is_ok(),
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
             let items = build_conversations_snapshot(state_manager, &registry.active_ids());

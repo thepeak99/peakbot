@@ -131,13 +131,19 @@ pub struct AppState {
     #[serde(default)]
     pub bash_panel_visibility: BashPanelVisibility,
 
-    /// Whether the multi-agent pipeline is enabled for this session
-    /// (`pipeline.enabled`, boot-only config). Mirrors the `StateManager`'s
-    /// session-fact bool so the web Agents panel can tell the truth about
-    /// whether sub-agents are actually available — instead of a local-only
-    /// checkbox that advertises a capability it can't switch on.
+    /// Whether a multi-agent pipeline is *configured* for this session
+    /// (`pipeline.enabled` + roles, boot-only config). This is the availability
+    /// fact — it decides only whether the Agents panel offers the opt-in, not
+    /// whether sub-agents are active.
     #[serde(default)]
-    pub pipeline_enabled: bool,
+    pub pipeline_available: bool,
+
+    /// Whether the user has opted this conversation into sub-agents. Default
+    /// off; mutable only before the first turn (the panel locks the checkbox
+    /// once the transcript is non-empty). The `delegate` tool is registered iff
+    /// `pipeline_available && subagents_enabled`.
+    #[serde(default)]
+    pub subagents_enabled: bool,
 }
 
 impl AppState {

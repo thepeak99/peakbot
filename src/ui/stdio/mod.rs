@@ -206,6 +206,14 @@ async fn run_stdin_loop(
                     break;
                 }
             }
+            Ok(InboundMessage::SetSubagents { enabled }) => {
+                if action_sender
+                    .send(UiAction::SetSubagentsEnabled(enabled))
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Ok(InboundMessage::ListDir { path }) => {
                 if out_tx.send(build_dir_listing(&path)).is_err() {
                     break;
