@@ -273,6 +273,20 @@ describe("todosByLane", () => {
       { id: 1, text: "only", status: "pending", lane: "pm" },
     ]);
   });
+
+  it("leaves todos unlabeled when no sub-agents ran (pre-agents behavior)", () => {
+    // Subagents disabled / never used ⇒ no delegation in the transcript.
+    // Todos must carry no lane so the panel renders no pill, exactly as before
+    // the sub-agents feature existed.
+    const todos = todosByLane([
+      todoCall({ action: "add", tasks: ["a", "b"] }),
+    ]);
+    expect(todos).toEqual([
+      { id: 1, text: "a", status: "pending" },
+      { id: 2, text: "b", status: "pending" },
+    ]);
+    expect(todos.every((t) => t.lane === undefined)).toBe(true);
+  });
 });
 
 describe("scoped todos carry no lane label", () => {

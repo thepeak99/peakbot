@@ -264,12 +264,17 @@ export function todosFromMessages(messages: WireChatMessage[]): TodoItem[] {
  * (no lane tag) — this is only for "global".
  */
 export function todosByLane(messages: WireChatMessage[]): TodoItem[] {
+  const roster = deriveSubAgentRoster(messages);
+  // No sub-agent activity ⇒ nothing to disambiguate. Return plain, unlabeled
+  // todos so a single-agent conversation renders exactly as it did pre-agents
+  // (no "Orchestrator" pill on every item).
+  if (roster.length === 0) return todosFromMessages(messages);
+
   const out: TodoItem[] = [];
   const tag = (lane: string, items: TodoItem[]) => {
     for (const it of items) out.push({ ...it, lane });
   };
   tag("Orchestrator", todosFromMessages(filterMessagesByView(messages, "orchestrator")));
-  const roster = deriveSubAgentRoster(messages);
   const callsPerRole = new Map<string, number>();
   for (const r of roster)
     callsPerRole.set(r.role, (callsPerRole.get(r.role) ?? 0) + 1);
