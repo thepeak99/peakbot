@@ -204,7 +204,12 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // Build the per-session system prompt from `session_cwd` — the only
     // place the cwd flows into the prompt. Skills + shell_kind are part
     // of the env block too.
-    let session_prompt = build_system_prompt(&deps.skills, deps.shell_kind.as_ref(), &session_cwd);
+    let session_prompt = build_system_prompt(
+        &deps.skills,
+        deps.shell_kind.as_ref(),
+        &session_cwd,
+        deps.config.memory.enabled,
+    );
 
     // Session-owned cell for the currently-running sub-agent hook (D6 stop
     // routing). Created once here, shared with the boot agent's DelegateTool
@@ -231,6 +236,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         deps.config.agent_max_turns,
         Some(todo_tool.clone()),
         &deps.config.bash,
+        &deps.config.tools,
         boot_registry,
         state_manager.clone(),
         deps.shell_kind.as_ref(),
@@ -296,6 +302,8 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         shell_kind: deps.shell_kind.clone(),
         skills: deps.skills.clone(),
         vector_store: deps.vector_store.clone(),
+        memory_enabled: deps.config.memory.enabled,
+        tools_filter: deps.config.tools.clone(),
     };
 
     let mut runner = AgentRunner::new(

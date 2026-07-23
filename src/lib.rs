@@ -202,6 +202,7 @@ enum CompletionResult {
 }
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
+const MEMORY_PROMPT_SECTION: &str = include_str!("system_prompt_memory.txt");
 
 /// Build the system prompt dynamically with environment information.
 ///
@@ -209,10 +210,14 @@ const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
 /// `**Shell**:` line to the environment block so the model uses the right
 /// syntax and the right shell tool name. On a PowerShell host this also
 /// overrides the bash-centric guidance baked into the static prompt.
+///
+/// `memory_enabled` gates the `memory.md` instructions: when false the
+/// section is omitted so the model is never told to read/update memory.md.
 pub fn build_system_prompt(
     skills: &SkillRegistry,
     shell_kind: Option<&ShellKind>,
     cwd: &std::path::Path,
+    memory_enabled: bool,
 ) -> String {
     let mut prompt = SYSTEM_PROMPT.to_string();
 
@@ -257,6 +262,10 @@ pub fn build_system_prompt(
         binary_path,
         shell_line(shell_kind),
     );
+
+    if memory_enabled {
+        prompt.push_str(MEMORY_PROMPT_SECTION);
+    }
 
     prompt.push_str(&skills_section);
     prompt.push_str(&env_info);
@@ -378,6 +387,13 @@ pub struct RebuildContext {
     /// clone (Arc-backed); persists across `/model` switches like the MCP
     /// handles, since the DB handle is provider-independent.
     pub vector_store: Option<crate::vector::VectorStore>,
+    /// Whether the memory.md feature is on — gates the memory prompt section
+    /// (and, at the compaction call site, the auto-compaction). Refreshed on
+    /// config reload like `skills`.
+    pub memory_enabled: bool,
+    /// Built-in tool filter (blocklist/allowlist). Refreshed on config reload;
+    /// consumed by `add_builtin_tools` when the agent is rebuilt.
+    pub tools_filter: crate::config::ToolsConfig,
 }
 
 /// Shared cell holding the *currently active* SessionHook. Replaced
@@ -1562,7 +1578,12 @@ impl AgentRunner {
 
         // Rebuild the prompt against the new cwd + refreshed agents.md and
         // persist it into ctx so subsequent /model switches keep the cwd.
-        ctx.system_prompt = build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref(), target);
+        ctx.system_prompt = build_system_prompt(
+            &ctx.skills,
+            ctx.shell_kind.as_ref(),
+            target,
+            ctx.memory_enabled,
+        );
 
         // Refresh the welcome banner's cwd so the status bar / web banner
         // reflect the new directory (welcome was stamped once at boot).
@@ -1661,6 +1682,13 @@ impl AgentRunner {
             }
         };
 
+        // Tool filter is a boundary parse — an invalid `tools:` block (both
+        // lists set, or an unknown tool name) keeps the previous config.
+        if let Err(e) = fresh.tools.validate() {
+            warnings.push(format!("⚠ config reload: {e} — keeping previous config."));
+            return warnings;
+        }
+
         // Diff boot-only keys against the still-current config and warn.
         for (label, changed) in [
             ("mcp_servers", config.mcp_servers != fresh.mcp_servers),
@@ -1686,8 +1714,14 @@ impl AgentRunner {
         config.adopt_reloaded(fresh);
 
         ctx.registry = Arc::new(new_registry);
-        ctx.system_prompt =
-            build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref(), &sm.session_cwd());
+        ctx.memory_enabled = config.memory.enabled;
+        ctx.tools_filter = config.tools.clone();
+        ctx.system_prompt = build_system_prompt(
+            &ctx.skills,
+            ctx.shell_kind.as_ref(),
+            &sm.session_cwd(),
+            ctx.memory_enabled,
+        );
         ctx.searxng_config = config.searxng.clone();
         ctx.max_turns = config.agent_max_turns;
         ctx.bash_config = config.bash.clone();
@@ -1785,6 +1819,7 @@ impl AgentRunner {
             ctx.max_turns,
             ctx.todo_tool.clone(),
             &ctx.bash_config,
+            &ctx.tools_filter,
             boot_registry,
             sm_for_provider.clone(),
             ctx.shell_kind.as_ref(),
@@ -1918,8 +1953,12 @@ impl AgentRunner {
                     // sessions in other trees stay race-free.
                     sm.clear_bg();
                     sm.set_session_cwd(target.clone());
-                    ctx.system_prompt =
-                        build_system_prompt(&ctx.skills, ctx.shell_kind.as_ref(), &target);
+                    ctx.system_prompt = build_system_prompt(
+                        &ctx.skills,
+                        ctx.shell_kind.as_ref(),
+                        &target,
+                        ctx.memory_enabled,
+                    );
                     sm.update_welcome_cwd(target);
                     cwd_changed = true;
                 }
@@ -3400,7 +3439,8 @@ mod tests {
         let ps = ShellKind::PowerShell {
             path: "pwsh.exe".to_string(),
         };
-        let prompt = build_system_prompt(&skills, Some(&ps), &std::env::current_dir().unwrap());
+        let prompt =
+            build_system_prompt(&skills, Some(&ps), &std::env::current_dir().unwrap(), true);
         assert!(
             prompt.contains("**Shell**: powershell"),
             "PowerShell env line missing from prompt"
@@ -3421,7 +3461,12 @@ mod tests {
         let bash = ShellKind::Bash {
             path: "/bin/sh".to_string(),
         };
-        let prompt = build_system_prompt(&skills, Some(&bash), &std::env::current_dir().unwrap());
+        let prompt = build_system_prompt(
+            &skills,
+            Some(&bash),
+            &std::env::current_dir().unwrap(),
+            true,
+        );
         assert!(
             prompt.contains("**Shell**: bash"),
             "bash env line missing from prompt"
@@ -3447,7 +3492,7 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-CONTENT").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir);
+        let prompt = build_system_prompt(&skills, None, &dir, true);
 
         assert!(
             prompt.contains(&dir.to_string_lossy().to_string()),
@@ -3458,6 +3503,48 @@ mod tests {
             "agents.md must be read from the passed cwd"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn system_prompt_includes_memory_section_when_enabled() {
+        // Use a clean temp dir (no agents.md) so the assertion sees only the
+        // base prompt + memory section, not agents.md's own "# Memory.md".
+        let dir = std::env::temp_dir().join(format!(
+            "peakbot-mem-on-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, &dir, true);
+        assert!(
+            prompt.contains("# Memory.md"),
+            "memory section must be present when memory is enabled"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn system_prompt_omits_memory_section_when_disabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "peakbot-mem-off-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, &dir, false);
+        assert!(
+            !prompt.contains("# Memory.md"),
+            "memory section must be omitted when memory is disabled"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

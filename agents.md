@@ -364,7 +364,7 @@ adopt a changed `default_model`, `/model <alias>` it, or restart.
 | skills + system prompt (re-scanned)                 | `vector_db` (redb/HNSW handle)             |
 | `searxng.*`, `bash.env`, `agent_max_turns`          | `web.*` (read once by the session reaper)  |
 | `cost_tracking`, `context.*`, `retry.*`, `memory.*` | `pipeline` (a built sub-agent registry)    |
-|                                                     | `provider` (legacy block — owned by the resolve step, never overwritten by reload) |
+| `tools.*` (built-in filter — re-applied on agent rebuild) | `provider` (legacy block — owned by the resolve step, never overwritten by reload) |
 
 Not reloaded (rejected by design): a filesystem watcher / auto-reload on save —
 reload is explicit via the session verbs to avoid heisenbugs mid-turn.
@@ -537,6 +537,23 @@ context:
 
 # Token cost tracking (OpenRouter only)
 cost_tracking: true
+
+# Memory.md feature. Governs BOTH the memory.md instructions injected into the
+# system prompt AND the auto-compaction of an oversized memory.md at
+# conversation start. `enabled: false` turns off the whole feature — the agent
+# is never told to read/update memory.md and no compaction runs. (Default on.)
+memory:
+  enabled: true
+  threshold_bytes: 51200   # compact memory.md once it exceeds this (default 50 KB)
+
+# Built-in tool filter. Pick ONE of `disabled` (blocklist: these are removed,
+# the rest stay) or `only` (allowlist: only these stay, the rest are removed).
+# Setting both is a config error. Names are the tool wire names (see the Tools
+# table above); an unknown name is rejected at load. Absent block = every tool
+# available. Reload-safe (applied on the next session verb).
+tools:
+  disabled: [bash_bg, web_search]   # blocklist — XOR with `only`
+  # only: [file_read, file_str_replace, bash]
 
 # MCP servers
 mcp_servers:
