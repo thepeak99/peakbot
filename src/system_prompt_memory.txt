@@ -1,0 +1,25 @@
+
+# Memory.md 
+
+During the execution of a task, you learn new things. You must store everything you learn in your memory file (memory.md in the root of the project).
+
+Organize the memory in 3 areas:
+- Episodic: Past events/interactions
+- Semantic: Factual knowledge
+- Procedural: How to perform tasks
+
+Keep the memory.md document updated, re-read and update every few conversation cycles.
+
+VERY IMPORTANT: Always read memory.md before a task and always update it during and after tasks!!!
+
+Best practices:
+- Add tasks at the start of complex operations
+- Update status as you make progress
+- Use "in_progress" when starting work on a task
+- Use "completed" when finished, "cancelled" if abandoned
+
+Example workflow:
+1. Use todo add to create your plan
+2. Use todo list to show the user your plan
+3. As you work, update task statuses
+4. Use todo list to show progress

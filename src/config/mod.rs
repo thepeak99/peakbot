@@ -302,6 +302,11 @@ pub struct Config {
     /// Web UI (`peakbot --web`) settings — sticky-session expiry.
     #[serde(default)]
     pub web: WebConfig,
+
+    /// Built-in tool filter (blocklist `disabled:` XOR allowlist `only:`).
+    /// Absent block = every tool available.
+    #[serde(default)]
+    pub tools: ToolsConfig,
 }
 
 /// Web UI settings. Only the sticky-session reaper is configurable; all
@@ -1064,11 +1069,13 @@ fn default_cost_tracking() -> bool {
     true
 }
 
-/// Configuration for memory.md automatic compaction
+/// Configuration for the memory.md feature
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
-    /// Enable automatic memory compaction at conversation start (default: true)
+    /// Enable the memory.md feature: injects the memory.md instructions into
+    /// the system prompt AND auto-compacts an oversized memory.md at
+    /// conversation start. `false` disables both (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// File size threshold in bytes to trigger compaction (default: 51200 = 50KB)
@@ -1081,6 +1088,78 @@ impl Default for MemoryConfig {
         Self {
             enabled: true,
             threshold_bytes: default_memory_threshold(),
+        }
+    }
+}
+
+/// Canonical names of every built-in tool. Used to reject typos in the
+/// `tools:` filter at load. Provider-gated tools (`view_image`, `doc_*`,
+/// `delegate`) are listed too — naming one that isn't currently registered
+/// is a harmless no-op, not an error.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "bash",
+    "bash_bg",
+    "delegate",
+    "doc_index",
+    "doc_search",
+    "fetch_page",
+    "fetch_url",
+    "file_create",
+    "file_insert",
+    "file_read",
+    "file_str_replace",
+    "list_directory",
+    "pdf_read",
+    "powershell",
+    "think",
+    "todo",
+    "view_image",
+    "web_search",
+];
+
+/// Built-in tool filter. `disabled` is a blocklist (those are removed, the
+/// rest stay); `only` is an allowlist (only those stay). The two are mutually
+/// exclusive — setting both is a config error. Both empty = every tool stays.
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ToolsConfig {
+    /// Blocklist: these tools are removed; every other tool stays.
+    #[serde(default)]
+    pub disabled: Vec<String>,
+    /// Allowlist: only these tools stay; every other tool is removed.
+    #[serde(default)]
+    pub only: Vec<String>,
+}
+
+impl ToolsConfig {
+    /// Boundary parse: reject the illegal `disabled`+`only` combination and
+    /// any name that isn't a real tool (typo catch). Returns a user-facing
+    /// message on failure.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.disabled.is_empty() && !self.only.is_empty() {
+            return Err(
+                "tools: set either `disabled` (blocklist) or `only` (allowlist), not both."
+                    .to_string(),
+            );
+        }
+        for name in self.disabled.iter().chain(self.only.iter()) {
+            if !BUILTIN_TOOL_NAMES.contains(&name.as_str()) {
+                return Err(format!(
+                    "tools: unknown tool '{name}'. Known tools: {}.",
+                    BUILTIN_TOOL_NAMES.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a built-in tool of this name should be registered. Allowlist
+    /// wins when present, then blocklist; empty filter allows everything.
+    pub fn allows(&self, name: &str) -> bool {
+        if !self.only.is_empty() {
+            self.only.iter().any(|n| n == name)
+        } else {
+            !self.disabled.iter().any(|n| n == name)
         }
     }
 }
@@ -1223,6 +1302,11 @@ impl Config {
             self.pipeline = other.pipeline;
         }
 
+        // tools - override if other has a non-default filter
+        if other.tools != ToolsConfig::default() {
+            self.tools = other.tools;
+        }
+
         // providers list - override if non-empty (per-repo overrides
         // the master providers list wholesale)
         if !other.providers.is_empty() {
@@ -1263,6 +1347,7 @@ impl Default for Config {
             pipeline: None,
             vector_db: None,
             web: WebConfig::default(),
+            tools: ToolsConfig::default(),
         }
     }
 }
@@ -1370,6 +1455,8 @@ impl Config {
         let config_file_found = master.is_some();
         let config = Self::merge_sources(master, load_per_repo_config());
 
+        config.tools.validate().map_err(anyhow::Error::msg)?;
+
         Ok(LoadedConfig {
             config,
             config_file_found,
@@ -1414,6 +1501,57 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tools_filter_default_allows_everything() {
+        let t = ToolsConfig::default();
+        assert!(t.allows("bash"));
+        assert!(t.allows("web_search"));
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn tools_filter_blocklist_removes_named_keeps_rest() {
+        let t = ToolsConfig {
+            disabled: vec!["bash_bg".into(), "web_search".into()],
+            only: vec![],
+        };
+        assert!(t.validate().is_ok());
+        assert!(!t.allows("bash_bg"));
+        assert!(!t.allows("web_search"));
+        assert!(t.allows("file_read"));
+    }
+
+    #[test]
+    fn tools_filter_allowlist_keeps_only_named() {
+        let t = ToolsConfig {
+            disabled: vec![],
+            only: vec!["file_read".into(), "bash".into()],
+        };
+        assert!(t.validate().is_ok());
+        assert!(t.allows("file_read"));
+        assert!(t.allows("bash"));
+        assert!(!t.allows("web_search"));
+        assert!(!t.allows("todo"));
+    }
+
+    #[test]
+    fn tools_filter_both_lists_is_error() {
+        let t = ToolsConfig {
+            disabled: vec!["bash".into()],
+            only: vec!["file_read".into()],
+        };
+        assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn tools_filter_unknown_tool_is_error() {
+        let t = ToolsConfig {
+            disabled: vec!["definitely_not_a_tool".into()],
+            only: vec![],
+        };
+        assert!(t.validate().is_err());
+    }
 
     #[test]
     fn test_anthropic_prompt_caching_defaults_auto() {
