@@ -296,9 +296,13 @@ No tool declares a `thought` parameter of its own. Instead, every built-in
    `thought` was absent, null, or whitespace, a one-line reminder is
    appended to the result.
 
-The `think` tool is the **one exception** — it is registered ungated,
-because its `thought` *is* the payload it echoes back, not metadata.
-Wrapping it would strip the very thing it returns.
+Two tools are **exceptions** — registered ungated:
+
+- `think` — its `thought` *is* the payload it echoes back, not metadata.
+  Wrapping it would strip the very thing it returns.
+- `todo` — the task text already carries the plan, so `thought` is
+  redundant; and some models (e.g. MiniMax) structurally refuse it,
+  tripping the gate's nudge on every todo call.
 
 The two vector tools share a single `VectorStore` (`src/vector/mod.rs`)
 built once at startup and injected into both — the same injection pattern
