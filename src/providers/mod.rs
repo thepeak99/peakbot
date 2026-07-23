@@ -509,7 +509,10 @@ where
         gate(Box::new(ListDirectoryTool::new(session_cwd.clone()))),
         gate(Box::new(FetchUrlTool)),
         gate(Box::new(FetchPageTool)),
-        gate(Box::new(todo)),
+        // `todo` is ungated: the task text already carries the plan, so a
+        // `thought` field is redundant — and some models (e.g. MiniMax)
+        // structurally refuse it, tripping the gate's nudge on every call.
+        Box::new(todo),
         // `think` is ungated: its `thought` IS the payload it echoes back,
         // not metadata — gating would strip the very thing it returns.
         Box::new(ThinkTool),
