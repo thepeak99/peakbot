@@ -881,7 +881,9 @@ src/
 │   ├── embeddings.rs       # EmbeddingsClient -- reqwest → /v1/embeddings, batched, dim-validated
 │   ├── parse.rs            # extract_text(path) -- dispatch by ext (txt/md/src/html/pdf/docx)
 │   └── chunk.rs            # split(text) -- overlapping char windows (size+overlap constants)
-├── system_prompt.txt       # Base system prompt (included at compile time)
+├── system_prompt_persona.txt  # Crusader persona (agentless-only; dropped for the orchestrator)
+├── system_prompt_core.txt     # Core tool guidance (agentless + orchestrator)
+├── system_prompt_memory.txt   # memory.md workflow section (gated by memory.enabled)
 ├── providers/
 │   └── mod.rs              # Provider abstraction (OpenRouter, OpenAI, LlamaCpp, Ollama), DynAgent, CostTracker
 ├── hooks/
@@ -1447,11 +1449,15 @@ no event channel — so their turns are not TEE'd and their cost is not tracked.
 
 ### Config shape
 
-A role is `(model, prompt)` + optional `env:`. The `model:` names an **alias**
-from the top-level `providers:` list — the same aliases `/model` uses — resolved
-at load against the `ModelRegistry`. Omit `model:` to fall back to
-`default_model`. There are no provider/credential fields on a role; model, key,
-and base URL all come from the resolved alias.
+A role is `(model, prompt)` + optional `env:` + optional `skills:`. The `model:`
+names an **alias** from the top-level `providers:` list — the same aliases
+`/model` uses — resolved at load against the `ModelRegistry`. Omit `model:` to
+fall back to `default_model`. There are no provider/credential fields on a role;
+model, key, and base URL all come from the resolved alias.
+
+`pipeline.orchestrator_prompt` (optional) is extra framing appended to the
+**orchestrator's** system prompt when sub-agents are active — see
+[The orchestrator vs. sub-agent prompt](#the-orchestrator-vs-sub-agent-prompt).
 
 ```yaml
 providers:
@@ -1465,20 +1471,62 @@ default_model: sonnet          # ← the orchestrator you chat with
 
 pipeline:
   enabled: true
+  orchestrator_prompt: |         # optional; appended to the orchestrator prompt
+    You lead a small team. Prefer delegating research and review to sub-agents;
+    keep the main thread on planning and integration.
   agents:
     researcher:
       model: flash             # alias from providers: (falls back to default_model if omitted)
       prompt: "You research codebases and the web. Return a tight brief."
+      skills:                  # optional per-role skill gate (mirrors `tools:`)
+        only: [helius-solana, github]   # allowlist (XOR `disabled:`)
     reviewer:
       model: sonnet
       prompt: "You review diffs and critique."
       env: { REVIEW_STRICT: "1" }   # optional; merged into THIS sub-agent's bash env only
+      skills:
+        enabled: false         # this role gets NO skills section
 ```
 
 Validation is at load (parse-at-the-boundary): an unknown alias, an empty
-prompt, or an empty role name is a clear boot-time error. `pipeline:` is
-**boot-only** — edit and restart (it's in the "ignored — restart to apply" set of
-the [reload table](#live-reload-on-session-verbs-new-model-cd-load)).
+prompt, an empty role name, or a `skills:` filter that sets both lists or names
+an unknown skill is a clear boot-time error. `pipeline:` is **boot-only** — edit
+and restart (it's in the "ignored — restart to apply" set of the
+[reload table](#live-reload-on-session-verbs-new-model-cd-load)).
+
+### The orchestrator vs. sub-agent prompt
+
+The system prompt has three recipes, all composed from the same small pieces
+(`src/lib.rs::build_system_prompt` + `env_block`):
+
+| Piece | Agentless | Orchestrator (sub-agents on) | Sub-agent |
+|-------|:---------:|:----------------------------:|:---------:|
+| persona (`system_prompt_persona.txt`, the "code crusader") | ✅ | ❌ | ❌ |
+| core tool guidance (`system_prompt_core.txt`) | ✅ | ✅ | ❌ |
+| memory.md workflow | ✅ (if enabled) | ✅ (if enabled) | ❌ |
+| skills section | ✅ (all) | ✅ (all) | ⚙️ per-role filtered |
+| env block (cwd/time/OS/shell) | ✅ | ✅ | ✅ |
+| `agents.md` | ✅ | ✅ | ❌ |
+| `orchestrator_prompt` | — | ✅ (if set) | — |
+
+- **The orchestrator drops the crusader persona** in sub-agents mode — it would
+  confuse an agent whose job is to coordinate a team — but keeps the core tool
+  guidance and gains the optional `orchestrator_prompt`. Agentless mode is
+  byte-identical to before this feature.
+- **A sub-agent's preamble** is `role.prompt` + the live env block + its
+  per-role-filtered skills. Nothing else: its `role.prompt` is its whole
+  persona, and everything else it needs goes in the delegated `task`. Built
+  fresh per delegation (`build_sub_agent_preamble`), so cwd/time are current.
+- **Per-role skills** (`pipeline.agents.<role>.skills`) mirror the `tools:`
+  filter: `only:` (allowlist) XOR `disabled:` (blocklist), plus an `enabled:`
+  master switch (`false` ⇒ no skills for that role). `SkillFilter::shows`
+  decides visibility; `SkillFilter::validate` runs at boot against the
+  discovered skill names.
+- The persona/orchestrator framing is recomputed at the **single agent-rebuild
+  seam** (`rebuild_agent_for_resolved`), keyed on the live
+  `pipeline_available && subagents_enabled` state, so toggling sub-agents,
+  `/cd`, and `/model` all produce the right prompt without any caller rebuilding
+  it themselves.
 
 ### Tools & isolation (v1)
 
@@ -1491,6 +1539,8 @@ the [reload table](#live-reload-on-session-verbs-new-model-cd-load)).
   there is intentionally no bespoke per-role tool filter today.
 - `env:` is per-role, merged only into that sub-agent's bash tool env — it never
   leaks into the orchestrator or other roles.
+- `skills:` is per-role and affects only what the sub-agent *sees listed* in its
+  preamble — it does not change which tools are registered.
 
 ### Stop during a delegation
 

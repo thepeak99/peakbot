@@ -199,6 +199,7 @@ pub fn create_provider(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     DynAgent,
@@ -221,6 +222,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                skills,
                 active_sub_agent_hook,
             )?;
             Ok((
@@ -244,6 +246,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                skills,
                 active_sub_agent_hook,
             )?;
             Ok((
@@ -267,6 +270,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                skills,
                 active_sub_agent_hook,
             )?;
             Ok((
@@ -290,6 +294,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                skills,
                 active_sub_agent_hook,
             )?;
             Ok((
@@ -313,6 +318,7 @@ pub fn create_provider(
                 state_manager,
                 shell_kind,
                 vector_store,
+                skills,
                 active_sub_agent_hook,
             )?;
             Ok((
@@ -566,6 +572,7 @@ where
             shell_kind: shell_kind.cloned(),
             vector_store: vector_store.cloned(),
             max_turns: wiring.max_turns,
+            skills: wiring.skills,
             event_sink: wiring.event_sink,
             active_hook: wiring.active_hook,
         };
@@ -604,6 +611,9 @@ pub(crate) struct SubAgentWiring {
     pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
     pub active_hook: crate::pipeline::ActiveSubAgentHook,
     pub max_turns: usize,
+    /// The discovered skills — each delegation renders this through the
+    /// role's filter into the sub-agent preamble.
+    pub skills: crate::skills::SkillRegistry,
 }
 
 /// Internal enum to hold either a Bash or PowerShell tool for registration.
@@ -637,6 +647,7 @@ fn create_openrouter_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
@@ -697,6 +708,7 @@ fn create_openrouter_agent(
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
             max_turns,
+            skills: skills.clone(),
         }),
     );
 
@@ -733,6 +745,7 @@ fn create_anthropic_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
@@ -797,6 +810,7 @@ fn create_anthropic_agent(
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
             max_turns,
+            skills: skills.clone(),
         }),
     );
 
@@ -830,6 +844,7 @@ fn create_ollama_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
@@ -881,6 +896,7 @@ fn create_ollama_agent(
             event_sink: None,
             active_hook: active_sub_agent_hook,
             max_turns,
+            skills: skills.clone(),
         }),
     );
 
@@ -915,6 +931,7 @@ fn create_openai_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
@@ -977,6 +994,7 @@ fn create_openai_agent(
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
             max_turns,
+            skills: skills.clone(),
         }),
     );
 
@@ -1011,6 +1029,7 @@ fn create_llamacpp_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
 ) -> Result<(
     Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
@@ -1076,6 +1095,7 @@ fn create_llamacpp_agent(
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
             max_turns,
+            skills: skills.clone(),
         }),
     );
 

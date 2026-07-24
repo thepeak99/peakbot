@@ -42,11 +42,31 @@ pub struct SubAgentDeps {
     pub shell_kind: Option<ShellKind>,
     pub vector_store: Option<crate::vector::VectorStore>,
     pub max_turns: usize,
+    /// The discovered skills, used to build each role's per-role-filtered
+    /// skills section in the sub-agent preamble (derived at delegation time).
+    pub skills: crate::skills::SkillRegistry,
     /// The orchestrator's event sink. Sub-agent events are pushed here tagged
     /// `SubAgent { role }`. `None` under Ollama (hookless) — see `build_sub_agent`.
     pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
     /// The cell holding the currently-running sub-agent hook, for `/stop`.
     pub active_hook: ActiveSubAgentHook,
+}
+
+/// Build a sub-agent's preamble: `role_prompt` + the live env block + this
+/// role's filtered skills. Deliberately lean — no persona, core guidance,
+/// memory, or agents.md (see the call site). Sections are separated by blank
+/// lines; empty pieces (no skills shown) contribute nothing.
+fn build_sub_agent_preamble(
+    role_prompt: &str,
+    shell_kind: Option<&ShellKind>,
+    cwd: &std::path::Path,
+    skills: &crate::skills::SkillRegistry,
+    filter: &crate::config::SkillFilter,
+) -> String {
+    let mut preamble = role_prompt.to_string();
+    preamble.push_str(&crate::env_block(shell_kind, cwd));
+    preamble.push_str(&skills.to_system_prompt_section_filtered(filter));
+    preamble
 }
 
 /// Merge a role's `env:` over a base bash env. Role keys win; base-only keys
@@ -174,9 +194,22 @@ impl Tool for DelegateTool {
 
         let bash_config = merge_role_env(&deps.bash_config, role.env.as_ref());
 
+        // Enrich the role prompt with a lean shared context: the live env
+        // block (cwd/time/shell) + this role's filtered skills. No persona,
+        // no core tool guidance, no memory, no agents.md — a sub-agent's
+        // `prompt` is its whole persona; everything else it needs goes in the
+        // task. Derived here (not cached) so cwd/time are always current.
+        let preamble = build_sub_agent_preamble(
+            &role.prompt,
+            deps.shell_kind.as_ref(),
+            &deps.state_manager.session_cwd(),
+            &deps.skills,
+            &role.skills,
+        );
+
         let (agent, hook) = crate::providers::build_sub_agent(
             &role.model.provider_config,
-            &role.prompt,
+            &preamble,
             deps.event_sink.clone(),
             &args.role,
             deps.searxng.as_ref(),

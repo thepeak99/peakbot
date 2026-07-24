@@ -208,7 +208,7 @@ async fn main() -> Result<()> {
     // clear boot error).
     let pipeline_registry = if config.pipeline_enabled() {
         let pipeline_config = config.pipeline().unwrap();
-        match SubAgentRegistry::new(pipeline_config, &model_registry) {
+        match SubAgentRegistry::new(pipeline_config, &model_registry, &skills.names()) {
             Ok(reg) => Some(Arc::new(reg)),
             Err(e) => anyhow::bail!("Invalid pipeline configuration: {e}"),
         }
