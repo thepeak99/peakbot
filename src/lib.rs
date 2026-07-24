@@ -201,8 +201,51 @@ enum CompletionResult {
     CommandDone,
 }
 
-const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
+const SYSTEM_PROMPT_PERSONA: &str = include_str!("system_prompt_persona.txt");
+const SYSTEM_PROMPT_CORE: &str = include_str!("system_prompt_core.txt");
 const MEMORY_PROMPT_SECTION: &str = include_str!("system_prompt_memory.txt");
+
+/// The `# Environment Information` block (cwd, time, version, OS, binary,
+/// shell). Derived fresh at each call so the time is live — shared by the
+/// orchestrator prompt and every sub-agent preamble.
+pub(crate) fn env_block(shell_kind: Option<&ShellKind>, cwd: &std::path::Path) -> String {
+    let current_time = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string();
+    let binary_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
+
+    format!(
+        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n- **Operating System**: {}\n- **PeakBot Binary Path**: {}\n{}",
+        cwd.to_string_lossy(),
+        current_time,
+        PEAKBOT_VERSION,
+        std::env::consts::OS,
+        binary_path,
+        shell_line(shell_kind),
+    )
+}
+
+/// Load `agents.md` from `cwd` (case-insensitive), wrapped as a prompt
+/// section. Empty when absent. Orchestrator/agentless only — sub-agents
+/// don't get it (the orchestrator passes any repo specifics in the task).
+fn agents_md_section(cwd: &std::path::Path) -> String {
+    std::fs::read_dir(cwd)
+        .ok()
+        .and_then(|entries| {
+            entries.filter_map(|e| e.ok()).find(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|name| name.to_lowercase() == "agents.md")
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|entry| std::fs::read_to_string(entry.path()).ok())
+        .map(|content| format!("\n# Agents.md Content\n\n--------------------------------------------------------\n{}\n", content.trim()))
+        .unwrap_or_default()
+}
 
 /// Build the system prompt dynamically with environment information.
 ///
@@ -213,63 +256,40 @@ const MEMORY_PROMPT_SECTION: &str = include_str!("system_prompt_memory.txt");
 ///
 /// `memory_enabled` gates the `memory.md` instructions: when false the
 /// section is omitted so the model is never told to read/update memory.md.
+///
+/// `subagents_active` selects the recipe: when false (agentless) the crusader
+/// **persona** leads the prompt; when true (orchestrator) the persona is
+/// dropped — it would confuse an agent whose job is to coordinate a team — and
+/// `orchestrator_prompt` (if set) is appended as extra framing. The core tool
+/// guidance, memory, skills, env block, and agents.md are shared by both.
 pub fn build_system_prompt(
     skills: &SkillRegistry,
     shell_kind: Option<&ShellKind>,
     cwd: &std::path::Path,
     memory_enabled: bool,
+    subagents_active: bool,
+    orchestrator_prompt: Option<&str>,
 ) -> String {
-    let mut prompt = SYSTEM_PROMPT.to_string();
+    let mut prompt = String::new();
 
-    let cwd_display = cwd.to_string_lossy().to_string();
-
-    let current_time = chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S %Z")
-        .to_string();
-
-    // Load agents.md from the session cwd (case-insensitive filename match).
-    let agents_md_content = std::fs::read_dir(cwd)
-        .ok()
-        .and_then(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .find(|e| {
-                    e.path()
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|name| name.to_lowercase() == "agents.md")
-                        .unwrap_or(false)
-                })
-        })
-        .and_then(|entry| std::fs::read_to_string(entry.path()).ok())
-        .map(|content| format!("\n# Agents.md Content\n\n--------------------------------------------------------\n{}\n", content.trim()))
-        .unwrap_or_default();
-
-    let skills_section = skills.to_system_prompt_section();
-
-    let os = std::env::consts::OS;
-
-    let binary_path = std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "Unknown".to_string());
-
-    let env_info = format!(
-        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n- **Operating System**: {}\n- **PeakBot Binary Path**: {}\n{}",
-        cwd_display,
-        current_time,
-        PEAKBOT_VERSION,
-        os,
-        binary_path,
-        shell_line(shell_kind),
-    );
+    if !subagents_active {
+        prompt.push_str(SYSTEM_PROMPT_PERSONA);
+    }
+    prompt.push_str(SYSTEM_PROMPT_CORE);
 
     if memory_enabled {
         prompt.push_str(MEMORY_PROMPT_SECTION);
     }
 
-    prompt.push_str(&skills_section);
-    prompt.push_str(&env_info);
-    prompt.push_str(&agents_md_content);
+    prompt.push_str(&skills.to_system_prompt_section());
+    prompt.push_str(&env_block(shell_kind, cwd));
+    prompt.push_str(&agents_md_section(cwd));
+
+    if subagents_active
+        && let Some(extra) = orchestrator_prompt.map(str::trim).filter(|s| !s.is_empty())
+    {
+        prompt.push_str(&format!("\n# Orchestrator Instructions\n\n{extra}\n"));
+    }
 
     debug!("System prompt:\n {}", prompt);
 
@@ -394,6 +414,10 @@ pub struct RebuildContext {
     /// Built-in tool filter (blocklist/allowlist). Refreshed on config reload;
     /// consumed by `add_builtin_tools` when the agent is rebuilt.
     pub tools_filter: crate::config::ToolsConfig,
+    /// The orchestrator prompt addendum (from `pipeline.orchestrator_prompt`).
+    /// Appended to the system prompt when sub-agents are active — recomputed
+    /// on the subagents toggle and `/cd`. Refreshed on config reload.
+    pub orchestrator_prompt: Option<String>,
 }
 
 /// Shared cell holding the *currently active* SessionHook. Replaced
@@ -1573,17 +1597,9 @@ impl AgentRunner {
         // The load-bearing act. Per-session only — no `set_current_dir`,
         // so two web sessions in different trees stay race-free. Must run
         // BEFORE the agent rebuild below, because `add_builtin_tools`
-        // snapshots `sm.session_cwd()` at build time.
+        // snapshots `sm.session_cwd()` at build time — and the rebuild seam
+        // reads it to recompute the system prompt against the new cwd.
         sm.set_session_cwd(target.to_path_buf());
-
-        // Rebuild the prompt against the new cwd + refreshed agents.md and
-        // persist it into ctx so subsequent /model switches keep the cwd.
-        ctx.system_prompt = build_system_prompt(
-            &ctx.skills,
-            ctx.shell_kind.as_ref(),
-            target,
-            ctx.memory_enabled,
-        );
 
         // Refresh the welcome banner's cwd so the status bar / web banner
         // reflect the new directory (welcome was stamped once at boot).
@@ -1716,12 +1732,9 @@ impl AgentRunner {
         ctx.registry = Arc::new(new_registry);
         ctx.memory_enabled = config.memory.enabled;
         ctx.tools_filter = config.tools.clone();
-        ctx.system_prompt = build_system_prompt(
-            &ctx.skills,
-            ctx.shell_kind.as_ref(),
-            &sm.session_cwd(),
-            ctx.memory_enabled,
-        );
+        // `ctx.system_prompt` is recomputed by the rebuild seam that follows
+        // every reload (it derives persona/orchestrator framing from the live
+        // subagents state), so it is not rebuilt here.
         ctx.searxng_config = config.searxng.clone();
         ctx.max_turns = config.agent_max_turns;
         ctx.bash_config = config.bash.clone();
@@ -1755,7 +1768,7 @@ impl AgentRunner {
         provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         state_manager: &Option<Arc<StateManager>>,
-        ctx: &RebuildContext,
+        ctx: &mut RebuildContext,
         active_sub_agent_hook: &crate::pipeline::ActiveSubAgentHook,
     ) -> Result<(), String> {
         // Validate compaction model *before* mutating any state. When
@@ -1805,11 +1818,26 @@ impl AgentRunner {
         // present) AND this conversation opted in. Gating here — the single
         // rebuild seam — keeps every rebuild path (`/model`, `/cd`, the
         // subagents toggle) honouring the opt-in without duplicating the rule.
-        let boot_registry = if sm_for_provider.subagents_enabled() {
+        let subagents_active =
+            ctx.pipeline_registry.is_some() && sm_for_provider.subagents_enabled();
+        let boot_registry = if subagents_active {
             ctx.pipeline_registry.as_deref()
         } else {
             None
         };
+
+        // Recompute the prompt here — the single seam — so persona/orchestrator
+        // framing always tracks the current subagents state and cwd. This makes
+        // the subagents toggle flip the persona without any caller having to
+        // rebuild the prompt itself.
+        ctx.system_prompt = build_system_prompt(
+            &ctx.skills,
+            ctx.shell_kind.as_ref(),
+            &sm_for_provider.session_cwd(),
+            ctx.memory_enabled,
+            subagents_active,
+            ctx.orchestrator_prompt.as_deref(),
+        );
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
             &resolved.provider_config,
@@ -1824,6 +1852,7 @@ impl AgentRunner {
             sm_for_provider.clone(),
             ctx.shell_kind.as_ref(),
             ctx.vector_store.as_ref(),
+            &ctx.skills,
             active_sub_agent_hook.clone(),
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
@@ -1946,19 +1975,14 @@ impl AgentRunner {
             let target = std::path::PathBuf::from(&saved_cwd);
             if target.is_dir() {
                 if target != current_session_cwd {
-                    // Kill bg processes rooted in the previous tree, then
-                    // refresh the prompt for the restored cwd/agents.md.
+                    // Kill bg processes rooted in the previous tree. The
+                    // rebuild seam below recomputes the prompt for the restored
+                    // cwd/agents.md (it reads `sm.session_cwd()`).
                     // Per-session only — no `set_current_dir`, so the
                     // process-global cwd is untouched and concurrent web
                     // sessions in other trees stay race-free.
                     sm.clear_bg();
                     sm.set_session_cwd(target.clone());
-                    ctx.system_prompt = build_system_prompt(
-                        &ctx.skills,
-                        ctx.shell_kind.as_ref(),
-                        &target,
-                        ctx.memory_enabled,
-                    );
                     sm.update_welcome_cwd(target);
                     cwd_changed = true;
                 }
@@ -3439,8 +3463,14 @@ mod tests {
         let ps = ShellKind::PowerShell {
             path: "pwsh.exe".to_string(),
         };
-        let prompt =
-            build_system_prompt(&skills, Some(&ps), &std::env::current_dir().unwrap(), true);
+        let prompt = build_system_prompt(
+            &skills,
+            Some(&ps),
+            &std::env::current_dir().unwrap(),
+            true,
+            false,
+            None,
+        );
         assert!(
             prompt.contains("**Shell**: powershell"),
             "PowerShell env line missing from prompt"
@@ -3466,6 +3496,8 @@ mod tests {
             Some(&bash),
             &std::env::current_dir().unwrap(),
             true,
+            false,
+            None,
         );
         assert!(
             prompt.contains("**Shell**: bash"),
@@ -3492,7 +3524,7 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-CONTENT").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true);
+        let prompt = build_system_prompt(&skills, None, &dir, true, false, None);
 
         assert!(
             prompt.contains(&dir.to_string_lossy().to_string()),
@@ -3520,7 +3552,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true);
+        let prompt = build_system_prompt(&skills, None, &dir, true, false, None);
         assert!(
             prompt.contains("# Memory.md"),
             "memory section must be present when memory is enabled"
@@ -3540,12 +3572,64 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, false);
+        let prompt = build_system_prompt(&skills, None, &dir, false, false, None);
         assert!(
             !prompt.contains("# Memory.md"),
             "memory section must be omitted when memory is disabled"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Agentless mode leads with the crusader persona; orchestrator mode
+    /// drops it (it would confuse an agent coordinating a team).
+    #[test]
+    fn system_prompt_persona_only_in_agentless_mode() {
+        let skills = SkillRegistry::new();
+        let cwd = std::env::current_dir().unwrap();
+
+        let agentless = build_system_prompt(&skills, None, &cwd, false, false, None);
+        assert!(
+            agentless.contains("CODE CRUSADER"),
+            "agentless prompt must carry the persona"
+        );
+
+        let orchestrator = build_system_prompt(&skills, None, &cwd, false, true, None);
+        assert!(
+            !orchestrator.contains("CODE CRUSADER"),
+            "orchestrator prompt must drop the persona"
+        );
+        assert!(
+            orchestrator.contains("# Working Principles"),
+            "orchestrator prompt must keep the core tool guidance"
+        );
+    }
+
+    /// The orchestrator prompt is appended only in orchestrator mode, and is
+    /// ignored in agentless mode.
+    #[test]
+    fn orchestrator_prompt_appended_only_when_subagents_active() {
+        let skills = SkillRegistry::new();
+        let cwd = std::env::current_dir().unwrap();
+        let extra = Some("Lead the SENTINEL-TEAM well.");
+
+        let on = build_system_prompt(&skills, None, &cwd, false, true, extra);
+        assert!(
+            on.contains("SENTINEL-TEAM"),
+            "orchestrator prompt must be appended when sub-agents are active"
+        );
+
+        let off = build_system_prompt(&skills, None, &cwd, false, false, extra);
+        assert!(
+            !off.contains("SENTINEL-TEAM"),
+            "orchestrator prompt must be ignored in agentless mode"
+        );
+
+        // A blank orchestrator prompt adds no section.
+        let blank = build_system_prompt(&skills, None, &cwd, false, true, Some("   "));
+        assert!(
+            !blank.contains("# Orchestrator Instructions"),
+            "a blank orchestrator prompt must not emit a section header"
+        );
     }
 
     #[tokio::test]

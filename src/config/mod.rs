@@ -355,6 +355,13 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Extra framing appended to the **orchestrator's** system prompt when
+    /// sub-agents are active. The orchestrator already loses the crusader
+    /// persona in this mode; this is where you tell it how to lead the team.
+    /// Absent = no addendum.
+    #[serde(default)]
+    pub orchestrator_prompt: Option<String>,
+
     /// Sub-agent definitions keyed by agent name
     #[serde(default)]
     pub agents: HashMap<String, AgentDefinition>,
@@ -382,6 +389,10 @@ pub struct AgentDefinition {
     /// built.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+
+    /// Which skills this role's sub-agent sees in its prompt. Default: all.
+    #[serde(default)]
+    pub skills: SkillFilter,
 }
 
 impl PipelineConfig {
@@ -522,6 +533,13 @@ impl Config {
             .as_ref()
             .map(|p| p.enabled && !p.agents.is_empty())
             .unwrap_or(false)
+    }
+
+    /// The orchestrator prompt addendum, if configured under `pipeline:`.
+    pub fn orchestrator_prompt(&self) -> Option<&str> {
+        self.pipeline
+            .as_ref()
+            .and_then(|p| p.orchestrator_prompt.as_deref())
     }
 
     /// Build a [`ModelRegistry`] from the loaded config.
@@ -1164,6 +1182,72 @@ impl ToolsConfig {
     }
 }
 
+/// Per-role skill filter (which skills a sub-agent sees in its prompt).
+///
+/// Mirrors [`ToolsConfig`] — `only` (allowlist) XOR `disabled` (blocklist),
+/// both empty means "all skills" — plus an `enabled` short-circuit so a
+/// focused role can be given no skills at all. Skill names are validated
+/// against the discovered skill set in a second boundary pass (after skill
+/// discovery), not here, since the names aren't known at config-parse time.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillFilter {
+    /// Master switch: `false` gives this role no skills, ignoring the lists.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Blocklist: these skills are hidden; every other skill stays.
+    #[serde(default)]
+    pub disabled: Vec<String>,
+    /// Allowlist: only these skills stay; every other skill is hidden.
+    #[serde(default)]
+    pub only: Vec<String>,
+}
+
+impl Default for SkillFilter {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            disabled: Vec::new(),
+            only: Vec::new(),
+        }
+    }
+}
+
+impl SkillFilter {
+    /// Boundary parse: reject the illegal `disabled`+`only` combination and
+    /// any name not in `known` (typo catch). Called after skill discovery.
+    pub fn validate(&self, role: &str, known: &[String]) -> Result<(), String> {
+        if !self.disabled.is_empty() && !self.only.is_empty() {
+            return Err(format!(
+                "pipeline.agents.{role}.skills: set either `disabled` (blocklist) or \
+                 `only` (allowlist), not both."
+            ));
+        }
+        for name in self.disabled.iter().chain(self.only.iter()) {
+            if !known.iter().any(|k| k == name) {
+                return Err(format!(
+                    "pipeline.agents.{role}.skills: unknown skill '{name}'. Known skills: {}.",
+                    known.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a skill of this name is shown to the role. `enabled: false`
+    /// short-circuits to none; then allowlist wins, then blocklist.
+    pub fn shows(&self, name: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if !self.only.is_empty() {
+            self.only.iter().any(|n| n == name)
+        } else {
+            !self.disabled.iter().any(|n| n == name)
+        }
+    }
+}
+
 /// Configuration for conversation persistence
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1508,6 +1592,69 @@ mod tests {
         assert!(t.allows("bash"));
         assert!(t.allows("web_search"));
         assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn skill_filter_default_shows_everything() {
+        let f = SkillFilter::default();
+        assert!(f.shows("github"));
+        assert!(f.shows("anything"));
+        assert!(f.validate("role", &["github".into()]).is_ok());
+    }
+
+    #[test]
+    fn skill_filter_disabled_master_switch_hides_all() {
+        let f = SkillFilter {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(!f.shows("github"), "enabled=false hides every skill");
+    }
+
+    #[test]
+    fn skill_filter_only_is_allowlist() {
+        let f = SkillFilter {
+            enabled: true,
+            disabled: vec![],
+            only: vec!["github".into()],
+        };
+        assert!(f.shows("github"));
+        assert!(!f.shows("helius-solana"));
+    }
+
+    #[test]
+    fn skill_filter_disabled_is_blocklist() {
+        let f = SkillFilter {
+            enabled: true,
+            disabled: vec!["helius-solana".into()],
+            only: vec![],
+        };
+        assert!(!f.shows("helius-solana"));
+        assert!(f.shows("github"));
+    }
+
+    #[test]
+    fn skill_filter_rejects_both_lists() {
+        let f = SkillFilter {
+            enabled: true,
+            disabled: vec!["a".into()],
+            only: vec!["b".into()],
+        };
+        let known = vec!["a".into(), "b".into()];
+        assert!(f.validate("role", &known).is_err(), "both lists is illegal");
+    }
+
+    #[test]
+    fn skill_filter_rejects_unknown_skill_name() {
+        let f = SkillFilter {
+            enabled: true,
+            disabled: vec![],
+            only: vec!["ghost".into()],
+        };
+        assert!(
+            f.validate("role", &["github".into()]).is_err(),
+            "an unknown skill name is a typo-catch error"
+        );
     }
 
     #[test]

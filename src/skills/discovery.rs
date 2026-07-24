@@ -66,6 +66,11 @@ impl SkillRegistry {
         self.skills.is_empty()
     }
 
+    /// Names of all registered skills (for filter validation).
+    pub fn names(&self) -> Vec<String> {
+        self.skills.keys().cloned().collect()
+    }
+
     /// Load all skills from a directory, appending a user-facing line to
     /// `warnings` for every skill that fails to parse (so the UI can surface
     /// it) — a single bad skill never aborts the scan.
@@ -127,13 +132,25 @@ impl SkillRegistry {
 
     /// Generate a system prompt section with available skills
     pub fn to_system_prompt_section(&self) -> String {
-        if self.is_empty() {
+        self.section_where(|_| true)
+    }
+
+    /// Like [`Self::to_system_prompt_section`], but only lists skills the
+    /// filter shows — the per-role sub-agent view. Empty when the filter
+    /// hides every skill (or none are registered).
+    pub fn to_system_prompt_section_filtered(&self, filter: &crate::config::SkillFilter) -> String {
+        self.section_where(|s| filter.shows(&s.name))
+    }
+
+    /// Shared body: render the skills section over the skills passing `keep`.
+    fn section_where(&self, keep: impl Fn(&Skill) -> bool) -> String {
+        let mut shown = self.skills.values().filter(|s| keep(s)).peekable();
+        if shown.peek().is_none() {
             return String::new();
         }
 
         let mut section = PROMPT.to_owned();
-
-        for skill in self.skills.values() {
+        for skill in shown {
             section.push_str(&format!(
                 "- {}: `{}` - {}\n",
                 skill.name,
@@ -144,7 +161,6 @@ impl SkillRegistry {
                 section.push_str(&format!("  - Allowed tools: `{}`\n", tools));
             }
         }
-
         section
     }
 }
@@ -223,6 +239,45 @@ mod tests {
         assert_eq!(registry.len(), 1, "broken skill must be skipped");
         assert_eq!(warnings.len(), 1, "broken skill must produce one warning");
         assert!(warnings[0].contains("broken-skill"));
+    }
+
+    #[test]
+    fn filtered_section_respects_skill_filter() {
+        use crate::config::SkillFilter;
+        let tmp = TempDir::new().unwrap();
+        write_skill(
+            tmp.path(),
+            "alpha",
+            "---\nname: alpha\ndescription: A\n---\n# Body\n",
+        );
+        write_skill(
+            tmp.path(),
+            "beta",
+            "---\nname: beta\ndescription: B\n---\n# Body\n",
+        );
+        let mut registry = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        registry.load_from_directory(tmp.path(), &mut warnings);
+
+        // Allowlist: only `alpha` is shown.
+        let only_alpha = SkillFilter {
+            enabled: true,
+            disabled: vec![],
+            only: vec!["alpha".into()],
+        };
+        let section = registry.to_system_prompt_section_filtered(&only_alpha);
+        assert!(section.contains("alpha"));
+        assert!(!section.contains("beta"), "beta must be filtered out");
+
+        // Master switch off: empty section, no header.
+        let none = SkillFilter {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(
+            registry.to_system_prompt_section_filtered(&none).is_empty(),
+            "enabled=false yields no skills section"
+        );
     }
 
     #[test]

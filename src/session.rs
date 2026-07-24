@@ -203,12 +203,16 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
 
     // Build the per-session system prompt from `session_cwd` — the only
     // place the cwd flows into the prompt. Skills + shell_kind are part
-    // of the env block too.
+    // of the env block too. When sub-agents are active this drops the
+    // crusader persona and appends the orchestrator prompt.
+    let subagents_active = pipeline_available && subagents_enabled;
     let session_prompt = build_system_prompt(
         &deps.skills,
         deps.shell_kind.as_ref(),
         &session_cwd,
         deps.config.memory.enabled,
+        subagents_active,
+        deps.config.orchestrator_prompt(),
     );
 
     // Session-owned cell for the currently-running sub-agent hook (D6 stop
@@ -241,6 +245,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         state_manager.clone(),
         deps.shell_kind.as_ref(),
         deps.vector_store.as_ref(),
+        &deps.skills,
         active_sub_agent_hook.clone(),
     )?;
 
@@ -304,6 +309,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         vector_store: deps.vector_store.clone(),
         memory_enabled: deps.config.memory.enabled,
         tools_filter: deps.config.tools.clone(),
+        orchestrator_prompt: deps.config.orchestrator_prompt().map(str::to_string),
     };
 
     let mut runner = AgentRunner::new(
