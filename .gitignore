@@ -13,3 +13,5 @@ output
 
 # Local scratch dir (test config + vector db)
 .test/
+
+scripts
