@@ -4,6 +4,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- Compacted `agents.md` from 1734 to ~510 lines: cut user-manual bulk (provider YAML variants, TLS/phone walkthrough, env/settings tables, generic rig multi-agent example, oversized architecture diagram), deduplicated the pre-commit gate / release-notes / bash_bg sections, and fixed documentation drift (stale `create_provider` signature, wrong built-in tool count — the tool table now follows `BUILTIN_TOOL_NAMES` and includes `fetch_page`/`powershell`; directory-level file map covering `pipeline/`, `state/`, `ui/web/`).
 - Added a `memory:` `enabled` switch that governs the whole memory.md feature: `memory.enabled: false` stops injecting the memory.md instructions into the system prompt **and** skips auto-compaction. (Default on.)
 - Added a `tools:` config block to filter built-in tools — `disabled:` (blocklist) or `only:` (allowlist), mutually exclusive, validated at load. Unknown tool names and setting both lists are rejected. Reload-safe (applied on the next session verb).
 - Dropped the injected `thought` field from the `todo` tool (now registered ungated, like `think`): the task text already carries the plan, and some models (e.g. MiniMax) structurally refuse the field, which tripped a "thought missing" nudge on every todo call.
