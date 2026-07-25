@@ -53,19 +53,24 @@ pub struct SubAgentDeps {
 }
 
 /// Build a sub-agent's preamble: `role_prompt` + the live env block + this
-/// role's filtered skills. Deliberately lean — no persona, core guidance,
-/// memory, or agents.md (see the call site). Sections are separated by blank
-/// lines; empty pieces (no skills shown) contribute nothing.
+/// role's filtered skills, optionally followed by the repo's `agents.md`
+/// (only when the role sets `agents_md: true`). Deliberately lean — no
+/// persona, core guidance, or memory. Sections are separated by blank lines;
+/// empty pieces (no skills shown, no agents.md) contribute nothing.
 fn build_sub_agent_preamble(
     role_prompt: &str,
     shell_kind: Option<&ShellKind>,
     cwd: &std::path::Path,
     skills: &crate::skills::SkillRegistry,
     filter: &crate::config::SkillFilter,
+    agents_md: bool,
 ) -> String {
     let mut preamble = role_prompt.to_string();
     preamble.push_str(&crate::env_block(shell_kind, cwd));
     preamble.push_str(&skills.to_system_prompt_section_filtered(filter));
+    if agents_md {
+        preamble.push_str(&crate::agents_md_section(cwd));
+    }
     preamble
 }
 
@@ -195,16 +200,18 @@ impl Tool for DelegateTool {
         let bash_config = merge_role_env(&deps.bash_config, role.env.as_ref());
 
         // Enrich the role prompt with a lean shared context: the live env
-        // block (cwd/time/shell) + this role's filtered skills. No persona,
-        // no core tool guidance, no memory, no agents.md — a sub-agent's
-        // `prompt` is its whole persona; everything else it needs goes in the
-        // task. Derived here (not cached) so cwd/time are always current.
+        // block (cwd/time/shell) + this role's filtered skills, plus the repo's
+        // agents.md only when the role opts in (`agents_md: true`). No persona,
+        // no core tool guidance, no memory — a sub-agent's `prompt` is its whole
+        // persona; everything else it needs goes in the task. Derived here (not
+        // cached) so cwd/time are always current.
         let preamble = build_sub_agent_preamble(
             &role.prompt,
             deps.shell_kind.as_ref(),
             &deps.state_manager.session_cwd(),
             &deps.skills,
             &role.skills,
+            role.agents_md,
         );
 
         let (agent, hook) = crate::providers::build_sub_agent(
@@ -366,6 +373,30 @@ mod tests {
             &MessageSource::SubAgent {
                 role: "reviewer".to_string()
             }
+        );
+    }
+
+    /// A role that opts in (`agents_md: true`) gets the repo's agents.md
+    /// injected into its preamble; a role that doesn't opt in never sees it.
+    #[test]
+    fn preamble_includes_agents_md_only_when_role_opts_in() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agents.md"), "SENTINEL-SUBAGENT-CONTEXT").unwrap();
+        let skills = crate::skills::SkillRegistry::default();
+        let filter = crate::config::SkillFilter::default();
+
+        let opted_in =
+            build_sub_agent_preamble("role prompt", None, dir.path(), &skills, &filter, true);
+        assert!(
+            opted_in.contains("SENTINEL-SUBAGENT-CONTEXT"),
+            "agents_md: true must inject the repo's agents.md"
+        );
+
+        let opted_out =
+            build_sub_agent_preamble("role prompt", None, dir.path(), &skills, &filter, false);
+        assert!(
+            !opted_out.contains("SENTINEL-SUBAGENT-CONTEXT"),
+            "default (agents_md: false) must keep the preamble lean"
         );
     }
 }

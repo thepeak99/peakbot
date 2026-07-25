@@ -20,6 +20,7 @@ pub(crate) struct ResolvedRole {
     pub(crate) prompt: String,
     pub(crate) env: Option<HashMap<String, String>>,
     pub(crate) skills: SkillFilter,
+    pub(crate) agents_md: bool,
 }
 
 /// A registry of sub-agents with factory methods.
@@ -76,6 +77,7 @@ impl SubAgentRegistry {
                     prompt: def.prompt.clone(),
                     env: def.env.clone(),
                     skills: def.skills.clone(),
+                    agents_md: def.agents_md,
                 },
             );
         }
@@ -165,6 +167,7 @@ mod tests {
             prompt: prompt.to_string(),
             env: None,
             skills: crate::config::SkillFilter::default(),
+            agents_md: false,
         }
     }
 

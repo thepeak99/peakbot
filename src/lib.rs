@@ -228,9 +228,10 @@ pub(crate) fn env_block(shell_kind: Option<&ShellKind>, cwd: &std::path::Path) -
 }
 
 /// Load `agents.md` from `cwd` (case-insensitive), wrapped as a prompt
-/// section. Empty when absent. Orchestrator/agentless only — sub-agents
-/// don't get it (the orchestrator passes any repo specifics in the task).
-fn agents_md_section(cwd: &std::path::Path) -> String {
+/// section. Empty when absent. Injected into the agentless/orchestrator
+/// prompt unconditionally; a sub-agent role gets it only when it opts in
+/// via `agents_md: true` (see `build_sub_agent_preamble`).
+pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
     std::fs::read_dir(cwd)
         .ok()
         .and_then(|entries| {

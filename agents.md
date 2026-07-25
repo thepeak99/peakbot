@@ -1449,7 +1449,8 @@ no event channel — so their turns are not TEE'd and their cost is not tracked.
 
 ### Config shape
 
-A role is `(model, prompt)` + optional `env:` + optional `skills:`. The `model:`
+A role is `(model, prompt)` + optional `env:` + optional `skills:` + optional
+`agents_md:`. The `model:`
 names an **alias** from the top-level `providers:` list — the same aliases
 `/model` uses — resolved at load against the `ModelRegistry`. Omit `model:` to
 fall back to `default_model`. There are no provider/credential fields on a role;
@@ -1484,6 +1485,7 @@ pipeline:
       model: sonnet
       prompt: "You review diffs and critique."
       env: { REVIEW_STRICT: "1" }   # optional; merged into THIS sub-agent's bash env only
+      agents_md: true          # optional; inject the repo's agents.md (default: off)
       skills:
         enabled: false         # this role gets NO skills section
 ```
@@ -1506,7 +1508,7 @@ The system prompt has three recipes, all composed from the same small pieces
 | memory.md workflow | ✅ (if enabled) | ✅ (if enabled) | ❌ |
 | skills section | ✅ (all) | ✅ (all) | ⚙️ per-role filtered |
 | env block (cwd/time/OS/shell) | ✅ | ✅ | ✅ |
-| `agents.md` | ✅ | ✅ | ❌ |
+| `agents.md` | ✅ | ✅ | ⚙️ per-role (`agents_md:`, default off) |
 | `orchestrator_prompt` | — | ✅ (if set) | — |
 
 - **The orchestrator drops the crusader persona** in sub-agents mode — it would
@@ -1514,7 +1516,8 @@ The system prompt has three recipes, all composed from the same small pieces
   guidance and gains the optional `orchestrator_prompt`. Agentless mode is
   byte-identical to before this feature.
 - **A sub-agent's preamble** is `role.prompt` + the live env block + its
-  per-role-filtered skills. Nothing else: its `role.prompt` is its whole
+  per-role-filtered skills, plus the repo's `agents.md` **only if the role sets
+  `agents_md: true`** (default off). Otherwise its `role.prompt` is its whole
   persona, and everything else it needs goes in the delegated `task`. Built
   fresh per delegation (`build_sub_agent_preamble`), so cwd/time are current.
 - **Per-role skills** (`pipeline.agents.<role>.skills`) mirror the `tools:`
@@ -1522,6 +1525,11 @@ The system prompt has three recipes, all composed from the same small pieces
   master switch (`false` ⇒ no skills for that role). `SkillFilter::shows`
   decides visibility; `SkillFilter::validate` runs at boot against the
   discovered skill names.
+- **Per-role `agents_md`** (`pipeline.agents.<role>.agents_md`, bool, default
+  `false`) opts a sub-agent into the repo's `agents.md`. The orchestrator and
+  agentless agent always get it; sub-agents stay lean unless a role opts in,
+  reusing the same `agents_md_section(cwd)` the main prompt uses (derived at
+  delegation time, so cwd is current).
 - The persona/orchestrator framing is recomputed at the **single agent-rebuild
   seam** (`rebuild_agent_for_resolved`), keyed on the live
   `pipeline_available && subagents_enabled` state, so toggling sub-agents,

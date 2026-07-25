@@ -393,6 +393,11 @@ pub struct AgentDefinition {
     /// Which skills this role's sub-agent sees in its prompt. Default: all.
     #[serde(default)]
     pub skills: SkillFilter,
+
+    /// Inject the repo's `agents.md` into this role's preamble. Default: off
+    /// (sub-agents get a lean, task-scoped preamble unless a role opts in).
+    #[serde(default)]
+    pub agents_md: bool,
 }
 
 impl PipelineConfig {
