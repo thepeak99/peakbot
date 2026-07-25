@@ -74,6 +74,19 @@ fn build_sub_agent_preamble(
     preamble
 }
 
+/// Guard against an empty sub-agent result (#222). A sub-agent that produced
+/// only tool calls (or nothing) yields `""`, which becomes an empty
+/// `ToolResult` — provider adapters reject empty tool-result content and the
+/// orchestrator's loop crashes. Replace whitespace-only output with a sentinel
+/// naming the role; non-empty output passes through unchanged.
+fn normalize_delegate_output(role: &str, raw: String) -> String {
+    if raw.trim().is_empty() {
+        format!("[sub-agent '{role}' produced no output — re-run with a more focused task.]")
+    } else {
+        raw
+    }
+}
+
 /// Merge a role's `env:` over a base bash env. Role keys win; base-only keys
 /// are kept. Returns a fresh `BashConfig` with the merged env — the base is
 /// not mutated (delegations must not leak env into the orchestrator's bash).
@@ -241,6 +254,7 @@ impl Tool for DelegateTool {
         agent
             .prompt_with_history(args.task.as_str(), &mut history)
             .await
+            .map(|text| normalize_delegate_output(&args.role, text))
             .map_err(|e| DelegateError::Run {
                 role: args.role.clone(),
                 error: e.to_string(),
@@ -373,6 +387,33 @@ mod tests {
             &MessageSource::SubAgent {
                 role: "reviewer".to_string()
             }
+        );
+    }
+
+    /// A sub-agent that returns empty or whitespace-only text must never reach
+    /// the orchestrator as an empty `ToolResult` (#222 — empty tool-result
+    /// content crashes provider adapters). The normalizer replaces it with a
+    /// human-readable sentinel naming the role; non-empty output passes through
+    /// byte-identical.
+    #[test]
+    fn delegate_output_never_empty() {
+        for empty in ["", "   ", "\n\t  \n"] {
+            let out = normalize_delegate_output("reviewer", empty.to_string());
+            assert!(
+                !out.trim().is_empty(),
+                "empty sub-agent output {empty:?} must become a non-empty sentinel"
+            );
+            assert!(
+                out.contains("reviewer"),
+                "sentinel must name the role for a useful orchestrator signal"
+            );
+        }
+
+        let real = "Found 3 issues in the diff.".to_string();
+        assert_eq!(
+            normalize_delegate_output("reviewer", real.clone()),
+            real,
+            "non-empty output must pass through unchanged"
         );
     }
 
