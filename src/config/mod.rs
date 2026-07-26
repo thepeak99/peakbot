@@ -307,6 +307,47 @@ pub struct Config {
     /// Absent block = every tool available.
     #[serde(default)]
     pub tools: ToolsConfig,
+
+    /// Outbound HTTP timeouts. Boot-only — read once when the process starts.
+    #[serde(default)]
+    pub http: HttpConfig,
+}
+
+/// Outbound HTTP timeouts, applied to every client PeakBot builds (LLM calls,
+/// embeddings, MCP auth, web tools). Without these a provider that accepts a
+/// request and never answers wedges the turn forever.
+///
+/// Deliberately NOT a total request timeout: `read_timeout` resets on each
+/// successful read, so it bounds *silence* rather than duration.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConfig {
+    /// Give up if TCP+TLS setup takes this long (default: 30 s, 0 = disabled).
+    /// A connect either completes in seconds or never will.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Give up after this many seconds with no bytes read (default: 600,
+    /// 0 = disabled). Completions are non-streaming, so for LLM calls this is
+    /// in effect a ceiling on a single generation — raise it if you run models
+    /// that legitimately think for longer than 10 minutes.
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: default_connect_timeout_secs(),
+            read_timeout_secs: default_read_timeout_secs(),
+        }
+    }
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    30
+}
+fn default_read_timeout_secs() -> u64 {
+    600
 }
 
 /// Web UI settings. Only the sticky-session reaper is configurable; all
@@ -1437,6 +1478,7 @@ impl Default for Config {
             vector_db: None,
             web: WebConfig::default(),
             tools: ToolsConfig::default(),
+            http: HttpConfig::default(),
         }
     }
 }
@@ -2153,6 +2195,23 @@ cost_traking: false   # typo of cost_tracking
             msg.contains("cost_traking"),
             "error must name the offending key, got: {msg}"
         );
+    }
+
+    #[test]
+    fn http_timeouts_default_and_parse() {
+        // Absent block: a config that never mentions http still gets bounded.
+        let cfg: Config = serde_yaml::from_str("cost_tracking: true").unwrap();
+        assert_eq!(cfg.http.connect_timeout_secs, 30);
+        assert_eq!(cfg.http.read_timeout_secs, 600);
+
+        // Partial block: the unspecified knob keeps its default.
+        let cfg: Config = serde_yaml::from_str("http:\n  read_timeout_secs: 1200\n").unwrap();
+        assert_eq!(cfg.http.connect_timeout_secs, 30);
+        assert_eq!(cfg.http.read_timeout_secs, 1200);
+
+        // 0 is the documented "disabled" escape hatch, not an error.
+        let cfg: Config = serde_yaml::from_str("http:\n  read_timeout_secs: 0\n").unwrap();
+        assert_eq!(cfg.http.read_timeout_secs, 0);
     }
 
     #[test]

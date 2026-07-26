@@ -138,6 +138,8 @@ async fn main() -> Result<()> {
     }
 
     let mut config = loaded.config;
+    // Boot-only: every HTTP client built from here on inherits these.
+    peakbot::http::init_timeouts(config.http.clone());
     // Load skills relative to the boot cwd (an allowed mint-site read of the
     // process cwd). Warnings are surfaced later as system messages by the
     // session factory; per-session verbs re-scan against the session cwd.
