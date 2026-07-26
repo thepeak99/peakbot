@@ -99,6 +99,9 @@ impl Tool for DocIndexTool {
             return Err(DocIndexError::NotFound(args.path));
         }
 
+        // Resolved once per call: every file in this walk lands in the DB that
+        // belongs to this session's cwd.
+        let db_path = self.store.db_path_for(&self.session_cwd);
         let recursive = args.recursive.unwrap_or(false);
         let files = collect_files(&root, recursive);
 
@@ -109,7 +112,7 @@ impl Tool for DocIndexTool {
                 report.unsupported += 1;
                 continue;
             }
-            match self.store.index_file(&file, &args.metadata).await {
+            match self.store.index_file(&db_path, &file, &args.metadata).await {
                 Ok(IndexOutcome::Indexed(n)) => {
                     report.indexed += 1;
                     report.chunks += n;
@@ -129,8 +132,13 @@ impl Tool for DocIndexTool {
 
         Ok(format!(
             "Indexed {} file(s), updated {}, skipped {} (unchanged), {} unsupported. \
-             {} chunk(s) written.",
-            report.indexed, report.updated, report.skipped, report.unsupported, report.chunks
+             {} chunk(s) written. → {}",
+            report.indexed,
+            report.updated,
+            report.skipped,
+            report.unsupported,
+            report.chunks,
+            db_path.display()
         ))
     }
 }
@@ -239,5 +247,42 @@ mod tests {
             tool.call(missing).await,
             Err(DocIndexError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn doc_index_reports_session_scoped_db_path() {
+        use crate::config::{EmbeddingsConfig, VectorDbConfig};
+
+        let session_dir = tempfile::tempdir().unwrap();
+        let probe = session_dir.path().join("probe.unsupported");
+        std::fs::write(&probe, "x").unwrap();
+        let config = VectorDbConfig {
+            enabled: true,
+            db_path: "./.peakbot/vectors.db".into(),
+            embeddings: EmbeddingsConfig {
+                base_url: "http://unused.invalid".into(),
+                api_key: None,
+                model: "test".into(),
+                dimensions: 3,
+            },
+        };
+        let store = VectorStore::open(&config).unwrap();
+        let tool = DocIndexTool::new(store).with_session_cwd(session_dir.path().to_path_buf());
+        let args: DocIndexArgs = serde_json::from_value(serde_json::json!({
+            "path": "probe.unsupported"
+        }))
+        .unwrap();
+
+        let output = tool.call(args).await.unwrap();
+        let expected = session_dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(".peakbot/vectors.db");
+        assert!(
+            output.contains(&expected.display().to_string()),
+            "got: {output}"
+        );
+        assert!(!expected.exists());
     }
 }

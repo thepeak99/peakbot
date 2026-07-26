@@ -3,6 +3,7 @@
 This file is the working draft for the next release. When a version is tagged, this file is renamed to `<version>.md` and a new empty `current.md` is created.
 
 ## Changes
+- **Fix: vector DB now lives in `.peakbot` under the current session cwd.** Previously, the vector DB path was resolved against the process boot directory, so `/cd` and the web cwd picker had no effect — the index always lived next to the config file. Now relative `db_path` config (the default `./.peakbot/vectors.db`) resolves per session cwd, so `/cd` and the web picker move it with you. Absolute `db_path` in config is unchanged (stays global). Users who boot and work in the same directory see no change — the resolved path is byte-identical, existing DB found. Users who `/cd`'d to a different directory: the old DB stays in the old tree untouched, the new tree starts empty (re-index is one tool call).
 
 - **Fixes: no more literal `[tool call]` in the transcript (#219).** When a model returned a tool call (with or without prose), the hook that builds the assistant text lane inserted a literal `[tool call]` placeholder — most visibly on sub-agent lanes, where a pure tool-call turn rendered as a `🧩 role` bubble containing nothing but that marker, directly above the real 🔧 tool-call entry. Tool calls (and assistant images) no longer contribute anything to the prose lane; a turn that produced no prose now correctly produces no prose bubble.
 

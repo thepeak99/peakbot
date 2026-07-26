@@ -243,7 +243,11 @@ async fn main() -> Result<()> {
     let vector_store = match config.vector_db.as_ref() {
         Some(vc) if vc.enabled => match peakbot::vector::VectorStore::open(vc) {
             Ok(store) => {
-                tracing::info!("Vector store enabled at: {}", vc.db_path);
+                tracing::info!(
+                    "Vector store enabled; DB resolved per session cwd from: {}",
+                    vc.db_path
+                );
+
                 Some(store)
             }
             Err(e) => {
