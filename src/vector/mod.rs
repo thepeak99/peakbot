@@ -1,19 +1,11 @@
 //! Vector store: a thin, `Send + Sync` wrapper around ruvector's `VectorDB`
 //! plus the embeddings client, shared by the `doc_index` / `doc_search` tools.
 //!
-//! One store is opened at startup and injected into both tools (mirroring
-//! `SearchTool::new(config)`). ruvector's `VectorDB` is itself `Send + Sync`
-//! and redb is single-writer, so a single shared handle behind `Arc` is the
-//! correct shape — two independently-opened handles on the same path would
-//! race.
-//!
-//! ## Lazy materialization
-//! Opening the store builds only the embeddings client — it touches no disk.
-//! The redb file at `db_path` is created on the **first write** (first
-//! `index_file` that actually inserts chunks). Reads (`search`) and the
-//! re-index skip-check before that point are pure no-ops: config-enabled is
-//! not the same as on-disk. All DB access routes through one lazily-initialised
-//! cell so the "nothing on disk until first index" invariant holds everywhere.
+//! One lazily-opened DB per resolved path — the store owns a map keyed by
+//! absolute `DbPath`. Relative `db_path` config resolves against the session
+//! cwd at tool-call time; an absolute config path stays global. Each DB is
+//! created on first write (first `index_file` that inserts chunks). Reads
+//! (`search`) and the re-index skip-check are pure no-ops when no DB exists.
 //!
 //! ## Idempotent re-index
 //! Each chunk's id is a stable hash of `(source_path, chunk_index)`, so
@@ -99,6 +91,23 @@ pub struct IndexReport {
     pub chunks: usize,
 }
 
+/// An absolute, lexically-normalized path to a vector DB file.
+/// The ONLY constructor is `VectorStore::db_path_for`, so a relative path
+/// can never reach ruvector (where it would silently bind to the process
+/// boot cwd — the bug this ticket fixes).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct DbPath(PathBuf);
+
+impl DbPath {
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn display(&self) -> std::path::Display<'_> {
+        self.0.display()
+    }
+}
+
 /// Shared vector store. Cheap to clone (everything is `Arc`-backed). The redb
 /// file is created lazily on the first write — see the module-level
 /// "Lazy materialization" note.
@@ -108,10 +117,14 @@ pub struct VectorStore {
 }
 
 struct StoreInner {
-    /// The redb-backed DB handle, created on first write. `None` until then.
-    db: OnceCell<Arc<VectorDB>>,
-    /// Where the DB will be created. Held so materialization is config-free.
-    db_path: String,
+    /// Lazily opened DB per resolved path. The outer `Mutex` guards only the
+    /// map lookup/insert and is **never** held across an await; the inner
+    /// `OnceCell` makes concurrent first-opens of the *same* path collapse
+    /// into one handle (two handles over one redb file would diverge).
+    dbs: std::sync::Mutex<HashMap<DbPath, Arc<OnceCell<Arc<VectorDB>>>>>,
+    /// The *configured* path template, verbatim from config. Never handed to
+    /// ruvector directly — always run through `db_path_for` first.
+    configured_db_path: String,
     embeddings: EmbeddingsClient,
 }
 
@@ -123,28 +136,35 @@ impl VectorStore {
         let embeddings = EmbeddingsClient::new(&config.embeddings);
         Ok(Self {
             inner: Arc::new(StoreInner {
-                db: OnceCell::new(),
-                db_path: config.db_path.clone(),
+                dbs: std::sync::Mutex::new(HashMap::new()),
+                configured_db_path: config.db_path.clone(),
                 embeddings,
             }),
         })
     }
 
-    /// The DB handle, creating the redb file (and parent dir) on first call.
-    /// This is the **only** path that materializes the store — call it solely
-    /// when about to write.
+    /// The DB handle for `db_path`, creating the redb file (and parent dir) on
+    /// first call. This is the **only** path that materializes a store — call
+    /// it solely when about to write.
     ///
     /// ⚠ On reopen of an existing path, ruvector rebuilds the index from disk
     /// using the STORED dimensions/metric — the `DbOptions` here only take
     /// effect when creating a fresh DB. A model whose output dimension differs
     /// from an existing DB surfaces as a clear error on insert, never as silent
     /// corruption.
-    async fn db(&self) -> Result<Arc<VectorDB>, VectorStoreError> {
-        let db = self
-            .inner
-            .db
+    async fn db(&self, db_path: &DbPath) -> Result<Arc<VectorDB>, VectorStoreError> {
+        // Take the cell out of the map and drop the guard *before* awaiting:
+        // a std `MutexGuard` must never span an await point. Opening then
+        // happens under the per-path `OnceCell`, so the map stays unlocked
+        // for other paths while one path is being opened.
+        let cell = {
+            let mut dbs = self.inner.dbs.lock().expect("vector db map lock poisoned");
+            Arc::clone(dbs.entry(db_path.clone()).or_default())
+        };
+
+        let db = cell
             .get_or_try_init(|| async {
-                let path = self.inner.db_path.clone();
+                let path = db_path.clone();
                 let dimensions = self.inner.embeddings.dimensions();
                 // ruvector's create is sync + does disk IO — keep it off the
                 // async runtime.
@@ -156,10 +176,34 @@ impl VectorStore {
         Ok(db.clone())
     }
 
-    /// The DB handle iff it has already been materialized. Reads use this so
-    /// they never create the file: an un-indexed store is empty by definition.
-    fn db_if_materialized(&self) -> Option<Arc<VectorDB>> {
-        self.inner.db.get().cloned()
+    /// The DB handle iff the file already exists on disk. Reads go through
+    /// here so they never create anything: a directory that was never indexed
+    /// has no DB, and asking about it must not conjure one. Async because
+    /// opening is blocking I/O, same as [`VectorStore::db`].
+    async fn db_if_exists(
+        &self,
+        db_path: &DbPath,
+    ) -> Result<Option<Arc<VectorDB>>, VectorStoreError> {
+        if !db_path.as_path().exists() {
+            return Ok(None);
+        }
+        self.db(db_path).await.map(Some)
+    }
+
+    /// Resolve the configured `db_path` against a session cwd. Pure except for
+    /// one `canonicalize` on the (existing) base dir. Call once per tool call.
+    pub fn db_path_for(&self, session_cwd: &Path) -> DbPath {
+        let p = Path::new(&self.inner.configured_db_path);
+        if p.is_absolute() {
+            return DbPath(normalize_lexical(p));
+        }
+        let base = if session_cwd.as_os_str().is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| session_cwd.to_path_buf())
+        } else {
+            session_cwd.to_path_buf()
+        };
+        let base = base.canonicalize().unwrap_or(base);
+        DbPath(normalize_lexical(&base.join(p)))
     }
 
     /// Index a single file: parse → chunk → embed → upsert. Returns the number
@@ -171,6 +215,7 @@ impl VectorStore {
     /// [`IndexReport`].
     pub async fn index_file(
         &self,
+        db_path: &DbPath,
         path: &Path,
         user_metadata: &HashMap<String, serde_json::Value>,
     ) -> Result<IndexOutcome, VectorStoreError> {
@@ -194,7 +239,7 @@ impl VectorStore {
         // Skip if this exact content is already indexed (id of chunk 0 carries
         // the file's content hash in metadata). One lookup decides both
         // skip-vs-reindex and whether this is an update.
-        let prior_hash = self.stored_hash(&source)?;
+        let prior_hash = self.stored_hash(db_path, &source).await?;
         if prior_hash.as_deref() == Some(content_hash.as_str()) {
             return Ok(IndexOutcome::Skipped);
         }
@@ -206,7 +251,7 @@ impl VectorStore {
             // chunks before, reap them all so the now-empty file leaves nothing
             // behind in the store.
             if is_update {
-                self.delete_chunks_from(&source, 0).await?;
+                self.delete_chunks_from(db_path, &source, 0).await?;
                 return Ok(IndexOutcome::Updated(0));
             }
             return Ok(IndexOutcome::Indexed(0));
@@ -233,7 +278,7 @@ impl VectorStore {
         let n = entries.len();
         // The first write materializes the store. ruvector's VectorDB is sync;
         // run the insert off the async runtime so the agent loop isn't starved.
-        let db = self.db().await?;
+        let db = self.db(db_path).await?;
         tokio::task::spawn_blocking(move || db.insert_batch(&entries))
             .await
             .expect("vector insert task panicked")?;
@@ -242,7 +287,7 @@ impl VectorStore {
         // higher-indexed rows from the previous version are now orphans. Reap
         // them. (No-op for a brand-new file, and cheap when nothing shrank.)
         if is_update {
-            self.delete_chunks_from(&source, n).await?;
+            self.delete_chunks_from(db_path, &source, n).await?;
         }
 
         Ok(if is_update {
@@ -253,10 +298,17 @@ impl VectorStore {
     }
 
     /// Embed `query` and return the top `k` most similar chunks. If nothing has
-    /// been indexed yet the store isn't materialized — return no hits without
+    /// been indexed at `db_path` there is no DB file — return no hits without
     /// touching the network or disk.
-    pub async fn search(&self, query: &str, k: usize) -> Result<Vec<Hit>, VectorStoreError> {
-        let Some(db) = self.db_if_materialized() else {
+    pub async fn search(
+        &self,
+        db_path: &DbPath,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Hit>, VectorStoreError> {
+        // Bail before embedding: no DB file means no hits, and asking must not
+        // cost a network round-trip (nor create the file).
+        let Some(db) = self.db_if_exists(db_path).await? else {
             return Ok(Vec::new());
         };
 
@@ -295,10 +347,13 @@ impl VectorStore {
 
     /// The content hash stored for a file's chunk 0, if the file was indexed
     /// before. Returns `None` if the file is not in the store — including the
-    /// case where nothing has been indexed yet (store not materialized), which
-    /// must not create the DB file.
-    fn stored_hash(&self, source: &str) -> Result<Option<String>, VectorStoreError> {
-        let Some(db) = self.db_if_materialized() else {
+    /// case where no DB exists at `db_path` yet, which must not create it.
+    async fn stored_hash(
+        &self,
+        db_path: &DbPath,
+        source: &str,
+    ) -> Result<Option<String>, VectorStoreError> {
+        let Some(db) = self.db_if_exists(db_path).await? else {
             return Ok(None);
         };
         let id = chunk_id(source, 0);
@@ -316,9 +371,14 @@ impl VectorStore {
     /// first absent id. Chunks are always written as a contiguous `0..count`
     /// run, so a miss means we've passed the end. Used after a re-index to
     /// reap orphans left when a file shrinks to fewer chunks (or to zero). A
-    /// no-op when the store isn't materialized (nothing to delete).
-    async fn delete_chunks_from(&self, source: &str, start: usize) -> Result<(), VectorStoreError> {
-        let Some(db) = self.db_if_materialized() else {
+    /// no-op when there is no DB at `db_path` (nothing to delete).
+    async fn delete_chunks_from(
+        &self,
+        db_path: &DbPath,
+        source: &str,
+        start: usize,
+    ) -> Result<(), VectorStoreError> {
+        let Some(db) = self.db_if_exists(db_path).await? else {
             return Ok(());
         };
         let source = source.to_string();
@@ -334,15 +394,47 @@ impl VectorStore {
         .expect("vector delete task panicked")
     }
 }
+/// Lexically normalize a path: drop `.` components, pop on `..` (never past
+/// root for absolute paths). No filesystem access — the DB file may not exist.
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut components = p.components().peekable();
+    let mut result = PathBuf::new();
+
+    // Preserve absolute prefix
+    if let Some(first) = components.peek() {
+        use std::path::Component;
+        if let Component::RootDir = first {
+            result.push("/");
+            components.next();
+        }
+    }
+
+    for component in components {
+        if component.as_os_str() == "." {
+            continue;
+        }
+        if component.as_os_str() == ".." {
+            // Never pop past the root for absolute paths
+            if result.components().count() > 1 || !p.is_absolute() {
+                result.pop();
+            }
+        } else {
+            result.push(component);
+        }
+    }
+
+    result
+}
 
 /// Create (or reopen) the redb-backed DB at `db_path`, creating the parent
 /// directory if missing. This is the single point that touches disk, invoked
-/// lazily from [`VectorStore::db`] on the first write.
-fn create_db(db_path: &str, dimensions: usize) -> Result<Arc<VectorDB>, VectorStoreError> {
-    let path = PathBuf::from(db_path);
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
+/// lazily from [`VectorStore::db`] on the first write. Errors carry the path
+/// so a failure names *which* DB broke, now that there can be several.
+fn create_db(db_path: &DbPath, dimensions: usize) -> Result<Arc<VectorDB>, VectorStoreError> {
+    let path = db_path.as_path();
+    // `DbPath` is absolute by construction, so the parent is always a real
+    // directory to create — no empty-parent case to guard.
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| VectorStoreError::Io {
             path: parent.display().to_string(),
             source,
@@ -352,11 +444,11 @@ fn create_db(db_path: &str, dimensions: usize) -> Result<Arc<VectorDB>, VectorSt
     let opts = DbOptions {
         dimensions,
         distance_metric: DistanceMetric::Cosine,
-        storage_path: db_path.to_string(),
+        storage_path: path.display().to_string(),
         ..Default::default()
     };
     let db = VectorDB::new(opts).map_err(|source| VectorStoreError::Open {
-        path: db_path.to_string(),
+        path: path.display().to_string(),
         source,
     })?;
     Ok(Arc::new(db))
@@ -512,8 +604,10 @@ mod tests {
             },
         };
         let store = VectorStore::open(&config).unwrap();
+        // Config path is absolute, so the session cwd is irrelevant here.
+        let db_path = store.db_path_for(Path::new(""));
         // Materialize the DB so we can seed it directly.
-        let db = store.db().await.unwrap();
+        let db = store.db(&db_path).await.unwrap();
 
         // Seed a 3-chunk file: chunks 0, 1, 2.
         let source = "shrinking.txt";
@@ -527,7 +621,7 @@ mod tests {
         db.insert_batch(&entries).unwrap();
 
         // File shrank to 1 chunk → delete everything from index 1 onward.
-        store.delete_chunks_from(source, 1).await.unwrap();
+        store.delete_chunks_from(&db_path, source, 1).await.unwrap();
 
         assert!(
             db.get(&chunk_id(source, 0)).unwrap().is_some(),
@@ -563,11 +657,12 @@ mod tests {
         };
 
         let store = VectorStore::open(&config).unwrap();
+        let resolved = store.db_path_for(Path::new(""));
         assert!(!db_path.exists(), "open() must not create the DB file");
 
         // A read (search) before anything is indexed is a pure no-op: empty
         // results, no network embed call, no DB file.
-        let hits = store.search("anything", 3).await.unwrap();
+        let hits = store.search(&resolved, "anything", 3).await.unwrap();
         assert!(hits.is_empty(), "search on an empty store returns no hits");
         assert!(
             !db_path.exists(),
@@ -575,8 +670,143 @@ mod tests {
         );
 
         // The first write materializes the store.
-        let _db = store.db().await.unwrap();
+        let _db = store.db(&resolved).await.unwrap();
         assert!(db_path.exists(), "first write must create the DB file");
+    }
+
+    fn test_config(db_path: impl Into<String>) -> VectorDbConfig {
+        VectorDbConfig {
+            enabled: true,
+            db_path: db_path.into(),
+            embeddings: EmbeddingsConfig {
+                base_url: "http://unused.invalid".into(),
+                api_key: None,
+                model: "test".into(),
+                dimensions: 3,
+            },
+        }
+    }
+
+    #[test]
+    fn db_path_resolves_relative_against_session_cwd() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(&test_config("./.peakbot/vectors.db")).unwrap();
+        let first_base = first.path().canonicalize().unwrap();
+        let second_base = second.path().canonicalize().unwrap();
+
+        let first_path = store.db_path_for(first.path());
+        let second_path = store.db_path_for(second.path());
+
+        assert_eq!(first_path.as_path(), first_base.join(".peakbot/vectors.db"));
+        assert_eq!(
+            second_path.as_path(),
+            second_base.join(".peakbot/vectors.db")
+        );
+        assert_ne!(first_path, second_path);
+        assert!(!first_path.as_path().exists());
+        assert!(!second_path.as_path().exists());
+    }
+
+    #[test]
+    fn absolute_config_db_path_ignores_session_cwd() {
+        let db = tempfile::tempdir().unwrap().path().join("vectors.db");
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(&test_config(db.display().to_string())).unwrap();
+
+        assert_eq!(
+            store.db_path_for(first.path()),
+            store.db_path_for(second.path())
+        );
+        assert_eq!(store.db_path_for(first.path()).as_path(), db);
+    }
+
+    #[test]
+    fn normalize_lexical_removes_current_directory_components() {
+        assert_eq!(normalize_lexical(Path::new("./a/b")), PathBuf::from("a/b"));
+    }
+
+    #[test]
+    fn normalize_lexical_resolves_parent_components() {
+        assert_eq!(normalize_lexical(Path::new("a/../b")), PathBuf::from("b"));
+    }
+
+    #[test]
+    fn normalize_lexical_preserves_absolute_paths() {
+        assert_eq!(normalize_lexical(Path::new("/a/../b")), PathBuf::from("/b"));
+    }
+
+    #[tokio::test]
+    async fn first_write_lands_under_session_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(&test_config("./.peakbot/vectors.db")).unwrap();
+        let path = store.db_path_for(dir.path());
+        let _db = store.db(&path).await.unwrap();
+
+        assert!(path.as_path().is_absolute());
+        assert!(
+            path.as_path()
+                .starts_with(dir.path().canonicalize().unwrap())
+        );
+        assert!(dir.path().join(".peakbot/vectors.db").exists());
+    }
+
+    #[tokio::test]
+    async fn distinct_session_cwds_get_independent_dbs() {
+        use ruvector_core::types::VectorEntry;
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(&test_config("./.peakbot/vectors.db")).unwrap();
+        let path_a = store.db_path_for(a.path());
+        let path_b = store.db_path_for(b.path());
+        let id = "synthetic-id";
+        store
+            .db(&path_a)
+            .await
+            .unwrap()
+            .insert_batch(&[VectorEntry {
+                id: Some(id.into()),
+                vector: vec![1.0, 0.0, 0.0],
+                metadata: None,
+            }])
+            .unwrap();
+
+        assert!(store.db(&path_b).await.unwrap().get(id).unwrap().is_none());
+        assert!(path_a.as_path().exists());
+        assert!(path_b.as_path().exists());
+    }
+
+    #[tokio::test]
+    async fn same_session_cwd_shares_one_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(&test_config("./.peakbot/vectors.db")).unwrap();
+        let path = store.db_path_for(dir.path());
+        let first = store.db(&path).await.unwrap();
+        let second = store.db(&path).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn search_opens_an_existing_db_without_creating_one() {
+        let indexed = tempfile::tempdir().unwrap();
+        let unindexed = tempfile::tempdir().unwrap();
+        let config = test_config("./.peakbot/vectors.db");
+        let store = VectorStore::open(&config).unwrap();
+        let indexed_path = store.db_path_for(indexed.path());
+        store.db(&indexed_path).await.unwrap();
+
+        let fresh = VectorStore::open(&config).unwrap();
+        assert!(
+            fresh
+                .db_if_exists(&fresh.db_path_for(indexed.path()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let unindexed_path = fresh.db_path_for(unindexed.path());
+        assert!(fresh.db_if_exists(&unindexed_path).await.unwrap().is_none());
+        assert!(!unindexed_path.as_path().exists());
     }
 
     #[test]

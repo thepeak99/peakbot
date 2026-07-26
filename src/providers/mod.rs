@@ -536,15 +536,14 @@ where
     if let Some(config) = searxng_config {
         tools.push(gate(Box::new(SearchTool::new(config))));
     }
-
     // Conditionally add the vector tools when a store is configured.
     if let Some(store) = vector_store {
         tools.push(gate(Box::new(
             crate::tools::DocIndexTool::new(store.clone()).with_session_cwd(session_cwd.clone()),
         )));
-        tools.push(gate(Box::new(crate::tools::DocSearchTool::new(
-            store.clone(),
-        ))));
+        tools.push(gate(Box::new(
+            crate::tools::DocSearchTool::new(store.clone()).with_session_cwd(session_cwd.clone()),
+        )));
     }
 
     // `view_image` needs a tool-result channel that carries images — only

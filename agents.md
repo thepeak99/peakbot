@@ -175,7 +175,7 @@ searxng:
 
 vector_db:
   enabled: true
-  db_path: ./.peakbot/vectors.db          # gitignored; default if omitted
+  db_path: ./.peakbot/vectors.db          # relative: resolves per session cwd; absolute stays global
   embeddings:
     base_url: https://api.openai.com/v1   # any OpenAI-compatible endpoint
     api_key: sk-...

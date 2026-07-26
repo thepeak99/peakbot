@@ -1,5 +1,7 @@
 //! `doc_search` tool: semantic search over indexed documents.
 
+use std::path::PathBuf;
+
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
@@ -21,15 +23,26 @@ pub enum DocSearchError {
     Store(#[from] VectorStoreError),
 }
 
-/// Semantic search tool over the shared vector store.
+/// Semantic search tool over the shared vector store. `session_cwd` is the base
+/// for resolving the vector DB path; the default empty path leaves the DB
+/// anchored at the process cwd (tests).
 #[derive(Clone)]
 pub struct DocSearchTool {
     store: VectorStore,
+    session_cwd: PathBuf,
 }
 
 impl DocSearchTool {
     pub fn new(store: VectorStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            session_cwd: PathBuf::new(),
+        }
+    }
+
+    pub fn with_session_cwd(mut self, session_cwd: PathBuf) -> Self {
+        self.session_cwd = session_cwd;
+        self
     }
 }
 
@@ -66,7 +79,8 @@ impl Tool for DocSearchTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let k = args.k.unwrap_or(DEFAULT_K).clamp(1, 50);
-        let hits = self.store.search(&args.query, k).await?;
+        let db_path = self.store.db_path_for(&self.session_cwd);
+        let hits = self.store.search(&db_path, &args.query, k).await?;
 
         if hits.is_empty() {
             return Ok(format!(
