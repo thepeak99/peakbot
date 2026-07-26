@@ -67,7 +67,8 @@ pub enum AgentEvent {
 
     /// Response received from the LLM
     CompletionResponse {
-        /// Text content from the model
+        /// Text content from the model. Prose only: empty when the turn
+        /// produced no text (e.g. a pure tool call).
         content: String,
         /// Reasoning/thinking from the model (if present)
         reasoning: Option<String>,
