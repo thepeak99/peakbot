@@ -394,6 +394,68 @@ mod tests {
         assert_eq!(input_context_tokens(&d), 1234);
     }
 
+    /// A tool call must contribute nothing to the prose lane, whether or not
+    /// the same turn also carried text.
+    #[test]
+    fn tool_call_alongside_prose_yields_prose_only() {
+        let choice = OneOrMany::many([
+            AssistantContent::text("Reading the file."),
+            AssistantContent::tool_call("1", "file_read", serde_json::json!({"path": "a.txt"})),
+        ])
+        .unwrap();
+
+        let (text, reasoning) = extract_content_from_response(&choice);
+        assert_eq!(text, "Reading the file.");
+        assert!(!text.contains("[tool call]"));
+        assert!(reasoning.is_none());
+
+        // Text split around a tool call joins with a single newline and leaves
+        // no dangling separator where the tool call used to sit.
+        let split = OneOrMany::many([
+            AssistantContent::text("a"),
+            AssistantContent::tool_call("1", "file_read", serde_json::json!({})),
+            AssistantContent::text("b"),
+        ])
+        .unwrap();
+
+        let (text, reasoning) = extract_content_from_response(&split);
+        assert_eq!(text, "a\nb");
+        assert!(reasoning.is_none());
+    }
+
+    /// A pure tool-call turn produces empty prose. Downstream,
+    /// `process_event_for_ui`'s `!content.trim().is_empty()` guard (src/lib.rs)
+    /// turns that into "no transcript bubble", while the 🔧 entry arrives
+    /// separately via `AgentEvent::ToolCall`.
+    #[test]
+    fn tool_call_only_response_yields_empty_prose() {
+        let choice = OneOrMany::one(AssistantContent::tool_call(
+            "1",
+            "file_read",
+            serde_json::json!({"path": "a.txt"}),
+        ));
+
+        let (text, reasoning) = extract_content_from_response(&choice);
+        assert!(text.is_empty());
+        assert!(reasoning.is_none());
+    }
+
+    /// Assistant images are never rendered — `ChatMessage.attachments` is
+    /// user-only — so they must not leak a placeholder into the prose lane.
+    #[test]
+    fn assistant_image_contributes_no_prose() {
+        let choice = OneOrMany::many([
+            AssistantContent::text("Here it is."),
+            AssistantContent::image_base64("aGVsbG8=", None, None),
+        ])
+        .unwrap();
+
+        let (text, reasoning) = extract_content_from_response(&choice);
+        assert_eq!(text, "Here it is.");
+        assert!(!text.contains("[image]"));
+        assert!(reasoning.is_none());
+    }
+
     #[test]
     fn test_get_model_pricing_minimax() {
         // JSON data from OpenRouter API for MiniMax M2.5 model
@@ -872,18 +934,10 @@ fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (Strin
                     reasoning = Some(reasonings);
                 }
             }
-            AssistantContent::ToolCall(_tc) => {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str("[tool call]");
-            }
-            AssistantContent::Image(_) => {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str("[image]");
-            }
+            // Tool calls and images are not prose — they reach the UI as their
+            // own ChatMessage (or not at all); synthesising a text placeholder
+            // here leaks a literal into the transcript.
+            AssistantContent::ToolCall(_) | AssistantContent::Image(_) => {}
         }
     }
 
