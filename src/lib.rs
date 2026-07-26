@@ -15,7 +15,7 @@ mod conversation;
 mod conversation_manager;
 mod conversation_title;
 mod hooks;
-mod http;
+pub mod http;
 mod mcp_auth;
 mod memory_compaction;
 #[cfg(feature = "mock")]

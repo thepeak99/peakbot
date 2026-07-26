@@ -132,6 +132,7 @@ Editing `config.yaml` or skills does not require a restart: each session verb re
 | `searxng.*`, `bash.env`, `agent_max_turns` | `web.*` (read once by the session reaper) |
 | `cost_tracking`, `context.*`, `retry.*`, `memory.*` | `pipeline` (built sub-agent registry) |
 | `tools.*` (built-in filter) | `provider` (legacy block) |
+| | `http.*` (published once into the client factory) |
 
 There is deliberately no filesystem watcher — reload is explicit, to avoid heisenbugs mid-turn.
 
@@ -197,7 +198,21 @@ tools:                           # built-in tool filter — pick ONE list
   disabled: [bash_bg, web_search]   # blocklist, XOR with:
   # only: [file_read, file_str_replace, bash]
   # Names = wire names from BUILTIN_TOOL_NAMES; unknown names rejected at load.
+
+http:                            # outbound timeouts for EVERY client (LLM,
+  connect_timeout_secs: 30       # embeddings, MCP auth, web tools). 0 = disabled.
+  read_timeout_secs: 600         # seconds of silence, reset on each read
 ```
+
+`read_timeout` bounds *silence*, not duration — but completions are
+non-streaming (`agent.prompt`), so nothing arrives until the model is done and
+for LLM calls it acts as a ceiling on a single generation. Raise it if you run
+models that legitimately think for longer than 10 minutes. Without it, an
+upstream that accepts a request and never answers wedges the turn until the
+process dies — Stop can't help, because `stop_requested` is only checked *after*
+the call returns. Tools that set their own shorter total `.timeout()`
+(`fetch_url`, `fetch_page`, `web_search`) are unaffected: whichever fires first
+wins.
 
 ### MCP servers
 
