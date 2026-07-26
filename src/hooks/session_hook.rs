@@ -5,7 +5,9 @@
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use rig_core::agent::{HookAction, PromptHook, ToolCallHookAction};
+use rig_core::agent::{
+    HookAction, InvalidToolCallContext, InvalidToolCallHookAction, PromptHook, ToolCallHookAction,
+};
 use rig_core::completion::message::AssistantContent;
 use rig_core::completion::{CompletionModel, CompletionResponse, message::Message};
 use rig_core::one_or_many::OneOrMany;
@@ -574,6 +576,146 @@ mod tests {
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].0, "developer");
     }
+
+    // ── Invalid tool-call recovery (ticket #223) ─────────────────────────────
+    //
+    // When the model emits a tool call for a name that isn't registered,
+    // PeakBot should feed it a synthetic "unknown tool" result and let it
+    // self-correct — instead of killing the turn with
+    // `PromptError::UnknownToolCall`. The planned fix overrides
+    // `PromptHook::on_invalid_tool_call` on `SessionHook` and returns
+    // `InvalidToolCallHookAction::Skip { reason }` with a reason string that
+    // (a) names the bad tool and (b) lists the registered tools so the
+    // model can pick a real one on retry.
+    //
+    // These tests pin BOTH branches of the reason formatter:
+    //   - empty available_tools → "(no tools available)"
+    //   - non-empty available_tools → comma-separated list
+    //
+    // They will not compile until the fix lands (the hook method doesn't
+    // exist on `SessionHook` yet), so the failure mode is a compile error
+    // pointing at the missing `on_invalid_tool_call` override — the
+    // intended RED.
+
+    /// Helper: build a minimal `InvalidToolCallContext` for the
+    /// reason-formatter tests. All fields on `InvalidToolCallContext` are
+    /// `pub` (verified against the vendored rig-core 0.38.2 source at
+    /// `~/.cargo/registry/src/.../rig-core-0.38.2/src/agent/prompt_request/hooks.rs`),
+    /// so direct struct construction is the right shape.
+    fn make_invalid_tool_call_context(
+        tool_name: &str,
+        available_tools: Vec<String>,
+    ) -> rig_core::agent::InvalidToolCallContext {
+        rig_core::agent::InvalidToolCallContext {
+            tool_name: tool_name.to_string(),
+            tool_call_id: Some("call_test_1".to_string()),
+            internal_call_id: Some("internal_test_1".to_string()),
+            args: Some("{}".to_string()),
+            available_tools,
+            allowed_tools: vec![],
+            tool_choice: None,
+            chat_history: vec![],
+            is_streaming: false,
+        }
+    }
+
+    /// Branch 1: when `available_tools` is empty, the synthetic reason
+    /// must name the bad tool AND include the literal
+    /// "(no tools available)". The model needs both pieces — the tool
+    /// name so it can correct itself, and the empty-list marker so it
+    /// doesn't keep retrying with a hallucinated tool.
+    #[tokio::test]
+    async fn invalid_tool_call_reason_names_bad_tool_when_no_tools_available() {
+        // Hook needs an event channel so SessionHook::new is happy — but
+        // we don't assert anything on events here, only on the returned
+        // reason. We pin `M = MockCompletionModel` via turbofish so the
+        // compiler can resolve which `PromptHook<M>` impl block we're
+        // invoking (production code never has this problem because the
+        // hook is always paired with a concrete completion model at
+        // agent-construction time).
+        let hook = SessionHook::new(None);
+        let ctx = make_invalid_tool_call_context("nope", vec![]);
+
+        // The trait `PromptHook<M>` is generic over `M` even though the
+        // method itself is not — turbofish on the trait disambiguates
+        // which impl block we're invoking. Production code never has
+        // this problem because the hook is always paired with a
+        // concrete completion model at agent-construction time.
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_invalid_tool_call(
+                &hook, &ctx,
+            )
+            .await;
+
+        // The fix MUST return Skip (not Fail, Retry, or Repair) so
+        // rig-core feeds the synthetic reason back as a ToolResult and
+        // loops. Asserting the exact variant pins the contract.
+        match action {
+            rig_core::agent::InvalidToolCallHookAction::Skip { reason } => {
+                assert!(
+                    reason.contains("unknown tool `nope`"),
+                    "reason must name the bad tool with backticks, got: {reason:?}"
+                );
+                assert!(
+                    reason.contains("(no tools available)"),
+                    "reason must include the empty-list marker, got: {reason:?}"
+                );
+            }
+            other => panic!(
+                "expected Skip {{ reason }}, got {other:?} — \
+                 SessionHook::on_invalid_tool_call must not fail-fast on unknown tools \
+                 (ticket #223: this would abort the turn with PromptError::UnknownToolCall)"
+            ),
+        }
+    }
+
+    /// Branch 2: when `available_tools` is non-empty, the synthetic
+    /// reason must name the bad tool AND every available tool (so the
+    /// model can pick a real one). We check three representative tool
+    /// names so the test pins ordering/comma-separation, not just
+    /// membership of a single token.
+    #[tokio::test]
+    async fn invalid_tool_call_reason_lists_every_available_tool() {
+        let hook = SessionHook::new(None);
+        let available = vec![
+            "bash".to_string(),
+            "file_read".to_string(),
+            "think".to_string(),
+        ];
+        let ctx = make_invalid_tool_call_context("totally_made_up", available.clone());
+
+        // See the empty-list test for the turbofish rationale.
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_invalid_tool_call(
+                &hook, &ctx,
+            )
+            .await;
+
+        match action {
+            rig_core::agent::InvalidToolCallHookAction::Skip { reason } => {
+                assert!(
+                    reason.contains("unknown tool `totally_made_up`"),
+                    "reason must name the bad tool with backticks, got: {reason:?}"
+                );
+                for tool in &available {
+                    assert!(
+                        reason.contains(tool),
+                        "reason must mention available tool `{tool}`, got: {reason:?}"
+                    );
+                }
+                // And — crucially — it must NOT use the empty-list marker
+                // when we have tools to list.
+                assert!(
+                    !reason.contains("(no tools available)"),
+                    "reason must NOT say 'no tools available' when tools ARE available, got: {reason:?}"
+                );
+            }
+            other => panic!(
+                "expected Skip {{ reason }}, got {other:?} — \
+                 SessionHook::on_invalid_tool_call must not fail-fast on unknown tools"
+            ),
+        }
+    }
 }
 
 #[derive(Clone)] // NOTE: Clone only shallow-copies the Arc handles
@@ -846,6 +988,37 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         }
 
         HookAction::Continue
+    }
+
+    /// A hallucinated tool name must not abort the whole turn (#223): hand the
+    /// model a synthetic error naming the real tools so it can self-correct.
+    /// `Skip` degrades to `Fail` under `ToolChoice::None`, which PeakBot never sets.
+    async fn on_invalid_tool_call(
+        &self,
+        ctx: &InvalidToolCallContext,
+    ) -> InvalidToolCallHookAction {
+        let available = if ctx.available_tools.is_empty() {
+            "(no tools available)".to_string()
+        } else {
+            ctx.available_tools.join(", ")
+        };
+        let reason = format!(
+            "Error: unknown tool `{}`. Available tools: {}. Pick one of those and retry.",
+            ctx.tool_name, available
+        );
+
+        // Surface it in the transcript — otherwise the recovery is invisible and
+        // the wasted round-trip looks like the model stalling.
+        if let Some(weak) = self.state_manager.as_ref()
+            && let Some(sm) = weak.upgrade()
+        {
+            sm.add_system_message(format!(
+                "⚠️  Model called unknown tool `{}` — sent a synthetic error and asked it to retry.",
+                ctx.tool_name
+            ));
+        }
+
+        InvalidToolCallHookAction::skip(reason)
     }
 
     /// Called before tool invocation - emit event
