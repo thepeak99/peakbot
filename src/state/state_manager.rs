@@ -329,6 +329,16 @@ impl StateManager {
         )
     }
 
+    /// Compaction threshold as a fraction (e.g. `0.8`), or `None` when
+    /// compaction is disabled or no `ContextManager` is initialized. The
+    /// delegate tool sizes each sub-agent's budget against *its own* model's
+    /// context size, so it needs the fraction rather than the token count.
+    pub fn compaction_threshold(&self) -> Option<f64> {
+        let guard = self.context_manager.read().unwrap();
+        let cm = guard.as_ref()?;
+        cm.is_enabled().then(|| cm.threshold_fraction())
+    }
+
     /// Read the most recent API-reported input-token count.
     /// Returns `0` when no API response has been seen yet — that signals
     /// `ContextManager` to fall back to the message-count heuristic.
@@ -3854,6 +3864,34 @@ mod tests {
         let cm = ContextManager::new(cfg, window, None);
         sm.init_context_manager(cm);
         sm
+    }
+
+    /// The delegate tool sizes each sub-agent's budget from this fraction
+    /// against the *role's* context size, so it must reflect config exactly.
+    #[test]
+    fn compaction_threshold_reports_fraction_when_enabled() {
+        let sm = sm_with_context_size(128_000);
+        assert_eq!(sm.compaction_threshold(), Some(0.8));
+    }
+
+    /// No `ContextManager` (or compaction disabled) means no budget — the
+    /// sub-agent gate then stays off rather than guessing a threshold.
+    #[test]
+    fn compaction_threshold_none_without_manager_or_when_disabled() {
+        use crate::config::ContextConfig;
+
+        let bare = StateManager::new_arc();
+        assert_eq!(bare.compaction_threshold(), None);
+
+        let sm = StateManager::new_arc();
+        let cfg = ContextConfig {
+            threshold: 0.8,
+            keep_recent: 5,
+            enabled: false,
+            compaction_model: None,
+        };
+        sm.init_context_manager(ContextManager::new(cfg, 128_000, None));
+        assert_eq!(sm.compaction_threshold(), None);
     }
 
     #[test]

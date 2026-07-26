@@ -1203,7 +1203,11 @@ pub fn create_mock_agent(
 /// **Ollama is hookless by type** (`DynAgent::Ollama` carries `()`), so a role
 /// on an Ollama model ignores `sink`/`source`: no event TEE, no cost roll-up,
 /// no stop for that lane. This matches Ollama's existing no-cost-tracking
-/// behaviour — a documented degradation, not a silent surprise.
+/// behaviour — a documented degradation, not a silent surprise. The same
+/// applies to `context_budget`: an Ollama sub-agent gets neither the proactive
+/// gate nor a history snapshot, so an interrupted run is summarised only when
+/// the error itself carries history (`MaxTurnsError`, `PromptCancelled`);
+/// a bare `CompletionError` yields a header-only handoff.
 pub(crate) fn build_sub_agent(
     config: &ProviderConfig,
     preamble: &str,
@@ -1216,11 +1220,15 @@ pub(crate) fn build_sub_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    context_budget: Option<usize>,
 ) -> Result<(DynAgent, Arc<SessionHook>)> {
-    // Events-only lane-tagged hook. No compaction gate (fresh context).
-    let hook = SessionHook::new(sink).with_source(crate::ui::app_state::MessageSource::SubAgent {
-        role: role.to_string(),
-    });
+    // Events-only lane-tagged hook. No compaction gate (fresh context) — the
+    // sub-agent gate terminates instead of compacting.
+    let hook = SessionHook::new(sink)
+        .with_source(crate::ui::app_state::MessageSource::SubAgent {
+            role: role.to_string(),
+        })
+        .with_sub_agent_gate(context_budget);
 
     // A sub-agent never sees `delegate` (no nested delegation). It reaches the
     // `todo` tool via `add_builtin_tools`'s `todo_tool.unwrap_or_default()`,

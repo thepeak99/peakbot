@@ -778,6 +778,121 @@ mod tests {
             ),
         }
     }
+
+    // ── Sub-agent gate ──────────────────────────────────────────────────────
+
+    fn user_msg(text: &str) -> Message {
+        Message::user(text)
+    }
+
+    /// The snapshot must be `history ++ [prompt]` — exactly what rig would put
+    /// in a `PromptCancelled` at that instant — and it must be visible through
+    /// a *clone* of the hook, since the agent holds one clone and the delegate
+    /// tool holds another.
+    #[tokio::test]
+    async fn sub_agent_gate_snapshots_history_through_clones() {
+        let hook = SessionHook::new(None).with_sub_agent_gate(None);
+        let clone = hook.clone();
+        assert!(
+            hook.history_snapshot().is_empty(),
+            "empty before any request"
+        );
+
+        let history = vec![user_msg("task"), Message::assistant("working")];
+        let prompt = user_msg("next");
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook, &prompt, &history,
+            )
+            .await;
+
+        assert!(
+            matches!(action, HookAction::Continue),
+            "no budget = no gate"
+        );
+        let snap = clone.history_snapshot();
+        assert_eq!(snap.len(), 3, "snapshot must be history ++ [prompt]");
+        assert_eq!(snap[2], prompt);
+    }
+
+    /// The gate fires on the request *after* the one that blew the budget —
+    /// terminating before the oversized request is what makes it proactive.
+    #[tokio::test]
+    async fn sub_agent_gate_terminates_over_budget() {
+        let stats = Arc::new(Mutex::new(SessionStats::new()));
+        let hook = SessionHook::with_context_tracking(None, stats.clone())
+            .with_sub_agent_gate(Some(1_000));
+
+        let prompt = user_msg("next");
+        let under =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &prompt,
+                &[],
+            )
+            .await;
+        assert!(
+            matches!(under, HookAction::Continue),
+            "no usage reported yet must not trip the gate"
+        );
+
+        stats
+            .lock()
+            .unwrap()
+            .add_request("reviewer", 1_001, 10, 0.0);
+        let over =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &prompt,
+                &[],
+            )
+            .await;
+        match over {
+            HookAction::Terminate { reason } => assert_eq!(reason, "subagent-context"),
+            other => panic!("expected terminate(subagent-context), got {other:?}"),
+        }
+        assert_eq!(
+            hook.history_snapshot().len(),
+            1,
+            "the gate must still snapshot before firing"
+        );
+    }
+
+    /// An orchestrator hook has no gate at all: no snapshot, no terminate.
+    #[tokio::test]
+    async fn orchestrator_hook_has_no_sub_agent_gate() {
+        let stats = Arc::new(Mutex::new(SessionStats::new()));
+        stats
+            .lock()
+            .unwrap()
+            .add_request("orchestrator", 999_999, 10, 0.0);
+        let hook = SessionHook::with_context_tracking(None, stats);
+
+        let prompt = user_msg("next");
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &prompt,
+                &[],
+            )
+            .await;
+        assert!(matches!(action, HookAction::Continue));
+        assert!(hook.history_snapshot().is_empty());
+    }
+}
+
+/// Sub-agent-only hook state. `SessionHook: Clone` shallow-copies Arc handles,
+/// so `last_history` must stay behind an `Arc` — otherwise the clone handed to
+/// the agent and the `Arc<SessionHook>` handed to the caller would diverge.
+#[derive(Clone)]
+struct SubAgentGate {
+    /// Terminate before a request whose predecessor already reported more
+    /// input tokens than this. `None` = gate disabled; snapshotting still happens.
+    budget: Option<usize>,
+    /// History as of the most recent `on_completion_call` — exactly the full
+    /// history rig would carry in a `PromptCancelled` at that instant. Empty
+    /// until the first call (and forever under hookless Ollama).
+    last_history: Arc<Mutex<Vec<Message>>>,
 }
 
 #[derive(Clone)] // NOTE: Clone only shallow-copies the Arc handles
@@ -800,6 +915,10 @@ pub struct SessionHook {
     /// hook, and the manager owns the agent indirectly via the registry, so
     /// an `Arc` here would cycle.
     state_manager: Option<Weak<crate::state::StateManager>>,
+    /// Set only on a sub-agent's hook (by `build_sub_agent`): the context
+    /// budget gate plus the per-request history snapshot the delegate tool
+    /// reads to summarise an interrupted delegation.
+    sub_agent: Option<SubAgentGate>,
 }
 
 impl SessionHook {
@@ -811,6 +930,7 @@ impl SessionHook {
             stats: Arc::new(Mutex::new(SessionStats::new())),
             stop_requested: Arc::new(AtomicBool::new(false)),
             state_manager: None,
+            sub_agent: None,
         }
     }
 
@@ -825,6 +945,7 @@ impl SessionHook {
             stats,
             stop_requested: Arc::new(AtomicBool::new(false)),
             state_manager: None,
+            sub_agent: None,
         }
     }
 
@@ -846,6 +967,27 @@ impl SessionHook {
     pub fn with_state_manager(mut self, sm: &Arc<crate::state::StateManager>) -> Self {
         self.state_manager = Some(Arc::downgrade(sm));
         self
+    }
+
+    /// Mark this hook as a sub-agent's and give it a context budget in input
+    /// tokens. Called only from `build_sub_agent`. A `None` budget disables the
+    /// proactive gate; history snapshotting happens either way.
+    pub fn with_sub_agent_gate(mut self, budget: Option<usize>) -> Self {
+        self.sub_agent = Some(SubAgentGate {
+            budget,
+            last_history: Arc::new(Mutex::new(Vec::new())),
+        });
+        self
+    }
+
+    /// The history as of the last `on_completion_call`. Empty for an
+    /// orchestrator hook, for a hookless (Ollama) sub-agent, and before the
+    /// first request.
+    pub fn history_snapshot(&self) -> Vec<Message> {
+        self.sub_agent
+            .as_ref()
+            .map(|gate| gate.last_history.lock().unwrap().clone())
+            .unwrap_or_default()
     }
 
     /// Request the agent to stop
@@ -878,6 +1020,7 @@ impl SessionHook {
                 stats: Arc::new(Mutex::new(SessionStats::new())),
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 state_manager: None,
+                sub_agent: None,
             },
             receiver,
         )
@@ -945,9 +1088,13 @@ fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (Strin
 }
 
 impl<M: CompletionModel> PromptHook<M> for SessionHook {
-    /// Called before the prompt is sent. Two responsibilities:
+    /// Called before the prompt is sent. Three responsibilities:
     /// 1. Emit a `CompletionRequest` event for observers (cost tracker, UI).
-    /// 2. **Gate in-loop compaction**: if the wired `StateManager` says
+    /// 2. **Sub-agent gate** (sub-agent hooks only): snapshot the history rig
+    ///    is about to send — the delegate tool summarises it if the run fails —
+    ///    and terminate with reason `"subagent-context"` when the previous
+    ///    request already blew the role's context budget.
+    /// 3. **Gate in-loop compaction**: if the wired `StateManager` says
     ///    `needs_compaction()`, terminate the agentic loop with reason
     ///    `"compact"`. The caller (`process_message_internal`) catches this,
     ///    runs `force_compact().await` synchronously, and re-enters
@@ -959,7 +1106,7 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
     /// cycles lives in `apply_compaction` (which clears
     /// `last_input_tokens`), not here. See `mid-compaction.md` for the full
     /// design.
-    async fn on_completion_call(&self, _prompt: &Message, history: &[Message]) -> HookAction {
+    async fn on_completion_call(&self, prompt: &Message, history: &[Message]) -> HookAction {
         if let Some(ref sender) = self.event_sender {
             let event = AgentEvent::CompletionRequest {
                 message_count: history.len() + 1,
@@ -970,6 +1117,27 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
                 source: self.source.clone(),
                 event,
             });
+        }
+
+        // Sub-agent budget gate. `history ++ [prompt]` is exactly what rig
+        // would put in a `PromptCancelled` here, so snapshot before deciding —
+        // the gate-fire and the error paths then see identical history.
+        if let Some(gate) = &self.sub_agent {
+            let mut full = history.to_vec();
+            full.push(prompt.clone());
+            *gate.last_history.lock().unwrap() = full;
+
+            let last_input = self.stats.lock().unwrap().last_input_tokens().unwrap_or(0) as usize;
+            if let Some(budget) = gate.budget
+                && last_input > budget
+            {
+                tracing::info!(
+                    last_input,
+                    budget,
+                    "Sub-agent context budget crossed, terminating before the oversized request"
+                );
+                return HookAction::terminate("subagent-context");
+            }
         }
 
         // In-loop compaction gate. Only fires when a StateManager is wired.

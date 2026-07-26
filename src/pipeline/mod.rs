@@ -4,6 +4,7 @@
 //! with an entrypoint agent that can delegate tasks to specialized sub-agents.
 
 mod delegate_tool;
+mod handoff;
 pub(crate) mod registry;
 
 use crate::hooks::SessionHook;
