@@ -247,6 +247,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         deps.vector_store.as_ref(),
         &deps.skills,
         active_sub_agent_hook.clone(),
+        &deps.config.retry,
     )?;
 
     // Stamp the wire identity `(provider_name, model)` and the display

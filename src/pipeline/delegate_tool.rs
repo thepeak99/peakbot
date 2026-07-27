@@ -16,6 +16,7 @@ use crate::config::{BashConfig, SearXngConfig};
 use crate::hooks::SessionHook;
 use crate::hooks::events::SourcedEvent;
 use crate::pipeline::ActiveSubAgentHook;
+use crate::pipeline::handoff;
 use crate::pipeline::registry::SubAgentRegistry;
 use crate::state::StateManager;
 use crate::tools::ShellKind;
@@ -50,6 +51,8 @@ pub struct SubAgentDeps {
     pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
     /// The cell holding the currently-running sub-agent hook, for `/stop`.
     pub active_hook: ActiveSubAgentHook,
+    /// Retry policy for a delegation's wire calls — the orchestrator's own.
+    pub retry: crate::config::RetryConfig,
 }
 
 /// Build a sub-agent's preamble: `role_prompt` + the live env block + this
@@ -227,6 +230,13 @@ impl Tool for DelegateTool {
             role.agents_md,
         );
 
+        // Size the gate against THIS role's model, not the orchestrator's:
+        // roles routinely run on smaller-context models.
+        let context_budget = deps
+            .state_manager
+            .compaction_threshold()
+            .map(|fraction| (fraction * role.model.context_size as f64) as usize);
+
         let (agent, hook) = crate::providers::build_sub_agent(
             &role.model.provider_config,
             &preamble,
@@ -239,6 +249,7 @@ impl Tool for DelegateTool {
             deps.state_manager.clone(),
             deps.shell_kind.as_ref(),
             deps.vector_store.as_ref(),
+            context_budget,
         )
         .map_err(|e| DelegateError::Build {
             role: args.role.clone(),
@@ -246,19 +257,58 @@ impl Tool for DelegateTool {
         })?;
 
         // Register the hook so `/stop` reaches this innermost agent. The guard
-        // clears the cell on any exit path.
-        let _guard = ActiveHookGuard::set(&deps.active_hook, hook);
+        // clears the cell on any exit path. The failure path still needs the
+        // hook to read its history snapshot, hence the clone.
+        let _guard = ActiveHookGuard::set(&deps.active_hook, hook.clone());
 
         // Fresh history — pure agents-as-tools; no memory of prior delegations.
         let mut history = Vec::new();
-        agent
-            .prompt_with_history(args.task.as_str(), &mut history)
-            .await
-            .map(|text| normalize_delegate_output(&args.role, text))
-            .map_err(|e| DelegateError::Run {
-                role: args.role.clone(),
-                error: e.to_string(),
-            })
+        let mut attempt = 0;
+        let outcome = loop {
+            match agent
+                .prompt_with_history(args.task.as_str(), &mut history)
+                .await
+            {
+                Ok(text) => break Ok(text),
+                // Transient wire failures (429/5xx/transport) get the same
+                // in-place retry the main loop gives its own turns — only what
+                // outlives the budget is worth handing back. The retry re-runs
+                // the delegation from the task: rig owns the sub-agent's
+                // internal loop state, which isn't resumable from out here.
+                Err(e) => {
+                    let Some(delay) =
+                        crate::providers::retry::next_retry_delay(&e, attempt, &deps.retry)
+                    else {
+                        break Err(e);
+                    };
+                    tracing::warn!(
+                        target: "peakbot",
+                        role = %args.role,
+                        attempt = attempt + 1,
+                        max_retries = deps.retry.max_retries,
+                        backoff_ms = delay.as_millis(),
+                        error = %e,
+                        "Sub-agent request failed transiently; backing off before retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        };
+
+        match outcome {
+            Ok(text) => Ok(normalize_delegate_output(&args.role, text)),
+            // A dead sub-agent still knows things. Everything but a user stop
+            // comes back as a summarised handoff so the orchestrator can decide
+            // what to re-delegate instead of re-running the same wall.
+            Err(e) => match handoff::classify(e, hook.history_snapshot()) {
+                handoff::Handoff::Abort(err) => Err(DelegateError::Run {
+                    role: args.role.clone(),
+                    error: err.to_string(),
+                }),
+                h => Ok(handoff::build(&args.role, h, &role.model.provider_config).await),
+            },
+        }
     }
 }
 

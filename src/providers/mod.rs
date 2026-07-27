@@ -14,7 +14,7 @@ pub mod retry;
 
 use crate::config::{
     AnthropicCaching, AnthropicConfig, BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig,
-    OpenRouterConfig, ProviderConfig, SearXngConfig,
+    OpenRouterConfig, ProviderConfig, RetryConfig, SearXngConfig,
 };
 use crate::hooks::SessionHook;
 use crate::hooks::events::SourcedEvent;
@@ -201,6 +201,7 @@ pub fn create_provider(
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
+    retry: &RetryConfig,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
@@ -224,6 +225,7 @@ pub fn create_provider(
                 vector_store,
                 skills,
                 active_sub_agent_hook,
+                retry,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -248,6 +250,7 @@ pub fn create_provider(
                 vector_store,
                 skills,
                 active_sub_agent_hook,
+                retry,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -272,6 +275,7 @@ pub fn create_provider(
                 vector_store,
                 skills,
                 active_sub_agent_hook,
+                retry,
             )?;
             Ok((
                 DynAgent::Anthropic(agent),
@@ -296,6 +300,7 @@ pub fn create_provider(
                 vector_store,
                 skills,
                 active_sub_agent_hook,
+                retry,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -320,6 +325,7 @@ pub fn create_provider(
                 vector_store,
                 skills,
                 active_sub_agent_hook,
+                retry,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -574,6 +580,7 @@ where
             skills: wiring.skills,
             event_sink: wiring.event_sink,
             active_hook: wiring.active_hook,
+            retry: wiring.retry,
         };
         let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(deps));
         tools.push(gate(Box::new(delegate_tool)));
@@ -605,7 +612,7 @@ fn wire_bash_tool(
 /// The extra sub-agent build context threaded into [`add_builtin_tools`] that
 /// it doesn't already receive as direct args: the orchestrator's event sink
 /// (sub-agent events TEE here tagged `SubAgent`), the active-hook cell (for
-/// `/stop` routing), and `max_turns`.
+/// `/stop` routing), `max_turns`, and the retry policy.
 pub(crate) struct SubAgentWiring {
     pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
     pub active_hook: crate::pipeline::ActiveSubAgentHook,
@@ -613,6 +620,9 @@ pub(crate) struct SubAgentWiring {
     /// The discovered skills — each delegation renders this through the
     /// role's filter into the sub-agent preamble.
     pub skills: crate::skills::SkillRegistry,
+    /// Retry policy for a delegation's own wire calls — the same one the main
+    /// run loop uses, so a sub-agent survives the blips a top-level turn does.
+    pub retry: RetryConfig,
 }
 
 /// Internal enum to hold either a Bash or PowerShell tool for registration.
@@ -648,6 +658,7 @@ fn create_openrouter_agent(
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
+    retry: &RetryConfig,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -706,6 +717,7 @@ fn create_openrouter_agent(
         Some(SubAgentWiring {
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
+            retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
         }),
@@ -746,6 +758,7 @@ fn create_anthropic_agent(
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
+    retry: &RetryConfig,
 ) -> Result<(
     Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -808,6 +821,7 @@ fn create_anthropic_agent(
         Some(SubAgentWiring {
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
+            retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
         }),
@@ -845,6 +859,7 @@ fn create_ollama_agent(
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
+    retry: &RetryConfig,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -894,6 +909,7 @@ fn create_ollama_agent(
         Some(SubAgentWiring {
             event_sink: None,
             active_hook: active_sub_agent_hook,
+            retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
         }),
@@ -932,6 +948,7 @@ fn create_openai_agent(
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
+    retry: &RetryConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -992,6 +1009,7 @@ fn create_openai_agent(
         Some(SubAgentWiring {
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
+            retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
         }),
@@ -1030,6 +1048,7 @@ fn create_llamacpp_agent(
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
+    retry: &RetryConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -1093,6 +1112,7 @@ fn create_llamacpp_agent(
         Some(SubAgentWiring {
             event_sink: Some(sender),
             active_hook: active_sub_agent_hook,
+            retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
         }),
@@ -1203,7 +1223,11 @@ pub fn create_mock_agent(
 /// **Ollama is hookless by type** (`DynAgent::Ollama` carries `()`), so a role
 /// on an Ollama model ignores `sink`/`source`: no event TEE, no cost roll-up,
 /// no stop for that lane. This matches Ollama's existing no-cost-tracking
-/// behaviour — a documented degradation, not a silent surprise.
+/// behaviour — a documented degradation, not a silent surprise. The same
+/// applies to `context_budget`: an Ollama sub-agent gets neither the proactive
+/// gate nor a history snapshot, so an interrupted run is summarised only when
+/// the error itself carries history (`MaxTurnsError`, `PromptCancelled`);
+/// a bare `CompletionError` yields a header-only handoff.
 pub(crate) fn build_sub_agent(
     config: &ProviderConfig,
     preamble: &str,
@@ -1216,11 +1240,15 @@ pub(crate) fn build_sub_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
+    context_budget: Option<usize>,
 ) -> Result<(DynAgent, Arc<SessionHook>)> {
-    // Events-only lane-tagged hook. No compaction gate (fresh context).
-    let hook = SessionHook::new(sink).with_source(crate::ui::app_state::MessageSource::SubAgent {
-        role: role.to_string(),
-    });
+    // Events-only lane-tagged hook. No compaction gate (fresh context) — the
+    // sub-agent gate terminates instead of compacting.
+    let hook = SessionHook::new(sink)
+        .with_source(crate::ui::app_state::MessageSource::SubAgent {
+            role: role.to_string(),
+        })
+        .with_sub_agent_gate(context_budget);
 
     // A sub-agent never sees `delegate` (no nested delegation). It reaches the
     // `todo` tool via `add_builtin_tools`'s `todo_tool.unwrap_or_default()`,
