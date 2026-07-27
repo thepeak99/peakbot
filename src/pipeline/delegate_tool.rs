@@ -51,6 +51,8 @@ pub struct SubAgentDeps {
     pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
     /// The cell holding the currently-running sub-agent hook, for `/stop`.
     pub active_hook: ActiveSubAgentHook,
+    /// Retry policy for a delegation's wire calls — the orchestrator's own.
+    pub retry: crate::config::RetryConfig,
 }
 
 /// Build a sub-agent's preamble: `role_prompt` + the live env block + this
@@ -261,10 +263,40 @@ impl Tool for DelegateTool {
 
         // Fresh history — pure agents-as-tools; no memory of prior delegations.
         let mut history = Vec::new();
-        match agent
-            .prompt_with_history(args.task.as_str(), &mut history)
-            .await
-        {
+        let mut attempt = 0;
+        let outcome = loop {
+            match agent
+                .prompt_with_history(args.task.as_str(), &mut history)
+                .await
+            {
+                Ok(text) => break Ok(text),
+                // Transient wire failures (429/5xx/transport) get the same
+                // in-place retry the main loop gives its own turns — only what
+                // outlives the budget is worth handing back. The retry re-runs
+                // the delegation from the task: rig owns the sub-agent's
+                // internal loop state, which isn't resumable from out here.
+                Err(e) => {
+                    let Some(delay) =
+                        crate::providers::retry::next_retry_delay(&e, attempt, &deps.retry)
+                    else {
+                        break Err(e);
+                    };
+                    tracing::warn!(
+                        target: "peakbot",
+                        role = %args.role,
+                        attempt = attempt + 1,
+                        max_retries = deps.retry.max_retries,
+                        backoff_ms = delay.as_millis(),
+                        error = %e,
+                        "Sub-agent request failed transiently; backing off before retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        };
+
+        match outcome {
             Ok(text) => Ok(normalize_delegate_output(&args.role, text)),
             // A dead sub-agent still knows things. Everything but a user stop
             // comes back as a summarised handoff so the orchestrator can decide

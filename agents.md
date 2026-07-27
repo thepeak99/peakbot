@@ -485,6 +485,8 @@ A sub-agent's preamble (`build_sub_agent_preamble`, rebuilt fresh per delegation
 
 Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). No sandbox in v1 — a sub-agent can write and run bash. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together (stop routes to the innermost hook via `ActiveSubAgentHook`); there is no resumption path.
 
+Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`), unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`.
+
 Where it lives: `src/pipeline/{delegate_tool,registry}.rs`, `build_sub_agent` in `src/providers/mod.rs`, `MessageSource` + lane filter in `src/ui/app_state.rs` / `src/state/state_manager.rs`.
 
 ## CI (Gitea Actions)

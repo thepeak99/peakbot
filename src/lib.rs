@@ -1855,6 +1855,7 @@ impl AgentRunner {
             ctx.vector_store.as_ref(),
             &ctx.skills,
             active_sub_agent_hook.clone(),
+            config.retry(),
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 

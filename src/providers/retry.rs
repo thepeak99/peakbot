@@ -78,6 +78,17 @@ pub fn backoff_delay(attempt: u32, cfg: &RetryConfig) -> Duration {
     Duration::from_millis(base_ms).min(Duration::from_millis(cfg.max_delay_ms))
 }
 
+/// How long to wait before re-running a failed prompt, or `None` when the
+/// error is permanent or the retry budget is spent. Same policy the main run
+/// loop applies inline (`process_message_internal`), reused by the sub-agent
+/// path so a delegation survives the blips a top-level turn survives.
+pub fn next_retry_delay(err: &PromptError, attempt: u32, cfg: &RetryConfig) -> Option<Duration> {
+    if !is_transient_prompt_error(err) || attempt >= cfg.max_retries {
+        return None;
+    }
+    Some(backoff_delay(attempt, cfg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +183,47 @@ mod tests {
 
         // attempt 100 would overflow 2^100 — must not panic, must clamp.
         assert_eq!(backoff_delay(100, &cfg), ms(8000));
+    }
+
+    #[test]
+    fn next_retry_delay_honours_transience_and_budget() {
+        let cfg = RetryConfig {
+            max_retries: 2,
+            initial_delay_ms: 100,
+            max_delay_ms: 1000,
+            backoff_factor: 2.0,
+        };
+        let transient = PromptError::CompletionError(CompletionError::ProviderError(
+            "503 Service Unavailable".to_string(),
+        ));
+        let permanent = PromptError::CompletionError(CompletionError::ProviderError(
+            "Invalid API key".to_string(),
+        ));
+
+        assert_eq!(
+            next_retry_delay(&transient, 0, &cfg),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            next_retry_delay(&transient, 1, &cfg),
+            Some(Duration::from_millis(200))
+        );
+        // Budget spent: attempt 2 would be the third try with max_retries = 2.
+        assert_eq!(next_retry_delay(&transient, 2, &cfg), None);
+        // Permanent errors never retry, however much budget is left.
+        assert_eq!(next_retry_delay(&permanent, 0, &cfg), None);
+    }
+
+    #[test]
+    fn next_retry_delay_with_retries_disabled() {
+        let cfg = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let transient = PromptError::CompletionError(CompletionError::HttpError(
+            rig_core::http_client::Error::StreamEnded,
+        ));
+        assert_eq!(next_retry_delay(&transient, 0, &cfg), None);
     }
 
     #[test]

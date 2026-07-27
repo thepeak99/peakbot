@@ -18,4 +18,5 @@ mod powershell_tests;
 mod queued_input_tests;
 mod stats_tests;
 mod stop_tests;
+mod tool_error_recovery;
 mod unknown_tool_call_recovery;

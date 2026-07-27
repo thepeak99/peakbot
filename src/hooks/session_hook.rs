@@ -779,6 +779,40 @@ mod tests {
         }
     }
 
+    /// A sub-agent's hook is the same `SessionHook` with a lane + budget gate,
+    /// so a hallucinated tool name must be skipped there too — a delegation
+    /// dying on an unknown tool would reach `handoff::classify` as a failure
+    /// instead of letting the sub-agent self-correct.
+    #[tokio::test]
+    async fn sub_agent_hook_skips_unknown_tool_call_like_the_orchestrator() {
+        let hook = SessionHook::new(None)
+            .with_source(MessageSource::SubAgent {
+                role: "reviewer".to_string(),
+            })
+            .with_sub_agent_gate(Some(1_000));
+        let ctx = make_invalid_tool_call_context("teleport", vec!["bash".to_string()]);
+
+        // See the empty-list test for the turbofish rationale.
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_invalid_tool_call(
+                &hook, &ctx,
+            )
+            .await;
+
+        match action {
+            rig_core::agent::InvalidToolCallHookAction::Skip { reason } => {
+                assert!(
+                    reason.contains("unknown tool `teleport`") && reason.contains("bash"),
+                    "reason must name the bad tool and the real ones, got: {reason:?}"
+                );
+            }
+            other => panic!(
+                "expected Skip {{ reason }}, got {other:?} — a sub-agent must recover \
+                 from an unknown tool call exactly like the orchestrator does"
+            ),
+        }
+    }
+
     // ── Sub-agent gate ──────────────────────────────────────────────────────
 
     fn user_msg(text: &str) -> Message {

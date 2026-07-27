@@ -9,6 +9,11 @@
 //!
 //! The single exception is a user `/stop`, which stays an error so the whole
 //! turn unwinds as before.
+//!
+//! Only failures that genuinely end a delegation reach `classify`: unknown
+//! tool calls and tool errors are fed back to the sub-agent mid-loop (see
+//! `SessionHook::on_invalid_tool_call` and rig's tool executor), and transient
+//! wire errors are retried in `DelegateTool::call`.
 
 use crate::config::ProviderConfig;
 use crate::providers::create_compaction_model;
@@ -104,6 +109,9 @@ pub(crate) fn classify(err: PromptError, snapshot: Vec<Message>) -> Handoff {
             error: format!("reached its max turn limit ({max_turns})"),
             history: pick(*chat_history, snapshot),
         },
+        // Only reachable for a hookless (Ollama) sub-agent: everywhere else
+        // `SessionHook::on_invalid_tool_call` skips the call with a synthetic
+        // "unknown tool" result and the sub-agent self-corrects (#223).
         PromptError::UnknownToolCall {
             tool_name,
             chat_history,
@@ -114,10 +122,15 @@ pub(crate) fn classify(err: PromptError, snapshot: Vec<Message>) -> Handoff {
         },
         // These variants carry no history at all — the snapshot is all there is.
         // Never sniff the provider's error text; the class is the signal.
+        // Transient ones were already retried in `DelegateTool::call`, so one
+        // arriving here means the budget is spent or the failure is permanent.
         PromptError::CompletionError(e) => Handoff::Failed {
             error: cap_error(&e.to_string()),
             history: snapshot,
         },
+        // rig hands a failing tool's message back to the model as a tool result
+        // and keeps looping, so the agentic loop never raises this — kept for
+        // totality over `PromptError`.
         PromptError::ToolError(e) => Handoff::Failed {
             error: cap_error(&e.to_string()),
             history: snapshot,
@@ -529,6 +542,10 @@ mod tests {
         }
     }
 
+    /// Residual path only: a hooked sub-agent recovers from a hallucinated
+    /// tool name in-loop (`SessionHook::on_invalid_tool_call`), so this arm
+    /// speaks for the hookless (Ollama) lane — where the delegation really is
+    /// over and the orchestrator needs the summary.
     #[test]
     fn classify_unknown_tool_call_is_failed_with_tool_name() {
         let err = PromptError::UnknownToolCall {
@@ -547,7 +564,10 @@ mod tests {
     }
 
     /// `CompletionError` carries no history, so the snapshot is all there is —
-    /// and its message is capped, never substring-sniffed.
+    /// and its message is capped, never substring-sniffed. Reaching `classify`
+    /// at all means `DelegateTool::call` already spent its retry budget (or
+    /// the error was permanent); the class is the signal, so this arm doesn't
+    /// re-judge transience.
     #[test]
     fn classify_completion_error_uses_snapshot_and_caps_message() {
         let long = "x".repeat(5000);
@@ -566,6 +586,10 @@ mod tests {
         }
     }
 
+    /// Defensive arm: rig returns a failing tool's message to the model as a
+    /// tool result and keeps looping, so the agentic loop never raises this.
+    /// Kept total anyway — if some future path does, the orchestrator gets a
+    /// summary rather than a stringified error.
     #[test]
     fn classify_tool_error_uses_snapshot() {
         let err = PromptError::ToolError(ToolSetError::ToolNotFoundError("nope".to_string()));
