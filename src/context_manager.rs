@@ -680,4 +680,132 @@ mod tests {
         // 50_000 × 0.8 = 40_000
         assert_eq!(cm.threshold(), 40_000);
     }
+
+    // ── Compaction × sub-agent lane (RED for tickets/compaction-subagent-lane) ─
+    //
+    // Pinned by `tickets/compaction-subagent-lane.md` § 8.2.
+
+    /// Spec § 8.2 — `compact_summary_input_excludes_sub_agent_turns`.
+    ///
+    /// The summarization prompt must be built from the orchestrator's live
+    /// context only. A sub-agent's internal turns (sourced `SubAgent { role }`)
+    /// live in the transcript but never the orchestrator's wire — and so
+    /// they must NEVER reach the compaction model. Today the prompt is
+    /// built from `!compacted` lane-blind, leaking sub-agent content into
+    /// the summary.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn compact_summary_input_excludes_sub_agent_turns() {
+        use crate::ui::app_state::{ChatMessage, MessageSource};
+        use rig_core::completion::message::UserContent;
+
+        let (model, mock) = crate::providers::create_mock_compaction_model();
+        mock.add_response(crate::mock::MockResponse::text("Summary text."));
+
+        let cfg = ContextConfig {
+            threshold: 0.5,
+            keep_recent: 1, // summarize everything except the last message
+            enabled: true,
+            compaction_model: None,
+        };
+        let cm = ContextManager::new(cfg, 100_000, Some(std::sync::Arc::new(model)));
+
+        // Interleave orchestrator rows carrying ORCH_MARKER with sub-agent
+        // rows carrying SUBAGENT_MARKER (in tool args/results/text).
+        // keep_recent=1: only the last row is kept, so the rest get summarized.
+        let orch = MessageSource::Human;
+        let sub = MessageSource::SubAgent {
+            role: "junior".to_string(),
+        };
+
+        let messages = vec![
+            // Summarized region
+            ChatMessage::user("ORCH_MARKER_first_user".to_string()).with_source(orch.clone()),
+            ChatMessage::tool_call(
+                "bash",
+                r#"{"command":"ORCH_MARKER in args"}"#,
+                Some("orch-tc".to_string()),
+            )
+            .with_source(orch.clone()),
+            ChatMessage::tool_result(
+                "bash",
+                r#"{"command":"ORCH_MARKER in args"}"#,
+                "ORCH_MARKER in result",
+                Some("orch-tc".to_string()),
+            )
+            .with_source(orch.clone()),
+            // Sub-agent rows interleaved
+            ChatMessage::agent("SUBAGENT_MARKER_thinking".to_string()).with_source(sub.clone()),
+            ChatMessage::tool_call(
+                "bash",
+                r#"{"command":"SUBAGENT_MARKER in args"}"#,
+                Some("sub-tc".to_string()),
+            )
+            .with_source(sub.clone()),
+            ChatMessage::tool_result(
+                "bash",
+                r#"{"command":"SUBAGENT_MARKER in args"}"#,
+                "SUBAGENT_MARKER in result",
+                Some("sub-tc".to_string()),
+            )
+            .with_source(sub.clone()),
+            ChatMessage::agent("ORCH_MARKER_middle_user".to_string()).with_source(orch.clone()),
+            ChatMessage::agent("SUBAGENT_MARKER_more".to_string()).with_source(sub.clone()),
+            // Kept region (last row)
+            ChatMessage::agent("ORCH_MARKER_last".to_string()).with_source(MessageSource::Human),
+        ];
+
+        let plan = cm
+            .compact(&messages)
+            .await
+            .expect("compact must succeed with mock summarizer queued");
+
+        // Extract the summarization prompt from the recorded request.
+        let requests = mock.get_recorded_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly 1 summarization request, got {}",
+            requests.len()
+        );
+        let req = &requests[0];
+
+        // The prompt lands as a User message in the agent's chat_history.
+        // Concatenate every text part of every User message so we can assert
+        // on substring presence without depending on message-splitting.
+        let prompt_text: String = req
+            .chat_history
+            .iter()
+            .flat_map(|m| match m {
+                rig_core::completion::message::Message::User { content } => {
+                    let parts: Vec<String> = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    parts
+                }
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Use the plan only to confirm compaction completed — the content
+        // assertions are on the recorded prompt.
+        assert!(!plan.summary.is_empty(), "summarizer must return a summary");
+
+        // The pin: orchestrator content IS summarized; sub-agent content is NOT.
+        assert!(
+            prompt_text.contains("ORCH_MARKER"),
+            "summarization prompt must contain orchestrator markers; got:\n{prompt_text}"
+        );
+        assert!(
+            !prompt_text.contains("SUBAGENT_MARKER"),
+            "summarization prompt must NOT contain any sub-agent marker content \
+             (RED: today the lane-blind slice feeds sub-agent rows to the compaction model); \
+             got:\n{prompt_text}"
+        );
+    }
 }

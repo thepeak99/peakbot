@@ -5280,4 +5280,317 @@ mod tests {
         let res = sm.try_forward_bash_stdin("hi".to_string());
         assert_eq!(res, Err(StdinNotActive));
     }
+
+    // ── Compaction × sub-agent lane (RED for tickets/compaction-subagent-lane) ─
+    //
+    // These tests pin the bug described in `tickets/compaction-subagent-lane.md`:
+    // a sub-agent's internal turns (sourced `MessageSource::SubAgent { role }`)
+    // must never count toward or feed into the orchestrator's compaction, and
+    // the compaction summary must never splice into a rescued tool-call pair.
+
+    /// Spec § 8.1 — `uncompacted_count_excludes_sub_agent_lane`.
+    ///
+    /// `uncompacted_message_count` is the count consumed by
+    /// `ContextManager::needs_compaction` (the gate) and the
+    /// `live.len() <= keep_recent` early-out in `compact()`. It must
+    /// reflect only the orchestrator's live context — sub-agent rows
+    /// live in the transcript (display + persistence) but never the
+    /// orchestrator's wire context.
+    #[test]
+    fn uncompacted_count_excludes_sub_agent_lane() {
+        let sm = StateManager::new();
+
+        // 3 orchestrator-lane rows.
+        sm.add_user_message("orch u".to_string());
+        sm.add_assistant_message("orch a".to_string());
+        sm.add_tool_call(
+            crate::ui::app_state::MessageSource::Human,
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("orch-tc-1".to_string()),
+        );
+
+        // 20 sub-agent-lane rows: mix of tool_call/tool_result/agent rows.
+        let sub = crate::ui::app_state::MessageSource::SubAgent {
+            role: "junior".to_string(),
+        };
+        for i in 0..10 {
+            sm.add_tool_call(
+                sub.clone(),
+                "bash".to_string(),
+                format!("{{\"i\":{i}}}"),
+                Some(format!("sub-tc-{i}")),
+            );
+            sm.add_tool_result(
+                sub.clone(),
+                "bash".to_string(),
+                format!("{{\"i\":{i}}}"),
+                format!("out-{i}"),
+                Some(format!("sub-tc-{i}")),
+            );
+        }
+
+        // Sanity: 23 rows total — confirms the lane-blind filter sees them all.
+        let total = sm.get_state().chat.messages.len();
+        assert_eq!(
+            total, 23,
+            "sanity: should have 3 orchestrator + 20 sub-agent rows"
+        );
+
+        // The pin: only the 3 orchestrator-lane rows count.
+        assert_eq!(
+            sm.uncompacted_message_count(),
+            3,
+            "uncompacted_message_count must exclude the 20 sub-agent rows; got {} (bug: counts all lanes)",
+            sm.uncompacted_message_count(),
+        );
+    }
+
+    /// Spec § 8.3 — `apply_compaction_never_wedges_summary_between_a_rescued_pair`.
+    ///
+    /// Models the bf7d62d3 repro conversation: an orchestrator `delegate`
+    /// ToolCall followed (non-adjacently) by many sub-agent rows and then
+    /// the orchestrator `delegate` ToolResult. After compaction, the
+    /// rescued ToolCall and its ToolResult must remain adjacent on the
+    /// wire — never separated by the inserted summary, or Anthropic
+    /// rejects the turn ("tool_use without tool_result immediately
+    /// after").
+    ///
+    /// Deviation from the spec (§8.3 says `keep_recent: 2`): we use
+    /// `keep_recent: 3`. With `keep_recent: 2` and the existing
+    /// `snap_boundary_past_tool_results` helper (still present today —
+    /// §2.3 of the design deletes it in T3), the boundary snaps past the
+    /// ToolResult and *the entire pair is dropped*, which masks the
+    /// wedged-summary failure mode. With `keep_recent: 3`, the boundary
+    /// lands on a sub-agent row (not a ToolResult), the snap does not
+    /// apply, the ToolCall is rescued, and today's bug manifests as
+    /// "Summary lands between the rescued ToolCall and its ToolResult" —
+    /// the literal RED the spec describes.
+    #[tokio::test]
+    async fn apply_compaction_never_wedges_summary_between_a_rescued_pair() {
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+
+        // Build a SM with a real compaction model so `force_compact` does work.
+        let sm = StateManager::new_arc();
+        let cfg = crate::config::ContextConfig {
+            threshold: 0.5,
+            keep_recent: 3, // see deviation note in the doc-comment above
+            enabled: true,
+            compaction_model: None,
+        };
+        let (model, mock) = crate::providers::create_mock_compaction_model();
+        mock.add_response(crate::mock::MockResponse::text("SUMMARY"));
+        let cm = crate::context_manager::ContextManager::new(
+            cfg,
+            1_000,
+            Some(std::sync::Arc::new(model)),
+        );
+        sm.init_context_manager(cm);
+
+        // Arrange the bf7d62d3-shaped transcript:
+        //   User m1, Agent, User m2, Agent,
+        //   ToolCall(delegate, c1) [orchestrator],
+        //   12 SubAgent{junior} rows,
+        //   ToolResult(delegate, c1) [orchestrator],
+        //   Agent("done")
+        sm.add_user_message("m1".to_string());
+        sm.add_assistant_message("a1".to_string());
+        sm.add_user_message("m2".to_string());
+        sm.add_assistant_message("a2".to_string());
+        sm.add_tool_call(
+            crate::ui::app_state::MessageSource::Human,
+            "delegate".to_string(),
+            r#"{"role":"researcher","task":"survey"}"#.to_string(),
+            Some("c1".to_string()),
+        );
+        let sub = crate::ui::app_state::MessageSource::SubAgent {
+            role: "junior".to_string(),
+        };
+        // 11 sub-agent rows ending with an Agent message so the compaction
+        // boundary lands on the Agent (not a ToolResult) — without that,
+        // `snap_boundary_past_tool_results` (still present today, deleted
+        // by §2.3 of the design) silently drops the rescued pair and
+        // masks the wedged-summary failure mode we want to pin.
+        for i in 0..5 {
+            sm.add_tool_call(
+                sub.clone(),
+                "bash".to_string(),
+                format!("{{\"i\":{i}}}"),
+                Some(format!("sub-c-{i}")),
+            );
+            sm.add_tool_result(
+                sub.clone(),
+                "bash".to_string(),
+                format!("{{\"i\":{i}}}"),
+                format!("sub-out-{i}"),
+                Some(format!("sub-c-{i}")),
+            );
+        }
+        sm.add_assistant_message_sourced(sub.clone(), "sub-agent done thinking".to_string());
+        sm.add_tool_result(
+            crate::ui::app_state::MessageSource::Human,
+            "delegate".to_string(),
+            r#"{"role":"researcher","task":"survey"}"#.to_string(),
+            "DELEGATE_RESULT".to_string(),
+            Some("c1".to_string()),
+        );
+        sm.add_assistant_message("done".to_string());
+
+        // Act
+        let result = sm.force_compact().await;
+        assert!(
+            result.is_some(),
+            "force_compact must produce a result with mock summarizer queued"
+        );
+
+        // Assert on the orchestrator wire.
+        let wire = sm.get_agent_history();
+
+        // 1. The Summary User-text appears BEFORE the delegate ToolCall.
+        let delegate_tc_pos = wire
+            .iter()
+            .position(|m| {
+                matches!(m, RigMessage::Assistant { content, .. }
+                if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(tc)
+                    if tc.id == "c1")))
+            })
+            .expect("delegate ToolCall(c1) must be on the wire");
+        let summary_pos = wire
+            .iter()
+            .position(|m| {
+                matches!(m, RigMessage::User { content }
+                if content.iter().any(|c| matches!(c, UserContent::Text(t)
+                    if t.text.contains("[Conversation summary]"))))
+            })
+            .expect("summary User-text must be on the wire (compaction happened)");
+        assert!(
+            summary_pos < delegate_tc_pos,
+            "Summary (pos={summary_pos}) must precede the rescued delegate ToolCall (pos={delegate_tc_pos}); \
+             current wire order wedges the pair — Anthropic would reject"
+        );
+
+        // 2. Pair adjacency: every Assistant(ToolCall X) is immediately
+        //    followed by a User(ToolResult X) with matching call_id.
+        for (i, m) in wire.iter().enumerate() {
+            if let RigMessage::Assistant { content, .. } = m
+                && let Some(AssistantContent::ToolCall(tc)) = content.iter().next()
+            {
+                let call_id = tc.id.clone();
+                let next = wire
+                    .get(i + 1)
+                    .unwrap_or_else(|| panic!("ToolCall {call_id:?} is the last wire element — no matching ToolResult follows"));
+                match next {
+                    RigMessage::User { content } => {
+                        let found = content.iter().any(|c| match c {
+                            UserContent::ToolResult(tr) => tr.id == call_id,
+                            _ => false,
+                        });
+                        assert!(
+                            found,
+                            "ToolCall {call_id:?} must be immediately followed by ToolResult {call_id:?}; got {next:?}"
+                        );
+                    }
+                    other => panic!(
+                        "ToolCall {call_id:?} must be immediately followed by a User ToolResult; got {other:?}"
+                    ),
+                }
+            }
+        }
+
+        // 3. No wire element contains any sub-agent marker.
+        for (i, m) in wire.iter().enumerate() {
+            let leaked = match m {
+                RigMessage::Assistant { content, .. } => content.iter().any(|c| match c {
+                    AssistantContent::Text(t) => {
+                        t.text.contains("sub-out-")
+                            || t.text.contains("sub-c-")
+                            || t.text.contains("sub-agent done")
+                    }
+                    AssistantContent::ToolCall(tc) => tc.id.starts_with("sub-c-"),
+                    _ => false,
+                }),
+                RigMessage::User { content } => content.iter().any(|c| match c {
+                    UserContent::Text(t) => {
+                        t.text.contains("sub-out-")
+                            || t.text.contains("sub-c-")
+                            || t.text.contains("sub-agent done")
+                    }
+                    UserContent::ToolResult(tr) => tr.id.starts_with("sub-c-"),
+                    _ => false,
+                }),
+                RigMessage::System { .. } => false,
+            };
+            assert!(
+                !leaked,
+                "sub-agent content leaked into the orchestrator wire at index {i}: {m:?}"
+            );
+        }
+    }
+
+    /// Spec § 8.4 — `sub_agent_request_does_not_move_the_compaction_gate`.
+    ///
+    /// The compaction gate reads the orchestrator-lane's last request, not
+    /// the session-wide last request. A sub-agent's 900-token request must
+    /// NOT trigger the orchestrator's 500-token gate. Companion assertion:
+    /// the status-bar reading (session-wide last) still shows the sub-agent
+    /// request — the fix must not hide it.
+    ///
+    /// Note: this test does not exercise `last_orchestrator_input_tokens()`
+    /// directly (it lands with task T4). It exercises the public
+    /// `StateManager::needs_compaction()` gate plus the public
+    /// `SessionStats::last_input_tokens()` display value — both exist today.
+    #[test]
+    fn sub_agent_request_does_not_move_the_compaction_gate() {
+        use crate::config::ContextConfig;
+        use crate::context_manager::ContextManager;
+
+        let sm = StateManager::new_arc();
+        // 500-token threshold; no compaction model needed for this assertion.
+        let cfg = ContextConfig {
+            threshold: 0.5,
+            keep_recent: 5, // default
+            enabled: true,
+            compaction_model: None,
+        };
+        sm.init_context_manager(ContextManager::new(cfg, 1_000, None));
+
+        // 6 orchestrator-lane rows so uncompacted_count (6) > keep_recent (5)
+        // — only then does `needs_compaction` reach the token branch.
+        for i in 0..3 {
+            sm.add_user_message(format!("u{i}"));
+            sm.add_assistant_message(format!("a{i}"));
+        }
+
+        // Orchestrator's last request: 100 tokens — well below the 500-token gate.
+        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 10, 0.0);
+
+        // A sub-agent then makes a 900-token request. Today this overwrites
+        // `last_input_tokens` → 900 → `needs_compaction()` reads true.
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::SubAgent {
+                role: "junior".to_string(),
+            },
+            900,
+            10,
+            0.0,
+        );
+
+        // The pin: a sub-agent's 900-token request must NOT trip the
+        // orchestrator's 500-token gate. The orchestrator's last request was
+        // only 100 tokens.
+        assert!(
+            !sm.needs_compaction(),
+            "sub-agent's 900-token request must not trip the orchestrator's 500-token gate \
+             (RED: today the gate is session-wide and reads true)"
+        );
+
+        // Companion: the status-bar reading is the session-wide last value
+        // and must be UNCHANGED by the fix (still Some(900)).
+        assert_eq!(
+            sm.get_stats().last_input_tokens(),
+            Some(900),
+            "the session-wide last-input reading (status bar) must still show 900 — \
+             the fix must not hide the sub-agent's request from the UI"
+        );
+    }
 }

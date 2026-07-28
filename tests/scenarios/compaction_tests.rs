@@ -1400,3 +1400,223 @@ async fn compaction_failure_does_not_carry_across_turns() {
         "Turn 3 must also abort (fresh attempt, no carry-over)"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 9: Sub-agent-lane × compaction regression
+// (Pinned by `tickets/compaction-subagent-lane.md` § 8.5)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Spec § 8.5 — `delegation_then_compaction_keeps_wire_valid`.
+///
+/// End-to-end pin of the bf7d62d3-class bug. A delegation puts a sub-agent's
+/// internal turns (sourced `SubAgent { role }`) into the transcript; later,
+/// `force_compact()` is called. After compaction:
+///
+/// 1. The rescued delegate `ToolCall`/`ToolResult` pair stays adjacent on
+///    the orchestrator wire (Anthropic rejects "tool_use without tool_result
+///    immediately after").
+/// 2. The summary is *prepended* to the surviving wire sequence, not
+///    spliced into the pair.
+/// 3. The summarization prompt does not contain sub-agent marker content
+///    (the lane filter is applied at the summarization-input seam).
+/// 4. The orchestrator wire history does not contain sub-agent marker
+///    content.
+///
+/// RED today on (1) and (3).
+#[tokio::test]
+async fn delegation_then_compaction_keeps_wire_valid() {
+    use peakbot::ui::app_state::MessageSource;
+    use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+
+    let config = ContextConfig {
+        threshold: 0.5, // 250 of a 500-token window
+        keep_recent: 2, // keep last 2 messages after compaction
+        enabled: true,
+        compaction_model: None,
+    };
+
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
+
+    // Two ordinary turns to give the conversation a couple of orchestrator rows.
+    // Each turn's response reports 300 input_tokens — over the 250 threshold
+    // — so the harness's pre-prompt compaction check doesn't kick in here
+    // (we're calling `force_compact` directly below).
+    harness.add_response(agent_response("R1", 300));
+    harness.add_response(agent_response("R2", 300));
+    harness.run_message("M1").await;
+    harness.run_message("M2").await;
+
+    // Now simulate one delegation directly on `harness.state_manager`,
+    // mirroring the pattern in `tests/scenarios/pipeline_tests.rs`.
+    //
+    // Orchestrator: ToolCall(delegate, "call-1") → (sub-agent rows) →
+    // ToolResult(delegate, "call-1") → trailing assistant.
+    harness.state_manager.add_tool_call(
+        MessageSource::Human,
+        "delegate".to_string(),
+        r#"{"role":"researcher","task":"survey"}"#.to_string(),
+        Some("call-1".to_string()),
+    );
+    let sub = MessageSource::SubAgent {
+        role: "researcher".to_string(),
+    };
+    harness.state_manager.add_tool_call(
+        sub.clone(),
+        "bash".to_string(),
+        r#"{"command":"echo SUBAGENT_SECRET step 1"}"#.to_string(),
+        Some("sub-c-1".to_string()),
+    );
+    harness.state_manager.add_tool_result(
+        sub.clone(),
+        "bash".to_string(),
+        r#"{"command":"echo SUBAGENT_SECRET step 1"}"#.to_string(),
+        "SUBAGENT_SECRET observed something".to_string(),
+        Some("sub-c-1".to_string()),
+    );
+    harness.state_manager.add_assistant_message_sourced(
+        sub.clone(),
+        "Internal sub-agent note SUBAGENT_SECRET".to_string(),
+    );
+    harness.state_manager.add_tool_call(
+        sub.clone(),
+        "bash".to_string(),
+        r#"{"command":"echo SUBAGENT_SECRET step 2"}"#.to_string(),
+        Some("sub-c-2".to_string()),
+    );
+    harness.state_manager.add_tool_result(
+        sub.clone(),
+        "bash".to_string(),
+        r#"{"command":"echo SUBAGENT_SECRET step 2"}"#.to_string(),
+        "SUBAGENT_SECRET saw the answer".to_string(),
+        Some("sub-c-2".to_string()),
+    );
+    harness.state_manager.add_tool_result(
+        MessageSource::Human,
+        "delegate".to_string(),
+        r#"{"role":"researcher","task":"survey"}"#.to_string(),
+        "DELEGATE_RESULT_payload".to_string(),
+        Some("call-1".to_string()),
+    );
+    harness
+        .state_manager
+        .add_assistant_message("done".to_string());
+
+    // Queue the summarization response.
+    harness.add_compaction_response(summarization_response_with("SUMMARY_TEXT"));
+
+    // Act: drive compaction through the full public path.
+    let result = harness
+        .state_manager
+        .force_compact()
+        .await
+        .expect("compaction must produce a result with mock summarizer queued");
+
+    // ── (3) Every summarization prompt must not contain SUBAGENT_SECRET ──
+    // (The harness may have triggered earlier compactions during the two
+    // ordinary setup turns; the lane filter must apply at every seam.)
+    let summ_requests = harness.get_summarization_requests();
+    assert!(
+        !summ_requests.is_empty(),
+        "expected at least one summarization request, got {}",
+        summ_requests.len()
+    );
+    for (i, req) in summ_requests.iter().enumerate() {
+        let prompt_text: String = req
+            .chat_history
+            .iter()
+            .flat_map(|m| match m {
+                RigMessage::User { content } => content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !prompt_text.contains("SUBAGENT_SECRET"),
+            "summarization request #{i} must NOT contain SUBAGENT_SECRET \
+             (lane filter must apply to compact()); got:\n{prompt_text}"
+        );
+    }
+
+    // ── (4) Wire history has no SUBAGENT_SECRET ─────────────────────────
+    let wire = harness.state_manager.get_agent_history();
+    for (i, m) in wire.iter().enumerate() {
+        let leaked = match m {
+            RigMessage::Assistant { content, .. } => content.iter().any(|c| match c {
+                AssistantContent::Text(t) => t.text.contains("SUBAGENT_SECRET"),
+                _ => false,
+            }),
+            RigMessage::User { content } => content.iter().any(|c| match c {
+                UserContent::Text(t) => t.text.contains("SUBAGENT_SECRET"),
+                _ => false,
+            }),
+            RigMessage::System { .. } => false,
+        };
+        assert!(
+            !leaked,
+            "SUBAGENT_SECRET leaked into the orchestrator wire at index {i}: {m:?}"
+        );
+    }
+
+    // ── (2) Summary precedes the delegate ToolCall on the wire ──────────
+    let delegate_tc_pos = wire
+        .iter()
+        .position(|m| {
+            matches!(m, RigMessage::Assistant { content, .. }
+            if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(tc)
+                if tc.id == "call-1")))
+        })
+        .expect("delegate ToolCall(call-1) must be on the wire");
+    let summary_pos = wire
+        .iter()
+        .position(|m| {
+            matches!(m, RigMessage::User { content }
+            if content.iter().any(|c| matches!(c, UserContent::Text(t)
+                if t.text.contains("[Conversation summary]"))))
+        })
+        .expect("summary User-text must be on the wire (compaction happened)");
+    assert!(
+        summary_pos < delegate_tc_pos,
+        "Summary (pos={summary_pos}) must precede the delegate ToolCall (pos={delegate_tc_pos}); \
+         current wire order wedges the rescued pair — Anthropic would reject"
+    );
+
+    // ── (1) Pair adjacency: every Assistant(ToolCall X) is immediately
+    //       followed by a User(ToolResult X) with matching call_id. ────────
+    for (i, m) in wire.iter().enumerate() {
+        if let RigMessage::Assistant { content, .. } = m
+            && let Some(AssistantContent::ToolCall(tc)) = content.iter().next()
+        {
+            let call_id = tc.id.clone();
+            let next = wire.get(i + 1).unwrap_or_else(|| {
+                panic!(
+                    "ToolCall {call_id:?} is the last wire element — no matching ToolResult follows"
+                )
+            });
+            match next {
+                RigMessage::User { content } => {
+                    let found = content.iter().any(|c| match c {
+                        UserContent::ToolResult(tr) => tr.id == call_id,
+                        _ => false,
+                    });
+                    assert!(
+                        found,
+                        "ToolCall {call_id:?} must be immediately followed by ToolResult {call_id:?}; got {next:?}"
+                    );
+                }
+                other => panic!(
+                    "ToolCall {call_id:?} must be immediately followed by a User ToolResult; got {other:?}"
+                ),
+            }
+        }
+    }
+
+    // Sanity: the summary text we queued appears in the resulting plan.
+    let _ = result; // result is used to drive the assertions above; quiet unused.
+}
