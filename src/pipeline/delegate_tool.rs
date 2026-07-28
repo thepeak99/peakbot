@@ -25,7 +25,18 @@ use rig_core::tool::Tool;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Wall clock for one delegation's prompt loop (including its in-loop wire
+/// retries). A sub-agent legitimately runs many minutes across many tool calls;
+/// beyond half an hour it is wedged, not working. On expiry the delegation is
+/// cancelled and its transcript is still salvaged through the normal handoff
+/// path — the orchestrator learns what the sub-agent accomplished instead of
+/// losing it (postmortem: 150+ completed tool calls were lost that way). Sits
+/// below `tools::budget_for("delegate")`, which leaves slack for the
+/// summarisation that follows.
+const DELEGATE_BUDGET: Duration = Duration::from_secs(1_800);
 
 /// Build context a sub-agent needs, captured where the orchestrator agent is
 /// constructed (inside `add_builtin_tools`). A per-delegation fresh agent
@@ -264,36 +275,61 @@ impl Tool for DelegateTool {
         // Fresh history — pure agents-as-tools; no memory of prior delegations.
         let mut history = Vec::new();
         let mut attempt = 0;
-        let outcome = loop {
-            match agent
-                .prompt_with_history(args.task.as_str(), &mut history)
-                .await
-            {
-                Ok(text) => break Ok(text),
-                // Transient wire failures (429/5xx/transport) get the same
-                // in-place retry the main loop gives its own turns — only what
-                // outlives the budget is worth handing back. The retry re-runs
-                // the delegation from the task: rig owns the sub-agent's
-                // internal loop state, which isn't resumable from out here.
-                Err(e) => {
-                    let Some(delay) =
-                        crate::providers::retry::next_retry_delay(&e, attempt, &deps.retry)
-                    else {
-                        break Err(e);
-                    };
-                    tracing::warn!(
-                        target: "peakbot",
-                        role = %args.role,
-                        attempt = attempt + 1,
-                        max_retries = deps.retry.max_retries,
-                        backoff_ms = delay.as_millis(),
-                        error = %e,
-                        "Sub-agent request failed transiently; backing off before retry"
-                    );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
+        // The whole loop sits inside the deadline, so the wire-retry budget is
+        // part of it rather than additive to it.
+        let bounded = tokio::time::timeout(DELEGATE_BUDGET, async {
+            loop {
+                match agent
+                    .prompt_with_history(args.task.as_str(), &mut history)
+                    .await
+                {
+                    Ok(text) => break Ok(text),
+                    // Transient wire failures (429/5xx/transport) get the same
+                    // in-place retry the main loop gives its own turns — only what
+                    // outlives the budget is worth handing back. The retry re-runs
+                    // the delegation from the task: rig owns the sub-agent's
+                    // internal loop state, which isn't resumable from out here.
+                    Err(e) => {
+                        let Some(delay) =
+                            crate::providers::retry::next_retry_delay(&e, attempt, &deps.retry)
+                        else {
+                            break Err(e);
+                        };
+                        tracing::warn!(
+                            target: "peakbot",
+                            role = %args.role,
+                            attempt = attempt + 1,
+                            max_retries = deps.retry.max_retries,
+                            backoff_ms = delay.as_millis(),
+                            error = %e,
+                            "Sub-agent request failed transiently; backing off before retry"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                    }
                 }
             }
+        })
+        .await;
+
+        let Ok(outcome) = bounded else {
+            tracing::error!(
+                target: "peakbot",
+                role = %args.role,
+                budget_secs = DELEGATE_BUDGET.as_secs(),
+                "Delegation exceeded its wall-clock budget; cancelling and salvaging a handoff"
+            );
+            // Bypass `classify` — there is no `PromptError` here, we cancelled
+            // it ourselves — and hand the snapshot straight to the renderer so
+            // the work already done still reaches the orchestrator.
+            let h = handoff::Handoff::Failed {
+                error: format!(
+                    "exceeded its {}s wall-clock budget and was cancelled",
+                    DELEGATE_BUDGET.as_secs()
+                ),
+                history: hook.history_snapshot(),
+            };
+            return Ok(handoff::build(&args.role, h, &role.model.provider_config).await);
         };
 
         match outcome {
@@ -488,6 +524,31 @@ mod tests {
         assert!(
             !opted_out.contains("SENTINEL-SUBAGENT-CONTEXT"),
             "default (agents_md: false) must keep the preamble lean"
+        );
+    }
+
+    // ── delegate wall-clock budget (C) ─────────────────────────────────────
+
+    /// §3.4 ordering invariant for the delegate row: the inner
+    /// `DELEGATE_BUDGET` (which bounds the prompt loop and triggers the
+    /// salvaged-handoff path on expiry) must be strictly less than the
+    /// `TimeBudget("delegate", …)` decorator entry. The slack is for
+    /// `handoff::build`'s own LLM call summarising the dead sub-agent —
+    /// without that slack the decorator would cut off the very path that
+    /// saves the 150 tool calls the postmortem lost.
+    ///
+    /// Lives in this module because `delegate_tool` is private; sibling
+    /// `time_budget.rs` tests pin the bash / powershell / fetch_page rows
+    /// of the same invariant. See `src/tools/time_budget.rs` for the rest.
+    #[test]
+    fn delegate_budget_is_below_its_decorator_backstop() {
+        use crate::tools::time_budget::budget_for;
+        assert!(
+            DELEGATE_BUDGET < budget_for("delegate"),
+            "DELEGATE_BUDGET = {:?} must be strictly less than budget_for(\"delegate\") = {:?} \
+             (the slack is for handoff::build's summarisation LLM call)",
+            DELEGATE_BUDGET,
+            budget_for("delegate")
         );
     }
 }

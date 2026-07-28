@@ -591,7 +591,7 @@ where
     // inner tool), so blocklist/allowlist address tools by their wire name.
     tools.retain(|t| tools_filter.allows(&t.name()));
 
-    builder.tools(tools)
+    builder.tools(budget_all(tools))
 }
 
 /// Attach the live bash panel iff this agent owns one. The orchestrator wires
@@ -637,9 +637,21 @@ fn gate(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
     Box::new(crate::tools::ThoughtGate::wrap(inner))
 }
 
-/// Wrap a slice of already-boxed tools (e.g. MCP) in `ThoughtGate`.
-pub(crate) fn gate_all(tools: Vec<Box<dyn ToolDyn>>) -> Vec<Box<dyn ToolDyn>> {
-    tools.into_iter().map(gate).collect()
+/// Wrap every tool in a wall-clock budget. Called at the two — and only two —
+/// places tools enter the rig builder, so "every tool the model can call is
+/// time-bounded" holds by construction. See docs/tool-time-budget-design.md.
+fn budget_all(tools: Vec<Box<dyn ToolDyn>>) -> Vec<Box<dyn ToolDyn>> {
+    tools
+        .into_iter()
+        .map(|t| Box::new(crate::tools::TimeBudget::wrap(t)) as Box<dyn ToolDyn>)
+        .collect()
+}
+
+/// Gate (`thought`) then budget (wall clock) a set of already-boxed MCP tools.
+/// The budget is outermost so it also covers the gate's own JSON work and so
+/// the timeout string is never mutated by the gate's nudge.
+pub(crate) fn prepare_mcp_tools(tools: Vec<Box<dyn ToolDyn>>) -> Vec<Box<dyn ToolDyn>> {
+    budget_all(tools.into_iter().map(gate).collect())
 }
 
 /// Create OpenRouter agent and info
@@ -725,7 +737,7 @@ fn create_openrouter_agent(
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder.tools(prepare_mcp_tools(tools)).build()
     } else {
         agent_builder.build()
     };
@@ -828,7 +840,7 @@ fn create_anthropic_agent(
     );
 
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder.tools(prepare_mcp_tools(tools)).build()
     } else {
         agent_builder.build()
     };
@@ -917,7 +929,7 @@ fn create_ollama_agent(
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder.tools(prepare_mcp_tools(tools)).build()
     } else {
         agent_builder.build()
     };
@@ -1017,7 +1029,7 @@ fn create_openai_agent(
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder.tools(prepare_mcp_tools(tools)).build()
     } else {
         agent_builder.build()
     };
@@ -1120,7 +1132,7 @@ fn create_llamacpp_agent(
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder.tools(prepare_mcp_tools(tools)).build()
     } else {
         agent_builder.build()
     };
@@ -1433,6 +1445,9 @@ pub(crate) fn build_sub_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::completion::ToolDefinition;
+    use rig_core::tool::Tool;
+    use serde_json::{Value, json};
 
     #[test]
     fn wire_bash_tool_severs_sub_agent_panel() {
@@ -1659,6 +1674,102 @@ mod tests {
         assert!(
             !msg.contains("max_tokens"),
             "max_tokens must be set so rig doesn't reject locally; got: {msg}"
+        );
+    }
+
+    // ── registration invariant (B) ─────────────────────────────────────────
+    //
+    // The two seams — `add_builtin_tools`'s `builder.tools(...)` and the
+    // renamed `prepare_mcp_tools` (ex-`gate_all`) — are the only two places
+    // tools enter the rig builder. These tests pin that both seams wrap
+    // every tool in `TimeBudget` AND (for MCP) `ThoughtGate`, so "an
+    // unbudgeted tool" stays unrepresentable. The functions don't exist
+    // yet — these tests are RED.
+
+    /// Minimal inner tool with a fixed name; used to verify the decorator
+    /// wrappers preserve `name()` and `definition()` byte-for-byte.
+    struct InnerEcho;
+
+    impl Tool for InnerEcho {
+        const NAME: &'static str = "echo";
+        type Error = std::convert::Infallible;
+        type Args = Value;
+        type Output = String;
+
+        async fn definition(&self, _p: String) -> ToolDefinition {
+            ToolDefinition {
+                name: "echo".to_string(),
+                description: "echo".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "x": { "type": "string" } },
+                    "required": ["x"]
+                }),
+            }
+        }
+
+        async fn call(&self, args: Value) -> Result<String, Self::Error> {
+            Ok(args.to_string())
+        }
+    }
+
+    /// `budget_all` must be a structural pass-through on the surface area
+    /// `ToolDyn` exposes: name preserved verbatim, definition body preserved
+    /// verbatim (no `thought` injection — that's `ThoughtGate`'s job; if
+    /// `TimeBudget` injected it, the gate would double-inject).
+    #[tokio::test]
+    async fn budget_all_preserves_name_and_definition() {
+        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(InnerEcho)];
+        let budgeted = budget_all(tools);
+
+        assert_eq!(budgeted.len(), 1, "budget_all must preserve count");
+        assert_eq!(budgeted[0].name(), "echo", "name must pass through");
+
+        let def = budgeted[0].definition(String::new()).await;
+        assert_eq!(def.name, "echo", "definition().name must pass through");
+
+        // The exact property set from InnerEcho.definition() — no `thought`.
+        let props = def.parameters["properties"].as_object().unwrap();
+        assert!(
+            !props.contains_key("thought"),
+            "TimeBudget must NOT inject `thought` — that's ThoughtGate's job; got schema: {}",
+            def.parameters
+        );
+    }
+
+    /// The MCP seam (`prepare_mcp_tools`) must produce tools with BOTH the
+    /// `thought` injection (from `ThoughtGate`) AND a budget (from
+    /// `TimeBudget`). The first is observable through `definition()`; the
+    /// second is observable only as "the schema wasn't touched by TimeBudget
+    /// alone" — together, the schema is `ThoughtGate(InnerEcho)` with the
+    /// TimeBudget wrapper sitting around the gate.
+    #[tokio::test]
+    async fn prepare_mcp_tools_injects_thought_and_preserves_name() {
+        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(InnerEcho)];
+        let mcp = prepare_mcp_tools(tools);
+
+        assert_eq!(mcp.len(), 1, "prepare_mcp_tools must preserve count");
+        assert_eq!(mcp[0].name(), "echo", "name must pass through");
+
+        let def = mcp[0].definition(String::new()).await;
+        assert_eq!(def.name, "echo", "definition().name must pass through");
+
+        // ThoughtGate effect: `thought` must appear as a required property.
+        let props = def.parameters["properties"].as_object().unwrap();
+        assert!(
+            props.contains_key("thought"),
+            "ThoughtGate must inject `thought` for every MCP tool; got schema: {}",
+            def.parameters
+        );
+        let required = def.parameters["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "thought"),
+            "`thought` must be in the required list (so the model is forced to provide it); got: {required:?}"
+        );
+        // The inner tool's own property must survive the gate.
+        assert!(
+            props.contains_key("x"),
+            "the inner tool's `x` property must survive both decorators; got: {props:?}"
         );
     }
 }
