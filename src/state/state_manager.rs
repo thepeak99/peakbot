@@ -357,14 +357,13 @@ impl StateManager {
     /// Also clears `last_input_tokens` (loop-guard) — see `mid-compaction.md` § 3.
     fn apply_compaction(&self, plan: &crate::context_manager::CompactionPlan) {
         use crate::context_manager::find_needed_tool_calls_chat;
-        use crate::context_manager::snap_boundary_past_tool_results;
 
         let mut state = self.state.write().unwrap();
         let messages = &mut state.chat.messages;
 
-        // Re-snap against the live messages: the plan's boundary may come from a
-        // slightly different snapshot. Idempotent if already snapped in compact().
-        let boundary = snap_boundary_past_tool_results(messages, plan.boundary);
+        // The plan was computed from a snapshot taken before the summarizer
+        // await; the live vector may have shrunk since. Clamp once, here.
+        let boundary = plan.boundary.min(messages.len());
 
         // Find tool calls before boundary that are needed by results after boundary
         let needed_tc: std::collections::HashSet<usize> =
@@ -372,16 +371,27 @@ impl StateManager {
                 .into_iter()
                 .collect();
 
-        // Tag messages before boundary as compacted, except needed tool calls
+        // Tag messages before boundary as compacted, except needed tool calls.
+        // Lane-blind and positional: `compacted` means "behind the boundary",
+        // not "belongs to a lane".
         for (i, msg) in messages.iter_mut().enumerate().take(boundary) {
-            if !msg.compacted && !needed_tc.contains(&i) {
+            if !needed_tc.contains(&i) {
                 msg.compacted = true;
             }
         }
 
-        // Insert the summary message at the boundary position
-        let summary = ChatMessage::summary(plan.summary.clone());
-        messages.insert(boundary, summary);
+        // INVARIANT: the summary is *prepended* to the surviving wire sequence,
+        // never spliced into it — otherwise it lands between a rescued ToolCall
+        // and its ToolResult and Anthropic rejects the turn. Derived from the
+        // tags written just above, so it cannot drift from them, and it MUST run
+        // after them: both index the pre-insert vector, and `insert` shifts
+        // every index past it.
+        let insert_at = messages[..boundary]
+            .iter()
+            .position(ChatMessage::is_orchestrator_context)
+            .unwrap_or(boundary);
+        messages.insert(insert_at, ChatMessage::summary(plan.summary.clone()));
+        // `plan.boundary` is meaningless from here on — do not use it.
 
         self.notify_update(&state);
         // Lock order: state → stats. Drop state guard before acquiring stats.

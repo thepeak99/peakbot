@@ -201,10 +201,6 @@ impl ContextManager {
             live[compact_count].0
         };
 
-        // Snap the boundary off any ToolResult so the inserted summary can't
-        // split a tool_use/tool_result pair (see snap_boundary_past_tool_results).
-        let boundary = snap_boundary_past_tool_results(messages, boundary);
-
         // Format older messages for summarization (the orchestrator's live
         // context before the boundary)
         let to_summarize: Vec<&ChatMessage> = messages[..boundary]
@@ -337,24 +333,6 @@ pub(crate) fn find_needed_tool_calls_chat(messages: &[ChatMessage], boundary: us
     }
 
     needed
-}
-
-/// Advance a compaction boundary forward so it never lands *on* a `ToolResult`.
-///
-/// The summary is inserted at the boundary; a boundary on a `ToolResult` whose
-/// `ToolCall` was rescued just before it wedges the summary between the pair,
-/// which Anthropic rejects (`tool_use ids were found without tool_result blocks
-/// immediately after`). Snapping past leading `ToolResult`s keeps each pair
-/// together. Returns the boundary unchanged when it already points at a
-/// non-`ToolResult` or the end of the list.
-pub(crate) fn snap_boundary_past_tool_results(messages: &[ChatMessage], boundary: usize) -> usize {
-    use crate::ui::app_state::MessageRole;
-
-    let mut b = boundary;
-    while b < messages.len() && messages[b].role == MessageRole::ToolResult {
-        b += 1;
-    }
-    b
 }
 
 /// Get the default context config
@@ -513,113 +491,6 @@ mod tests {
 
         let needed = find_needed_tool_calls_chat(&messages, 2);
         assert_eq!(needed, vec![1]);
-    }
-
-    /// Regression: a boundary on a ToolResult must snap forward, else the
-    /// inserted summary orphans the rescued ToolCall and Anthropic rejects it.
-    #[test]
-    fn snap_boundary_advances_past_tool_result() {
-        let messages = vec![
-            ChatMessage::user("q".to_string()),
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "out", Some("c1".to_string())),
-            ChatMessage::agent("a".to_string()),
-        ];
-
-        // Boundary points at the ToolResult (index 2) — the bug trigger.
-        assert_eq!(snap_boundary_past_tool_results(&messages, 2), 3);
-    }
-
-    #[test]
-    fn snap_boundary_leaves_non_tool_result_untouched() {
-        let messages = vec![
-            ChatMessage::user("q".to_string()),
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "out", Some("c1".to_string())),
-            ChatMessage::tool_call("bash", "{}", Some("c2".to_string())),
-        ];
-
-        // Boundary on a ToolCall: kept call+result stay together, no snap needed.
-        assert_eq!(snap_boundary_past_tool_results(&messages, 3), 3);
-        // Boundary on a User message: untouched.
-        assert_eq!(snap_boundary_past_tool_results(&messages, 0), 0);
-    }
-
-    #[test]
-    fn snap_boundary_skips_consecutive_tool_results() {
-        // A ToolCall whose call_id has two results (duplicate-id case) — snap
-        // must skip BOTH so neither gets orphaned across the summary insert.
-        let messages = vec![
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "r1", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "r2", Some("c1".to_string())),
-            ChatMessage::agent("done".to_string()),
-        ];
-
-        assert_eq!(snap_boundary_past_tool_results(&messages, 1), 3);
-    }
-
-    #[test]
-    fn snap_boundary_clamps_at_end() {
-        let messages = vec![
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "r1", Some("c1".to_string())),
-        ];
-
-        // Boundary at the trailing ToolResult would snap to len() (compact all).
-        assert_eq!(snap_boundary_past_tool_results(&messages, 1), 2);
-        // Boundary already at end is a no-op.
-        assert_eq!(snap_boundary_past_tool_results(&messages, 2), 2);
-    }
-
-    /// After the snap, every kept ToolCall is immediately followed by its
-    /// ToolResult even with the summary inserted at the boundary.
-    #[test]
-    fn snap_prevents_summary_splitting_a_pair() {
-        use crate::ui::app_state::MessageRole;
-
-        let messages = vec![
-            ChatMessage::user("q".to_string()),
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "out", Some("c1".to_string())),
-            ChatMessage::agent("a".to_string()),
-        ];
-
-        // Raw boundary bisects the pair (points at the ToolResult).
-        let raw = 2;
-        let snapped = snap_boundary_past_tool_results(&messages, raw);
-
-        // Simulate apply_compaction: rescue calls before boundary whose result is
-        // at/after boundary, then insert a summary at the boundary.
-        let needed: std::collections::HashSet<usize> =
-            find_needed_tool_calls_chat(&messages, snapped)
-                .into_iter()
-                .collect();
-        let mut seq: Vec<(MessageRole, Option<String>)> = Vec::new();
-        for (i, m) in messages.iter().enumerate() {
-            if i == snapped {
-                seq.push((MessageRole::Summary, None));
-            }
-            if i >= snapped || needed.contains(&i) {
-                seq.push((m.role, m.call_id.clone()));
-            }
-        }
-        if snapped >= messages.len() {
-            seq.push((MessageRole::Summary, None));
-        }
-
-        // Invariant: every kept ToolCall is immediately followed by its result.
-        for w in seq.windows(2) {
-            if w[0].0 == MessageRole::ToolCall {
-                assert_eq!(
-                    w[1].0,
-                    MessageRole::ToolResult,
-                    "ToolCall must be immediately followed by ToolResult, got {:?}",
-                    w[1]
-                );
-                assert_eq!(w[0].1, w[1].1, "call_id mismatch across the pair");
-            }
-        }
     }
 
     #[test]
