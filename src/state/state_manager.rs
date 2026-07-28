@@ -396,10 +396,16 @@ impl StateManager {
         self.sync_stats_to_ui();
     }
 
-    /// Count of messages that are not compacted (what the LLM would see).
+    /// Count of messages in the orchestrator's live context (what the LLM
+    /// would see) — see `ChatMessage::is_orchestrator_context`.
     fn uncompacted_message_count(&self) -> usize {
         let state = self.state.read().unwrap();
-        state.chat.messages.iter().filter(|m| !m.compacted).count()
+        state
+            .chat
+            .messages
+            .iter()
+            .filter(|m| m.is_orchestrator_context())
+            .count()
     }
 
     /// Get a snapshot of the current chat messages.
@@ -1681,18 +1687,19 @@ impl StateManager {
 
         let state = self.state.read().unwrap();
 
-        // If the very last uncompacted message is a User message, exclude it.
-        // It will be supplied separately as the prompt argument to prompt_with_history().
-        // Only exclude it when it's truly trailing — if there are assistant/tool messages
-        // after it, it's part of the conversation history and must be kept.
-        let last_uncompacted = state
+        // If the very last message of the orchestrator's live context is a User
+        // message, exclude it. It will be supplied separately as the prompt
+        // argument to prompt_with_history(). Only exclude it when it's truly
+        // trailing — if there are assistant/tool messages after it, it's part of
+        // the conversation history and must be kept.
+        let last_live = state
             .chat
             .messages
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, msg)| !msg.compacted);
-        let skip_last_idx = last_uncompacted
+            .find(|(_, msg)| msg.is_orchestrator_context());
+        let skip_last_idx = last_live
             .filter(|(_, msg)| msg.role == MessageRole::User)
             .map(|(i, _)| i);
 
@@ -1701,11 +1708,12 @@ impl StateManager {
             .messages
             .iter()
             .enumerate()
-            .filter(|(_, msg)| !msg.compacted)
             // Isolation boundary: a sub-agent's internal turns live in the
             // transcript (for display + persistence) but must NEVER enter the
-            // orchestrator model's context. Removing this line leaks them.
-            .filter(|(_, msg)| msg.source.is_orchestrator_lane())
+            // orchestrator model's context. `is_orchestrator_context()` is the
+            // single definition of this set — see also `uncompacted_message_count`,
+            // `ContextManager::compact`, `build_resumption_for_compaction`.
+            .filter(|(_, msg)| msg.is_orchestrator_context())
             .filter(|(i, _)| Some(*i) != skip_last_idx)
             .map(|(_, msg)| msg)
             .filter_map(|msg| match msg.role {
@@ -1781,7 +1789,7 @@ impl StateManager {
             .messages
             .iter()
             .rev()
-            .find(|m| !m.compacted && m.role == MessageRole::User)?;
+            .find(|m| m.is_orchestrator_context() && m.role == MessageRole::User)?;
 
         Some(RigMessage::User {
             content: user_content_from_chat_message(last_user),
@@ -1823,14 +1831,14 @@ impl StateManager {
         let state = self.state.read().unwrap();
         let messages = &state.chat.messages;
 
-        // Find the last non-compacted message (whatever its role)
-        let last_non_compacted = messages
+        // Find the last message of the orchestrator's live context (whatever its role)
+        let last_live = messages
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, m)| !m.compacted);
+            .find(|(_, m)| m.is_orchestrator_context());
 
-        let (last_idx, last_msg) = last_non_compacted?;
+        let (last_idx, last_msg) = last_live?;
 
         // If there's only one message, it's a fresh turn — not a mid-action
         // resumption. Return None so the caller uses the normal path.
@@ -1841,7 +1849,7 @@ impl StateManager {
         // ── Build history: everything before the last message ──────────────
         let history: Vec<_> = messages[..last_idx]
             .iter()
-            .filter(|m| !m.compacted)
+            .filter(|m| m.is_orchestrator_context())
             .filter_map(|msg| match msg.role {
                 MessageRole::User => Some(RigMessage::User {
                     content: user_content_from_chat_message(msg),

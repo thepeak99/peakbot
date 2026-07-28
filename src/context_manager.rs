@@ -178,36 +178,38 @@ impl ContextManager {
             .as_ref()
             .context("No compaction model available for summarization")?;
 
-        // Only consider uncompacted messages
-        let uncompacted: Vec<(usize, &ChatMessage)> = messages
+        // Only consider the orchestrator's live context — a sub-agent's
+        // internal turns are not what the orchestrator model sees.
+        let live: Vec<(usize, &ChatMessage)> = messages
             .iter()
             .enumerate()
-            .filter(|(_, m)| !m.compacted)
+            .filter(|(_, m)| m.is_orchestrator_context())
             .collect();
 
-        if uncompacted.len() <= self.config.keep_recent {
+        if live.len() <= self.config.keep_recent {
             anyhow::bail!("Not enough uncompacted messages to compact");
         }
 
-        // The boundary: compact everything except the last keep_recent uncompacted messages
+        // The boundary: compact everything except the last keep_recent live messages
         let keep_count = self.config.keep_recent;
-        let compact_count = uncompacted.len() - keep_count;
+        let compact_count = live.len() - keep_count;
         // boundary is the original index of the first message to keep.
         // When keep_recent=0, compact everything — boundary is past the last message.
-        let boundary = if compact_count >= uncompacted.len() {
+        let boundary = if compact_count >= live.len() {
             messages.len()
         } else {
-            uncompacted[compact_count].0
+            live[compact_count].0
         };
 
         // Snap the boundary off any ToolResult so the inserted summary can't
         // split a tool_use/tool_result pair (see snap_boundary_past_tool_results).
         let boundary = snap_boundary_past_tool_results(messages, boundary);
 
-        // Format older messages for summarization (everything before boundary that isn't already compacted)
+        // Format older messages for summarization (the orchestrator's live
+        // context before the boundary)
         let to_summarize: Vec<&ChatMessage> = messages[..boundary]
             .iter()
-            .filter(|m| !m.compacted)
+            .filter(|m| m.is_orchestrator_context())
             .collect();
 
         let formatted = format_chat_messages_for_summary(&to_summarize);
