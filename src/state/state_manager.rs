@@ -343,7 +343,11 @@ impl StateManager {
     /// Returns `0` when no API response has been seen yet — that signals
     /// `ContextManager` to fall back to the message-count heuristic.
     fn current_input_tokens(&self) -> usize {
-        self.stats.lock().unwrap().last_input_tokens().unwrap_or(0) as usize
+        self.stats
+            .lock()
+            .unwrap()
+            .last_orchestrator_input_tokens()
+            .unwrap_or(0) as usize
     }
 
     /// Clear the live `last_input_tokens` signal without touching cumulative stats.
