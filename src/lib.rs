@@ -91,6 +91,12 @@ use tracing::debug;
 /// the event loop. This is what guarantees user-typed text only ever
 /// lands between agent turns, never inside one (specifically, never
 /// between an in-flight `ToolCall` and its `ToolResult`).
+///
+/// **Exception:** `run_bg_synthetic_turn_if_any` →
+/// `add_user_message_from_background` is a second writer that bypasses
+/// this invariant by injecting a `[bg output]` user message directly into
+/// the transcript. This is the seam where a bg message can wedge between
+/// a `ToolCall` and its `ToolResult`.
 enum QueueMessage {
     UserMessage {
         text: String,
@@ -724,6 +730,12 @@ impl AgentRunner {
     /// only enters `state.chat.messages` from the agent loop, at dequeue time,
     /// immediately before its turn fires. That structurally prevents user-text
     /// from wedging between an in-flight `ToolCall` and its `ToolResult`.
+    ///
+    /// **Exception:** `run_bg_synthetic_turn_if_any` →
+    /// `add_user_message_from_background` is a second writer that bypasses
+    /// this invariant by injecting a `[bg output]` user message directly into
+    /// the transcript. This is the seam where a bg message can wedge between
+    /// a `ToolCall` and its `ToolResult`.
     ///
     /// Typing during a busy turn is therefore a queued **follow-up**, not an
     /// interrupt. The explicit interrupt is `/stop` (or `Esc` →
