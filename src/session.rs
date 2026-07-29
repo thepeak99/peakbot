@@ -248,6 +248,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         &deps.skills,
         active_sub_agent_hook.clone(),
         &deps.config.retry,
+        &deps.config.timeouts,
     )?;
 
     // Stamp the wire identity `(provider_name, model)` and the display
