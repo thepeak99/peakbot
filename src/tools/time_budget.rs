@@ -392,15 +392,181 @@ mod tests {
     /// There is no "disabled" or "0" budget. The whole point of this
     /// decorator is to make "no wall-clock deadline" unrepresentable; an
     /// empty / unknown tool name must still get a budget, never `Duration::ZERO`.
+    ///
+    /// Updated for the configurable-budget surface: iterates the same tool
+    /// names against BOTH the default config AND the minimum-legal config
+    /// (`tool_secs: 1, delegate_secs: 1`) so the no-zero invariant holds
+    /// even at the configured floor. The shell clamp is checked separately
+    /// by `shell_budget_never_drops_below_the_shell_clamp` so the bash
+    /// floor of 7500s doesn't overshadow the "1s is allowed for tools that
+    /// don't get a clamp" test below.
     #[test]
     fn budget_is_never_zero() {
-        for name in ["", "bash", "delegate", "fetch_page", "some_future_tool"] {
+        for cfg in [
+            TimeoutsConfig::default(),
+            TimeoutsConfig {
+                tool_secs: 1,
+                delegate_secs: 1,
+            },
+        ] {
+            for name in ["", "fetch_page", "some_future_tool"] {
+                assert!(
+                    budget_for(name, &cfg) > Duration::ZERO,
+                    "budget_for({name:?}, &{cfg:?}) = {:?} must be > 0",
+                    budget_for(name, &cfg)
+                );
+            }
+            // Delegate at tool_secs=1 must still inherit the 300s salvage
+            // margin on top of delegate_secs, so its budget > 0 trivially.
             assert!(
-                budget_for(name) > Duration::ZERO,
-                "budget_for({name:?}) = {:?} must be > 0",
-                budget_for(name)
+                budget_for("delegate", &cfg) > Duration::ZERO,
+                "delegate budget must always be > 0 even at minimum delegate_secs"
             );
         }
+    }
+
+    // ── budget table (configurable budgets) ───────────────────────────────
+    //
+    // The locked-name API surface: `budget_for(tool, cfg)` resolves any tool
+    // name to a `Duration`, and `delegate_loop_budget(cfg)` exposes the
+    // pure inner-loop budget. Tests 11–16 lock the new shape.
+
+    #[test]
+    fn default_config_budgets_every_unnamed_tool_at_30_minutes() {
+        // Every tool that doesn't appear in the budget_for table (anything
+        // other than bash / powershell / delegate) must get `cfg.tool_secs`
+        // verbatim, with no clamping — the budget is the budget, full stop.
+        // This is the only class of tool the model can ship NEW examples of,
+        // so it's also the one most likely to be wrong.
+        let cfg = TimeoutsConfig::default();
+        for name in [
+            "file_read",
+            "web_search",
+            "search",
+            "thought_gate",
+            "anything",
+        ] {
+            assert_eq!(
+                budget_for(name, &cfg),
+                Duration::from_secs(1_800),
+                "unnamed tool {name:?} must get tool_secs verbatim (1800s with default cfg)"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_secs_drives_the_generic_budget() {
+        // The generic row of `budget_for` is a direct pass-through to
+        // `cfg.tool_secs`. Without `#[serde(default)]` per field or a default
+        // regression, this is the cheapest knob the operator can use.
+        let cfg = TimeoutsConfig {
+            tool_secs: 42,
+            delegate_secs: 3_600,
+        };
+        assert_eq!(
+            budget_for("some_tool", &cfg),
+            Duration::from_secs(42),
+            "generic row must pass through cfg.tool_secs without clamping"
+        );
+        assert_eq!(
+            budget_for("file_read", &cfg),
+            Duration::from_secs(42),
+            "file_read isn't in the override table either; must use cfg.tool_secs"
+        );
+    }
+
+    #[test]
+    fn shell_budget_never_drops_below_the_shell_clamp() {
+        // The shell clamp at 7500s is load-bearing: bash / powershell self-
+        // cap their `timeout_seconds` at 7200, and the decorator MUST stay
+        // strictly above that, or the tool's informative "I cancelled
+        // myself at 7200s" message never reaches the model — a wedged
+        // sub-shell would be reported by the decorator instead, with no
+        // exit code in the output.
+        //
+        // The clamp applies for ANY value of `cfg.tool_secs` (including the
+        // minimum legal value of 1) and must hold even when the operator
+        // sets tool_secs far above the clamp (86400 — saturating).
+        let shell_clamp = Duration::from_secs(7_500);
+        let shell_self_cap = Duration::from_secs(7_200);
+        for tool_secs in [1, 1_800, 7_500, 86_400] {
+            let cfg = TimeoutsConfig {
+                tool_secs,
+                delegate_secs: 3_600,
+            };
+            for shell in ["bash", "powershell"] {
+                let budget = budget_for(shell, &cfg);
+                assert!(
+                    budget > shell_self_cap,
+                    "{shell} budget ({:?}) at tool_secs={tool_secs} must exceed the 7200s self-cap; \
+                     the decorator can't be allowed to cut a tool's own informative message",
+                    budget
+                );
+                assert!(
+                    budget >= std::cmp::max(shell_clamp, Duration::from_secs(tool_secs)),
+                    "{shell} budget ({:?}) at tool_secs={tool_secs} must be at least \
+                     max(shell_clamp=7500s, tool_secs={tool_secs}s)",
+                    budget
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delegate_registration_strictly_exceeds_the_delegate_loop() {
+        // The §3.4 ordering invariant, now expressed via the new API: the
+        // outer decorator budget registered with the rig builder MUST sit
+        // strictly above `delegate_loop_budget(cfg)`, by exactly the
+        // SALVAGE_MARGIN (300s), so the salvaged-handoff summary LLM call
+        // can run after the inner deadline fires without being cut.
+        //
+        // Holds at any `delegate_secs` an operator could legally pick (the
+        // validate() boundary is 1..=86400).
+        for delegate_secs in [1, 3_600, 86_400] {
+            let cfg = TimeoutsConfig {
+                tool_secs: 1_800,
+                delegate_secs,
+            };
+            let inner = delegate_loop_budget(&cfg);
+            let registered = budget_for("delegate", &cfg);
+            assert_eq!(
+                inner,
+                Duration::from_secs(delegate_secs),
+                "delegate_loop_budget must equal cfg.delegate_secs"
+            );
+            assert_eq!(
+                registered,
+                inner + Duration::from_secs(300),
+                "the registered delegate budget must equal the inner budget + the salvage margin"
+            );
+            assert!(
+                registered > inner,
+                "registered budget ({registered:?}) must be strictly greater than the inner budget ({inner:?})"
+            );
+        }
+    }
+
+    /// `default_budget_exceeds_fetch_page_worst_case` — moved from
+    /// `src/tools/fetch_page.rs` so the budget-vs-worst-case coherence lives
+    /// next to the function that owns the budget half of the relationship.
+    /// Single source of truth: fetch_page owns the worst-case calc, the
+    /// decorator owns the resolved budget, and this is the one test that
+    /// knows about both.
+    ///
+    /// Pre-existing assertion: `DEFAULT_TOOL_BUDGET > fetch_page::worst_case_duration()`.
+    /// Post-fix: `budget_for("fetch_page", &TimeoutsConfig::default()) >
+    /// fetch_page::worst_case_duration()`. The numeric value changes
+    /// (600s → 1800s); the ordering invariant is what this test pins.
+    #[test]
+    fn default_budget_exceeds_fetch_page_worst_case() {
+        let cfg = TimeoutsConfig::default();
+        assert!(
+            budget_for("fetch_page", &cfg) > crate::tools::fetch_page::worst_case_duration(),
+            "budget_for(\"fetch_page\", &default) = {:?} must exceed fetch_page::worst_case_duration() = {:?} \
+             (else the generic backstop cuts the informative per-attempt message before fetch_page's own bound fires)",
+            budget_for("fetch_page", &cfg),
+            crate::tools::fetch_page::worst_case_duration()
+        );
     }
 
     /// The shared `timeout_message` must produce the canonical text — one

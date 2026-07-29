@@ -381,15 +381,10 @@ mod tests {
         let expected = Duration::from_secs(35) * (MAX_RETRIES + 1)
             + (BACKOFF_CAP + Duration::from_millis(250)) * MAX_RETRIES;
         assert_eq!(worst_case_duration(), expected);
-        // And the whole tool must fit inside the default decorator budget,
-        // else the generic backstop cuts the informative per-attempt message
-        // before fetch_page's own bound fires.
-        assert!(
-            worst_case_duration() < crate::tools::time_budget::DEFAULT_TOOL_BUDGET,
-            "fetch_page worst case ({:?}) must fit inside the default tool budget ({:?})",
-            worst_case_duration(),
-            crate::tools::time_budget::DEFAULT_TOOL_BUDGET
-        );
+        // The "fits inside the decorator budget" half of this invariant moved to
+        // `time_budget::default_budget_exceeds_fetch_page_worst_case` — one place
+        // owns the budget-vs-worst-case coherence, next to the function that
+        // owns the budget resolution.
     }
 
     /// Design §9.2 Q3: the per-attempt deadline must stay strictly above the

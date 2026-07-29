@@ -2202,7 +2202,12 @@ cost_traking: false   # typo of cost_tracking
         // Absent block: a config that never mentions http still gets bounded.
         let cfg: Config = serde_yaml::from_str("cost_tracking: true").unwrap();
         assert_eq!(cfg.http.connect_timeout_secs, 30);
-        assert_eq!(cfg.http.read_timeout_secs, 600);
+        // The postmortem fix raised the read-timeout ceiling from 600 (10 min)
+        // to 1800 (30 min) so a model that legitimately thinks for more than ten
+        // minutes on a single non-streaming turn doesn't get cut off by the
+        // HTTP backstop. Pinned here so a future tweak to the default is
+        // deliberate.
+        assert_eq!(cfg.http.read_timeout_secs, 1800);
 
         // Partial block: the unspecified knob keeps its default.
         let cfg: Config = serde_yaml::from_str("http:\n  read_timeout_secs: 1200\n").unwrap();
@@ -2689,6 +2694,224 @@ agents:
         assert!(
             err.to_string().contains("type") || err.to_string().contains("unknown field"),
             "error should name the offending field, got: {err}"
+        );
+    }
+
+    // ── timeouts block (postmortem fix) ──────────────────────────────────
+    //
+    // The tool-call wall-clock budgets used to be hard-coded constants. They
+    // get a YAML home now so an operator can tune them without recompiling,
+    // and so the `validate()` boundary catches the obvious mistakes
+    // (zero, >24h) before the tool ever fires. These pins lock down the
+    // surface the new block exposes.
+
+    #[test]
+    fn timeouts_defaults_are_30min_tool_and_1h_delegate() {
+        // Two boundary values, one observer: the defaults are the floor that
+        // the boot configuration must produce, so absent any YAML the process
+        // starts with a 30-minute tool ceiling and a 1-hour delegation
+        // ceiling — anything tighter would surprise users who'd never seen
+        // the postmortem.
+        let t = TimeoutsConfig::default();
+        assert_eq!(
+            t.tool_secs, 1_800,
+            "default tool_secs is 30 minutes (1800s); pin so a future tweak is deliberate"
+        );
+        assert_eq!(
+            t.delegate_secs, 3_600,
+            "default delegate_secs is 1 hour (3600s); pin so a future tweak is deliberate"
+        );
+    }
+
+    #[test]
+    fn config_default_carries_timeouts_defaults() {
+        // The manual `impl Default for Config` must wire the `timeouts` field
+        // to `TimeoutsConfig::default()` — easy to forget on an edit, and a
+        // mismatched default would leave every boot pinned to a weird hand-
+        // rolled `TimeBudget` for every tool. Single equality assertion, no
+        // field-by-field guesswork.
+        assert_eq!(
+            Config::default().timeouts,
+            TimeoutsConfig::default(),
+            "Config::default().timeouts must equal TimeoutsConfig::default() (manual Default impl)"
+        );
+    }
+
+    #[test]
+    fn absent_timeouts_block_yields_defaults() {
+        // Mirrors the pattern set by `http_timeouts_default_and_parse`: a
+        // config that never mentions `timeouts:` still parses cleanly and
+        // gets the documented defaults. Without `#[serde(default)]` on the
+        // field, an omitted block would be a hard error.
+        let cfg: Config = serde_yaml::from_str("cost_tracking: true\n")
+            .expect("absent timeouts block must still parse");
+        assert_eq!(cfg.timeouts, TimeoutsConfig::default());
+    }
+
+    #[test]
+    fn timeouts_block_parses_both_fields() {
+        // Round-trip: explicit YAML produces the same struct a hand-built
+        // literal would. The auto-generated serde defaults are easy to read
+        // for a single field; the two-field interaction is the part that
+        // genuinely needs pinning.
+        let yaml = "timeouts:\n  tool_secs: 42\n  delegate_secs: 99\n";
+        let cfg: Config = serde_yaml::from_str(yaml).expect("both fields present must parse");
+        assert_eq!(cfg.timeouts.tool_secs, 42);
+        assert_eq!(cfg.timeouts.delegate_secs, 99);
+    }
+
+    #[test]
+    fn timeouts_partial_block_defaults_the_other_field() {
+        // Per-field `#[serde(default)]`: leaving one key out must default
+        // the OTHER key, not leave it zero. Catches a regression where the
+        // implementer forgets one of the two defaults and an operator who
+        // only tunes one knob silently disables the other.
+        let cfg: Config = serde_yaml::from_str("timeouts:\n  tool_secs: 120\n")
+            .expect("only-tool_secs block must parse");
+        assert_eq!(
+            cfg.timeouts.tool_secs, 120,
+            "explicitly set value must be retained"
+        );
+        assert_eq!(
+            cfg.timeouts.delegate_secs, 3_600,
+            "unset delegate_secs must default to 3600, not zero"
+        );
+
+        let cfg: Config = serde_yaml::from_str("timeouts:\n  delegate_secs: 99\n")
+            .expect("only-delegate_secs block must parse");
+        assert_eq!(cfg.timeouts.delegate_secs, 99);
+        assert_eq!(
+            cfg.timeouts.tool_secs, 1_800,
+            "unset tool_secs must default to 1800, not zero"
+        );
+    }
+
+    #[test]
+    fn timeouts_rejects_unknown_field() {
+        // Sibling pin to the existing `deny_unknown_fields` pins in this
+        // module: an unknown key inside `timeouts:` (e.g. a typo of
+        // `tool_secs`) must be a hard parse error, not silently dropped.
+        // The original incident was caused by silently-dropped knobs — the
+        // same shape inside the new block would re-create it.
+        let yaml = "timeouts:\n  tool_seccs: 42\n";
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .expect_err("unknown field inside timeouts block must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tool_seccs"),
+            "error must name the offending key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn timeouts_validate_rejects_zero() {
+        // 0 is the documented "disabled" value for HTTP timeouts, but it is
+        // NOT acceptable for tool / delegate budgets — a zero budget means
+        // `tokio::time::timeout` fires immediately and every tool call
+        // would surface as a TIMEOUT. Validate must reject 0 with a message
+        // that names the field so an operator staring at the error knows
+        // which knob to fix.
+        for (field, cfg) in [
+            (
+                "tool_secs",
+                TimeoutsConfig {
+                    tool_secs: 0,
+                    delegate_secs: 3_600,
+                },
+            ),
+            (
+                "delegate_secs",
+                TimeoutsConfig {
+                    tool_secs: 1_800,
+                    delegate_secs: 0,
+                },
+            ),
+        ] {
+            let err = cfg.validate().expect_err("zero budget must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(field),
+                "error must name the offending field ({field}), got: {msg}"
+            );
+            assert!(
+                msg.contains('0') || msg.contains("zero"),
+                "error must mention the offending value (0/zero), got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn timeouts_validate_rejects_above_24h() {
+        // 86400s is the documented upper bound (1 day); 86401 must be
+        // rejected to catch an unbounded `u64` slipping into production.
+        // Above 24h a tool budget would exceed the session's TTL (10 min
+        // default!) and the wall clock becomes a sleep, not a deadline.
+        for (field, cfg) in [
+            (
+                "tool_secs",
+                TimeoutsConfig {
+                    tool_secs: 86_401,
+                    delegate_secs: 3_600,
+                },
+            ),
+            (
+                "delegate_secs",
+                TimeoutsConfig {
+                    tool_secs: 1_800,
+                    delegate_secs: 86_401,
+                },
+            ),
+        ] {
+            let err = cfg.validate().expect_err("budget > 24h must be rejected");
+            assert!(
+                err.to_string().contains(field),
+                "error must name the offending field ({field}), got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn timeouts_validate_accepts_the_bounds() {
+        // Boundary test: 1 (the smallest legal value) and 86400 (the
+        // largest) must BOTH be accepted. Without this the rejection logic
+        // could go off-by-one in either direction and silently exclude the
+        // legal edge.
+        for cfg in [
+            TimeoutsConfig {
+                tool_secs: 1,
+                delegate_secs: 3_600,
+            },
+            TimeoutsConfig {
+                tool_secs: 1_800,
+                delegate_secs: 1,
+            },
+            TimeoutsConfig {
+                tool_secs: 86_400,
+                delegate_secs: 3_600,
+            },
+            TimeoutsConfig {
+                tool_secs: 1_800,
+                delegate_secs: 86_400,
+            },
+        ] {
+            assert!(
+                cfg.validate().is_ok(),
+                "configs at the boundaries must validate; got error for {cfg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_read_timeout_defaults_to_30_minutes() {
+        // Pins the new default literally via the default fn, rather than
+        // relying on `assert_eq!(cfg.http.read_timeout_secs, 1800)` in the
+        // round-trip test: the implementer must change BOTH the function
+        // AND the YAML parser default, in the same direction, and this
+        // test catches the case where one of the two is forgotten.
+        assert_eq!(
+            default_read_timeout_secs(),
+            1_800,
+            "default_read_timeout_secs() must return 1800 (30 min); was 600 pre-postmortem fix"
         );
     }
 }

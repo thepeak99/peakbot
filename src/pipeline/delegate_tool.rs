@@ -527,28 +527,13 @@ mod tests {
         );
     }
 
-    // ── delegate wall-clock budget (C) ─────────────────────────────────────
-
-    /// §3.4 ordering invariant for the delegate row: the inner
-    /// `DELEGATE_BUDGET` (which bounds the prompt loop and triggers the
-    /// salvaged-handoff path on expiry) must be strictly less than the
-    /// `TimeBudget("delegate", …)` decorator entry. The slack is for
-    /// `handoff::build`'s own LLM call summarising the dead sub-agent —
-    /// without that slack the decorator would cut off the very path that
-    /// saves the 150 tool calls the postmortem lost.
-    ///
-    /// Lives in this module because `delegate_tool` is private; sibling
-    /// `time_budget.rs` tests pin the bash / powershell / fetch_page rows
-    /// of the same invariant. See `src/tools/time_budget.rs` for the rest.
-    #[test]
-    fn delegate_budget_is_below_its_decorator_backstop() {
-        use crate::tools::time_budget::budget_for;
-        assert!(
-            DELEGATE_BUDGET < budget_for("delegate"),
-            "DELEGATE_BUDGET = {:?} must be strictly less than budget_for(\"delegate\") = {:?} \
-             (the slack is for handoff::build's summarisation LLM call)",
-            DELEGATE_BUDGET,
-            budget_for("delegate")
-        );
-    }
+    // The §3.4 ordering invariant for delegate — "the inner loop budget
+    // strictly sits below the outer decorator budget, with the slack being
+    // for handoff::build's summarisation LLM call" — used to be pinned here
+    // against `DELEGATE_BUDGET` and `budget_for("delegate")` directly. After
+    // the postmortem fix both APIs become configurable (`SubAgentDeps`
+    // owns a `TimeoutsConfig`, `budget_for` takes one). The new home for
+    // this invariant is `delegate_registration_strictly_exceeds_the_delegate_loop`
+    // in `time_budget.rs`, which is the right module — it's an invariant
+    // about the *budget table*, not about this tool.
 }

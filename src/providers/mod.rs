@@ -1448,6 +1448,7 @@ mod tests {
     use rig_core::completion::ToolDefinition;
     use rig_core::tool::Tool;
     use serde_json::{Value, json};
+    use std::time::Duration;
 
     #[test]
     fn wire_bash_tool_severs_sub_agent_panel() {
@@ -1717,10 +1718,14 @@ mod tests {
     /// `ToolDyn` exposes: name preserved verbatim, definition body preserved
     /// verbatim (no `thought` injection — that's `ThoughtGate`'s job; if
     /// `TimeBudget` injected it, the gate would double-inject).
+    ///
+    /// Updated for the configurable-budget surface: `budget_all` now
+    /// threads `cfg: &TimeoutsConfig` through so every tool's budget resolves
+    /// from the operator's config, not the hard-coded constant.
     #[tokio::test]
     async fn budget_all_preserves_name_and_definition() {
         let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(InnerEcho)];
-        let budgeted = budget_all(tools);
+        let budgeted = budget_all(tools, &TimeoutsConfig::default());
 
         assert_eq!(budgeted.len(), 1, "budget_all must preserve count");
         assert_eq!(budgeted[0].name(), "echo", "name must pass through");
@@ -1743,10 +1748,13 @@ mod tests {
     /// second is observable only as "the schema wasn't touched by TimeBudget
     /// alone" — together, the schema is `ThoughtGate(InnerEcho)` with the
     /// TimeBudget wrapper sitting around the gate.
+    ///
+    /// Updated for the configurable-budget surface: same threading as
+    /// `budget_all` — `cfg: &TimeoutsConfig` for the budget resolution.
     #[tokio::test]
     async fn prepare_mcp_tools_injects_thought_and_preserves_name() {
         let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(InnerEcho)];
-        let mcp = prepare_mcp_tools(tools);
+        let mcp = prepare_mcp_tools(tools, &TimeoutsConfig::default());
 
         assert_eq!(mcp.len(), 1, "prepare_mcp_tools must preserve count");
         assert_eq!(mcp[0].name(), "echo", "name must pass through");
@@ -1771,5 +1779,90 @@ mod tests {
             props.contains_key("x"),
             "the inner tool's `x` property must survive both decorators; got: {props:?}"
         );
+    }
+
+    /// End-to-end pin for the configurable-budget surface: a tool that
+    /// hangs forever, wrapped by `budget_all` with the *configured* budget
+    /// set to 1 second, must come back as a `⏱ TIMEOUT` string inside a
+    /// few seconds of real wall clock. Mirrors the same real-short-budget
+    /// technique the `time_budget` self-test uses (`tokio::start_paused`
+    /// needs `test-util`, not enabled in this crate).
+    ///
+    /// RED state: this test will fail to compile before the implementer
+    /// threads `cfg: &TimeoutsConfig` into `budget_all` AND adds
+    /// `TimeoutsConfig` to the providers module's `crate::config` import
+    /// block. Once the surface is in place, this test is the load-bearing
+    /// end-to-end pin: a tool resolving its budget from the operator's
+    /// config, not from a constant. Pre-implementation: zero sites can
+    /// pass it.
+    #[tokio::test]
+    async fn budget_all_applies_the_configured_seconds() {
+        // `tool_secs: 1` is the minimum legal config value; nothing smaller
+        // gets past `TimeoutsConfig::validate()`. The decorator arms exactly
+        // `Duration::from_secs(1)` because `budget_for("always_pending", &cfg)`
+        // for an unknown tool returns `cfg.tool_secs` verbatim — no clamping
+        // — so this test verifies the pass-through works.
+        let cfg = TimeoutsConfig {
+            tool_secs: 1,
+            delegate_secs: 3_600,
+        };
+
+        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(AlwaysPending)];
+        let budgeted = budget_all(tools, &cfg);
+        assert_eq!(budgeted.len(), 1, "budget_all must preserve count");
+        assert_eq!(
+            budgeted[0].name(),
+            "always_pending",
+            "name must pass through"
+        );
+
+        let started = tokio::time::Instant::now();
+        let result = budgeted[0].call("{}".to_string()).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "configured budget (1s) must fire within seconds; took {:?}",
+            elapsed
+        );
+
+        let s = result.expect("timeout must be Ok(String), not Err(ToolError)");
+        assert!(s.contains("⏱ TIMEOUT"), "timeout marker missing from: {s}");
+        assert!(s.contains("always_pending"), "tool name missing from: {s}");
+        assert!(
+            s.contains("1s"),
+            "configured budget seconds (1s) must appear in the timeout message; got: {s}"
+        );
+    }
+
+    /// Local fixture used only by `budget_all_applies_the_configured_seconds`:
+    /// a `ToolDyn` whose `call` returns a never-completing future, so
+    /// `TimeBudget` is forced to arm the wall-clock boundary. Inlined here
+    /// (rather than reaching for `time_budget::Named` which is a private
+    /// sibling-module type) to keep both tests independent — if the
+    /// decorator-side fixture changes shape, this test shouldn't move with it.
+    struct AlwaysPending;
+
+    impl Tool for AlwaysPending {
+        const NAME: &'static str = "always_pending";
+        type Error = std::convert::Infallible;
+        type Args = Value;
+        type Output = String;
+
+        async fn definition(&self, _p: String) -> ToolDefinition {
+            ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "hangs forever".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                }),
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<String, Self::Error> {
+            std::future::pending::<()>().await;
+            unreachable!("never returns");
+        }
     }
 }
