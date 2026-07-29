@@ -14,7 +14,7 @@ pub mod retry;
 
 use crate::config::{
     AnthropicCaching, AnthropicConfig, BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig,
-    OpenRouterConfig, ProviderConfig, RetryConfig, SearXngConfig,
+    OpenRouterConfig, ProviderConfig, RetryConfig, SearXngConfig, TimeoutsConfig,
 };
 use crate::hooks::SessionHook;
 use crate::hooks::events::SourcedEvent;
@@ -202,6 +202,7 @@ pub fn create_provider(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
@@ -226,6 +227,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -251,6 +253,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -276,6 +279,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::Anthropic(agent),
@@ -301,6 +305,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -326,6 +331,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -453,6 +459,7 @@ fn add_builtin_tools<M, P>(
     register_view_image: bool,
     wire_bash_panel: bool,
     sub_agent_wiring: Option<SubAgentWiring>,
+    timeouts: &TimeoutsConfig,
 ) -> rig_core::agent::AgentBuilder<M, P, rig_core::agent::WithBuilderTools>
 where
     M: rig_core::completion::CompletionModel,
@@ -581,6 +588,7 @@ where
             event_sink: wiring.event_sink,
             active_hook: wiring.active_hook,
             retry: wiring.retry,
+            timeouts: timeouts.clone(),
         };
         let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(deps));
         tools.push(gate(Box::new(delegate_tool)));
@@ -591,7 +599,7 @@ where
     // inner tool), so blocklist/allowlist address tools by their wire name.
     tools.retain(|t| tools_filter.allows(&t.name()));
 
-    builder.tools(budget_all(tools))
+    builder.tools(budget_all(tools, timeouts))
 }
 
 /// Attach the live bash panel iff this agent owns one. The orchestrator wires
@@ -640,18 +648,21 @@ fn gate(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
 /// Wrap every tool in a wall-clock budget. Called at the two — and only two —
 /// places tools enter the rig builder, so "every tool the model can call is
 /// time-bounded" holds by construction. See docs/tool-time-budget-design.md.
-fn budget_all(tools: Vec<Box<dyn ToolDyn>>) -> Vec<Box<dyn ToolDyn>> {
+fn budget_all(tools: Vec<Box<dyn ToolDyn>>, cfg: &TimeoutsConfig) -> Vec<Box<dyn ToolDyn>> {
     tools
         .into_iter()
-        .map(|t| Box::new(crate::tools::TimeBudget::wrap(t)) as Box<dyn ToolDyn>)
+        .map(|t| Box::new(crate::tools::TimeBudget::wrap(t, cfg)) as Box<dyn ToolDyn>)
         .collect()
 }
 
 /// Gate (`thought`) then budget (wall clock) a set of already-boxed MCP tools.
 /// The budget is outermost so it also covers the gate's own JSON work and so
 /// the timeout string is never mutated by the gate's nudge.
-pub(crate) fn prepare_mcp_tools(tools: Vec<Box<dyn ToolDyn>>) -> Vec<Box<dyn ToolDyn>> {
-    budget_all(tools.into_iter().map(gate).collect())
+pub(crate) fn prepare_mcp_tools(
+    tools: Vec<Box<dyn ToolDyn>>,
+    cfg: &TimeoutsConfig,
+) -> Vec<Box<dyn ToolDyn>> {
+    budget_all(tools.into_iter().map(gate).collect(), cfg)
 }
 
 /// Create OpenRouter agent and info
@@ -671,6 +682,7 @@ fn create_openrouter_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -733,11 +745,14 @@ fn create_openrouter_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(prepare_mcp_tools(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -771,6 +786,7 @@ fn create_anthropic_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -837,10 +853,13 @@ fn create_anthropic_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(prepare_mcp_tools(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -872,6 +891,7 @@ fn create_ollama_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -925,11 +945,14 @@ fn create_ollama_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(prepare_mcp_tools(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -961,6 +984,7 @@ fn create_openai_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -1025,11 +1049,14 @@ fn create_openai_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(prepare_mcp_tools(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -1061,6 +1088,7 @@ fn create_llamacpp_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -1128,11 +1156,14 @@ fn create_llamacpp_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(prepare_mcp_tools(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -1253,6 +1284,7 @@ pub(crate) fn build_sub_agent(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     context_budget: Option<usize>,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(DynAgent, Arc<SessionHook>)> {
     // Events-only lane-tagged hook. No compaction gate (fresh context) — the
     // sub-agent gate terminates instead of compacting.
@@ -1299,6 +1331,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::OpenRouter(builder.build()), Arc::new(hook)))
         }
@@ -1332,6 +1365,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::OpenAI(builder.build()), Arc::new(hook)))
         }
@@ -1369,6 +1403,7 @@ pub(crate) fn build_sub_agent(
                 supports_vision,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::Anthropic(builder.build()), Arc::new(hook)))
         }
@@ -1403,6 +1438,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::LlamaCpp(builder.build()), Arc::new(hook)))
         }
@@ -1436,6 +1472,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::Ollama(builder.build()), Arc::new(hook)))
         }

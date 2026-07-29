@@ -1866,6 +1866,7 @@ impl AgentRunner {
             &ctx.skills,
             active_sub_agent_hook.clone(),
             config.retry(),
+            config.timeouts(),
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 

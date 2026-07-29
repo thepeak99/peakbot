@@ -25,18 +25,7 @@ use rig_core::tool::Tool;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
-
-/// Wall clock for one delegation's prompt loop (including its in-loop wire
-/// retries). A sub-agent legitimately runs many minutes across many tool calls;
-/// beyond half an hour it is wedged, not working. On expiry the delegation is
-/// cancelled and its transcript is still salvaged through the normal handoff
-/// path — the orchestrator learns what the sub-agent accomplished instead of
-/// losing it (postmortem: 150+ completed tool calls were lost that way). Sits
-/// below `tools::budget_for("delegate")`, which leaves slack for the
-/// summarisation that follows.
-const DELEGATE_BUDGET: Duration = Duration::from_secs(1_800);
 
 /// Build context a sub-agent needs, captured where the orchestrator agent is
 /// constructed (inside `add_builtin_tools`). A per-delegation fresh agent
@@ -64,6 +53,9 @@ pub struct SubAgentDeps {
     pub active_hook: ActiveSubAgentHook,
     /// Retry policy for a delegation's wire calls — the orchestrator's own.
     pub retry: crate::config::RetryConfig,
+    /// Wall-clock budgets — the delegation's prompt loop reads `delegate_secs`
+    /// from here, so the operator's config drives it rather than a constant.
+    pub timeouts: crate::config::TimeoutsConfig,
 }
 
 /// Build a sub-agent's preamble: `role_prompt` + the live env block + this
@@ -261,6 +253,7 @@ impl Tool for DelegateTool {
             deps.shell_kind.as_ref(),
             deps.vector_store.as_ref(),
             context_budget,
+            &deps.timeouts,
         )
         .map_err(|e| DelegateError::Build {
             role: args.role.clone(),
@@ -276,8 +269,12 @@ impl Tool for DelegateTool {
         let mut history = Vec::new();
         let mut attempt = 0;
         // The whole loop sits inside the deadline, so the wire-retry budget is
-        // part of it rather than additive to it.
-        let bounded = tokio::time::timeout(DELEGATE_BUDGET, async {
+        // part of it rather than additive to it. On expiry the delegation is
+        // cancelled and its transcript is still salvaged through the normal
+        // handoff path — the outer `budget_for("delegate")` sits a salvage
+        // margin above this bound, leaving room for that summarisation.
+        let budget = crate::tools::time_budget::delegate_loop_budget(&deps.timeouts);
+        let bounded = tokio::time::timeout(budget, async {
             loop {
                 match agent
                     .prompt_with_history(args.task.as_str(), &mut history)
@@ -316,7 +313,7 @@ impl Tool for DelegateTool {
             tracing::error!(
                 target: "peakbot",
                 role = %args.role,
-                budget_secs = DELEGATE_BUDGET.as_secs(),
+                budget_secs = budget.as_secs(),
                 "Delegation exceeded its wall-clock budget; cancelling and salvaging a handoff"
             );
             // Bypass `classify` — there is no `PromptError` here, we cancelled
@@ -325,7 +322,7 @@ impl Tool for DelegateTool {
             let h = handoff::Handoff::Failed {
                 error: format!(
                     "exceeded its {}s wall-clock budget and was cancelled",
-                    DELEGATE_BUDGET.as_secs()
+                    budget.as_secs()
                 ),
                 history: hook.history_snapshot(),
             };

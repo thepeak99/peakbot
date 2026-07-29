@@ -15,29 +15,42 @@
 //!
 //! See `docs/tool-time-budget-design.md`.
 
+use crate::config::TimeoutsConfig;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::{ToolDyn, ToolError};
 use rig_core::wasm_compat::WasmBoxedFuture;
 use std::time::Duration;
 
-/// Wall-clock ceiling for a tool call that does not name itself in
-/// [`budget_for`].
-pub(crate) const DEFAULT_TOOL_BUDGET: Duration = Duration::from_secs(600);
+/// Floor (not an override) for the shell tools: they clamp their own
+/// `timeout_seconds` at 7200s, and this decorator must stay strictly above
+/// that so their own "Command timed out" message always wins. A `tool_secs`
+/// larger than the floor still raises the shell budget.
+const SHELL_FLOOR: Duration = Duration::from_secs(7_500);
 
-/// Tools owning a *longer* internal deadline get an entry that sits ABOVE it,
-/// so their own (more informative) bound always fires first and this one stays
-/// a pure backstop. There is deliberately no opt-out: "exempt from the
+/// Slack between the delegate loop's own deadline and the decorator's. The
+/// loop expires first and spends this margin rendering the INTERRUPTED
+/// handoff (`handoff::build` makes an LLM call) before the generic backstop
+/// would cut it.
+const SALVAGE_MARGIN: Duration = Duration::from_secs(300);
+
+/// Resolve one tool's wall-clock ceiling from the operator's config. Tools
+/// owning a *longer* internal deadline get a derived entry that sits ABOVE
+/// it, so their own (more informative) bound always fires first and this one
+/// stays a pure backstop. There is deliberately no opt-out: "exempt from the
 /// liveness guarantee" is the sentence that writes the next postmortem.
-pub(crate) fn budget_for(tool: &str) -> Duration {
+pub(crate) fn budget_for(tool: &str, cfg: &TimeoutsConfig) -> Duration {
     match tool {
-        // bash/powershell clamp their own `timeout_seconds` to 7200s.
-        "bash" | "powershell" => Duration::from_secs(7_500),
-        // delegate bounds its own prompt loop at DELEGATE_BUDGET (1800s) and
-        // then spends time summarising the dead sub-agent (handoff::build
-        // makes an LLM call); the slack covers that summarisation.
-        "delegate" => Duration::from_secs(2_100),
-        _ => DEFAULT_TOOL_BUDGET,
+        "bash" | "powershell" => std::cmp::max(Duration::from_secs(cfg.tool_secs), SHELL_FLOOR),
+        "delegate" => delegate_loop_budget(cfg) + SALVAGE_MARGIN,
+        _ => Duration::from_secs(cfg.tool_secs),
     }
+}
+
+/// The delegate tool's *inner* prompt-loop deadline — the one that fires
+/// first and still salvages a handoff. Shared with `delegate_tool` so both
+/// halves of the ordering invariant read the same number.
+pub(crate) fn delegate_loop_budget(cfg: &TimeoutsConfig) -> Duration {
+    Duration::from_secs(cfg.delegate_secs)
 }
 
 /// The one and only wording for "a call was cut off by its deadline". Shared
@@ -63,9 +76,10 @@ pub struct TimeBudget {
 }
 
 impl TimeBudget {
-    /// Production constructor: the budget is resolved from the tool's name.
-    pub fn wrap(inner: Box<dyn ToolDyn>) -> Self {
-        let budget = budget_for(&inner.name());
+    /// Production constructor: the budget is resolved from the tool's name
+    /// against the operator's configured timeouts.
+    pub fn wrap(inner: Box<dyn ToolDyn>, cfg: &TimeoutsConfig) -> Self {
+        let budget = budget_for(&inner.name(), cfg);
         Self::with_budget(inner, budget)
     }
 
@@ -311,82 +325,24 @@ mod tests {
     }
 
     /// `TimeBudget::wrap` resolves the budget from the inner tool's name via
-    /// the table in §3.3. The three-row override table must be wired
-    /// correctly — any edit that breaks it loses the ordering invariant in
-    /// §3.4 (informative inner bound must always fire first).
+    /// [`budget_for`] against the passed config — the wrapper must not invent
+    /// its own number. This pins the wrap→table wiring; the table's own rows
+    /// are pinned by the `budget_for` tests below.
     #[test]
     fn wrap_uses_the_name_table() {
         let named = |name| Named {
             name,
             build: Box::new(|| Box::pin(async { Ok(String::new()) })),
         };
+        let cfg = TimeoutsConfig::default();
 
-        assert_eq!(
-            TimeBudget::wrap(Box::new(named("bash"))).budget(),
-            Duration::from_secs(7_500),
-            "bash gets the 2h+5min override"
-        );
-        assert_eq!(
-            TimeBudget::wrap(Box::new(named("powershell"))).budget(),
-            Duration::from_secs(7_500),
-            "powershell gets the 2h+5min override"
-        );
-        assert_eq!(
-            TimeBudget::wrap(Box::new(named("delegate"))).budget(),
-            Duration::from_secs(2_100),
-            "delegate gets the 35min override (slack above its own 30min inner bound)"
-        );
-        assert_eq!(
-            TimeBudget::wrap(Box::new(named("fetch_page"))).budget(),
-            DEFAULT_TOOL_BUDGET,
-            "fetch_page uses the 600s default (its own inner ~165s bound fires first)"
-        );
-        assert_eq!(
-            TimeBudget::wrap(Box::new(named("totally_unknown_tool"))).budget(),
-            DEFAULT_TOOL_BUDGET,
-            "any unknown tool name falls through to the 600s default"
-        );
-    }
-
-    /// The §3.4 ordering invariant, expressed as a single assertion per row.
-    /// If anyone edits one of these constants in isolation, this test fails
-    /// loudly with the exact invariant that broke — rather than letting the
-    /// informative inner bound become unreachable in production.
-    ///
-    /// Note: the delegate-side assertion (`budget_for("delegate") >
-    /// DELEGATE_BUDGET`) lives in `src/pipeline/delegate_tool.rs` tests
-    /// because `delegate_tool` is a private sibling module — this file
-    /// can't reach its constants. Fetch-page's row lives here so the
-    /// decorator-vs-fetch-page coherence is pinned in one place; the
-    /// decorator-vs-bash / powershell rows are likewise pinned here.
-    #[test]
-    fn budget_exceeds_every_tool_owned_deadline() {
-        // bash / powershell self-clamp at 7200s; their decorator entry must
-        // sit strictly above that or the tool's own informative message
-        // never wins.
-        const BASH_MAX_SECS: u64 = 7_200;
-        const POWERSHELL_MAX_SECS: u64 = 7_200;
-        assert!(
-            budget_for("bash") > Duration::from_secs(BASH_MAX_SECS),
-            "budget_for(\"bash\") = {:?} must exceed bash's {}s self-clamp",
-            budget_for("bash"),
-            BASH_MAX_SECS
-        );
-        assert!(
-            budget_for("powershell") > Duration::from_secs(POWERSHELL_MAX_SECS),
-            "budget_for(\"powershell\") = {:?} must exceed powershell's {}s self-clamp",
-            budget_for("powershell"),
-            POWERSHELL_MAX_SECS
-        );
-
-        // fetch_page's worst case must fit inside the default — otherwise the
-        // generic 600s backstop would cut the informative per-attempt message.
-        assert!(
-            DEFAULT_TOOL_BUDGET > crate::tools::fetch_page::worst_case_duration(),
-            "DEFAULT_TOOL_BUDGET = {:?} must exceed fetch_page::worst_case_duration() = {:?}",
-            DEFAULT_TOOL_BUDGET,
-            crate::tools::fetch_page::worst_case_duration()
-        );
+        for name in ["bash", "powershell", "delegate", "fetch_page", "unknown"] {
+            assert_eq!(
+                TimeBudget::wrap(Box::new(named(name)), &cfg).budget(),
+                budget_for(name, &cfg),
+                "wrap({name:?}) must take its budget straight from budget_for"
+            );
+        }
     }
 
     /// There is no "disabled" or "0" budget. The whole point of this
