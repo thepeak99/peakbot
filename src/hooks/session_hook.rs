@@ -90,6 +90,13 @@ pub struct SessionStats {
     /// first lane-attributed request; the flat totals above are the
     /// authoritative grand total and are never derived from this map.
     lanes: std::collections::HashMap<String, LaneStats>,
+    /// Input tokens of the last orchestrator-lane request.
+    /// The compaction gate reads this; a sub-agent's request must not move it.
+    /// `None` = no reading yet (gate falls through to the message-count heuristic).
+    /// Deliberately NOT derived from `lanes`: that map is display state for
+    /// `/stats`, and the compaction loop-guard has to zero this without lying
+    /// to the user about what the orchestrator's last request cost.
+    last_orchestrator_input_tokens: Option<u64>,
 }
 
 impl SessionStats {
@@ -120,6 +127,10 @@ impl SessionStats {
         bucket.output_tokens = output;
         bucket.api_calls += 1;
         bucket.cost += cost;
+
+        if lane == crate::ui::app_state::ORCHESTRATOR_LANE {
+            self.last_orchestrator_input_tokens = Some(input);
+        }
     }
 
     /// Per-lane breakdown, sorted with `"orchestrator"` first then roles
@@ -191,6 +202,8 @@ impl SessionStats {
                 cost,
             });
         }
+        // /load must not blind the gate — seed it with the persisted input count.
+        self.last_orchestrator_input_tokens = Some(input);
     }
 
     /// Replace the per-lane breakdown wholesale (e.g. after `/load`). The flat
@@ -240,6 +253,13 @@ impl SessionStats {
         self.requests.last().map(|r| r.input_tokens)
     }
 
+    /// Input tokens of the last orchestrator-lane request.
+    /// The compaction gate's reading — a sub-agent's request never moves it.
+    /// `None` → gate falls back to the message-count heuristic.
+    pub fn last_orchestrator_input_tokens(&self) -> Option<u64> {
+        self.last_orchestrator_input_tokens
+    }
+
     /// Reset the "live context size" signal to 0 *without* touching cumulative
     /// `total_*` bookkeeping or the API-call counter.
     ///
@@ -264,6 +284,8 @@ impl SessionStats {
             output_tokens: 0,
             cost: 0.0,
         });
+        // Loop guard, same reason: the gate must not re-fire post-compaction.
+        self.last_orchestrator_input_tokens = None;
     }
 }
 
@@ -564,6 +586,27 @@ mod tests {
         assert!(
             (stats.total_cost - cost_before).abs() < f64::EPSILON,
             "total cost must not change"
+        );
+
+        // The orchestrator gate scalar is also cleared — the compaction gate
+        // must not re-fire from a stale orchestrator-lane reading.
+        assert!(
+            stats.last_orchestrator_input_tokens().is_none(),
+            "orchestrator gate must be cleared (None) after clear_last_input_tokens"
+        );
+    }
+
+    /// `restore` seeds the orchestrator gate so `/load` does not blind it.
+    /// Without this, a resumed conversation would see `None` and the gate
+    /// would fall through to the message-count heuristic indefinitely.
+    #[test]
+    fn restore_seeds_the_orchestrator_gate_reading() {
+        let mut stats = SessionStats::new();
+        stats.restore(5_000, 200, 10, 1.50);
+        assert_eq!(
+            stats.last_orchestrator_input_tokens(),
+            Some(5_000),
+            "restore must seed the orchestrator gate with the persisted input count"
         );
     }
 

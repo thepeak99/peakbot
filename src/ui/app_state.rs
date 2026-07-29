@@ -447,6 +447,18 @@ impl ChatMessage {
         self.source = source;
         self
     }
+
+    /// True iff this message is part of **the orchestrator's live context**:
+    /// it survived compaction AND it belongs to the orchestrator lane.
+    ///
+    /// This is THE definition of "what the orchestrator model sees". Every seam
+    /// that counts, summarises, or serialises the orchestrator's context filters
+    /// on this and nothing else. A sub-agent's internal turns live in the
+    /// transcript (display + persistence) but are never the orchestrator's
+    /// context — its own context died with the delegation.
+    pub fn is_orchestrator_context(&self) -> bool {
+        !self.compacted && self.source.is_orchestrator_lane()
+    }
 }
 
 /// Format tool call with structured output: thought intent first, then params
@@ -684,6 +696,10 @@ fn format_generic_result(result: &str) -> String {
     truncate_to_lines(result, 3)
 }
 
+/// The lane label for every non-sub-agent turn. Single source of truth for
+/// the string `SessionStats` buckets and gates on.
+pub const ORCHESTRATOR_LANE: &str = "orchestrator";
+
 /// Origin of a chat message.
 ///
 /// Distinguishes background-process-driven synthetic turns from
@@ -737,7 +753,7 @@ impl MessageSource {
     pub fn lane_label(&self) -> &str {
         match self {
             MessageSource::SubAgent { role } => role,
-            _ => "orchestrator",
+            _ => ORCHESTRATOR_LANE,
         }
     }
 }
@@ -1374,6 +1390,47 @@ mod tests {
         };
         assert!(!s.is_orchestrator_lane());
         assert!(!s.is_human());
+    }
+
+    /// `is_orchestrator_context` is the single definition of "what the
+    /// orchestrator model sees": lane AND compaction state, never one alone.
+    #[test]
+    fn is_orchestrator_context_requires_lane_and_live() {
+        let human = ChatMessage::user("hi".into());
+        assert!(human.is_orchestrator_context());
+
+        let background = ChatMessage::user_from_background("out".into(), vec![1]);
+        assert!(background.is_orchestrator_context());
+
+        let mut compacted = ChatMessage::user("old".into());
+        compacted.compacted = true;
+        assert!(!compacted.is_orchestrator_context());
+
+        let sub = MessageSource::SubAgent {
+            role: "junior".to_string(),
+        };
+        let sub_live = ChatMessage::agent("internal".into()).with_source(sub.clone());
+        assert!(!sub_live.is_orchestrator_context());
+
+        let mut sub_compacted = ChatMessage::agent("internal".into()).with_source(sub);
+        sub_compacted.compacted = true;
+        assert!(!sub_compacted.is_orchestrator_context());
+    }
+
+    #[test]
+    fn lane_label_uses_the_shared_constant() {
+        assert_eq!(MessageSource::Human.lane_label(), ORCHESTRATOR_LANE);
+        assert_eq!(
+            MessageSource::Background { proc_ids: vec![1] }.lane_label(),
+            ORCHESTRATOR_LANE
+        );
+        assert_eq!(
+            MessageSource::SubAgent {
+                role: "junior".to_string()
+            }
+            .lane_label(),
+            "junior"
+        );
     }
 
     #[test]
