@@ -97,6 +97,12 @@ All tools live in `src/tools/` and implement `rig::tool::Tool` (`NAME`, `Args`, 
 
 Plus optional **MCP tools** from configured servers (wrapped in `LoggingToolDyn` for tracing).
 
+### Time budgets
+
+Every tool — built-in and MCP alike — is wrapped at registration in `TimeBudget` (`src/tools/time_budget.rs`); there is no unbudgeted state. `timeouts.tool_secs` (default 30 min) is the ceiling; tools that own a longer deadline get a derived one *above* it so their own message wins: `bash`/`powershell` get `max(tool_secs, 7500s)` (above their own 7200s clamp), `delegate` gets `timeouts.delegate_secs + 300s` (above the loop's own budget, leaving room for the INTERRUPTED handoff).
+
+Expiry returns `⏱ TIMEOUT: …` as a normal tool result — the model self-corrects; the turn is not killed. Design: `docs/tool-time-budget-design.md`.
+
 ### The `thought` field (ThoughtGate)
 
 No tool declares a `thought` parameter itself. Every built-in **and** MCP tool is wrapped at registration in `ThoughtGate` (`src/tools/thought_gate.rs`):
@@ -130,7 +136,7 @@ Editing `config.yaml` or skills does not require a restart: each session verb re
 | `providers:` / `default_model` (new aliases resolve) | `mcp_servers` (live subprocesses) |
 | skills + system prompt | `vector_db` (redb/HNSW handle) |
 | `searxng.*`, `bash.env`, `agent_max_turns` | `web.*` (read once by the session reaper) |
-| `cost_tracking`, `context.*`, `retry.*`, `memory.*` | `pipeline` (built sub-agent registry) |
+| `cost_tracking`, `context.*`, `retry.*`, `memory.*`, `timeouts.*` | `pipeline` (built sub-agent registry) |
 | `tools.*` (built-in filter) | `provider` (legacy block) |
 | | `http.*` (published once into the client factory) |
 
@@ -199,15 +205,19 @@ tools:                           # built-in tool filter — pick ONE list
   # only: [file_read, file_str_replace, bash]
   # Names = wire names from BUILTIN_TOOL_NAMES; unknown names rejected at load.
 
+timeouts:                        # wall-clock ceilings on agent work; see
+  tool_secs: 1800                # `http:` for per-socket network timeouts
+  delegate_secs: 3600            # 1..=86400 each; 0 rejected at load
+
 http:                            # outbound timeouts for EVERY client (LLM,
   connect_timeout_secs: 30       # embeddings, MCP auth, web tools). 0 = disabled.
-  read_timeout_secs: 600         # seconds of silence, reset on each read
+  read_timeout_secs: 1800        # seconds of silence, reset on each read
 ```
 
 `read_timeout` bounds *silence*, not duration — but completions are
 non-streaming (`agent.prompt`), so nothing arrives until the model is done and
 for LLM calls it acts as a ceiling on a single generation. Raise it if you run
-models that legitimately think for longer than 10 minutes. Without it, an
+models that legitimately think for longer than 30 minutes. Without it, an
 upstream that accepts a request and never answers wedges the turn until the
 process dies — Stop can't help, because `stop_requested` is only checked *after*
 the call returns. Tools that set their own shorter total `.timeout()`
@@ -485,7 +495,7 @@ A sub-agent's preamble (`build_sub_agent_preamble`, rebuilt fresh per delegation
 
 Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). No sandbox in v1 — a sub-agent can write and run bash. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together (stop routes to the innermost hook via `ActiveSubAgentHook`); there is no resumption path.
 
-Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`), unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`.
+Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`), unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`. The whole delegation is bounded by `timeouts.delegate_secs` (default 1 h); on expiry the transcript takes that same path — summarised and returned as `INTERRUPTED`, not discarded.
 
 Where it lives: `src/pipeline/{delegate_tool,registry}.rs`, `build_sub_agent` in `src/providers/mod.rs`, `MessageSource` + lane filter in `src/ui/app_state.rs` / `src/state/state_manager.rs`.
 
