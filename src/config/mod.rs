@@ -311,6 +311,11 @@ pub struct Config {
     /// Outbound HTTP timeouts. Boot-only — read once when the process starts.
     #[serde(default)]
     pub http: HttpConfig,
+
+    /// Wall-clock budgets for tool calls and delegation. Applied per call, so
+    /// a reload takes effect on the next tool.
+    #[serde(default)]
+    pub timeouts: TimeoutsConfig,
 }
 
 /// Outbound HTTP timeouts, applied to every client PeakBot builds (LLM calls,
@@ -326,10 +331,10 @@ pub struct HttpConfig {
     /// A connect either completes in seconds or never will.
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
-    /// Give up after this many seconds with no bytes read (default: 600,
+    /// Give up after this many seconds with no bytes read (default: 1800,
     /// 0 = disabled). Completions are non-streaming, so for LLM calls this is
     /// in effect a ceiling on a single generation — raise it if you run models
-    /// that legitimately think for longer than 10 minutes.
+    /// that legitimately think for longer than 30 minutes.
     #[serde(default = "default_read_timeout_secs")]
     pub read_timeout_secs: u64,
 }
@@ -347,7 +352,57 @@ fn default_connect_timeout_secs() -> u64 {
     30
 }
 fn default_read_timeout_secs() -> u64 {
-    600
+    1800
+}
+
+/// Wall-clock ceilings on agent work: how long a single tool call, or a whole
+/// delegation to a sub-agent, may run before it is cut short. See `http:` for
+/// the per-socket network timeouts, which bound silence rather than duration.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TimeoutsConfig {
+    /// Budget for one tool call (default: 1800 = 30 min).
+    #[serde(default = "default_tool_secs")]
+    pub tool_secs: u64,
+    /// Budget for one delegation to a sub-agent (default: 3600 = 1 h). Longer
+    /// than `tool_secs` because a delegate runs a full turn loop of its own.
+    #[serde(default = "default_delegate_secs")]
+    pub delegate_secs: u64,
+}
+
+impl Default for TimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            tool_secs: default_tool_secs(),
+            delegate_secs: default_delegate_secs(),
+        }
+    }
+}
+
+impl TimeoutsConfig {
+    /// Boundary parse: 0 would make every call time out instantly and a
+    /// budget beyond a day is a deadline in name only. Returns a user-facing
+    /// message on failure.
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("tool_secs", self.tool_secs),
+            ("delegate_secs", self.delegate_secs),
+        ] {
+            if !(1..=86_400).contains(&value) {
+                return Err(format!(
+                    "timeouts.{field} must be 1..=86400 seconds (got {value})"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_tool_secs() -> u64 {
+    1800
+}
+fn default_delegate_secs() -> u64 {
+    3600
 }
 
 /// Web UI settings. Only the sticky-session reaper is configurable; all
@@ -566,6 +621,11 @@ impl Config {
     /// Get the retry configuration
     pub fn retry(&self) -> &RetryConfig {
         &self.retry
+    }
+
+    /// Get the wall-clock tool/delegation budgets
+    pub fn timeouts(&self) -> &TimeoutsConfig {
+        &self.timeouts
     }
 
     /// Get pipeline configuration if present
@@ -1479,6 +1539,7 @@ impl Default for Config {
             web: WebConfig::default(),
             tools: ToolsConfig::default(),
             http: HttpConfig::default(),
+            timeouts: TimeoutsConfig::default(),
         }
     }
 }
@@ -1587,6 +1648,7 @@ impl Config {
         let config = Self::merge_sources(master, load_per_repo_config());
 
         config.tools.validate().map_err(anyhow::Error::msg)?;
+        config.timeouts.validate().map_err(anyhow::Error::msg)?;
 
         Ok(LoadedConfig {
             config,
