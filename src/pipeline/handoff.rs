@@ -928,4 +928,63 @@ mod tests {
             out.len()
         );
     }
+
+    // ── build (delegate-timeout salvage contract) ──────────────────────────
+
+    /// A delegation that exceeded its 30-min wall-clock budget must come
+    /// back to the orchestrator as an `INTERRUPTED` handoff with a summary
+    /// of what the sub-agent accomplished, NOT as an opaque "timed out".
+    /// In the production incident this is the exact path that would have
+    /// saved the 150 lost tool calls (see §6.4).
+    ///
+    /// The summariser is forced to fail (no API key) so `build` falls
+    /// through to the `last_assistant_text` fallback; that fallback is the
+    /// one path the test exercises — it is the worst case the orchestrator
+    /// can rely on, and it is exactly what the postmortem needed.
+    #[tokio::test]
+    async fn timeout_handoff_is_rendered_as_an_interrupted_result() {
+        use crate::config::{OpenRouterConfig, ProviderConfig};
+
+        let history = vec![
+            user_text("the original task brief"),
+            assistant_text("in-progress work the sub-agent did — must survive"),
+        ];
+
+        let cfg = ProviderConfig::OpenRouter(OpenRouterConfig {
+            api_key: None, // forces create_compaction_model → Err → fallback path
+            model: "any/model".to_string(),
+            max_tokens: 1024,
+            vision: None,
+        });
+
+        let out = build(
+            "reviewer",
+            Handoff::Failed {
+                error: "exceeded its 1800s wall-clock budget and was cancelled".to_string(),
+                history,
+            },
+            &cfg,
+        )
+        .await;
+
+        // The wire shape the orchestrator reads — pinned so a future edit to
+        // the banner or guidance changes the test, not the model's vocabulary.
+        assert!(
+            out.starts_with(
+                "[delegate:reviewer] INTERRUPTED — error: exceeded its 1800s wall-clock budget and was cancelled"
+            ),
+            "banner must name the role, the INTERRUPTED class, and the budget error verbatim; got:\n{out}"
+        );
+        // The fallback path surfaces the most recent assistant text so the
+        // orchestrator knows what the dead sub-agent had actually done.
+        assert!(
+            out.contains("in-progress work the sub-agent did — must survive"),
+            "fallback assistant text must appear in the rendered handoff; got:\n{out}"
+        );
+        // Standard failure guidance — same as every other non-stop failure.
+        assert!(
+            out.ends_with(FAILED_GUIDANCE),
+            "rendered handoff must end with FAILED_GUIDANCE so the orchestrator knows how to react; got:\n{out}"
+        );
+    }
 }

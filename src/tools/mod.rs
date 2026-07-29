@@ -13,6 +13,7 @@ mod search;
 mod shell_detect;
 mod think;
 mod thought_gate;
+pub(crate) mod time_budget;
 pub mod todo;
 mod view_image;
 
@@ -31,5 +32,6 @@ pub use search::SearchTool;
 pub use shell_detect::{ShellKind, print_no_shell_warning};
 pub use think::ThinkTool;
 pub use thought_gate::ThoughtGate;
+pub use time_budget::TimeBudget;
 pub use todo::{TodoArgs, TodoItem, TodoStatus, TodoTool};
 pub use view_image::ViewImageTool;
