@@ -389,16 +389,211 @@ mod tests {
         }
     }
 
-    /// The delegate surface is exactly `{role, task}` — no `mode`, no
-    /// `timeout`, no comma-split agent list. Sequential-only is unrepresentable.
+    /// Build a minimal `DelegateTool` for unit tests that need its schema
+    /// (`definition()`) but do not actually run a delegation. An empty
+    /// `SubAgentRegistry` is fine because `definition()` only reads role
+    /// names — never `call()`s them — and `Self::available_roles()` returns
+    /// an empty vec when no roles are configured. The wiring is the same
+    /// shape `providers::add_builtin_tools` builds in production, but every
+    /// optional / empty slot is stubbed out.
+    async fn minimal_delegate_tool() -> DelegateTool {
+        use crate::config::{
+            ModelEntry, ModelRegistry, PipelineConfig, ProviderEntry, ProviderType,
+        };
+
+        let provider = ProviderEntry {
+            name: "openai".into(),
+            kind: ProviderType::OpenAI,
+            api_key: Some("sk-test".into()),
+            base_url: None,
+            models: vec![ModelEntry {
+                name: "gpt-4o".into(),
+                alias: Some("gpt4".into()),
+                max_tokens: None,
+                temperature: None,
+                extra_params: None,
+                prompt_caching: None,
+                vision: None,
+                context_size: None,
+            }],
+        };
+        let model_registry =
+            ModelRegistry::build(&[provider], Some("gpt4")).expect("test model registry builds");
+        let pipeline_config = PipelineConfig {
+            enabled: false,
+            orchestrator_prompt: None,
+            agents: std::collections::HashMap::new(),
+        };
+        let registry = SubAgentRegistry::new(&pipeline_config, &model_registry, &[])
+            .expect("empty role registry builds");
+
+        let deps = SubAgentDeps {
+            registry: Arc::new(registry),
+            searxng: None,
+            bash_config: BashConfig::default(),
+            tools_filter: crate::config::ToolsConfig::default(),
+            state_manager: StateManager::new_arc(),
+            shell_kind: None,
+            vector_store: None,
+            max_turns: 0,
+            skills: crate::skills::SkillRegistry::default(),
+            event_sink: None,
+            active_hook: Arc::new(std::sync::Mutex::new(None)),
+            retry: crate::config::RetryConfig::default(),
+            timeouts: crate::config::TimeoutsConfig::default(),
+        };
+        DelegateTool::new(Arc::new(deps))
+    }
+
+    /// The delegate surface is exactly `{role, task, parent_task_id}` — the
+    /// parent link is required, not optional (sub-agent todo nesting, design
+    /// §3.1). An orphan delegation is unrepresentable at the boundary.
     #[test]
     fn delegate_args_parse_role_and_task() {
-        let args: DelegateArgs = serde_json::from_value(
-            serde_json::json!({"role": "reviewer", "task": "review the diff"}),
-        )
-        .expect("role+task parse");
+        let args: DelegateArgs = serde_json::from_value(serde_json::json!({
+            "role": "reviewer",
+            "task": "review the diff",
+            "parent_task_id": 3,
+        }))
+        .expect("role+task+parent_task_id parse");
         assert_eq!(args.role, "reviewer");
         assert_eq!(args.task, "review the diff");
+        assert_eq!(args.parent_task_id, 3);
+    }
+
+    /// A delegate call without `parent_task_id` must FAIL to deserialise.
+    /// This pins the "unrepresentable" invariant: a delegation cannot be born
+    /// without naming its parent todo item (design §3.1). Any transcript
+    /// argument that drops the field is rejected at the Rust boundary.
+    #[test]
+    fn delegate_args_missing_parent_task_id_fails_to_deserialize() {
+        let result: Result<DelegateArgs, _> = serde_json::from_value(serde_json::json!({
+            "role": "reviewer",
+            "task": "review the diff",
+        }));
+        assert!(
+            result.is_err(),
+            "DelegateArgs without parent_task_id must be Err — an orphan delegation is unrepresentable; got: {:?}",
+            result.map(|a| (a.role, a.task))
+        );
+    }
+
+    /// The model-facing schema advertises `parent_task_id` as a required
+    /// integer property of the `delegate` tool. The description points the
+    /// model at the todo tool (which echoes the id) so it can fetch the
+    /// numeric id it needs to send (design §5.1).
+    #[tokio::test]
+    async fn delegate_definition_requires_parent_task_id_in_schema() {
+        let tool = minimal_delegate_tool().await;
+        let def = <DelegateTool as Tool>::definition(&tool, String::new()).await;
+
+        // `required` must contain all three names (order-independent).
+        let required = def
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("schema must have a `required` array");
+        let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        for name in ["role", "task", "parent_task_id"] {
+            assert!(
+                required_names.contains(&name),
+                "delegate schema `required` must contain {name:?}; got {required_names:?}"
+            );
+        }
+
+        // `properties.parent_task_id` is an integer and its description
+        // mentions the todo tool so the model knows where to fetch the id.
+        let parent_prop = def
+            .parameters
+            .get("properties")
+            .and_then(|p| p.get("parent_task_id"))
+            .expect("schema must have a `parent_task_id` property");
+        assert_eq!(
+            parent_prop.get("type").and_then(|v| v.as_str()),
+            Some("integer"),
+            "parent_task_id must be typed `integer`"
+        );
+        let desc = parent_prop
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            desc.to_lowercase().contains("todo"),
+            "parent_task_id description must reference the todo tool so the model knows where to fetch the id; got: {desc:?}"
+        );
+    }
+
+    /// `validate_parent` accepts an existing id, including one whose status is
+    /// completed (design §3.1 — we don't police parent status; least
+    /// astonishing for the orchestrator).
+    #[test]
+    fn validate_parent_accepts_existing_id_including_completed() {
+        use crate::tools::todo::{TodoList, TodoStatus};
+
+        let mut list = TodoList::new();
+        list.add("live task".to_string());
+        list.add("done task".to_string());
+        list.update_status(2, TodoStatus::Completed)
+            .expect("completed update");
+
+        // Pending item → accepted.
+        assert!(
+            validate_parent(&list, 1).is_ok(),
+            "validate_parent must accept a pending parent; list: {}",
+            list.render()
+        );
+        // Completed item → still accepted (no status policing).
+        assert!(
+            validate_parent(&list, 2).is_ok(),
+            "validate_parent must accept a completed parent (design §3.1 — no status policing)"
+        );
+    }
+
+    /// `validate_parent` rejects a missing id; the error must surface the id,
+    /// the literal token `parent_task_id`, and the same rendered list the
+    /// `todo` tool returns (design §3.2). The model self-corrects from this.
+    #[test]
+    fn validate_parent_rejects_missing_id_with_actionable_error() {
+        use crate::tools::todo::TodoList;
+
+        let mut list = TodoList::new();
+        list.add("alpha".to_string());
+        list.add("beta".to_string());
+        let rendered = list.render();
+
+        let err = validate_parent(&list, 99).expect_err("id 99 is not in the list");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("99"),
+            "error must surface the bad id (99) so the model can see which id it sent; got: {msg}"
+        );
+        assert!(
+            msg.contains("parent_task_id"),
+            "error must name the parameter so the model knows which arg to fix; got: {msg}"
+        );
+        assert!(
+            msg.contains(&rendered) || msg.contains("beta") || msg.contains("alpha"),
+            "error must include the rendered todo list (so the model can pick a real id); got: {msg}"
+        );
+    }
+
+    /// `validate_parent` against an empty TodoList must produce an error whose
+    /// rendered list block reads "No tasks in the todo list." — the same
+    /// sentinel `TodoList::render()` uses (todo.rs:L250-254). The orchestrator
+    /// sees an empty list and knows to add an item first.
+    #[test]
+    fn validate_parent_against_empty_list_returns_no_tasks_message() {
+        use crate::tools::todo::TodoList;
+
+        let list = TodoList::new();
+        let err = validate_parent(&list, 1).expect_err("empty list rejects any id");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("No tasks in the todo list."),
+            "error against an empty list must include the canonical empty-list sentinel; got: {msg}"
+        );
     }
 
     /// A role's `env:` overrides base keys and unions in role-only keys; base
