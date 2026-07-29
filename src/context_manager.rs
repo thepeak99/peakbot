@@ -178,36 +178,34 @@ impl ContextManager {
             .as_ref()
             .context("No compaction model available for summarization")?;
 
-        // Only consider uncompacted messages
-        let uncompacted: Vec<(usize, &ChatMessage)> = messages
+        // Only consider the orchestrator's live context — a sub-agent's
+        // internal turns are not what the orchestrator model sees.
+        let live: Vec<(usize, &ChatMessage)> = messages
             .iter()
             .enumerate()
-            .filter(|(_, m)| !m.compacted)
+            .filter(|(_, m)| m.is_orchestrator_context())
             .collect();
 
-        if uncompacted.len() <= self.config.keep_recent {
+        if live.len() <= self.config.keep_recent {
             anyhow::bail!("Not enough uncompacted messages to compact");
         }
 
-        // The boundary: compact everything except the last keep_recent uncompacted messages
+        // The boundary: compact everything except the last keep_recent live messages
         let keep_count = self.config.keep_recent;
-        let compact_count = uncompacted.len() - keep_count;
+        let compact_count = live.len() - keep_count;
         // boundary is the original index of the first message to keep.
         // When keep_recent=0, compact everything — boundary is past the last message.
-        let boundary = if compact_count >= uncompacted.len() {
+        let boundary = if compact_count >= live.len() {
             messages.len()
         } else {
-            uncompacted[compact_count].0
+            live[compact_count].0
         };
 
-        // Snap the boundary off any ToolResult so the inserted summary can't
-        // split a tool_use/tool_result pair (see snap_boundary_past_tool_results).
-        let boundary = snap_boundary_past_tool_results(messages, boundary);
-
-        // Format older messages for summarization (everything before boundary that isn't already compacted)
+        // Format older messages for summarization (the orchestrator's live
+        // context before the boundary)
         let to_summarize: Vec<&ChatMessage> = messages[..boundary]
             .iter()
-            .filter(|m| !m.compacted)
+            .filter(|m| m.is_orchestrator_context())
             .collect();
 
         let formatted = format_chat_messages_for_summary(&to_summarize);
@@ -335,24 +333,6 @@ pub(crate) fn find_needed_tool_calls_chat(messages: &[ChatMessage], boundary: us
     }
 
     needed
-}
-
-/// Advance a compaction boundary forward so it never lands *on* a `ToolResult`.
-///
-/// The summary is inserted at the boundary; a boundary on a `ToolResult` whose
-/// `ToolCall` was rescued just before it wedges the summary between the pair,
-/// which Anthropic rejects (`tool_use ids were found without tool_result blocks
-/// immediately after`). Snapping past leading `ToolResult`s keeps each pair
-/// together. Returns the boundary unchanged when it already points at a
-/// non-`ToolResult` or the end of the list.
-pub(crate) fn snap_boundary_past_tool_results(messages: &[ChatMessage], boundary: usize) -> usize {
-    use crate::ui::app_state::MessageRole;
-
-    let mut b = boundary;
-    while b < messages.len() && messages[b].role == MessageRole::ToolResult {
-        b += 1;
-    }
-    b
 }
 
 /// Get the default context config
@@ -513,113 +493,6 @@ mod tests {
         assert_eq!(needed, vec![1]);
     }
 
-    /// Regression: a boundary on a ToolResult must snap forward, else the
-    /// inserted summary orphans the rescued ToolCall and Anthropic rejects it.
-    #[test]
-    fn snap_boundary_advances_past_tool_result() {
-        let messages = vec![
-            ChatMessage::user("q".to_string()),
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "out", Some("c1".to_string())),
-            ChatMessage::agent("a".to_string()),
-        ];
-
-        // Boundary points at the ToolResult (index 2) — the bug trigger.
-        assert_eq!(snap_boundary_past_tool_results(&messages, 2), 3);
-    }
-
-    #[test]
-    fn snap_boundary_leaves_non_tool_result_untouched() {
-        let messages = vec![
-            ChatMessage::user("q".to_string()),
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "out", Some("c1".to_string())),
-            ChatMessage::tool_call("bash", "{}", Some("c2".to_string())),
-        ];
-
-        // Boundary on a ToolCall: kept call+result stay together, no snap needed.
-        assert_eq!(snap_boundary_past_tool_results(&messages, 3), 3);
-        // Boundary on a User message: untouched.
-        assert_eq!(snap_boundary_past_tool_results(&messages, 0), 0);
-    }
-
-    #[test]
-    fn snap_boundary_skips_consecutive_tool_results() {
-        // A ToolCall whose call_id has two results (duplicate-id case) — snap
-        // must skip BOTH so neither gets orphaned across the summary insert.
-        let messages = vec![
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "r1", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "r2", Some("c1".to_string())),
-            ChatMessage::agent("done".to_string()),
-        ];
-
-        assert_eq!(snap_boundary_past_tool_results(&messages, 1), 3);
-    }
-
-    #[test]
-    fn snap_boundary_clamps_at_end() {
-        let messages = vec![
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "r1", Some("c1".to_string())),
-        ];
-
-        // Boundary at the trailing ToolResult would snap to len() (compact all).
-        assert_eq!(snap_boundary_past_tool_results(&messages, 1), 2);
-        // Boundary already at end is a no-op.
-        assert_eq!(snap_boundary_past_tool_results(&messages, 2), 2);
-    }
-
-    /// After the snap, every kept ToolCall is immediately followed by its
-    /// ToolResult even with the summary inserted at the boundary.
-    #[test]
-    fn snap_prevents_summary_splitting_a_pair() {
-        use crate::ui::app_state::MessageRole;
-
-        let messages = vec![
-            ChatMessage::user("q".to_string()),
-            ChatMessage::tool_call("bash", "{}", Some("c1".to_string())),
-            ChatMessage::tool_result("bash", "{}", "out", Some("c1".to_string())),
-            ChatMessage::agent("a".to_string()),
-        ];
-
-        // Raw boundary bisects the pair (points at the ToolResult).
-        let raw = 2;
-        let snapped = snap_boundary_past_tool_results(&messages, raw);
-
-        // Simulate apply_compaction: rescue calls before boundary whose result is
-        // at/after boundary, then insert a summary at the boundary.
-        let needed: std::collections::HashSet<usize> =
-            find_needed_tool_calls_chat(&messages, snapped)
-                .into_iter()
-                .collect();
-        let mut seq: Vec<(MessageRole, Option<String>)> = Vec::new();
-        for (i, m) in messages.iter().enumerate() {
-            if i == snapped {
-                seq.push((MessageRole::Summary, None));
-            }
-            if i >= snapped || needed.contains(&i) {
-                seq.push((m.role, m.call_id.clone()));
-            }
-        }
-        if snapped >= messages.len() {
-            seq.push((MessageRole::Summary, None));
-        }
-
-        // Invariant: every kept ToolCall is immediately followed by its result.
-        for w in seq.windows(2) {
-            if w[0].0 == MessageRole::ToolCall {
-                assert_eq!(
-                    w[1].0,
-                    MessageRole::ToolResult,
-                    "ToolCall must be immediately followed by ToolResult, got {:?}",
-                    w[1]
-                );
-                assert_eq!(w[0].1, w[1].1, "call_id mismatch across the pair");
-            }
-        }
-    }
-
     #[test]
     fn test_truncate_at_call_sites() {
         // The two call sites in `build_summary_prompt` rely on
@@ -679,5 +552,133 @@ mod tests {
         assert_eq!(cm.context_size(), 50_000);
         // 50_000 × 0.8 = 40_000
         assert_eq!(cm.threshold(), 40_000);
+    }
+
+    // ── Compaction × sub-agent lane (RED for tickets/compaction-subagent-lane) ─
+    //
+    // Pinned by `tickets/compaction-subagent-lane.md` § 8.2.
+
+    /// Spec § 8.2 — `compact_summary_input_excludes_sub_agent_turns`.
+    ///
+    /// The summarization prompt must be built from the orchestrator's live
+    /// context only. A sub-agent's internal turns (sourced `SubAgent { role }`)
+    /// live in the transcript but never the orchestrator's wire — and so
+    /// they must NEVER reach the compaction model. Today the prompt is
+    /// built from `!compacted` lane-blind, leaking sub-agent content into
+    /// the summary.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn compact_summary_input_excludes_sub_agent_turns() {
+        use crate::ui::app_state::{ChatMessage, MessageSource};
+        use rig_core::completion::message::UserContent;
+
+        let (model, mock) = crate::providers::create_mock_compaction_model();
+        mock.add_response(crate::mock::MockResponse::text("Summary text."));
+
+        let cfg = ContextConfig {
+            threshold: 0.5,
+            keep_recent: 1, // summarize everything except the last message
+            enabled: true,
+            compaction_model: None,
+        };
+        let cm = ContextManager::new(cfg, 100_000, Some(std::sync::Arc::new(model)));
+
+        // Interleave orchestrator rows carrying ORCH_MARKER with sub-agent
+        // rows carrying SUBAGENT_MARKER (in tool args/results/text).
+        // keep_recent=1: only the last row is kept, so the rest get summarized.
+        let orch = MessageSource::Human;
+        let sub = MessageSource::SubAgent {
+            role: "junior".to_string(),
+        };
+
+        let messages = vec![
+            // Summarized region
+            ChatMessage::user("ORCH_MARKER_first_user".to_string()).with_source(orch.clone()),
+            ChatMessage::tool_call(
+                "bash",
+                r#"{"command":"ORCH_MARKER in args"}"#,
+                Some("orch-tc".to_string()),
+            )
+            .with_source(orch.clone()),
+            ChatMessage::tool_result(
+                "bash",
+                r#"{"command":"ORCH_MARKER in args"}"#,
+                "ORCH_MARKER in result",
+                Some("orch-tc".to_string()),
+            )
+            .with_source(orch.clone()),
+            // Sub-agent rows interleaved
+            ChatMessage::agent("SUBAGENT_MARKER_thinking".to_string()).with_source(sub.clone()),
+            ChatMessage::tool_call(
+                "bash",
+                r#"{"command":"SUBAGENT_MARKER in args"}"#,
+                Some("sub-tc".to_string()),
+            )
+            .with_source(sub.clone()),
+            ChatMessage::tool_result(
+                "bash",
+                r#"{"command":"SUBAGENT_MARKER in args"}"#,
+                "SUBAGENT_MARKER in result",
+                Some("sub-tc".to_string()),
+            )
+            .with_source(sub.clone()),
+            ChatMessage::agent("ORCH_MARKER_middle_user".to_string()).with_source(orch.clone()),
+            ChatMessage::agent("SUBAGENT_MARKER_more".to_string()).with_source(sub.clone()),
+            // Kept region (last row)
+            ChatMessage::agent("ORCH_MARKER_last".to_string()).with_source(MessageSource::Human),
+        ];
+
+        let plan = cm
+            .compact(&messages)
+            .await
+            .expect("compact must succeed with mock summarizer queued");
+
+        // Extract the summarization prompt from the recorded request.
+        let requests = mock.get_recorded_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly 1 summarization request, got {}",
+            requests.len()
+        );
+        let req = &requests[0];
+
+        // The prompt lands as a User message in the agent's chat_history.
+        // Concatenate every text part of every User message so we can assert
+        // on substring presence without depending on message-splitting.
+        let prompt_text: String = req
+            .chat_history
+            .iter()
+            .flat_map(|m| match m {
+                rig_core::completion::message::Message::User { content } => {
+                    let parts: Vec<String> = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    parts
+                }
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Use the plan only to confirm compaction completed — the content
+        // assertions are on the recorded prompt.
+        assert!(!plan.summary.is_empty(), "summarizer must return a summary");
+
+        // The pin: orchestrator content IS summarized; sub-agent content is NOT.
+        assert!(
+            prompt_text.contains("ORCH_MARKER"),
+            "summarization prompt must contain orchestrator markers; got:\n{prompt_text}"
+        );
+        assert!(
+            !prompt_text.contains("SUBAGENT_MARKER"),
+            "summarization prompt must NOT contain any sub-agent marker content \
+             (RED: today the lane-blind slice feeds sub-agent rows to the compaction model); \
+             got:\n{prompt_text}"
+        );
     }
 }

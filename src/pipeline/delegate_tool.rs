@@ -53,6 +53,9 @@ pub struct SubAgentDeps {
     pub active_hook: ActiveSubAgentHook,
     /// Retry policy for a delegation's wire calls — the orchestrator's own.
     pub retry: crate::config::RetryConfig,
+    /// Wall-clock budgets — the delegation's prompt loop reads `delegate_secs`
+    /// from here, so the operator's config drives it rather than a constant.
+    pub timeouts: crate::config::TimeoutsConfig,
 }
 
 /// Build a sub-agent's preamble: `role_prompt` + the live env block + this
@@ -250,6 +253,7 @@ impl Tool for DelegateTool {
             deps.shell_kind.as_ref(),
             deps.vector_store.as_ref(),
             context_budget,
+            &deps.timeouts,
         )
         .map_err(|e| DelegateError::Build {
             role: args.role.clone(),
@@ -264,36 +268,65 @@ impl Tool for DelegateTool {
         // Fresh history — pure agents-as-tools; no memory of prior delegations.
         let mut history = Vec::new();
         let mut attempt = 0;
-        let outcome = loop {
-            match agent
-                .prompt_with_history(args.task.as_str(), &mut history)
-                .await
-            {
-                Ok(text) => break Ok(text),
-                // Transient wire failures (429/5xx/transport) get the same
-                // in-place retry the main loop gives its own turns — only what
-                // outlives the budget is worth handing back. The retry re-runs
-                // the delegation from the task: rig owns the sub-agent's
-                // internal loop state, which isn't resumable from out here.
-                Err(e) => {
-                    let Some(delay) =
-                        crate::providers::retry::next_retry_delay(&e, attempt, &deps.retry)
-                    else {
-                        break Err(e);
-                    };
-                    tracing::warn!(
-                        target: "peakbot",
-                        role = %args.role,
-                        attempt = attempt + 1,
-                        max_retries = deps.retry.max_retries,
-                        backoff_ms = delay.as_millis(),
-                        error = %e,
-                        "Sub-agent request failed transiently; backing off before retry"
-                    );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
+        // The whole loop sits inside the deadline, so the wire-retry budget is
+        // part of it rather than additive to it. On expiry the delegation is
+        // cancelled and its transcript is still salvaged through the normal
+        // handoff path — the outer `budget_for("delegate")` sits a salvage
+        // margin above this bound, leaving room for that summarisation.
+        let budget = crate::tools::time_budget::delegate_loop_budget(&deps.timeouts);
+        let bounded = tokio::time::timeout(budget, async {
+            loop {
+                match agent
+                    .prompt_with_history(args.task.as_str(), &mut history)
+                    .await
+                {
+                    Ok(text) => break Ok(text),
+                    // Transient wire failures (429/5xx/transport) get the same
+                    // in-place retry the main loop gives its own turns — only what
+                    // outlives the budget is worth handing back. The retry re-runs
+                    // the delegation from the task: rig owns the sub-agent's
+                    // internal loop state, which isn't resumable from out here.
+                    Err(e) => {
+                        let Some(delay) =
+                            crate::providers::retry::next_retry_delay(&e, attempt, &deps.retry)
+                        else {
+                            break Err(e);
+                        };
+                        tracing::warn!(
+                            target: "peakbot",
+                            role = %args.role,
+                            attempt = attempt + 1,
+                            max_retries = deps.retry.max_retries,
+                            backoff_ms = delay.as_millis(),
+                            error = %e,
+                            "Sub-agent request failed transiently; backing off before retry"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                    }
                 }
             }
+        })
+        .await;
+
+        let Ok(outcome) = bounded else {
+            tracing::error!(
+                target: "peakbot",
+                role = %args.role,
+                budget_secs = budget.as_secs(),
+                "Delegation exceeded its wall-clock budget; cancelling and salvaging a handoff"
+            );
+            // Bypass `classify` — there is no `PromptError` here, we cancelled
+            // it ourselves — and hand the snapshot straight to the renderer so
+            // the work already done still reaches the orchestrator.
+            let h = handoff::Handoff::Failed {
+                error: format!(
+                    "exceeded its {}s wall-clock budget and was cancelled",
+                    budget.as_secs()
+                ),
+                history: hook.history_snapshot(),
+            };
+            return Ok(handoff::build(&args.role, h, &role.model.provider_config).await);
         };
 
         match outcome {
@@ -490,4 +523,14 @@ mod tests {
             "default (agents_md: false) must keep the preamble lean"
         );
     }
+
+    // The §3.4 ordering invariant for delegate — "the inner loop budget
+    // strictly sits below the outer decorator budget, with the slack being
+    // for handoff::build's summarisation LLM call" — used to be pinned here
+    // against `DELEGATE_BUDGET` and `budget_for("delegate")` directly. After
+    // the postmortem fix both APIs become configurable (`SubAgentDeps`
+    // owns a `TimeoutsConfig`, `budget_for` takes one). The new home for
+    // this invariant is `delegate_registration_strictly_exceeds_the_delegate_loop`
+    // in `time_budget.rs`, which is the right module — it's an invariant
+    // about the *budget table*, not about this tool.
 }

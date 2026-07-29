@@ -213,7 +213,9 @@ impl TestHarness {
         self.state_manager.get_state().chat.messages.len()
     }
 
-    /// Get the number of uncompacted messages (what the LLM would see).
+    /// Get the number of messages not tagged `compacted` (lane-blind).
+    /// This counts all rows where `compacted` is `false`, regardless of lane.
+    /// For "what the orchestrator model actually sees", use `is_orchestrator_context()`.
     pub fn get_uncompacted_message_count(&self) -> usize {
         self.state_manager
             .get_state()

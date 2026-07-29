@@ -1718,12 +1718,22 @@ impl AgentRunner {
             return warnings;
         }
 
+        // Same boundary for the wall-clock budgets: a zero or absurd value
+        // would take effect on the very next tool call.
+        if let Err(e) = fresh.timeouts.validate() {
+            warnings.push(format!("⚠ config reload: {e} — keeping previous config."));
+            return warnings;
+        }
+
         // Diff boot-only keys against the still-current config and warn.
         for (label, changed) in [
             ("mcp_servers", config.mcp_servers != fresh.mcp_servers),
             ("vector_db", config.vector_db != fresh.vector_db),
             ("web", config.web != fresh.web),
             ("pipeline", config.pipeline != fresh.pipeline),
+            // `http` is baked into the HTTP clients at boot; it was missing
+            // here, so edits were adopted into the config yet never applied.
+            ("http", config.http != fresh.http),
         ] {
             if changed {
                 warnings.push(format!("⚠ {label} change ignored — restart to apply."));
@@ -1868,6 +1878,7 @@ impl AgentRunner {
             &ctx.skills,
             active_sub_agent_hook.clone(),
             config.retry(),
+            config.timeouts(),
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 

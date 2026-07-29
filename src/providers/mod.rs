@@ -14,7 +14,7 @@ pub mod retry;
 
 use crate::config::{
     AnthropicCaching, AnthropicConfig, BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig,
-    OpenRouterConfig, ProviderConfig, RetryConfig, SearXngConfig,
+    OpenRouterConfig, ProviderConfig, RetryConfig, SearXngConfig, TimeoutsConfig,
 };
 use crate::hooks::SessionHook;
 use crate::hooks::events::SourcedEvent;
@@ -202,6 +202,7 @@ pub fn create_provider(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
@@ -226,6 +227,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -251,6 +253,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -276,6 +279,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::Anthropic(agent),
@@ -301,6 +305,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -326,6 +331,7 @@ pub fn create_provider(
                 skills,
                 active_sub_agent_hook,
                 retry,
+                timeouts,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -453,6 +459,7 @@ fn add_builtin_tools<M, P>(
     register_view_image: bool,
     wire_bash_panel: bool,
     sub_agent_wiring: Option<SubAgentWiring>,
+    timeouts: &TimeoutsConfig,
 ) -> rig_core::agent::AgentBuilder<M, P, rig_core::agent::WithBuilderTools>
 where
     M: rig_core::completion::CompletionModel,
@@ -581,6 +588,7 @@ where
             event_sink: wiring.event_sink,
             active_hook: wiring.active_hook,
             retry: wiring.retry,
+            timeouts: timeouts.clone(),
         };
         let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(deps));
         tools.push(gate(Box::new(delegate_tool)));
@@ -591,7 +599,7 @@ where
     // inner tool), so blocklist/allowlist address tools by their wire name.
     tools.retain(|t| tools_filter.allows(&t.name()));
 
-    builder.tools(tools)
+    builder.tools(budget_all(tools, timeouts))
 }
 
 /// Attach the live bash panel iff this agent owns one. The orchestrator wires
@@ -637,9 +645,24 @@ fn gate(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
     Box::new(crate::tools::ThoughtGate::wrap(inner))
 }
 
-/// Wrap a slice of already-boxed tools (e.g. MCP) in `ThoughtGate`.
-pub(crate) fn gate_all(tools: Vec<Box<dyn ToolDyn>>) -> Vec<Box<dyn ToolDyn>> {
-    tools.into_iter().map(gate).collect()
+/// Wrap every tool in a wall-clock budget. Called at the two — and only two —
+/// places tools enter the rig builder, so "every tool the model can call is
+/// time-bounded" holds by construction. See docs/tool-time-budget-design.md.
+fn budget_all(tools: Vec<Box<dyn ToolDyn>>, cfg: &TimeoutsConfig) -> Vec<Box<dyn ToolDyn>> {
+    tools
+        .into_iter()
+        .map(|t| Box::new(crate::tools::TimeBudget::wrap(t, cfg)) as Box<dyn ToolDyn>)
+        .collect()
+}
+
+/// Gate (`thought`) then budget (wall clock) a set of already-boxed MCP tools.
+/// The budget is outermost so it also covers the gate's own JSON work and so
+/// the timeout string is never mutated by the gate's nudge.
+pub(crate) fn prepare_mcp_tools(
+    tools: Vec<Box<dyn ToolDyn>>,
+    cfg: &TimeoutsConfig,
+) -> Vec<Box<dyn ToolDyn>> {
+    budget_all(tools.into_iter().map(gate).collect(), cfg)
 }
 
 /// Create OpenRouter agent and info
@@ -659,6 +682,7 @@ fn create_openrouter_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -721,11 +745,14 @@ fn create_openrouter_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -759,6 +786,7 @@ fn create_anthropic_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -825,10 +853,13 @@ fn create_anthropic_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -860,6 +891,7 @@ fn create_ollama_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -913,11 +945,14 @@ fn create_ollama_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -949,6 +984,7 @@ fn create_openai_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -1013,11 +1049,14 @@ fn create_openai_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -1049,6 +1088,7 @@ fn create_llamacpp_agent(
     skills: &crate::skills::SkillRegistry,
     active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -1116,11 +1156,14 @@ fn create_llamacpp_agent(
             max_turns,
             skills: skills.clone(),
         }),
+        timeouts,
     );
 
     // Add MCP tools and build
     let agent = if let Some(tools) = mcp_tools {
-        agent_builder.tools(gate_all(tools)).build()
+        agent_builder
+            .tools(prepare_mcp_tools(tools, timeouts))
+            .build()
     } else {
         agent_builder.build()
     };
@@ -1241,6 +1284,7 @@ pub(crate) fn build_sub_agent(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     context_budget: Option<usize>,
+    timeouts: &TimeoutsConfig,
 ) -> Result<(DynAgent, Arc<SessionHook>)> {
     // Events-only lane-tagged hook. No compaction gate (fresh context) — the
     // sub-agent gate terminates instead of compacting.
@@ -1287,6 +1331,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::OpenRouter(builder.build()), Arc::new(hook)))
         }
@@ -1320,6 +1365,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::OpenAI(builder.build()), Arc::new(hook)))
         }
@@ -1357,6 +1403,7 @@ pub(crate) fn build_sub_agent(
                 supports_vision,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::Anthropic(builder.build()), Arc::new(hook)))
         }
@@ -1391,6 +1438,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::LlamaCpp(builder.build()), Arc::new(hook)))
         }
@@ -1424,6 +1472,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 false,
                 None,
+                timeouts,
             );
             Ok((DynAgent::Ollama(builder.build()), Arc::new(hook)))
         }
@@ -1433,6 +1482,10 @@ pub(crate) fn build_sub_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::completion::ToolDefinition;
+    use rig_core::tool::Tool;
+    use serde_json::{Value, json};
+    use std::time::Duration;
 
     #[test]
     fn wire_bash_tool_severs_sub_agent_panel() {
@@ -1660,5 +1713,193 @@ mod tests {
             !msg.contains("max_tokens"),
             "max_tokens must be set so rig doesn't reject locally; got: {msg}"
         );
+    }
+
+    // ── registration invariant (B) ─────────────────────────────────────────
+    //
+    // The two seams — `add_builtin_tools`'s `builder.tools(...)` and the
+    // renamed `prepare_mcp_tools` (ex-`gate_all`) — are the only two places
+    // tools enter the rig builder. These tests pin that both seams wrap
+    // every tool in `TimeBudget` AND (for MCP) `ThoughtGate`, so "an
+    // unbudgeted tool" stays unrepresentable. The functions don't exist
+    // yet — these tests are RED.
+
+    /// Minimal inner tool with a fixed name; used to verify the decorator
+    /// wrappers preserve `name()` and `definition()` byte-for-byte.
+    struct InnerEcho;
+
+    impl Tool for InnerEcho {
+        const NAME: &'static str = "echo";
+        type Error = std::convert::Infallible;
+        type Args = Value;
+        type Output = String;
+
+        async fn definition(&self, _p: String) -> ToolDefinition {
+            ToolDefinition {
+                name: "echo".to_string(),
+                description: "echo".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "x": { "type": "string" } },
+                    "required": ["x"]
+                }),
+            }
+        }
+
+        async fn call(&self, args: Value) -> Result<String, Self::Error> {
+            Ok(args.to_string())
+        }
+    }
+
+    /// `budget_all` must be a structural pass-through on the surface area
+    /// `ToolDyn` exposes: name preserved verbatim, definition body preserved
+    /// verbatim (no `thought` injection — that's `ThoughtGate`'s job; if
+    /// `TimeBudget` injected it, the gate would double-inject).
+    ///
+    /// Updated for the configurable-budget surface: `budget_all` now
+    /// threads `cfg: &TimeoutsConfig` through so every tool's budget resolves
+    /// from the operator's config, not the hard-coded constant.
+    #[tokio::test]
+    async fn budget_all_preserves_name_and_definition() {
+        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(InnerEcho)];
+        let budgeted = budget_all(tools, &TimeoutsConfig::default());
+
+        assert_eq!(budgeted.len(), 1, "budget_all must preserve count");
+        assert_eq!(budgeted[0].name(), "echo", "name must pass through");
+
+        let def = budgeted[0].definition(String::new()).await;
+        assert_eq!(def.name, "echo", "definition().name must pass through");
+
+        // The exact property set from InnerEcho.definition() — no `thought`.
+        let props = def.parameters["properties"].as_object().unwrap();
+        assert!(
+            !props.contains_key("thought"),
+            "TimeBudget must NOT inject `thought` — that's ThoughtGate's job; got schema: {}",
+            def.parameters
+        );
+    }
+
+    /// The MCP seam (`prepare_mcp_tools`) must produce tools with BOTH the
+    /// `thought` injection (from `ThoughtGate`) AND a budget (from
+    /// `TimeBudget`). The first is observable through `definition()`; the
+    /// second is observable only as "the schema wasn't touched by TimeBudget
+    /// alone" — together, the schema is `ThoughtGate(InnerEcho)` with the
+    /// TimeBudget wrapper sitting around the gate.
+    ///
+    /// Updated for the configurable-budget surface: same threading as
+    /// `budget_all` — `cfg: &TimeoutsConfig` for the budget resolution.
+    #[tokio::test]
+    async fn prepare_mcp_tools_injects_thought_and_preserves_name() {
+        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(InnerEcho)];
+        let mcp = prepare_mcp_tools(tools, &TimeoutsConfig::default());
+
+        assert_eq!(mcp.len(), 1, "prepare_mcp_tools must preserve count");
+        assert_eq!(mcp[0].name(), "echo", "name must pass through");
+
+        let def = mcp[0].definition(String::new()).await;
+        assert_eq!(def.name, "echo", "definition().name must pass through");
+
+        // ThoughtGate effect: `thought` must appear as a required property.
+        let props = def.parameters["properties"].as_object().unwrap();
+        assert!(
+            props.contains_key("thought"),
+            "ThoughtGate must inject `thought` for every MCP tool; got schema: {}",
+            def.parameters
+        );
+        let required = def.parameters["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "thought"),
+            "`thought` must be in the required list (so the model is forced to provide it); got: {required:?}"
+        );
+        // The inner tool's own property must survive the gate.
+        assert!(
+            props.contains_key("x"),
+            "the inner tool's `x` property must survive both decorators; got: {props:?}"
+        );
+    }
+
+    /// End-to-end pin for the configurable-budget surface: a tool that
+    /// hangs forever, wrapped by `budget_all` with the *configured* budget
+    /// set to 1 second, must come back as a `⏱ TIMEOUT` string inside a
+    /// few seconds of real wall clock. Mirrors the same real-short-budget
+    /// technique the `time_budget` self-test uses (`tokio::start_paused`
+    /// needs `test-util`, not enabled in this crate).
+    ///
+    /// RED state: this test will fail to compile before the implementer
+    /// threads `cfg: &TimeoutsConfig` into `budget_all` AND adds
+    /// `TimeoutsConfig` to the providers module's `crate::config` import
+    /// block. Once the surface is in place, this test is the load-bearing
+    /// end-to-end pin: a tool resolving its budget from the operator's
+    /// config, not from a constant. Pre-implementation: zero sites can
+    /// pass it.
+    #[tokio::test]
+    async fn budget_all_applies_the_configured_seconds() {
+        // `tool_secs: 1` is the minimum legal config value; nothing smaller
+        // gets past `TimeoutsConfig::validate()`. The decorator arms exactly
+        // `Duration::from_secs(1)` because `budget_for("always_pending", &cfg)`
+        // for an unknown tool returns `cfg.tool_secs` verbatim — no clamping
+        // — so this test verifies the pass-through works.
+        let cfg = TimeoutsConfig {
+            tool_secs: 1,
+            delegate_secs: 3_600,
+        };
+
+        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(AlwaysPending)];
+        let budgeted = budget_all(tools, &cfg);
+        assert_eq!(budgeted.len(), 1, "budget_all must preserve count");
+        assert_eq!(
+            budgeted[0].name(),
+            "always_pending",
+            "name must pass through"
+        );
+
+        let started = tokio::time::Instant::now();
+        let result = budgeted[0].call("{}".to_string()).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "configured budget (1s) must fire within seconds; took {:?}",
+            elapsed
+        );
+
+        let s = result.expect("timeout must be Ok(String), not Err(ToolError)");
+        assert!(s.contains("⏱ TIMEOUT"), "timeout marker missing from: {s}");
+        assert!(s.contains("always_pending"), "tool name missing from: {s}");
+        assert!(
+            s.contains("1s"),
+            "configured budget seconds (1s) must appear in the timeout message; got: {s}"
+        );
+    }
+
+    /// Local fixture used only by `budget_all_applies_the_configured_seconds`:
+    /// a `ToolDyn` whose `call` returns a never-completing future, so
+    /// `TimeBudget` is forced to arm the wall-clock boundary. Inlined here
+    /// (rather than reaching for `time_budget::Named` which is a private
+    /// sibling-module type) to keep both tests independent — if the
+    /// decorator-side fixture changes shape, this test shouldn't move with it.
+    struct AlwaysPending;
+
+    impl Tool for AlwaysPending {
+        const NAME: &'static str = "always_pending";
+        type Error = std::convert::Infallible;
+        type Args = Value;
+        type Output = String;
+
+        async fn definition(&self, _p: String) -> ToolDefinition {
+            ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "hangs forever".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                }),
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<String, Self::Error> {
+            std::future::pending::<()>().await;
+            unreachable!("never returns");
+        }
     }
 }
