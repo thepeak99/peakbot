@@ -1671,6 +1671,12 @@ impl StateManager {
     /// user turn. Since `add_user_message()` is called before this method in
     /// the production flow, including it here would send the same message to
     /// the model twice.
+    ///
+    /// Messages are run through [`sanitize_tool_pairs`] first: this is the wire
+    /// boundary, and an unpaired `ToolCall` here is a hard provider error, not
+    /// a display glitch.
+    ///
+    /// [`sanitize_tool_pairs`]: crate::tool_use_validator::sanitize_tool_pairs
     pub fn get_agent_history(&self) -> Vec<rig_core::completion::message::Message> {
         use crate::ui::app_state::MessageRole;
         use rig_core::completion::message::{
@@ -1696,7 +1702,7 @@ impl StateManager {
             .filter(|(_, msg)| msg.role == MessageRole::User)
             .map(|(i, _)| i);
 
-        state
+        let live: Vec<&crate::ui::app_state::ChatMessage> = state
             .chat
             .messages
             .iter()
@@ -1708,6 +1714,14 @@ impl StateManager {
             .filter(|(_, msg)| msg.source.is_orchestrator_lane())
             .filter(|(i, _)| Some(*i) != skip_last_idx)
             .map(|(_, msg)| msg)
+            .collect();
+
+        // Last stop before the wire: concurrent appends (the bg drain seam vs.
+        // the event-processor task) can split a ToolCall/ToolResult pair, and
+        // every provider 400s on that — permanently, for the rest of the
+        // conversation. Dropping the broken pair here self-heals instead.
+        crate::tool_use_validator::sanitize_tool_pairs(live)
+            .into_iter()
             .filter_map(|msg| match msg.role {
                 MessageRole::User => Some(RigMessage::User {
                     content: user_content_from_chat_message(msg),
@@ -3155,7 +3169,8 @@ mod tests {
         );
     }
 
-    /// Test that get_agent_history() produces proper rig ToolCall messages (not text approximations)
+    /// Test that get_agent_history() produces proper rig ToolCall messages (not text approximations).
+    /// The result is added too because an orphan call is dropped at the wire boundary.
     #[test]
     fn test_get_agent_history_tool_call_is_structured() {
         use rig_core::completion::message::{AssistantContent, Message as RigMessage};
@@ -3167,9 +3182,16 @@ mod tests {
             r#"{"command":"ls -la"}"#.to_string(),
             Some("call_42".to_string()),
         );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "bash".to_string(),
+            r#"{"command":"ls -la"}"#.to_string(),
+            "ok".to_string(),
+            Some("call_42".to_string()),
+        );
 
         let history = sm.get_agent_history();
-        assert_eq!(history.len(), 1);
+        assert_eq!(history.len(), 2);
 
         match &history[0] {
             RigMessage::Assistant { content, .. } => {
@@ -3190,7 +3212,8 @@ mod tests {
         }
     }
 
-    /// Test that get_agent_history() produces proper rig ToolResult messages
+    /// Test that get_agent_history() produces proper rig ToolResult messages.
+    /// The call is added too because an orphan result is dropped at the wire boundary.
     #[test]
     fn test_get_agent_history_tool_result_is_structured() {
         use rig_core::completion::message::{
@@ -3198,6 +3221,12 @@ mod tests {
         };
 
         let sm = StateManager::new();
+        sm.add_tool_call(
+            MessageSource::Human,
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            Some("call_42".to_string()),
+        );
         sm.add_tool_result(
             MessageSource::Human,
             "bash".to_string(),
@@ -3207,9 +3236,9 @@ mod tests {
         );
 
         let history = sm.get_agent_history();
-        assert_eq!(history.len(), 1);
+        assert_eq!(history.len(), 2);
 
-        match &history[0] {
+        match &history[1] {
             RigMessage::User { content } => {
                 let first = content.first();
                 match first {
@@ -4240,6 +4269,141 @@ mod tests {
             has_bg,
             "background turn was wrongly filtered from orchestrator wire history"
         );
+    }
+
+    /// Regression: a `bash_bg` synthetic user message can land between the
+    /// `ToolCall` and its matching `ToolResult` when the event-processor task
+    /// and the bg-drain seam race. The wire history must never emit a
+    /// `ToolCall` that is not immediately followed by its matching
+    /// `ToolResult`, or every provider rejects the next request with 400 and
+    /// the conversation wedges permanently.
+    #[test]
+    fn get_agent_history_repairs_wedged_bg_user_between_tool_call_and_result() {
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+
+        sm.add_user_message("do thing".to_string());
+        sm.add_assistant_message("thinking".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("call_x".to_string()),
+        );
+        // The wedge: the bg-drain seam lands its user message between the
+        // tool call and its matching tool result.
+        sm.add_user_message_from_background("bg noise".to_string(), vec![1]);
+        sm.add_tool_result(
+            MessageSource::Human,
+            "bash".to_string(),
+            "{}".to_string(),
+            "ok".to_string(),
+            Some("call_x".to_string()),
+        );
+        // Trailing user so the wedge is not the trailing-stripped slot.
+        sm.add_user_message("next thing".to_string());
+
+        let history = sm.get_agent_history();
+
+        // Wire invariant: every ToolCall in the history is immediately
+        // followed by a User message carrying a ToolResult with the same id.
+        for (idx, msg) in history.iter().enumerate() {
+            let RigMessage::Assistant { content, .. } = msg else {
+                continue;
+            };
+            let tool_call_ids: Vec<&str> = content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::ToolCall(tc) => Some(tc.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if tool_call_ids.is_empty() {
+                continue;
+            }
+            let next = history.get(idx + 1).unwrap_or_else(|| {
+                panic!("ToolCall at idx {idx} has no following message: {history:?}")
+            });
+            let RigMessage::User {
+                content: next_content,
+            } = next
+            else {
+                panic!(
+                    "ToolCall at idx {idx} must be followed by a User message, got {next:?} (history: {history:?})"
+                );
+            };
+            let result_ids: Vec<&str> = next_content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                result_ids, tool_call_ids,
+                "ToolCall(s) at idx {idx} ({tool_call_ids:?}) must be immediately followed by ToolResult(s) with matching ids, got {result_ids:?} (history: {history:?})"
+            );
+        }
+    }
+
+    /// Inverse regression: a canonical transcript (ToolCall immediately
+    /// followed by its ToolResult, then a user turn) must pass through
+    /// `get_agent_history` untouched. Guards against an overzealous fix that
+    /// mangles valid history.
+    #[test]
+    fn get_agent_history_preserves_canonical_tool_call_then_tool_result_pair() {
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+
+        sm.add_user_message("do thing".to_string());
+        sm.add_assistant_message("thinking".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("call_x".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "bash".to_string(),
+            "{}".to_string(),
+            "ok".to_string(),
+            Some("call_x".to_string()),
+        );
+        // Trailing user so the tool result is not the trailing-stripped slot.
+        sm.add_user_message("trailing".to_string());
+
+        let history = sm.get_agent_history();
+
+        // Trailing user is excluded; the surviving 4 messages pass through.
+        assert_eq!(history.len(), 4, "history: {history:?}");
+
+        // The ToolCall at index 2 is immediately followed by the ToolResult
+        // at index 3 — no orphan, no mangling.
+        let tc_id = match &history[2] {
+            RigMessage::Assistant { content, .. } => content
+                .iter()
+                .find_map(|c| match c {
+                    AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    _ => None,
+                })
+                .expect("ToolCall at index 2"),
+            other => panic!("expected Assistant ToolCall at index 2, got {other:?}"),
+        };
+        let tr_id = match &history[3] {
+            RigMessage::User { content } => content
+                .iter()
+                .find_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.id.clone()),
+                    _ => None,
+                })
+                .expect("ToolResult at index 3"),
+            other => panic!("expected User ToolResult at index 3, got {other:?}"),
+        };
+        assert_eq!(tc_id, "call_x");
+        assert_eq!(tr_id, "call_x");
     }
 
     #[test]

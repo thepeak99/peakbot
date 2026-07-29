@@ -2,10 +2,7 @@
 //!
 //! The rig wire layer assumes that every [`MessageRole::ToolCall`] is
 //! immediately followed by a [`MessageRole::ToolResult`] with the same
-//! `call_id`. The runtime `add_tool_call` / `add_tool_result` paths
-//! cannot violate this — they are sequential, single-threaded writes
-//! from inside the agent loop. The two places where the invariant *can*
-//! break are:
+//! `call_id`. Three paths can break that:
 //!
 //! 1. **Loading a conversation from disk** ([`StateManager::sync_from_conversation`])
 //!    — a file may have been truncated mid-write, edited by hand, or
@@ -13,17 +10,25 @@
 //! 2. **Context compaction** ([`StateManager::replace_chat_messages`])
 //!    — summarisation can drop a `ToolResult` while keeping its `ToolCall`,
 //!    or vice-versa.
+//! 3. **Concurrent appends at runtime** — `add_tool_call` / `add_tool_result`
+//!    are not one atomic unit, and another task (the `bash_bg` drain seam
+//!    calling `add_user_message_from_background`) can append a User message
+//!    into the gap between them. The `RwLock` orders individual pushes, not
+//!    pairs. Hence [`StateManager::get_agent_history`] sanitizes too: it is
+//!    the last point before the wire, where an unpaired `ToolCall` turns
+//!    into a 400 that wedges the conversation for good.
 //!
-//! [`sanitize_tool_pairs`] is the single repair function applied at both
-//! boundaries. It runs once per load / once per compaction; orphans are
-//! dropped silently. See `opus-proposal.md` for the design rationale and
-//! the explicit decision to **not** log or report drops — sanitization is
-//! a boundary repair, not a fault.
+//! [`sanitize_tool_pairs`] is the single repair function applied at all
+//! three points; orphans are dropped silently. See `opus-proposal.md` for
+//! the design rationale and the explicit decision to **not** log or report
+//! drops — sanitization is a boundary repair, not a fault.
 //!
 //! [`StateManager::sync_from_conversation`]: crate::state::StateManager
 //! [`StateManager::replace_chat_messages`]: crate::state::StateManager::replace_chat_messages
+//! [`StateManager::get_agent_history`]: crate::state::StateManager::get_agent_history
 
 use crate::ui::app_state::{ChatMessage, MessageRole};
+use std::borrow::Borrow;
 
 /// Drop tool-call/result messages that violate the
 /// `ToolCall(id) → ToolResult(id)` adjacent-pair invariant.
@@ -34,35 +39,30 @@ use crate::ui::app_state::{ChatMessage, MessageRole};
 /// All other tool messages are dropped **silently**. Non-tool messages
 /// pass through unchanged in order.
 ///
-/// The function is pure and stateless; the two integration points in
-/// `state_manager.rs` are the only callers.
-pub fn sanitize_tool_pairs(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+/// The function is pure and stateless. It is generic over anything that
+/// borrows a [`ChatMessage`] so the wire-boundary caller can sanitize a
+/// `Vec<&ChatMessage>` without cloning the transcript on every request.
+pub fn sanitize_tool_pairs<T: Borrow<ChatMessage>>(messages: Vec<T>) -> Vec<T> {
     let mut out = Vec::with_capacity(messages.len());
-    let mut i = 0;
-    while i < messages.len() {
-        match messages[i].role {
+    let mut iter = messages.into_iter().peekable();
+    while let Some(msg) = iter.next() {
+        match msg.borrow().role {
             MessageRole::ToolCall => {
-                let paired = messages.get(i + 1).is_some_and(|next| {
-                    next.role == MessageRole::ToolResult && next.call_id == messages[i].call_id
+                let call_id = &msg.borrow().call_id;
+                let paired = iter.peek().is_some_and(|next| {
+                    let next = next.borrow();
+                    next.role == MessageRole::ToolResult && &next.call_id == call_id
                 });
                 if paired {
-                    out.push(messages[i].clone());
-                    out.push(messages[i + 1].clone());
-                    i += 2;
-                } else {
-                    // Orphan ToolCall: no matching ToolResult adjacent.
-                    i += 1;
+                    out.push(msg);
+                    out.extend(iter.next());
                 }
+                // Otherwise an orphan ToolCall: dropped.
             }
-            MessageRole::ToolResult => {
-                // Any matching ToolResult would have been consumed by
-                // the ToolCall arm above. Reaching here means orphan.
-                i += 1;
-            }
-            _ => {
-                out.push(messages[i].clone());
-                i += 1;
-            }
+            // Any matching ToolResult would have been consumed by the
+            // ToolCall arm above. Reaching here means orphan.
+            MessageRole::ToolResult => {}
+            _ => out.push(msg),
         }
     }
     out
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn empty_input_is_clean() {
-        let out = sanitize_tool_pairs(vec![]);
+        let out = sanitize_tool_pairs(Vec::<ChatMessage>::new());
         assert!(out.is_empty());
     }
 
