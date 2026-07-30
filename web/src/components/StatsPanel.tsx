@@ -16,6 +16,16 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
+// One figure in an agent card: micro-label above the number.
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wide text-zinc-600">{label}</div>
+      <div className="font-mono tabular-nums text-zinc-300">{value}</div>
+    </div>
+  );
+}
+
 // Session stats + context-usage meter. Mirrors SessionState / ContextState
 // (src/ui/app_state.rs). The meter turns amber past the compaction
 // threshold, red when full — same signal the TUI status bar carries.
@@ -68,34 +78,31 @@ export function StatsPanel({
           <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
             Agents · cumulative
           </h3>
-          <table className="w-full text-xs tabular-nums">
-            <thead>
-              <tr className="text-[10px] uppercase tracking-wide text-zinc-600">
-                <th className="pb-1 text-left font-medium">agent</th>
-                <th className="pb-1 text-left font-medium">model</th>
-                <th className="pb-1 text-right font-medium">in</th>
-                <th className="pb-1 text-right font-medium">out</th>
-                <th className="pb-1 text-right font-medium">calls</th>
-              </tr>
-            </thead>
-            <tbody>
-              {stats.lanes.map((l) => (
-                <tr key={l.lane}>
-                  <td className="truncate pr-2 text-zinc-500">{viewLabel(l.lane)}</td>
-                  <td className="truncate pr-2 font-mono text-zinc-400">
+          <div className="space-y-2">
+            {stats.lanes.map((l) => (
+              <div
+                key={l.lane}
+                className="rounded-md border border-zinc-800 bg-zinc-900/40 px-2.5 py-2"
+              >
+                <div className="mb-1.5 flex items-baseline justify-between gap-2">
+                  <span className="truncate text-xs font-medium text-zinc-300">
+                    {viewLabel(l.lane)}
+                  </span>
+                  <span
+                    className="truncate font-mono text-[10px] text-zinc-500"
+                    title={l.model || undefined}
+                  >
                     {l.model || "—"}
-                  </td>
-                  <td className="text-right font-mono text-zinc-300">
-                    {fmtTokens(l.inputTokens)}
-                  </td>
-                  <td className="text-right font-mono text-zinc-300">
-                    {fmtTokens(l.outputTokens)}
-                  </td>
-                  <td className="text-right font-mono text-zinc-300">{l.apiCalls}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  <Stat label="in" value={fmtTokens(l.inputTokens)} />
+                  <Stat label="out" value={fmtTokens(l.outputTokens)} />
+                  <Stat label="calls" value={String(l.apiCalls)} />
+                </div>
+              </div>
+            ))}
+          </div>
         </section>
       )}
 
