@@ -126,16 +126,13 @@ export function App() {
   // Todos & files derive from the transcript. In the global view todos show
   // every lane's list, each labeled by its lane (todosByLane); a scoped view
   // shows just that lane's list, unlabeled. Files stay global-mixed by design.
-  const scopedMessages = state
-    ? filterMessagesByView(state.chat.messages, effectiveView)
-    : [];
   const todos =
     state && effectiveView === "global"
       ? todosByLane(state.chat.messages)
-      : todosFromMessages(scopedMessages);
+      : todosFromMessages(visibleMessages);
   const bg = state ? adaptBg(state) : [];
   const context = state ? adaptContext(state) : null;
-  const files = filesFromMessages(scopedMessages);
+  const files = filesFromMessages(visibleMessages);
 
   const runningBg = bg.filter((p) => p.status === "running").length;
   const pendingInput = state?.pending_input_count ?? 0;
