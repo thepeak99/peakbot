@@ -1,14 +1,12 @@
 /**
  * SetupDraft — the in-memory shape of the /setup wizard.
  *
- * One slice per step from plan §8.4 (1=Welcome … 10=Review). The senior
- * implementation owns `useState<SetupDraft>` inside `<Setup>`; this module
- * only declares the shape, defaults, and the validation functions the UI
- * will call.
+ * One slice per step from plan §8.4 (1=Welcome … 10=Review). `<Setup>` owns
+ * the single `useState<SetupDraft>`; this module declares the shape, the
+ * defaults, and the local validation the steps call.
  *
- * Stubs below return placeholder values so the file compiles and tests
- * can be written against the contract. The real validation logic is the
- * next PR.
+ * Validation is *shape* validation only — required/empty/duplicate/XOR — and
+ * runs entirely in the browser. Nothing here talks to the binary.
  */
 
 // ---------- slice types -----------------------------------------------------
@@ -225,47 +223,92 @@ export function collectAliases(draft: SetupDraft): string[] {
       if (typeof m.alias === "string" && m.alias.length > 0) out.push(m.alias);
     }
   }
-  // Aliases from the legacy single-provider block live on the model too; the
-  // dummy currently doesn't surface them, but collectors should be ready.
-  void draft;
   return out;
+}
+
+/** Total models declared across every provider — `default_model` is required
+ *  iff this is > 0. */
+function countModels(draft: SetupDraft): number {
+  return draft.providers.reduce((n, p) => n + (p.models?.length ?? 0), 0);
 }
 
 // ---------- validators ------------------------------------------------------
 
 /** Errors from step 4 (Models). Empty array = valid. */
 export function validateModels(draft: SetupDraft): string[] {
-  // PLACEHOLDER — real implementation runs the four documented rules:
-  //   - alias charset ^[A-Za-z0-9_./:-]+$
-  //   - "unknown" reserved
-  //   - aliases unique across all providers
-  //   - default_model required iff >=1 model declared, must reference one
-  void draft;
-  return [];
+  const errors: string[] = [];
+  const aliases = collectAliases(draft);
+  const seen = new Set<string>();
+  const reported = new Set<string>();
+
+  for (const alias of aliases) {
+    if (!ALIAS_PATTERN.test(alias)) {
+      errors.push(
+        `Model alias "${alias}" is outside the allowed charset ${ALIAS_PATTERN.source}.`,
+      );
+    }
+    if (alias === RESERVED_ALIAS) {
+      errors.push(`Model alias "${alias}" is reserved — pick another one.`);
+    }
+    // One message per duplicated alias, not one per extra occurrence.
+    if (seen.has(alias) && !reported.has(alias)) {
+      errors.push(
+        `Duplicate model alias "${alias}" — aliases are globally unique across every provider.`,
+      );
+      reported.add(alias);
+    }
+    seen.add(alias);
+  }
+
+  if (countModels(draft) > 0 && !draft.defaultModel) {
+    errors.push("default_model is required once any model is declared.");
+  }
+  if (draft.defaultModel && !aliases.includes(draft.defaultModel)) {
+    errors.push(
+      `default_model "${draft.defaultModel}" does not match any declared alias.`,
+    );
+  }
+
+  return errors;
 }
 
 /** Errors from step 6 (Services). Empty array = valid. The XOR on the
  *  `tools` filter (disabled vs only) is the documented hard rule. */
 export function validateServices(draft: SetupDraft): string[] {
-  // PLACEHOLDER — real implementation enforces tools.disabled XOR tools.only.
-  void draft;
+  const tools = draft.services.tools;
+  if ((tools?.disabled?.length ?? 0) > 0 && (tools?.only?.length ?? 0) > 0) {
+    return [
+      "tools: disabled and only are XOR — keep the blocklist or the allowlist, not both.",
+    ];
+  }
   return [];
 }
 
 /** Errors from step 9 (Multi-agent). Re-runs after step 4 edits; role
  *  `model` aliases must resolve against the live models slice. */
 export function validateMultiAgent(draft: SetupDraft): string[] {
-  // PLACEHOLDER — real implementation checks every pipeline.agents[*].model
-  // against collectAliases(draft); flags references to aliases that no
-  // longer exist after the user edited step 4.
-  void draft;
-  return [];
+  if (!draft.pipeline.enabled) return [];
+  const aliases = collectAliases(draft);
+  const errors: string[] = [];
+  for (const agent of draft.pipeline.agents ?? []) {
+    // An omitted model is legal — the role falls back to default_model.
+    if (!agent.model) continue;
+    if (!aliases.includes(agent.model)) {
+      errors.push(
+        `Role "${agent.role ?? ""}" points at model alias "${agent.model}", which no longer exists in the Models step.`,
+      );
+    }
+  }
+  return errors;
 }
 
 /** Errors from step 7 (Access). Empty array = valid. */
 export function validateAccess(draft: SetupDraft): string[] {
-  // PLACEHOLDER — real implementation rejects mode = "lan" with no token.
-  void draft;
+  if (draft.access.mode === "lan" && !draft.access.token?.trim()) {
+    return [
+      "A LAN bind requires a token — generate one, or switch back to local only.",
+    ];
+  }
   return [];
 }
 
@@ -286,12 +329,27 @@ export function validateDraft(draft: SetupDraft): string[] {
  *  requires a full restart. From agents.md "Live reload on session verbs". */
 export type RestartImpact = "reload-safe" | "boot-only";
 
+/** Top-level keys the session verbs re-read (`/new`, `/model`, `/cd`,
+ *  `/load`). Everything else — including the boot-only blocks and any key we
+ *  don't recognise — needs a restart. */
+const RELOAD_SAFE_KEYS = new Set([
+  "providers",
+  "default_model",
+  "skills",
+  "searxng",
+  "bash",
+  "agent_max_turns",
+  "cost_tracking",
+  "context",
+  "retry",
+  "memory",
+  "timeouts",
+  "tools",
+]);
+
 /** Classify a top-level config key. Unrecognised keys default to
  *  "boot-only" (conservative — telling the user "restart" is safer than
  *  silently telling them a change is hot-reloadable when it isn't). */
 export function classifyChange(key: string): RestartImpact {
-  // PLACEHOLDER — real implementation reads key against the documented
-  // reload-safe / boot-only table in agents.md.
-  void key;
-  return "boot-only";
+  return RELOAD_SAFE_KEYS.has(key) ? "reload-safe" : "boot-only";
 }

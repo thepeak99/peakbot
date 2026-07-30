@@ -110,9 +110,9 @@ describe("renderYaml — tools block", () => {
     draft.services = { tools: { disabled: ["bash_bg", "web_search"] } };
     const yaml = renderYaml(draft);
     expect(yaml).toMatch(/^tools:/m);
-    expect(yaml).toMatch(/^  disabled:/m);
+    expect(yaml).toMatch(/^ {2}disabled:/m);
     expect(yaml).toMatch(/- bash_bg/);
-    expect(yaml).not.toMatch(/^  only:/m);
+    expect(yaml).not.toMatch(/^ {2}only:/m);
   });
 
   it("renders tools.only when set", () => {
@@ -120,9 +120,9 @@ describe("renderYaml — tools block", () => {
     draft.services = { tools: { only: ["file_read", "bash"] } };
     const yaml = renderYaml(draft);
     expect(yaml).toMatch(/^tools:/m);
-    expect(yaml).toMatch(/^  only:/m);
+    expect(yaml).toMatch(/^ {2}only:/m);
     expect(yaml).toMatch(/- file_read/);
-    expect(yaml).not.toMatch(/^  disabled:/m);
+    expect(yaml).not.toMatch(/^ {2}disabled:/m);
   });
 });
 
@@ -209,7 +209,7 @@ describe("renderYaml — bash.env", () => {
     draft.bashEnv = { MY_API_KEY: "abc123", DEBUG: "1" };
     const yaml = renderYaml(draft);
     expect(yaml).toMatch(/^bash:/m);
-    expect(yaml).toMatch(/^  env:/m);
+    expect(yaml).toMatch(/^ {2}env:/m);
     expect(yaml).toMatch(/MY_API_KEY: "abc123"/);
   });
 
