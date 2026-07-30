@@ -1,4 +1,5 @@
 import type { ContextUsage, SessionStats } from "../types";
+import { viewLabel } from "../adapt";
 
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -61,6 +62,42 @@ export function StatsPanel({
           <Row label="cost" value={`$${stats.costUsd.toFixed(4)}`} />
         </div>
       </section>
+
+      {stats.lanes.length > 1 && (
+        <section>
+          <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+            Agents · cumulative
+          </h3>
+          <table className="w-full text-xs tabular-nums">
+            <thead>
+              <tr className="text-[10px] uppercase tracking-wide text-zinc-600">
+                <th className="pb-1 text-left font-medium">agent</th>
+                <th className="pb-1 text-left font-medium">model</th>
+                <th className="pb-1 text-right font-medium">in</th>
+                <th className="pb-1 text-right font-medium">out</th>
+                <th className="pb-1 text-right font-medium">calls</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.lanes.map((l) => (
+                <tr key={l.lane}>
+                  <td className="truncate pr-2 text-zinc-500">{viewLabel(l.lane)}</td>
+                  <td className="truncate pr-2 font-mono text-zinc-400">
+                    {l.model || "—"}
+                  </td>
+                  <td className="text-right font-mono text-zinc-300">
+                    {fmtTokens(l.inputTokens)}
+                  </td>
+                  <td className="text-right font-mono text-zinc-300">
+                    {fmtTokens(l.outputTokens)}
+                  </td>
+                  <td className="text-right font-mono text-zinc-300">{l.apiCalls}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
 
       <section>
         <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">

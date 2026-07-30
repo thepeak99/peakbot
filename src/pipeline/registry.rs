@@ -100,6 +100,16 @@ impl SubAgentRegistry {
     pub(crate) fn role(&self, name: &str) -> Option<&ResolvedRole> {
         self.roles.get(name)
     }
+
+    /// Every role paired with its resolved model alias. Published into the
+    /// UI state at session build so the Session panel can name the model
+    /// behind each agent lane.
+    pub fn role_model_aliases(&self) -> Vec<(String, String)> {
+        self.roles
+            .iter()
+            .map(|(role, r)| (role.clone(), r.model.alias.clone()))
+            .collect()
+    }
 }
 
 /// Errors that can occur when working with sub-agents

@@ -257,6 +257,13 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     state_manager.set_provider_name(boot_provider_name);
     state_manager.set_model_alias(boot_alias.clone());
 
+    // Name the model behind each sub-agent lane for the Session panel. Roles
+    // only — the orchestrator's model is derived from the active alias at
+    // stamp time, so `/model` needs no bookkeeping here.
+    if let Some(reg) = deps.pipeline_registry.as_deref() {
+        state_manager.set_lane_models(reg.role_model_aliases().into_iter().collect());
+    }
+
     // Initialise the conversation synchronously so `conversation_id` is valid
     // before the controller loop spawns. `resume` best-effort adopts a
     // persisted conversation; `ensure_boot_conversation` is idempotent, so it

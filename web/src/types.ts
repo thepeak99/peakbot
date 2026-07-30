@@ -44,6 +44,8 @@ export interface LaneStat {
   inputTokens: number;
   outputTokens: number;
   apiCalls: number;
+  /** Model alias behind this lane; empty when the backend didn't name one. */
+  model: string;
   costUsd: number;
 }
 

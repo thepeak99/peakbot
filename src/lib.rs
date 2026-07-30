@@ -2517,11 +2517,15 @@ impl AgentRunner {
                         let rows: String = lanes
                             .iter()
                             .map(|(name, l)| {
-                                format!("\n| {} | {} | ${:.4} |", name, l.api_calls, l.cost)
+                                format!(
+                                    "\n| {} | {} | {} | {} | ${:.4} |",
+                                    name, l.input_tokens, l.output_tokens, l.api_calls, l.cost
+                                )
                             })
                             .collect();
                         format!(
-                            "{msg}\n\n### By lane\n\n| Lane | Calls | Cost |\n|---|---|---|{rows}"
+                            "{msg}\n\n### By lane (cumulative)\n\n\
+                             | Lane | In | Out | Calls | Cost |\n|---|---|---|---|---|{rows}"
                         )
                     } else {
                         msg
