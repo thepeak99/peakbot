@@ -56,7 +56,7 @@ export function TopBar({
     // transcript's `relative` wrapper, or the dropdowns render but can't be clicked.
     <header className="relative z-30 flex min-h-14 items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur">
       <div className="flex items-center gap-2">
-        <span className="text-base">✦</span>
+        <img src="/shifu-mark.png" alt="" className="h-6 w-6 rounded-sm" />
         <span className="font-semibold text-zinc-100">Shifu</span>
       </div>
 

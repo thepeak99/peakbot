@@ -220,7 +220,7 @@ impl WebUi {
     async fn serve_plain(&self, app: Router) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         let url = self.entry_url();
-        eprintln!("🌐 PeakBot web UI: {url}  (Ctrl+C to quit)");
+        eprintln!("🌐 Shifu web UI: {url}  (Ctrl+C to quit)");
         self.maybe_open_browser(&url);
 
         axum::serve(listener, app)
@@ -239,7 +239,7 @@ impl WebUi {
         let server_config = tls::server_config(&tls_dir, &sans)?;
 
         let url = self.entry_url();
-        eprintln!("🔒 PeakBot web UI (HTTPS): {url}  (Ctrl+C to quit)");
+        eprintln!("🔒 Shifu web UI (HTTPS): {url}  (Ctrl+C to quit)");
         let host = tls::primary_lan_host(self.addr);
         eprintln!(
             "📲 Install the CA on your phone once: https://{host}:{}/peakbot-ca.crt",
