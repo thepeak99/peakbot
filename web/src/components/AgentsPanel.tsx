@@ -40,6 +40,7 @@ export function AgentsPanel({
   active,
   onSelect,
   roster,
+  laneCalls,
 }: {
   /** Whether a multi-agent pipeline is *configured* for this session
    * (`pipeline.enabled` + roles, boot-only). Decides whether the opt-in is
@@ -57,6 +58,9 @@ export function AgentsPanel({
   /** One entry per delegation call, in call order, with its composite key and
    * turn count (see deriveSubAgentRoster). */
   roster: { key: string; role: string; n: number; count: number }[];
+  /** Lane → API-call count, from the same source as the Session tab. Shown
+   * beside the message count so the two numbers can't be read as one. */
+  laneCalls: Record<string, number>;
 }) {
   // Sub-agent views are shown only when the conversation actually opted in.
   const active_ = pipelineAvailable && subagentsEnabled;
@@ -230,9 +234,16 @@ export function AgentsPanel({
                       )}
                       <span
                         className="rounded bg-zinc-800/80 px-1.5 py-0.5 text-[10px] tabular-nums text-zinc-400"
-                        title={`${g.total} transcript messages — not API calls (see the Session tab for those)`}
+                        title={`${g.total} transcript messages${
+                          laneCalls[g.role] === undefined
+                            ? ""
+                            : ` from ${laneCalls[g.role]} API calls`
+                        } — a call usually produces several messages`}
                       >
                         {g.total} msg
+                        {laneCalls[g.role] === undefined
+                          ? ""
+                          : ` · ${laneCalls[g.role]} calls`}
                       </span>
                       {roleActive && (
                         <span className="text-[10px] text-sky-400">watching</span>

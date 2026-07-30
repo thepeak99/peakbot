@@ -136,6 +136,11 @@ export function App() {
   const bg = state ? adaptBg(state) : [];
   const context = state ? adaptContext(state) : null;
   const files = filesFromMessages(visibleMessages);
+  // API calls per lane, so the Agents panel can show them next to its message
+  // counts — two different units that otherwise look like disagreement.
+  const laneCalls = Object.fromEntries(
+    (stats?.lanes ?? []).map((l) => [l.lane, l.apiCalls]),
+  );
 
   const runningBg = bg.filter((p) => p.status === "running").length;
   const pendingInput = state?.pending_input_count ?? 0;
@@ -195,6 +200,7 @@ export function App() {
           active={view}
           onSelect={setView}
           roster={roster}
+          laneCalls={laneCalls}
         />
       ),
       badge:
