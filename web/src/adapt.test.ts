@@ -452,7 +452,7 @@ describe("todoTree", () => {
     // Hand-crafted toolcall with non-parseable tool_args. The delegate call
     // is silently skipped — its (empty) lane does not appear at all, the
     // orchestrator item still renders, and the panel is otherwise correct.
-    const msgs = [
+    const msgs: WireChatMessage[] = [
       todoCall({ action: "add", tasks: ["task 1"] }), // id 1
       {
         role: "toolcall",

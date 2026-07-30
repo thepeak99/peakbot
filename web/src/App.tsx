@@ -35,9 +35,10 @@ import {
   deriveSubAgentRoster,
   filesFromMessages,
   filterMessagesByView,
+  flatTree,
   laneOf,
   scopeStatsToView,
-  todosByLane,
+  todoTree,
   todosFromMessages,
   viewLabel,
 } from "./adapt";
@@ -111,16 +112,18 @@ export function App() {
   const scopedStats = stats ? scopeStatsToView(stats, effectiveView) : null;
   const welcome = state ? adaptWelcome(state) : null;
   const bash = state ? adaptBashPanel(state.bash_panel) : null;
-  // Todos & files derive from the transcript. In the global view todos show
-  // every lane's list, each labeled by its lane (todosByLane); a scoped view
-  // shows just that lane's list, unlabeled. Files stay global-mixed by design.
+  // Todos & files derive from the transcript. In the global view todos form a
+  // one-level tree: each lane's list labeled by lane, sub-agent todos nested
+  // under the orchestrator item they were delegated from (todoTree). A scoped
+  // view shows just that lane's flat, unlabeled list. Files stay global-mixed
+  // by design.
   const scopedMessages = state
     ? filterMessagesByView(state.chat.messages, effectiveView)
     : [];
   const todos =
     state && effectiveView === "global"
-      ? todosByLane(state.chat.messages)
-      : todosFromMessages(scopedMessages);
+      ? todoTree(state.chat.messages)
+      : flatTree(todosFromMessages(scopedMessages));
   const bg = state ? adaptBg(state) : [];
   const context = state ? adaptContext(state) : null;
   const files = filesFromMessages(scopedMessages);
@@ -145,8 +148,9 @@ export function App() {
     {
       id: "todo",
       label: "Todo",
-      content: <TodoPanel items={todos} />,
-      badge: todos.length,
+      content: <TodoPanel nodes={todos} />,
+      // Every rendered row counts — parents plus their nested sub-agent todos.
+      badge: todos.reduce((n, node) => n + 1 + node.children.length, 0),
     },
     {
       id: "files",

@@ -34,9 +34,19 @@ export interface TodoItem {
   text: string;
   status: TodoStatus;
   /** Display label for the lane this todo belongs to ("Orchestrator", a role,
-   * or "role · call N"). Set only in the global view (todosByLane) so the panel
+   * or "role · call N"). Set only in the global view (todoTree) so the panel
    * can label it; absent when the panel is already scoped to a single lane. */
   lane?: string;
+}
+
+// One rendered todo row plus the sub-agent todos delegated from it. Depth is
+// capped at one *by the type*: a child is a plain TodoItem, so a grandchild is
+// unrepresentable — matching the product decision (one nesting level; a
+// sub-agent cannot itself delegate). `children` is always present, possibly
+// empty, so the renderer needs no undefined branch.
+export interface TodoNode {
+  item: TodoItem;
+  children: TodoItem[];
 }
 
 export interface LaneStat {
