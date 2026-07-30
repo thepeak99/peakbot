@@ -512,6 +512,23 @@ export function filterMessagesByView(
   );
 }
 
+// Transcript message count per lane, keyed exactly as `stats.lanes[].lane`
+// ("orchestrator" or a role). The single source for both the Session cards and
+// the Agents panel's role totals, so the two can't drift apart.
+export function messagesByLane(
+  messages: WireChatMessage[],
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const m of messages) {
+    // `role` is optional on the wire; a sub_agent source without one can't be
+    // attributed, so it counts as orchestrator rather than a phantom lane.
+    const lane =
+      m.source?.kind === "sub_agent" ? (m.source.role ?? "orchestrator") : "orchestrator";
+    out[lane] = (out[lane] ?? 0) + 1;
+  }
+  return out;
+}
+
 // Roster. Return one entry per delegation call, in call order, each with its
 // composite key and turn count. A role delegated to N times yields N entries
 // (role#1 … role#N). Zero backend — derived from the transcript via

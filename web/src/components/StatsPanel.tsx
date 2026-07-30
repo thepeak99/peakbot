@@ -34,6 +34,7 @@ export function StatsPanel({
   context,
   peakbotVersion,
   scopeLabel,
+  laneMessages,
 }: {
   stats: SessionStats;
   context: ContextUsage;
@@ -44,6 +45,9 @@ export function StatsPanel({
   /** When watching a single lane (a role or the orchestrator), the session
    * rows show that lane's numbers and this label names it. Null = global. */
   scopeLabel?: string | null;
+  /** Lane → transcript message count. Same map the Agents panel uses, so a
+   * lane's `msgs` reads identically in both places. */
+  laneMessages: Record<string, number>;
 }) {
   const pct = context.windowSize
     ? (context.currentUsage / context.windowSize) * 100
@@ -95,10 +99,14 @@ export function StatsPanel({
                     {l.model || "—"}
                   </span>
                 </div>
-                <div className="grid grid-cols-3 gap-2 text-xs">
+                <div className="grid grid-cols-4 gap-2 text-xs">
                   <Stat label="in" value={fmtTokens(l.inputTokens)} />
                   <Stat label="out" value={fmtTokens(l.outputTokens)} />
                   <Stat label="calls" value={String(l.apiCalls)} />
+                  <Stat
+                    label="msgs"
+                    value={String(laneMessages[l.lane] ?? 0)}
+                  />
                 </div>
               </div>
             ))}

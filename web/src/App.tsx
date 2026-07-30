@@ -39,6 +39,7 @@ import {
   filterMessagesByView,
   flatTree,
   laneOf,
+  messagesByLane,
   scopeStatsToView,
   todoTree,
   todosFromMessages,
@@ -141,6 +142,9 @@ export function App() {
   const laneCalls = Object.fromEntries(
     (stats?.lanes ?? []).map((l) => [l.lane, l.apiCalls]),
   );
+  // One derivation of per-lane message counts, shared by the Session cards and
+  // the Agents panel — two panels reporting the same figure from one place.
+  const laneMessages = messagesByLane(state?.chat.messages ?? []);
 
   const runningBg = bg.filter((p) => p.status === "running").length;
   const pendingInput = state?.pending_input_count ?? 0;
@@ -156,6 +160,7 @@ export function App() {
             context={context}
             peakbotVersion={welcome?.peakbotVersion}
             scopeLabel={scopeLabel}
+            laneMessages={laneMessages}
           />
         ) : null,
     },
@@ -201,6 +206,7 @@ export function App() {
           onSelect={setView}
           roster={roster}
           laneCalls={laneCalls}
+          laneMessages={laneMessages}
         />
       ),
       badge:

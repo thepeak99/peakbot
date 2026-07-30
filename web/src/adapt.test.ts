@@ -5,6 +5,7 @@ import {
   deriveSubAgentRoster,
   filterMessagesByView,
   flatTree,
+  messagesByLane,
   parseCallKey,
   todoTree,
   todosFromMessages,
@@ -170,6 +171,37 @@ function subAgent(role: string, todo?: Record<string, unknown>): WireChatMessage
     source: { kind: "sub_agent", role },
   };
 }
+
+describe("messagesByLane", () => {
+  it("counts every message into its lane, orchestrator by default", () => {
+    const msgs = [
+      delegate("junior"),
+      subAgent("junior"),
+      subAgent("junior"),
+      delegate("pm"),
+      subAgent("pm"),
+    ];
+    expect(messagesByLane(msgs)).toEqual({ orchestrator: 2, junior: 2, pm: 1 });
+  });
+
+  it("sums a role's separate delegations into one lane total", () => {
+    const msgs = [
+      delegate("junior"),
+      subAgent("junior"),
+      delegate("pm"),
+      subAgent("pm"),
+      delegate("junior"),
+      subAgent("junior"),
+      subAgent("junior"),
+    ];
+    // junior was delegated to twice (1 + 2 turns) — the lane holds all three.
+    expect(messagesByLane(msgs).junior).toBe(3);
+  });
+
+  it("returns an empty map for an empty transcript", () => {
+    expect(messagesByLane([])).toEqual({});
+  });
+});
 
 describe("parseCallKey", () => {
   it("splits role#n and treats a bare role as call 1", () => {

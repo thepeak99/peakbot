@@ -41,6 +41,7 @@ export function AgentsPanel({
   onSelect,
   roster,
   laneCalls,
+  laneMessages,
 }: {
   /** Whether a multi-agent pipeline is *configured* for this session
    * (`pipeline.enabled` + roles, boot-only). Decides whether the opt-in is
@@ -61,6 +62,9 @@ export function AgentsPanel({
   /** Lane → API-call count, from the same source as the Session tab. Shown
    * beside the message count so the two numbers can't be read as one. */
   laneCalls: Record<string, number>;
+  /** Lane → transcript message count (messagesByLane), shared with the
+   * Session cards so both panels report the same figure. */
+  laneMessages: Record<string, number>;
 }) {
   // Sub-agent views are shown only when the conversation actually opted in.
   const active_ = pipelineAvailable && subagentsEnabled;
@@ -69,14 +73,18 @@ export function AgentsPanel({
   const canToggle = pipelineAvailable && !locked;
 
   // Group the per-call roster by role: one row per agent, its delegations
-  // nested underneath. A role's msg count is the sum of its calls'.
+  // nested underneath. The role total comes from `laneMessages` (shared with
+  // the Session cards); per-call counts stay roster-derived.
   const byRole = new Map<
     string,
     { role: string; total: number; calls: { key: string; n: number; count: number }[] }
   >();
   for (const r of roster) {
-    const g = byRole.get(r.role) ?? { role: r.role, total: 0, calls: [] };
-    g.total += r.count;
+    const g = byRole.get(r.role) ?? {
+      role: r.role,
+      total: laneMessages[r.role] ?? 0,
+      calls: [],
+    };
     g.calls.push({ key: r.key, n: r.n, count: r.count });
     byRole.set(r.role, g);
   }
