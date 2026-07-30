@@ -142,6 +142,13 @@ export function AgentsPanel({
         </p>
       )}
 
+      {active_ && (
+        <p className="mb-3 text-[11px] text-zinc-500">
+          Picking a role is a view. Your message goes to the orchestrator, which
+          decides what to delegate.
+        </p>
+      )}
+
       {!active_ ? (
         <p className="mt-2 text-xs text-zinc-600">
           {pipelineAvailable
