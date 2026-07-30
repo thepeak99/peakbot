@@ -673,8 +673,8 @@ mod tests {
         let status = resp.status();
         let body = resp.text().await.unwrap();
         assert_eq!(status, 200, "body: {body}");
-        let ct_index = body.find("PeakBot").unwrap_or(usize::MAX);
-        assert!(ct_index < 1024, "root body did not contain PeakBot: {body}");
+        let ct_index = body.find("Shifu").unwrap_or(usize::MAX);
+        assert!(ct_index < 1024, "root body did not contain Shifu: {body}");
     }
 
     #[tokio::test]
@@ -685,7 +685,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
-        assert!(body.contains("PeakBot"), "SPA fallback body = {body:?}");
+        assert!(body.contains("Shifu"), "SPA fallback body = {body:?}");
     }
 
     #[tokio::test]

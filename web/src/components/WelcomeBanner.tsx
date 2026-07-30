@@ -20,14 +20,14 @@ export function WelcomeBanner({ welcome }: { welcome: Welcome }) {
     <div className="rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900/80 to-zinc-950/40 p-4">
       <div className="mb-3 flex items-center gap-2">
         <span className="text-lg">✦</span>
-        <h2 className="text-base font-semibold text-zinc-100">Welcome to PeakBot</h2>
+        <h2 className="text-base font-semibold text-zinc-100">Welcome to Shifu</h2>
         <span className="rounded bg-emerald-950/60 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
           ready
         </span>
         {welcome.peakbotVersion && (
           <span
             className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400"
-            title={`PeakBot v${welcome.peakbotVersion}`}
+            title={`Shifu v${welcome.peakbotVersion}`}
           >
             v{welcome.peakbotVersion}
           </span>

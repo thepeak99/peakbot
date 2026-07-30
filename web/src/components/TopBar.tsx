@@ -57,7 +57,7 @@ export function TopBar({
     <header className="relative z-30 flex min-h-14 items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur">
       <div className="flex items-center gap-2">
         <span className="text-base">✦</span>
-        <span className="font-semibold text-zinc-100">PeakBot</span>
+        <span className="font-semibold text-zinc-100">Shifu</span>
       </div>
 
       {/* Sessions trio — conversations + model + cwd. On mobile they move
