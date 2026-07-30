@@ -37,7 +37,7 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
     sm.add_tool_call(
         MessageSource::Human,
         "delegate".to_string(),
-        r#"{"role":"researcher","task":"survey the codebase"}"#.to_string(),
+        r#"{"role":"researcher","task":"survey the codebase","parent_task_id":1}"#.to_string(),
         Some("call-1".to_string()),
     );
 
@@ -68,7 +68,7 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
     sm.add_tool_result(
         MessageSource::Human,
         "delegate".to_string(),
-        r#"{"role":"researcher","task":"survey the codebase"}"#.to_string(),
+        r#"{"role":"researcher","task":"survey the codebase","parent_task_id":1}"#.to_string(),
         returned.to_string(),
         Some("call-1".to_string()),
     );
