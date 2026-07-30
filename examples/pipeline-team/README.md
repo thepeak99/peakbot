@@ -9,7 +9,7 @@ tester.
 - **You talk to one agent: the orchestrator.** It's just your normal top-level
   agent (`default_model` in the config — `sonnet` here). It is **not** a
   pipeline role.
-- The orchestrator has a **`delegate(role, task)`** tool (present only while
+- The orchestrator has a **`delegate(role, task, parent_task_id)`** tool (present only while
   `pipeline.enabled: true`). It calls sub-agents **one at a time** (sequential —
   there is no parallel mode).
 - Each delegation runs the role's agent to completion on a **fresh** context

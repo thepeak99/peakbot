@@ -20,6 +20,7 @@ use crate::pipeline::handoff;
 use crate::pipeline::registry::SubAgentRegistry;
 use crate::state::StateManager;
 use crate::tools::ShellKind;
+use crate::tools::todo::TodoList;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
@@ -184,7 +185,12 @@ impl Tool for DelegateTool {
                 Write `task` as a self-contained brief: state the objective, the \
                 expected output shape, and the boundaries (what NOT to do). Scale \
                 effort to complexity — don't delegate a one-liner you can do yourself.\n\n\
-                Available roles: {roles}"
+                Available roles: {roles}\n\n\
+                Keep a todo list while you orchestrate. Before every `delegate` call, \
+                add a todo item describing the work you are handing off, then pass that \
+                item's id as `parent_task_id` — the sub-agent's own subtasks are \
+                displayed nested under it. Update the item's status when the delegation \
+                returns."
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -198,9 +204,16 @@ impl Tool for DelegateTool {
                         "description": "Self-contained brief for the sub-agent: objective, \
                                         expected output, and boundaries. Include ALL context — \
                                         the sub-agent cannot see this conversation."
+                    },
+                    "parent_task_id": {
+                        "type": "integer",
+                        "description": "The id of YOUR todo item that this delegation fulfils. \
+                            Add the item first with the todo tool — its result gives you the id \
+                            (\"Added task #3: …\") — or read `todo action=list`. Must be an id \
+                            that currently exists in your todo list."
                     }
                 },
-                "required": ["role", "task"]
+                "required": ["role", "task", "parent_task_id"]
             }),
         }
     }
@@ -215,6 +228,10 @@ impl Tool for DelegateTool {
                 role: args.role.clone(),
                 available: self.available_roles(),
             })?;
+
+        // Snapshot todo list and validate parent before any awaits (lock discipline).
+        let snapshot = deps.state_manager.get_todo_list();
+        validate_parent(&snapshot, args.parent_task_id)?;
 
         let bash_config = merge_role_env(&deps.bash_config, role.env.as_ref());
 
@@ -345,13 +362,15 @@ impl Tool for DelegateTool {
     }
 }
 
-/// Arguments for the delegate tool: one role, one task.
+/// Arguments for the delegate tool: one role, one task, and the parent todo id.
 #[derive(Debug, Deserialize)]
 pub struct DelegateArgs {
     /// Which sub-agent role to run.
     pub role: String,
     /// The self-contained task brief for the sub-agent.
     pub task: String,
+    /// The id of the orchestrator's todo item this delegation fulfils.
+    pub parent_task_id: usize,
 }
 
 /// Errors from the delegate tool.
@@ -368,6 +387,26 @@ pub enum DelegateError {
 
     #[error("Sub-agent '{role}' failed: {error}")]
     Run { role: String, error: String },
+
+    #[error(
+        "Unknown parent_task_id {id}: no such item in your todo list. \
+         Add a todo item for this delegation first (todo action=add), then pass \
+         its id. Your list:\n{list}"
+    )]
+    UnknownParentTask { id: usize, list: String },
+}
+
+/// Validate that `parent_task_id` exists in the orchestrator's todo list.
+/// Accepts any status (including completed) — no status policing (design §3.1).
+fn validate_parent(list: &TodoList, parent_task_id: usize) -> Result<(), DelegateError> {
+    if list.get(parent_task_id).is_some() {
+        Ok(())
+    } else {
+        Err(DelegateError::UnknownParentTask {
+            id: parent_task_id,
+            list: list.render(),
+        })
+    }
 }
 
 #[cfg(test)]
