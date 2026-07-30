@@ -4,7 +4,7 @@
 # is simply your normal top-level agent (whatever `default_model` resolves to).
 # It is NOT a pipeline role — do not list it under `pipeline.agents`.
 #
-# The orchestrator gets a `delegate(role, task)` tool (present only while
+# The orchestrator gets a `delegate(role, task, parent_task_id)` tool (present only while
 # `pipeline.enabled: true`). Each delegation runs one sub-agent to completion
 # on a FRESH context and returns a single result string. You see every
 # sub-agent's turns in the transcript, tagged `🧩 <role>`; the orchestrator

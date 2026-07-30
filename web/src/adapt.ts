@@ -19,6 +19,7 @@ import type {
   MessageRole,
   SessionStats,
   TodoItem,
+  TodoNode,
   TodoStatus,
   ViewFilter,
   Welcome,
@@ -181,6 +182,93 @@ const TODO_WIRE_STATUSES = new Set<WireTodoStatus>([
   "cancelled",
 ]);
 
+// A replayed todo item plus its `uid` — a monotonic identity that, unlike the
+// tool-facing `id`, is NEVER reused. `clear` resets the id counter when the
+// list empties (mirroring TodoList), so ids alone cannot tell an old item from
+// a later one that reuses its number. todoTree binds delegation parents by uid
+// so id reuse can't silently re-parent an old delegation. `uid` never leaves
+// this module.
+interface ReplayEntry {
+  item: TodoItem;
+  uid: number;
+}
+
+interface ReplayState {
+  entries: ReplayEntry[];
+  nextId: number;
+  nextUid: number;
+}
+
+function newReplay(): ReplayState {
+  return { entries: [], nextId: 1, nextUid: 1 };
+}
+
+/**
+ * Apply one transcript message to a todo replay state — the single reducer
+ * shared by todosFromMessages and todoTree (two copies would drift from each
+ * other and from Rust). Messages that aren't `todo` tool calls, and calls the
+ * real tool would have rejected, are no-ops.
+ *
+ * This reimplements the Rust `TodoList` transition function (src/tools/todo.rs)
+ * — it never consults tool *results*, keeping the derivation a pure function of
+ * the call args.
+ */
+function applyTodoCall(st: ReplayState, m: WireChatMessage): void {
+  if (m.role !== "toolcall" || m.tool_name !== "todo") return;
+  let args: {
+    action?: string;
+    tasks?: unknown;
+    task_id?: unknown;
+    status?: unknown;
+  };
+  try {
+    args = JSON.parse(m.tool_args ?? "{}");
+  } catch {
+    return; // malformed args — skip rather than crash the panel
+  }
+
+  switch (args.action) {
+    case "add":
+      if (Array.isArray(args.tasks)) {
+        for (const t of args.tasks) {
+          if (typeof t !== "string") continue;
+          const lower = t.toLowerCase();
+          if (st.entries.some((e) => e.item.text.toLowerCase() === lower))
+            continue; // dedupe — does not consume an id
+          st.entries.push({
+            item: { id: st.nextId++, text: t, status: "pending" },
+            uid: st.nextUid++,
+          });
+        }
+      }
+      break;
+    case "update": {
+      if (
+        typeof args.status !== "string" ||
+        !TODO_WIRE_STATUSES.has(args.status as WireTodoStatus)
+      )
+        break; // invalid status → tool would error → no-op
+      const e = st.entries.find((x) => x.item.id === args.task_id);
+      if (e) e.item.status = TODO_STATUS_MAP[args.status as WireTodoStatus];
+      break;
+    }
+    case "remove": {
+      const idx = st.entries.findIndex((x) => x.item.id === args.task_id);
+      if (idx !== -1) st.entries.splice(idx, 1);
+      break;
+    }
+    case "clear": {
+      for (let i = st.entries.length - 1; i >= 0; i--) {
+        const s = st.entries[i].item.status;
+        if (s === "completed" || s === "cancelled") st.entries.splice(i, 1);
+      }
+      if (st.entries.length === 0) st.nextId = 1; // mirror TodoList id reset
+      break;
+    }
+    // "list" and anything else are read-only / unknown → no state change.
+  }
+}
+
 /**
  * Derive a lane's todo list from its transcript slice — the todo counterpart
  * to filesFromMessages (#208-adjacent). Sub-agent lanes drive no backend todo
@@ -188,104 +276,104 @@ const TODO_WIRE_STATUSES = new Set<WireTodoStatus>([
  * role; replaying those calls reconstructs the list without any new state. The
  * orchestrator and agents-off flows fall out as the single-lane case.
  *
- * This reimplements the Rust `TodoList` transition function (src/tools/todo.rs)
- * — it never consults tool *results*. A call the real tool would have rejected
- * (unknown id, invalid status) no-ops here for free, keeping the derivation a
- * pure function of the call args. Callers pass the already-scoped slice.
+ * Callers pass the already-scoped slice. No `lane` tag — that's the global
+ * view's job (todoTree).
  */
 export function todosFromMessages(messages: WireChatMessage[]): TodoItem[] {
-  const items: TodoItem[] = [];
-  let nextId = 1;
+  const st = newReplay();
+  for (const m of messages) applyTodoCall(st, m);
+  return st.entries.map((e) => e.item);
+}
 
-  const add = (task: string) => {
-    const lower = task.toLowerCase();
-    if (items.some((t) => t.text.toLowerCase() === lower)) return; // dedupe
-    items.push({ id: nextId++, text: task, status: "pending" });
-  };
+/** Items → childless nodes, order preserved. The scoped-view shape: no tree to
+ * surface when the panel is already narrowed to one lane. */
+export function flatTree(items: TodoItem[]): TodoNode[] {
+  return items.map((item) => ({ item, children: [] }));
+}
 
-  for (const m of messages) {
-    if (m.role !== "toolcall" || m.tool_name !== "todo") continue;
-    let args: {
-      action?: string;
-      tasks?: unknown;
-      task_id?: unknown;
-      status?: unknown;
-    };
-    try {
-      args = JSON.parse(m.tool_args ?? "{}");
-    } catch {
-      continue; // malformed args — skip rather than crash the panel
-    }
-
-    switch (args.action) {
-      case "add":
-        if (Array.isArray(args.tasks)) {
-          for (const t of args.tasks) if (typeof t === "string") add(t);
-        }
-        break;
-      case "update": {
-        if (
-          typeof args.status !== "string" ||
-          !TODO_WIRE_STATUSES.has(args.status as WireTodoStatus)
-        )
-          break; // invalid status → tool would error → no-op
-        const it = items.find((t) => t.id === args.task_id);
-        if (it) it.status = TODO_STATUS_MAP[args.status as WireTodoStatus];
-        break;
-      }
-      case "remove": {
-        const idx = items.findIndex((t) => t.id === args.task_id);
-        if (idx !== -1) items.splice(idx, 1);
-        break;
-      }
-      case "clear": {
-        for (let i = items.length - 1; i >= 0; i--) {
-          const s = items[i].status;
-          if (s === "completed" || s === "cancelled") items.splice(i, 1);
-        }
-        if (items.length === 0) nextId = 1; // mirror TodoList id reset
-        break;
-      }
-      // "list" and anything else are read-only / unknown → no state change.
-    }
-  }
-
-  return items;
+function isDelegateCall(m: WireChatMessage): boolean {
+  return m.role === "toolcall" && m.tool_name === "delegate";
 }
 
 /**
- * Global-view todos: every lane's list, each item tagged with its lane so the
- * panel can label it. Each lane has its own independent backend TodoList (own
- * id space, own clear-resets), so we replay per lane — never on the mixed
- * transcript, which would corrupt ids/dedupe/clear. Orchestrator first, then
- * each delegation in call order. The `lane` tag is a display-ready label
- * ("Orchestrator", "role", or "role · call N") — todos aren't click targets, so
- * the pill only needs to read well. Scoped views keep using todosFromMessages
- * (no lane tag) — this is only for "global".
+ * Global-view todos as a one-level tree: the orchestrator's list, with each
+ * delegation's todos nested under the orchestrator item it was handed off from
+ * (`delegate`'s `parent_task_id`). Each lane has its own independent backend
+ * TodoList (own id space, own clear-resets), so we replay per lane — never on
+ * the mixed transcript, which would corrupt ids/dedupe/clear.
+ *
+ * The parent link is resolved id→uid *at the delegate call* (see ReplayEntry):
+ * a `clear`-then-refill that reuses id 2 therefore cannot re-parent an old
+ * delegation onto a new, unrelated task.
+ *
+ * A delegation with no resolvable parent — no `parent_task_id` (old
+ * transcript), a non-integer or unknown id, or a parent that was removed before
+ * the end of the replay — surfaces as a top-level group after the orchestrator
+ * items, i.e. exactly the flat lane rendering this replaced. Nothing is ever
+ * dropped. Scoped views use flatTree(todosFromMessages(...)) instead.
  */
-export function todosByLane(messages: WireChatMessage[]): TodoItem[] {
+export function todoTree(messages: WireChatMessage[]): TodoNode[] {
   const roster = deriveSubAgentRoster(messages);
-  // No sub-agent activity ⇒ nothing to disambiguate. Return plain, unlabeled
-  // todos so a single-agent conversation renders exactly as it did pre-agents
-  // (no "Orchestrator" pill on every item).
-  if (roster.length === 0) return todosFromMessages(messages);
+  // No sub-agent activity at all ⇒ nothing to disambiguate: plain unlabeled
+  // todos, so a single-agent conversation renders exactly as it did pre-agents
+  // (no "Orchestrator" pill on every item). A `delegate` call with no sub-agent
+  // turns (empty or malformed delegation) still counts as activity — the
+  // orchestrator lane is real once it has delegated.
+  if (roster.length === 0 && !messages.some(isDelegateCall))
+    return flatTree(todosFromMessages(messages));
 
-  const out: TodoItem[] = [];
-  const tag = (lane: string, items: TodoItem[]) => {
-    for (const it of items) out.push({ ...it, lane });
-  };
-  tag("Orchestrator", todosFromMessages(filterMessagesByView(messages, "orchestrator")));
+  // One ordered pass: replay the orchestrator lane's todo calls and bind each
+  // delegation's parent as of the moment it was called.
+  const st = newReplay();
+  const parentUidByKey = new Map<string, number>();
+  const countByRole = new Map<string, number>();
+  for (const m of messages) {
+    if (isDelegateCall(m)) {
+      let args: { role?: unknown; parent_task_id?: unknown };
+      try {
+        args = JSON.parse(m.tool_args ?? "{}");
+      } catch {
+        continue; // malformed delegate args — skip, same as assignDelegationCalls
+      }
+      const role = args.role;
+      if (typeof role !== "string" || role.length === 0) continue;
+      // Same counter rule as assignDelegationCalls, so the keys line up with
+      // the roster's.
+      const n = (countByRole.get(role) ?? 0) + 1;
+      countByRole.set(role, n);
+      const parentId = args.parent_task_id;
+      if (typeof parentId !== "number" || !Number.isInteger(parentId)) continue;
+      const parent = st.entries.find((e) => e.item.id === parentId);
+      if (parent) parentUidByKey.set(`${role}#${n}`, parent.uid);
+      continue;
+    }
+    if (m.source?.kind === "sub_agent") continue; // other lanes replay separately
+    applyTodoCall(st, m);
+  }
+
+  const nodes: TodoNode[] = st.entries.map((e) => ({
+    item: { ...e.item, lane: "Orchestrator" },
+    children: [],
+  }));
+  const nodeByUid = new Map<number, TodoNode>(
+    st.entries.map((e, i) => [e.uid, nodes[i]]),
+  );
+
   const callsPerRole = new Map<string, number>();
   for (const r of roster)
     callsPerRole.set(r.role, (callsPerRole.get(r.role) ?? 0) + 1);
+  const unparented: TodoNode[] = [];
   for (const call of roster) {
-    const multi = (callsPerRole.get(call.role) ?? 0) > 1;
-    tag(
-      viewLabel(call.key, multi),
-      todosFromMessages(filterMessagesByView(messages, call.key)),
-    );
+    const lane = viewLabel(call.key, (callsPerRole.get(call.role) ?? 0) > 1);
+    const items = todosFromMessages(
+      filterMessagesByView(messages, call.key),
+    ).map((it) => ({ ...it, lane }));
+    const uid = parentUidByKey.get(call.key);
+    const parent = uid === undefined ? undefined : nodeByUid.get(uid);
+    if (parent) parent.children.push(...items);
+    else for (const it of items) unparented.push({ item: it, children: [] });
   }
-  return out;
+  return [...nodes, ...unparented];
 }
 
 /** Whole seconds → "MM:SS". */

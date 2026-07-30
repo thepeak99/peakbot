@@ -1455,7 +1455,7 @@ async fn delegation_then_compaction_keeps_wire_valid() {
     harness.state_manager.add_tool_call(
         MessageSource::Human,
         "delegate".to_string(),
-        r#"{"role":"researcher","task":"survey"}"#.to_string(),
+        r#"{"role":"researcher","task":"survey","parent_task_id":1}"#.to_string(),
         Some("call-1".to_string()),
     );
     let sub = MessageSource::SubAgent {
@@ -1494,7 +1494,7 @@ async fn delegation_then_compaction_keeps_wire_valid() {
     harness.state_manager.add_tool_result(
         MessageSource::Human,
         "delegate".to_string(),
-        r#"{"role":"researcher","task":"survey"}"#.to_string(),
+        r#"{"role":"researcher","task":"survey","parent_task_id":1}"#.to_string(),
         "DELEGATE_RESULT_payload".to_string(),
         Some("call-1".to_string()),
     );
