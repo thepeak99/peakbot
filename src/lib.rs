@@ -899,7 +899,9 @@ impl AgentRunner {
                                     } else {
                                         format!(
                                             "🧩 Sub-agents are {now} for this conversation. \
-                                             Usage: /subagents on|off (only before the first turn)."
+                                             Usage: /subagents on|off (only before the first turn). \
+                                             Your messages always go to the orchestrator, which \
+                                             decides what to delegate."
                                         )
                                     };
                                     sm.add_system_message(msg);
@@ -1526,7 +1528,11 @@ impl AgentRunner {
         .await?;
 
         sm.add_system_message(if enabled {
-            "🧩 Sub-agents enabled for this conversation.".to_string()
+            // Say where input goes at the moment the feature is turned on —
+            // that's when the "am I talking to a role now?" question appears.
+            "🧩 Sub-agents enabled for this conversation. Your messages always go to \
+             the orchestrator, which decides what to delegate."
+                .to_string()
         } else {
             "🧩 Sub-agents disabled for this conversation.".to_string()
         });

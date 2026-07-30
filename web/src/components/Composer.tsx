@@ -16,6 +16,10 @@
 // trailing space for commands that take args); the user still presses Enter
 // to send, so nothing auto-fires.
 //
+// While a sub-agent view is selected (`watchingRole`), the box carries a
+// one-line notice and a softened placeholder: the view is a transcript filter,
+// input still goes to the orchestrator.
+//
 // Images: paste, drag-drop, or click the 📎 clip button to attach image files.
 // Attachments show as
 // removable chips above the input and are kept OUT of the visible textarea
@@ -54,12 +58,20 @@ export function Composer({
   commands,
   onSend,
   onStop,
+  watchingRole,
+  onClearWatch,
 }: {
   isRunning: boolean;
   connected: boolean;
   commands: SlashCommand[];
   onSend: (text: string) => void;
   onStop: () => void;
+  /** Label of the sub-agent view currently being watched, or null in the
+   * global view. Purely a transcript filter — input always goes to the
+   * orchestrator — so its only job here is to say so. */
+  watchingRole?: string | null;
+  /** Drop back to the global view (the notice's "Clear" link). */
+  onClearWatch?: () => void;
 }) {
   const [text, setText] = useState("");
   const [selected, setSelected] = useState(0);
@@ -216,7 +228,12 @@ export function Composer({
 
   // Single placeholder, no embedded instructions. Touch/desktop parity —
   // gestures and key bindings live in the hint row below (desktop only).
-  const placeholder = connected ? "Type a message…" : "Connecting…";
+  // While watching a sub-agent lane it names the real recipient instead.
+  const placeholder = !connected
+    ? "Connecting…"
+    : watchingRole
+      ? "Message the orchestrator…"
+      : "Type a message…";
 
   const canSend = connected && (!!text.trim() || images.length > 0);
 
@@ -261,6 +278,28 @@ export function Composer({
                 : "border-zinc-800 focus-within:border-zinc-700"
             }`}
           >
+            {/* Inside the box (not the desktop-only hint row below) so it also
+                shows on touch: selecting a role filters the transcript, it does
+                not re-route input. */}
+            {watchingRole && (
+              <div className="flex items-center gap-1.5 px-1 pt-0.5 text-[11px] text-zinc-400">
+                {/* Zinc, not sky: the palette's zinc ramp is the one thing light
+                    mode remaps, so a sky tint here would be unreadable on the
+                    light composer surface. */}
+                <span>
+                  🧩 Watching <span className="font-medium">{watchingRole}</span> — this
+                  is a view. Your message goes to the orchestrator, which decides what
+                  to delegate.
+                </span>
+                <button
+                  onClick={onClearWatch}
+                  className="shrink-0 cursor-pointer rounded px-1 text-zinc-300 underline hover:bg-zinc-800"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+
             {images.length > 0 && (
               <div className="flex flex-wrap gap-2 px-1 pt-1">
                 {images.map((img) => (

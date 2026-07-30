@@ -24,8 +24,10 @@ html.light {
 /* Fenced code blocks stay dark-on-dark in both themes (paired with the
    github-dark highlight theme) — a light-mode dark code block reads as
    intentional. Only the inline-code chip needs a light tweak so it isn't
-   a dark smudge on a light line. */
-html.light .markdown-body code {
+   a dark smudge on a light line. `:not(pre) >` keeps it to real inline code:
+   unscoped, this rule (0-2-2) outranked `.markdown-body pre code` (0-1-2) and
+   painted the chip background inside fenced blocks too. */
+html.light .markdown-body :not(pre) > code {
   background: rgb(0 0 0 / 0.06);
 }
 html.light .markdown-body a {
@@ -108,6 +110,12 @@ html.light .markdown-body a {
 }
 .markdown-body pre {
   background: rgb(24 24 27 / 0.9);
+  /* Explicit foreground, not inherited: rehype-highlight only adds `.hljs`
+     (which carries a colour) to fences that declare a language. An unlabeled
+     fence inherits the bubble's text colour, which light mode remaps to
+     near-black — unreadable on this dark surface. github-dark's own fg keeps
+     labeled and unlabeled fences consistent in both themes. */
+  color: #c9d1d9;
   padding: 0.75rem 0.9rem;
   border-radius: 0.5rem;
   overflow-x: auto;

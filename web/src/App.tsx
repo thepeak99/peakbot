@@ -256,6 +256,8 @@ export function App() {
             commands={commands}
             onSend={(text) => send({ type: "send_message", text })}
             onStop={() => send({ type: "stop" })}
+            watchingRole={scopeLabel}
+            onClearWatch={() => setView("global")}
           />
         </main>
       </div>
