@@ -1,4 +1,5 @@
 import type { ContextUsage, SessionStats } from "../types";
+import { viewLabel } from "../adapt";
 
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -15,6 +16,16 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
+// One figure in an agent card: micro-label above the number.
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wide text-zinc-600">{label}</div>
+      <div className="font-mono tabular-nums text-zinc-300">{value}</div>
+    </div>
+  );
+}
+
 // Session stats + context-usage meter. Mirrors SessionState / ContextState
 // (src/ui/app_state.rs). The meter turns amber past the compaction
 // threshold, red when full — same signal the TUI status bar carries.
@@ -23,6 +34,7 @@ export function StatsPanel({
   context,
   peakbotVersion,
   scopeLabel,
+  laneMessages,
 }: {
   stats: SessionStats;
   context: ContextUsage;
@@ -33,6 +45,9 @@ export function StatsPanel({
   /** When watching a single lane (a role or the orchestrator), the session
    * rows show that lane's numbers and this label names it. Null = global. */
   scopeLabel?: string | null;
+  /** Lane → transcript message count. Same map the Agents panel uses, so a
+   * lane's `msgs` reads identically in both places. */
+  laneMessages: Record<string, number>;
 }) {
   const pct = context.windowSize
     ? (context.currentUsage / context.windowSize) * 100
@@ -61,6 +76,43 @@ export function StatsPanel({
           <Row label="cost" value={`$${stats.costUsd.toFixed(4)}`} />
         </div>
       </section>
+
+      {stats.lanes.length > 1 && (
+        <section>
+          <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+            Agents · cumulative
+          </h3>
+          <div className="space-y-2">
+            {stats.lanes.map((l) => (
+              <div
+                key={l.lane}
+                className="rounded-md border border-zinc-800 bg-zinc-900/40 px-2.5 py-2"
+              >
+                <div className="mb-1.5 flex items-baseline justify-between gap-2">
+                  <span className="truncate text-xs font-medium text-zinc-300">
+                    {viewLabel(l.lane)}
+                  </span>
+                  <span
+                    className="truncate font-mono text-[10px] text-zinc-500"
+                    title={l.model || undefined}
+                  >
+                    {l.model || "—"}
+                  </span>
+                </div>
+                <div className="grid grid-cols-4 gap-2 text-xs">
+                  <Stat label="in" value={fmtTokens(l.inputTokens)} />
+                  <Stat label="out" value={fmtTokens(l.outputTokens)} />
+                  <Stat label="calls" value={String(l.apiCalls)} />
+                  <Stat
+                    label="msgs"
+                    value={String(laneMessages[l.lane] ?? 0)}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <section>
         <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">

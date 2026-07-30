@@ -51,15 +51,15 @@ pub struct RequestStats {
     pub cost: f64,
 }
 
-/// One bucket per lane label (`"orchestrator"` or a sub-agent role). Mirrors
-/// the flat totals' semantics: input/output tokens are the LAST request's on
-/// that lane (overwritten), api_calls + cost accumulate. Lets `/stats` break
-/// down "how much did the reviewer cost" without conflating models.
+/// One bucket per lane label (`"orchestrator"` or a sub-agent role). Every
+/// field accumulates — unlike the flat totals, whose input/output are the last
+/// request's. A lane's question is "what did this agent consume over the whole
+/// session", not "how big was its last context".
 #[derive(Clone, Debug, Default)]
 pub struct LaneStats {
-    /// Input tokens from the LAST request on this lane (overwritten).
+    /// Input tokens summed across every request on this lane.
     pub input_tokens: u64,
-    /// Output tokens from the LAST request on this lane (overwritten).
+    /// Output tokens summed across every request on this lane.
     pub output_tokens: u64,
     /// API calls made on this lane.
     pub api_calls: u64,
@@ -109,8 +109,8 @@ impl SessionStats {
     ///
     /// Token counts (input/output) are overwritten per request — only the most recent
     /// request's token usage is tracked. This mirrors rig's per-request usage reporting.
-    /// API call count and total cost accumulate across all requests. The same
-    /// overwrite/accumulate split is applied to the `lane`'s bucket.
+    /// API call count and total cost accumulate across all requests. The lane's
+    /// bucket accumulates everything, tokens included.
     pub fn add_request(&mut self, lane: &str, input: u64, output: u64, cost: f64) {
         self.total_input_tokens = input;
         self.total_output_tokens = output;
@@ -123,8 +123,8 @@ impl SessionStats {
         });
 
         let bucket = self.lanes.entry(lane.to_string()).or_default();
-        bucket.input_tokens = input;
-        bucket.output_tokens = output;
+        bucket.input_tokens += input;
+        bucket.output_tokens += output;
         bucket.api_calls += 1;
         bucket.cost += cost;
 
@@ -630,12 +630,42 @@ mod tests {
         assert_eq!(lanes[0].0, "orchestrator");
         assert_eq!(lanes[0].1.api_calls, 1);
         assert!((lanes[0].1.cost - 0.01).abs() < 1e-9);
-        // reviewer bucket: 2 calls, cost accumulates, tokens = LAST request.
+        // reviewer bucket: 2 calls, cost and tokens accumulate.
         assert_eq!(lanes[1].0, "reviewer");
         assert_eq!(lanes[1].1.api_calls, 2);
         assert!((lanes[1].1.cost - 0.05).abs() < 1e-9);
-        assert_eq!(lanes[1].1.input_tokens, 300);
-        assert_eq!(lanes[1].1.output_tokens, 60);
+        assert_eq!(lanes[1].1.input_tokens, 500);
+        assert_eq!(lanes[1].1.output_tokens, 100);
+    }
+
+    /// A resumed conversation must ADD to its persisted lane totals, not
+    /// restart from zero and not double-count the restored base. This is the
+    /// `/load`-then-keep-working path.
+    #[test]
+    fn add_request_accumulates_on_top_of_restored_lanes() {
+        let mut stats = SessionStats::new();
+        stats.restore_lanes([(
+            "junior".to_string(),
+            LaneStats {
+                input_tokens: 10_000,
+                output_tokens: 500,
+                api_calls: 3,
+                cost: 0.1,
+            },
+        )]);
+
+        stats.add_request("junior", 2_000, 100, 0.02);
+        stats.add_request("junior", 3_000, 150, 0.03);
+
+        let (_, junior) = stats
+            .lanes_sorted()
+            .into_iter()
+            .find(|(n, _)| n == "junior")
+            .expect("junior lane present");
+        assert_eq!(junior.input_tokens, 15_000, "10k base + 2k + 3k");
+        assert_eq!(junior.output_tokens, 750, "500 base + 100 + 150");
+        assert_eq!(junior.api_calls, 5, "3 base + 2 new");
+        assert!((junior.cost - 0.15).abs() < 1e-9);
     }
 
     /// `restore_lanes` rehydrates the per-lane breakdown wholesale (the /load

@@ -220,7 +220,7 @@ impl WebUi {
     async fn serve_plain(&self, app: Router) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         let url = self.entry_url();
-        eprintln!("🌐 PeakBot web UI: {url}  (Ctrl+C to quit)");
+        eprintln!("🌐 Shifu web UI: {url}  (Ctrl+C to quit)");
         self.maybe_open_browser(&url);
 
         axum::serve(listener, app)
@@ -239,7 +239,7 @@ impl WebUi {
         let server_config = tls::server_config(&tls_dir, &sans)?;
 
         let url = self.entry_url();
-        eprintln!("🔒 PeakBot web UI (HTTPS): {url}  (Ctrl+C to quit)");
+        eprintln!("🔒 Shifu web UI (HTTPS): {url}  (Ctrl+C to quit)");
         let host = tls::primary_lan_host(self.addr);
         eprintln!(
             "📲 Install the CA on your phone once: https://{host}:{}/peakbot-ca.crt",
@@ -673,8 +673,8 @@ mod tests {
         let status = resp.status();
         let body = resp.text().await.unwrap();
         assert_eq!(status, 200, "body: {body}");
-        let ct_index = body.find("PeakBot").unwrap_or(usize::MAX);
-        assert!(ct_index < 1024, "root body did not contain PeakBot: {body}");
+        let ct_index = body.find("Shifu").unwrap_or(usize::MAX);
+        assert!(ct_index < 1024, "root body did not contain Shifu: {body}");
     }
 
     #[tokio::test]
@@ -685,7 +685,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
-        assert!(body.contains("PeakBot"), "SPA fallback body = {body:?}");
+        assert!(body.contains("Shifu"), "SPA fallback body = {body:?}");
     }
 
     #[tokio::test]

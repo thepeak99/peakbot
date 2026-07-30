@@ -985,19 +985,24 @@ impl InputState {
 }
 
 /// One lane's slice of the session stats, serialized to the web wire so the
-/// Agents panel can scope `/stats` to a single sub-agent (or the orchestrator).
-/// Mirrors [`crate::hooks::SessionStats`]'s `LaneStats`: input/output tokens are
-/// the LAST request on that lane; api_calls + cost accumulate.
+/// Session panel can break stats down per agent (and scope to one). Mirrors
+/// [`crate::hooks::SessionStats`]'s `LaneStats`: every field accumulates over
+/// the session.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LaneStat {
     /// Lane label — `"orchestrator"` or a sub-agent role name.
     pub lane: String,
-    /// Input tokens from the last request on this lane.
+    /// Input tokens summed across this lane's requests.
     pub input_tokens: u64,
-    /// Output tokens from the last request on this lane.
+    /// Output tokens summed across this lane's requests.
     pub output_tokens: u64,
     /// API calls made on this lane.
     pub api_calls: u64,
+    /// Model alias this lane runs on (orchestrator: the active alias;
+    /// a role: its `pipeline.agents.<role>.model`). Empty when unknown —
+    /// old wire snapshots and lanes with no configured role.
+    #[serde(default)]
+    pub model: String,
     /// Accumulated cost (USD) on this lane.
     pub cost: f64,
 }
@@ -1045,6 +1050,14 @@ pub struct SessionState {
     /// `provider_name + model` for re-activation.
     #[serde(default)]
     pub model_alias: String,
+
+    /// Sub-agent role → model alias, published once at session build from the
+    /// pipeline registry. Boot-immutable config, not per-request data —
+    /// `sync_stats_to_ui` reads it to stamp each [`LaneStat`], so it never
+    /// rides the wire itself. The orchestrator is absent by design: its model
+    /// is derived from `model_alias`, which `/model` keeps current.
+    #[serde(skip)]
+    pub lane_models: std::collections::HashMap<String, String>,
 }
 
 impl SessionState {

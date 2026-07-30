@@ -63,21 +63,32 @@ export function adaptMessage(m: WireChatMessage): ChatMessage {
 }
 
 export function adaptStats(s: AppState): SessionStats {
+  const lanes = (s.stats.lanes ?? []).map((l) => ({
+    lane: l.lane,
+    inputTokens: l.input_tokens,
+    outputTokens: l.output_tokens,
+    apiCalls: l.api_calls,
+    model: l.model ?? "",
+    costUsd: l.cost,
+  }));
+  // The flat wire totals hold only the LAST request's tokens, so they'd
+  // contradict the cumulative per-lane rows sitting right below them. Derive
+  // the session figure as the sum of the lanes instead — the total is then the
+  // sum of its parts by construction. Live context size is a separate concern
+  // and has its own meter (ContextUsage). Pre-lane backends fall back to flat.
+  const summed = lanes.reduce(
+    (a, l) => ({ input: a.input + l.inputTokens, output: a.output + l.outputTokens }),
+    { input: 0, output: 0 },
+  );
   return {
-    inputTokens: s.stats.total_input_tokens,
-    outputTokens: s.stats.total_output_tokens,
+    inputTokens: lanes.length ? summed.input : s.stats.total_input_tokens,
+    outputTokens: lanes.length ? summed.output : s.stats.total_output_tokens,
     apiCalls: s.stats.total_api_calls,
     costUsd: s.stats.total_cost,
     modelAlias: s.stats.model_alias,
     model: s.stats.model,
     provider: s.stats.provider_name,
-    lanes: (s.stats.lanes ?? []).map((l) => ({
-      lane: l.lane,
-      inputTokens: l.input_tokens,
-      outputTokens: l.output_tokens,
-      apiCalls: l.api_calls,
-      costUsd: l.cost,
-    })),
+    lanes,
   };
 }
 
@@ -441,44 +452,37 @@ export function laneOf(view: ViewFilter): ViewFilter {
 /**
  * Assign each sub-agent message to a specific delegation call. Delegations are
  * sequential and non-nested (the `delegate` tool runs one sub-agent to
- * completion before returning), so per-call identity is fully derivable from
- * transcript position — no backend, works on already-saved convos.
+ * completion before returning), so a *contiguous run* of one role's messages is
+ * exactly one delegation — fully derivable from transcript position, with no
+ * backend and no reliance on the orchestrator's `delegate` ToolCall surviving in
+ * the transcript (long conversations can lose it: its ToolResult lands thousands
+ * of messages later, so pair-sanitising drops it).
  *
- * A `delegate` ToolCall on the orchestrator lane opens a new call for the role
- * named in its args, bumping that role's 1-based counter. Every following
- * sub-agent message of that role belongs to the open call. The result maps a
- * message's index to its "role#n" key; orchestrator-lane messages are absent.
+ * A role's counter bumps whenever its messages resume after any other lane
+ * spoke. Caveat: a `[bg output]` turn arriving mid-delegation splits one
+ * delegation in two — rare, and it errs toward more granularity, not less.
  */
 export function assignDelegationCalls(
   messages: WireChatMessage[],
 ): Map<number, string> {
   const keyByIndex = new Map<number, string>();
   const countByRole = new Map<string, number>();
-  const openCall = new Map<string, number>(); // role → current call number
+  let prevRole: string | null = null;
 
   for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
-    if (m.role === "toolcall" && m.tool_name === "delegate") {
-      let role: unknown;
-      try {
-        role = JSON.parse(m.tool_args ?? "{}").role;
-      } catch {
-        continue; // malformed delegate args — leave following turns untagged
-      }
-      if (typeof role !== "string" || role.length === 0) continue;
-      const n = (countByRole.get(role) ?? 0) + 1;
-      countByRole.set(role, n);
-      openCall.set(role, n);
+    const role =
+      messages[i].source?.kind === "sub_agent"
+        ? (messages[i].source as { role: string }).role
+        : null;
+    if (!role) {
+      prevRole = null; // another lane spoke — the next run is a new delegation
       continue;
     }
-    if (m.source?.kind !== "sub_agent") continue;
-    const role = m.source.role;
-    if (!role) continue;
-    // Fall back to call 1 if a sub-agent turn appears with no preceding
-    // delegate ToolCall (defensive — shouldn't happen in a well-formed convo).
-    const n = openCall.get(role) ?? 1;
-    if (!openCall.has(role)) openCall.set(role, n);
-    keyByIndex.set(i, `${role}#${n}`);
+    if (role !== prevRole) {
+      countByRole.set(role, (countByRole.get(role) ?? 0) + 1);
+      prevRole = role;
+    }
+    keyByIndex.set(i, `${role}#${countByRole.get(role)}`);
   }
   return keyByIndex;
 }
@@ -506,6 +510,23 @@ export function filterMessagesByView(
   return messages.filter(
     (m) => m.source?.kind === "sub_agent" && m.source.role === call.role,
   );
+}
+
+// Transcript message count per lane, keyed exactly as `stats.lanes[].lane`
+// ("orchestrator" or a role). The single source for both the Session cards and
+// the Agents panel's role totals, so the two can't drift apart.
+export function messagesByLane(
+  messages: WireChatMessage[],
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const m of messages) {
+    // `role` is optional on the wire; a sub_agent source without one can't be
+    // attributed, so it counts as orchestrator rather than a phantom lane.
+    const lane =
+      m.source?.kind === "sub_agent" ? (m.source.role ?? "orchestrator") : "orchestrator";
+    out[lane] = (out[lane] ?? 0) + 1;
+  }
+  return out;
 }
 
 // Roster. Return one entry per delegation call, in call order, each with its

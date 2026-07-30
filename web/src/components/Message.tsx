@@ -18,7 +18,7 @@ const ROLE_META: Record<
     bubble: "bg-sky-950/40 border-sky-900/60",
   },
   agent: {
-    label: "PeakBot",
+    label: "Shifu",
     glyph: "✦",
     accent: "text-emerald-400",
     bubble: "bg-zinc-900/60 border-zinc-800",

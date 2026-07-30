@@ -8,7 +8,7 @@
 // body is a 288px rail, below sm it spans 94vw. Replaces the old static aside
 // + separate mobile hamburger drawer.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Message } from "./components/Message";
 import { WelcomeBanner } from "./components/WelcomeBanner";
 import { BashPanel } from "./components/BashPanel";
@@ -21,7 +21,9 @@ import { TodoPanel } from "./components/TodoPanel";
 import { BgPanel } from "./components/BgPanel";
 import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
+import { TranscriptNav } from "./components/TranscriptNav";
 import { useAgent } from "./useAgent";
+import { useTranscriptScroll } from "./useTranscriptScroll";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
 import type { ViewFilter } from "./types";
@@ -37,6 +39,7 @@ import {
   filterMessagesByView,
   flatTree,
   laneOf,
+  messagesByLane,
   scopeStatsToView,
   todoTree,
   todosFromMessages,
@@ -61,12 +64,22 @@ export function App() {
   const isRunning = state?.is_running ?? false;
   useFavicon(isRunning);
 
-  // Keep the transcript pinned to the newest message.
-  const bottomRef = useRef<HTMLDivElement>(null);
+  // Follow the newest message, but only while the user is pinned to the bottom
+  // (see `useTranscriptScroll`); scrolled up to read history, they stay put and
+  // `TranscriptNav` offers the way back.
   const messageCount = state?.chat.messages.length ?? 0;
+  const {
+    sectionRef,
+    onScroll,
+    pinned,
+    unread,
+    showTop,
+    scrollToBottom,
+    scrollToTop,
+  } = useTranscriptScroll(messageCount);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messageCount, isRunning]);
+    if (pinned) scrollToBottom();
+  }, [messageCount, isRunning, pinned, scrollToBottom]);
 
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
@@ -117,16 +130,21 @@ export function App() {
   // under the orchestrator item they were delegated from (todoTree). A scoped
   // view shows just that lane's flat, unlabeled list. Files stay global-mixed
   // by design.
-  const scopedMessages = state
-    ? filterMessagesByView(state.chat.messages, effectiveView)
-    : [];
   const todos =
     state && effectiveView === "global"
       ? todoTree(state.chat.messages)
-      : flatTree(todosFromMessages(scopedMessages));
+      : flatTree(todosFromMessages(visibleMessages));
   const bg = state ? adaptBg(state) : [];
   const context = state ? adaptContext(state) : null;
-  const files = filesFromMessages(scopedMessages);
+  const files = filesFromMessages(visibleMessages);
+  // API calls per lane, so the Agents panel can show them next to its message
+  // counts — two different units that otherwise look like disagreement.
+  const laneCalls = Object.fromEntries(
+    (stats?.lanes ?? []).map((l) => [l.lane, l.apiCalls]),
+  );
+  // One derivation of per-lane message counts, shared by the Session cards and
+  // the Agents panel — two panels reporting the same figure from one place.
+  const laneMessages = messagesByLane(state?.chat.messages ?? []);
 
   const runningBg = bg.filter((p) => p.status === "running").length;
   const pendingInput = state?.pending_input_count ?? 0;
@@ -142,6 +160,7 @@ export function App() {
             context={context}
             peakbotVersion={welcome?.peakbotVersion}
             scopeLabel={scopeLabel}
+            laneMessages={laneMessages}
           />
         ) : null,
     },
@@ -186,6 +205,8 @@ export function App() {
           active={view}
           onSelect={setView}
           roster={roster}
+          laneCalls={laneCalls}
+          laneMessages={laneMessages}
         />
       ),
       badge:
@@ -222,44 +243,70 @@ export function App() {
 
       <div className="flex min-h-0 flex-1">
         <main className="flex min-w-0 flex-1 flex-col">
-          <section className="min-h-0 flex-1 overflow-y-auto mr-12 px-4 py-4 sm:px-6 md:px-8">
-            <div className="mx-auto max-w-5xl space-y-3">
-              {welcome && messageCount === 0 && <WelcomeBanner welcome={welcome} />}
-              {scopeLabel && (
-                <div className="flex items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300">
-                  <span>
-                    👁 Watching <span className="font-medium">{scopeLabel}</span>
-                    <span className="ml-2 text-sky-500/70">
-                      {visibleMessages.length} message
-                      {visibleMessages.length === 1 ? "" : "s"}
+          {/* The nav buttons float over the transcript, so they must live in a
+              positioned wrapper *outside* the scrolling <section> — absolute
+              inside it would scroll away with the content. */}
+          <div className="relative flex min-h-0 flex-1 flex-col">
+            <section
+              ref={sectionRef}
+              onScroll={onScroll}
+              className="min-h-0 flex-1 overflow-y-auto mr-12 px-4 py-4 sm:px-6 md:px-8"
+            >
+              <div className="mx-auto max-w-5xl space-y-3">
+                {welcome && messageCount === 0 && (
+                  <WelcomeBanner welcome={welcome} />
+                )}
+                {scopeLabel && (
+                  <div className="flex items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300">
+                    <span>
+                      👁 Watching <span className="font-medium">{scopeLabel}</span>
+                      <span className="ml-2 text-sky-500/70">
+                        {visibleMessages.length} message
+                        {visibleMessages.length === 1 ? "" : "s"}
+                      </span>
                     </span>
-                  </span>
-                  <button
-                    onClick={() => setView("global")}
-                    className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40"
-                  >
-                    Clear
-                  </button>
-                </div>
-              )}
-              {scopeLabel && visibleMessages.length === 0 && (
-                <p className="rounded-md border border-dashed border-zinc-800 px-3 py-6 text-center text-xs text-zinc-600">
-                  No messages from {scopeLabel} yet.
-                </p>
-              )}
-              {visibleMessages.map((m, i) => (
-                <Message key={i} message={adaptMessage(m)} />
-              ))}
-              <div ref={bottomRef} />
-            </div>
-          </section>
+                    <button
+                      onClick={() => setView("global")}
+                      className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
+                {scopeLabel && visibleMessages.length === 0 && (
+                  <p className="rounded-md border border-dashed border-zinc-800 px-3 py-6 text-center text-xs text-zinc-600">
+                    No messages from {scopeLabel} yet.
+                  </p>
+                )}
+                {visibleMessages.map((m, i) => (
+                  <Message key={i} message={adaptMessage(m)} />
+                ))}
+              </div>
+            </section>
+
+            {hasTranscript && (
+              <TranscriptNav
+                pinned={pinned}
+                unread={unread}
+                showTop={showTop}
+                onBottom={scrollToBottom}
+                onTop={scrollToTop}
+              />
+            )}
+          </div>
 
           <Composer
             isRunning={isRunning}
             connected={connected}
             commands={commands}
-            onSend={(text) => send({ type: "send_message", text })}
+            onSend={(text) => {
+              // Sending always re-pins: you expect to see your own message.
+              send({ type: "send_message", text });
+              scrollToBottom();
+            }}
             onStop={() => send({ type: "stop" })}
+            watchingRole={scopeLabel}
+            onClearWatch={() => setView("global")}
           />
         </main>
       </div>

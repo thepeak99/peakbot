@@ -1,6 +1,6 @@
 // Browser notification on task completion (issue #119). Fires a Notification
 // when the agent transitions running → idle *while the tab is not focused*, so
-// the user can walk away and be pinged when PeakBot is done — success or not.
+// the user can walk away and be pinged when Shifu is done — success or not.
 //
 // Opt-in per session: `enabled` is user-controlled (a toggle in the UI) and
 // starts off. Turning it on requests Notification permission; if the user
@@ -93,13 +93,13 @@ export function useTaskNotifications(isRunning: boolean): TaskNotifications {
       const next = !on;
       if (next && typeof Notification !== "undefined") {
         if (Notification.permission === "granted") {
-          notify("PeakBot notifications on", "You'll be pinged when a task finishes.");
+          notify("Shifu notifications on", "You'll be pinged when a task finishes.");
         } else if (Notification.permission === "default") {
           // Ask for permission the first time the user opts in; confirm once granted.
           void Notification.requestPermission().then((p) => {
             setPermission(p as NotifyPermission);
             if (p === "granted") {
-              notify("PeakBot notifications on", "You'll be pinged when a task finishes.");
+              notify("Shifu notifications on", "You'll be pinged when a task finishes.");
             }
           });
         }
@@ -116,7 +116,7 @@ export function useTaskNotifications(isRunning: boolean): TaskNotifications {
     // Only nag when the user has looked away — no point interrupting a
     // focused tab they're already watching.
     if (typeof document !== "undefined" && !document.hidden) return;
-    notify("PeakBot", "Task complete — ready for your next message.");
+    notify("Shifu", "Task complete — ready for your next message.");
   }, [isRunning, enabled]);
 
   return { enabled, permission, toggle };

@@ -488,16 +488,29 @@ impl StateManager {
         state.stats.total_output_tokens = output;
         state.stats.total_api_calls = calls;
         state.stats.total_cost = cost;
-        state.stats.lanes = lanes
-            .into_iter()
-            .map(|(lane, s)| crate::ui::app_state::LaneStat {
-                lane,
-                input_tokens: s.input_tokens,
-                output_tokens: s.output_tokens,
-                api_calls: s.api_calls,
-                cost: s.cost,
-            })
-            .collect();
+        // Scoped so the borrows end before `state.stats.lanes` is assigned.
+        // The orchestrator's model is derived from `model_alias` (kept current
+        // by `/model`), never copied into the map — one source of truth.
+        let rows: Vec<crate::ui::app_state::LaneStat> = {
+            let lane_models = &state.stats.lane_models;
+            let active_alias = &state.stats.model_alias;
+            lanes
+                .into_iter()
+                .map(|(lane, s)| crate::ui::app_state::LaneStat {
+                    model: if lane == crate::ui::app_state::ORCHESTRATOR_LANE {
+                        active_alias.clone()
+                    } else {
+                        lane_models.get(&lane).cloned().unwrap_or_default()
+                    },
+                    lane,
+                    input_tokens: s.input_tokens,
+                    output_tokens: s.output_tokens,
+                    api_calls: s.api_calls,
+                    cost: s.cost,
+                })
+                .collect()
+        };
+        state.stats.lanes = rows;
         state.context.current_usage = last_input;
         self.notify_update(&state);
     }
@@ -888,6 +901,16 @@ impl StateManager {
     /// Get the current display alias (empty string if unset).
     pub fn get_model_alias(&self) -> String {
         self.state.read().unwrap().stats.model_alias.clone()
+    }
+
+    /// Publish the sub-agent role → model-alias map. Boot-immutable config;
+    /// `sync_stats_to_ui` stamps it onto every
+    /// [`crate::ui::app_state::LaneStat`] so the Session panel can name the
+    /// model behind each agent.
+    pub fn set_lane_models(&self, models: std::collections::HashMap<String, String>) {
+        let mut state = self.state.write().unwrap();
+        state.stats.lane_models = models;
+        self.notify_update(&state);
     }
 
     /// Update context state
@@ -2793,6 +2816,64 @@ mod tests {
         assert_eq!(lanes[1].input_tokens, 200);
         assert_eq!(lanes[1].api_calls, 1);
         assert!((lanes[1].cost - 0.20).abs() < f64::EPSILON);
+    }
+
+    /// A fresh session's lane rows must be true cumulative sums by the time
+    /// they reach the wire, and the model must be named per role. This is the
+    /// whole Session-panel contract: every row's `in ÷ calls` stays a plausible
+    /// per-request size, and no lane's tokens are a single request's count.
+    #[test]
+    fn fresh_session_lane_rows_are_cumulative_and_carry_the_model() {
+        use crate::ui::app_state::MessageSource;
+        let sm = StateManager::new();
+        sm.set_model_alias("opus-5".to_string());
+        sm.set_lane_models(
+            [("junior".to_string(), "qwen3.6-27B".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let junior = MessageSource::SubAgent {
+            role: "junior".into(),
+        };
+        // Three orchestrator requests and two junior ones, all realistic sizes.
+        sm.add_request(&MessageSource::Human, 4_000, 200, 0.01);
+        sm.add_request(&junior, 5_000, 300, 0.02);
+        sm.add_request(&MessageSource::Human, 4_500, 250, 0.01);
+        sm.add_request(&junior, 6_000, 400, 0.02);
+        sm.add_request(&MessageSource::Human, 5_000, 100, 0.01);
+
+        let lanes = sm.get_state().stats.lanes;
+        let orch = &lanes[0];
+        assert_eq!(orch.lane, "orchestrator");
+        assert_eq!(orch.input_tokens, 13_500, "4000 + 4500 + 5000");
+        assert_eq!(orch.output_tokens, 550, "200 + 250 + 100");
+        assert_eq!(orch.api_calls, 3);
+        assert_eq!(
+            orch.model, "opus-5",
+            "the orchestrator row derives its model from the active alias"
+        );
+
+        let jr = &lanes[1];
+        assert_eq!(jr.lane, "junior");
+        assert_eq!(jr.input_tokens, 11_000, "5000 + 6000");
+        assert_eq!(jr.output_tokens, 700, "300 + 400");
+        assert_eq!(jr.api_calls, 2);
+        assert_eq!(
+            jr.model, "qwen3.6-27B",
+            "roles carry their configured model"
+        );
+
+        // The regression guard: last-request semantics would put in/call far
+        // below one request's size (the 36-tokens-per-call symptom).
+        for l in &lanes {
+            let per_call = l.input_tokens / l.api_calls;
+            assert!(
+                per_call >= 4_000,
+                "lane {} shows {per_call} input tokens per call — tokens are not accumulating",
+                l.lane
+            );
+        }
     }
 
     /// The two Agents-panel facts mirror into the live `AppState`:

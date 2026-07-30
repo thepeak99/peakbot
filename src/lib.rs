@@ -899,7 +899,9 @@ impl AgentRunner {
                                     } else {
                                         format!(
                                             "🧩 Sub-agents are {now} for this conversation. \
-                                             Usage: /subagents on|off (only before the first turn)."
+                                             Usage: /subagents on|off (only before the first turn). \
+                                             Your messages always go to the orchestrator, which \
+                                             decides what to delegate."
                                         )
                                     };
                                     sm.add_system_message(msg);
@@ -1526,7 +1528,11 @@ impl AgentRunner {
         .await?;
 
         sm.add_system_message(if enabled {
-            "🧩 Sub-agents enabled for this conversation.".to_string()
+            // Say where input goes at the moment the feature is turned on —
+            // that's when the "am I talking to a role now?" question appears.
+            "🧩 Sub-agents enabled for this conversation. Your messages always go to \
+             the orchestrator, which decides what to delegate."
+                .to_string()
         } else {
             "🧩 Sub-agents disabled for this conversation.".to_string()
         });
@@ -2517,11 +2523,15 @@ impl AgentRunner {
                         let rows: String = lanes
                             .iter()
                             .map(|(name, l)| {
-                                format!("\n| {} | {} | ${:.4} |", name, l.api_calls, l.cost)
+                                format!(
+                                    "\n| {} | {} | {} | {} | ${:.4} |",
+                                    name, l.input_tokens, l.output_tokens, l.api_calls, l.cost
+                                )
                             })
                             .collect();
                         format!(
-                            "{msg}\n\n### By lane\n\n| Lane | Calls | Cost |\n|---|---|---|{rows}"
+                            "{msg}\n\n### By lane (cumulative)\n\n\
+                             | Lane | In | Out | Calls | Cost |\n|---|---|---|---|---|{rows}"
                         )
                     } else {
                         msg

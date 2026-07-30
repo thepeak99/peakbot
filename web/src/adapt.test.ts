@@ -1,15 +1,17 @@
 import { describe, it, expect } from "vitest";
 import {
+  adaptStats,
   assignDelegationCalls,
   deriveSubAgentRoster,
   filterMessagesByView,
   flatTree,
+  messagesByLane,
   parseCallKey,
   todoTree,
   todosFromMessages,
   viewLabel,
 } from "./adapt";
-import type { WireChatMessage } from "./state";
+import type { AppState, WireChatMessage, WireStats } from "./state";
 import type { TodoNode } from "./types";
 
 // Minimal transcript builder: a `todo` tool call carrying the given args JSON.
@@ -170,6 +172,37 @@ function subAgent(role: string, todo?: Record<string, unknown>): WireChatMessage
   };
 }
 
+describe("messagesByLane", () => {
+  it("counts every message into its lane, orchestrator by default", () => {
+    const msgs = [
+      delegate("junior"),
+      subAgent("junior"),
+      subAgent("junior"),
+      delegate("pm"),
+      subAgent("pm"),
+    ];
+    expect(messagesByLane(msgs)).toEqual({ orchestrator: 2, junior: 2, pm: 1 });
+  });
+
+  it("sums a role's separate delegations into one lane total", () => {
+    const msgs = [
+      delegate("junior"),
+      subAgent("junior"),
+      delegate("pm"),
+      subAgent("pm"),
+      delegate("junior"),
+      subAgent("junior"),
+      subAgent("junior"),
+    ];
+    // junior was delegated to twice (1 + 2 turns) — the lane holds all three.
+    expect(messagesByLane(msgs).junior).toBe(3);
+  });
+
+  it("returns an empty map for an empty transcript", () => {
+    expect(messagesByLane([])).toEqual({});
+  });
+});
+
 describe("parseCallKey", () => {
   it("splits role#n and treats a bare role as call 1", () => {
     expect(parseCallKey("pm#2")).toEqual({ key: "pm#2", role: "pm", n: 2 });
@@ -213,6 +246,41 @@ describe("assignDelegationCalls", () => {
     ]);
     expect(roster.map((r) => r.key)).toEqual(["pm#1", "architect#1", "pm#2"]);
     expect(roster.find((r) => r.key === "pm#2")?.count).toBe(2);
+  });
+
+  // A long conversation can lose its `delegate` ToolCalls (the ToolResult lands
+  // thousands of messages later, so pair-sanitising drops it). Splitting must
+  // still work: it keys off contiguous runs of a role's messages, not the
+  // delegate call. Regression for "junior 1641 msg collapsed into one row".
+  it("splits delegations with no delegate ToolCall present at all", () => {
+    const roster = deriveSubAgentRoster([
+      subAgent("junior"),
+      subAgent("junior"),
+      subAgent("senior"), // another lane spoke → junior's next run is call 2
+      subAgent("junior"),
+      todoCall({ action: "add", tasks: ["orchestrator turn"] }), // orch lane
+      subAgent("junior"), // → call 3
+    ]);
+    expect(roster.map((r) => r.key)).toEqual([
+      "junior#1",
+      "senior#1",
+      "junior#2",
+      "junior#3",
+    ]);
+    expect(roster.find((r) => r.key === "junior#1")?.count).toBe(2);
+    expect(roster.find((r) => r.key === "junior#3")?.count).toBe(1);
+  });
+
+  // Consecutive turns by one role are ONE delegation, however many messages it
+  // spans — the run only breaks when a different lane speaks.
+  it("keeps an uninterrupted run as a single delegation", () => {
+    const roster = deriveSubAgentRoster([
+      subAgent("tester"),
+      subAgent("tester"),
+      subAgent("tester"),
+    ]);
+    expect(roster).toHaveLength(1);
+    expect(roster[0]).toMatchObject({ key: "tester#1", count: 3 });
   });
 });
 
@@ -535,5 +603,74 @@ describe("scoped todos carry no lane label", () => {
   it("todosFromMessages never sets lane (scoped view stays unlabeled)", () => {
     const scoped = todosFromMessages([todoCall({ action: "add", tasks: ["a"] })]);
     expect(scoped.every((t) => t.lane === undefined)).toBe(true);
+  });
+});
+
+// The Session panel shows one "in"/"out" figure above the per-agent rows. The
+// flat wire totals are LAST-request only, so reading them there would make the
+// header contradict its own breakdown (the bug: junior 1641 vs session 425).
+// adaptStats derives the session figure from the lanes instead.
+describe("adaptStats reconciles session totals with the lane breakdown", () => {
+  function stateWithLanes(lanes: WireStats["lanes"]): AppState {
+    return {
+      chat: { messages: [] },
+      todo: { visible: false, items: [] },
+      stats: {
+        // Deliberately the LAST request's numbers, as the backend sends them.
+        total_input_tokens: 425,
+        total_output_tokens: 12,
+        total_api_calls: 4,
+        total_cost: 0.5,
+        lanes,
+        model: "m",
+        provider_name: "p",
+        model_alias: "a",
+      },
+      context: {
+        current_usage: 0,
+        window_size: 1000,
+        compaction_enabled: true,
+        compaction_threshold: 0.8,
+      },
+      conversation: null,
+      is_running: false,
+      is_loading: false,
+      welcome: null,
+      exit_requested: false,
+      bg: { recent_summaries: [] },
+      bash_panel: { visible: false, entries: [] },
+    } as unknown as AppState;
+  }
+
+  it("sums the lanes rather than echoing the last request", () => {
+    const stats = adaptStats(
+      stateWithLanes([
+        {
+          lane: "orchestrator",
+          input_tokens: 425,
+          output_tokens: 12,
+          api_calls: 2,
+          cost: 0.2,
+        },
+        {
+          lane: "junior",
+          input_tokens: 1641,
+          output_tokens: 88,
+          api_calls: 2,
+          cost: 0.3,
+        },
+      ]),
+    );
+    // The total is the sum of its parts — never smaller than a single row.
+    expect(stats.inputTokens).toBe(2066);
+    expect(stats.outputTokens).toBe(100);
+    const rowSum = stats.lanes.reduce((a, l) => a + l.inputTokens, 0);
+    expect(stats.inputTokens).toBe(rowSum);
+  });
+
+  it("falls back to the flat totals when no lanes are reported", () => {
+    const stats = adaptStats(stateWithLanes([]));
+    expect(stats.inputTokens).toBe(425);
+    expect(stats.outputTokens).toBe(12);
   });
 });

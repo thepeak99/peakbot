@@ -30,7 +30,7 @@ pub struct ConversationMetadata {
     pub total_cost: f64,
     /// Per-lane stats snapshot (orchestrator + sub-agent roles). `#[serde(default)]`
     /// so pre-pipeline files load with an empty breakdown — the right answer for
-    /// them. Mirrors the flat totals' overwrite/accumulate split per lane.
+    /// them. Every field accumulates over the conversation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lanes: Vec<LaneMetadata>,
 }

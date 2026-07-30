@@ -58,6 +58,8 @@ export interface WireLaneStat {
   input_tokens: number;
   output_tokens: number;
   api_calls: number;
+  /** Model alias behind this lane. Optional so old snapshots parse. */
+  model?: string;
   cost: number;
 }
 
