@@ -60,11 +60,29 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use uuid::Uuid;
 
 mod registry;
+pub mod setup;
 pub mod tls;
 
 /// Port the web UI listens on. Fixed for now (`--port` flag is Phase 4).
 /// See `webui.md` §3 decision 1.
 pub const DEFAULT_WEB_ADDR: &str = "127.0.0.1:7823";
+
+fn windowed_from(ssh: bool, display: bool, wayland: bool, os: &str) -> bool {
+    if ssh {
+        return false;
+    }
+    matches!(os, "macos" | "windows") || display || wayland
+}
+
+/// True when this process is attached to a local graphical session.
+pub fn windowed_session() -> bool {
+    windowed_from(
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some(),
+        std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()),
+        std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()),
+        std::env::consts::OS,
+    )
+}
 
 /// Self-explaining page served when `web/dist/index.html` is missing from
 /// the embedded bundle (i.e. the binary was built without `make web`).
@@ -105,9 +123,12 @@ pub struct WebUi {
     extra_sans: Vec<String>,
     /// How often the reaper scans for expired sessions.
     reaper_tick: Duration,
+    /// Redirect only the root document to the setup wizard on first run.
+    needs_setup: bool,
 }
 
 impl WebUi {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: SocketAddr,
         deps: Arc<SessionDeps>,
@@ -116,6 +137,7 @@ impl WebUi {
         token: Option<String>,
         tls: bool,
         extra_sans: Vec<String>,
+        needs_setup: bool,
     ) -> Self {
         let web = deps.config.web.clone();
         Self {
@@ -130,6 +152,7 @@ impl WebUi {
             tls,
             extra_sans,
             reaper_tick: Duration::from_secs(web.reaper_tick_secs),
+            needs_setup,
         }
     }
 
@@ -152,11 +175,10 @@ impl WebUi {
         if std::env::var_os("PEAKBOT_NO_OPEN").is_some() {
             return;
         }
-        let local = self.addr.ip().is_loopback() && std::env::var_os("SSH_CONNECTION").is_none();
+        let local = self.addr.ip().is_loopback() && windowed_session();
         if local {
-            // Detached: `open::that` waits on the spawned handler (xdg-open),
-            // which can block forever — that stalls the async runtime before
-            // `axum::serve` is ever reached, leaving the bound port dead.
+            // Detached because waiting on xdg-open can stall the runtime before
+            // axum starts serving the already-bound port.
             let _ = open::that_detached(url);
         }
     }
@@ -174,6 +196,30 @@ impl Ui for WebUi {
             .route("/commands", get(commands_handler))
             .with_state(self.ws_state.clone())
             .fallback(static_handler);
+
+        if self.needs_setup {
+            app = app.route("/", get(setup_redirect));
+        }
+
+        // Mount the setup wizard (plan §A-Q2, §B, §D S3). The router is
+        // merged BEFORE the token layer so every `/api/setup/*` route is
+        // gated by the same `require_token` as `/ws` and `/commands`.
+        // Constructed here (rather than in `WebUi::new`) so we read the
+        // config path fresh; the resolution is `dirs` + `ProjectDirs`
+        // and runs once at boot.
+        let config_path = crate::config::get_config_file_path()
+            .unwrap_or_else(|| std::path::PathBuf::from("config.yaml"));
+        let setup_state = setup::SetupState {
+            config_path,
+            facts_base: setup::FactsBase::current(),
+            needs_setup: self.needs_setup,
+            // Track I: the seams now point at the real install / service
+            // dispatchers. Tests still inject their own fakes via
+            // `SetupState`; production never sees `default_for_tests()`.
+            install: setup::InstallFn(setup::install_op_adapter),
+            service: setup::ServiceFn(setup::service_op_adapter),
+        };
+        app = app.merge(setup::router(setup_state));
 
         // Gate every route behind the shared secret when one is configured.
         // Open by default (loopback); `main` guarantees a token exists before
@@ -215,10 +261,23 @@ impl Ui for WebUi {
     }
 }
 
+/// Format a human-readable error message for `AddrInUse` (plan §E.14 #10, task I7).
+fn format_addr_in_use(addr: SocketAddr) -> String {
+    format!(
+        "{addr} is already in use — a PeakBot service may already be running.\n         Check with: peakbot service status\n         To use a different port, start with: peakbot --bind 127.0.0.1:<port>"
+    )
+}
+
 impl WebUi {
     /// Serve plain HTTP with a Ctrl+C graceful shutdown.
     async fn serve_plain(&self, app: Router) -> Result<()> {
-        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        let listener = match tokio::net::TcpListener::bind(self.addr).await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                anyhow::bail!("{}", format_addr_in_use(self.addr));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let url = self.entry_url();
         eprintln!("🌐 Shifu web UI: {url}  (Ctrl+C to quit)");
         self.maybe_open_browser(&url);
@@ -260,11 +319,17 @@ impl WebUi {
 
         let rustls_cfg =
             axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
-        axum_server::bind_rustls(self.addr, rustls_cfg)
+        match axum_server::bind_rustls(self.addr, rustls_cfg)
             .handle(handle)
             .serve(app.into_make_service())
-            .await?;
-        Ok(())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                anyhow::bail!("{}", format_addr_in_use(self.addr));
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -302,7 +367,11 @@ const TOKEN_COOKIE: &str = "peakbot_token";
 /// configured. Accepts the token from the `?token=…` query (browser first
 /// load) or the `peakbot_token` cookie (every request after). A query-borne
 /// match sets the cookie so the token leaves the URL after one hop.
-async fn require_token(State(token): State<Arc<str>>, req: Request<Body>, next: Next) -> Response {
+pub async fn require_token(
+    State(token): State<Arc<str>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     let via_query = token_from_query(req.uri().query()).is_some_and(|t| ct_eq(t, &token));
     let ok = via_query || token_from_cookie(&req).is_some_and(|t| ct_eq(t, &token));
 
@@ -602,6 +671,17 @@ fn dispatch_inbound(
     }
 }
 
+/// Redirect only the first document request to the setup SPA route. This sits
+/// inside the existing token layer, so a token-bearing entry request receives
+/// its auth cookie on this 303 before the browser follows `/setup`.
+async fn setup_redirect() -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, "/setup")],
+        Body::empty(),
+    )
+        .into_response()
+}
 /// Serve a single file from the embedded bundle. Unknown routes fall back
 /// to `index.html` (SPA client-side routing → 200, not 404), except paths
 /// containing `..` which are refused. When the bundle has no `index.html`
@@ -653,6 +733,16 @@ fn serve_stub() -> Response {
 mod tests {
     use super::*;
 
+    #[test]
+    fn format_addr_in_use_contains_expected_parts() {
+        let addr: SocketAddr = "127.0.0.1:7823".parse().unwrap();
+        let msg = format_addr_in_use(addr);
+        assert!(msg.contains("127.0.0.1:7823"));
+        assert!(msg.contains("already in use"));
+        assert!(msg.contains("peakbot service status"));
+        assert!(msg.contains("--bind"));
+    }
+
     /// Spawn the real axum router on a random loopback port, then
     /// roundtrip through `reqwest`. More honest than a tower-oneshot
     /// stub — exercises actual TCP, actual content-type headers, etc.
@@ -666,6 +756,18 @@ mod tests {
         addr
     }
 
+    #[test]
+    fn windowed_detection_matrix_is_pure() {
+        assert!(!windowed_from(true, true, true, "linux"));
+        assert!(windowed_from(false, false, true, "linux"));
+        assert!(windowed_from(false, true, false, "linux"));
+        assert!(!windowed_from(false, false, false, "linux"));
+        assert!(windowed_from(false, false, false, "macos"));
+        assert!(windowed_from(false, false, false, "windows"));
+        assert!(!windowed_from(true, false, false, "macos"));
+        assert!(!windowed_from(true, false, false, "windows"));
+    }
+
     #[tokio::test]
     async fn root_serves_index_html() {
         let addr = spawn_app().await;
@@ -675,6 +777,26 @@ mod tests {
         assert_eq!(status, 200, "body: {body}");
         let ct_index = body.find("Shifu").unwrap_or(usize::MAX);
         assert!(ct_index < 1024, "root body did not contain Shifu: {body}");
+    }
+
+    #[tokio::test]
+    async fn first_run_root_redirects_to_setup() {
+        let app: Router = Router::new()
+            .route("/", get(setup_redirect))
+            .fallback(static_handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers()[header::LOCATION], "/setup");
     }
 
     #[tokio::test]

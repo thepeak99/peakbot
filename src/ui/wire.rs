@@ -1,6 +1,6 @@
 //! Shared wire protocol for the duplex NDJSON/WebSocket Views.
 //!
-//! `StdioUi` (`peakbot --stdio`) and `WebUi` (`peakbot --web`) speak the
+//! `StdioUi` (`peakbot --stdio`) and `WebUi` (bare `peakbot`) speak the
 //! *same* protocol — one over stdin/stdout NDJSON, one over WebSocket text
 //! frames. The message shapes live here so a change to the format forces
 //! both transports to change together (a *necessarily-same* dedup, not a

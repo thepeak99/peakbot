@@ -9,13 +9,14 @@
 pub const PEAKBOT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod bg_processes;
-mod config;
+pub mod config;
 mod context_manager;
 mod conversation;
 mod conversation_manager;
 mod conversation_title;
 mod hooks;
 pub mod http;
+pub mod install;
 mod mcp_auth;
 mod memory_compaction;
 #[cfg(feature = "mock")]
@@ -24,7 +25,7 @@ mod pipeline;
 mod providers;
 pub mod pty_runner;
 pub mod session;
-mod skills;
+pub mod skills;
 pub mod state;
 pub mod storage;
 pub mod test_runner;
@@ -269,6 +270,11 @@ pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
 /// dropped — it would confuse an agent whose job is to coordinate a team — and
 /// `orchestrator_prompt` (if set) is appended as extra framing. The core tool
 /// guidance, memory, skills, env block, and agents.md are shared by both.
+///
+/// `persona` replaces the built-in persona at the head of the agentless recipe
+/// (plan §A-Q7). `None` / whitespace-only falls back to the built-in. The
+/// parameter is gated by `!subagents_active` so it never reaches the
+/// orchestrator recipe.
 pub fn build_system_prompt(
     skills: &SkillRegistry,
     shell_kind: Option<&ShellKind>,
@@ -276,11 +282,21 @@ pub fn build_system_prompt(
     memory_enabled: bool,
     subagents_active: bool,
     orchestrator_prompt: Option<&str>,
+    persona: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
 
     if !subagents_active {
-        prompt.push_str(SYSTEM_PROMPT_PERSONA);
+        match persona.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => {
+                prompt.push_str(p);
+                // Mirrors the built-in persona's trailing single `\n` so
+                // either branch produces the same byte boundary before
+                // `SYSTEM_PROMPT_CORE`.
+                prompt.push('\n');
+            }
+            None => prompt.push_str(SYSTEM_PROMPT_PERSONA),
+        }
     }
     prompt.push_str(SYSTEM_PROMPT_CORE);
 
@@ -423,8 +439,13 @@ pub struct RebuildContext {
     pub tools_filter: crate::config::ToolsConfig,
     /// The orchestrator prompt addendum (from `pipeline.orchestrator_prompt`).
     /// Appended to the system prompt when sub-agents are active — recomputed
-    /// on the subagents toggle and `/cd`. Refreshed on config reload.
+    /// on the subagents toggle and `/cd`.
     pub orchestrator_prompt: Option<String>,
+    /// The configured persona (from `persona:`). Replaces the built-in persona
+    /// at the head of the agentless recipe. Live-reloadable via `/new`,
+    /// `/model`, `/cd`, `/load` — the rebuild seam recomputes the prompt with
+    /// this value, and `persona` has no live handles behind it (just a string).
+    pub persona: Option<String>,
 }
 
 /// Shared cell holding the *currently active* SessionHook. Replaced
@@ -1767,6 +1788,9 @@ impl AgentRunner {
         ctx.searxng_config = config.searxng.clone();
         ctx.max_turns = config.agent_max_turns;
         ctx.bash_config = config.bash.clone();
+        // `persona` is live-reloadable (no handles behind it). Mirroring it
+        // here is what makes `/new` after a config edit pick up the new text.
+        ctx.persona = config.persona.clone();
 
         warnings
     }
@@ -1866,6 +1890,7 @@ impl AgentRunner {
             ctx.memory_enabled,
             subagents_active,
             ctx.orchestrator_prompt.as_deref(),
+            ctx.persona.as_deref(),
         );
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
@@ -3505,6 +3530,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
         assert!(
             prompt.contains("**Shell**: powershell"),
@@ -3533,6 +3559,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
         assert!(
             prompt.contains("**Shell**: bash"),
@@ -3559,7 +3586,7 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-CONTENT").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, None);
+        let prompt = build_system_prompt(&skills, None, &dir, true, false, None, None);
 
         assert!(
             prompt.contains(&dir.to_string_lossy().to_string()),
@@ -3587,7 +3614,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, None);
+        let prompt = build_system_prompt(&skills, None, &dir, true, false, None, None);
         assert!(
             prompt.contains("# Memory.md"),
             "memory section must be present when memory is enabled"
@@ -3607,7 +3634,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, false, false, None);
+        let prompt = build_system_prompt(&skills, None, &dir, false, false, None, None);
         assert!(
             !prompt.contains("# Memory.md"),
             "memory section must be omitted when memory is disabled"
@@ -3622,13 +3649,13 @@ mod tests {
         let skills = SkillRegistry::new();
         let cwd = std::env::current_dir().unwrap();
 
-        let agentless = build_system_prompt(&skills, None, &cwd, false, false, None);
+        let agentless = build_system_prompt(&skills, None, &cwd, false, false, None, None);
         assert!(
             agentless.contains("CODE CRUSADER"),
             "agentless prompt must carry the persona"
         );
 
-        let orchestrator = build_system_prompt(&skills, None, &cwd, false, true, None);
+        let orchestrator = build_system_prompt(&skills, None, &cwd, false, true, None, None);
         assert!(
             !orchestrator.contains("CODE CRUSADER"),
             "orchestrator prompt must drop the persona"
@@ -3647,20 +3674,20 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let extra = Some("Lead the SENTINEL-TEAM well.");
 
-        let on = build_system_prompt(&skills, None, &cwd, false, true, extra);
+        let on = build_system_prompt(&skills, None, &cwd, false, true, extra, None);
         assert!(
             on.contains("SENTINEL-TEAM"),
             "orchestrator prompt must be appended when sub-agents are active"
         );
 
-        let off = build_system_prompt(&skills, None, &cwd, false, false, extra);
+        let off = build_system_prompt(&skills, None, &cwd, false, false, extra, None);
         assert!(
             !off.contains("SENTINEL-TEAM"),
             "orchestrator prompt must be ignored in agentless mode"
         );
 
         // A blank orchestrator prompt adds no section.
-        let blank = build_system_prompt(&skills, None, &cwd, false, true, Some("   "));
+        let blank = build_system_prompt(&skills, None, &cwd, false, true, Some("   "), None);
         assert!(
             !blank.contains("# Orchestrator Instructions"),
             "a blank orchestrator prompt must not emit a section header"

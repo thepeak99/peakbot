@@ -92,6 +92,18 @@ export PROVIDER='{"type":"openrouter","api_key":"sk-or-v1-xxx","model":"anthropi
 cargo run --release
 ```
 
+On the very first run with **no** config (and no provider key in the env), PeakBot
+decides based on the surface it's launched on:
+
+- **Desktop session, web UI (default):** opens the browser at `/setup` — a guided
+  wizard that writes the config, installs the binary to your per-user app dir,
+  and (optionally) registers a start-at-login service. You do not edit YAML by
+  hand.
+- **Headless / SSH, no TTY, or `--stdio`:** refuses to start and prints the
+  commands to set a provider key or run the wizard from a desktop session.
+- **`peakbot --tui`:** starts the terminal UI directly — no wizard. Use this
+  when you already have a config and just want a session.
+
 ---
 
 ## 🖥️ Usage
@@ -130,6 +142,49 @@ peakbot> what's in [img:~/screenshots/error.png]?
 
 peakbot> compare [img:/tmp/before.png] and [img:/tmp/after.png]
 ```
+
+---
+
+## 📦 Install & Service
+
+Beyond `cargo run`, PeakBot ships verbs that put it on `PATH` and keep it running
+across logins. All three are idempotent — re-run to update.
+
+### `peakbot install`
+
+Copies the running binary to a stable per-user location so it survives `cargo
+clean` and reboots:
+
+- **Linux / macOS:** `~/.local/bin/peakbot` (add `~/.local/bin` to `PATH` if it
+  isn't already; the command reports current `PATH` membership).
+- **Windows:** `%LOCALAPPDATA%\Programs\peakbot\peakbot.exe`.
+
+Re-run any time to overwrite with a freshly-built binary. Requires no config and
+runs before `Config::load()` — use it on a fresh machine.
+
+### `peakbot service install | uninstall | status`
+
+Registers PeakBot to start automatically at login (a single shared-secret web
+server, no interactive prompt). The exact mechanism is per-platform:
+
+- **Linux:** a `systemd --user` unit at `~/.config/systemd/user/peakbot.service`.
+  It runs in your login session. To keep it alive **after logout / at boot**,
+  enable lingering once: `loginctl enable-linger $USER`.
+- **macOS:** a launchd LaunchAgent at
+  `~/Library/LaunchAgents/com.peakbot.agent.plist`. LaunchAgents live in the
+  GUI session — there is no per-user linger; the agent stops at logout.
+- **Windows:** a Task Scheduler logon task named `PeakBot`. Because PeakBot is
+  a console-subsystem binary, **a console window opens at sign-in and stays
+  open** — that is PeakBot running. `service status` may report `unknown` here;
+  open the URL in your browser to confirm it is actually live.
+
+`peakbot service install` accepts `--bind <addr>` and `--token <secret>` so the
+service is self-contained; pass `--token` once and it is written to
+`<config_dir>/web-token` (`0600`). The token file is the source for subsequent
+runs — you do not need to export `PEAKBOT_WEB_TOKEN` to your shell.
+
+Non-loopback binds **require** a token; the loopback/token invariant is
+enforced at plan-build time, not as a runtime check.
 
 ---
 
@@ -178,7 +233,7 @@ cargo test -- --nocapture
 
 ### Web UI dev mode
 
-The web UI (`peakbot --web`) ships as an embedded React + Vite bundle. For
+The web UI (`peakbot`) ships as an embedded React + Vite bundle. For
 iterating on it, `make dev` runs both halves with hot reload:
 
 ```bash
@@ -194,8 +249,9 @@ serves the app with HMR and proxies the `/ws` WebSocket to the backend.
   WebSocket session — the browser reconnects on its own.
 - Requires `cargo install cargo-watch` and Node.js 22+.
 
-Production is unchanged: `make web` builds the static bundle that `cargo run -- --web`
-embeds and serves on `:7823`. `make dev` touches no Rust code paths.
+Production uses `make web` to build the static bundle that bare `cargo run --`
+embeds and serves on `:7823`. Use `cargo run -- --tui` for the terminal UI.
+`make dev` touches no Rust code paths.
 
 ### Pre-commit Gate
 

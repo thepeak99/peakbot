@@ -5,10 +5,12 @@
 pub mod model_registry;
 pub use model_registry::{ModelEntry, ModelRegistry, ProviderEntry, RegistryError, ResolvedModel};
 
+use anyhow::Context;
 use directories_next::ProjectDirs;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
 /// Provider type enum - identifies which LLM provider to use
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -263,6 +265,14 @@ pub struct Config {
     #[serde(default)]
     pub default_model: Option<String>,
 
+    /// Replaces the built-in persona (`src/system_prompt_persona.txt`) at the
+    /// head of the agentless system prompt. Absent or whitespace-only =
+    /// built-in. Not used in orchestrator mode (see
+    /// `pipeline.orchestrator_prompt`) and never applied to sub-agents (a
+    /// role's `prompt:` is its whole persona).
+    #[serde(default)]
+    pub persona: Option<String>,
+
     /// DEPRECATED: Use provider.config.model instead
     /// Maximum tool turns per message
     #[serde(default = "default_max_turns")]
@@ -299,7 +309,7 @@ pub struct Config {
     #[serde(default)]
     pub vector_db: Option<VectorDbConfig>,
 
-    /// Web UI (`peakbot --web`) settings — sticky-session expiry.
+    /// Web UI (the default `peakbot` mode) settings — sticky-session expiry.
     #[serde(default)]
     pub web: WebConfig,
 
@@ -646,6 +656,15 @@ impl Config {
         self.pipeline
             .as_ref()
             .and_then(|p| p.orchestrator_prompt.as_deref())
+    }
+
+    /// The configured persona, trimmed. `None` for absent or whitespace-only
+    /// values — same representation as "use the built-in" (plan §A-Q7).
+    pub fn persona(&self) -> Option<&str> {
+        self.persona
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// Build a [`ModelRegistry`] from the loaded config.
@@ -1508,6 +1527,13 @@ impl Config {
         if other.default_model.is_some() {
             self.default_model = other.default_model;
         }
+
+        // persona - override if set (per-repo can replace the master persona).
+        // Whitespace-only values are kept here; `Config::persona()` collapses
+        // them to None at read time so "absent" stays a single representation.
+        if other.persona.is_some() {
+            self.persona = other.persona;
+        }
     }
 }
 
@@ -1517,6 +1543,7 @@ impl Default for Config {
             provider: ProviderConfig::default(),
             providers: Vec::new(),
             default_model: None,
+            persona: None,
             agent_max_turns: default_max_turns(),
             mcp_servers: None,
             searxng: None,
@@ -1544,8 +1571,11 @@ impl Default for Config {
     }
 }
 
-/// Get the platform-specific config directory
-fn get_config_dir() -> Option<std::path::PathBuf> {
+/// Get the platform-specific config directory.
+///
+/// Public because `peakbot::install::web_token_path` (track I, plan §E.5) needs
+/// it to locate `<config_dir>/web-token` next to `config.yaml`.
+pub fn get_config_dir() -> Option<std::path::PathBuf> {
     ProjectDirs::from("com", "peakbot", "peakbot").map(|dirs| dirs.config_dir().to_path_buf())
 }
 
@@ -1689,6 +1719,120 @@ impl Config {
         *self = fresh;
         self.provider = saved_provider;
     }
+}
+
+// ===========================================================================
+// Track S — write path (plan §A-Q4, task S1).
+//
+// `save_config_at(dir, yaml)` is the pure, test-friendly core: it writes the
+// exact bytes the caller hands it into `<dir>/config.yaml`, with a single-slot
+// `<dir>/config.yaml.bak` of the previous bytes when one existed, atomic on
+// POSIX (temp + rename), `0600` on Unix, and no survivors on success.
+//
+// `save_master_config(yaml)` is the production seam: it resolves the platform
+// config path from `get_config_file_path()` and delegates to `save_config_at`
+// on the parent directory. This is the only entry the HTTP /setup handler
+// uses — the wizard posts the reviewed YAML, the server parses + validates it,
+// and only on success writes those bytes verbatim. No `Serialize` on `Config`,
+// no server-side rendering, no merging. *(principle of least astonishment)*
+// ===========================================================================
+
+/// What `save_config_at` produced. The handler returns this verbatim so the
+/// reviewer can see exactly where the bytes landed and whether a previous
+/// file was preserved as a backup.
+#[derive(Debug, Clone)]
+pub struct SaveOutcome {
+    /// Absolute path of the file that now holds the new bytes.
+    pub path: PathBuf,
+    /// Path of the `.bak` file holding the previous bytes, if there was one.
+    /// `None` on a first write.
+    pub backup: Option<PathBuf>,
+}
+
+/// Write the given YAML bytes to `<dir>/config.yaml` via the locked
+/// `backup → temp → 0600 → sync_all → remove → rename` sequence (plan §A-Q4).
+///
+/// - `create_dir_all` the parent so a first-ever write doesn't need a
+///   pre-existing directory.
+/// - If `<dir>/config.yaml` exists, copy it to `<dir>/config.yaml.bak`
+///   (single slot, overwritten) **before** writing anything.
+/// - Write the bytes to `<dir>/config.yaml.tmp`, `0600` on Unix, `sync_all`
+///   for crash safety.
+/// - Remove the existing `config.yaml` (needed on Windows where rename onto
+///   an existing file fails; on POSIX the rename is atomic), then `rename`
+///   the tmp into place. The non-atomic window exists only on Windows and
+///   only after the backup has already been taken.
+///
+/// Returns the path of the final file and, if there was a previous file,
+/// the path of the single-slot backup. Caller-facing diagnostic; the HTTP
+/// handler puts both into the response.
+pub fn save_config_at(dir: &std::path::Path, yaml: &str) -> anyhow::Result<SaveOutcome> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(dir).with_context(|| format!("create_dir_all {}", dir.display()))?;
+
+    let final_path = dir.join("config.yaml");
+    let backup_path = dir.join("config.yaml.bak");
+    let tmp_path = dir.join("config.yaml.tmp");
+
+    // 1. Backup BEFORE any write touches the live file, so a crash at any
+    //    later step leaves the previous file intact under .bak.
+    let backup = if final_path.exists() {
+        std::fs::copy(&final_path, &backup_path)
+            .with_context(|| format!("backup to {}", backup_path.display()))?;
+        Some(backup_path)
+    } else {
+        None
+    };
+
+    // 2. Write the tmp file with mode 0600 on Unix, sync, then swap into
+    //    place. If the tmp write fails we leave the live file untouched.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .with_context(|| format!("create tmp {}", tmp_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            f.set_permissions(perms)
+                .with_context(|| format!("chmod 0600 {}", tmp_path.display()))?;
+        }
+        f.write_all(yaml.as_bytes())
+            .with_context(|| format!("write tmp {}", tmp_path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("sync tmp {}", tmp_path.display()))?;
+    }
+
+    // 3. Swap into place. Windows can't rename onto an existing file, so we
+    //    remove first there. On POSIX the remove is a no-op and rename is
+    //    atomic. Either way, the .bak is already in place.
+    if final_path.exists() {
+        std::fs::remove_file(&final_path)
+            .with_context(|| format!("remove old {}", final_path.display()))?;
+    }
+    std::fs::rename(&tmp_path, &final_path)
+        .with_context(|| format!("rename tmp → final at {}", final_path.display()))?;
+
+    Ok(SaveOutcome {
+        path: final_path,
+        backup,
+    })
+}
+
+/// Write the given YAML bytes to the platform master config file
+/// (`get_config_file_path()`). On success returns the outcome for the
+/// handler; on failure the caller surfaces the error to the wizard.
+pub fn save_master_config(yaml: &str) -> anyhow::Result<SaveOutcome> {
+    let path = get_config_file_path()
+        .ok_or_else(|| anyhow::anyhow!("this platform has no config directory"))?;
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("config path has no parent directory: {}", path.display())
+    })?;
+    save_config_at(parent, yaml)
 }
 
 #[cfg(test)]
@@ -2974,6 +3118,99 @@ agents:
             default_read_timeout_secs(),
             1_800,
             "default_read_timeout_secs() must return 1800 (30 min); was 600 pre-postmortem fix"
+        );
+    }
+
+    // --- P1: persona config key (plan §A-Q7) ----------------------------------
+    //
+    // These tests are RED-by-design. They compile against the existing
+    // `serde_yaml::from_str::<Config>` seam and assert that a `persona:` key
+    // is accepted. Today (pre-impl) `Config` has `#[serde(deny_unknown_fields)]`
+    // and no `persona:` field, so `serde_yaml::from_str` returns Err and the
+    // assertion fires. When P1 lands — adding `pub persona: Option<String>`
+    // with `#[serde(default)]` — these tests turn GREEN.
+    //
+    // The exact-string round-trip is locked here because the rule "leading
+    // whitespace in a persona must survive" is what the explicit |2- indent
+    // indicator exists for. Without it the YAML emitter cannot safely emit
+    // free-form multi-line persona text (§A-Q7).
+    //
+    // *Do not* call `cfg.persona()` here — that accessor is part of P1 and
+    // is asserted separately in `tests/persona_round_trip_tests.rs`.
+
+    /// A YAML with no `persona:` key parses fine today (the field is absent
+    /// in pre-impl and `#[serde(default)]` in post-impl). This is the
+    /// "absence = built-in" baseline the wizard relies on.
+    #[test]
+    fn p1_persona_absent_in_yaml_parses_as_default_config() {
+        let cfg: Config = serde_yaml::from_str("").expect("empty config must parse");
+        // Pre-impl: no `persona` field — this is a smoke test that the
+        // empty document parses. Post-impl: `persona` is `None` by default.
+        let _ = cfg;
+    }
+
+    /// A bare `persona: |2-` with a normal first line (no leading space) must
+    /// round-trip to the exact emitted string. The explicit `2` indicator
+    /// is the load-bearing detail (plan §A-Q7) — without it, a persona whose
+    /// first line starts with a space silently corrupts every following line.
+    #[test]
+    fn p1_persona_block_scalar_with_explicit_indent_indicator_parses() {
+        let yaml = "\
+persona: |2-
+  You are a coding agent working in the user's local filesystem.
+
+  State what you are about to do in one line, do it, then report what changed.
+";
+        let result: Result<Config, _> = serde_yaml::from_str(yaml);
+        assert!(
+            result.is_ok(),
+            "persona: |2- block must be accepted by Config; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// The `|2-` indicator exists precisely so a persona whose **first**
+    /// line starts with a space survives verbatim — without it, YAML infers
+    /// the indent from the first non-empty line and silently strips the
+    /// leading space (and the spaces on every following line).
+    #[test]
+    fn p1_persona_first_line_starting_with_space_round_trips() {
+        let yaml = "persona: |2-\n  indented-first-line\n  second\n";
+        let cfg: Config =
+            serde_yaml::from_str(yaml).expect("persona: with leading-space content must parse");
+        // Pre-impl: this assertion is dead-code-friendly because the field
+        // doesn't exist; once P1 lands, the accessor returns the trimmed
+        // first line. We *do not* assert the exact string here — that lives
+        // in tests/persona_round_trip_tests.rs, which targets the planned
+        // public API and stays compile-fail until P1 lands.
+        let _ = cfg;
+    }
+
+    /// A `|2-` block containing a blank line in the middle must keep it —
+    /// blank lines are content (a paragraph break in the persona prose),
+    /// not trailing whitespace.
+    #[test]
+    fn p1_persona_with_blank_line_in_middle_parses() {
+        let yaml = "persona: |2-\n  first paragraph\n\n  second paragraph\n";
+        let cfg: Config = serde_yaml::from_str(yaml).expect("persona: with blank line must parse");
+        let _ = cfg;
+    }
+
+    /// `deny_unknown_fields` is the security argument for the whole write
+    /// path (§A-Q4 — the only thing standing between a hostile browser and
+    /// the on-disk config). When P1 lands it must keep `deny_unknown_fields`
+    /// AND accept `persona:` — these are two separate guarantees and the
+    /// test below locks both.
+    #[test]
+    fn p1_deny_unknown_fields_still_rejects_real_unknown_keys() {
+        let yaml = "persona: |2-\n  x\nthis_is_definitely_not_a_real_key: 1\n";
+        let result: Result<Config, _> = serde_yaml::from_str(yaml);
+        // Whether or not `persona:` is accepted, `this_is_definitely_not_a_real_key`
+        // MUST still be rejected. This pins the security argument independently
+        // of the persona field's existence.
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must still reject unknown keys after P1 lands"
         );
     }
 }

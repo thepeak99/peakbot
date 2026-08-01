@@ -9,7 +9,7 @@
 import type { ModelDraft } from "../draft";
 import { ALIAS_PATTERN, RESERVED_ALIAS } from "../draft";
 import type { StepProps } from "../steps";
-import { MODEL_PRESETS, PROVIDER_TYPES } from "../fixtures";
+import { MODEL_PRESETS, PROVIDER_TYPES } from "../catalog";
 import { Check, Field, ghostButtonClass, inputClass } from "../ui";
 
 /** The one alias problem to show under *this* row. Duplicates blame the later
