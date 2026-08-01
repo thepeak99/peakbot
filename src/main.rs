@@ -283,7 +283,7 @@ fn resolve_service_exe() -> (std::path::PathBuf, Option<String>) {
             )),
         );
     };
-    if target.exists() {
+    if std::fs::symlink_metadata(&target).is_ok() {
         return (target, None);
     }
     // Fallback: target dir doesn't exist yet, so the install copy isn't
@@ -929,7 +929,7 @@ mod tests {
         // at `~/.local/bin/peakbot`; the function (correctly) returns
         // it, and the sibling test below owns that branch.
         let target = install_target().expect("a host with a home dir has an install target");
-        if target.exists() {
+        if std::fs::symlink_metadata(&target).is_ok() {
             eprintln!(
                 "skipping: install target {} already exists; \
                  the sibling test covers the installed-target branch",
@@ -977,46 +977,63 @@ mod tests {
     }
 
     /// RAII restore-on-drop for a file path the test swapped.
-    /// Captures the original contents (if any) on construction and
-    /// writes them back on drop, so a developer's installed binary
-    /// at `~/.local/bin/peakbot` is not silently uninstalled by this
-    /// test. (`peakbot install` on a future run sees the original
-    /// file and honours its `AlreadyCurrent` branch.)
+    /// Captures the original state (regular file contents, symlink
+    /// so a developer's installed binary at `~/.local/bin/peakbot`
+    /// is not silently uninstalled by this test.
     ///
-    /// When no file existed at the path before the test, `saved` is
-    /// `None` and `drop` removes the sentinel so the next run still
-    /// exercises the absent-target branch.
+    /// Handles dangling symlinks correctly: `symlink_metadata` +
+    /// `read_link` detect the symlink entry regardless of whether
+    /// the target exists, and `remove_file` clears it so the test
+    /// can write a sentinel. On drop, the symlink is recreated.
     struct TempFileGuard {
         path: std::path::PathBuf,
-        saved: Option<Vec<u8>>,
-        permissions: Option<std::fs::Permissions>,
+        saved: Option<TempFileGuardSaved>,
     }
+
+    enum TempFileGuardSaved {
+        File(Vec<u8>, Option<std::fs::Permissions>),
+        Symlink(std::path::PathBuf),
+    }
+
     impl TempFileGuard {
         fn new(p: std::path::PathBuf) -> Self {
-            let (saved, permissions) = match std::fs::read(&p) {
-                Ok(bytes) => {
-                    let perms = std::fs::metadata(&p).ok().map(|m| m.permissions());
-                    (Some(bytes), perms)
+            let saved = match std::fs::symlink_metadata(&p) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    // Symlink (valid or dangling) — save the link target
+                    let link_target = std::fs::read_link(&p).ok();
+                    let _ = std::fs::remove_file(&p);
+                    link_target.map(TempFileGuardSaved::Symlink)
                 }
-                Err(_) => (None, None),
+                Ok(_) => {
+                    // Regular file — save contents and permissions
+                    match std::fs::read(&p) {
+                        Ok(bytes) => {
+                            let perms = std::fs::metadata(&p).ok().map(|m| m.permissions());
+                            let _ = std::fs::remove_file(&p);
+                            Some(TempFileGuardSaved::File(bytes, perms))
+                        }
+                        Err(_) => {
+                            let _ = std::fs::remove_file(&p);
+                            None
+                        }
+                    }
+                }
+                Err(_) => None, // Path does not exist
             };
-            Self {
-                path: p,
-                saved,
-                permissions,
-            }
+            Self { path: p, saved }
         }
     }
+
     impl Drop for TempFileGuard {
         fn drop(&mut self) {
             match &self.saved {
-                Some(bytes) => {
+                Some(TempFileGuardSaved::File(bytes, permissions)) => {
                     // Real file was here before the test — restore it
                     // verbatim (and its permissions) so the
                     // developer's install survives.
                     if let Err(e) = std::fs::write(&self.path, bytes) {
                         eprintln!("warning: failed to restore {}: {e}", self.path.display());
-                    } else if let Some(perms) = &self.permissions
+                    } else if let Some(perms) = permissions
                         && let Err(e) = std::fs::set_permissions(&self.path, perms.clone())
                     {
                         eprintln!(
@@ -1025,11 +1042,29 @@ mod tests {
                         );
                     }
                 }
+                Some(TempFileGuardSaved::Symlink(target)) => {
+                    // Symlink was here before — recreate it
+                    let _ = std::fs::remove_file(&self.path);
+                    #[cfg(unix)]
+                    if let Err(e) = std::os::unix::fs::symlink(target, &self.path) {
+                        eprintln!(
+                            "warning: failed to restore symlink {}: {e}",
+                            self.path.display()
+                        );
+                    }
+                    #[cfg(windows)]
+                    if let Err(e) = std::os::windows::fs::symlink_file(target, &self.path) {
+                        eprintln!(
+                            "warning: failed to restore symlink {}: {e}",
+                            self.path.display()
+                        );
+                    }
+                }
                 None => {
-                    // No file before the test — the target was meant
-                    // to be absent. Delete the sentinel we wrote so
-                    // the fallback-branch test can run again next
-                    // time.
+                    // No file or symlink before the test — the target
+                    // was meant to be absent. Delete the sentinel we
+                    // wrote so the fallback-branch test can run again
+                    // next time.
                     let _ = std::fs::remove_file(&self.path);
                 }
             }
