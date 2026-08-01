@@ -966,6 +966,13 @@ mod tests {
         // the guard just removed the file in `Drop` and silently
         // uninstalled PeakBot off the operator's PATH.
         let target = install_target().expect("a host with a home dir has an install target");
+        // CI containers (e.g. `rust:1.95` as root) don't have
+        // `/root/.local/bin` yet, and `std::fs::write` does not create
+        // parent directories. Make the dir so the sentinel write
+        // succeeds; the guard's `Drop` only removes the file, so the
+        // directory persists (matching CI-container reality).
+        std::fs::create_dir_all(target.parent().expect("install target has a parent"))
+            .expect("create install-target parent dir");
         let _guard = TempFileGuard::new(target.clone());
         std::fs::write(&target, b"sentinel").expect("write sentinel at install target");
         let (path, note) = resolve_service_exe();
