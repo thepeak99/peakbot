@@ -98,14 +98,7 @@ export type AccessDraft = {
   tls?: boolean;
 };
 
-/** Step 8 — Start on boot. Preview-only in the dummy. */
-export type StartOnBootDraft = {
-  enabled?: boolean;
-  /** Human-readable unit/plist/task name shown in the preview. */
-  serviceName?: string;
-  /** The enable command shown in the preview. */
-  command?: string;
-};
+/** Step 8 — Start on boot is OS state (service/install endpoint), not draft state. */
 
 /** Step 9 — Multi-agent pipeline. Per-role `model` aliases must resolve
  *  against `providers[*].models[*].alias` (live re-validated). */
@@ -164,7 +157,6 @@ export type SetupDraft = {
   persona: PersonaDraft;
   services: ServicesDraft;
   access: AccessDraft;
-  startOnBoot: StartOnBootDraft;
   pipeline: PipelineDraft;
   bashEnv: BashEnvDraft;
   context: ContextDraft;
@@ -173,15 +165,8 @@ export type SetupDraft = {
   timeouts: TimeoutsDraft;
   http: HttpDraft;
   agentMaxTurns?: number;
-  mcpServers: Array<{
-    name?: string;
-    command?: string;
-    args?: string[];
-    url?: string;
-    /** type: stdio | streamable-http. */
-    type?: string;
-    auth?: { type?: string; token?: string };
-  }>;
+  /** Top-level config keys not owned by the wizard, preserved verbatim. */
+  passthrough: Record<string, unknown>;
 };
 
 // ---------- defaults --------------------------------------------------------
@@ -195,14 +180,13 @@ export function defaultSetupDraft(): SetupDraft {
     persona: {},
     services: {},
     access: { mode: "local" },
-    startOnBoot: {},
     pipeline: {},
     bashEnv: {},
     context: {},
     memory: {},
     timeouts: {},
     http: {},
-    mcpServers: [],
+    passthrough: {},
   };
 }
 
@@ -211,6 +195,52 @@ export function defaultSetupDraft(): SetupDraft {
 /** Alias charset from agents.md: `^[A-Za-z0-9_./:-]+$`. */
 export const ALIAS_PATTERN = /^[A-Za-z0-9_./:-]+$/;
 
+
+const OWNED_KEYS = new Set([
+  "providers", "default_model", "persona", "searxng", "vector_db", "tools", "bash",
+  "context", "cost_tracking", "agent_max_turns", "memory", "timeouts", "http", "web", "pipeline",
+]);
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Convert GET /api/setup existing.config JSON into the wizard's managed draft. */
+export function configJsonToDraft(config: unknown): SetupDraft {
+  const source = asRecord(config);
+  const draft = defaultSetupDraft();
+  const providers = Array.isArray(source.providers) ? source.providers : [];
+  draft.providers = providers.filter((p): p is Record<string, unknown> => !!p && typeof p === "object").map((p) => ({
+    name: typeof p.name === "string" ? p.name : undefined,
+    type: typeof p.type === "string" && ["openrouter", "openai", "anthropic", "llamacpp", "ollama"].includes(p.type) ? p.type as ProviderDraft["type"] : undefined,
+    baseUrl: typeof p.base_url === "string" ? p.base_url : undefined,
+    apiKey: typeof p.api_key === "string" ? p.api_key : undefined,
+    models: Array.isArray(p.models) ? p.models.filter((m): m is Record<string, unknown> => !!m && typeof m === "object").map((m) => ({
+      name: typeof m.name === "string" ? m.name : undefined,
+      alias: typeof m.alias === "string" ? m.alias : undefined,
+      maxTokens: asNumber(m.max_tokens), temperature: asNumber(m.temperature), vision: typeof m.vision === "boolean" ? m.vision : undefined,
+      contextWindowOverride: asNumber(m.context_window_override), numCtx: asNumber(m.num_ctx), extraParams: asRecord(m.extra_params),
+      promptCaching: typeof m.prompt_caching === "string" ? m.prompt_caching as ModelDraft["promptCaching"] : undefined,
+    })) : [],
+  }));
+  draft.defaultModel = typeof source.default_model === "string" ? source.default_model : undefined;
+  if (typeof source.persona === "string") draft.persona = { mode: "custom", custom: source.persona };
+  const s = asRecord(source.searxng);
+  if (Object.keys(s).length) draft.services.searxng = { baseUrl: typeof s.base_url === "string" ? s.base_url : undefined, enabled: typeof s.enabled === "boolean" ? s.enabled : undefined, timeoutSeconds: asNumber(s.timeout_seconds), maxResults: asNumber(s.max_results), bearerToken: typeof s.bearer_token === "string" ? s.bearer_token : undefined };
+  const v = asRecord(source.vector_db);
+  if (Object.keys(v).length) { const e = asRecord(v.embeddings); draft.services.vectorDb = { enabled: typeof v.enabled === "boolean" ? v.enabled : undefined, dbPath: typeof v.db_path === "string" ? v.db_path : undefined, embeddings: Object.keys(e).length ? { baseUrl: typeof e.base_url === "string" ? e.base_url : undefined, apiKey: typeof e.api_key === "string" ? e.api_key : undefined, model: typeof e.model === "string" ? e.model : undefined, dimensions: asNumber(e.dimensions) } : undefined }; }
+  const tools = asRecord(source.tools);
+  if (Array.isArray(tools.disabled)) draft.services.tools = { disabled: tools.disabled.filter((x): x is string => typeof x === "string") };
+  else if (Array.isArray(tools.only)) draft.services.tools = { only: tools.only.filter((x): x is string => typeof x === "string") };
+  const passthrough: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) if (!OWNED_KEYS.has(key)) passthrough[key] = value;
+  draft.passthrough = passthrough;
+  return draft;
+}
 /** Reserved alias that must never be declared. */
 export const RESERVED_ALIAS = "unknown";
 

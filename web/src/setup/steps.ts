@@ -8,6 +8,7 @@
  * optional field is not an error; a duplicate alias is.
  */
 
+import type { SetupInfo } from "./api";
 import type { ReactElement } from "react";
 import type { SetupDraft } from "./draft";
 import {
@@ -34,6 +35,8 @@ export type StepProps = {
   patch: (partial: Partial<SetupDraft>) => void;
   /** Advance one step — for the in-body shortcuts (Welcome's "Start fresh"). */
   next: () => void;
+  /** Live machine facts from GET /api/setup (null until the fetch resolves). */
+  info: SetupInfo | null;
 };
 
 export type Step = {
@@ -107,7 +110,7 @@ export const STEPS: Step[] = [
     id: "boot",
     title: "Start on boot",
     optional: true,
-    isComplete: (d) => d.startOnBoot.enabled === true,
+    isComplete: () => false,
     errors: none,
     Component: StartOnBootStep,
   },

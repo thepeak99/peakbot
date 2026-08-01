@@ -1,4 +1,4 @@
-//! PeakBot's built-in certificate authority for `peakbot --web --tls`.
+//! PeakBot's built-in certificate authority for `peakbot --tls`.
 //!
 //! PeakBot owns the whole PKI so HTTPS is batteries-included: it self-signs a
 //! long-lived **CA** (install it on your phone ONCE), then mints a fresh

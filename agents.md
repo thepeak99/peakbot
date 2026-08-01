@@ -2,7 +2,7 @@
 
 ## Overview
 
-PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.38). It runs as a terminal REPL or web UI, equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills, conversation persistence, todo management, an event-driven hooks system for cost tracking, and an opt-in multi-agent pipeline.
+PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.38). It runs a web UI by default and a terminal TUI (`peakbot --tui`) or NDJSON stdio frontend (`peakbot --stdio`), equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills, conversation persistence, todo management, an event-driven hooks system for cost tracking, an opt-in multi-agent pipeline, a first-run setup wizard, and `peakbot install` / `peakbot service …` verbs for end-user install + start-at-login.
 
 ## Architecture
 
@@ -260,13 +260,13 @@ OAuth notes: first connect opens the browser; tokens cached under `~/.cache/peak
 | `/subagents on\|off` | Per-conversation sub-agent opt-in (before first turn; needs `pipeline:`) |
 | `exit` | Quit |
 
-### Web UI (`peakbot --web`)
+### Web UI (`peakbot`, the default)
 
-Serves the embedded SPA + live chat over WebSocket.
+Serves the embedded SPA + live chat over WebSocket. Use `peakbot --tui` for the terminal UI.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--web` | off | Web UI instead of terminal; binds loopback, auto-opens browser locally |
+| `--tui` | off | Terminal UI instead of the default web UI |
 | `--bind <host:port>` | `127.0.0.1:7823` | Non-loopback bind **requires** a token |
 | `--token <secret>` | — | Guards every route; prefer `PEAKBOT_WEB_TOKEN` (keeps it out of shell history) |
 | `--tls` / `--tls-name <NAME>` | off | HTTPS with the built-in CA; `--tls-name` adds SANs (repeatable) |
@@ -403,7 +403,7 @@ All four end `FROM scratch` with `--output type=local,dest=./output`. **Gotcha:*
 
 ### Make targets
 
-`make help` for the full list. Highlights: `make` / `make build` (all four platforms), `make build-{linux,windows,macos,android}`, `make clean`, `make web` (SPA bundle for `--web`), `make dev` (backend under cargo-watch `:8080` + Vite HMR `:5173`; requires cargo-watch + Node 22+). Non-release builds produce unversioned filenames; the release flow injects semver via `--build-arg VERSION`.
+`make help` for the full list. Highlights: `make` / `make build` (all four platforms), `make build-{linux,windows,macos,android}`, `make clean`, `make web` (SPA bundle for the default web mode), `make dev` (backend under cargo-watch `:8080` + Vite HMR `:5173`; requires cargo-watch + Node 22+). Non-release builds produce unversioned filenames; the release flow injects semver via `--build-arg VERSION`.
 
 ### Release pipeline
 

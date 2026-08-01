@@ -212,6 +212,19 @@ impl ModelRegistry {
                         model: model.name.clone(),
                     });
                 }
+                // Reserved literal (plan §A-Q4). The wizard's Review step
+                // forbids `alias: unknown` because the registry's runtime
+                // resolution uses it as the "no resolution" sentinel — a
+                // model aliased `unknown` would shadow that and route
+                // requests to nothing. Reject at validation time so the
+                // error names the alias, not the runtime symptom.
+                if alias == "unknown" {
+                    return Err(RegistryError::InvalidAlias {
+                        alias,
+                        provider: prov.name.clone(),
+                        model: model.name.clone(),
+                    });
+                }
                 if let Some((first_prov, first_model)) = origins.get(&alias) {
                     return Err(RegistryError::DuplicateAlias {
                         alias: alias.clone(),

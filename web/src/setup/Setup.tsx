@@ -10,11 +10,12 @@
  * redirect trivial later.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ThemeToggle } from "../components/ThemeToggle";
-import { defaultSetupDraft, type SetupDraft } from "./draft";
+import { defaultSetupDraft, configJsonToDraft, type SetupDraft } from "./draft";
 import { REVIEW_INDEX, STEPS } from "./steps";
-import { Errors, PreviewChip, buttonClass, ghostButtonClass } from "./ui";
+import { Errors, buttonClass, ghostButtonClass } from "./ui";
+import { apiErrorMessage, getSetupInfo, type SetupInfo } from "./api";
 
 /** Rail dot: red on a hard error, filled once the step has real input. */
 function dotClass(state: "error" | "complete" | "empty"): string {
@@ -27,6 +28,26 @@ export function Setup() {
   const [draft, setDraft] = useState<SetupDraft>(defaultSetupDraft);
   const [index, setIndex] = useState(0);
   const [visited, setVisited] = useState<number[]>([0]);
+  const [info, setInfo] = useState<SetupInfo | null>(null);
+  const [infoError, setInfoError] = useState<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getSetupInfo()
+      .then((next) => {
+        if (cancelled) return;
+        setInfo(next);
+        const existing = next.existing;
+        if (existing.status === "ok") {
+          setDraft(configJsonToDraft(existing.config));
+          setDraft((d) => ({ ...d, welcome: { ...d.welcome, startMode: "import", importedSummary: "Imported from existing config.yaml" } }));
+        } else if (existing.status === "error") {
+          setInfoError((prev) => [...prev, `Existing config could not be parsed: ${existing.message}. Starting with a blank draft.`]);
+        }
+      })
+      .catch((err) => { if (!cancelled) setInfoError(apiErrorMessage(err)); });
+    return () => { cancelled = true; };
+  }, []);
 
   const step = STEPS[index];
   const errors = step.errors(draft);
@@ -48,7 +69,12 @@ export function Setup() {
       <header className="flex items-center gap-3 border-b border-zinc-900 px-4 py-2.5">
         <img src="/favicon.svg" alt="" className="h-6 w-6" />
         <h1 className="text-sm font-medium">Setup</h1>
-        <PreviewChip />
+        {info && (
+          <span className="text-[11px] text-zinc-500">
+            {info.os} · {info.arch}
+            {info.needs_setup ? " · first run" : null}
+          </span>
+        )}
         <div className="ml-auto flex items-center gap-3">
           <a
             href="/"
@@ -130,10 +156,12 @@ export function Setup() {
                 )}
               </div>
               <Errors errors={errors} />
+              <Errors errors={infoError} />
               <step.Component
                 draft={draft}
                 patch={patch}
                 next={() => goTo(Math.min(index + 1, REVIEW_INDEX))}
+                info={info}
               />
             </div>
           </section>

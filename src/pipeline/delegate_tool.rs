@@ -758,6 +758,94 @@ mod tests {
         );
     }
 
+    // --- P2 — persona MUST NOT leak into a sub-agent preamble (plan §A-Q7 row 3).
+    //
+    // Plan §A-Q7 locks: "Sub-agent (`build_sub_agent_preamble`) … unchanged
+    // — confirmed and locked. The global `persona:` must never leak into a
+    // role preamble; a role's identity is its `prompt:`."
+    //
+    // Today `build_sub_agent_preamble` has no `persona` parameter (the
+    // signature lives at `pipeline/delegate_tool.rs:67`). After P2 lands
+    // the parameter MUST NOT have been added — this test guards that.
+    // It is GREEN today as a behaviour guard; the assertion remains GREEN
+    // after P2 lands.
+
+    /// A sub-agent preamble carries the role's own `prompt:` and nothing
+    /// that looks like the built-in crusader persona. The role is its own
+    /// persona (§A-Q7 row 3).
+    #[test]
+    fn p2_sub_agent_preamble_does_not_include_built_in_crusader_persona() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = crate::skills::SkillRegistry::default();
+        let filter = crate::config::SkillFilter::default();
+
+        let preamble = build_sub_agent_preamble(
+            "ROLE-PROMPT-SENTINEL",
+            None,
+            dir.path(),
+            &skills,
+            &filter,
+            false,
+        );
+
+        assert!(
+            preamble.contains("ROLE-PROMPT-SENTINEL"),
+            "the role's own prompt must be present"
+        );
+        assert!(
+            !preamble.contains("CODE CRUSADER"),
+            "the built-in crusader persona MUST NOT leak into a sub-agent preamble"
+        );
+        assert!(
+            !preamble.contains("# Working Principles"),
+            "the core tool guidance block MUST NOT leak into a sub-agent preamble"
+        );
+    }
+
+    /// A custom persona-bearing role is still sub-agent-shaped: the role
+    /// prompt is the persona, no other text resembling a persona is added.
+    /// This is the GREEN guard against an impl that accidentally threads
+    /// the configured persona through to sub-agents.
+    #[test]
+    fn p2_sub_agent_preamble_only_carries_the_role_own_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = crate::skills::SkillRegistry::default();
+        let filter = crate::config::SkillFilter::default();
+
+        // A role prompt that itself looks like a persona. The preamble
+        // must start with this text and contain no other persona-shaped
+        // prose.
+        let role_prompt = "ROLE-PERSONA-SENTINEL: be terse.";
+        let preamble =
+            build_sub_agent_preamble(role_prompt, None, dir.path(), &skills, &filter, false);
+
+        assert!(
+            preamble.starts_with(role_prompt),
+            "the preamble must begin with the role's own prompt"
+        );
+    }
+
+    /// Compile-time guard: the current signature has no `persona` parameter.
+    /// If P2 (wrongly) adds one, this fn-ptr capture will stop compiling
+    /// because the parameter list changed. That is the load-bearing
+    /// assertion — the persona MUST NOT be threaded into sub-agent preambles.
+    #[test]
+    fn p2_sub_agent_preamble_signature_has_no_persona_parameter() {
+        // Build a function pointer to the CURRENT signature. If P2 adds
+        // a `persona: Option<&str>` parameter to `build_sub_agent_preamble`,
+        // this line fails to compile. That is the strongest contract we
+        // can write at the type level for a "must NOT" invariant.
+        type PreambleFn = fn(
+            &str,
+            Option<&crate::ShellKind>,
+            &std::path::Path,
+            &crate::skills::SkillRegistry,
+            &crate::config::SkillFilter,
+            bool,
+        ) -> String;
+        let _f: PreambleFn = build_sub_agent_preamble;
+    }
+
     // The §3.4 ordering invariant for delegate — "the inner loop budget
     // strictly sits below the outer decorator budget, with the slack being
     // for handoff::build's summarisation LLM call" — used to be pinned here

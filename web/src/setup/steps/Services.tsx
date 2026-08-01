@@ -9,9 +9,8 @@
 
 import type { ServicesDraft } from "../draft";
 import type { StepProps } from "../steps";
-import { BUILTIN_TOOL_NAMES, EMBEDDING_MODELS } from "../fixtures";
+import { BUILTIN_TOOL_NAMES, EMBEDDING_MODELS } from "../catalog";
 import { Check, Field, RadioCards, Section, inputClass } from "../ui";
-
 type ToolMode = "all" | "disabled" | "only";
 
 function toNumber(raw: string): number | undefined {
@@ -20,10 +19,11 @@ function toNumber(raw: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-export function ServicesStep({ draft, patch }: StepProps) {
+export function ServicesStep({ draft, patch, info }: StepProps) {
   const set = (partial: Partial<ServicesDraft>) =>
     patch({ services: { ...draft.services, ...partial } });
   const { searxng, vectorDb, tools } = draft.services;
+  const toolNames: string[] = info?.builtin_tools?.length ? info.builtin_tools : [...BUILTIN_TOOL_NAMES];
 
   const mode: ToolMode = tools?.only
     ? "only"
@@ -224,7 +224,7 @@ export function ServicesStep({ draft, patch }: StepProps) {
         />
         {mode !== "all" && (
           <div className="grid grid-cols-2 gap-1 sm:grid-cols-3">
-            {BUILTIN_TOOL_NAMES.map((name) => (
+            {toolNames.map((name) => (
               <Check
                 key={name}
                 label={name}

@@ -7,7 +7,7 @@
 
 import type { PersonaDraft } from "../draft";
 import type { StepProps } from "../steps";
-import { PERSONA_PRESETS } from "../fixtures";
+import { PERSONA_PRESETS } from "../catalog";
 import { inputClass } from "../ui";
 
 export function PersonaStep({ draft, patch }: StepProps) {

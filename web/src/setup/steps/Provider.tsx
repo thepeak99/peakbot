@@ -10,13 +10,8 @@
 import { useState } from "react";
 import type { ProviderWithModelsDraft } from "../draft";
 import type { StepProps } from "../steps";
-import { PROVIDER_TYPES, TEST_CONNECTION_RESULT } from "../fixtures";
-import {
-  FakeActionButton,
-  Field,
-  ghostButtonClass,
-  inputClass,
-} from "../ui";
+import { PROVIDER_TYPES } from "../catalog";
+import { Field, ghostButtonClass, inputClass } from "../ui";
 
 export function ProviderStep({ draft, patch }: StepProps) {
   const [revealed, setRevealed] = useState(false);
@@ -112,11 +107,9 @@ export function ProviderStep({ draft, patch }: StepProps) {
         </Field>
       )}
 
-      <FakeActionButton
-        label="Test connection"
-        result={TEST_CONNECTION_RESULT}
-        disabled={!provider.type}
-      />
+      <p className="text-[11px] text-zinc-500">
+        Test connection is a cuttable endpoint; verify the key by sending a message from the chat.
+      </p>
     </div>
   );
 }

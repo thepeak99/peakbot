@@ -91,7 +91,7 @@ $(OUTPUT_DIR)/$(ANDROID_BIN): Dockerfile.android
 	@echo "✅ Built: $(OUTPUT_DIR)/$(ANDROID_BIN)"
 	@ls -lh $(OUTPUT_DIR)/$(ANDROID_BIN)
 
-## web: Build the web UI (web/dist/) — required for `peakbot --web` to serve the real SPA.
+## web: Build the web UI (web/dist/) — required for bare `peakbot` to serve the real SPA.
 ##        CI and Docker builds run the Node stage automatically; this is for local dev.
 web:
 	@command -v node >/dev/null 2>&1 || { echo "❌ node not found — install Node.js 22+"; exit 1; }
@@ -109,7 +109,7 @@ dev:
 	cd web && npm install
 	@echo "→ web (HMR): http://localhost:5173   backend: http://127.0.0.1:8080"
 	@trap 'kill 0' INT TERM; \
-	PEAKBOT_NO_OPEN=1 cargo watch -x 'run -- --web --bind 127.0.0.1:8080' & \
+	PEAKBOT_NO_OPEN=1 cargo watch -x 'run -- --bind 127.0.0.1:8080' & \
 	( cd web && npm run dev ) & \
 	wait
 

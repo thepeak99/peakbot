@@ -25,7 +25,7 @@ pub mod repl;
 // NDJSON stdio UI (`peakbot --stdio`)
 pub mod stdio;
 
-// Web UI (`peakbot --web`) — Phase 1: static shell + live WebSocket. See module docs.
+// Web UI (default `peakbot` mode) — embedded shell + live WebSocket. See module docs.
 pub mod web;
 
 // Re-export commonly used types
