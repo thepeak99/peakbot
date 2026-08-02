@@ -326,39 +326,54 @@ impl Tool for DelegateTool {
         })
         .await;
 
-        let Ok(outcome) = bounded else {
-            tracing::error!(
-                target: "peakbot",
-                role = %args.role,
-                budget_secs = budget.as_secs(),
-                "Delegation exceeded its wall-clock budget; cancelling and salvaging a handoff"
-            );
-            // Bypass `classify` — there is no `PromptError` here, we cancelled
-            // it ourselves — and hand the snapshot straight to the renderer so
-            // the work already done still reaches the orchestrator.
-            let h = handoff::Handoff::Failed {
-                error: format!(
-                    "exceeded its {}s wall-clock budget and was cancelled",
-                    budget.as_secs()
-                ),
-                history: hook.history_snapshot(),
-            };
-            return Ok(handoff::build(&args.role, h, &role.model.provider_config).await);
-        };
-
-        match outcome {
-            Ok(text) => Ok(normalize_delegate_output(&args.role, text)),
+        let result = match bounded {
+            Err(_elapsed) => {
+                tracing::error!(
+                    target: "peakbot",
+                    role = %args.role,
+                    budget_secs = budget.as_secs(),
+                    "Delegation exceeded its wall-clock budget; cancelling and salvaging a handoff"
+                );
+                // Bypass `classify` — there is no `PromptError` here, we cancelled
+                // it ourselves — and hand the snapshot straight to the renderer so
+                // the work already done still reaches the orchestrator.
+                let h = handoff::Handoff::Failed {
+                    error: format!(
+                        "exceeded its {}s wall-clock budget and was cancelled",
+                        budget.as_secs()
+                    ),
+                    history: hook.history_snapshot(),
+                };
+                handoff::build(&args.role, h, &role.model.provider_config).await
+            }
+            Ok(Ok(text)) => normalize_delegate_output(&args.role, text),
             // A dead sub-agent still knows things. Everything but a user stop
             // comes back as a summarised handoff so the orchestrator can decide
             // what to re-delegate instead of re-running the same wall.
-            Err(e) => match handoff::classify(e, hook.history_snapshot()) {
-                handoff::Handoff::Abort(err) => Err(DelegateError::Run {
-                    role: args.role.clone(),
-                    error: err.to_string(),
-                }),
-                h => Ok(handoff::build(&args.role, h, &role.model.provider_config).await),
+            Ok(Err(e)) => match handoff::classify(e, hook.history_snapshot()) {
+                handoff::Handoff::Abort(err) => {
+                    // User-initiated cancel: no file, no note — return Err so the
+                    // orchestrator sees the stop take precedence.
+                    return Err(DelegateError::Run {
+                        role: args.role.clone(),
+                        error: err.to_string(),
+                    });
+                }
+                h => handoff::build(&args.role, h, &role.model.provider_config).await,
             },
-        }
+        };
+
+        // Every successful path through this tool — including timed-out and
+        // dead-sub-agent handoffs — saves the sub-agent's own earlier messages
+        // to a temp file and appends a one-line pointer. INTERRUPTED/timeout
+        // delegations still get a file: their history snapshot is populated.
+        // Only the user-cancel `Abort` above short-circuits the note (via the
+        // `return Err`).
+        Ok(super::sub_agent_messages::attach_note(
+            result,
+            &args.role,
+            &hook.history_snapshot(),
+        ))
     }
 }
 

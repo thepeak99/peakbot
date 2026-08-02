@@ -6,6 +6,7 @@
 mod delegate_tool;
 mod handoff;
 pub(crate) mod registry;
+mod sub_agent_messages;
 
 use crate::hooks::SessionHook;
 use std::sync::{Arc, Mutex};
