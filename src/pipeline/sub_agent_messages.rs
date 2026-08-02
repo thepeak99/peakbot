@@ -7,18 +7,9 @@
 //! Hookless Ollama sub-agents produce an empty snapshot → no file, no note
 //! (degrades to prior behavior).
 
-//! STUB PHASE — every public item below awaits implementation. The contract
-//! tests in this module drive the signatures; until the real bodies land,
-//! the production items are referenced only by `#[cfg(test)]` code, which
-//! clippy's lib compilation cannot see. The blanket allow is the smallest
-//! way to keep `-D warnings` green for the stub; the real implementation
-//! will drop it.
-
-#![allow(dead_code)]
-
-use rig_core::completion::message::Message;
+use rig_core::completion::message::{AssistantContent, Message};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How many of the sub-agent's own messages we keep. Its final reply is not
 /// among them — that is the delegate result the orchestrator already has.
@@ -30,49 +21,131 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Scratch root, shared with the bash tool: `<temp>/peakbot`.
 fn temp_root() -> PathBuf {
-    unimplemented!()
+    std::env::temp_dir().join("peakbot")
 }
 
 /// Every non-empty assistant text turn, oldest first. Tool calls, reasoning,
 /// images, the orchestrator's task, and tool results are all excluded — the
 /// goal is the sub-agent's prose report, not its plumbing. Multiple text
 /// blocks inside one turn join with "\n" and count as ONE message.
-fn assistant_texts(_history: &[Message]) -> Vec<String> {
-    unimplemented!()
+fn assistant_texts(history: &[Message]) -> Vec<String> {
+    let mut out = Vec::new();
+    for msg in history {
+        if let Message::Assistant { content, .. } = msg {
+            let mut texts = Vec::new();
+            for c in content.iter() {
+                if let AssistantContent::Text(t) = c {
+                    texts.push(t.text.as_str());
+                }
+            }
+            let joined = texts.join("\n");
+            if !joined.trim().is_empty() {
+                out.push(joined);
+            }
+        }
+    }
+    out
 }
 
 /// `delegate_{role}_{pid}_{counter}.txt`; role is sanitised to
 /// `[A-Za-z0-9_-]` so a config role name is always a legal file name.
-fn file_name(_role: &str) -> String {
-    unimplemented!()
+fn file_name(role: &str) -> String {
+    let sanitised: String = role
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let pid = std::process::id();
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("delegate_{sanitised}_{pid}_{counter}.txt")
 }
 
 /// Header + numbered messages. Pure.
-fn render(_role: &str, _kept: &[String], _total: usize) -> String {
-    unimplemented!()
+fn render(role: &str, kept: &[String], total: usize) -> String {
+    let kept_n = kept.len();
+    let count_phrase = if kept_n == total {
+        format!("all {kept_n}")
+    } else {
+        format!("last {kept_n} of {total}")
+    };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "[delegate:{role}] The sub-agent's own messages, oldest first — {count_phrase}. \
+         Its final reply is NOT here (that is the delegate result you already have).\n"
+    ));
+    for (i, text) in kept.iter().enumerate() {
+        out.push('\n');
+        out.push_str(&format!("===== message {}/{kept_n} =====\n", i + 1));
+        out.push_str(text);
+        out.push('\n');
+    }
+    out
 }
 
 /// create_dir_all + write. Returns the path. `dir` is a parameter purely so
 /// the failure path is testable.
-fn save(_dir: &Path, _role: &str, _body: &str) -> std::io::Result<PathBuf> {
-    unimplemented!()
+fn save(dir: &Path, role: &str, body: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(file_name(role));
+    std::fs::write(&path, body)?;
+    Ok(path)
 }
 
 /// The one-line pointer appended to the delegate result. Pure.
-fn note(_role: &str, _kept: usize, _path: &Path) -> String {
-    unimplemented!()
+fn note(role: &str, kept: usize, path: &Path) -> String {
+    let (noun, verb) = if kept == 1 {
+        ("earlier message", "was")
+    } else {
+        ("earlier messages", "were")
+    };
+    format!(
+        "[delegate:{role}] Its {kept} {noun} {verb} saved to {} — \
+         if the result above is not the full report (e.g. just \"done\" or a one-liner), \
+         `file_read` that path to recover it.",
+        path.display()
+    )
 }
 
 /// Testable core.
-fn attach_note_in(_dir: &Path, _result: String, _role: &str, _history: &[Message]) -> String {
-    unimplemented!()
+fn attach_note_in(dir: &Path, result: String, role: &str, history: &[Message]) -> String {
+    let texts = assistant_texts(history);
+    if texts.is_empty() {
+        return result;
+    }
+    let total = texts.len();
+    let kept_start = total.saturating_sub(KEEP);
+    let kept = &texts[kept_start..];
+    let body = render(role, kept, total);
+
+    // NOTE: deliberately NO writer-side size cap — `file_read`
+    // (`src/tools/file_read.rs`) caps reads at 50_000 chars and offers
+    // start_line/end_line pagination, so the orchestrator can chunk-recover a
+    // long salvage file. A cap here would silently drop the sub-agent's real
+    // report, which is exactly what this feature exists to prevent.
+    match save(dir, role, &body) {
+        Ok(path) => format!("{result}\n\n{}", note(role, kept.len(), &path)),
+        Err(e) => {
+            tracing::warn!(
+                target: "peakbot",
+                role = %role,
+                error = %e,
+                "Failed to save sub-agent salvage file; returning delegate result unchanged"
+            );
+            result
+        }
+    }
 }
 
 /// THE seam. Save the sub-agent's own earlier messages and append a pointer
 /// to `result`. Returns `result` byte-identical when there is nothing to save
 /// or the write fails — a delegation is never failed by this.
-pub(crate) fn attach_note(_result: String, _role: &str, _history: &[Message]) -> String {
-    unimplemented!()
+pub(crate) fn attach_note(result: String, role: &str, history: &[Message]) -> String {
+    attach_note_in(&temp_root(), result, role, history)
 }
 
 #[cfg(test)]
