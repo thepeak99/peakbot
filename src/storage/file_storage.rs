@@ -6,7 +6,8 @@ use super::ConversationStorage;
 use crate::conversation::{Conversation, ConversationSummary};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -118,8 +119,19 @@ impl FileStorage {
     /// crash-safe write used for conversations.
     fn write_index(&self, index: &HashMap<Uuid, ConversationSummary>) -> Result<()> {
         let temp_path = self.storage_dir.join(".index.tmp.json");
-        let json = serde_json::to_string(index)?;
-        fs::write(&temp_path, json)?;
+        // Stream: 256 KiB fixed buffer recycles forever; grows in ~256 KiB
+        // chunks instead of one ~703 KiB String that exceeds glibc's
+        // 32 MiB mmap threshold on every event-driven persist.
+        let f = File::create(&temp_path)?;
+        let mut writer = BufWriter::with_capacity(256 * 1024, f);
+        serde_json::to_writer(&mut writer, index)?;
+        // BufWriter::Drop swallows I/O errors — recover explicitly so a truncated
+        // write never gets renamed into place.
+        let f = writer
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("failed to flush index BufWriter: {e}"))?;
+        f.sync_all()?;
+        drop(f);
         fs::rename(&temp_path, self.index_path())?;
         Ok(())
     }
@@ -173,13 +185,26 @@ impl FileStorage {
         Ok(index)
     }
 
-    /// Upsert a single summary into the index and persist it. Falls back to a
-    /// full rebuild if the index is missing or corrupt.
+    /// Upsert a single summary into the index and persist it. If the index is
+    /// missing, seed a fresh cache from this conversation rather than
+    /// re-scanning disk — `list()` rebuilds lazily when it detects a
+    /// count mismatch against on-disk conversation files.
     fn index_upsert(&self, conversation: &Conversation) -> Result<()> {
         let _guard = self.index_lock.lock().unwrap();
         let mut index = match self.read_index() {
             Some(index) => index,
-            None => return self.rebuild_index().map(|_| ()),
+            None => {
+                // Seed a fresh index from the in-memory conversation instead
+                // of falling back to rebuild_index: a rebuild would re-read
+                // the just-written (potentially many-MiB) conversation file
+                // back from disk via read_to_string, blowing save's peak
+                // alloc. list() detects count mismatch against on-disk files
+                // and rebuilds lazily if other conversations are missing
+                // from the cache.
+                let mut fresh = HashMap::new();
+                fresh.insert(conversation.id, ConversationSummary::from(conversation));
+                return self.write_index(&fresh);
+            }
         };
         index.insert(conversation.id, ConversationSummary::from(conversation));
         self.write_index(&index)
@@ -203,10 +228,19 @@ impl ConversationStorage for FileStorage {
         let temp_path = self.storage_dir.join(".tmp.json");
         let final_path = self.conversation_path(conversation.id);
 
-        let json = serde_json::to_string_pretty(conversation)?;
-
-        // Write to temp file first
-        fs::write(&temp_path, json)?;
+        // Stream: 256 KiB fixed buffer recycles forever; grows in ~256 KiB
+        // chunks instead of one ~64 MiB String that exceeds glibc's 32 MiB
+        // mmap threshold and forces a fresh non-main-arena heap per persist.
+        let f = File::create(&temp_path)?;
+        let mut writer = BufWriter::with_capacity(256 * 1024, f);
+        serde_json::to_writer_pretty(&mut writer, conversation)?;
+        // BufWriter::Drop swallows I/O errors — recover explicitly so a
+        // truncated write never gets renamed into place as a "good" file.
+        let f = writer
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("failed to flush conversation BufWriter: {e}"))?;
+        f.sync_all()?;
+        drop(f);
 
         // Atomic rename
         fs::rename(&temp_path, &final_path)?;

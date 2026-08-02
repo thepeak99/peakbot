@@ -129,3 +129,10 @@ This file is the working draft for the next release. When a version is tagged, t
 - **Delegate tool gains a required `parent_task_id` parameter.** Orchestrators must add a todo item before delegating and pass its id — the web UI now renders each sub-agent's todos nested under that parent task in the Todo panel (one level deep). Unparented or old transcripts fall back to the previous flat per-lane grouping. REPL unchanged.
 
 - **Delegate salvage file.** When a `delegate` call completes, the sub-agent's last ≤10 earlier assistant messages are saved to a plain-text file in the temp directory, and a pointer is appended to the delegate result so the orchestrator can `file_read` it. Useful when the sub-agent's final reply is terse but the real report lives in an earlier message. Write failures degrade silently; hookless Ollama sub-agents get no file.
+
+- **Conversation saves now keep memory use constant.** File storage streams
+  conversation JSON and its summary index through a fixed 256 KiB buffer instead
+  of building the entire document in memory before every write. Save errors are
+  surfaced before the atomic rename, existing JSON formatting stays byte-for-byte
+  compatible, and large conversations no longer trigger ever-growing allocator
+  retention during persistence.
