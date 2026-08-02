@@ -441,6 +441,7 @@ Configuring `pipeline:` makes sub-agents **available**, not **on**. Each convers
 
 - You talk to the **orchestrator** — your normal top-level agent (whatever `default_model` resolves to; never listed under `pipeline.agents`).
 - It gets a **`delegate(role, task)`** tool: runs one sub-agent — *(model alias, prompt)* + optional `env:`/`skills:`/`agents_md:` — to completion on a **fresh context**, returns one string. Sequential by construction; no parallel mode. A sub-agent has no memory of prior delegations — everything it needs goes in `task`.
+- On completion, the sub-agent's last ≤10 earlier assistant messages (excluding its final reply) are saved to `<temp>/peakbot/delegate_{role}_{pid}_{counter}.txt`; a one-line pointer is appended to the delegate result string so the orchestrator can `file_read` it. Write failures degrade silently; hookless Ollama sub-agents get no file (empty snapshot).
 
 ### The isolation invariant
 
