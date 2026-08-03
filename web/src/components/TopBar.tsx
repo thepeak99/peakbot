@@ -32,6 +32,7 @@ export function TopBar({
   notifyEnabled,
   notifyPermission,
   onToggleNotify,
+  drawerOpen,
 }: {
   stats: SessionStats | null;
   isRunning: boolean;
@@ -49,12 +50,17 @@ export function TopBar({
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
   onToggleNotify: () => void;
+  drawerOpen: boolean;
 }) {
   return (
     // `backdrop-blur` makes this header a stacking context, which traps the
     // pickers' `z-20` panels inside it — so the header itself must outrank the
     // transcript's `relative` wrapper, or the dropdowns render but can't be clicked.
-    <header className="relative z-30 flex min-h-14 items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur">
+    <header
+      className={`relative z-30 flex min-h-14 items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur transition-[padding] duration-300 ease-out ${
+        drawerOpen ? "lg:pr-[328px]" : ""
+      }`}
+    >
       <div className="flex items-center gap-2">
         <img src="/shifu-mark.png" alt="" className="h-6 w-6 rounded-sm" />
         <span className="font-semibold text-zinc-100">Shifu</span>

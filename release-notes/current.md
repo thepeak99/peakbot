@@ -4,6 +4,10 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Side drawer no longer hides the web UI's bar controls.** Opening a drawer
+  tab now shifts the overlapping top and bottom bar links left in sync with the
+  drawer animation, while narrow phones keep their full picker width.
+
 - **Agents panel: per-delegation drill-down.** Roles are now grouped — one row
   per agent showing its delegation count and total messages, with an expandable
   list of individual delegations beneath. Click a role to watch all its turns,

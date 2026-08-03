@@ -83,6 +83,8 @@ export function App() {
 
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
+  const [drawerTab, setDrawerTab] = useState<string | null>(null);
+  const drawerOpen = drawerTab !== null;
 
   // Sub-agent watch. Two distinct facts, kept apart:
   //  * `pipelineAvailable` — is a pipeline *configured*? (boot-only config).
@@ -233,6 +235,7 @@ export function App() {
         notifyEnabled={notify.enabled}
         notifyPermission={notify.permission}
         onToggleNotify={notify.toggle}
+        drawerOpen={drawerOpen}
       />
 
       {error && (
@@ -321,9 +324,14 @@ export function App() {
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={(id) => switchConvo(id)}
+        drawerOpen={drawerOpen}
       />
 
-      <TabbedDrawer tabs={tabs} />
+      <TabbedDrawer
+        tabs={tabs}
+        active={drawerTab}
+        onActiveChange={setDrawerTab}
+      />
     </div>
   );
 }
