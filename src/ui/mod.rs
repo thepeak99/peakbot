@@ -19,6 +19,11 @@ pub mod ui_trait;
 // Shared duplex wire protocol (stdio + web Views).
 pub mod wire;
 
+// Per-connection outbound plumbing (bounded FIFO for ordered frames + a
+// coalescing watch slot for `state`) — design §2.2. Production body is
+// added by the implementer of task 3; the test module is the TDD spec.
+mod outbound;
+
 // REPL UI
 pub mod repl;
 

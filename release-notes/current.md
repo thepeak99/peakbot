@@ -122,3 +122,20 @@ This file is the working draft for the next release. When a version is tagged, t
   surfaced before the atomic rename, existing JSON formatting stays byte-for-byte
   compatible, and large conversations no longer trigger ever-growing allocator
   retention during persistence.
+
+- **WebSocket and stdio outbound paths are now bounded.** A half-open peer
+  (laptop sleeps, no FIN/RST) used to let the per-socket outbound channel
+  accumulate undelivered `state` snapshots without limit — the bug took a
+  production machine to ~17 GB RSS in two hours. The outbound plumbing is
+  now split by delivery contract (`src/ui/outbound.rs`): a bounded FIFO of
+  32 for ordered control frames, and a 1-deep coalescing slot for `state`
+  snapshots, so per-socket memory is bounded regardless of peer behaviour.
+  The web writer gains a 120 s write timeout (tear-down, never retry — a
+  timed-out `send` may have written a partial frame into the TLS stream)
+  and a 30 s keepalive ping so the timeout can observe a dead idle peer.
+  The forwarder's `select!` now also arms on writer completion so a
+  torn-down socket actually detaches from the session registry instead
+  of pinning `attached > 0` against the idle-TTL reaper. The stdio
+  transport gets the same shared channel with no timers (NDJSON has no
+  half-open pipe; a slow consumer is legitimate backpressure). The
+  `state` frame on the wire is byte-identical — no frontend change.

@@ -8,10 +8,29 @@
 //!
 //! `WebUi::run` blocks on the axum server's graceful-shutdown future
 //! (Ctrl+C). Each WebSocket connection builds a session via
-//! [`crate::create_session`] from the shared [`crate::SessionDeps`]; the
-//! connection handler is `StdioUi`'s three-task shape (writer sink, state
-//! broadcast, inbound reader) over WS frames instead of stdio lines,
-//! reusing the same [`crate::ui::wire`] protocol.
+//! [`crate::create_session`] from the shared [`crate::SessionDeps`].
+//!
+//! ## Concurrency per socket
+//!
+//! Each connection has four concurrent jobs, with strict ownership to keep
+//! frames whole and the memory bound a property of the type:
+//!
+//! | part                | owns                                                                                              |
+//! |---------------------|---------------------------------------------------------------------------------------------------|
+//! | writer task         | the WS sink (`writer_loop`) — the *only* thing that writes frames                                  |
+//! | reader task         | the WS stream — parses inbound frames into `UiAction`s / off-band replies                          |
+//! | state forwarder     | subscribes to `StateManager`, pushes snapshots into the coalescing slot (`forward_state`)         |
+//! | shared channel      | bounded FIFO of 32 for ordered control frames + 1-deep coalescing `watch` slot for `state` (`src/ui/outbound.rs`) |
+//!
+//! The writer has a 120 s `WRITE_TIMEOUT` (tear-down, never retry — a
+//! timed-out `send` may have written a partial frame into the TLS stream)
+//! and a 30 s keepalive `PING_INTERVAL` so the timeout can observe a dead
+//! idle peer. The forwarder's `select!` arms on writer completion too —
+//! that's the bit the inline version was missing, and is what keeps a
+//! torn-down socket from pinning `attached > 0` against the idle-TTL reaper.
+//!
+//! On close the session **detaches** — it survives for other sockets and
+//! for reconnect, and only expires via the reaper or a kill.
 //!
 //! ## Static handler — why hand-rolled
 //!
@@ -33,7 +52,9 @@
 //! so the frontend needs no token-threading code.
 
 use crate::session::SessionDeps;
+use crate::ui::AppState;
 use crate::ui::Ui;
+use crate::ui::outbound::{OutboundRx, OutboundTx, outbound_channel};
 use crate::ui::ui_trait::builtin_commands;
 use crate::ui::wire::{
     InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot, build_dir_listing,
@@ -50,13 +71,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use futures::{SinkExt, StreamExt};
+use bytes::Bytes;
+use futures::{Sink, SinkExt, StreamExt};
 use registry::SessionRegistry;
 use rust_embed::RustEmbed;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 mod registry;
@@ -66,6 +89,21 @@ pub mod tls;
 /// Port the web UI listens on. Fixed for now (`--port` flag is Phase 4).
 /// See `webui.md` §3 decision 1.
 pub const DEFAULT_WEB_ADDR: &str = "127.0.0.1:7823";
+
+/// Hard constant. The writer reaper for any single frame: a stalled
+/// `sink.send` past this is treated as a half-open peer (kernel/TLS write
+/// buffers full, no FIN/RST) and the connection is torn down. Generous
+/// because per-socket memory is already bounded by the coalescing slot
+/// (`src/ui/outbound.rs`), so this is a reaper, not a memory limit — it
+/// must comfortably exceed the time to push one worst-case snapshot
+/// (~8 MiB, see #250) over a slow mobile link. See design §6 risk 1.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Keepalive cadence. The writer always has *something* to write so the
+/// `WRITE_TIMEOUT` and the kernel's retransmission give-up can observe a
+/// dead idle peer; we do not track pongs (browsers auto-pong; the reader
+/// already ignores ping/pong, `:549-550`).
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 fn windowed_from(ssh: bool, display: bool, wayland: bool, os: &str) -> bool {
     if ssh {
@@ -448,6 +486,88 @@ async fn commands_handler() -> Response {
     }
 }
 
+/// Sole owner of the WS sink. Generic over the sink so tests can inject a
+/// stalled/recording/gated sink — a half-open peer is otherwise untestable.
+/// Serialises every frame as JSON text, wraps with `WRITE_TIMEOUT` so a
+/// stalled `send` tears the connection down (a timed-out send may have
+/// written a partial frame into the TLS stream, so we never retry), and
+/// interleaves `PING_INTERVAL` keepalives so the timeout can observe a
+/// dead *idle* peer (see design §2.4).
+pub(crate) async fn writer_loop<S>(mut sink: S, mut rx: OutboundRx)
+where
+    S: Sink<Message> + Unpin,
+{
+    let mut ping =
+        tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    // If we're slow on a frame, do *not* back-to-back ping on recovery —
+    // an unconditional 2-byte ping is cheaper than tracking the state.
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        let frame = tokio::select! {
+            msg = rx.next() => match msg {
+                Some(m) => match serde_json::to_string(&m) {
+                    Ok(s) => Message::Text(s.into()),
+                    Err(e) => {
+                        tracing::error!("failed to serialise outbound message: {e:?}");
+                        continue;
+                    }
+                },
+                None => break, // all producers gone
+            },
+            _ = ping.tick() => Message::Ping(Bytes::new()),
+        };
+        // A timed-out `send` may have written a partial frame into the TLS
+        // stream, so the sink is unusable afterwards: NEVER retry, always
+        // tear down.
+        match tokio::time::timeout(WRITE_TIMEOUT, sink.send(frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => break, // socket closed
+            Err(_) => {
+                tracing::warn!("closing socket: write stalled >{WRITE_TIMEOUT:?} (half-open peer)");
+                break;
+            }
+        }
+    }
+    let _ = sink.close().await;
+}
+
+/// Which task ended the forward loop. Encoded as a type so teardown cannot
+/// re-await a `JoinHandle` that already completed (which panics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardExit {
+    ReaderGone,
+    WriterGone,
+    StateEnded,
+}
+
+/// Pump `StateManager` snapshots into the connection's coalescing slot
+/// until any leg of the connection dies. The `writer` arm is what turns
+/// "the writer noticed the peer is dead" into "the socket detaches from
+/// the registry" — without it a half-open socket would keep
+/// `AttachState.attached > 0` forever and block the idle-TTL reaper.
+pub(crate) async fn forward_state(
+    state_rx: &mut mpsc::Receiver<AppState>,
+    out: &OutboundTx,
+    reader: &mut tokio::task::JoinHandle<()>,
+    writer: &mut tokio::task::JoinHandle<()>,
+) -> ForwardExit {
+    loop {
+        tokio::select! {
+            maybe_state = state_rx.recv() => {
+                let Some(app_state) = maybe_state else { return ForwardExit::StateEnded };
+                let exit = app_state.exit_requested;
+                if out.publish_state(Arc::new(app_state)).is_err() {
+                    return ForwardExit::WriterGone;
+                }
+                if exit { return ForwardExit::StateEnded }
+            }
+            _ = &mut *reader => return ForwardExit::ReaderGone,
+            _ = &mut *writer => return ForwardExit::WriterGone,
+        }
+    }
+}
+
 /// Drive one browser connection. The first frame must be `Attach`, which
 /// binds the socket to a session in the registry (sharing an active one,
 /// resuming a persisted one, or minting fresh). The socket then runs the
@@ -455,26 +575,14 @@ async fn commands_handler() -> Response {
 /// over WS frames. On close it **detaches** — the session survives for other
 /// sockets and for reconnect, and only expires via the reaper or a kill.
 async fn handle_socket(socket: WebSocket, state: WsState) {
-    let (mut ws_sink, mut ws_stream) = socket.split();
+    let (ws_sink, mut ws_stream) = socket.split();
 
-    // Sole owner of the WS sink — every outbound frame funnels through
-    // this task so frames stay whole (mirrors StdioUi's writer task).
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboundMessage>();
-    let writer_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            let txt = match serde_json::to_string(&msg) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("failed to serialise outbound message: {e:?}");
-                    continue;
-                }
-            };
-            if ws_sink.send(Message::Text(txt.into())).await.is_err() {
-                break; // socket closed
-            }
-        }
-        let _ = ws_sink.close().await;
-    });
+    // Bounded FIFO (32) for ordered frames + a 1-deep coalescing `watch`
+    // slot for `state` snapshots. Per-socket memory is ~3 payload-sized
+    // allocations regardless of peer behaviour — see `src/ui/outbound.rs`
+    // for the two-class delivery contract.
+    let (out_tx, out_rx) = outbound_channel();
+    let mut writer_task = tokio::spawn(writer_loop(ws_sink, out_rx));
 
     // Read the handshake frame. The client always sends `Attach` first; a
     // non-attach first frame attaches fresh and is then processed normally so
@@ -565,43 +673,25 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         }
     });
 
-    // State broadcast: push every AppState snapshot to the client until the
-    // session requests exit, the writer drops, or the client disconnects.
-    // Selecting on `reader_task` is what makes a client-initiated close
-    // *prompt*: without it this loop parks on `state_rx.recv()` and only
-    // notices the gone socket on the next failed `out_tx.send`, so an idle
-    // session's close handshake would hang until a TCP timeout (~10s) — which
-    // stalls every convo-switch reconnect and tab-close teardown. When the
-    // reader ends (Close frame or stream end) we break at once, dropping
-    // `out_tx` so the writer closes the sink and the handshake completes in ms.
+    // State broadcast: push every AppState snapshot to the client's
+    // coalescing slot until any leg of the connection dies. The
+    // `writer_task` arm is the missing one the inline version never had —
+    // without it, a writer torn down by `WRITE_TIMEOUT` would never wake
+    // this loop and the socket would leak `attached > 0` in the registry,
+    // blocking the idle-TTL reaper.
     let mut state_rx = registered.session.state_manager.subscribe();
-    loop {
-        tokio::select! {
-            maybe_state = state_rx.recv() => {
-                let Some(app_state) = maybe_state else { break };
-                let exit = app_state.exit_requested;
-                if out_tx
-                    .send(OutboundMessage::State {
-                        state: Box::new(app_state),
-                    })
-                    .is_err()
-                {
-                    break; // writer/socket gone
-                }
-                if exit {
-                    break;
-                }
-            }
-            _ = &mut reader_task => break, // client disconnected
-        }
-    }
+    let _exit = forward_state(&mut state_rx, &out_tx, &mut reader_task, &mut writer_task).await;
 
-    // Teardown: stop the reader, drain the writer, then detach. The session
-    // stays alive in the registry for other sockets / reconnect; it only ends
-    // via the reaper (idle TTL) or an explicit kill.
+    // Teardown: stop the reader, drain the writer exactly once (the
+    // forwarder already observed WriterGone if the writer died first;
+    // awaiting again panics). The session stays alive in the registry for
+    // other sockets / reconnect; it only ends via the reaper (idle TTL) or
+    // an explicit kill.
     reader_task.abort();
     drop(out_tx);
-    let _ = writer_task.await;
+    if !matches!(_exit, ForwardExit::WriterGone) {
+        let _ = writer_task.await;
+    }
     state.registry.detach(session_key);
 }
 
@@ -626,7 +716,7 @@ async fn read_first_frame(
 fn dispatch_inbound(
     line: &str,
     action_sender: &UnboundedSender<UiAction>,
-    out_tx: &UnboundedSender<OutboundMessage>,
+    out_tx: &OutboundTx,
     state_manager: &StateManager,
     registry: &SessionRegistry,
 ) -> bool {
@@ -951,5 +1041,564 @@ mod tests {
             Some("xyz")
         );
         assert_eq!(token_from_cookie(&req("other=1")), None);
+    }
+
+    // --- T7 / T9 / T13: WS outbound backpressure (design §5) ---
+    //
+    // These tests reference the planned `outbound` module API
+    // (`OutboundTx`, `OutboundRx`, `outbound_channel`, `Disconnected`) and
+    // the planned `writer_loop` / `forward_state` / `ForwardExit` items in
+    // this module. None of them exist yet — that absence is the RED
+    // baseline the design §5 documents. The bodies express the contract;
+    // the implementer fills in the production code to make them pass.
+
+    use crate::ui::app_state::{AppState, ChatMessage};
+    use crate::ui::outbound::{OutboundRx, OutboundTx, outbound_channel};
+    use crate::ui::wire::ModelInfo;
+    use futures::Sink;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::task::{Context, Poll};
+    use tokio::sync::Semaphore;
+
+    /// A `Sink<Message>` whose `poll_ready` and `poll_flush` return
+    /// `Poll::Pending` forever. Models a half-open peer (kernel/TLS write
+    /// buffers full, no FIN/RST) so a writer parked inside `send` is
+    /// pinned there indefinitely — the production-incident condition.
+    struct PendingSink;
+
+    impl Sink<Message> for PendingSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A `Sink<Message>` that records every frame it accepts and blocks
+    /// each `poll_flush` until the test releases one permit on the
+    /// semaphore. Lets the test gate exactly how many writes complete
+    /// before the writer sees all producers gone.
+    ///
+    /// Implementation note: `poll_flush` stores its `Waker` in a shared
+    /// slot so the test can wake the parked writer after `add_permits`.
+    /// A `Semaphore`'s `try_acquire` does not register a waker on its
+    /// own — only `acquire().await` does — so we need the explicit bridge
+    /// to unblock a stalled flush.
+    struct GatedSink {
+        recorded: Arc<StdMutex<Vec<Message>>>,
+        permits: Arc<Semaphore>,
+        waker_slot: Arc<StdMutex<Option<std::task::Waker>>>,
+    }
+
+    impl Sink<Message> for GatedSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.recorded
+                .lock()
+                .expect("gated-sink mutex poisoned")
+                .push(item);
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            // Store the waker so the test can wake us after adding permits.
+            *self
+                .waker_slot
+                .lock()
+                .expect("gated-sink waker mutex poisoned") = Some(cx.waker().clone());
+            match self.permits.try_acquire() {
+                Ok(_p) => Poll::Ready(Ok(())),
+                Err(_) => Poll::Pending,
+            }
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// T7 — incident regression. The design's `writer_loop` is generic
+    /// over `S: Sink<Message> + Unpin`; we inject `PendingSink` to
+    /// reproduce the half-open-peer condition without actually opening a
+    /// socket. Live snapshot count must stay bounded and must not grow
+    /// with the number of publishes — the invariance is the assertion.
+    // The sentinel `usize::MAX` initialiser on `count_at_50`/`count_at_500`
+    // is intentional (they're overwritten before being read) but trips the
+    // unused-assignments lint; scope the allow to this test only.
+    #[allow(unused_assignments)]
+    #[tokio::test]
+    async fn stalled_sink_keeps_exactly_one_snapshot_alive() {
+        let (tx, rx): (OutboundTx, OutboundRx) = outbound_channel();
+        let writer = tokio::spawn(writer_loop(PendingSink, rx));
+
+        let mut weaks: Vec<std::sync::Weak<AppState>> = Vec::with_capacity(500);
+        let mut count_at_50: usize = usize::MAX;
+        let mut count_at_500: usize = usize::MAX;
+
+        for i in 0..500 {
+            let mut state = AppState::new();
+            state.chat.messages = (0..(i + 1))
+                .map(|n| ChatMessage::user(format!("m{n}")))
+                .collect();
+            let arc = Arc::new(state);
+            weaks.push(Arc::downgrade(&arc));
+            tx.publish_state(arc)
+                .expect("producer must not be disconnected while tx is alive");
+            // Give the writer task a chance to enter `sink.send(...).await`
+            // and park on the first snapshot — without this yield the
+            // writer never runs and the slot accumulates.
+            tokio::task::yield_now().await;
+
+            if i == 49 {
+                count_at_50 = weaks.iter().filter(|w| w.upgrade().is_some()).count();
+            }
+        }
+
+        count_at_500 = weaks.iter().filter(|w| w.upgrade().is_some()).count();
+
+        // Drop the producer so the writer eventually exits; otherwise the
+        // join handle leaks across the test boundary.
+        drop(tx);
+        let _ = writer.await;
+
+        assert!(
+            count_at_50 <= 2,
+            "live snapshots after 50 publishes must be ≤ 2 (slot + at most one \
+             in-flight); was {count_at_50}"
+        );
+        assert!(
+            count_at_500 <= 2,
+            "live snapshots after 500 publishes must be ≤ 2; was {count_at_500}"
+        );
+        // The invariance: a merely-slower leak would still pass the ≤2
+        // bound at 50. The bug is that the count GROWS with publishes;
+        // locking the equality is what catches the regression.
+        assert_eq!(
+            count_at_500, count_at_50,
+            "live snapshot count must not grow between 50 and 500 publishes; \
+             was {count_at_50} → {count_at_500}"
+        );
+    }
+
+    /// T9 — locks the two-class delivery contract. Ordered control frames
+    /// (`attached`/`ready`/`models_available`) must be delivered in send
+    /// order, exactly once, never coalesced; `state` frames may be
+    /// coalesced (newest wins) but the **last** one written must still be
+    /// the newest published. A regression that drops ordered frames, or
+    /// that reorders a state frame, would corrupt the SPA handshake.
+    #[tokio::test]
+    async fn slow_sink_coalesces_state_but_never_drops_ordered_frames() {
+        let recorded: Arc<StdMutex<Vec<Message>>> = Arc::new(StdMutex::new(Vec::new()));
+        let permits = Arc::new(Semaphore::new(0));
+        let waker_slot: Arc<StdMutex<Option<std::task::Waker>>> = Arc::new(StdMutex::new(None));
+        let sink = GatedSink {
+            recorded: recorded.clone(),
+            permits: permits.clone(),
+            waker_slot: waker_slot.clone(),
+        };
+        let (tx, rx): (OutboundTx, OutboundRx) = outbound_channel();
+        let writer = tokio::spawn(writer_loop(sink, rx));
+
+        // Interleave 3 ordered frames with 50 state publishes — the
+        // ordered trio is what the production code sends as the handshake.
+        tx.send(OutboundMessage::Attached {
+            convo: "c-1".to_string(),
+        })
+        .expect("ordered send must succeed before producer is dropped");
+        for i in 0..50 {
+            let mut state = AppState::new();
+            state.chat.messages = (0..(i + 1))
+                .map(|n| ChatMessage::user(format!("m{n}")))
+                .collect();
+            tx.publish_state(Arc::new(state))
+                .expect("publish must succeed before producer is dropped");
+        }
+        tx.send(OutboundMessage::Ready)
+            .expect("ordered send must succeed");
+        tx.send(OutboundMessage::ModelsAvailable {
+            active: "sonnet".to_string(),
+            models: vec![ModelInfo {
+                alias: "sonnet".to_string(),
+                provider_name: "openrouter".to_string(),
+                model_name: "anthropic/claude-sonnet-4.6".to_string(),
+                context_size: 200_000,
+            }],
+        })
+        .expect("ordered send must succeed");
+
+        // Release enough permits to drain every queued frame (3 ordered
+        // + ≤5 coalesced states = 8 max). Then wake the writer (it is
+        // parked in `poll_flush` because permits started at 0).
+        permits.add_permits(100);
+        if let Some(w) = waker_slot
+            .lock()
+            .expect("gated-sink waker mutex poisoned")
+            .take()
+        {
+            w.wake();
+        }
+
+        // Drop the producer so the writer sees "all producers gone" and
+        // exits; then await the task so the recorded vec is final.
+        drop(tx);
+        let _ = writer.await;
+
+        let frames = recorded.lock().expect("gated-sink mutex poisoned").clone();
+        let mut ordered_kinds: Vec<&'static str> = Vec::new();
+        let mut state_message_lens: Vec<usize> = Vec::new();
+        for m in &frames {
+            let text = match m {
+                Message::Text(t) => t.clone(),
+                other => panic!("unexpected non-text frame in GatedSink: {other:?}"),
+            };
+            match serde_json::from_str::<OutboundMessage>(&text)
+                .expect("every recorded frame must deserialise as OutboundMessage")
+            {
+                OutboundMessage::Attached { .. } => ordered_kinds.push("attached"),
+                OutboundMessage::Ready => ordered_kinds.push("ready"),
+                OutboundMessage::ModelsAvailable { .. } => ordered_kinds.push("models_available"),
+                OutboundMessage::State { state } => {
+                    state_message_lens.push(state.chat.messages.len());
+                }
+                other => panic!("unexpected variant in GatedSink: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            ordered_kinds,
+            vec!["attached", "ready", "models_available"],
+            "ordered frames must be delivered in send order, each exactly once; got {ordered_kinds:?}"
+        );
+        assert!(
+            state_message_lens.len() <= 5,
+            "state frames must be coalesced to ≤ 5 (50 publishes → at most 5 writes); \
+             got {} writes with message-lens {state_message_lens:?}",
+            state_message_lens.len()
+        );
+        assert!(
+            state_message_lens.contains(&50),
+            "the last coalesced state frame must be the newest (snapshot #50, \
+             chat.messages.len() == 50); got lens {state_message_lens:?}"
+        );
+    }
+
+    /// T13 — the literal missing `select!` arm. The current inline
+    /// forwarder at `handle_socket` selects on `state_rx` and
+    /// `reader_task` but **not** on `writer_task`, so a writer that has
+    /// already returned never wakes the forwarder. The fix extracts
+    /// `forward_state` with a third arm; this test is its contract.
+    ///
+    /// RED against the current code in two stages: first the function
+    /// does not exist (compile error), then — once extracted without the
+    /// arm — the call hangs past the 1 s timeout. Either way, the
+    /// assertion is the one that encodes the bug.
+    #[tokio::test]
+    async fn forwarder_exits_when_writer_dies() {
+        // state_rx that never yields — controls out the StateEnded arm.
+        let (_state_tx, mut state_rx) = mpsc::channel::<AppState>(1);
+
+        // reader that never completes — controls out the ReaderGone arm.
+        let mut reader: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+
+        // writer that has already finished — the arm under test.
+        let mut writer: tokio::task::JoinHandle<()> = tokio::spawn(async {});
+
+        // The forwarder needs an `OutboundTx`; we never use it because the
+        // writer arm must fire first, but the function signature requires
+        // one. Disconnect does not matter to the assertion.
+        let (out, _rx): (OutboundTx, OutboundRx) = outbound_channel();
+        let _ = _rx;
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            forward_state(&mut state_rx, &out, &mut reader, &mut writer),
+        )
+        .await
+        .expect("forwarder must exit promptly when the writer task has already returned");
+
+        assert!(
+            matches!(exit, ForwardExit::WriterGone),
+            "forwarder must return WriterGone when the writer task completes first; got {exit:?}"
+        );
+    }
+
+    /// T14 — mirror of T13: a reader that returns must surface as
+    /// `ReaderGone`. Guards the existing prompt-close path the inline
+    /// forwarder added deliberately (the comment block at `handle_socket`).
+    #[tokio::test]
+    async fn forwarder_exits_when_reader_ends() {
+        let (_state_tx, mut state_rx) = mpsc::channel::<AppState>(1);
+
+        // reader that has already finished — the arm under test.
+        let mut reader: tokio::task::JoinHandle<()> = tokio::spawn(async {});
+
+        // writer that never completes — controls out the WriterGone arm.
+        let mut writer: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+
+        let (out, _rx): (OutboundTx, OutboundRx) = outbound_channel();
+        let _ = _rx;
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            forward_state(&mut state_rx, &out, &mut reader, &mut writer),
+        )
+        .await
+        .expect("forwarder must exit promptly when the reader task has already returned");
+
+        assert!(
+            matches!(exit, ForwardExit::ReaderGone),
+            "forwarder must return ReaderGone when the reader task completes first; got {exit:?}"
+        );
+    }
+
+    /// T8 — a stalled `sink.send` cannot pin the writer forever: the
+    /// `WRITE_TIMEOUT` reaper must close it (and the connection). The
+    /// paused-time advance fires the timeout deterministically.
+    ///
+    /// Note: `tokio::time::advance` only yields *once* (via its internal
+    /// `yield_now`). We use that one yield to drive the writer into
+    /// `sink.send`, then a second advance fires the timeout that was
+    /// started at the sink. With a single advance the timeout would be
+    /// created *after* the time-jump and never fire.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_sink_is_torn_down_after_write_timeout() {
+        let (tx, rx) = outbound_channel();
+        let writer = tokio::spawn(writer_loop(PendingSink, rx));
+
+        tx.publish_state(Arc::new(AppState::new()))
+            .expect("publish while rx is alive");
+
+        // First advance — its internal yield drives the writer into
+        // `sink.send`, where it creates the Sleep that backs
+        // `WRITE_TIMEOUT`. The advance itself doesn't fire that Sleep
+        // because the Sleep didn't exist when the clock was bumped.
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        // Now the writer is parked in `timeout(WRITE_TIMEOUT, sink.send(...))`.
+        // Advance past WRITE_TIMEOUT so the Sleep fires.
+        tokio::time::advance(WRITE_TIMEOUT).await;
+
+        // Once the timeout reaper tears down, the writer task must complete
+        // promptly (the timeout resolution itself causes the break/close).
+        tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("writer must exit within 1s after the timeout reaper fires")
+            .expect("writer task must not panic");
+
+        // And producers see `Disconnected` afterwards.
+        assert!(
+            tx.publish_state(Arc::new(AppState::new())).is_err(),
+            "publish_state must return Err after the writer tore down"
+        );
+    }
+
+    /// T10 — an idle socket must still generate traffic (pings) so the
+    /// write timeout and the kernel's retransmission give-up can observe
+    /// a half-open peer even when no app data flows.
+    ///
+    /// `MissedTickBehavior::Delay` reschedules each tick to `now + period`
+    /// after the previous one — so one big advance doesn't burst-deliver
+    /// three pings. We do many small advances and yield between them so
+    /// the runtime has a chance to poll the writer and emit each ping in
+    /// turn. RecordingSink returns `Ready` everywhere, so each ping writes
+    /// immediately.
+    #[tokio::test(start_paused = true)]
+    async fn idle_socket_sends_keepalive_pings() {
+        let recorded: Arc<StdMutex<Vec<Message>>> = Arc::new(StdMutex::new(Vec::new()));
+        let close_count: Arc<StdMutex<usize>> = Arc::new(StdMutex::new(0));
+        let sink = RecordingSink {
+            recorded: recorded.clone(),
+            close_count: close_count.clone(),
+        };
+        let (tx, rx) = outbound_channel();
+        let writer = tokio::spawn(writer_loop(sink, rx));
+
+        // Drive the writer through enough time for ≥ 3 pings under
+        // MissedTickBehavior::Delay. Each small `advance` yields once,
+        // which gives the runtime a chance to poll the writer and let it
+        // emit the next ping.
+        for _ in 0..(PING_INTERVAL.as_secs() as usize * 4) {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            // The yields inside `advance` only drive *one* ready task per
+            // call; an extra yield lets the writer re-enter `select!`
+            // after emitting a ping.
+            tokio::task::yield_now().await;
+        }
+
+        // Drop the producer so the writer exits cleanly, then await it.
+        drop(tx);
+        let _ = writer.await;
+
+        let frames = recorded
+            .lock()
+            .expect("recording-sink mutex poisoned")
+            .clone();
+        let pings = frames
+            .iter()
+            .filter(|m| matches!(m, Message::Ping(_)))
+            .count();
+        let texts = frames
+            .iter()
+            .filter(|m| matches!(m, Message::Text(_)))
+            .count();
+        assert!(
+            pings >= 3,
+            "writer must emit ≥ 3 ping frames during idleness; got {pings}"
+        );
+        assert_eq!(texts, 0, "idle writer must not emit text frames");
+    }
+
+    /// T11 — healthy sink: the handshake trio is delivered in send order
+    /// and the sink is closed exactly once on producer drop.
+    #[tokio::test]
+    async fn healthy_sink_writes_every_ordered_frame_then_closes() {
+        let recorded: Arc<StdMutex<Vec<Message>>> = Arc::new(StdMutex::new(Vec::new()));
+        let close_count: Arc<StdMutex<usize>> = Arc::new(StdMutex::new(0));
+        let sink = RecordingSink {
+            recorded: recorded.clone(),
+            close_count: close_count.clone(),
+        };
+        let (tx, rx) = outbound_channel();
+        let writer = tokio::spawn(writer_loop(sink, rx));
+
+        tx.send(OutboundMessage::Attached {
+            convo: "c-1".to_string(),
+        })
+        .unwrap();
+        tx.send(OutboundMessage::Ready).unwrap();
+        tx.send(OutboundMessage::ModelsAvailable {
+            active: "sonnet".to_string(),
+            models: vec![ModelInfo {
+                alias: "sonnet".to_string(),
+                provider_name: "openrouter".to_string(),
+                model_name: "anthropic/claude-sonnet-4.6".to_string(),
+                context_size: 200_000,
+            }],
+        })
+        .unwrap();
+
+        drop(tx);
+        let _ = writer.await;
+
+        let frames = recorded
+            .lock()
+            .expect("recording-sink mutex poisoned")
+            .clone();
+        let texts: Vec<String> = frames
+            .iter()
+            .filter_map(|m| match m {
+                Message::Text(t) => Some(t.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts.len(),
+            3,
+            "exactly the three handshake frames; got {texts:?}"
+        );
+        let kinds: Vec<&'static str> = texts
+            .iter()
+            .map(|s| {
+                serde_json::from_str::<OutboundMessage>(s)
+                    .map(|m| match m {
+                        OutboundMessage::Attached { .. } => "attached",
+                        OutboundMessage::Ready => "ready",
+                        OutboundMessage::ModelsAvailable { .. } => "models_available",
+                        other => panic!("unexpected variant: {other:?}"),
+                    })
+                    .unwrap_or_else(|e| panic!("unparseable frame: {e}: {s}"))
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["attached", "ready", "models_available"],
+            "handshake trio must be delivered in send order"
+        );
+        assert_eq!(
+            *close_count.lock().expect("recording-sink mutex poisoned"),
+            1,
+            "sink.close() must be called exactly once on producer drop"
+        );
+    }
+
+    /// A `Sink<Message>` that records every frame and counts `close()`
+    /// invocations. Used by T10/T11 to assert delivery ordering and the
+    /// one-and-only-one close on producer drop.
+    struct RecordingSink {
+        recorded: Arc<StdMutex<Vec<Message>>>,
+        close_count: Arc<StdMutex<usize>>,
+    }
+
+    impl Sink<Message> for RecordingSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.recorded
+                .lock()
+                .expect("recording-sink mutex poisoned")
+                .push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            *self
+                .close_count
+                .lock()
+                .expect("recording-sink mutex poisoned") += 1;
+            Poll::Ready(Ok(()))
+        }
     }
 }

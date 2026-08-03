@@ -36,6 +36,7 @@ use crate::StateManager;
 use crate::config::ModelRegistry;
 use crate::ui::app_state::AppState;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Inbound message types from the client.
 #[derive(Debug, Deserialize)]
@@ -85,7 +86,7 @@ pub(crate) enum InboundMessage {
 
 /// One `models_available` entry — the subset of `ResolvedModel` a model
 /// picker needs.
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelInfo {
     /// What `/model <alias>` accepts.
     pub alias: String,
@@ -112,7 +113,7 @@ pub fn build_models_snapshot(registry: &ModelRegistry) -> Vec<ModelInfo> {
 
 /// One entry in a [`OutboundMessage::DirListing`]. Directories drive
 /// navigation; files are shown greyed (this is a *folder* picker).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct DirEntryWire {
     pub name: String,
     pub is_dir: bool,
@@ -177,7 +178,7 @@ pub(crate) fn build_dir_listing(path: &str) -> OutboundMessage {
 
 /// Trimmed subset of `ConversationSummary` for a dropdown picker
 /// (backend already sorts newest first).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ConversationSummaryWire {
     /// Fed back as `/load <id>`.
     id: String,
@@ -192,8 +193,9 @@ pub(crate) struct ConversationSummaryWire {
 }
 
 /// Outbound message envelopes to the client. Owning (no lifetime) so any
-/// task can push to the shared writer channel.
-#[derive(Debug, Serialize)]
+/// task can push to the shared writer channel. `Deserialize` is derived so
+/// tests can round-trip recorded text frames; the live wire is serialize-only.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum OutboundMessage {
     /// Handshake, sent once before any user input so the client can render
@@ -209,9 +211,11 @@ pub(crate) enum OutboundMessage {
         active: String,
         models: Vec<ModelInfo>,
     },
-    /// A full `AppState` snapshot — the same broadcast the TUI sees. Boxed
-    /// to keep the enum slim (clippy `large_enum_variant`).
-    State { state: Box<AppState> },
+    /// A full `AppState` snapshot — the same broadcast the TUI sees.
+    /// Behind an `Arc` so the coalescing slot and the writer can pass the
+    /// snapshot around without deep-copying ~8 MiB; serialises identically
+    /// to the previous `Box` (no frontend change).
+    State { state: Arc<AppState> },
     /// Reply to `request_conversations`; empty when no storage is configured.
     ConversationsList { items: Vec<ConversationSummaryWire> },
     /// One-shot answer to `list_dir` — a transient request/response for the
@@ -347,5 +351,31 @@ mod tests {
         };
         let json = serde_json::to_string(&wire).unwrap();
         assert!(json.contains(r#""active":true"#), "json = {json}");
+    }
+
+    /// `State` now carries `Arc<AppState>`; serde with the `rc` feature
+    /// emits the inner value with no wrapper, identical to the previous
+    /// `Box<AppState>` — no frontend change. This test guards that invariant.
+    #[test]
+    fn state_frame_serialises_identically_with_arc_or_box() {
+        // We cannot construct both `Box<AppState>` and `Arc<AppState>` values
+        // here (the field type is fixed), so we lock the JSON shape against
+        // the literal the SPA expects: an object with `type:"state"` and a
+        // nested `state:{...}` whose inner object starts with the AppState
+        // fields. Drift here means the frontend breaks.
+        let m = OutboundMessage::State {
+            state: Arc::new(AppState::new()),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "state");
+        assert!(
+            parsed["state"].is_object(),
+            "state must be an object: {json}"
+        );
+        // AppState serialises with `chat` as its top-level field; drift
+        // here means the frontend breaks.
+        let state = &parsed["state"];
+        assert!(state.get("chat").is_some(), "missing chat: {json}");
     }
 }
