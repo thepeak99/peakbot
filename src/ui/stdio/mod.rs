@@ -54,6 +54,7 @@
 //! onto an MPSC; a single writer task drains it and serialises to
 //! stdout. NDJSON line atomicity is preserved by construction.
 
+use crate::ui::outbound::{OutboundTx, outbound_channel};
 use crate::ui::wire::{
     InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot, build_dir_listing,
 };
@@ -61,7 +62,7 @@ use crate::{StateManager, Ui, UiAction};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// `Ui` implementation that pumps `AppState` broadcasts to stdout as
 /// NDJSON and reads `UiAction` requests from stdin as NDJSON.
@@ -97,12 +98,14 @@ impl Ui for StdioUi {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+        let (out_tx, mut out_rx) = outbound_channel();
 
         // Sole owner of stdout — keeps NDJSON lines atomic since no other
-        // task ever writes there.
+        // task ever writes there. No write timeout (NDJSON has no half-open
+        // pipe; a slow consumer is legitimate backpressure, bounded by the
+        // coalescing slot — see `src/ui/outbound.rs` §2.6).
         let writer_task = tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
+            while let Some(msg) = out_rx.next().await {
                 let line = match serde_json::to_string(&msg) {
                     Ok(s) => s,
                     Err(e) => {
@@ -141,12 +144,7 @@ impl Ui for StdioUi {
         let mut state_rx = self.state_manager.subscribe();
         while let Some(state) = state_rx.recv().await {
             let exit = state.exit_requested;
-            if out_tx
-                .send(OutboundMessage::State {
-                    state: Box::new(state),
-                })
-                .is_err()
-            {
+            if out_tx.publish_state(Arc::new(state)).is_err() {
                 // Writer dropped its receiver.
                 break;
             }
@@ -174,7 +172,7 @@ impl Ui for StdioUi {
 /// pull-style replies bypass stdout.
 async fn run_stdin_loop(
     action_sender: UnboundedSender<UiAction>,
-    out_tx: mpsc::UnboundedSender<OutboundMessage>,
+    out_tx: OutboundTx,
     state_manager: Arc<StateManager>,
 ) -> Result<()> {
     let stdin = tokio::io::stdin();
