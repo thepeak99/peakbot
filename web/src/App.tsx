@@ -235,7 +235,6 @@ export function App() {
         notifyEnabled={notify.enabled}
         notifyPermission={notify.permission}
         onToggleNotify={notify.toggle}
-        drawerOpen={drawerOpen}
       />
 
       {error && (
@@ -325,7 +324,6 @@ export function App() {
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={(id) => switchConvo(id)}
-        drawerOpen={drawerOpen}
       />
 
       <TabbedDrawer
