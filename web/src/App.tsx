@@ -294,6 +294,7 @@ export function App() {
                 showTop={showTop}
                 onBottom={scrollToBottom}
                 onTop={scrollToTop}
+                drawerOpen={drawerOpen}
               />
             )}
           </div>
