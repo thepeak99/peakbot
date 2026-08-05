@@ -8,6 +8,7 @@ mod bg_tests;
 mod chat_render_tests;
 mod compaction_tests;
 mod context_tests;
+mod cross_agent_bg_visibility_tests;
 mod e2e_tests;
 mod event_tests;
 mod message_roundtrip;

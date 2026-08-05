@@ -139,3 +139,5 @@ This file is the working draft for the next release. When a version is tagged, t
   transport gets the same shared channel with no timers (NDJSON has no
   half-open pipe; a slow consumer is legitimate backpressure). The
   `state` frame on the wire is byte-identical — no frontend change.
+
+- **Background processes are shared session state.** The `bash_bg` lifecycle text no longer claims a process dies when the conversation ends — the registry is session-wide, so a sub-agent's processes outlive its delegation. Sub-agents now receive a snapshot of what is already running in their preamble, and the delegate result tells the orchestrator what the delegation left running or stopped. Both renderings are silent when there is nothing to report.
