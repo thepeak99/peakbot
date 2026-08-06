@@ -11,7 +11,7 @@
 // `--drawer-w` (body width) = min(width, 94vw), so the transform that hides
 // the body and the body's own width always match on any viewport.
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { useMediaQuery } from "../useMediaQuery";
 
 export interface DrawerTab {
@@ -27,15 +27,19 @@ export interface DrawerTab {
 
 export function TabbedDrawer({
   tabs,
+  active,
+  onActiveChange,
   width = 288,
   defaultTab = null,
 }: {
   tabs: DrawerTab[];
+  active: string | null;
+  onActiveChange: (active: string | null) => void;
   /** Drawer body width in px; capped at 94vw so it fits small phones. */
   width?: number;
   defaultTab?: string | null;
 }) {
-  const [active, setActive] = useState<string | null>(defaultTab);
+  void defaultTab;
   // Tap-outside-to-close is a touch affordance. On desktop the drawer is a
   // slim side rail you keep open while working — closing it on any stray click
   // in the transcript would be surprising, so it's mobile/tablet only.
@@ -45,17 +49,17 @@ export function TabbedDrawer({
   useEffect(() => {
     if (active === null) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setActive(null);
+      if (e.key === "Escape") onActiveChange(null);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [active]);
+  }, [active, onActiveChange]);
 
   if (tabs.length === 0) return null;
 
   const open = active !== null;
   const activeTab = tabs.find((t) => t.id === active);
-  const toggle = (id: string) => setActive((cur) => (cur === id ? null : id));
+  const toggle = (id: string) => onActiveChange(active === id ? null : id);
 
   return (
     <>
@@ -66,7 +70,7 @@ export function TabbedDrawer({
       {open && !isDesktop && (
         <div
           className="fixed inset-0 z-30"
-          onClick={() => setActive(null)}
+          onClick={() => onActiveChange(null)}
           aria-hidden
         />
       )}

@@ -4,6 +4,12 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Side drawer no longer hides the floating transcript scroll buttons.** When
+  a drawer tab opens, the scroll-to-top, scroll-to-bottom and "N new messages"
+  buttons glide to the left with the same 300 ms slide as the drawer so the
+  drawer never covers them. The top and bottom bars are intentionally *not*
+  shifted (they stay full-width); only the floating buttons move.
+
 - **Agents panel: per-delegation drill-down.** Roles are now grouped — one row
   per agent showing its delegation count and total messages, with an expandable
   list of individual delegations beneath. Click a role to watch all its turns,

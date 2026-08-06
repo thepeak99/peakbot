@@ -83,6 +83,8 @@ export function App() {
 
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
+  const [drawerTab, setDrawerTab] = useState<string | null>(null);
+  const drawerOpen = drawerTab !== null;
 
   // Sub-agent watch. Two distinct facts, kept apart:
   //  * `pipelineAvailable` — is a pipeline *configured*? (boot-only config).
@@ -291,6 +293,7 @@ export function App() {
                 showTop={showTop}
                 onBottom={scrollToBottom}
                 onTop={scrollToTop}
+                drawerOpen={drawerOpen}
               />
             )}
           </div>
@@ -323,7 +326,11 @@ export function App() {
         onLoadConversation={(id) => switchConvo(id)}
       />
 
-      <TabbedDrawer tabs={tabs} />
+      <TabbedDrawer
+        tabs={tabs}
+        active={drawerTab}
+        onActiveChange={setDrawerTab}
+      />
     </div>
   );
 }
