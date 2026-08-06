@@ -34,6 +34,20 @@ This file is the working draft for the next release. When a version is tagged, t
   restart versus what applies on the next `/new`. Leaving `/setup`
   still starts over.
 
+- **`/setup` install flow moved to the Review step.** The Locations step
+  used to carry a real Install button; it now just shows the machine facts
+  and the PATH state verdict (the `PATH state` label also got a `block`
+  so it no longer renders jammed against its value). The Review step has
+  a single `Install` button that writes the config (`POST /api/setup/config`,
+  which validates server-side and is skipped if it fails) and then runs
+  the binary install (`POST /api/setup/install`), with progressive labels
+  (`Writing config…` then `Installing…`). The success panel combines both
+  results — config path + backup, installed target/action, and the
+  post-install PATH verdict/notes — and a `Cancel` ghost link sits beside
+  the button. If the config write succeeded but the install failed, the
+  error panel says the config was written so the user can retry without
+  losing it.
+
 - **`peakbot install` and the `service` subcommand: the new end-user
   onboarding verbs.** `peakbot install` copies the binary onto the user's
   `PATH` (system or user install, detected from the running privileges)
