@@ -1,53 +1,34 @@
-// Dynamically swap the favicon to a spinning yellow arc while the agent is
-// working, and restore the original icon when idle.
+// The tab icon is the working indicator: the sage turns terracotta while the
+// agent runs, so a backgrounded tab shows progress without an animation loop.
 
 import { useEffect } from "react";
 
-const TICK_MS = 66;
+const IDLE = "/logo_shifu.png";
+const RUNNING = "/logo_shifu_think.png";
+
+// `rel~='icon'` matches a whole token, so it can never select apple-touch-icon.
+function iconLink(): HTMLLinkElement {
+  const existing = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
+  if (existing) return existing;
+  const link = document.createElement("link");
+  link.rel = "icon";
+  document.head.appendChild(link);
+  return link;
+}
 
 export function useFavicon(isRunning: boolean) {
+  // Warm the cache once, or the first swap blanks the tab while the PNG loads.
   useEffect(() => {
-    if (!isRunning) {
-      // Replace the single existing <link rel="icon"> in place so the browser
-      // re-reads it and the count never grows across toggles. The HTML
-      // <link rel="icon"> stays the source of truth for the idle href.
-      const existing = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
-      const href = existing?.href ?? "/favicon.svg";
-      existing?.remove();
-      const link = document.createElement("link");
-      link.rel = "icon";
-      link.href = href;
-      document.head.appendChild(link);
-      return;
-    }
+    new Image().src = RUNNING;
+  }, []);
 
-    const canvas = document.createElement("canvas");
-    canvas.width = 16;
-    canvas.height = 16;
-    const ctx = canvas.getContext("2d")!;
-    const link = document.createElement("link");
-    link.rel = "icon";
-    link.type = "image/png";
-    document.head.appendChild(link);
-
-    let angle = 0;
-    const id = window.setInterval(() => {
-      ctx.clearRect(0, 0, 16, 16);
-      ctx.beginPath();
-      ctx.arc(8, 8, 7, angle, angle + Math.PI * 1.5);
-      ctx.strokeStyle = "#facc15";
-      ctx.lineWidth = 2;
-      ctx.lineCap = "round";
-      ctx.stroke();
-      link.href = canvas.toDataURL("image/png");
-      angle = (angle + 0.15) % (Math.PI * 2);
-    }, TICK_MS);
-
-    // React runs this cleanup before the next effect and on unmount, so the
-    // animated link and its interval are always torn down — no ref needed.
+  useEffect(() => {
+    const link = iconLink();
+    link.href = isRunning ? RUNNING : IDLE;
+    // Reusing the one link element keeps the icon count flat across toggles, and
+    // the cleanup stops an unmount from stranding the running icon on the tab.
     return () => {
-      clearInterval(id);
-      link.remove();
+      link.href = IDLE;
     };
   }, [isRunning]);
 }
