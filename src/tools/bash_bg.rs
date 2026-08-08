@@ -113,7 +113,10 @@ impl Tool for BashBgTool {
 
 Distinct from the synchronous `bash` tool: `bash_bg start` returns
 immediately with a numeric id; the process keeps running until you call
-`bash_bg stop <id>`, it exits on its own, or the conversation ends.
+`bash_bg stop <id>` or it exits on its own. The registry is session-wide
+and shared by every agent in this session — ids are one namespace, and a
+process outlives the turn that started it. If you are a sub-agent, it
+also outlives your delegation: hand it back or stop it.
 
 ## How notifications work (READ THIS)
 
@@ -177,7 +180,11 @@ Pick the cooldown by intent:
 
 ## Notes
 
+  • The registry is shared session state. `bash_bg list` shows every
+    process in the session, including ones another agent started.
+    Do not stop a process you did not start unless you were asked to.
   • `/new`, `/model`, and `/load` kill all background processes.
+    Nothing else reaps them — ending a turn or a delegation does not.
   • Stopped/exited processes are removed from the registry on the
     next drain (after their final tail is delivered to you).
   • A real user message flushes all buffered bg output immediately,
