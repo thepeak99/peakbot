@@ -1,22 +1,24 @@
 # PeakBot Multi-Agent Pipeline — sample "software team" configuration
 #
-# One conversation, one agent you talk to: the ORCHESTRATOR. The orchestrator
-# is simply your normal top-level agent (whatever `default_model` resolves to).
-# It is NOT a pipeline role — do not list it under `pipeline.agents`.
+# Multi-pipeline: declare one or more named teams under `pipelines:`. Each
+# team owns its full cast — an `orchestrator:` (the agent you talk to) and
+# an `agents:` map of sub-agent roles. The orchestrator is a member of the
+# team, not a separate top-level concept.
 #
-# The orchestrator gets a `delegate(role, task, parent_task_id)` tool (present only while
-# `pipeline.enabled: true`). Each delegation runs one sub-agent to completion
-# on a FRESH context and returns a single result string. You see every
-# sub-agent's turns in the transcript, tagged `🧩 <role>`; the orchestrator
-# sees only the string each delegation returns.
+# Selection is per-conversation: use `/pipeline <name>` (or the Agents tab
+# selector in the web UI) to pick a team. The choice is locked after the
+# first turn. `/pipeline none` (or "none" in the selector) = single agent,
+# no delegation.
+#
+# The legacy `pipeline:` config block (with `enabled:` and `orchestrator_prompt:`)
+# is a HARD BOOT ERROR — PeakBot will refuse to start with a migration hint.
+# Wrap your old config under a named `pipelines:` entry instead.
 #
 # Usage: copy to your config.yaml, drop in your API key, run `peakbot`.
 
 # =============================================================================
 # PROVIDERS — the models every agent (orchestrator + sub-agents) draws from
 # =============================================================================
-# Sub-agent roles below reference these aliases by name (same aliases `/model`
-# uses). `default_model` is the orchestrator you talk to.
 providers:
   - name: openrouter
     type: openrouter
@@ -30,49 +32,79 @@ providers:
       - name: google/gemini-2.0-flash-001
         alias: flash
 
-default_model: sonnet                 # ← the orchestrator you chat with
+default_model: sonnet                 # ← boot model when no pipeline is selected
 
 # =============================================================================
-# PIPELINE — the sub-agent roles the orchestrator can delegate to
+# PIPELINES — named teams (ordered list; declaration order is UI order)
 # =============================================================================
-# A role is (model alias, prompt) + optional per-role `env:`. That's the whole
-# surface. Every sub-agent receives the full built-in toolset MINUS `delegate`
-# (no nested delegation), so roles can read files, run bash, search, etc.
-#
-# Note there is NO `orchestrator` role here — the orchestrator is the
-# top-level `default_model` agent above.
-pipeline:
-  enabled: true
+pipelines:
 
-  agents:
-    pm:
+  # --- Pipeline 1: full software team ---
+  - name: software-team
+    orchestrator:
+      model: sonnet                   # optional — falls back to default_model
+      prompt: |                       # optional addendum appended to the orchestrator recipe
+        You lead a small software team. Delegate research, review, and
+        implementation to your sub-agents. Keep the main thread focused on
+        planning and coordination.
+      # persona: |                    # optional — replaces the global persona for this
+      #   You are a technical lead.   # pipeline's orchestrator only. Omit to keep the
+      #                               # global persona (from config.yaml or the built-in).
+    agents:
+      pm:
+        model: sonnet-3.5
+        prompt: |
+          You are the Product Manager. Turn a request into a tight product spec:
+          problem statement, core user stories, in-scope vs out-of-scope, and
+          success criteria. Be decisive; say "out of scope" when it is.
+
+      architect:
+        model: sonnet
+        prompt: |
+          You are the Software Architect. Given a spec, design the simplest
+          system that solves it: components, data flow, interfaces, and the key
+          tradeoffs. "Perfection is when there is nothing left to take away."
+
+      developer:
+        model: sonnet
+        prompt: |
+          You are the Developer. Implement the design as clean, boring,
+          maintainable code. Explain WHY on non-obvious choices, handle errors
+          gracefully, avoid premature abstraction and clever one-liners.
+
+      tester:
+        model: flash
+        prompt: |
+          You are the QA Engineer. Write tests that try to make the code fail:
+          happy path AND edge cases (empty, max, null, error paths). Name each
+          test by what it verifies. Report any bugs you spot with repro steps.
+        env:
+          # Per-role env is merged into THIS sub-agent's bash tool env only —
+          # it never leaks into the orchestrator or other roles.
+          RUN_INTEGRATION_TESTS: "1"
+
+  # --- Pipeline 2: lightweight research + review ---
+  - name: research
+    orchestrator:
       model: sonnet-3.5
       prompt: |
-        You are the Product Manager. Turn a request into a tight product spec:
-        problem statement, core user stories, in-scope vs out-of-scope, and
-        success criteria. Be decisive; say "out of scope" when it is.
+        You coordinate a research team. Delegate fact-checking and source
+        critique to your sub-agents. Synthesise their findings into a concise
+        brief for the user.
+      persona: |
+        You are a research lead — thorough, sceptical, and concise.
+        You prioritise accuracy over speed and flag uncertainty.
+    agents:
+      researcher:
+        model: flash
+        prompt: |
+          You research codebases, documentation, and the web. Return a tight,
+          well-sourced brief: key facts, relevant links, and any gaps.
+        skills:
+          only: [web_search, github]
 
-    architect:
-      model: sonnet
-      prompt: |
-        You are the Software Architect. Given a spec, design the simplest
-        system that solves it: components, data flow, interfaces, and the key
-        tradeoffs. "Perfection is when there is nothing left to take away."
-
-    developer:
-      model: sonnet
-      prompt: |
-        You are the Developer. Implement the design as clean, boring,
-        maintainable code. Explain WHY on non-obvious choices, handle errors
-        gracefully, avoid premature abstraction and clever one-liners.
-
-    tester:
-      model: flash
-      prompt: |
-        You are the QA Engineer. Write tests that try to make the code fail:
-        happy path AND edge cases (empty, max, null, error paths). Name each
-        test by what it verifies. Report any bugs you spot with repro steps.
-      env:
-        # Per-role env is merged into THIS sub-agent's bash tool env only —
-        # it never leaks into the orchestrator or other roles.
-        RUN_INTEGRATION_TESTS: "1"
+      reviewer:
+        model: sonnet
+        prompt: |
+          You critique sources and findings. Check for logical gaps,
+          unsupported claims, and missing context. Be constructive but direct.

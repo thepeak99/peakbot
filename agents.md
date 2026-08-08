@@ -2,7 +2,7 @@
 
 ## Overview
 
-PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.38). It runs a web UI by default and a terminal TUI (`peakbot --tui`) or NDJSON stdio frontend (`peakbot --stdio`), equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills, conversation persistence, todo management, an event-driven hooks system for cost tracking, an opt-in multi-agent pipeline, a first-run setup wizard, and `peakbot install` / `peakbot service …` verbs for end-user install + start-at-login.
+PeakBot is a single-agent coding assistant built with [Rig](https://github.com/0xPlaygrounds/rig) (`rig-core` v0.38). It runs a web UI by default and a terminal TUI (`peakbot --tui`) or NDJSON stdio frontend (`peakbot --stdio`), equipped with filesystem, shell, web fetch, and web search tools. It also supports dynamically loading tools from MCP (Model Context Protocol) servers and Agent Skills, conversation persistence, todo management, an event-driven hooks system for cost tracking, multi-pipeline teams (orchestrator + sub-agents), a first-run setup wizard, and `peakbot install` / `peakbot service …` verbs for end-user install + start-at-login.
 
 ## Architecture
 
@@ -93,7 +93,7 @@ All tools live in `src/tools/` and implement `rig::tool::Tool` (`NAME`, `Args`, 
 | `todo` | `todo.rs` | Todo list management |
 | `doc_index` / `doc_search` | `doc_index.rs` / `doc_search.rs` | Semantic vector store — registered only when `vector_db:` is configured |
 | `view_image` | `view_image.rs` | Load a local image into vision context — registered only on the Anthropic provider (the lone rig provider whose tool results deliver images) |
-| `delegate` | `pipeline/delegate_tool.rs` | Run one sub-agent to completion — registered only when a `pipeline:` is configured AND the conversation opted in |
+| `delegate` | `pipeline/delegate_tool.rs` | Run one sub-agent to completion — registered only when a pipeline is selected |
 
 Plus optional **MCP tools** from configured servers (wrapped in `LoggingToolDyn` for tracing).
 
@@ -136,7 +136,7 @@ Editing `config.yaml` or skills does not require a restart: each session verb re
 | `providers:` / `default_model` (new aliases resolve) | `mcp_servers` (live subprocesses) |
 | skills + system prompt | `vector_db` (redb/HNSW handle) |
 | `searxng.*`, `bash.env`, `agent_max_turns` | `web.*` (read once by the session reaper) |
-| `cost_tracking`, `context.*`, `retry.*`, `memory.*`, `timeouts.*` | `pipeline` (built sub-agent registry) |
+| `cost_tracking`, `context.*`, `retry.*`, `memory.*`, `timeouts.*` | `pipeline` / `pipelines` (built sub-agent registry) |
 | `tools.*` (built-in filter) | `provider` (legacy block) |
 | | `http.*` (published once into the client factory) |
 
@@ -166,6 +166,8 @@ Rules:
 - Per-model overrides: `max_tokens`, `temperature`, `num_ctx` (Ollama), `extra_params` (LlamaCpp), `context_window_override`, `prompt_caching` (Anthropic: `auto`/`auto_1h`/`manual`/`off`), `vision` (force image support on/off; omit for auto-detection).
 
 `/model` semantics: no arg lists aliases (active marked `→`); `/model <alias>` starts a **new conversation** on that model (confirm overlay if the chat has content); unknown alias / current alias are safe no-ops with a message. The active alias is bound to the conversation metadata — `/load` re-activates it and rejects the load if the alias no longer resolves. MCP servers persist across switches.
+
+When a pipeline is selected, the orchestrator model is **locked** to the pipeline's configuration — `/model <alias>` refuses with an explanatory message, and the top model selector is read-only. Bare `/model` still lists aliases and marks the fixed one.
 
 The legacy single-provider block (`provider: { type: …, config: { … } }`) is still supported — same fields, one model, no aliases.
 
@@ -255,9 +257,9 @@ OAuth notes: first connect opens the browser; tokens cached under `~/.cache/peak
 | `/compact` | Force context compaction |
 | `/bg` | List background processes |
 | `/model [alias]` | List / switch models |
+| `/pipeline [name\|none]` | List / select / clear pipeline |
 | `/cd [path]` | Show / change session cwd |
 | `/new`, `/load`, `/conversations` | Conversation management |
-| `/subagents on\|off` | Per-conversation sub-agent opt-in (before first turn; needs `pipeline:`) |
 | `exit` | Quit |
 
 ### Web UI (`peakbot`, the default)
@@ -301,7 +303,7 @@ src/
 ├── config/                 # config loading/merging, ToolsConfig, BUILTIN_TOOL_NAMES
 ├── providers/              # DynAgent, create_provider, per-provider constructors, add_builtin_tools
 ├── hooks/                  # SessionHook, event channel, AgentEvent
-├── pipeline/               # delegate tool, SubAgentRegistry (multi-agent)
+├── pipeline/               # delegate tool, SubAgentRegistry, PipelineSet (multi-agent)
 ├── state/                  # StateManager (single source of truth for sessions)
 ├── tools/                  # all built-in tools + ThoughtGate + LoggingToolDyn
 ├── skills/                 # skill discovery + SKILL.md parsing
@@ -431,15 +433,72 @@ Images persist **inline** as base64 in the conversation JSON. Internals: `vision
 
 ## Multi-agent pipeline (orchestrator + sub-agents)
 
-Opt-in via the `pipeline:` config block — absent or `enabled: false` means none of this exists and `delegate` isn't registered. Runnable example: `examples/pipeline-team/`.
+Declare one or more named teams under `pipelines:`. Each team owns its full cast: an `orchestrator:` (the agent you talk to) and an `agents:` map of sub-agent roles. Selection is per-conversation, persisted, and locked after the first turn. Runnable example: `examples/pipeline-team/`.
 
-### Per-conversation opt-in (default off)
+### Config shape
 
-Configuring `pipeline:` makes sub-agents **available**, not **on**. Each conversation opts in (web Agents-panel checkbox or `/subagents on|off`), **only before the first turn** — after that it's locked (flipping `delegate` mid-conversation would desync the tool list from wire history). Two distinct facts drive it: `pipeline_available` (config, boot-only) and `subagents_enabled` (per-conversation, persisted, serde-default false). `delegate` registers iff **both** are true — gated in `session::create_session` and `rebuild_agent_for_resolved`.
+```yaml
+pipelines:
+  - name: my-team                    # ^[A-Za-z0-9_.-]+$, unique, not "none"
+    orchestrator:                    # REQUIRED
+      model: sonnet                  # optional — falls back to default_model
+      prompt: |                      # optional addendum to the orchestrator recipe
+        You lead the team. Delegate research and review.
+      persona: |                     # optional — replaces global persona for this pipeline
+        You are a technical lead.
+    agents:                          # REQUIRED, non-empty
+      researcher:
+        model: flash                 # alias from providers: (omit → default_model)
+        prompt: "You research codebases and the web. Return a tight brief."
+        skills: { only: [github] }   # per-role skill gate: only: XOR disabled:, or enabled: false
+        agents_md: true              # opt this role into the repo's agents.md (default false)
+      reviewer:
+        model: sonnet
+        prompt: "You review diffs and critique."
+        env: { REVIEW_STRICT: "1" }  # merged into THIS role's bash env only
+```
+
+**Validation at boot** (all in `PipelineSet::build`):
+- **Legacy `pipeline:` block** — hard boot error with migration hint (wrap `agents:` under a named `pipelines:` entry, move `orchestrator_prompt:` to `orchestrator.prompt`, drop `enabled:`).
+- **Duplicate pipeline names** — boot error.
+- **Reserved name `none`** — boot error (`none` means "no pipeline").
+- **Member named `orchestrator`** — boot error (configure it under `orchestrator:`, not inside `agents:`).
+- **Empty `agents:`** — boot error (needs at least one sub-agent).
+- **Unknown model alias** — boot error naming the alias and available alternatives.
+- **Duplicate member keys** — serde parse error (caught by `Members` custom deserializer).
+
+`pipelines:` is **boot-only** — changes require a restart.
+
+### Pipeline selection
+
+Selection is per-conversation, persisted as `Conversation.pipeline`, and locked after the first turn (flipping `delegate` mid-conversation desyncs the tool list from wire history).
+
+- **`/pipeline`** (no arg) — lists available pipelines and the current selection.
+- **`/pipeline <name>`** — selects that pipeline (pre-first-turn only).
+- **`/pipeline none`** — clears selection (single agent mode).
+- **Web UI** — Agents tab has a pipeline selector (radio buttons: "None" + one per pipeline).
+- **`/new`** keeps the current selection. Fresh sessions start at "none".
+- **`/subagents`** is removed; a tombstone message points to `/pipeline`.
+
+### Locked orchestrator model
+
+The orchestrator's model is **derived** from the selected pipeline at the rebuild seam — it is not independently configurable once a pipeline is active. Consequences:
+
+- **`/model <alias>`** refuses with an explanatory message naming the pipeline.
+- **Top model selector** is read-only (greyed chip with tooltip).
+- **Bare `/model`** still lists aliases and marks the fixed one.
+
+### Orchestrator member fields
+
+The `orchestrator:` key inside each pipeline entry configures the team's leader:
+
+- **`model`** (optional) — model alias for the orchestrator. Omit to use `default_model`.
+- **`prompt`** (optional) — addendum appended to the orchestrator's system-prompt recipe. Not a persona replacement — it supplements the core guidance.
+- **`persona`** (optional) — when set, replaces the global persona in the orchestrator's system-prompt recipe for this pipeline only. Omit to keep the global persona.
 
 ### The model
 
-- You talk to the **orchestrator** — your normal top-level agent (whatever `default_model` resolves to; never listed under `pipeline.agents`).
+- You talk to the **orchestrator** — the pipeline's configured leader (its `orchestrator.model` or `default_model`). The orchestrator is a member of the team, not a separate concept.
 - It gets a **`delegate(role, task)`** tool: runs one sub-agent — *(model alias, prompt)* + optional `env:`/`skills:`/`agents_md:` — to completion on a **fresh context**, returns one string. Sequential by construction; no parallel mode. A sub-agent has no memory of prior delegations — everything it needs goes in `task`.
 - On completion, the sub-agent's last ≤10 earlier assistant messages (excluding its final reply) are saved to `<temp>/peakbot/delegate_{role}_{pid}_{counter}.txt`; a one-line pointer is appended to the delegate result string so the orchestrator can `file_read` it. Write failures degrade silently; hookless Ollama sub-agents get no file (empty snapshot).
 
@@ -455,26 +514,9 @@ The load-bearing guarantee: sub-agent turns are filtered out of the orchestrator
 
 Delegation tokens/cost roll into the parent `/stats` lane-agnostically (exception: Ollama sub-agents are hookless — untracked).
 
-### Config shape
+### Context meter
 
-```yaml
-pipeline:
-  enabled: true
-  orchestrator_prompt: |        # optional; appended to the orchestrator's prompt
-    You lead a small team. Delegate research and review; keep the main thread on planning.
-  agents:
-    researcher:
-      model: flash              # alias from providers: (omit → default_model)
-      prompt: "You research codebases and the web. Return a tight brief."
-      skills: { only: [github] }        # per-role skill gate: only: XOR disabled:, or enabled: false
-      agents_md: true                   # opt this role into the repo's agents.md (default false)
-    reviewer:
-      model: sonnet
-      prompt: "You review diffs and critique."
-      env: { REVIEW_STRICT: "1" }       # merged into THIS role's bash env only
-```
-
-Validation at load (unknown alias, empty prompt/role, bad skills filter = boot error). `pipeline:` is **boot-only**.
+The Session tab context meter is sourced from the **orchestrator lane** only (sub-agent turns do not move it). This is the same signal the compaction gate reads. Labelled "Orchestrator context" with a tooltip explaining the distinction. With no pipeline selected, behaviour is identical to single-agent mode.
 
 ### Prompt recipes
 
@@ -482,15 +524,15 @@ Validation at load (unknown alias, empty prompt/role, bad skills filter = boot e
 
 | Piece | Agentless | Orchestrator | Sub-agent |
 |-------|:---------:|:------------:|:---------:|
-| persona (`system_prompt_persona.txt`) | ✅ | ❌ | ❌ |
+| persona (`system_prompt_persona.txt`) | ✅ | ❌ (or `orchestrator.persona` if set) | ❌ |
 | core tool guidance (`system_prompt_core.txt`) | ✅ | ✅ | ❌ |
 | memory.md workflow (if enabled) | ✅ | ✅ | ❌ |
 | skills | ✅ all | ✅ all | ⚙️ per-role filtered |
 | env block (cwd/time/OS/shell) | ✅ | ✅ | ✅ |
 | `agents.md` | ✅ | ✅ | ⚙️ per-role `agents_md:` |
-| `orchestrator_prompt` | — | ✅ if set | — |
+| `orchestrator.prompt` (addendum) | — | ✅ if set | — |
 
-A sub-agent's preamble (`build_sub_agent_preamble`, rebuilt fresh per delegation) is `role.prompt` + live env block + filtered skills (+ agents.md if opted in) — its `prompt` is its whole persona. The framing is recomputed at the single agent-rebuild seam (`rebuild_agent_for_resolved`), so toggling sub-agents, `/cd`, and `/model` all produce the right prompt.
+A sub-agent's preamble (`build_sub_agent_preamble`, rebuilt fresh per delegation) is `role.prompt` + live env block + filtered skills (+ agents.md if opted in) — its `prompt` is its whole persona. The framing is recomputed at the single agent-rebuild seam (`rebuild_agent_for_resolved`), so toggling pipelines, `/cd`, and `/model` all produce the right prompt.
 
 ### Tools, isolation, stop
 
@@ -498,7 +540,7 @@ Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegat
 
 Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`), unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`. The whole delegation is bounded by `timeouts.delegate_secs` (default 1 h); on expiry the transcript takes that same path — summarised and returned as `INTERRUPTED`, not discarded.
 
-Where it lives: `src/pipeline/{delegate_tool,registry}.rs`, `build_sub_agent` in `src/providers/mod.rs`, `MessageSource` + lane filter in `src/ui/app_state.rs` / `src/state/state_manager.rs`.
+Where it lives: `src/pipeline/{delegate_tool,registry,set}.rs`, `build_sub_agent` in `src/providers/mod.rs`, `MessageSource` + lane filter in `src/ui/app_state.rs` / `src/state/state_manager.rs`.
 
 ## CI (Gitea Actions)
 
