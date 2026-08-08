@@ -23,6 +23,7 @@ export function BottomBar({
   send,
   onSwitchModel,
   onLoadConversation,
+  lockedReason = null,
 }: {
   conversations: ConversationSummary[];
   models: ModelInfo[];
@@ -32,6 +33,7 @@ export function BottomBar({
   dirListing: DirListing | null;
   send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
+  lockedReason?: string | null;
   onLoadConversation: (id: string) => void;
 }) {
   return (
@@ -44,13 +46,15 @@ export function BottomBar({
         onKill={(id) => send({ type: "kill_session", convo: id })}
         dropUp
       />
-      <ModelSwitcher
+     <ModelSwitcher
         models={models}
         activeAlias={activeAlias}
         hasTranscript={hasTranscript}
         onSwitch={onSwitchModel}
         dropUp
+        lockedReason={lockedReason}
       />
+ 
 
       {cwd && (
         <CwdPicker

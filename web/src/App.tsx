@@ -94,6 +94,11 @@ export function App() {
   // and stats to one lane via the message `source`.
   const pipelines = state?.pipelines ?? [];
   const selectedPipeline = state?.selected_pipeline ?? null;
+ // When a pipeline is selected, the model selector is locked to the
+  // orchestrator's model — the chip stays visible but is disabled.
+  const modelLockedReason = selectedPipeline
+    ? `fixed by pipeline ${selectedPipeline}`
+    : null;
   const [view, setView] = useState<ViewFilter>("global");
   // Sub-agent views only make sense once a pipeline is actually selected.
   const effectiveView: ViewFilter = selectedPipeline ? view : "global";
@@ -215,7 +220,7 @@ export function App() {
 
   return (
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-zinc-950 text-zinc-100">
-      <TopBar
+    <TopBar
         stats={stats}
         isRunning={isRunning}
         connected={connected}
@@ -232,7 +237,9 @@ export function App() {
         notifyEnabled={notify.enabled}
         notifyPermission={notify.permission}
         onToggleNotify={notify.toggle}
+        lockedReason={modelLockedReason}
       />
+  
 
       {error && (
         <div className="bg-red-950/70 px-4 py-1.5 text-center text-xs text-red-300">
@@ -311,7 +318,7 @@ export function App() {
         </main>
       </div>
 
-      <BottomBar
+   <BottomBar
         conversations={conversations}
         models={models}
         activeAlias={stats?.modelAlias || activeAlias}
@@ -321,7 +328,9 @@ export function App() {
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={(id) => switchConvo(id)}
+        lockedReason={modelLockedReason}
       />
+   
 
       <TabbedDrawer
         tabs={tabs}
