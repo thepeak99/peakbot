@@ -32,6 +32,7 @@ export function TopBar({
   notifyEnabled,
   notifyPermission,
   onToggleNotify,
+  lockedReason = null,
 }: {
   stats: SessionStats | null;
   isRunning: boolean;
@@ -49,8 +50,10 @@ export function TopBar({
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
   onToggleNotify: () => void;
+  lockedReason?: string | null;
 }) {
   return (
+
     // `backdrop-blur` makes this header a stacking context, which traps the
     // pickers' `z-20` panels inside it — so the header itself must outrank the
     // transcript's `relative` wrapper, or the dropdowns render but can't be clicked.
@@ -71,12 +74,14 @@ export function TopBar({
           onKill={(id) => send({ type: "kill_session", convo: id })}
         />
 
-        <ModelSwitcher
+       <ModelSwitcher
           models={models}
           activeAlias={activeAlias}
           hasTranscript={hasTranscript}
           onSwitch={onSwitchModel}
+          lockedReason={lockedReason}
         />
+ 
 
         {cwd && (
           <CwdPicker

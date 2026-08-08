@@ -22,11 +22,12 @@
 //! the teardown (verified `lib.rs` run_loop end).
 
 use crate::config::{Config, ModelRegistry, SearXngConfig};
+use crate::pipeline::PipelineSet;
 use crate::tools::ShellKind;
 use crate::ui::app_state::WelcomeState;
 use crate::{
     AgentRunner, McpServerHandle, PEAKBOT_VERSION, RebuildContext, SkillRegistry, StateManager,
-    SubAgentRegistry, TodoTool, UiAction, build_system_prompt, create_provider,
+    TodoTool, UiAction, build_system_prompt, create_provider,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -37,7 +38,7 @@ use uuid::Uuid;
 
 /// Process-wide inputs shared by every session. Built once in `main`,
 /// borrowed by each [`create_session`] call. The heavy handles
-/// (`mcp_handles`, `vector_store`, `pipeline_registry`, `model_registry`)
+/// (`mcp_handles`, `vector_store`, `pipelines`, `model_registry`)
 /// are `Arc`-backed, so the per-call clones are cheap.
 pub struct SessionDeps {
     /// Boot config with `provider` already mirrored to the active provider
@@ -54,7 +55,10 @@ pub struct SessionDeps {
     /// clones the *tools list*, not the processes.
     pub mcp_handles: Arc<Vec<McpServerHandle>>,
     pub searxng_config: Option<SearXngConfig>,
-    pub pipeline_registry: Option<Arc<SubAgentRegistry>>,
+    /// The named teams this install declares, resolved once at boot. An empty
+    /// set is "no pipelines configured" — one fewer nullable than the old
+    /// `Option<SubAgentRegistry>`.
+    pub pipelines: Arc<PipelineSet>,
     pub vector_store: Option<crate::vector::VectorStore>,
     pub shell_kind: Option<ShellKind>,
     /// Shared conversation storage (writes distinct files per conversation
@@ -119,37 +123,42 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         state_manager.set_shell(sk.executable().to_string());
     }
 
-    // Session availability fact: is a pipeline *configured*? Stamped onto every
-    // conversation this session mints so a reloaded conversation knows a
-    // pipeline was available.
-    let pipeline_available = deps.config.pipeline_enabled();
-    state_manager.set_pipeline_available(pipeline_available);
+    // The pipeline catalogue every View reads (Agents panel roster). Stamped
+    // once — it is a projection of the boot-built set, never mutated.
+    state_manager.set_pipelines(deps.pipelines.infos());
 
-    // Per-conversation sub-agent opt-in. Default OFF for a fresh session; a
-    // resumed conversation adopts its persisted choice so it rebuilds with the
-    // `delegate` tool iff it was opted in. Stamp it *before* building the agent
-    // so the boot agent's tool list matches the choice.
-    let subagents_enabled = resume
-        .and_then(|id| state_manager.peek_conversation_subagents_enabled(id).ok())
-        .unwrap_or(false);
-    state_manager.set_subagents_enabled(subagents_enabled);
+    // The conversation's pipeline selection. A fresh session has none; a
+    // resumed one adopts its saved team, or drops it with a warning when that
+    // team is no longer configured. Resolved *before* the agent is built so
+    // the boot agent runs on the right orchestrator with the right roster.
+    let saved_pipeline = resume
+        .and_then(|id| state_manager.peek_conversation_pipeline(id).ok())
+        .flatten();
+    let (active, pipeline_warning) = deps.pipelines.resolve_saved(saved_pipeline.as_deref());
+    state_manager.set_selected_pipeline(active.map(|p| p.name.clone()));
 
     let todo_tool = TodoTool::new(state_manager.clone());
 
-    // Pick the model to boot on. A resumed conversation boots on the model
-    // it was saved with (mirrors the REPL `/load` re-activation); a fresh
-    // session boots the registry default. The saved wire id is peeked
-    // without loading — the same preflight `/load` uses.
+    // Pick the model to boot on. The selected pipeline OWNS the orchestrator's
+    // model, so it beats the conversation's saved wire id (plan §8.6) — and a
+    // saved-but-dropped pipeline falls back to the registry default rather than
+    // that pipeline's fossilised wire id. Only a conversation that never had a
+    // pipeline boots on its saved model; a fresh session boots the registry
+    // default. The saved wire id is peeked without loading — the same preflight
+    // `/load` uses.
     let saved_wire_id = resume.and_then(|id| state_manager.peek_conversation_wire_id(id).ok());
     let boot = deps.model_registry.resolve_boot(
         saved_wire_id
             .as_ref()
+            .filter(|_| saved_pipeline.is_none())
             .map(|(p, m)| (p.as_str(), m.as_str())),
     );
-    // A resumed conversation boots on its saved model; a fresh session on
-    // the registry default. `resolve_boot` guarantees a model (a config-built
-    // registry always has a default), so there is no None case to handle.
-    let boot_model = boot.model;
+    // `resolve_boot` guarantees a model (a config-built registry always has a
+    // default), so there is no None case to handle.
+    let boot_model = match active {
+        Some(pipeline) => &pipeline.orchestrator,
+        None => boot.model,
+    };
     let boot_provider_config = &boot_model.provider_config;
     let boot_provider_name = boot_model.provider_name.clone();
     let boot_alias = boot_model.alias.clone();
@@ -203,18 +212,20 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
 
     // Build the per-session system prompt from `session_cwd` — the only
     // place the cwd flows into the prompt. Skills + shell_kind are part
-    // of the env block too. When sub-agents are active this drops the
-    // crusader persona and appends the orchestrator prompt. A configured
-    // `persona:` REPLACES the built-in persona in the agentless recipe.
-    let subagents_active = pipeline_available && subagents_enabled;
+    // of the env block too. With a pipeline selected this drops the
+    // crusader persona and appends the pipeline's orchestrator prompt. A
+    // pipeline's own `persona:` replaces the global one for its orchestrator
+    // (amendment 1); otherwise the global `persona:` applies unchanged.
     let session_prompt = build_system_prompt(
         &deps.skills,
         deps.shell_kind.as_ref(),
         &session_cwd,
         deps.config.memory.enabled,
-        subagents_active,
-        deps.config.orchestrator_prompt(),
-        deps.config.persona(),
+        active.is_some(),
+        active.and_then(|p| p.orchestrator_prompt.as_deref()),
+        active
+            .and_then(|p| p.orchestrator_persona.as_deref())
+            .or_else(|| deps.config.persona()),
     );
 
     // Session-owned cell for the currently-running sub-agent hook (D6 stop
@@ -224,15 +235,11 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     let active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook = Default::default();
 
     // The `delegate` tool (and thus sub-agents) is registered iff a pipeline is
-    // configured AND this conversation opted in. A fresh session defaults off,
-    // so the boot agent has no delegate until the user toggles it on (which
-    // rebuilds the agent). `RebuildContext` keeps the full registry so the
-    // toggle-rebuild can add delegate on demand.
-    let boot_registry = if pipeline_available && subagents_enabled {
-        deps.pipeline_registry.as_deref()
-    } else {
-        None
-    };
+    // selected — and it exposes exactly that team's roster. A fresh session has
+    // no selection, so the boot agent has no delegate until the user selects a
+    // pipeline (which rebuilds the agent). `RebuildContext` keeps the whole set
+    // so that rebuild can hand over a different team's registry.
+    let boot_registry = active.map(|p| p.registry.as_ref());
 
     let (agent, provider_info, event_receiver, session_hook) = create_provider(
         boot_provider_config,
@@ -259,13 +266,6 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     state_manager.set_provider_name(boot_provider_name);
     state_manager.set_model_alias(boot_alias.clone());
 
-    // Name the model behind each sub-agent lane for the Session panel. Roles
-    // only — the orchestrator's model is derived from the active alias at
-    // stamp time, so `/model` needs no bookkeeping here.
-    if let Some(reg) = deps.pipeline_registry.as_deref() {
-        state_manager.set_lane_models(reg.role_model_aliases().into_iter().collect());
-    }
-
     // Initialise the conversation synchronously so `conversation_id` is valid
     // before the controller loop spawns. `resume` best-effort adopts a
     // persisted conversation; `ensure_boot_conversation` is idempotent, so it
@@ -280,6 +280,18 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     let conversation_id = state_manager
         .get_current_conversation_id()
         .expect("ensure_boot_conversation guarantees a current conversation");
+
+    // `load_conversation` restored the *saved* selection; re-stamp the one the
+    // session actually booted on so an unconfigured name is dropped from the
+    // conversation too (and not re-persisted).
+    state_manager.set_selected_pipeline(active.map(|p| p.name.clone()));
+
+    // A resumed conversation whose saved pipeline is gone from config boots
+    // without one — say so rather than silently downgrade. Emitted after the
+    // load, which replaces the chat with the saved transcript.
+    if let Some(warning) = pipeline_warning {
+        state_manager.add_system_message(warning);
+    }
 
     // A resumed conversation whose saved model is gone from the registry
     // boots on the default instead — tell the user rather than downgrade
@@ -314,13 +326,12 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         max_turns: deps.config.agent_max_turns,
         todo_tool: Some(todo_tool),
         bash_config: deps.config.bash.clone(),
-        pipeline_registry: deps.pipeline_registry.clone(),
+        pipelines: deps.pipelines.clone(),
         shell_kind: deps.shell_kind.clone(),
         skills: deps.skills.clone(),
         vector_store: deps.vector_store.clone(),
         memory_enabled: deps.config.memory.enabled,
         tools_filter: deps.config.tools.clone(),
-        orchestrator_prompt: deps.config.orchestrator_prompt().map(str::to_string),
         persona: deps.config.persona().map(str::to_string),
     };
 
@@ -438,7 +449,7 @@ mod tests {
             skill_warnings: Vec::new(),
             mcp_handles: Arc::new(Vec::new()),
             searxng_config: None,
-            pipeline_registry: None,
+            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
             vector_store: None,
             shell_kind: None,
             storage: Some(storage),
@@ -556,6 +567,255 @@ mod tests {
             session.state_manager.session_cwd(),
             std::env::current_dir().unwrap(),
             "missing saved cwd must fall back to the boot cwd"
+        );
+    }
+    // ── Stage 1.2: pipeline-driven session boot ─────────────────────────────
+    //
+    // These pin §4 of the multi-pipeline plan: when a conversation is
+    // resumed with `pipeline: Some(name)`, the session's `model_alias`
+    // comes from the pipeline's orchestrator (NOT the conversation's
+    // saved wire id). The pipeline owns the orchestrator — "the
+    // selection replaces the state, it does not add to it."
+    //
+    // SessionDeps' `pipeline_registry` field is renamed `pipelines:
+    // Arc<PipelineSet>` per §7 (no longer Optional — an empty set is
+    // the "no pipelines configured" mode, one fewer nullable). Until
+    // that rename lands, these tests won't compile (RED).
+
+    /// Build a `SessionDeps` with a non-empty `PipelineSet`. Mirrors the
+    /// existing `test_deps` helper but exercises the new field shape.
+    fn test_deps_with_pipelines(
+        registry: Arc<ModelRegistry>,
+        storage: Arc<dyn ConversationStorage>,
+        pipelines: Arc<crate::pipeline::PipelineSet>,
+    ) -> SessionDeps {
+        let mut config = Config::default();
+        config.context.enabled = false;
+        SessionDeps {
+            config,
+            model_registry: registry,
+            skills: crate::skills::SkillRegistry::new(),
+            skill_warnings: Vec::new(),
+            mcp_handles: Arc::new(Vec::new()),
+            searxng_config: None,
+            pipelines, // Stage 1.2 field (replaces `pipeline_registry`)
+            vector_store: None,
+            shell_kind: None,
+            storage: Some(storage),
+            mcp_tools_count: 0,
+            skills_count: 0,
+        }
+    }
+
+    /// Construct a `PipelineSet` whose `web-team` orchestrator aliases
+    /// `sonnet`, with one member `reviewer` aliasing `flash`. Mirrors
+    /// the test helper in `src/pipeline/set.rs`.
+    fn pipelines_with_web_team() -> Arc<crate::pipeline::PipelineSet> {
+        // Same YAML shape as the fixture in `src/pipeline/set.rs::tests`;
+        // resolves the same way. We could build via Rust literals but the
+        // YAML path keeps this fixture honest about what real config
+        // looks like (and would catch an upstream serde regression).
+        let yaml = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-test
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: sonnet
+      - name: google/gemini-2.0-flash-001
+        alias: flash
+default_model: sonnet
+pipelines:
+  - name: web-team
+    orchestrator:
+      model: sonnet
+    agents:
+      reviewer:
+        model: flash
+        prompt: review
+";
+        let cfg: crate::config::Config = serde_yaml::from_str(yaml).expect("config parses");
+        let set = crate::pipeline::PipelineSet::build(&cfg, &registry_two_aliases(), Some(&[]))
+            .expect("set builds");
+        Arc::new(set)
+    }
+
+    /// `registry_two_aliases` mirrors `ollama_registry` but with two
+    /// aliases (`sonnet`, `flash`) — needed for the pipeline orchestrator
+    /// (sonnet) to differ from the conversation's saved wire id (flash).
+    fn registry_two_aliases() -> Arc<ModelRegistry> {
+        use crate::config::{ModelEntry, ProviderEntry, ProviderType};
+        let openrouter = ProviderEntry {
+            name: "openrouter".into(),
+            kind: ProviderType::OpenRouter,
+            api_key: Some("sk-test".into()),
+            base_url: None,
+            models: vec![
+                ModelEntry {
+                    name: "anthropic/claude-3.7-sonnet".into(),
+                    alias: Some("sonnet".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    extra_params: None,
+                    prompt_caching: None,
+                    vision: None,
+                    context_size: None,
+                },
+                ModelEntry {
+                    name: "google/gemini-2.0-flash-001".into(),
+                    alias: Some("flash".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    extra_params: None,
+                    prompt_caching: None,
+                    vision: None,
+                    context_size: None,
+                },
+            ],
+        };
+        Arc::new(
+            ModelRegistry::build(std::slice::from_ref(&openrouter), Some("sonnet"))
+                .expect("registry builds"),
+        )
+    }
+
+    /// The headline Stage 1.2 contract: when a conversation is resumed
+    /// with `pipeline: Some("web-team")`, the session's `model_alias` is
+    /// the pipeline's orchestrator alias (`sonnet`), not the
+    /// conversation's saved wire id (`flash`). The pipeline owns the
+    /// orchestrator — see plan §4 "rebuild seam … first lines derive
+    /// active from sm.selected_pipeline() and override resolved".
+    #[tokio::test]
+    async fn create_session_resume_with_pipeline_uses_orchestrator_alias() {
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let mut saved = Conversation::new(
+            "resumed-with-pipe".into(),
+            "openrouter".into(),
+            // Conversation's saved wire id: FLASH — would boot to flash
+            // in the no-pipeline world.
+            "google/gemini-2.0-flash-001".into(),
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        // Resume claims `web-team` is selected. Per §4, the pipeline's
+        // orchestrator alias (sonnet) MUST beat the saved wire id.
+        saved.pipeline = Some("web-team".into());
+        let saved_id = saved.id;
+        storage.save(&saved).expect("save");
+
+        let deps = test_deps_with_pipelines(
+            registry_two_aliases(),
+            storage.clone(),
+            pipelines_with_web_team(),
+        );
+        let session = create_session(&deps, Some(saved_id)).expect("create_session");
+
+        assert_eq!(
+            session.model_alias, "sonnet",
+            "resumed conversation with `pipeline: web-team` must boot the pipeline's \
+             orchestrator alias (`sonnet`), NOT the saved wire id (`flash`)"
+        );
+        // The selection is mirrored into AppState (plan §3 "One nullable fact").
+        assert_eq!(
+            session.state_manager.selected_pipeline().as_deref(),
+            Some("web-team"),
+            "selection must be mirrored into AppState.selected_pipeline on resume"
+        );
+    }
+
+    /// The inverse case: a conversation saved with `pipeline: Some("ghost")`
+    /// where `ghost` is no longer configured. `resolve_saved` returns
+    /// `(None, Some(warning))` — the implementer must drop the
+    /// selection, boot the registry default, AND surface the warning
+    /// to the user. The alias that lands on `session.model_alias` is
+    /// the registry default (`sonnet`), not anything stale.
+    #[tokio::test]
+    async fn create_session_resume_with_unconfigured_pipeline_clears_with_warning() {
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let mut saved = Conversation::new(
+            "ghost-pipe".into(),
+            "openrouter".into(),
+            "google/gemini-2.0-flash-001".into(),
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        saved.pipeline = Some("ghost".into());
+        let saved_id = saved.id;
+        storage.save(&saved).expect("save");
+
+        let deps = test_deps_with_pipelines(
+            registry_two_aliases(),
+            storage.clone(),
+            // Only `web-team` is configured — `ghost` is missing.
+            pipelines_with_web_team(),
+        );
+        let session = create_session(&deps, Some(saved_id)).expect("create_session");
+
+        // Selection is dropped (amendment 5: orphan pipeline → none,
+        // not the stale name).
+        assert_eq!(
+            session.state_manager.selected_pipeline().as_deref(),
+            None,
+            "an unconfigured pipeline name must be dropped on resume"
+        );
+        // The model falls back to the registry default (no pipeline
+        // orchestrator to take over).
+        assert_eq!(
+            session.model_alias, "sonnet",
+            "with no pipeline selected, the session must boot the registry default \
+             (`sonnet`), NOT any stale orchestrator alias"
+        );
+
+        // A system message must surface the warning. We can't assert on
+        // exact wording (that's plan §7's "warning text") but the name
+        // `ghost` and the phrase "no longer" / "configured" must be in
+        // the message so the user understands what changed.
+        let state = session.state_manager.get_state();
+        let last_warning = state
+            .chat
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::ui::app_state::MessageRole::System))
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        assert!(
+            last_warning.contains("ghost"),
+            "warning must name the dropped pipeline; got: {last_warning:?}"
+        );
+        assert!(
+            last_warning.contains("no longer") || last_warning.contains("configured"),
+            "warning must explain why (no longer / configured); got: {last_warning:?}"
+        );
+    }
+
+    /// Fresh session baseline: no resume, no pipeline selection. The
+    /// session boots the registry default; nothing is mirrored into
+    /// `AppState.selected_pipeline`. Mirrors plan §4 "fresh session =
+    /// None (single agent, default_model)".
+    #[tokio::test]
+    async fn create_session_fresh_has_no_pipeline_selected() {
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let deps = test_deps_with_pipelines(
+            registry_two_aliases(),
+            storage.clone(),
+            pipelines_with_web_team(),
+        );
+        let session = create_session(&deps, None).expect("create_session");
+
+        assert_eq!(
+            session.state_manager.selected_pipeline().as_deref(),
+            None,
+            "fresh session must start with selected_pipeline = None even when pipelines are configured"
+        );
+        assert_eq!(
+            session.model_alias, "sonnet",
+            "fresh session must boot the registry default"
         );
     }
 }

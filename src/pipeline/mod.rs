@@ -6,6 +6,7 @@
 mod delegate_tool;
 mod handoff;
 pub(crate) mod registry;
+mod set;
 mod sub_agent_messages;
 
 use crate::hooks::SessionHook;
@@ -13,6 +14,10 @@ use std::sync::{Arc, Mutex};
 
 pub use delegate_tool::{DelegateTool, SubAgentDeps, fire_stop};
 pub use registry::SubAgentRegistry;
+// `PipelineSet` is built once at boot (`main.rs`) and carried by
+// `SessionDeps` / `RebuildContext`; the re-exports let callers say
+// `crate::pipeline::PipelineSet` without reaching into the leaf module.
+pub use set::{PipelineInfo, PipelineSet, PipelineSetError, ResolvedPipeline};
 
 /// The sub-agent hook that is *currently* running inside a `delegate` call,
 /// if any. Owned by the session; set by [`DelegateTool`] for the duration of

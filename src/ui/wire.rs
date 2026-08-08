@@ -16,6 +16,7 @@
 //! {"type":"switch_cwd","path":"~/proj"}    // maps to UiAction::ChangeCwd
 //! {"type":"list_dir","path":"~/proj"}      // browse for the cwd picker
 //! {"type":"request_conversations"}
+//! {"type":"select_pipeline","name":"web-team"}  // null clears the binding
 //! {"type":"kill_session","convo":"aabbcc-…"}
 //! {"type":"shutdown"}
 //! ```
@@ -71,11 +72,12 @@ pub(crate) enum InboundMessage {
         path: String,
     },
     RequestConversations,
-    /// Opt the current conversation into/out of sub-agents (the Agents panel
-    /// checkbox). Maps to [`crate::ui::ui_trait::UiAction::SetSubagentsEnabled`].
-    /// The backend enforces the lock (rejected once the conversation has turns).
-    SetSubagents {
-        enabled: bool,
+    /// Bind the current conversation to a named pipeline (the Agents panel
+    /// selector); `name: null` clears the binding. Maps to
+    /// [`crate::ui::ui_trait::UiAction::SelectPipeline`]. The backend enforces
+    /// the lock (rejected once the conversation has turns).
+    SelectPipeline {
+        name: Option<String>,
     },
     /// End an active session for *everyone* attached to it (dropdown "kill").
     KillSession {

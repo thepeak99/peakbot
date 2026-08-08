@@ -254,20 +254,13 @@ pub struct Conversation {
     /// Todo list persisted with this conversation
     #[serde(default)]
     pub todos: crate::tools::todo::TodoList,
-    /// Whether the multi-agent pipeline was enabled for the session that
-    /// created this conversation (config sense: `pipeline.enabled`, a
-    /// boot-only fact). Conversation-global, not per-message. Defaults to
-    /// `false` for every pre-existing file — old conversations genuinely had
-    /// no pipeline.
-    #[serde(default)]
-    pub pipeline_enabled: bool,
-    /// Whether the user opted this conversation into sub-agents (the Agents
-    /// panel checkbox). Distinct from `pipeline_enabled` (config availability):
-    /// a conversation may be created in a pipeline-configured session yet leave
-    /// this `false`. Drives whether the `delegate` tool is registered on
-    /// resume. Defaults `false` for every pre-existing file.
-    #[serde(default)]
-    pub subagents_enabled: bool,
+    /// The pipeline (named team) this conversation is bound to, or `None` for
+    /// single-agent mode. The **one nullable fact** that drives the delegate
+    /// roster, the prompt recipe and the orchestrator's model on resume.
+    /// Absent for every pre-existing file; the legacy `subagents_enabled` key
+    /// such files carry is ignored on load (no auto-mapping — amendment 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
 }
 
 impl Conversation {
@@ -298,9 +291,15 @@ impl Conversation {
             cwd,
             metadata: ConversationMetadata::default(),
             todos: crate::tools::todo::TodoList::new(),
-            pipeline_enabled: false,
-            subagents_enabled: false,
+            pipeline: None,
         }
+    }
+
+    /// The pipeline this conversation is bound to. Reads the `pipeline` field
+    /// and nothing else — amendment 5 cancels the legacy `subagents_enabled`
+    /// mapping, so an old file resumes without a pipeline.
+    pub fn selected_pipeline(&self) -> Option<&str> {
+        self.pipeline.as_deref()
     }
 
     /// Add a user message to the conversation
@@ -389,11 +388,6 @@ pub struct ConversationSummary {
     pub provider_name: String,
     /// Wire id of the model used (e.g. `anthropic/claude-3.7-sonnet`).
     pub model: String,
-    /// Whether the pipeline was enabled for the session that created this
-    /// conversation. Surfaced to any summary consumer (a picker badge is a
-    /// deferred frontend concern). Defaults to `false` for pre-existing files.
-    #[serde(default)]
-    pub pipeline_enabled: bool,
 }
 
 impl From<&Conversation> for ConversationSummary {
@@ -408,7 +402,6 @@ impl From<&Conversation> for ConversationSummary {
             message_count: conv.metadata.message_count,
             provider_name: conv.provider_name.clone(),
             model: conv.model.clone(),
-            pipeline_enabled: conv.pipeline_enabled,
         }
     }
 }
@@ -672,67 +665,44 @@ mod tests {
         );
     }
 
-    // ── conversation-global pipeline_enabled marker ────────────────────────
+    // ── legacy conversation-global pipeline_enabled marker ─────────────────
 
+    /// `pipeline_enabled` was a dead stamp on saved conversations: written at
+    /// save time from the session's config availability, never read back to
+    /// drive anything. Removed by the multi-pipeline work (plan § 9 Stage 0b)
+    /// in favour of the one live fact, `pipeline`.
+    ///
+    /// Conversations already on disk still carry the key — as does the
+    /// per-conversation `subagents_enabled` opt-in the pipeline selection
+    /// replaced. `Conversation` has no `deny_unknown_fields`, so serde must
+    /// simply ignore both — an existing file keeps loading, with every other
+    /// field intact.
     #[test]
-    fn pipeline_enabled_roundtrips_and_defaults_false() {
-        let mut conv = Conversation::new(
-            "Test".into(),
-            "openrouter".into(),
-            "anthropic/claude-3.7-sonnet".into(),
-            String::new(),
-        );
-        // Fresh conversations default to false.
-        assert!(!conv.pipeline_enabled);
-
-        // A pipeline conversation roundtrips true.
-        conv.pipeline_enabled = true;
-        let json = serde_json::to_string(&conv).unwrap();
-        let parsed: Conversation = serde_json::from_str(&json).unwrap();
-        assert!(parsed.pipeline_enabled);
-        // Summary carries the fact for downstream consumers.
-        assert!(ConversationSummary::from(&parsed).pipeline_enabled);
-
-        // A non-pipeline conversation roundtrips false.
-        conv.pipeline_enabled = false;
-        let json = serde_json::to_string(&conv).unwrap();
-        let parsed: Conversation = serde_json::from_str(&json).unwrap();
-        assert!(!parsed.pipeline_enabled);
-        assert!(!ConversationSummary::from(&parsed).pipeline_enabled);
-    }
-
-    #[test]
-    fn subagents_enabled_roundtrips_and_defaults_false() {
-        let mut conv = Conversation::new(
-            "Test".into(),
-            "openrouter".into(),
-            "anthropic/claude-3.7-sonnet".into(),
-            String::new(),
-        );
-        // Default off — a conversation is not opted into sub-agents by default,
-        // even when a pipeline is configured.
-        assert!(!conv.subagents_enabled);
-
-        conv.subagents_enabled = true;
-        let json = serde_json::to_string(&conv).unwrap();
-        let parsed: Conversation = serde_json::from_str(&json).unwrap();
-        assert!(parsed.subagents_enabled);
-
-        // Pre-existing files with no key default to false (independent of
-        // pipeline_enabled).
+    fn legacy_pipeline_enabled_key_is_ignored_on_load() {
         let legacy = r#"{
             "id": "00000000-0000-0000-0000-000000000000",
             "name": "old",
             "created_at": "2020-01-01T00:00:00Z",
             "updated_at": "2020-01-01T00:00:00Z",
             "messages": [],
+            "provider_name": "openrouter",
             "model": "anthropic/claude-3.7-sonnet",
             "metadata": {},
-            "pipeline_enabled": true
+            "pipeline_enabled": true,
+            "subagents_enabled": true
         }"#;
-        let parsed: Conversation = serde_json::from_str(legacy).unwrap();
-        assert!(parsed.pipeline_enabled);
-        assert!(!parsed.subagents_enabled);
+
+        let parsed: Conversation =
+            serde_json::from_str(legacy).expect("a legacy file with pipeline_enabled must load");
+
+        // The unknown keys are dropped silently; the rest of the document is
+        // unharmed — that's the whole contract.
+        assert_eq!(parsed.name, "old");
+        assert_eq!(parsed.model, "anthropic/claude-3.7-sonnet");
+        assert_eq!(
+            parsed.provider_name, "openrouter",
+            "neighbouring fields must survive the ignored keys"
+        );
     }
 
     // ── per-lane stats metadata ────────────────────────────────────────────
@@ -782,9 +752,11 @@ mod tests {
     }
 
     #[test]
-    fn pre_existing_file_without_field_defaults_false() {
-        // A JSON that has no `pipeline_enabled` key at all; serde default
-        // must fill in `false` (least astonishment — old convos had no pipeline).
+    fn pre_existing_file_without_optional_fields_loads_with_defaults() {
+        // A minimal pre-existing document: none of the fields added after v1
+        // are present. Every one of them must fall back to its serde default
+        // rather than failing the load (least astonishment — old convos had no
+        // cwd, no todos, and no pipeline).
         let json = r#"{
             "id": "00000000-0000-0000-0000-000000000000",
             "name": "old",
@@ -795,7 +767,10 @@ mod tests {
             "metadata": {}
         }"#;
         let parsed: Conversation = serde_json::from_str(json).unwrap();
-        assert!(!parsed.pipeline_enabled);
+        assert_eq!(parsed.cwd, "");
+        assert!(parsed.provider_name.is_empty());
+        assert!(parsed.todos.list().is_empty());
+        assert!(parsed.pipeline.is_none());
     }
 
     // === v5: conversation title ====================
@@ -1083,5 +1058,104 @@ mod tests {
             Message::Assistant { source, .. } => assert_eq!(source, &MessageSource::Human),
             other => panic!("expected Assistant, got {other:?}"),
         }
+    }
+    // ── Stage 1.2: per-conversation pipeline selection ───────────────────────
+    //
+    // The single nullable fact that replaces today's two-booleans state
+    // (`pipeline_available` + `subagents_enabled`). Persisted on the
+    // conversation so a resume / /load can re-activate the right team
+    // without re-asking the user. Amendment 5: legacy `subagents_enabled`
+    // is silently ignored on load — there is NO auto-mapping back to a
+    // `default` pipeline.
+
+    /// `pipeline` is `Option<String>`, defaults to `None`, and roundtrips
+    /// 1:1 through JSON (key = `"pipeline"` per plan §3).
+    #[test]
+    fn pipeline_field_round_trips_and_defaults_none() {
+        let mut conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "anthropic/claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        // Default = no pipeline (fresh session baseline, plan §4 "fresh
+        // session = None").
+        assert_eq!(conv.pipeline, None);
+
+        conv.pipeline = Some("web-team".into());
+        let json = serde_json::to_string(&conv).expect("serializes");
+        // The field key is `pipeline`, per plan §3.
+        assert!(
+            json.contains("\"pipeline\":\"web-team\""),
+            "JSON must contain the `pipeline` field; got: {json}"
+        );
+
+        let parsed: Conversation = serde_json::from_str(&json).expect("parses back");
+        assert_eq!(parsed.pipeline.as_deref(), Some("web-team"));
+
+        // Pre-existing files with no `pipeline` key default to None.
+        let legacy_no_pipeline = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "old",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "messages": [],
+            "provider_name": "openrouter",
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {}
+        }"#;
+        let parsed: Conversation = serde_json::from_str(legacy_no_pipeline).unwrap();
+        assert_eq!(parsed.pipeline, None);
+    }
+
+    /// `selected_pipeline()` returns `self.pipeline.as_deref()` — single
+    /// source of truth, derived from the persisted field. It does NOT
+    /// consult any legacy field; amendment 5 cancels that adaptation.
+    #[test]
+    fn selected_pipeline_returns_pipeline_field_only() {
+        let mut conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "anthropic/claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        assert_eq!(conv.selected_pipeline(), None);
+        conv.pipeline = Some("research-crew".into());
+        assert_eq!(conv.selected_pipeline(), Some("research-crew"));
+        conv.pipeline = None;
+        assert_eq!(conv.selected_pipeline(), None);
+    }
+
+    /// Amendment 5 pinned as a Conversation-level test (separate from
+    /// the StateManager mirror test): a JSON document that carries the
+    /// legacy `subagents_enabled: true` key but no `pipeline` key
+    /// deserializes to a conversation whose `selected_pipeline()` is
+    /// `None`. There is no auto-mapping back to a `default` pipeline —
+    /// the legacy key is either dropped as an unknown field or, if
+    /// the field is kept for back-compat, is simply not consulted by
+    /// `selected_pipeline()`.
+    #[test]
+    fn legacy_subagents_enabled_does_not_auto_select_default_pipeline() {
+        let legacy = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "old",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "messages": [],
+            "provider_name": "openrouter",
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {},
+            "subagents_enabled": true
+        }"#;
+        let conv: Conversation = serde_json::from_str(legacy)
+            .expect("legacy JSON must parse; subagents_enabled key is dropped or ignored");
+        assert_eq!(
+            conv.selected_pipeline(),
+            None,
+            "amendment 5: a legacy conversation's selected_pipeline is None; \
+             `subagents_enabled: true` does NOT auto-map to a 'default' pipeline"
+        );
+        // And the field is also None directly, since no `pipeline` key.
+        assert_eq!(conv.pipeline, None);
     }
 }

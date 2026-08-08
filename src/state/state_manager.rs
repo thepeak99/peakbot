@@ -15,7 +15,7 @@ use crate::ui::app_state::{
     AppState, BashPanelState, BashPanelVisibility, BgState, BgSummary, ChatMessage, ChatState,
     ContextState, MessageSource, SessionState, TodoItem, TodoState, WelcomeState,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -88,20 +88,6 @@ pub struct StateManager {
     // ── Rendering Coalescence ─────────────────────────────────────────────────
     /// Monotonic counter for render coalescence — see `slow-messages.md` §4.4.
     revision: AtomicU64,
-
-    // ── Session facts ─────────────────────────────────────────────────────────
-    /// Whether a multi-agent pipeline is *configured* for this session
-    /// (`pipeline.enabled` + at least one role, boot-only). This is the
-    /// availability fact — it only decides whether the user may opt in, not
-    /// whether sub-agents are active. `AtomicBool` because it's set once during
-    /// session wiring and read on each mint — no lock needed.
-    pipeline_available: AtomicBool,
-
-    /// Whether the user has opted this conversation into sub-agents. Default
-    /// false, mutable only before the first turn (locked after), persisted on
-    /// the conversation so a resumed opt-in rebuilds with the `delegate` tool.
-    /// The `delegate` tool registers iff `pipeline_available && this`.
-    subagents_enabled: AtomicBool,
 }
 
 impl StateManager {
@@ -141,8 +127,6 @@ impl StateManager {
             shell: RwLock::new(String::new()),
             session_cwd: RwLock::new(std::env::current_dir().unwrap_or_default()),
             revision: AtomicU64::new(0),
-            pipeline_available: AtomicBool::new(false),
-            subagents_enabled: AtomicBool::new(false),
         }
     }
 
@@ -477,8 +461,9 @@ impl StateManager {
                 stats.total_output_tokens,
                 stats.total_api_calls,
                 stats.total_cost,
-                // last_input_tokens is the current context size (not cumulative)
-                stats.last_input_tokens().unwrap_or(0),
+                // Read the orchestrator's last input tokens — the same signal the
+                // compaction gate uses. Sub-agent turns must not move this meter.
+                stats.last_orchestrator_input_tokens().unwrap_or(0),
                 stats.lanes_sorted(),
             )
         };
@@ -489,18 +474,28 @@ impl StateManager {
         state.stats.total_api_calls = calls;
         state.stats.total_cost = cost;
         // Scoped so the borrows end before `state.stats.lanes` is assigned.
-        // The orchestrator's model is derived from `model_alias` (kept current
-        // by `/model`), never copied into the map — one source of truth.
+        // Both models are DERIVED: the orchestrator's from `model_alias` (kept
+        // current by every rebuild), a role's from the selected pipeline's
+        // member list. Nothing is stored twice.
         let rows: Vec<crate::ui::app_state::LaneStat> = {
-            let lane_models = &state.stats.lane_models;
             let active_alias = &state.stats.model_alias;
+            let members = state
+                .selected_pipeline
+                .as_deref()
+                .and_then(|name| state.pipelines.iter().find(|p| p.name == name))
+                .map(|p| p.members.as_slice())
+                .unwrap_or(&[]);
             lanes
                 .into_iter()
                 .map(|(lane, s)| crate::ui::app_state::LaneStat {
                     model: if lane == crate::ui::app_state::ORCHESTRATOR_LANE {
                         active_alias.clone()
                     } else {
-                        lane_models.get(&lane).cloned().unwrap_or_default()
+                        members
+                            .iter()
+                            .find(|(role, _)| role == &lane)
+                            .map(|(_, alias)| alias.clone())
+                            .unwrap_or_default()
                     },
                     lane,
                     input_tokens: s.input_tokens,
@@ -903,16 +898,6 @@ impl StateManager {
         self.state.read().unwrap().stats.model_alias.clone()
     }
 
-    /// Publish the sub-agent role → model-alias map. Boot-immutable config;
-    /// `sync_stats_to_ui` stamps it onto every
-    /// [`crate::ui::app_state::LaneStat`] so the Session panel can name the
-    /// model behind each agent.
-    pub fn set_lane_models(&self, models: std::collections::HashMap<String, String>) {
-        let mut state = self.state.write().unwrap();
-        state.stats.lane_models = models;
-        self.notify_update(&state);
-    }
-
     /// Update context state
     pub fn update_context(&self, context_state: ContextState) {
         let mut state = self.state.write().unwrap();
@@ -1024,34 +1009,36 @@ impl StateManager {
         model: String,
         cwd: String,
     ) {
+        // Snapshot the selection under the state lock and release it *before*
+        // locking the conversation — never hold both guards together (plan §4).
+        // `/new` mints on the current pipeline (D2: the selection survives).
+        let selected = self.state.read().unwrap().selected_pipeline.clone();
         let mut conv = Conversation::new(name, provider_name, model, cwd);
-        conv.pipeline_enabled = self.pipeline_available.load(Ordering::Acquire);
-        conv.subagents_enabled = self.subagents_enabled.load(Ordering::Acquire);
+        conv.pipeline = selected;
         *self.current_conversation.lock().unwrap() = Some(conv);
         self.mirror_conversation_to_state();
     }
 
-    /// Record whether a multi-agent pipeline is *configured* for this session
-    /// (availability). Set once during session wiring; stamped onto every
-    /// conversation this session mints (see [`Self::create_conversation`]) and
-    /// mirrored into the live `AppState` so the web Agents panel knows whether
-    /// to offer the opt-in.
-    pub fn set_pipeline_available(&self, available: bool) {
-        self.pipeline_available.store(available, Ordering::Release);
+    /// Publish the pipeline catalogue (the boot-built `PipelineSet` projected
+    /// into wire shape). Stamped once at session build; "no pipelines
+    /// configured" is an empty vec, never a separate flag.
+    pub fn set_pipelines(&self, pipelines: Vec<crate::pipeline::PipelineInfo>) {
         let mut state = self.state.write().unwrap();
-        state.pipeline_available = available;
+        state.pipelines = pipelines;
         self.notify_update(&state);
     }
 
-    /// Whether the user has opted this conversation into sub-agents.
-    pub fn subagents_enabled(&self) -> bool {
-        self.subagents_enabled.load(Ordering::Acquire)
+    /// The pipeline this conversation is bound to, or `None` for single-agent
+    /// mode. Reads the live `AppState` mirror — the same value
+    /// [`Self::set_selected_pipeline`] writes.
+    pub fn selected_pipeline(&self) -> Option<String> {
+        self.state.read().unwrap().selected_pipeline.clone()
     }
 
     /// Whether the current conversation has had a real turn (any user or agent
     /// message). System banners don't count — a fresh session showing only a
     /// welcome/warning is still "not started". This is the lock signal for the
-    /// sub-agent opt-in: mutable before the first turn, frozen after.
+    /// pipeline selection: mutable before the first turn, frozen after.
     pub fn conversation_has_turns(&self) -> bool {
         use crate::ui::app_state::MessageRole;
         self.state
@@ -1063,18 +1050,34 @@ impl StateManager {
             .any(|m| matches!(m.role, MessageRole::User | MessageRole::Agent))
     }
 
-    /// Set the per-conversation sub-agent opt-in. Stamps the choice onto the
-    /// current conversation (persisted on next save) and mirrors it into the
-    /// live `AppState`. The caller owns the lock-after-first-turn rule and the
-    /// agent rebuild — this only records the fact.
-    pub fn set_subagents_enabled(&self, enabled: bool) {
-        self.subagents_enabled.store(enabled, Ordering::Release);
+    /// Record the pipeline selection: onto the current conversation (persisted
+    /// on the next save) and into the live `AppState`. The caller owns the
+    /// lock-after-first-turn rule and the agent rebuild — this only records
+    /// the fact.
+    ///
+    /// **Lock rule:** the conversation guard is taken and released before the
+    /// state guard. Holding both would invert the `state → current_conversation`
+    /// order the persist path uses and deadlock (see
+    /// `select_pipeline_and_persist_current_do_not_deadlock`).
+    pub fn set_selected_pipeline(&self, name: Option<String>) {
         if let Some(conv) = self.current_conversation.lock().unwrap().as_mut() {
-            conv.subagents_enabled = enabled;
+            conv.pipeline = name.clone();
         }
         let mut state = self.state.write().unwrap();
-        state.subagents_enabled = enabled;
+        state.selected_pipeline = name;
         self.notify_update(&state);
+    }
+
+    /// Re-stamp the current conversation's wire identity `(provider_name,
+    /// model)`. Used when a pipeline selection swaps the orchestrator's model
+    /// in place: the conversation keeps its id (sticky `?convo=`) but its
+    /// persisted re-activation key must follow the model it actually runs on.
+    pub fn set_conversation_wire_id(&self, provider_name: String, model: String) {
+        if let Some(conv) = self.current_conversation.lock().unwrap().as_mut() {
+            conv.provider_name = provider_name;
+            conv.model = model;
+        }
+        self.mirror_conversation_to_state();
     }
 
     /// Mirror the current conversation's identity into `AppState.conversation`
@@ -1143,21 +1146,19 @@ impl StateManager {
             let conv = storage.load(id)?;
             *self.current_conversation.lock().unwrap() = Some(conv);
             self.sync_from_conversation();
-            // Restore the per-conversation sub-agent opt-in from the loaded
-            // conversation so a resumed opt-in rebuilds with `delegate` and the
-            // Agents panel reflects the saved choice. `pipeline_available` is a
-            // session fact set at wiring — not restored here.
+            // Restore the saved pipeline selection so a resumed conversation
+            // rebuilds on its team's orchestrator and the Agents panel shows
+            // the right row. A name that is no longer configured is dropped by
+            // the caller (`PipelineSet::resolve_saved`), not here.
             let restored = self
                 .current_conversation
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map(|c| c.subagents_enabled)
-                .unwrap_or(false);
-            self.subagents_enabled.store(restored, Ordering::Release);
+                .and_then(|c| c.pipeline.clone());
             {
                 let mut state = self.state.write().unwrap();
-                state.subagents_enabled = restored;
+                state.selected_pipeline = restored;
             }
             // Background processes are scoped to the conversation they
             // were spawned in. Loading a different conversation severs
@@ -1196,17 +1197,16 @@ impl StateManager {
         Ok((conv.provider_name, conv.model))
     }
 
-    /// Peek at a saved conversation's persisted `subagents_enabled` opt-in
-    /// without loading it. Used by `create_session` on the resume path to
-    /// decide whether the boot agent registers the `delegate` tool — a resumed
-    /// opt-in must rebuild with sub-agents available. Pre-field files return
-    /// `false`.
-    pub fn peek_conversation_subagents_enabled(&self, id: Uuid) -> anyhow::Result<bool> {
+    /// Peek at a saved conversation's persisted pipeline selection without
+    /// loading it. Used by `create_session` on the resume path to build the
+    /// boot agent on the right orchestrator *before* the conversation is
+    /// loaded. Pre-field files return `None`.
+    pub fn peek_conversation_pipeline(&self, id: Uuid) -> anyhow::Result<Option<String>> {
         let storage = self
             .storage
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
-        Ok(storage.load(id)?.subagents_enabled)
+        Ok(storage.load(id)?.pipeline)
     }
 
     /// Peek at a saved conversation's persisted `cwd` without loading
@@ -2516,6 +2516,9 @@ impl Default for StateManager {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    // Only the deadlock probes need this — the production state moved off
+    // atomics onto `AppState`.
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn test_new_state_manager() {
@@ -2725,25 +2728,24 @@ mod tests {
         assert_eq!(sm.peek_conversation_cwd(id).unwrap(), "");
     }
 
-    /// `create_conversation` stamps the session's pipeline availability +
-    /// sub-agent opt-in onto every conversation it mints, so both facts survive
-    /// persistence/reload.
+    /// `create_conversation` stamps the session's pipeline selection onto every
+    /// conversation it mints, so the choice survives persistence/reload — and
+    /// `/new` keeps the current team (D2).
     #[test]
-    fn create_conversation_stamps_pipeline_flags() {
+    fn create_conversation_stamps_pipeline_selection() {
         let sm = StateManager::new();
 
-        // Default session: unavailable + not opted in.
+        // Default session: no pipeline.
         sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
-        assert!(!sm.get_current_conversation().unwrap().pipeline_enabled);
-        assert!(!sm.get_current_conversation().unwrap().subagents_enabled);
+        assert!(sm.get_current_conversation().unwrap().pipeline.is_none());
 
-        // Session with a configured pipeline and an opted-in conversation →
-        // minted conversation carries both flags.
-        sm.set_pipeline_available(true);
-        sm.set_subagents_enabled(true);
+        // A session with a selection → the minted conversation carries it.
+        sm.set_selected_pipeline(Some("web-team".into()));
         sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
-        assert!(sm.get_current_conversation().unwrap().pipeline_enabled);
-        assert!(sm.get_current_conversation().unwrap().subagents_enabled);
+        assert_eq!(
+            sm.get_current_conversation().unwrap().pipeline.as_deref(),
+            Some("web-team")
+        );
     }
 
     #[test]
@@ -2824,14 +2826,17 @@ mod tests {
     /// per-request size, and no lane's tokens are a single request's count.
     #[test]
     fn fresh_session_lane_rows_are_cumulative_and_carry_the_model() {
+        use crate::pipeline::PipelineInfo;
         use crate::ui::app_state::MessageSource;
         let sm = StateManager::new();
         sm.set_model_alias("opus-5".to_string());
-        sm.set_lane_models(
-            [("junior".to_string(), "qwen3.6-27B".to_string())]
-                .into_iter()
-                .collect(),
-        );
+        // Role models are derived from the selected pipeline's catalogue entry.
+        sm.set_pipelines(vec![PipelineInfo {
+            name: "web-team".to_string(),
+            orchestrator_model: "opus-5".to_string(),
+            members: vec![("junior".to_string(), "qwen3.6-27B".to_string())],
+        }]);
+        sm.set_selected_pipeline(Some("web-team".to_string()));
 
         let junior = MessageSource::SubAgent {
             role: "junior".into(),
@@ -2876,27 +2881,6 @@ mod tests {
         }
     }
 
-    /// The two Agents-panel facts mirror into the live `AppState`:
-    /// `pipeline_available` (config) and `subagents_enabled` (per-conversation
-    /// opt-in). Both default off.
-    #[test]
-    fn pipeline_facts_reflect_on_state() {
-        let sm = StateManager::new();
-        assert!(!sm.get_state().pipeline_available);
-        assert!(!sm.get_state().subagents_enabled);
-
-        sm.set_pipeline_available(true);
-        assert!(sm.get_state().pipeline_available);
-
-        sm.set_subagents_enabled(true);
-        assert!(sm.get_state().subagents_enabled);
-        assert!(sm.subagents_enabled());
-
-        sm.set_subagents_enabled(false);
-        assert!(!sm.get_state().subagents_enabled);
-        assert!(!sm.subagents_enabled());
-    }
-
     /// The opt-in lock signal ignores system banners: a fresh conversation
     /// showing only a welcome/warning is still "not started".
     #[test]
@@ -2912,32 +2896,6 @@ mod tests {
 
         sm.add_user_message("hello".to_string());
         assert!(sm.conversation_has_turns());
-    }
-
-    /// Loading a conversation restores its persisted sub-agent opt-in so a
-    /// resumed opt-in rebuilds with `delegate` and the panel reflects it.
-    #[test]
-    fn load_conversation_restores_subagents_opt_in() {
-        use crate::conversation::Conversation;
-        use crate::storage::InMemoryStorage;
-        let storage = Arc::new(InMemoryStorage::default());
-        let sm = StateManager::new_arc_with_storage(storage.clone());
-
-        let mut conv = Conversation::new(
-            "opted-in".into(),
-            "prov".into(),
-            "model".into(),
-            String::new(),
-        );
-        conv.subagents_enabled = true;
-        let id = conv.id;
-        storage.save(&conv).unwrap();
-
-        // Session default is off; loading the opted-in conversation flips it on.
-        assert!(!sm.subagents_enabled());
-        sm.load_conversation(id).unwrap();
-        assert!(sm.subagents_enabled());
-        assert!(sm.get_state().subagents_enabled);
     }
 
     #[test]
@@ -4044,44 +4002,88 @@ mod tests {
         );
     }
 
+    /// The context meter measures the ORCHESTRATOR's context, not "whatever
+    /// lane spoke last". A sub-agent's request runs on its own model with its
+    /// own window and must never move the orchestrator's meter — otherwise a
+    /// delegate call visibly collapses the user's context gauge to the
+    /// sub-agent's tiny wire size.
+    ///
+    /// Pinned by the multi-pipeline plan § 6 (bonus): `sync_stats_to_ui` reads
+    /// `last_orchestrator_input_tokens()`, the same signal the compaction gate
+    /// already uses — not `last_input_tokens()` (last request on ANY lane).
     #[test]
-    fn context_current_usage_tracks_last_input_tokens() {
-        let sm = sm_with_context_size(200_000);
+    fn context_meter_tracks_orchestrator_lane_only() {
+        use crate::ui::app_state::MessageSource;
+        let sm = StateManager::new();
 
-        // Before any request: usage is 0 but window is non-zero.
-        let state = sm.get_state();
-        assert_eq!(state.context.current_usage, 0);
-        assert_eq!(state.context.window_size, 200_000);
-        assert_eq!(state.context.usage_percentage(), 0.0);
-
-        // After a request: current_usage reflects the last input-token count.
-        sm.add_request(
-            &crate::ui::app_state::MessageSource::Human,
-            50_000,
-            1_000,
-            0.0,
-        );
-        let state = sm.get_state();
+        // The orchestrator turn sets the meter.
+        sm.add_request(&MessageSource::Human, 1_000, 100, 0.0);
         assert_eq!(
-            state.context.current_usage, 50_000,
-            "current_usage must be updated when stats are synced — otherwise the status bar shows 0% forever"
-        );
-        // 50k / 200k = 25%
-        assert!(
-            (state.context.usage_percentage() - 25.0).abs() < 0.01,
-            "expected ~25% usage, got {}",
-            state.context.usage_percentage()
+            sm.get_state().context.current_usage,
+            1_000,
+            "orchestrator request must set the meter"
         );
 
-        // A later request overwrites (tokens aren't cumulative — see SessionStats docs).
+        // A sub-agent turn must NOT clobber it, however small.
         sm.add_request(
-            &crate::ui::app_state::MessageSource::Human,
-            100_000,
-            2_000,
+            &MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            50,
+            10,
             0.0,
         );
-        let state = sm.get_state();
-        assert_eq!(state.context.current_usage, 100_000);
+        assert_eq!(
+            sm.get_state().context.current_usage,
+            1_000,
+            "a sub-agent's request must not move the orchestrator's context meter"
+        );
+    }
+
+    /// The meter and the compaction gate must read the SAME number. Today they
+    /// can disagree — the meter shows a sub-agent's last wire size while the
+    /// gate reads the orchestrator's — which is how `/context` ends up
+    /// contradicting its own threshold warning.
+    #[test]
+    fn context_meter_agrees_with_compaction_gate() {
+        use crate::ui::app_state::MessageSource;
+        // 1_000-token window, 0.8 threshold → the gate fires above 800.
+        let sm = sm_with_context_size(1_000);
+
+        // Enough traffic to clear the `keep_recent` floor (5) so the gate can
+        // reach its token branch at all.
+        for i in 0..5 {
+            sm.add_user_message(format!("u{i}"));
+            sm.add_assistant_message(format!("a{i}"));
+        }
+
+        sm.add_request(&MessageSource::Human, 1_000, 100, 0.0);
+        sm.add_request(
+            &MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            50,
+            10,
+            0.0,
+        );
+
+        // The one invariant: what the user sees IS what the gate decides on.
+        assert_eq!(
+            sm.get_state().context.current_usage as usize,
+            sm.current_input_tokens(),
+            "the context meter must display the same token count the compaction gate reads"
+        );
+
+        // And that shared reading is over threshold, so the meter cannot show a
+        // comfortable number while compaction is firing behind it.
+        assert!(
+            sm.needs_compaction(),
+            "precondition: 1000 > 800 threshold on the orchestrator lane"
+        );
+        assert!(
+            sm.get_state().context.current_usage > 800,
+            "meter must show the over-threshold value that triggered compaction"
+        );
     }
 
     /// `StateManager::needs_compaction()` is the new public accessor used by
@@ -4839,7 +4841,7 @@ mod tests {
     #[test]
     fn add_request_and_persist_current_do_not_deadlock() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::thread;
         use std::time::{Duration, Instant};
 
@@ -4967,7 +4969,7 @@ mod tests {
     #[test]
     fn update_todo_and_persist_current_do_not_deadlock() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::thread;
         use std::time::{Duration, Instant};
 
@@ -5858,6 +5860,299 @@ mod tests {
             Some(900),
             "the session-wide last-input reading (status bar) must still show 900 — \
              the fix must not hide the sub-agent's request from the UI"
+        );
+    }
+    // ── Stage 1.2: multi-pipeline selection state ─────────────────────────────
+    //
+    // These pin §7 / §4 of the multi-pipeline plan: the per-conversation
+    // selection state lives on `Conversation.pipeline` (persisted) and is
+    // mirrored into `AppState.selected_pipeline` for the live UI. The
+    // single boolean pair (`pipeline_available` + `subagents_enabled`)
+    // is replaced by one nullable string — the implementer may keep the
+    // booleans around for back-compat reads but they MUST NOT be the
+    // authority.
+
+    /// `set_selected_pipeline(Some(name))` mirrors the choice into the
+    /// current conversation's `pipeline` field AND into
+    /// `AppState.selected_pipeline`. The single string is the source of
+    /// truth for both surfaces — plan §3 "One nullable fact".
+    #[test]
+    fn set_selected_pipeline_writes_conversation_and_app_state() {
+        let sm = StateManager::new();
+        // Seed a current conversation — the persisted mirror requires it.
+        sm.create_conversation(
+            "pipe-select".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
+
+        // Default = no pipeline.
+        assert_eq!(sm.get_state().selected_pipeline, None);
+
+        // Set some — both surfaces must reflect.
+        sm.set_selected_pipeline(Some("web-team".into()));
+        assert_eq!(sm.get_state().selected_pipeline, Some("web-team".into()));
+        assert_eq!(
+            sm.get_current_conversation()
+                .expect("current conversation")
+                .pipeline
+                .as_deref(),
+            Some("web-team"),
+            "the conversation's persisted `pipeline` field must mirror the choice"
+        );
+
+        // Set None — both surfaces cleared.
+        sm.set_selected_pipeline(None);
+        assert_eq!(sm.get_state().selected_pipeline, None);
+        assert_eq!(
+            sm.get_current_conversation()
+                .expect("current conversation")
+                .pipeline,
+            None,
+            "the conversation's persisted `pipeline` field must be cleared too"
+        );
+    }
+
+    /// `selected_pipeline()` reads through `AppState.selected_pipeline` —
+    /// it's the getter half of the seam `set_selected_pipeline` writes.
+    /// Pinning it as a separate test catches an implementer who wires the
+    /// setter to one source and the getter to another.
+    #[test]
+    fn selected_pipeline_getter_reads_app_state() {
+        let sm = StateManager::new();
+        assert_eq!(sm.selected_pipeline().as_deref(), None);
+        sm.set_selected_pipeline(Some("research-crew".into()));
+        assert_eq!(sm.selected_pipeline().as_deref(), Some("research-crew"));
+        sm.set_selected_pipeline(None);
+        assert_eq!(sm.selected_pipeline().as_deref(), None);
+    }
+
+    /// Resuming a conversation with `pipeline: Some(name)` stamps the
+    /// choice into `AppState.selected_pipeline` so the rebuilt agent
+    /// boots on the pipeline's orchestrator. Mirrors the
+    /// `load_conversation_restores_subagents_opt_in` test (the existing
+    /// subagents toggle) but for the new field.
+    #[test]
+    fn load_conversation_restores_selected_pipeline() {
+        use crate::conversation::Conversation;
+        use crate::storage::InMemoryStorage;
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let mut conv = Conversation::new(
+            "opted-in".into(),
+            "prov".into(),
+            "model".into(),
+            String::new(),
+        );
+        conv.pipeline = Some("web-team".into());
+        let id = conv.id;
+        storage.save(&conv).unwrap();
+
+        // Session default is no pipeline; loading the opted-in
+        // conversation flips it on.
+        assert_eq!(sm.selected_pipeline().as_deref(), None);
+        sm.load_conversation(id).unwrap();
+        assert_eq!(sm.selected_pipeline().as_deref(), Some("web-team"));
+        assert_eq!(sm.get_state().selected_pipeline, Some("web-team".into()));
+    }
+
+    /// `peek_conversation_pipeline(id)` returns the saved pipeline name
+    /// WITHOUT loading the conversation into the current slot — the same
+    /// pre-flight pattern as `peek_conversation_wire_id` /
+    /// `peek_conversation_subagents_enabled`. Used by `create_session` on
+    /// the resume path so the agent can be built on the right orchestrator
+    /// before the conversation is loaded.
+    #[test]
+    fn peek_conversation_pipeline_returns_saved_name() {
+        use crate::conversation::Conversation;
+        use crate::storage::InMemoryStorage;
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let mut conv = Conversation::new(
+            "peek-target".into(),
+            "prov".into(),
+            "model".into(),
+            String::new(),
+        );
+        conv.pipeline = Some("research-crew".into());
+        let id = conv.id;
+        storage.save(&conv).unwrap();
+
+        let peeked = sm
+            .peek_conversation_pipeline(id)
+            .expect("peek must succeed when storage is configured");
+        assert_eq!(peeked.as_deref(), Some("research-crew"));
+
+        // Peek must NOT mutate current_conversation — the session can
+        // still load a *different* conversation after peeking. Re-load
+        // and assert the slot survives unchanged.
+        assert!(
+            !sm.has_current_conversation(),
+            "peek must not touch the slot"
+        );
+    }
+
+    /// Amendment 5: a legacy conversation (one written before the
+    /// pipeline field existed) carries `subagents_enabled: true` but no
+    /// `pipeline` key. The selection resumes as `None` — there is NO
+    /// legacy-mapping code path. Pin: a loaded legacy conversation has
+    /// `selected_pipeline() == None`, and `peek_conversation_pipeline`
+    /// also returns `None`.
+    #[test]
+    fn legacy_subagents_enabled_does_not_select_a_pipeline() {
+        use crate::conversation::Conversation;
+        use crate::storage::InMemoryStorage;
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        // JSON-shape legacy: `subagents_enabled: true`, no `pipeline` key.
+        // `Conversation` has no `deny_unknown_fields`, so the unknown
+        // `subagents_enabled` key is silently dropped on load if the
+        // field is removed in Stage 1.2 (amendment 5). Either way, the
+        // selection must be None.
+        let legacy_json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "old",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "messages": [],
+            "provider_name": "openrouter",
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {},
+            "subagents_enabled": true
+        }"#;
+        let parsed: Conversation = serde_json::from_str(legacy_json)
+            .expect("legacy JSON must parse (unknown subagents_enabled key is dropped)");
+        let id = parsed.id;
+        storage.save(&parsed).unwrap();
+
+        sm.load_conversation(id).unwrap();
+
+        assert_eq!(
+            sm.selected_pipeline().as_deref(),
+            None,
+            "amendment 5: a legacy conversation resumes with selected_pipeline = None; \
+             the old subagents_enabled key does NOT auto-map to a 'default' pipeline"
+        );
+        assert_eq!(
+            sm.peek_conversation_pipeline(id).unwrap(),
+            None,
+            "peek must report None for a legacy conversation"
+        );
+    }
+
+    /// Lock-order sibling of
+    /// `add_request_and_persist_current_do_not_deadlock`. The new
+    /// pipeline API touches `state` and `current_conversation` from
+    /// `set_selected_pipeline` (writes to both) — if any future caller
+    /// holds both guards simultaneously the same A→B vs B→A deadlock
+    /// class appears. This test hammers create + select + persist from
+    /// two threads and demands forward progress. With the lock rule
+    /// "never hold state + current_conversation together" (plan §3) the
+    /// producers run tens of thousands of iterations; without it they
+    /// wedge.
+    #[test]
+    fn select_pipeline_and_persist_current_do_not_deadlock() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let sm = StdArc::new(StateManager::new());
+        // Seed a conversation so persist_current has a current slot to
+        // walk. Mirrors the deadlock-probe fixture.
+        sm.create_conversation(
+            "select-pipeline-deadlock-probe".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
+        // Seed a real turn so sync_to_conversation has work to copy under
+        // the locks (mirrors the other deadlock pins).
+        sm.add_user_message("hello".into());
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        let count_a = StdArc::new(AtomicU64::new(0));
+        let count_b = StdArc::new(AtomicU64::new(0));
+
+        // Producer A: hammers `set_selected_pipeline`, alternating Some
+        // and None — the new API that touches both `state` and
+        // `current_conversation`.
+        let sm_a = sm.clone();
+        let stop_a = stop.clone();
+        let count_a_t = count_a.clone();
+        let t_a = thread::spawn(move || {
+            let mut toggle = false;
+            while !stop_a.load(Ordering::Relaxed) {
+                if toggle {
+                    sm_a.set_selected_pipeline(Some("web-team".into()));
+                } else {
+                    sm_a.set_selected_pipeline(None);
+                }
+                toggle = !toggle;
+                count_a_t.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Producer B: hammers the agent-loop path (add_assistant_message
+        // → persist_current → sync_to_conversation, which takes
+        // state.read → current_conversation.lock). If the new
+        // `set_selected_pipeline` holds both guards together, this is
+        // the inverse-order path that wedges.
+        let sm_b = sm.clone();
+        let stop_b = stop.clone();
+        let count_b_t = count_b.clone();
+        let t_b = thread::spawn(move || {
+            while !stop_b.load(Ordering::Relaxed) {
+                sm_b.add_assistant_message("reply".into());
+                count_b_t.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Watchdog — mirror the existing deadlock pin: pure atomic
+        // polling, never touches any involved lock.
+        let stop_w = stop.clone();
+        let count_a_w = count_a.clone();
+        let count_b_w = count_b.clone();
+        let _watchdog = thread::spawn(move || {
+            let mut last_a = 0u64;
+            let mut last_b = 0u64;
+            let mut stuck_since: Option<Instant> = None;
+            while !stop_w.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(50));
+                let now_a = count_a_w.load(Ordering::Relaxed);
+                let now_b = count_b_w.load(Ordering::Relaxed);
+                if now_a == last_a && now_b == last_b {
+                    let since = stuck_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(2) {
+                        eprintln!(
+                            "deadlock detected: select-pipeline counters frozen at A={now_a}, B={now_b} for >2s"
+                        );
+                        std::process::abort();
+                    }
+                } else {
+                    stuck_since = None;
+                    last_a = now_a;
+                    last_b = now_b;
+                }
+            }
+        });
+
+        thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        t_a.join().expect("producer A must not panic");
+        t_b.join().expect("producer B must not panic");
+
+        assert!(
+            count_a.load(Ordering::Relaxed) > 0,
+            "producer A (set_selected_pipeline) made no progress"
+        );
+        assert!(
+            count_b.load(Ordering::Relaxed) > 0,
+            "producer B (add_assistant_message → persist_current) made no progress"
         );
     }
 }

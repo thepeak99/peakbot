@@ -5,6 +5,7 @@
 //! with existing PeakBot types (TodoList, SessionStats, etc.).
 
 use crate::TodoStatus;
+use crate::pipeline::PipelineInfo;
 use crate::tools::todo::TodoItem as CoreTodoItem;
 use crate::ui::ui_trait::TodoItemAction;
 use chrono::{DateTime, Local};
@@ -131,19 +132,19 @@ pub struct AppState {
     #[serde(default)]
     pub bash_panel_visibility: BashPanelVisibility,
 
-    /// Whether a multi-agent pipeline is *configured* for this session
-    /// (`pipeline.enabled` + roles, boot-only config). This is the availability
-    /// fact — it decides only whether the Agents panel offers the opt-in, not
-    /// whether sub-agents are active.
+    /// The pipelines (named teams) this install declares, in config order.
+    /// Projected once at session build from the boot-built `PipelineSet` —
+    /// the Agents panel renders the roster from this, and "no pipelines
+    /// configured" is `is_empty()`, never a separate flag.
     #[serde(default)]
-    pub pipeline_available: bool,
+    pub pipelines: Vec<PipelineInfo>,
 
-    /// Whether the user has opted this conversation into sub-agents. Default
-    /// off; mutable only before the first turn (the panel locks the checkbox
-    /// once the transcript is non-empty). The `delegate` tool is registered iff
-    /// `pipeline_available && subagents_enabled`.
-    #[serde(default)]
-    pub subagents_enabled: bool,
+    /// The pipeline this conversation is bound to, or `None` for single-agent
+    /// mode. Mirror of `Conversation.pipeline` (the persisted truth); mutable
+    /// only before the first turn. Everything downstream — delegate roster,
+    /// prompt recipe, orchestrator model, `/model` lock — derives from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_pipeline: Option<String>,
 }
 
 impl AppState {
@@ -998,9 +999,9 @@ pub struct LaneStat {
     pub output_tokens: u64,
     /// API calls made on this lane.
     pub api_calls: u64,
-    /// Model alias this lane runs on (orchestrator: the active alias;
-    /// a role: its `pipeline.agents.<role>.model`). Empty when unknown —
-    /// old wire snapshots and lanes with no configured role.
+    /// Model alias this lane runs on (orchestrator: the active alias; a role:
+    /// its member entry in the selected pipeline). Empty when unknown — old
+    /// wire snapshots and lanes with no configured role.
     #[serde(default)]
     pub model: String,
     /// Accumulated cost (USD) on this lane.
@@ -1050,14 +1051,6 @@ pub struct SessionState {
     /// `provider_name + model` for re-activation.
     #[serde(default)]
     pub model_alias: String,
-
-    /// Sub-agent role → model alias, published once at session build from the
-    /// pipeline registry. Boot-immutable config, not per-request data —
-    /// `sync_stats_to_ui` reads it to stamp each [`LaneStat`], so it never
-    /// rides the wire itself. The orchestrator is absent by design: its model
-    /// is derived from `model_alias`, which `/model` keeps current.
-    #[serde(skip)]
-    pub lane_models: std::collections::HashMap<String, String>,
 }
 
 impl SessionState {
@@ -1470,6 +1463,127 @@ mod tests {
         assert_eq!(json, r#"{"kind":"sub_agent","role":"researcher"}"#);
         let back: MessageSource = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
+    }
+    // ── Stage 1.2: AppState wire-shape back-compat ──────────────────────
+    //
+    // The plan removes `pipeline_available` and `subagents_enabled`
+    // from AppState and adds `pipelines: Vec<PipelineInfo>` and
+    // `selected_pipeline: Option<String>` (plan §3 "AppState — DELETED:
+    // pipeline_available, subagents_enabled (both derived)").
+    //
+    // Two properties must hold:
+    // 1. A snapshot emitted by the OLD code (fields present) still
+    //    parses on the new code. The fields must be `#[serde(default)]`
+    //    on the new code path, OR serde-tolerant in some other way.
+    // 2. The new fields round-trip 1:1 through JSON.
+
+    /// A snapshot emitted by today's `AppState` (pre-Stage 1.2) carries
+    /// `pipeline_available: true` and `subagents_enabled: true`. When
+    /// the new code parses it, those fields must be silently absorbed
+    /// (the new code's `selected_pipeline` derives from the catalogue,
+    /// not from the deleted booleans). Without `#[serde(default)]` on
+    /// the new fields this test would fail with "missing field
+    /// selected_pipeline"; without absorb-tolerance for the old fields
+    /// it would fail with "unknown field pipeline_available".
+    #[test]
+    fn old_app_state_snapshot_with_legacy_booleans_parses() {
+        // Hand-craft a JSON snapshot in the shape the pre-Stage 1.2
+        // code emits. Empty chat / stats / context / conversation —
+        // we only care about the field-level serde behaviour, not the
+        // content.
+        let old_snapshot = r#"{
+            "chat": {"messages": [], "auto_scroll": true, "scroll_offset": 0},
+            "todo": {"items": [], "visible": false},
+            "input": {"buffer": "", "cursor": 0, "history": []},
+            "stats": {"model": "", "model_alias": "", "provider_name": "", "total_input_tokens": 0, "total_output_tokens": 0, "total_api_calls": 0, "total_cost": 0.0, "lanes": []},
+            "context": {"current_usage": 0, "window_size": 0, "compaction_enabled": false, "compaction_threshold": 0.0, "last_input_tokens": 0, "compaction_keep_recent": 0},
+            "conversation": null,
+            "preferences": {"theme": "auto", "tool_render_mode": "collapsed"},
+            "is_running": false,
+            "is_loading": false,
+            "is_final": false,
+            "status_message": null,
+            "exit_requested": false,
+            "pending_input_count": 0,
+            "bg": {"running_count": 0, "recent_summaries": []},
+            "bash_panel": {"kind": "idle"},
+            "bash_panel_visibility": "Auto",
+            "pipeline_available": true,
+            "subagents_enabled": false
+        }"#;
+
+        let parsed: AppState =
+            serde_json::from_str(old_snapshot).expect("old snapshot must parse on new code");
+        // The legacy booleans were absorbed without error — the
+        // new code derives `selected_pipeline` from `pipelines` (the
+        // catalogue), not from those booleans. So:
+        assert_eq!(
+            parsed.selected_pipeline, None,
+            "old snapshot has no catalogue → selected_pipeline derives to None"
+        );
+        assert!(
+            parsed.pipelines.is_empty(),
+            "old snapshot has no catalogue → pipelines is empty"
+        );
+    }
+
+    /// The new fields round-trip 1:1. `pipelines: Vec<PipelineInfo>`
+    /// uses `#[serde(default)]` for forward compat (a new code
+    /// snapshot read by an older client sees an empty vec). The
+    /// `selected_pipeline: Option<String>` uses
+    /// `skip_serializing_if = "Option::is_none"` so a snapshot with
+    /// no selection stays byte-identical to the pre-Stage-1.2 form
+    /// for that field.
+    #[test]
+    fn new_app_state_fields_round_trip() {
+        let mut state = AppState::new();
+        // Stamp a non-empty selection + catalogue.
+        state.selected_pipeline = Some("web-team".into());
+        state.pipelines = vec![PipelineInfo {
+            name: "web-team".into(),
+            orchestrator_model: "sonnet".into(),
+            members: vec![("reviewer".to_string(), "flash".to_string())],
+        }];
+
+        let json = serde_json::to_string(&state).expect("serializes");
+        assert!(
+            json.contains("\"selected_pipeline\":\"web-team\""),
+            "selected_pipeline must serialize as a top-level field; got: {json}"
+        );
+        assert!(
+            json.contains("\"pipelines\""),
+            "pipelines must serialize as a top-level field; got: {json}"
+        );
+
+        let parsed: AppState = serde_json::from_str(&json).expect("round-trips back");
+        assert_eq!(parsed.selected_pipeline, Some("web-team".into()));
+        assert_eq!(parsed.pipelines.len(), 1);
+        assert_eq!(parsed.pipelines[0].name, "web-team");
+        assert_eq!(parsed.pipelines[0].orchestrator_model, "sonnet");
+        assert_eq!(
+            parsed.pipelines[0].members,
+            vec![("reviewer".to_string(), "flash".to_string())]
+        );
+    }
+
+    /// The deleted legacy booleans (`pipeline_available`,
+    /// `subagents_enabled`) MUST NOT appear in the new snapshot when
+    /// serialized by the new code. Pin: a fresh `AppState` serializes
+    /// to a JSON document that does NOT contain either of those keys.
+    /// If a refactor keeps the fields around as dead state, this test
+    /// flags it (they should be gone, per plan §3).
+    #[test]
+    fn new_app_state_does_not_serialize_deleted_booleans() {
+        let state = AppState::new();
+        let json = serde_json::to_string(&state).expect("serializes");
+        assert!(
+            !json.contains("pipeline_available"),
+            "the deleted `pipeline_available` field must NOT appear in the new snapshot; got: {json}"
+        );
+        assert!(
+            !json.contains("subagents_enabled"),
+            "the deleted `subagents_enabled` field must NOT appear in the new snapshot; got: {json}"
+        );
     }
 
     #[test]

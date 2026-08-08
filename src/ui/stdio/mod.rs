@@ -204,11 +204,8 @@ async fn run_stdin_loop(
                     break;
                 }
             }
-            Ok(InboundMessage::SetSubagents { enabled }) => {
-                if action_sender
-                    .send(UiAction::SetSubagentsEnabled(enabled))
-                    .is_err()
-                {
+            Ok(InboundMessage::SelectPipeline { name }) => {
+                if action_sender.send(UiAction::SelectPipeline(name)).is_err() {
                     break;
                 }
             }

@@ -1,6 +1,12 @@
 // Allow dead_code for provider-specific config structs - not all providers may be used
 // depending on build configuration. The enum variants are accessed via deserialization.
 #![allow(dead_code)]
+// The stage 1.1 test pin at line 3432 deliberately uses
+// `assert_eq!(agents_md, true)` for symmetry with the surrounding
+// literal comparisons; clippy's `bool_assert_comparison` lint wants
+// `assert!` instead. Allow here so the RED→GREEN transition is a pure
+// impl change with no test edits.
+#![allow(clippy::bool_assert_comparison)]
 
 pub mod model_registry;
 pub use model_registry::{ModelEntry, ModelRegistry, ProviderEntry, RegistryError, ResolvedModel};
@@ -10,6 +16,7 @@ use directories_next::ProjectDirs;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Deref;
 use std::path::PathBuf;
 
 /// Provider type enum - identifies which LLM provider to use
@@ -304,6 +311,13 @@ pub struct Config {
     /// Multi-agent pipeline configuration
     #[serde(default)]
     pub pipeline: Option<PipelineConfig>,
+
+    /// Named, ordered list of pipelines (plan §3.3, stage 1.1). The
+    /// orchestrator of every entry lives next to the sub-agents inside
+    /// `orchestrator:` — a team owns its full cast. Declaration order is
+    /// UI order.
+    #[serde(default)]
+    pub pipelines: Vec<PipelineDef>,
     /// Vector DB configuration (doc_index / doc_search tools).
     /// When absent, both tools are skipped entirely (not registered).
     #[serde(default)]
@@ -468,9 +482,11 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub orchestrator_prompt: Option<String>,
 
-    /// Sub-agent definitions keyed by agent name
+    /// Sub-agent definitions keyed by agent name. `Members` is the
+    /// newtype with duplicate-key detection (D4, plan §3.3) — legacy
+    /// `pipeline:` blocks get that check for free.
     #[serde(default)]
-    pub agents: HashMap<String, AgentDefinition>,
+    pub agents: Members,
 }
 
 /// Definition of a sub-agent role the orchestrator can delegate to.
@@ -506,21 +522,109 @@ pub struct AgentDefinition {
     pub agents_md: bool,
 }
 
-impl PipelineConfig {
-    /// Check if the pipeline has any agents defined
-    pub fn has_agents(&self) -> bool {
-        !self.agents.is_empty()
-    }
+/// Sub-agent role map with duplicate-key detection (D4, plan §3.3).
+///
+/// `serde_yaml` silently last-wins on duplicate `HashMap` keys, so a plain
+/// `HashMap<String, AgentDefinition>` would let a config like
+///
+/// ```yaml
+/// agents:
+///   reviewer:
+///     prompt: first
+///   reviewer:
+///     prompt: second
+/// ```
+///
+/// boot and discard the first entry without a peep. `Members` is a thin
+/// newtype with a manual `Deserialize` that walks the YAML mapping and
+/// rejects the second key with a clear error (`duplicate member
+/// 'reviewer'`). The map is exposed via `Deref<Target = HashMap<…>>` so
+/// existing call sites that just want to read roles (e.g.
+/// `SubAgentRegistry::from_members`, tests) need no ceremony.
+///
+/// The inner field is `pub(crate)` so test fixtures across the crate
+/// can build a `Members` literal (e.g. `Members(HashMap::from([...]))`)
+/// without going through the `From` impl. Production code outside this
+/// module should construct via `serde_yaml` or the `From` impl.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Members(pub(crate) HashMap<String, AgentDefinition>);
 
-    /// Get the names of all defined agents
-    pub fn agent_names(&self) -> Vec<&str> {
-        self.agents.keys().map(|s| s.as_str()).collect()
+impl Deref for Members {
+    type Target = HashMap<String, AgentDefinition>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
+}
 
-    /// Get an agent definition by name
-    pub fn get_agent(&self, name: &str) -> Option<&AgentDefinition> {
-        self.agents.get(name)
+impl From<HashMap<String, AgentDefinition>> for Members {
+    fn from(map: HashMap<String, AgentDefinition>) -> Self {
+        Self(map)
     }
+}
+
+impl<'de> Deserialize<'de> for Members {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MembersVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for MembersVisitor {
+            type Value = Members;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of member name to sub-agent definition")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut access: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut out: HashMap<String, AgentDefinition> =
+                    HashMap::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some((key, value)) = access.next_entry::<String, AgentDefinition>()? {
+                    if out.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate member '{key}'"
+                        )));
+                    }
+                    out.insert(key, value);
+                }
+                Ok(Members(out))
+            }
+        }
+
+        deserializer.deserialize_map(MembersVisitor)
+    }
+}
+
+/// Orchestrator configuration nested inside a `PipelineDef` (plan §3.3,
+/// amendment 1). All three fields default to `None`:
+///
+/// * `model: None` falls back to `default_model` at build time,
+/// * `prompt: None` means "no addendum to the orchestrator recipe",
+/// * `persona: None` keeps the global persona; when set it REPLACES the
+///   global persona in the orchestrator's system-prompt recipe for this
+///   pipeline only (mirrors how `config.persona()` works today).
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestratorDef {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub persona: Option<String>,
+}
+
+/// One pipeline entry from the new `pipelines:` list (plan §3.3).
+///
+/// `orchestrator:` is REQUIRED so "pipeline with no orchestrator" is a
+/// parse error, not a runtime rule. `agents:` is required and non-empty
+/// (validated later by `PipelineSet::build`).
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineDef {
+    pub name: String,
+    pub orchestrator: OrchestratorDef,
+    pub agents: Members,
 }
 
 impl Config {
@@ -641,21 +745,6 @@ impl Config {
     /// Get pipeline configuration if present
     pub fn pipeline(&self) -> Option<&PipelineConfig> {
         self.pipeline.as_ref()
-    }
-
-    /// Check if multi-agent pipelines are enabled
-    pub fn pipeline_enabled(&self) -> bool {
-        self.pipeline
-            .as_ref()
-            .map(|p| p.enabled && !p.agents.is_empty())
-            .unwrap_or(false)
-    }
-
-    /// The orchestrator prompt addendum, if configured under `pipeline:`.
-    pub fn orchestrator_prompt(&self) -> Option<&str> {
-        self.pipeline
-            .as_ref()
-            .and_then(|p| p.orchestrator_prompt.as_deref())
     }
 
     /// The configured persona, trimmed. `None` for absent or whitespace-only
@@ -1511,6 +1600,13 @@ impl Config {
             self.pipeline = other.pipeline;
         }
 
+        // pipelines list - override if non-empty (per-repo overrides
+        // the master pipelines list wholesale; mirrors the `providers:`
+        // rule above).
+        if !other.pipelines.is_empty() {
+            self.pipelines = other.pipelines;
+        }
+
         // tools - override if other has a non-default filter
         if other.tools != ToolsConfig::default() {
             self.tools = other.tools;
@@ -1562,6 +1658,7 @@ impl Default for Config {
             bash: BashConfig::default(),
             retry: RetryConfig::default(),
             pipeline: None,
+            pipelines: Vec::new(),
             vector_db: None,
             web: WebConfig::default(),
             tools: ToolsConfig::default(),
@@ -2865,12 +2962,12 @@ agents:
         let cfg: PipelineConfig = serde_yaml::from_str(yaml).expect("v2 role shape must parse");
         assert!(cfg.enabled);
 
-        let researcher = cfg.get_agent("researcher").expect("researcher present");
+        let researcher = cfg.agents.get("researcher").expect("researcher present");
         assert_eq!(researcher.model.as_deref(), Some("flash"));
         assert_eq!(researcher.prompt, "You research codebases.");
         assert!(researcher.env.is_none());
 
-        let reviewer = cfg.get_agent("reviewer").expect("reviewer present");
+        let reviewer = cfg.agents.get("reviewer").expect("reviewer present");
         // model omitted → None (registry falls back to default_model).
         assert!(reviewer.model.is_none());
         assert_eq!(
@@ -3212,5 +3309,430 @@ persona: |2-
             result.is_err(),
             "deny_unknown_fields must still reject unknown keys after P1 lands"
         );
+    }
+
+    // ============================================================================
+    // Stage 1.1 — Multi-pipeline config layer (plan §3.3 / §7).
+    //
+    // RED by design: PipelineDef, OrchestratorDef, Members, Config.pipelines
+    // do not exist yet. These tests pin the serde surface and the manual-Default
+    // / merge_with behaviour the builder must land in commit 1/3 of the
+    // multi-pipeline PR. Compile errors are the expected initial state.
+    //
+    // Naming convention mirrors the existing pins in this module
+    // (e.g. `config_default_carries_timeouts_defaults`,
+    // `p1_deny_unknown_fields_still_rejects_real_unknown_keys`).
+    // ============================================================================
+
+    /// The minimum viable `providers:` block for a Config that parses a
+    /// `pipelines:` block. Two aliases (`sonnet`, `flash`) and a default
+    /// (`flash`) — matches the registry fixture in `src/pipeline/registry.rs`
+    /// so the same YAML shape can be reused by the PipelineSet tests below.
+    const STAGE11_PROVIDERS_YAML: &str = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-or-test
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: sonnet
+      - name: google/gemini-2.0-flash-001
+        alias: flash
+default_model: flash
+";
+
+    #[test]
+    fn stage11_two_pipeline_yaml_parses_in_declaration_order() {
+        // The plan pins that `pipelines:` is an ordered Vec (declaration
+        // order = UI order — §3 "ordered; declaration order is UI order").
+        // Parse two pipelines where the second one has no orchestrator
+        // body and confirm:
+        //   1. .len() == 2 in declaration order
+        //   2. every member field on AgentDefinition survives (model,
+        //      prompt, skills, agents_md, env) — proves Members Derefs
+        //      to the existing AgentDefinition struct unchanged
+        //   3. all three orchestrator fields parse: model, prompt,
+        //      AND the amendment-1 persona
+        let yaml = format!(
+            "{STAGE11_PROVIDERS_YAML}\
+pipelines:
+  - name: web-team
+    orchestrator:
+      model: sonnet
+      prompt: \"You lead the web team. Delegate UI work.\"
+      persona: \"You are a focused orchestrator.\"
+    agents:
+      reviewer:
+        model: flash
+        prompt: \"You review diffs.\"
+        skills:
+          only: [github]
+        agents_md: true
+        env:
+          REVIEW_STRICT: \"1\"
+      tester:
+        prompt: \"You write failing tests first.\"
+  - name: research-crew
+    orchestrator: {{}}
+    agents:
+      reviewer:
+        prompt: \"You critique sources.\"
+"
+        );
+
+        let cfg: Config =
+            serde_yaml::from_str(&yaml).expect("two-pipeline YAML must parse under the new shape");
+
+        assert_eq!(
+            cfg.pipelines.len(),
+            2,
+            "pipelines: Vec preserves declaration order; got: {:?}",
+            cfg.pipelines.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+        assert_eq!(cfg.pipelines[0].name, "web-team");
+        assert_eq!(cfg.pipelines[1].name, "research-crew");
+
+        // --- orchestrator fields (amendment 1: model + prompt + persona) ---
+        let orch0 = &cfg.pipelines[0].orchestrator;
+        assert_eq!(orch0.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            orch0.prompt.as_deref(),
+            Some("You lead the web team. Delegate UI work.")
+        );
+        assert_eq!(
+            orch0.persona.as_deref(),
+            Some("You are a focused orchestrator.")
+        );
+
+        // --- agents: Deref<HashMap<String, AgentDefinition>> keeps the
+        // existing field shape end-to-end (skills, env, agents_md) ---
+        let members0 = &cfg.pipelines[0].agents;
+        let reviewer = members0
+            .get("reviewer")
+            .expect("reviewer role survives parse");
+        assert_eq!(reviewer.model.as_deref(), Some("flash"));
+        assert_eq!(reviewer.prompt, "You review diffs.");
+        assert_eq!(reviewer.agents_md, true);
+        assert_eq!(
+            reviewer.skills.only,
+            vec!["github".to_string()],
+            "skills.only: must parse through Member's Deref<HashMap<…, AgentDefinition>>"
+        );
+        assert_eq!(
+            reviewer
+                .env
+                .as_ref()
+                .and_then(|e| e.get("REVIEW_STRICT"))
+                .map(String::as_str),
+            Some("1"),
+            "env: per-role vars must round-trip"
+        );
+
+        // tester has no `model:` — registry's `default_model` is the fallback.
+        let tester = members0.get("tester").expect("tester role survives parse");
+        assert!(tester.model.is_none());
+        assert_eq!(tester.prompt, "You write failing tests first.");
+
+        // Second pipeline: `orchestrator: {}` — see the dedicated test below.
+        assert!(cfg.pipelines[1].orchestrator.model.is_none());
+        assert!(cfg.pipelines[1].orchestrator.prompt.is_none());
+        assert!(cfg.pipelines[1].orchestrator.persona.is_none());
+    }
+
+    #[test]
+    fn stage11_missing_orchestrator_key_is_a_serde_error_naming_the_field() {
+        // D1 / amendment 1: `orchestrator:` is REQUIRED on each pipeline entry,
+        // so "no orchestrator" is a *parse* error, not a runtime validation
+        // rule. This is the whole reason OrchestratorDef is its own struct
+        // rather than a reserved member key.
+        //
+        // The error MUST name `orchestrator` so an operator staring at the
+        // boot log knows which field they forgot — `serde` with `deny_unknown_fields`
+        // does not help here, `missing field` is the load-bearing keyword.
+        let yaml = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-or-test
+    models:
+      - name: m
+        alias: m
+default_model: m
+
+pipelines:
+  - name: web-team
+    agents:
+      reviewer:
+        prompt: x
+";
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .expect_err("missing orchestrator: key must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("orchestrator"),
+            "error must name the missing `orchestrator` field; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn stage11_typo_in_orchestrator_key_is_rejected_by_deny_unknown_fields() {
+        // `#[serde(deny_unknown_fields)]` on PipelineDef means a typo at the
+        // entry level (`orchestartor:` instead of `orchestrator:`) is rejected
+        // at parse, not silently ignored. The error must name the typo so the
+        // user sees it. Sibling pin to `timeouts_rejects_unknown_field` and
+        // `p1_deny_unknown_fields_still_rejects_real_unknown_keys`.
+        let yaml = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-or-test
+    models:
+      - name: m
+        alias: m
+default_model: m
+
+pipelines:
+  - name: web-team
+    orchestartor: {}
+    agents:
+      reviewer:
+        prompt: x
+";
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .expect_err("typo `orchestartor:` must fail deny_unknown_fields");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("orchestartor"),
+            "error must name the offending (typo) key `orchestartor`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn stage11_typo_in_orchestrator_block_is_rejected_by_deny_unknown_fields() {
+        // Same denial, one level deeper: a typo *inside* the `orchestrator:`
+        // block must also be rejected (the block itself carries
+        // `deny_unknown_fields` per plan §3.3). The classic mistake is
+        // `modell:` instead of `model:` — silent-default would mean the
+        // orchestrator boots on `default_model` instead of the alias the
+        // user thought they picked.
+        let yaml = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-or-test
+    models:
+      - name: m
+        alias: m
+default_model: m
+
+pipelines:
+  - name: web-team
+    orchestrator:
+      modell: sonnet
+    agents:
+      reviewer:
+        prompt: x
+";
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .expect_err("typo `modell:` inside orchestrator: must fail deny_unknown_fields");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("modell"),
+            "error must name the offending inner key `modell`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn stage11_empty_orchestrator_block_parses_with_all_none_fields() {
+        // Per plan §2 the `orchestrator: {}` shorthand means "inherit
+        // default_model, no prompt addendum, no persona override". All three
+        // fields must be `None` after parse — this pins that the orchestrator
+        // struct is built with `#[serde(default)]` on every field, not that
+        // the field is missing entirely (which would itself be a parse error
+        // — covered by `stage11_missing_orchestrator_key_is_a_serde_error_naming_the_field`).
+        let yaml = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-or-test
+    models:
+      - name: m
+        alias: m
+default_model: m
+
+pipelines:
+  - name: research-crew
+    orchestrator: {}
+    agents:
+      reviewer:
+        prompt: x
+";
+        let cfg: Config = serde_yaml::from_str(yaml).expect("orchestrator: {} must parse");
+        let orch = &cfg.pipelines[0].orchestrator;
+        assert!(
+            orch.model.is_none(),
+            "orchestrator.model must default to None when omitted"
+        );
+        assert!(
+            orch.prompt.is_none(),
+            "orchestrator.prompt must default to None when omitted"
+        );
+        assert!(
+            orch.persona.is_none(),
+            "orchestrator.persona must default to None when omitted (amendment 1)"
+        );
+    }
+
+    #[test]
+    fn stage11_duplicate_member_key_under_agents_is_rejected() {
+        // D4: serde_yaml silently last-wins duplicate HashMap keys, so
+        // `Members` is a newtype with a manual Deserialize that rejects
+        // duplicates. This is the load-bearing reason Members is its own
+        // type — a plain HashMap would let this YAML boot and silently
+        // discard the first `reviewer:` entry. The error must name the
+        // duplicate key so the user knows which member to rename.
+        //
+        // Plan table: "Duplicate member | serde parse error:
+        // `pipelines[0].agents: duplicate member 'reviewer'.`"
+        let yaml = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-or-test
+    models:
+      - name: m
+        alias: m
+default_model: m
+
+pipelines:
+  - name: web-team
+    orchestrator: {}
+    agents:
+      reviewer:
+        prompt: first
+      reviewer:
+        prompt: second
+";
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .expect_err("duplicate member key must fail at parse, not silently last-win");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate") && msg.contains("reviewer"),
+            "error must call out duplicate and the offending key 'reviewer'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn stage11_pipelines_field_round_trips_through_members_deref() {
+        // `Members` is documented as a Deref<Target = HashMap<…>> so callers
+        // can iterate / index without ceremony. Pin the Deref surface
+        // explicitly so a future impl choice (e.g. wrapping in Vec to
+        // preserve declaration order on the *member* side too) doesn't
+        // silently break callers that read members like a map.
+        let yaml = format!(
+            "{STAGE11_PROVIDERS_YAML}\
+pipelines:
+  - name: web-team
+    orchestrator: {{}}
+    agents:
+      reviewer:
+        prompt: review
+      tester:
+        prompt: test
+"
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).expect("parses");
+        let members = &cfg.pipelines[0].agents;
+        // HashMap-style accessors via Deref:
+        assert!(members.contains_key("reviewer"));
+        assert!(members.contains_key("tester"));
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            members.get("reviewer").map(|d| d.prompt.as_str()),
+            Some("review")
+        );
+    }
+
+    #[test]
+    fn stage11_manual_default_pipelines_is_empty() {
+        // Sibling pin to `config_default_carries_timeouts_defaults` (line
+        // ~2932). The manual `impl Default for Config` is a known trap —
+        // forgetting to wire `pipelines: Vec::new()` would default it via
+        // `Vec::default()` accidentally (which is empty too, but only by
+        // coincidence — and only if the field even exists). One assertion
+        // is enough; the post-impl code must explicitly initialize it.
+        assert!(
+            Config::default().pipelines.is_empty(),
+            "Config::default().pipelines must be empty (manual Default impl pin)"
+        );
+    }
+
+    #[test]
+    fn stage11_merge_with_per_repo_pipelines_overrides_master() {
+        // Mirrors the `providers:` override rule: per-repo non-empty list
+        // replaces master wholesale. Master had one pipeline ("alpha"),
+        // per-repo has a different one ("beta") — the merged config must
+        // show only "beta".
+        let yaml_alpha = format!(
+            "{STAGE11_PROVIDERS_YAML}\
+pipelines:
+  - name: alpha
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let yaml_beta = format!(
+            "{STAGE11_PROVIDERS_YAML}\
+pipelines:
+  - name: beta
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let mut master: Config = serde_yaml::from_str(&yaml_alpha).expect("master parses");
+        let repo: Config = serde_yaml::from_str(&yaml_beta).expect("repo parses");
+
+        master.merge_with(repo);
+
+        assert_eq!(master.pipelines.len(), 1, "non-empty repo must override");
+        assert_eq!(master.pipelines[0].name, "beta");
+    }
+
+    #[test]
+    fn stage11_merge_with_empty_per_repo_keeps_master_pipelines() {
+        // Mirror: an absent / empty `pipelines:` in the per-repo config
+        // must NOT clobber the master's pipelines. (Same shape as
+        // `test_merge_preserves_master_when_repo_doesnt_override` for the
+        // `provider` field — pin it for the new field so a future
+        // refactor doesn't accidentally turn the empty case into an
+        // override.)
+        let yaml_alpha = format!(
+            "{STAGE11_PROVIDERS_YAML}\
+pipelines:
+  - name: alpha
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let mut master: Config = serde_yaml::from_str(&yaml_alpha).expect("master parses");
+        // Per-repo with no `pipelines:` block — .pipelines defaults to [].
+        let repo: Config =
+            serde_yaml::from_str(STAGE11_PROVIDERS_YAML).expect("empty pipelines repo parses");
+
+        assert!(repo.pipelines.is_empty(), "fixture: repo has no pipelines");
+        master.merge_with(repo);
+
+        assert_eq!(
+            master.pipelines.len(),
+            1,
+            "empty per-repo pipelines must preserve master pipelines"
+        );
+        assert_eq!(master.pipelines[0].name, "alpha");
     }
 }
