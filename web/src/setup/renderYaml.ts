@@ -7,7 +7,7 @@
  *   max_tokens?, temperature?, vision?, context_window_override? }] }]
  *   default_model: <alias>
  *   searxng / vector_db / tools / bash.env / context / cost_tracking /
- *   memory / timeouts / http / web / pipeline
+ *   memory / timeouts / http / web / pipelines
  *
  * Two deliberate rules:
  *  * Only *documented* keys are emitted. Things the wizard collects that have
@@ -20,6 +20,7 @@
  */
 
 import { PERSONA_PRESETS } from "./catalog";
+import { importedPipelines, pipelineName } from "./draft";
 import type { SetupDraft } from "./draft";
 
 const MASK = "****";
@@ -114,11 +115,25 @@ export function renderYaml(draft: SetupDraft, options: RenderOptions = {}): stri
   const h = draft.http;
   if (h.connectTimeoutSecs !== undefined || h.readTimeoutSecs !== undefined) { push(0, "http:"); if (h.connectTimeoutSecs !== undefined) push(1, `connect_timeout_secs: ${h.connectTimeoutSecs}`); if (h.readTimeoutSecs !== undefined) push(1, `read_timeout_secs: ${h.readTimeoutSecs}`); }
   if (draft.access.tls !== undefined) { push(0, "web:"); push(1, `tls: ${draft.access.tls}`); }
-  if (draft.pipeline.enabled) {
-    push(0, "pipeline:"); push(1, "enabled: true");
-    if (draft.pipeline.orchestratorPrompt) pushBlock(1, "orchestrator_prompt", draft.pipeline.orchestratorPrompt);
-    const agents = (draft.pipeline.agents ?? []).filter((a) => a.role);
-    if (agents.length) { push(1, "agents:"); for (const a of agents) { push(2, `${a.role}:`); if (a.model) push(3, `model: ${scalar(a.model)}`); if (a.prompt) pushBlock(3, "prompt", a.prompt); if (a.skills?.enabled === false) { push(3, "skills:"); push(4, "enabled: false"); } else if (a.skills?.only?.length) { push(3, "skills:"); pushList(4, "only", a.skills.only); } else if (a.skills?.disabled?.length) { push(3, "skills:"); pushList(4, "disabled", a.skills.disabled); } if (a.agentsMd) push(3, "agents_md: true"); const ae = Object.entries(a.env ?? {}); if (ae.length) { push(3, "env:"); for (const [k, value] of ae) push(4, `${k}: ${scalar(value)}`); } } }
+  // An imported `pipelines:` list rides along in passthrough and is emitted
+  // verbatim below — emitting the wizard's entry too would produce a duplicate
+  // top-level key (and silently drop one of the two teams).
+  const pipe = draft.pipeline;
+  if (pipe.include && !importedPipelines(draft)) {
+    push(0, "pipelines:");
+    push(1, `- name: ${scalar(pipelineName(pipe))}`);
+    // `orchestrator:` is required by the binary, and a childless key would
+    // parse as null; `{}` is the "all defaults" spelling.
+    if (pipe.orchestratorModel || pipe.orchestratorPrompt || pipe.orchestratorPersona) {
+      push(2, "orchestrator:");
+      if (pipe.orchestratorModel) push(3, `model: ${scalar(pipe.orchestratorModel)}`);
+      if (pipe.orchestratorPrompt) pushBlock(3, "prompt", pipe.orchestratorPrompt);
+      if (pipe.orchestratorPersona) pushBlock(3, "persona", pipe.orchestratorPersona);
+    } else {
+      push(2, "orchestrator: {}");
+    }
+    const agents = (pipe.agents ?? []).filter((a) => a.role);
+    if (agents.length) { push(2, "agents:"); for (const a of agents) { push(3, `${a.role}:`); if (a.model) push(4, `model: ${scalar(a.model)}`); if (a.prompt) pushBlock(4, "prompt", a.prompt); if (a.skills?.enabled === false) { push(4, "skills:"); push(5, "enabled: false"); } else if (a.skills?.only?.length) { push(4, "skills:"); pushList(5, "only", a.skills.only); } else if (a.skills?.disabled?.length) { push(4, "skills:"); pushList(5, "disabled", a.skills.disabled); } if (a.agentsMd) push(4, "agents_md: true"); const ae = Object.entries(a.env ?? {}); if (ae.length) { push(4, "env:"); for (const [k, value] of ae) push(5, `${k}: ${scalar(value)}`); } } }
   }
   for (const [key, value] of Object.entries(draft.passthrough)) {
     if (value === undefined) continue;

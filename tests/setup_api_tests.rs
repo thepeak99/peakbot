@@ -511,6 +511,138 @@ async fn post_yaml_with_tools_disabled_and_only_returns_422() {
     assert!(!cfg_path.exists(), "422 must NOT write to disk");
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3 — the `pipelines:` validator (plan §6.6). The endpoint runs the
+// same `PipelineSet::build` the binary runs at boot, so a team the binary
+// would refuse to start with never reaches disk.
+// ---------------------------------------------------------------------------
+
+/// `providers:` + `default_model:` prefix shared by the pipeline fixtures.
+const MODELS_YAML: &str = "providers:\n  - name: openrouter\n    type: openrouter\n    api_key: k\n    models:\n      - name: anthropic/claude-3.7-sonnet\n        alias: sonnet\ndefault_model: sonnet\n";
+
+/// Collect the `problems[]` array of an error envelope into one string.
+async fn problems_joined(resp: reqwest::Response) -> String {
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body.get("problems")
+        .and_then(|p| p.as_array())
+        .expect("problems[]")
+        .iter()
+        .map(|p| p.as_str().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+#[tokio::test]
+async fn post_valid_pipelines_list_returns_200() {
+    let cfg_dir = TempDir::new().unwrap();
+    let cfg_path = cfg_dir.path().join("config.yaml");
+    let (addr, _t) = spawn_setup(cfg_path.clone(), None).await;
+    let yaml = format!(
+        "{MODELS_YAML}pipelines:\n  - name: review-team\n    orchestrator:\n      model: sonnet\n      prompt: |2-\n        You lead a small team.\n    agents:\n      reviewer:\n        model: sonnet\n        prompt: |2-\n          Review diffs.\n"
+    );
+
+    let resp = bare_client()
+        .post(format!("http://{addr}/api/setup/config"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({ "yaml": yaml }).to_string())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "a valid pipelines list must be accepted"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        yaml,
+        "the reviewed bytes are what lands"
+    );
+}
+
+#[tokio::test]
+async fn post_pipelines_with_unknown_orchestrator_alias_returns_422_with_pipeline_message() {
+    let cfg_dir = TempDir::new().unwrap();
+    let cfg_path = cfg_dir.path().join("config.yaml");
+    let (addr, _t) = spawn_setup(cfg_path.clone(), None).await;
+    let yaml = format!(
+        "{MODELS_YAML}pipelines:\n  - name: review-team\n    orchestrator:\n      model: ghost\n    agents:\n      reviewer:\n        prompt: Review diffs.\n"
+    );
+
+    let resp = bare_client()
+        .post(format!("http://{addr}/api/setup/config"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({ "yaml": yaml }).to_string())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 422, "unknown orchestrator alias must be 422");
+    let joined = problems_joined(resp).await;
+    assert!(
+        joined.contains("pipeline 'review-team'")
+            && joined.contains("orchestrator names unknown model alias 'ghost'"),
+        "problems[] must carry the PipelineSet message verbatim; got: {joined}"
+    );
+    assert!(!cfg_path.exists(), "422 must NOT write to disk");
+}
+
+#[tokio::test]
+async fn post_pipeline_with_no_members_returns_422() {
+    let cfg_dir = TempDir::new().unwrap();
+    let cfg_path = cfg_dir.path().join("config.yaml");
+    let (addr, _t) = spawn_setup(cfg_path.clone(), None).await;
+    let yaml = format!(
+        "{MODELS_YAML}pipelines:\n  - name: solo\n    orchestrator: {{}}\n    agents: {{}}\n"
+    );
+
+    let resp = bare_client()
+        .post(format!("http://{addr}/api/setup/config"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({ "yaml": yaml }).to_string())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 422, "a memberless pipeline must be 422");
+    let joined = problems_joined(resp).await;
+    assert!(
+        joined.contains("pipeline 'solo'") && joined.contains("at least one sub-agent"),
+        "problems[] must name the empty team; got: {joined}"
+    );
+    assert!(!cfg_path.exists(), "422 must NOT write to disk");
+}
+
+#[tokio::test]
+async fn post_legacy_pipeline_block_returns_422_with_migration_hint() {
+    // Amendment 5: the legacy block is a hard boot error, so the wizard
+    // must refuse it here rather than write a config that cannot start.
+    let cfg_dir = TempDir::new().unwrap();
+    let cfg_path = cfg_dir.path().join("config.yaml");
+    let (addr, _t) = spawn_setup(cfg_path.clone(), None).await;
+    let yaml = format!(
+        "{MODELS_YAML}pipeline:\n  enabled: true\n  orchestrator_prompt: You lead a small team.\n  agents:\n    reviewer:\n      prompt: Review diffs.\n"
+    );
+
+    let resp = bare_client()
+        .post(format!("http://{addr}/api/setup/config"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({ "yaml": yaml }).to_string())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 422, "the legacy pipeline block must be 422");
+    let joined = problems_joined(resp).await;
+    assert!(
+        joined.contains("legacy 'pipeline:' block is no longer supported")
+            && joined.contains("pipelines:"),
+        "problems[] must carry the migration recipe; got: {joined}"
+    );
+    assert!(!cfg_path.exists(), "422 must NOT write to disk");
+}
+
 #[tokio::test]
 async fn post_when_config_exists_creates_backup_with_old_bytes() {
     let cfg_dir = TempDir::new().unwrap();

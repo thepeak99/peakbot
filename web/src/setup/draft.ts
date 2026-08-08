@@ -117,9 +117,22 @@ export type PipelineAgentDraft = {
   env?: Record<string, string>;
 };
 
+/** One entry of the `pipelines:` list. The wizard writes at most one team;
+ *  configs with several are imported read-only (see {@link importedPipelines}).
+ *
+ *  `include` replaced the legacy `enabled` flag: `pipelines:` has no
+ *  `enabled:` key, so the boolean now only decides whether the wizard emits
+ *  an entry at all. */
 export type PipelineDraft = {
-  enabled?: boolean;
+  include?: boolean;
+  /** Typed after `/pipeline`, so `^[A-Za-z0-9_.-]+$`. Unset → "default". */
+  name?: string;
+  /** Orchestrator alias; omitted → default_model. */
+  orchestratorModel?: string;
+  /** Addendum to the orchestrator's recipe (not a whole persona). */
   orchestratorPrompt?: string;
+  /** Replaces the global persona for this pipeline's orchestrator. */
+  orchestratorPersona?: string;
   agents?: PipelineAgentDraft[];
 };
 
@@ -195,7 +208,26 @@ export function defaultSetupDraft(): SetupDraft {
 /** Alias charset from agents.md: `^[A-Za-z0-9_./:-]+$`. */
 export const ALIAS_PATTERN = /^[A-Za-z0-9_./:-]+$/;
 
+/** Pipeline-name charset from `PipelineSet::build`: no spaces, because the
+ *  name is typed after `/pipeline`. */
+export const PIPELINE_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 
+/** Name used when the user never touches the field. */
+export const DEFAULT_PIPELINE_NAME = "default";
+
+/** Reserved pipeline name — it means "no pipeline". */
+export const RESERVED_PIPELINE_NAME = "none";
+
+/** The name that will be emitted for a draft pipeline. */
+export function pipelineName(pipeline: PipelineDraft): string {
+  return pipeline.name ?? DEFAULT_PIPELINE_NAME;
+}
+
+// `pipelines` is deliberately absent: an imported multi-pipeline config must
+// pass through verbatim, and owning the key would let the wizard silently
+// delete the user's teams. The legacy `pipeline` key stays owned — it is a
+// hard boot error now, so dropping it is the migration, and keeping it out of
+// passthrough is also what stops the wizard writing both shapes at once.
 const OWNED_KEYS = new Set([
   "providers", "default_model", "persona", "searxng", "vector_db", "tools", "bash",
   "context", "cost_tracking", "agent_max_turns", "memory", "timeouts", "http", "web", "pipeline",
@@ -262,6 +294,18 @@ function countModels(draft: SetupDraft): number {
   return draft.providers.reduce((n, p) => n + (p.models?.length ?? 0), 0);
 }
 
+/** The `pipelines:` entries an imported config brought along, or `undefined`
+ *  when there are none. They live in `passthrough` because `pipelines` is not
+ *  an owned key; their presence is the wizard's "hands off" signal — the
+ *  Multi-agent step goes read-only and renderYaml emits only the passthrough
+ *  copy. A non-array value still counts as present: a config we cannot read is
+ *  even less ours to rewrite. */
+export function importedPipelines(draft: SetupDraft): unknown[] | undefined {
+  const value = draft.passthrough.pipelines;
+  if (value === undefined) return undefined;
+  return Array.isArray(value) ? value : [];
+}
+
 // ---------- validators ------------------------------------------------------
 
 /** Errors from step 4 (Models). Empty array = valid. */
@@ -314,13 +358,44 @@ export function validateServices(draft: SetupDraft): string[] {
   return [];
 }
 
-/** Errors from step 9 (Multi-agent). Re-runs after step 4 edits; role
- *  `model` aliases must resolve against the live models slice. */
+/** Errors from step 9 (Multi-agent). Mirrors the rules `PipelineSet::build`
+ *  enforces at boot (plan §3.4), so the wizard refuses locally what the binary
+ *  would refuse to start with. Re-runs after step 4 edits; every `model` here
+ *  must resolve against the live models slice. */
 export function validateMultiAgent(draft: SetupDraft): string[] {
-  if (!draft.pipeline.enabled) return [];
+  // An imported `pipelines:` list is passthrough — not ours to judge.
+  if (importedPipelines(draft)) return [];
+  const pipeline = draft.pipeline;
+  if (!pipeline.include) return [];
   const aliases = collectAliases(draft);
   const errors: string[] = [];
-  for (const agent of draft.pipeline.agents ?? []) {
+
+  const name = pipelineName(pipeline);
+  if (!name.trim()) {
+    errors.push("The pipeline needs a name — it is what you type after /pipeline.");
+  } else if (name === RESERVED_PIPELINE_NAME) {
+    errors.push(`"${name}" is a reserved pipeline name — it means "no pipeline".`);
+  } else if (!PIPELINE_NAME_PATTERN.test(name)) {
+    errors.push(
+      `Pipeline name "${name}" is outside ${PIPELINE_NAME_PATTERN.source} — no spaces, you type it after /pipeline.`,
+    );
+  }
+
+  // An omitted orchestrator model is legal — it falls back to default_model.
+  if (pipeline.orchestratorModel && !aliases.includes(pipeline.orchestratorModel)) {
+    errors.push(
+      `The orchestrator points at model alias "${pipeline.orchestratorModel}", which no longer exists in the Models step.`,
+    );
+  }
+
+  const agents = pipeline.agents ?? [];
+  // Rows without a role are dropped by renderYaml, so they cannot count as
+  // members: the emitted entry would have no `agents:` map, which the binary
+  // rejects at parse time.
+  if (agents.filter((a) => a.role?.trim()).length === 0) {
+    errors.push(`Pipeline "${name}" needs at least one sub-agent role.`);
+  }
+  for (const agent of agents) {
     // An omitted model is legal — the role falls back to default_model.
     if (!agent.model) continue;
     if (!aliases.includes(agent.model)) {

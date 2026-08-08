@@ -1,16 +1,21 @@
 import { describe, it, expect } from "vitest";
 import {
   ALIAS_PATTERN,
+  DEFAULT_PIPELINE_NAME,
   RESERVED_ALIAS,
   classifyChange,
   collectAliases,
+  configJsonToDraft,
   defaultSetupDraft,
+  importedPipelines,
+  pipelineName,
   validateAccess,
   validateDraft,
   validateModels,
   validateMultiAgent,
   validateServices,
 } from "./draft";
+import type { PipelineDraft } from "./draft";
 
 // ---------- helpers ---------------------------------------------------------
 
@@ -161,33 +166,27 @@ describe("validateServices tools XOR (disabled vs only)", () => {
 // ---------- validateMultiAgent ----------------------------------------------
 
 describe("validateMultiAgent (live re-validation against models slice)", () => {
-  it("accepts when pipeline is not enabled (no role checks fire)", () => {
+  it("accepts when the draft declares no pipeline (no role checks fire)", () => {
     const draft = oneModelDraft({ alias: "sonnet", defaultModel: "sonnet" });
-    draft.pipeline = { enabled: false, agents: [{ role: "pm", model: "ghost" }] };
-    expect(validateMultiAgent(draft)).toEqual([]);
-  });
-
-  it("accepts when no agents are declared", () => {
-    const draft = oneModelDraft({ alias: "sonnet", defaultModel: "sonnet" });
-    draft.pipeline = { enabled: true };
+    draft.pipeline = { include: false, agents: [{ role: "pm", model: "ghost" }] };
     expect(validateMultiAgent(draft)).toEqual([]);
   });
 
   it("accepts a role whose model references a declared alias", () => {
     const draft = oneModelDraft({ alias: "sonnet", defaultModel: "sonnet" });
-    draft.pipeline = { enabled: true, agents: [{ role: "pm", model: "sonnet", prompt: "…" }] };
+    draft.pipeline = { include: true, agents: [{ role: "pm", model: "sonnet", prompt: "…" }] };
     expect(validateMultiAgent(draft)).toEqual([]);
   });
 
   it("accepts a role that omits model (→ resolves to default_model later)", () => {
     const draft = oneModelDraft({ alias: "sonnet", defaultModel: "sonnet" });
-    draft.pipeline = { enabled: true, agents: [{ role: "pm", prompt: "…" }] };
+    draft.pipeline = { include: true, agents: [{ role: "pm", prompt: "…" }] };
     expect(validateMultiAgent(draft)).toEqual([]);
   });
 
   it("rejects a role whose model references an undeclared alias", () => {
     const draft = oneModelDraft({ alias: "sonnet", defaultModel: "sonnet" });
-    draft.pipeline = { enabled: true, agents: [{ role: "pm", model: "ghost", prompt: "…" }] };
+    draft.pipeline = { include: true, agents: [{ role: "pm", model: "ghost", prompt: "…" }] };
     const errs = validateMultiAgent(draft);
     expect(hasErrorContaining(errs, "ghost")).toBe(true);
     expect(hasErrorContaining(errs, "pm")).toBe(true);
@@ -196,7 +195,7 @@ describe("validateMultiAgent (live re-validation against models slice)", () => {
   it("re-runs after models edits — removing an alias breaks the pipeline", () => {
     // 1. Start clean: pipeline references "sonnet", which exists.
     const draft = oneModelDraft({ alias: "sonnet", defaultModel: "sonnet" });
-    draft.pipeline = { enabled: true, agents: [{ role: "pm", model: "sonnet", prompt: "…" }] };
+    draft.pipeline = { include: true, agents: [{ role: "pm", model: "sonnet", prompt: "…" }] };
     expect(validateMultiAgent(draft)).toEqual([]);
 
     // 2. User edits step 4 — the alias they removed is "sonnet" itself.
@@ -205,6 +204,116 @@ describe("validateMultiAgent (live re-validation against models slice)", () => {
 
     const errs = validateMultiAgent(draft);
     expect(hasErrorContaining(errs, "sonnet")).toBe(true);
+  });
+});
+
+// ---------- validateMultiAgent — the pipelines-list rules -------------------
+//
+// These mirror `PipelineSet::build`'s validation table (plan §3.4): the
+// wizard refuses locally what the binary would refuse at boot.
+
+describe("validateMultiAgent (pipeline name / orchestrator / members)", () => {
+  /** A draft with one model and one legal pipeline. */
+  function pipelineDraft(pipeline: Partial<PipelineDraft> = {}) {
+    const draft = oneModelDraft({ alias: "sonnet", defaultModel: "sonnet" });
+    draft.pipeline = {
+      include: true,
+      agents: [{ role: "pm", prompt: "…" }],
+      ...pipeline,
+    };
+    return draft;
+  }
+
+  it("accepts a pipeline that omits the name (→ the default name)", () => {
+    expect(validateMultiAgent(pipelineDraft())).toEqual([]);
+    expect(pipelineName(pipelineDraft().pipeline)).toBe(DEFAULT_PIPELINE_NAME);
+  });
+
+  it("accepts an explicit legal name", () => {
+    expect(validateMultiAgent(pipelineDraft({ name: "review-team.2" }))).toEqual([]);
+  });
+
+  it("rejects an empty name (the user cleared the field)", () => {
+    const errs = validateMultiAgent(pipelineDraft({ name: "  " }));
+    expect(hasErrorContaining(errs, "name")).toBe(true);
+  });
+
+  it("rejects a name with spaces — it is typed after /pipeline", () => {
+    const errs = validateMultiAgent(pipelineDraft({ name: "review team" }));
+    expect(hasErrorContaining(errs, "review team")).toBe(true);
+    expect(hasErrorContaining(errs, "/pipeline")).toBe(true);
+  });
+
+  it("rejects the reserved name `none`", () => {
+    const errs = validateMultiAgent(pipelineDraft({ name: "none" }));
+    expect(hasErrorContaining(errs, "none")).toBe(true);
+    expect(hasErrorContaining(errs, "reserved")).toBe(true);
+  });
+
+  it("accepts an orchestrator model that resolves against a declared alias", () => {
+    expect(validateMultiAgent(pipelineDraft({ orchestratorModel: "sonnet" }))).toEqual([]);
+  });
+
+  it("accepts an omitted orchestrator model (→ default_model)", () => {
+    expect(validateMultiAgent(pipelineDraft({ orchestratorModel: undefined }))).toEqual([]);
+  });
+
+  it("rejects an orchestrator model that resolves to nothing", () => {
+    const errs = validateMultiAgent(pipelineDraft({ orchestratorModel: "ghost" }));
+    expect(hasErrorContaining(errs, "orchestrator")).toBe(true);
+    expect(hasErrorContaining(errs, "ghost")).toBe(true);
+  });
+
+  it("rejects a pipeline with zero members", () => {
+    const errs = validateMultiAgent(pipelineDraft({ agents: [] }));
+    expect(hasErrorContaining(errs, "at least one")).toBe(true);
+  });
+
+  it("rejects a pipeline whose only member row has no role yet", () => {
+    // A role-less row is dropped by renderYaml, so it cannot count as a
+    // member: the emitted entry would have no `agents:` map at all.
+    const errs = validateMultiAgent(pipelineDraft({ agents: [{ model: "sonnet" }] }));
+    expect(hasErrorContaining(errs, "at least one")).toBe(true);
+  });
+
+  it("stays silent when the imported config already carries `pipelines:`", () => {
+    // Passthrough pipelines are not the wizard's to validate or rewrite.
+    const draft = pipelineDraft({ name: "none", agents: [] }); // would fail twice
+    draft.passthrough.pipelines = [{ name: "imported" }];
+    expect(validateMultiAgent(draft)).toEqual([]);
+  });
+});
+
+// ---------- importedPipelines ------------------------------------------------
+
+describe("importedPipelines (passthrough is the wizard's hands-off signal)", () => {
+  it("returns undefined when the draft has no passthrough pipelines", () => {
+    expect(importedPipelines(defaultSetupDraft())).toBeUndefined();
+  });
+
+  it("returns the imported entries verbatim", () => {
+    const draft = defaultSetupDraft();
+    const entries = [{ name: "a" }, { name: "b" }];
+    draft.passthrough.pipelines = entries;
+    expect(importedPipelines(draft)).toEqual(entries);
+  });
+
+  it("`pipelines` is NOT an owned key — an imported list survives the round trip", () => {
+    // Adding it to OWNED_KEYS would let the wizard silently delete the
+    // user's teams; instead they ride along in passthrough.
+    const draft = configJsonToDraft({
+      pipelines: [{ name: "team", orchestrator: { model: "sonnet" }, agents: { pm: {} } }],
+    });
+    expect(importedPipelines(draft)).toEqual([
+      { name: "team", orchestrator: { model: "sonnet" }, agents: { pm: {} } },
+    ]);
+  });
+
+  it("drops the legacy `pipeline` block instead of passing it through", () => {
+    // Legacy stays owned: it hard-errors at boot, and keeping it out of
+    // passthrough also stops the wizard writing both shapes at once.
+    const draft = configJsonToDraft({ pipeline: { enabled: true, agents: { pm: {} } } });
+    expect(draft.passthrough.pipeline).toBeUndefined();
   });
 });
 
@@ -242,7 +351,7 @@ describe("validateDraft", () => {
     ];
     draft.services = { tools: { disabled: ["a"], only: ["b"] } }; // XOR
     draft.access = { mode: "lan" }; // missing token
-    draft.pipeline = { enabled: true, agents: [{ role: "pm", model: "ghost" }] }; // alias ref
+    draft.pipeline = { include: true, agents: [{ role: "pm", model: "ghost" }] }; // alias ref
 
     const all = validateDraft(draft);
     expect(all.length).toBeGreaterThanOrEqual(3);
@@ -273,7 +382,7 @@ describe("classifyChange (restart matrix from agents.md)", () => {
     "tools",
     "skills",
   ];
-  const BOOT_ONLY = ["mcp_servers", "vector_db", "web", "pipeline", "http"];
+  const BOOT_ONLY = ["mcp_servers", "vector_db", "web", "pipeline", "pipelines", "http"];
 
   for (const k of RELOAD_SAFE) {
     it(`classifies ${k} as reload-safe`, () => {

@@ -19,6 +19,7 @@
 //! `require_token` as `/ws` and `/commands`.
 
 use crate::config::{Config, save_config_at};
+use crate::pipeline::PipelineSet;
 use axum::{
     Router,
     body::Body,
@@ -699,8 +700,8 @@ fn read_existing(path: &std::path::Path) -> ExistingConfig {
 
 /// POST /api/setup/config — validate the YAML, then write the verbatim bytes.
 /// Plan §A-Q4 pipeline: parse → tools validate → timeouts validate → registry
-/// build → write. Every failure becomes a 422 envelope; the file is never
-/// touched on failure.
+/// build → pipelines build → write. Every failure becomes a 422 envelope; the
+/// file is never touched on failure.
 async fn post_config(State(state): State<Arc<SetupState>>, req: Request<Body>) -> Response {
     if let Err(resp) = require_json_content_type(&req) {
         return *resp;
@@ -742,15 +743,26 @@ async fn post_config(State(state): State<Arc<SetupState>>, req: Request<Body>) -
 
     // Step 4 — model registry build. Alias charset, reserved `unknown`,
     // uniqueness, default_model resolution.
-    if let Err(e) = cfg.build_model_registry() {
-        problems.push(e.to_string());
+    match cfg.build_model_registry() {
+        Ok(registry) => {
+            // Step 5 — pipelines. The same validator the binary runs at
+            // boot, so a team that cannot start never reaches disk (and the
+            // legacy `pipeline:` block is refused here with its migration
+            // recipe). `None` for `known_skills` skips the per-role
+            // skill-name check: the wizard does no skill discovery, and
+            // guessing would reject configs the binary accepts.
+            if let Err(e) = PipelineSet::build(&cfg, &registry, None) {
+                problems.push(e.to_string());
+            }
+        }
+        Err(e) => problems.push(e.to_string()),
     }
 
     if !problems.is_empty() {
         return ApiError::validation(problems);
     }
 
-    // Step 5 — write. This is the only mutating call. The CFG is fully
+    // Step 6 — write. This is the only mutating call. The CFG is fully
     // validated at this point; the bytes written are the reviewed YAML
     // verbatim (plan §A-Q4 ruling: "what you review is byte-for-byte
     // what lands").
