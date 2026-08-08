@@ -476,7 +476,9 @@ mod tests {
         let pipeline_config = PipelineConfig {
             enabled: false,
             orchestrator_prompt: None,
-            agents: std::collections::HashMap::new(),
+            // Stage 1.1: `agents` is a `Members` newtype (duplicate-key
+            // detection on parse). `HashMap::new()` is the empty default.
+            agents: crate::config::Members(std::collections::HashMap::new()),
         };
         let registry = SubAgentRegistry::new(&pipeline_config, &model_registry, &[])
             .expect("empty role registry builds");

@@ -6,7 +6,7 @@
 //! [`crate::pipeline::SubAgentDeps`], which owns the orchestrator's build
 //! context (tools, env, event sink) — the registry itself stays lean.
 
-use crate::config::{ModelRegistry, PipelineConfig, ResolvedModel, SkillFilter};
+use crate::config::{Members, ModelRegistry, PipelineConfig, ResolvedModel, SkillFilter};
 use std::collections::HashMap;
 
 /// A role resolved against the model registry, ready to build.
@@ -30,9 +30,15 @@ pub struct SubAgentRegistry {
 }
 
 impl SubAgentRegistry {
-    /// Build the registry from pipeline config, resolving every role's
-    /// `model:` alias against `model_registry` and validating each role's
-    /// `skills:` filter against `known_skills` (the discovered skill names).
+    /// Build the registry from a legacy `PipelineConfig`, resolving every
+    /// role's `model:` alias against `model_registry` and validating each
+    /// role's `skills:` filter against `known_skills` (the discovered
+    /// skill names).
+    ///
+    /// Thin shim over [`SubAgentRegistry::from_members`]. Stage 1.1 keeps
+    /// this signature for any pre-existing callers (notably the
+    /// `PipelineConfig`-shaped tests in this module); Stage 1.2 removes
+    /// it once the runtime stops reading `Config::pipeline` directly.
     ///
     /// # Errors
     /// - empty role name,
@@ -44,9 +50,27 @@ impl SubAgentRegistry {
         model_registry: &ModelRegistry,
         known_skills: &[String],
     ) -> Result<Self, SubAgentError> {
-        let mut roles = HashMap::with_capacity(pipeline_config.agents.len());
+        Self::from_members(&pipeline_config.agents, model_registry, known_skills)
+    }
 
-        for (name, def) in &pipeline_config.agents {
+    /// Build a registry from a `Members` map (plan §3.3). The shape
+    /// `PipelineSet::build` uses — narrower than `new` so the new code
+    /// path doesn't need to drag a `PipelineConfig` through it. Existing
+    /// callers of `new` are unchanged; this constructor sits alongside.
+    ///
+    /// # Errors
+    /// - empty role name,
+    /// - empty prompt,
+    /// - a `model:` alias not present in the registry,
+    /// - a `skills:` filter that sets both lists or names an unknown skill.
+    pub fn from_members(
+        members: &Members,
+        model_registry: &ModelRegistry,
+        known_skills: &[String],
+    ) -> Result<Self, SubAgentError> {
+        let mut roles = HashMap::with_capacity(members.len());
+
+        for (name, def) in members.iter() {
             if name.is_empty() {
                 return Err(SubAgentError::EmptyRoleName);
             }
@@ -135,7 +159,9 @@ pub enum SubAgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentDefinition, ModelEntry, ModelRegistry, ProviderEntry, ProviderType};
+    use crate::config::{
+        AgentDefinition, Members, ModelEntry, ModelRegistry, ProviderEntry, ProviderType,
+    };
     use std::collections::HashMap;
 
     /// A two-model registry: `flash` (default) and `sonnet`.
@@ -185,10 +211,16 @@ mod tests {
         PipelineConfig {
             enabled: true,
             orchestrator_prompt: None,
-            agents: agents
-                .into_iter()
-                .map(|(n, d)| (n.to_string(), d))
-                .collect(),
+            // Stage 1.1: `agents` is a `Members` newtype (duplicate-key
+            // detection). Wrap the literal HashMap — the field is no
+            // longer a plain `HashMap`, just a structural signature drift
+            // in the test fixture.
+            agents: Members(
+                agents
+                    .into_iter()
+                    .map(|(n, d)| (n.to_string(), d))
+                    .collect(),
+            ),
         }
     }
 
