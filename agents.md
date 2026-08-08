@@ -439,7 +439,7 @@ Declare one or more named teams under `pipelines:`. Each team owns its full cast
 
 ```yaml
 pipelines:
-  - name: my-team                    # ^[A-Za-z0-9_.-]+$, unique, not "none"
+  - name: my-team                    # ^[A-Za-z0-9_ .-]+$, trimmed, unique, not "none"
     orchestrator:                    # REQUIRED
       model: sonnet                  # optional — falls back to default_model
       prompt: |                      # optional addendum to the orchestrator recipe
@@ -474,7 +474,7 @@ pipelines:
 Selection is per-conversation, persisted as `Conversation.pipeline`, and locked after the first turn (flipping `delegate` mid-conversation desyncs the tool list from wire history).
 
 - **`/pipeline`** (no arg) — lists available pipelines and the current selection.
-- **`/pipeline <name>`** — selects that pipeline (pre-first-turn only).
+- **`/pipeline <name>`** — selects that pipeline (pre-first-turn only). The name is the **rest of the line**, so spaced names work: `/pipeline Generic Dev Team`. Names are case-sensitive and trimmed.
 - **`/pipeline none`** — clears selection (single agent mode).
 - **Web UI** — Agents tab has a pipeline selector (radio buttons: "None" + one per pipeline).
 - **`/new`** keeps the current selection. Fresh sessions start at "none".

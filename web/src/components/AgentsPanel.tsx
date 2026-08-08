@@ -174,10 +174,15 @@ export function AgentsPanel({
                 onChange={() => onSelectPipeline(p.name)}
                 className="h-3.5 w-3.5 accent-sky-500"
               />
-              <span className="flex-1 truncate font-medium">{p.name}</span>
-              <span className="shrink-0 text-[10px] text-zinc-500">
-                🎬 {p.orchestrator_model} · {p.members.length} sub-agent
-                {p.members.length === 1 ? "" : "s"}
+              {/* Two lines: pipeline names can be long (and may now contain
+                  spaces), so the name gets its own full-width line instead of
+                  being truncated by the meta text sharing the row. */}
+              <span className="flex min-w-0 flex-1 flex-col">
+                <span className="font-medium break-words">{p.name}</span>
+                <span className="text-[10px] text-zinc-500">
+                  🎬 {p.orchestrator_model} · {p.members.length} sub-agent
+                  {p.members.length === 1 ? "" : "s"}
+                </span>
               </span>
             </label>
           </li>

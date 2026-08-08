@@ -562,6 +562,32 @@ async fn post_valid_pipelines_list_returns_200() {
 }
 
 #[tokio::test]
+async fn post_pipeline_name_with_spaces_returns_200() {
+    // `/pipeline` takes the rest of the line, so a spaced name is legal and
+    // the endpoint must not refuse what the binary now boots with.
+    let cfg_dir = TempDir::new().unwrap();
+    let cfg_path = cfg_dir.path().join("config.yaml");
+    let (addr, _t) = spawn_setup(cfg_path.clone(), None).await;
+    let yaml = format!(
+        "{MODELS_YAML}pipelines:\n  - name: \"Generic Dev Team\"\n    orchestrator:\n      model: sonnet\n    agents:\n      reviewer:\n        prompt: Review diffs.\n"
+    );
+
+    let resp = bare_client()
+        .post(format!("http://{addr}/api/setup/config"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({ "yaml": yaml }).to_string())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "a pipeline name with spaces must be accepted"
+    );
+}
+
+#[tokio::test]
 async fn post_pipelines_with_unknown_orchestrator_alias_returns_422_with_pipeline_message() {
     let cfg_dir = TempDir::new().unwrap();
     let cfg_path = cfg_dir.path().join("config.yaml");

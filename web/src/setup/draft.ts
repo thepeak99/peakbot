@@ -125,7 +125,8 @@ export type PipelineAgentDraft = {
  *  an entry at all. */
 export type PipelineDraft = {
   include?: boolean;
-  /** Typed after `/pipeline`, so `^[A-Za-z0-9_.-]+$`. Unset → "default". */
+  /** Typed after `/pipeline` (rest of the line), so `^[A-Za-z0-9_ .-]+$`.
+   *  Trimmed; unset → "default". */
   name?: string;
   /** Orchestrator alias; omitted → default_model. */
   orchestratorModel?: string;
@@ -208,9 +209,9 @@ export function defaultSetupDraft(): SetupDraft {
 /** Alias charset from agents.md: `^[A-Za-z0-9_./:-]+$`. */
 export const ALIAS_PATTERN = /^[A-Za-z0-9_./:-]+$/;
 
-/** Pipeline-name charset from `PipelineSet::build`: no spaces, because the
- *  name is typed after `/pipeline`. */
-export const PIPELINE_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
+/** Pipeline-name charset from `PipelineSet::build`: spaces allowed, because
+ *  `/pipeline` takes the rest of the line. */
+export const PIPELINE_NAME_PATTERN = /^[A-Za-z0-9_ .-]+$/;
 
 /** Name used when the user never touches the field. */
 export const DEFAULT_PIPELINE_NAME = "default";
@@ -218,9 +219,10 @@ export const DEFAULT_PIPELINE_NAME = "default";
 /** Reserved pipeline name — it means "no pipeline". */
 export const RESERVED_PIPELINE_NAME = "none";
 
-/** The name that will be emitted for a draft pipeline. */
+/** The normalized name that will be emitted for a draft pipeline. Leading and
+ *  trailing whitespace are trimmed to match `PipelineSet::build` behavior. */
 export function pipelineName(pipeline: PipelineDraft): string {
-  return pipeline.name ?? DEFAULT_PIPELINE_NAME;
+  return (pipeline.name ?? DEFAULT_PIPELINE_NAME).trim();
 }
 
 // `pipelines` is deliberately absent: an imported multi-pipeline config must
@@ -370,15 +372,15 @@ export function validateMultiAgent(draft: SetupDraft): string[] {
   const aliases = collectAliases(draft);
   const errors: string[] = [];
 
+  // `pipelineName` already trimmed, so a whitespace-only field reads as empty
+  // here — same collapse `PipelineSet::build` does before its empty-name check.
   const name = pipelineName(pipeline);
-  if (!name.trim()) {
+  if (!name) {
     errors.push("The pipeline needs a name — it is what you type after /pipeline.");
   } else if (name === RESERVED_PIPELINE_NAME) {
     errors.push(`"${name}" is a reserved pipeline name — it means "no pipeline".`);
   } else if (!PIPELINE_NAME_PATTERN.test(name)) {
-    errors.push(
-      `Pipeline name "${name}" is outside ${PIPELINE_NAME_PATTERN.source} — no spaces, you type it after /pipeline.`,
-    );
+    errors.push(`Pipeline name "${name}" is outside ${PIPELINE_NAME_PATTERN.source}.`);
   }
 
   // An omitted orchestrator model is legal — it falls back to default_model.

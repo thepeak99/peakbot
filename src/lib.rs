@@ -4896,6 +4896,51 @@ mod tests {
     }
 
     #[test]
+    fn classify_pipeline_bare_lists() {
+        assert!(matches!(
+            classify_submission("/pipeline"),
+            SubmitKind::PipelineCommand(PipelineSubmission::List)
+        ));
+    }
+
+    #[test]
+    fn classify_pipeline_single_word_selects() {
+        assert!(matches!(
+            classify_submission("/pipeline web-team"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(Some(s))) if s == "web-team"
+        ));
+    }
+
+    #[test]
+    fn classify_pipeline_spaced_name_selects_rest_of_line() {
+        // Names may contain spaces; parsing must take everything after "/pipeline ".
+        assert!(matches!(
+            classify_submission("/pipeline Generic Dev Team"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(Some(s))) if s == "Generic Dev Team"
+        ));
+    }
+
+    #[test]
+    fn classify_pipeline_none_clears() {
+        assert!(matches!(
+            classify_submission("/pipeline none"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(None))
+        ));
+        assert!(matches!(
+            classify_submission("/pipeline off"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(None))
+        ));
+    }
+
+    #[test]
+    fn classify_pipeline_trims_whitespace() {
+        assert!(matches!(
+            classify_submission("  /pipeline Generic Dev Team  "),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(Some(s))) if s == "Generic Dev Team"
+        ));
+    }
+
+    #[test]
     fn classify_inline_image_path_is_multimodal() {
         use std::io::Write;
         // Create a real tempfile the classifier can resolve.

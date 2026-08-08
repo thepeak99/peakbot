@@ -25,7 +25,7 @@ use thiserror::Error;
 /// `PipelineSet` is preserved — UI order matches config order.
 #[derive(Debug, Clone)]
 pub struct ResolvedPipeline {
-    /// Pipeline name (`^[A-Za-z0-9_.-]+$`, unique, never `"none"`).
+    /// Pipeline name (`^[A-Za-z0-9_ .-]+$`, unique, never `"none"`).
     pub name: String,
     /// Orchestrator model resolved against the shared `ModelRegistry`.
     /// `model: None` in the YAML falls back to `default_model` here.
@@ -96,21 +96,25 @@ impl PipelineSet {
         let mut seen: HashMap<String, usize> = HashMap::new();
         for (i, def) in cfg.pipelines.iter().enumerate() {
             // ── name rules ──────────────────────────────────────────
-            if def.name.is_empty() {
+            // Trim once; the normalized name is what we validate, store, and
+            // match against for duplicates. Whitespace-only names collapse to
+            // empty and are rejected by the empty-name rule.
+            let name = def.name.trim();
+            if name.is_empty() {
                 return Err(PipelineSetError::EmptyName(i));
             }
-            if def.name == "none" {
-                return Err(PipelineSetError::ReservedName(def.name.clone()));
+            if name == "none" {
+                return Err(PipelineSetError::ReservedName(name.to_string()));
             }
-            if !is_valid_pipeline_name(&def.name) {
+            if !is_valid_pipeline_name(name) {
                 return Err(PipelineSetError::InvalidName {
-                    name: def.name.clone(),
+                    name: name.to_string(),
                     index: i,
                 });
             }
-            if let Some(&first) = seen.get(&def.name) {
+            if let Some(&first) = seen.get(name) {
                 return Err(PipelineSetError::DuplicateName {
-                    name: def.name.clone(),
+                    name: name.to_string(),
                     first,
                     second: i,
                 });
@@ -118,14 +122,14 @@ impl PipelineSet {
 
             // ── agents / members ───────────────────────────────────
             if def.agents.is_empty() {
-                return Err(PipelineSetError::EmptyAgents(def.name.clone()));
+                return Err(PipelineSetError::EmptyAgents(name.to_string()));
             }
             // Reserved-name check fires before the alias resolution so
             // the user sees a clear, role-specific error rather than a
             // downstream "unknown role" confusion.
             if def.agents.contains_key("orchestrator") {
                 return Err(PipelineSetError::ReservedMember {
-                    pipeline: def.name.clone(),
+                    pipeline: name.to_string(),
                 });
             }
 
@@ -137,7 +141,7 @@ impl PipelineSet {
                 .unwrap_or(models.default_alias());
             let orch_model = models.resolve(orch_alias).cloned().ok_or_else(|| {
                 PipelineSetError::UnknownOrchestrator {
-                    pipeline: def.name.clone(),
+                    pipeline: name.to_string(),
                     alias: orch_alias.to_string(),
                     available: models.aliases_sorted().join(", "),
                 }
@@ -147,14 +151,14 @@ impl PipelineSet {
             let registry =
                 SubAgentRegistry::from_members(&def.agents, models, skills).map_err(|source| {
                     PipelineSetError::SubAgent {
-                        pipeline: def.name.clone(),
+                        pipeline: name.to_string(),
                         source,
                     }
                 })?;
 
-            seen.insert(def.name.clone(), i);
+            seen.insert(name.to_string(), i);
             resolved.push(ResolvedPipeline {
-                name: def.name.clone(),
+                name: name.to_string(),
                 orchestrator: orch_model,
                 orchestrator_prompt: def.orchestrator.prompt.clone(),
                 orchestrator_persona: def.orchestrator.persona.clone(),
@@ -238,13 +242,13 @@ impl PipelineSet {
     }
 }
 
-/// `^[A-Za-z0-9_.-]+$` — pipeline names are typed after `/pipeline`, so
-/// shell-metacharacter free is the actual safety boundary (matches the
-/// hand-rolled check in `model_registry::is_valid_alias`).
+/// `^[A-Za-z0-9_ .-]+$` — pipeline names may contain spaces (they are typed
+/// after `/pipeline` as the rest of the line). Control characters and other
+/// shell metacharacters stay out.
 fn is_valid_pipeline_name(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+            .all(|b| b.is_ascii_alphanumeric() || b == b' ' || matches!(b, b'_' | b'-' | b'.'))
 }
 
 /// All the ways `PipelineSet::build` can refuse a config. The
@@ -269,7 +273,7 @@ pub enum PipelineSetError {
     EmptyName(usize),
 
     #[error(
-        "pipeline config: name '{name}' must match ^[A-Za-z0-9_.-]+$ (no spaces — you type it after /pipeline)."
+        "pipeline config: name '{name}' must match ^[A-Za-z0-9_ .-]+$ (no control characters)."
     )]
     InvalidName { name: String, index: usize },
 
@@ -493,12 +497,12 @@ pipelines:
     }
 
     /// Plan table: "Bad charset | `… name '{name}' must match
-    /// ^[A-Za-z0-9_.-]+$ (no spaces — you type it after /pipeline).`"
+    /// ^[A-Za-z0-9_ .-]+$ (no control characters).`"
     ///
-    /// A space in the name is the canonical mistake the rule exists to
-    /// catch — `/pipeline web team` would tokenize ambiguously.
+    /// A spaced name is now allowed because `/pipeline` takes the rest of the
+    /// line (e.g., `/pipeline Generic Dev Team`).
     #[test]
-    fn pipeline_name_with_space_fails_charset_check() {
+    fn pipeline_name_with_space_passes_charset_check() {
         let yaml = format!(
             "{PROVIDERS}\
 pipelines:
@@ -510,11 +514,54 @@ pipelines:
 "
         );
         let cfg: Config = serde_yaml::from_str(&yaml).expect("config parses");
+        let set = PipelineSet::build(&cfg, &two_model_registry(), Some(&[]))
+            .expect("name with space must build");
+        assert_eq!(
+            set.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["web team"]
+        );
+    }
+
+    /// Whitespace-only (or all-space) names collapse to empty after trim and
+    /// are rejected by the empty-name rule.
+    #[test]
+    fn pipeline_name_whitespace_only_is_rejected_as_empty() {
+        let yaml = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: \"   \"
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).expect("config parses");
         let err = PipelineSet::build(&cfg, &two_model_registry(), None)
-            .expect_err("name with space must be rejected");
+            .expect_err("whitespace-only name must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("empty name"), "got: {msg}");
+    }
+
+    /// Control characters stay outside the allowed charset.
+    #[test]
+    fn pipeline_name_with_control_char_is_rejected() {
+        let yaml = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: \"web\\tteam\"
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).expect("config parses");
+        let err = PipelineSet::build(&cfg, &two_model_registry(), None)
+            .expect_err("name with tab must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("web team") && msg.contains("^[A-Za-z0-9_.-]+$"),
+            msg.contains("web\tteam") && msg.contains("^[A-Za-z0-9_ .-]+$"),
             "error must name the bad name AND the allowed charset; got: {msg}"
         );
     }

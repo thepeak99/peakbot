@@ -238,10 +238,19 @@ describe("validateMultiAgent (pipeline name / orchestrator / members)", () => {
     expect(hasErrorContaining(errs, "name")).toBe(true);
   });
 
-  it("rejects a name with spaces — it is typed after /pipeline", () => {
-    const errs = validateMultiAgent(pipelineDraft({ name: "review team" }));
-    expect(hasErrorContaining(errs, "review team")).toBe(true);
-    expect(hasErrorContaining(errs, "/pipeline")).toBe(true);
+  it("accepts a name with spaces — /pipeline takes the rest of the line", () => {
+    expect(validateMultiAgent(pipelineDraft({ name: "Generic Dev Team" }))).toEqual([]);
+  });
+
+  it("trims the emitted name, so padding is not part of it", () => {
+    const draft = pipelineDraft({ name: "  Generic Dev Team  " });
+    expect(validateMultiAgent(draft)).toEqual([]);
+    expect(pipelineName(draft.pipeline)).toBe("Generic Dev Team");
+  });
+
+  it("rejects a name outside the charset (a tab is not a space)", () => {
+    const errs = validateMultiAgent(pipelineDraft({ name: "review\tteam" }));
+    expect(hasErrorContaining(errs, "outside")).toBe(true);
   });
 
   it("rejects the reserved name `none`", () => {
