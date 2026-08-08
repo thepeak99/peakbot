@@ -115,8 +115,11 @@ export function StatsPanel({
       )}
 
       <section>
-        <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
-          Context
+        <h3
+          className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500"
+          title="Input tokens on the orchestrator's last request — the number compaction watches. Sub-agent turns don't move it."
+        >
+          Orchestrator context
         </h3>
         <div className="mb-1.5 flex items-baseline justify-between text-xs">
           <span className="font-mono tabular-nums text-zinc-400">

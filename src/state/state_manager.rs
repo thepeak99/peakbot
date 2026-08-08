@@ -477,8 +477,9 @@ impl StateManager {
                 stats.total_output_tokens,
                 stats.total_api_calls,
                 stats.total_cost,
-                // last_input_tokens is the current context size (not cumulative)
-                stats.last_input_tokens().unwrap_or(0),
+                // Read the orchestrator's last input tokens — the same signal the
+                // compaction gate uses. Sub-agent turns must not move this meter.
+                stats.last_orchestrator_input_tokens().unwrap_or(0),
                 stats.lanes_sorted(),
             )
         };
@@ -1025,7 +1026,6 @@ impl StateManager {
         cwd: String,
     ) {
         let mut conv = Conversation::new(name, provider_name, model, cwd);
-        conv.pipeline_enabled = self.pipeline_available.load(Ordering::Acquire);
         conv.subagents_enabled = self.subagents_enabled.load(Ordering::Acquire);
         *self.current_conversation.lock().unwrap() = Some(conv);
         self.mirror_conversation_to_state();
@@ -2725,24 +2725,21 @@ mod tests {
         assert_eq!(sm.peek_conversation_cwd(id).unwrap(), "");
     }
 
-    /// `create_conversation` stamps the session's pipeline availability +
-    /// sub-agent opt-in onto every conversation it mints, so both facts survive
-    /// persistence/reload.
+    /// `create_conversation` stamps the session's sub-agent opt-in onto every
+    /// conversation it mints, so the fact survives persistence/reload.
     #[test]
     fn create_conversation_stamps_pipeline_flags() {
         let sm = StateManager::new();
 
-        // Default session: unavailable + not opted in.
+        // Default session: not opted in.
         sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
-        assert!(!sm.get_current_conversation().unwrap().pipeline_enabled);
         assert!(!sm.get_current_conversation().unwrap().subagents_enabled);
 
         // Session with a configured pipeline and an opted-in conversation →
-        // minted conversation carries both flags.
+        // minted conversation carries the opt-in.
         sm.set_pipeline_available(true);
         sm.set_subagents_enabled(true);
         sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
-        assert!(sm.get_current_conversation().unwrap().pipeline_enabled);
         assert!(sm.get_current_conversation().unwrap().subagents_enabled);
     }
 
@@ -4044,44 +4041,88 @@ mod tests {
         );
     }
 
+    /// The context meter measures the ORCHESTRATOR's context, not "whatever
+    /// lane spoke last". A sub-agent's request runs on its own model with its
+    /// own window and must never move the orchestrator's meter — otherwise a
+    /// delegate call visibly collapses the user's context gauge to the
+    /// sub-agent's tiny wire size.
+    ///
+    /// Pinned by the multi-pipeline plan § 6 (bonus): `sync_stats_to_ui` reads
+    /// `last_orchestrator_input_tokens()`, the same signal the compaction gate
+    /// already uses — not `last_input_tokens()` (last request on ANY lane).
     #[test]
-    fn context_current_usage_tracks_last_input_tokens() {
-        let sm = sm_with_context_size(200_000);
+    fn context_meter_tracks_orchestrator_lane_only() {
+        use crate::ui::app_state::MessageSource;
+        let sm = StateManager::new();
 
-        // Before any request: usage is 0 but window is non-zero.
-        let state = sm.get_state();
-        assert_eq!(state.context.current_usage, 0);
-        assert_eq!(state.context.window_size, 200_000);
-        assert_eq!(state.context.usage_percentage(), 0.0);
-
-        // After a request: current_usage reflects the last input-token count.
-        sm.add_request(
-            &crate::ui::app_state::MessageSource::Human,
-            50_000,
-            1_000,
-            0.0,
-        );
-        let state = sm.get_state();
+        // The orchestrator turn sets the meter.
+        sm.add_request(&MessageSource::Human, 1_000, 100, 0.0);
         assert_eq!(
-            state.context.current_usage, 50_000,
-            "current_usage must be updated when stats are synced — otherwise the status bar shows 0% forever"
-        );
-        // 50k / 200k = 25%
-        assert!(
-            (state.context.usage_percentage() - 25.0).abs() < 0.01,
-            "expected ~25% usage, got {}",
-            state.context.usage_percentage()
+            sm.get_state().context.current_usage,
+            1_000,
+            "orchestrator request must set the meter"
         );
 
-        // A later request overwrites (tokens aren't cumulative — see SessionStats docs).
+        // A sub-agent turn must NOT clobber it, however small.
         sm.add_request(
-            &crate::ui::app_state::MessageSource::Human,
-            100_000,
-            2_000,
+            &MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            50,
+            10,
             0.0,
         );
-        let state = sm.get_state();
-        assert_eq!(state.context.current_usage, 100_000);
+        assert_eq!(
+            sm.get_state().context.current_usage,
+            1_000,
+            "a sub-agent's request must not move the orchestrator's context meter"
+        );
+    }
+
+    /// The meter and the compaction gate must read the SAME number. Today they
+    /// can disagree — the meter shows a sub-agent's last wire size while the
+    /// gate reads the orchestrator's — which is how `/context` ends up
+    /// contradicting its own threshold warning.
+    #[test]
+    fn context_meter_agrees_with_compaction_gate() {
+        use crate::ui::app_state::MessageSource;
+        // 1_000-token window, 0.8 threshold → the gate fires above 800.
+        let sm = sm_with_context_size(1_000);
+
+        // Enough traffic to clear the `keep_recent` floor (5) so the gate can
+        // reach its token branch at all.
+        for i in 0..5 {
+            sm.add_user_message(format!("u{i}"));
+            sm.add_assistant_message(format!("a{i}"));
+        }
+
+        sm.add_request(&MessageSource::Human, 1_000, 100, 0.0);
+        sm.add_request(
+            &MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            50,
+            10,
+            0.0,
+        );
+
+        // The one invariant: what the user sees IS what the gate decides on.
+        assert_eq!(
+            sm.get_state().context.current_usage as usize,
+            sm.current_input_tokens(),
+            "the context meter must display the same token count the compaction gate reads"
+        );
+
+        // And that shared reading is over threshold, so the meter cannot show a
+        // comfortable number while compaction is firing behind it.
+        assert!(
+            sm.needs_compaction(),
+            "precondition: 1000 > 800 threshold on the orchestrator lane"
+        );
+        assert!(
+            sm.get_state().context.current_usage > 800,
+            "meter must show the over-threshold value that triggered compaction"
+        );
     }
 
     /// `StateManager::needs_compaction()` is the new public accessor used by

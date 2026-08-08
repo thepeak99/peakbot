@@ -254,18 +254,13 @@ pub struct Conversation {
     /// Todo list persisted with this conversation
     #[serde(default)]
     pub todos: crate::tools::todo::TodoList,
-    /// Whether the multi-agent pipeline was enabled for the session that
-    /// created this conversation (config sense: `pipeline.enabled`, a
-    /// boot-only fact). Conversation-global, not per-message. Defaults to
-    /// `false` for every pre-existing file — old conversations genuinely had
-    /// no pipeline.
-    #[serde(default)]
-    pub pipeline_enabled: bool,
     /// Whether the user opted this conversation into sub-agents (the Agents
-    /// panel checkbox). Distinct from `pipeline_enabled` (config availability):
-    /// a conversation may be created in a pipeline-configured session yet leave
-    /// this `false`. Drives whether the `delegate` tool is registered on
-    /// resume. Defaults `false` for every pre-existing file.
+    /// panel checkbox). Conversation-global, not per-message. Defaults to
+    /// `false` for every pre-existing file — old conversations genuinely had
+    /// no opt-in. Drives whether the `delegate` tool is registered on resume.
+    /// The boot-only `pipeline_available` fact (config sense) is mirrored into
+    /// `AppState.pipeline_available` and is NOT persisted — see
+    /// [`crate::state::state_manager::StateManager::set_pipeline_available`].
     #[serde(default)]
     pub subagents_enabled: bool,
 }
@@ -298,7 +293,6 @@ impl Conversation {
             cwd,
             metadata: ConversationMetadata::default(),
             todos: crate::tools::todo::TodoList::new(),
-            pipeline_enabled: false,
             subagents_enabled: false,
         }
     }
@@ -389,11 +383,6 @@ pub struct ConversationSummary {
     pub provider_name: String,
     /// Wire id of the model used (e.g. `anthropic/claude-3.7-sonnet`).
     pub model: String,
-    /// Whether the pipeline was enabled for the session that created this
-    /// conversation. Surfaced to any summary consumer (a picker badge is a
-    /// deferred frontend concern). Defaults to `false` for pre-existing files.
-    #[serde(default)]
-    pub pipeline_enabled: bool,
 }
 
 impl From<&Conversation> for ConversationSummary {
@@ -408,7 +397,6 @@ impl From<&Conversation> for ConversationSummary {
             message_count: conv.metadata.message_count,
             provider_name: conv.provider_name.clone(),
             model: conv.model.clone(),
-            pipeline_enabled: conv.pipeline_enabled,
         }
     }
 }
@@ -672,33 +660,44 @@ mod tests {
         );
     }
 
-    // ── conversation-global pipeline_enabled marker ────────────────────────
+    // ── legacy conversation-global pipeline_enabled marker ─────────────────
 
+    /// `pipeline_enabled` was a dead stamp on saved conversations: written at
+    /// save time from the session's config availability, never read back to
+    /// drive anything. Removed by the multi-pipeline work (plan § 9 Stage 0b)
+    /// in favour of the one live fact, `selected_pipeline` — and of the
+    /// session-only `AppState.pipeline_available` mirror (config sense).
+    ///
+    /// Conversations already on disk still carry the key. `Conversation` has
+    /// no `deny_unknown_fields`, so serde must simply ignore it — an existing
+    /// file keeps loading, with every other field intact.
     #[test]
-    fn pipeline_enabled_roundtrips_and_defaults_false() {
-        let mut conv = Conversation::new(
-            "Test".into(),
-            "openrouter".into(),
-            "anthropic/claude-3.7-sonnet".into(),
-            String::new(),
+    fn legacy_pipeline_enabled_key_is_ignored_on_load() {
+        let legacy = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "old",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "messages": [],
+            "provider_name": "openrouter",
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {},
+            "pipeline_enabled": true,
+            "subagents_enabled": true
+        }"#;
+
+        let parsed: Conversation =
+            serde_json::from_str(legacy).expect("a legacy file with pipeline_enabled must load");
+
+        // The unknown key is dropped silently; the rest of the document is
+        // unharmed — that's the whole contract.
+        assert_eq!(parsed.name, "old");
+        assert_eq!(parsed.model, "anthropic/claude-3.7-sonnet");
+        assert_eq!(parsed.provider_name, "openrouter");
+        assert!(
+            parsed.subagents_enabled,
+            "neighbouring fields must survive the ignored key"
         );
-        // Fresh conversations default to false.
-        assert!(!conv.pipeline_enabled);
-
-        // A pipeline conversation roundtrips true.
-        conv.pipeline_enabled = true;
-        let json = serde_json::to_string(&conv).unwrap();
-        let parsed: Conversation = serde_json::from_str(&json).unwrap();
-        assert!(parsed.pipeline_enabled);
-        // Summary carries the fact for downstream consumers.
-        assert!(ConversationSummary::from(&parsed).pipeline_enabled);
-
-        // A non-pipeline conversation roundtrips false.
-        conv.pipeline_enabled = false;
-        let json = serde_json::to_string(&conv).unwrap();
-        let parsed: Conversation = serde_json::from_str(&json).unwrap();
-        assert!(!parsed.pipeline_enabled);
-        assert!(!ConversationSummary::from(&parsed).pipeline_enabled);
     }
 
     #[test]
@@ -718,8 +717,9 @@ mod tests {
         let parsed: Conversation = serde_json::from_str(&json).unwrap();
         assert!(parsed.subagents_enabled);
 
-        // Pre-existing files with no key default to false (independent of
-        // pipeline_enabled).
+        // Pre-existing files with no `subagents_enabled` key default to false.
+        // The document also carries the legacy `pipeline_enabled` stamp, which
+        // is ignored on load (see `legacy_pipeline_enabled_key_is_ignored_on_load`).
         let legacy = r#"{
             "id": "00000000-0000-0000-0000-000000000000",
             "name": "old",
@@ -731,7 +731,6 @@ mod tests {
             "pipeline_enabled": true
         }"#;
         let parsed: Conversation = serde_json::from_str(legacy).unwrap();
-        assert!(parsed.pipeline_enabled);
         assert!(!parsed.subagents_enabled);
     }
 
@@ -782,9 +781,11 @@ mod tests {
     }
 
     #[test]
-    fn pre_existing_file_without_field_defaults_false() {
-        // A JSON that has no `pipeline_enabled` key at all; serde default
-        // must fill in `false` (least astonishment — old convos had no pipeline).
+    fn pre_existing_file_without_optional_fields_loads_with_defaults() {
+        // A minimal pre-existing document: none of the fields added after v1
+        // are present. Every one of them must fall back to its serde default
+        // rather than failing the load (least astonishment — old convos had no
+        // cwd, no todos, and no sub-agents).
         let json = r#"{
             "id": "00000000-0000-0000-0000-000000000000",
             "name": "old",
@@ -795,7 +796,10 @@ mod tests {
             "metadata": {}
         }"#;
         let parsed: Conversation = serde_json::from_str(json).unwrap();
-        assert!(!parsed.pipeline_enabled);
+        assert_eq!(parsed.cwd, "");
+        assert!(parsed.provider_name.is_empty());
+        assert!(parsed.todos.list().is_empty());
+        assert!(!parsed.subagents_enabled);
     }
 
     // === v5: conversation title ====================
