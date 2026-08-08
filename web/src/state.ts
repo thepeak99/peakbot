@@ -144,12 +144,25 @@ export interface AppState {
   exit_requested: boolean;
   bg: WireBg;
   bash_panel: WireBashPanel;
-  /** Whether a multi-agent pipeline is *configured* for this session
-   * (boot-only config availability). Optional so old wire snapshots parse. */
-  pipeline_available?: boolean;
-  /** Whether the user opted THIS conversation into sub-agents (default off,
-   * locked once the conversation has turns). Optional for old snapshots. */
-  subagents_enabled?: boolean;
+  /** The pipelines configured at boot, in declaration order (the UI's order).
+   * Empty / absent means no `pipelines:` block — selection isn't offered.
+   * Optional so old wire snapshots parse. */
+  pipelines?: WirePipelineInfo[];
+  /** The pipeline THIS conversation is bound to, or null for single-agent
+   * mode. Mutable only before the first turn; everything downstream
+   * (orchestrator model, delegate roster, `/model` lock) derives from it. */
+  selected_pipeline?: string | null;
+}
+
+/** One configured pipeline — the wire projection of `PipelineInfo`
+ * (src/pipeline/set.rs), carried on `AppState.pipelines`. */
+export interface WirePipelineInfo {
+  name: string;
+  /** Model alias the orchestrator is pinned to (config, not live state). */
+  orchestrator_model: string;
+  /** `[role, model alias]` pairs, sorted by role. TUPLES on the wire: serde
+   * serialises the Rust `Vec<(String, String)>` as arrays of two strings. */
+  members: [string, string][];
 }
 
 // ── Protocol envelopes (src/ui/wire.rs) ───────────────────────────────
@@ -213,7 +226,9 @@ export type InboundMessage =
   | { type: "stop" }
   | { type: "switch_model"; alias: string }
   | { type: "switch_cwd"; path: string }
-  | { type: "set_subagents"; enabled: boolean }
+  /** Bind this conversation to a named pipeline; `null` clears the binding
+   * (single-agent mode). The backend enforces the pre-first-turn lock. */
+  | { type: "select_pipeline"; name: string | null }
   | { type: "list_dir"; path: string }
   | { type: "request_conversations" }
   | { type: "kill_session"; convo: string }

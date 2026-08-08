@@ -14,17 +14,9 @@
 //! named `pipelines:` entry, move `orchestrator_prompt` to
 //! `orchestrator.prompt`, drop `enabled`, or delete the block).
 
-// Stage 1.1: this whole module is newly public surface; live runtime
-// wiring (main.rs / session.rs / delegate_tool callers) lands in
-// commit 2/3. Until then the public types are only consumed by the
-// test module below, so the `#[allow(dead_code)]` is the bridge
-// across the stage boundary — the API is part of the crate but no
-// production code reaches into it yet. The test module compiles under
-// `#[cfg(test)]`, where dead_code is suppressed by the test profile.
-#![allow(dead_code)]
-
 use crate::config::{Config, ModelRegistry, ResolvedModel};
 use crate::pipeline::SubAgentRegistry;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -50,11 +42,10 @@ pub struct ResolvedPipeline {
     pub registry: Arc<SubAgentRegistry>,
 }
 
-/// A per-pipeline projection for the UI / wire (plan §3). Lives in
-/// `set.rs` for now (Stage 1.1 has no app_state changes) — re-exported
-/// from `crate::pipeline`. Once Stage 1.2 / 1.3 lands, the long-term
-/// home is `src/ui/app_state.rs` per the plan.
-#[derive(Debug, Clone, PartialEq)]
+/// A per-pipeline projection for the UI / wire (plan §3). Carried on
+/// `AppState.pipelines` — the one channel every View reads, so the
+/// Agents panel renders the configured roster without a second frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PipelineInfo {
     pub name: String,
     pub orchestrator_model: String,

@@ -747,29 +747,6 @@ impl Config {
         self.pipeline.as_ref()
     }
 
-    /// Check if multi-agent pipelines are enabled.
-    // removed in stage 1.2 (multi-pipeline runtime) — keep compiling
-    // through Stage 1.1; runtime wiring (main.rs / session.rs) still
-    // calls it. Plan §3 deletes the surface entirely in commit 2/3.
-    #[allow(dead_code)]
-    pub fn pipeline_enabled(&self) -> bool {
-        self.pipeline
-            .as_ref()
-            .map(|p| p.enabled && !p.agents.is_empty())
-            .unwrap_or(false)
-    }
-
-    /// The orchestrator prompt addendum, if configured under `pipeline:`.
-    // removed in stage 1.2 (multi-pipeline runtime) — same as
-    // pipeline_enabled; runtime wiring reads this through
-    // `ResolvedPipeline.orchestrator_prompt` once pipelines land.
-    #[allow(dead_code)]
-    pub fn orchestrator_prompt(&self) -> Option<&str> {
-        self.pipeline
-            .as_ref()
-            .and_then(|p| p.orchestrator_prompt.as_deref())
-    }
-
     /// The configured persona, trimmed. `None` for absent or whitespace-only
     /// values — same representation as "use the built-in" (plan §A-Q7).
     pub fn persona(&self) -> Option<&str> {

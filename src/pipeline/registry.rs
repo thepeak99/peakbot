@@ -35,10 +35,10 @@ impl SubAgentRegistry {
     /// role's `skills:` filter against `known_skills` (the discovered
     /// skill names).
     ///
-    /// Thin shim over [`SubAgentRegistry::from_members`]. Stage 1.1 keeps
-    /// this signature for any pre-existing callers (notably the
-    /// `PipelineConfig`-shaped tests in this module); Stage 1.2 removes
-    /// it once the runtime stops reading `Config::pipeline` directly.
+    /// Thin shim over [`SubAgentRegistry::from_members`]. No production caller
+    /// remains — boot goes through `PipelineSet::build` — but it is the
+    /// `PipelineConfig`-shaped constructor the registry's own tests and the
+    /// cross-pipeline scenario test build their fixtures with.
     ///
     /// # Errors
     /// - empty role name,

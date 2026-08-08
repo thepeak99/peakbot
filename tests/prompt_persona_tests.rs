@@ -1,26 +1,24 @@
-//! P2 — `build_system_prompt` persona replacement tests (plan §A-Q7).
+//! P2 — `build_system_prompt` persona replacement tests (plan §A-Q7, amended
+//! by multi-pipeline amendment 1).
 //!
-//! **Status: compile-fail until P2 lands.** This file targets the planned
-//! `build_system_prompt(... persona: Option<&str>, ...)` parameter. The
-//! current signature has no `persona` argument and always emits
-//! `SYSTEM_PROMPT_PERSONA` (the crusader text) when `subagents_active` is
-//! false. Once P2 wires the optional parameter through, these tests will
-//! compile and assert the locked semantics from §A-Q7:
+//! The `persona: Option<&str>` parameter carries the resolved persona — a
+//! pipeline's `orchestrator.persona` when set, else the global `persona:`.
+//! The locked semantics:
 //!
 //! - `Some(p)` ⇒ prompt begins with `p` and **does not** contain the built-in
 //!   "CODE CRUSADER" content
 //! - `None` / whitespace-only ⇒ prompt contains the built-in crusader text
-//! - Orchestrator mode (`subagents_active = true`) ⇒ **neither** persona
-//!   appears regardless of the configured value
+//! - Orchestrator mode (`subagents_active = true`) ⇒ a **configured** persona
+//!   leads the prompt (multi-pipeline amendment 1: a pipeline's
+//!   `orchestrator.persona` replaces the global one; omitted, the global
+//!   persona applies unchanged), while an absent one yields **no** persona at
+//!   all — the built-in crusader is never the orchestrator's default
 //! - The byte boundary between persona and `# Working Principles` is
 //!   identical for both branches (a single `'\n'` join)
 //!
 //! The dedicated sub-agent-preamble test (plan §A-Q7 row 3 — persona MUST
 //! NOT leak into a role preamble) lives next to the helper itself in
 //! `src/pipeline/delegate_tool.rs::tests`; it is a GREEN guard today.
-//!
-//! Until the impl lands, this file fails to compile and `cargo test` stops
-//! at this integration target. That is the RED state.
 
 use peakbot::build_system_prompt;
 use peakbot::skills::SkillRegistry;
@@ -98,10 +96,11 @@ fn agentless_prompt_with_whitespace_only_persona_keeps_crusader() {
 }
 
 #[test]
-fn orchestrator_prompt_drops_configured_persona() {
-    // §A-Q7: orchestrator mode is unchanged by the persona key. The crusader
-    // is dropped (and now also: the configured persona is dropped) — the
-    // whole recipe is gated on `!subagents_active`.
+fn orchestrator_prompt_carries_configured_persona() {
+    // Multi-pipeline amendment 1: an orchestrator's persona — a pipeline's own
+    // `orchestrator.persona`, or the global `persona:` when the pipeline omits
+    // one — REPLACES the global persona and reaches the orchestrator recipe.
+    // Only the built-in crusader stays agentless-only.
     let skills = SkillRegistry::new();
     let custom = "SENTINEL-CUSTOM-PERSONA";
     let prompt = build_system_prompt(
@@ -114,8 +113,8 @@ fn orchestrator_prompt_drops_configured_persona() {
         Some(custom),
     );
     assert!(
-        !prompt.contains(custom),
-        "orchestrator prompt must NOT carry the configured persona"
+        prompt.contains(custom),
+        "orchestrator prompt must carry the configured persona"
     );
     assert!(
         !prompt.contains("CODE CRUSADER"),
@@ -128,7 +127,33 @@ fn orchestrator_prompt_drops_configured_persona() {
 }
 
 #[test]
-fn orchestrator_prompt_with_addendum_keeps_orchestrator_prompt_and_drops_persona() {
+fn orchestrator_prompt_without_persona_carries_none_at_all() {
+    // The other half of amendment 1: nothing configured (no pipeline persona,
+    // no global persona) ⇒ the orchestrator leads with the core guidance. The
+    // crusader is NOT an orchestrator fallback.
+    let skills = SkillRegistry::new();
+    let prompt = build_system_prompt(
+        &skills,
+        None,
+        &cwd(),
+        false,
+        /* subagents_active */ true,
+        None,
+        /* persona */ None,
+    );
+    assert!(
+        !prompt.contains("CODE CRUSADER"),
+        "orchestrator prompt with no configured persona must carry no persona"
+    );
+    assert!(
+        prompt.starts_with("# Working Principles"),
+        "with no persona the orchestrator prompt must open on the core guidance; got: {:?}",
+        &prompt[..prompt.len().min(80)]
+    );
+}
+
+#[test]
+fn orchestrator_prompt_with_addendum_keeps_orchestrator_prompt_and_persona() {
     let skills = SkillRegistry::new();
     let custom = "SENTINEL-CUSTOM-PERSONA";
     let extra = "SENTINEL-ORCH-EXTRA";
@@ -146,8 +171,8 @@ fn orchestrator_prompt_with_addendum_keeps_orchestrator_prompt_and_drops_persona
         "orchestrator prompt addendum must still appear"
     );
     assert!(
-        !prompt.contains(custom),
-        "persona must not leak into orchestrator prompt even with addendum"
+        prompt.contains(custom),
+        "the configured persona and the addendum are independent — both appear"
     );
 }
 
