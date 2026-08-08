@@ -127,59 +127,111 @@ describe("renderYaml — tools block", () => {
   });
 });
 
-// ---------- pipeline --------------------------------------------------------
+// ---------- pipelines -------------------------------------------------------
 
-describe("renderYaml — pipeline block", () => {
-  it("renders pipeline with enabled, orchestrator_prompt, and agents", () => {
+describe("renderYaml — pipelines list", () => {
+  function teamDraft(pipeline: Partial<SetupDraft["pipeline"]> = {}): SetupDraft {
     const draft = minimalDraft();
     draft.pipeline = {
-      enabled: true,
-      orchestratorPrompt: "You lead a small team.",
-      agents: [
-        { role: "researcher", model: "sonnet", prompt: "Research things." },
-        { role: "reviewer", model: "sonnet", prompt: "Review diffs." },
-      ],
+      include: true,
+      agents: [{ role: "researcher", model: "sonnet", prompt: "Research things." }],
+      ...pipeline,
     };
-    const yaml = renderYaml(draft);
-    expect(yaml).toMatch(/^pipeline:/m);
-    expect(yaml).toMatch(/enabled: true/);
-    expect(yaml).toMatch(/orchestrator_prompt: \|2-/);
-    expect(yaml).toMatch(/agents:/);
-    expect(yaml).toMatch(/researcher:/);
-    expect(yaml).toMatch(/model: "sonnet"/);
-    expect(yaml).toMatch(/reviewer:/);
+    return draft;
+  }
+
+  it("emits a pipelines list with name, orchestrator, and agents", () => {
+    const yaml = renderYaml(
+      teamDraft({
+        name: "review-team",
+        orchestratorModel: "sonnet",
+        orchestratorPrompt: "You lead a small team.",
+        agents: [
+          { role: "researcher", model: "sonnet", prompt: "Research things." },
+          { role: "reviewer", model: "sonnet", prompt: "Review diffs." },
+        ],
+      }),
+    );
+    expect(yaml).toMatch(/^pipelines:/m);
+    expect(yaml).toMatch(/^ {2}- name: "review-team"$/m);
+    expect(yaml).toMatch(/^ {4}orchestrator:$/m);
+    expect(yaml).toMatch(/^ {6}model: "sonnet"$/m);
+    expect(yaml).toMatch(/^ {6}prompt: \|2-$/m);
+    expect(yaml).toMatch(/^ {4}agents:$/m);
+    expect(yaml).toMatch(/^ {6}researcher:$/m);
+    expect(yaml).toMatch(/^ {6}reviewer:$/m);
+  });
+
+  it("falls back to the default pipeline name when none is typed", () => {
+    const yaml = renderYaml(teamDraft());
+    expect(yaml).toMatch(/^ {2}- name: "default"$/m);
+  });
+
+  it("emits the orchestrator persona override when set", () => {
+    const yaml = renderYaml(teamDraft({ orchestratorPersona: "You are terse." }));
+    expect(yaml).toMatch(/^ {6}persona: \|2-$/m);
+    expect(yaml).toMatch(/You are terse\./);
+  });
+
+  it("omits unset orchestrator fields, emitting an empty mapping", () => {
+    // `orchestrator:` with no children would deserialize as null and fail
+    // the parse; `{}` means "all defaults", which is what we mean.
+    const yaml = renderYaml(teamDraft());
+    expect(yaml).toMatch(/^ {4}orchestrator: \{\}$/m);
+    expect(yaml).not.toMatch(/^ {6}model:/m);
+    expect(yaml).not.toMatch(/^ {6}prompt:/m);
+    expect(yaml).not.toMatch(/^ {6}persona:/m);
+  });
+
+  it("never emits `enabled:` or the legacy `pipeline:` block", () => {
+    const yaml = renderYaml(
+      teamDraft({ name: "team", orchestratorPrompt: "Lead.", orchestratorModel: "sonnet" }),
+    );
+    expect(yaml).not.toMatch(/^pipeline:/m);
+    expect(yaml).not.toMatch(/enabled:/);
+    expect(yaml).not.toMatch(/orchestrator_prompt:/);
   });
 
   it("renders the agents.<role>.env block when set", () => {
-    const draft = minimalDraft();
-    draft.pipeline = {
-      enabled: true,
-      agents: [
-        { role: "reviewer", model: "sonnet", prompt: "x", env: { REVIEW_STRICT: "1" } },
-      ],
-    };
-    const yaml = renderYaml(draft);
+    const yaml = renderYaml(
+      teamDraft({
+        agents: [{ role: "reviewer", model: "sonnet", prompt: "x", env: { REVIEW_STRICT: "1" } }],
+      }),
+    );
     expect(yaml).toMatch(/env:/);
     expect(yaml).toMatch(/REVIEW_STRICT: "1"/);
   });
 
   it("renders agents.<role>.skills only block", () => {
-    const draft = minimalDraft();
-    draft.pipeline = {
-      enabled: true,
-      agents: [
-        { role: "researcher", model: "sonnet", prompt: "x", skills: { only: ["github"] } },
-      ],
-    };
-    const yaml = renderYaml(draft);
+    const yaml = renderYaml(
+      teamDraft({
+        agents: [
+          { role: "researcher", model: "sonnet", prompt: "x", skills: { only: ["github"] } },
+        ],
+      }),
+    );
     expect(yaml).toMatch(/skills:/);
     expect(yaml).toMatch(/only:/);
     expect(yaml).toMatch(/- "github"/);
   });
 
-  it("omits pipeline entirely when pipeline.enabled is not true", () => {
+  it("omits pipelines entirely when the draft declares none", () => {
     const yaml = renderYaml(minimalDraft());
+    expect(yaml).not.toMatch(/^pipelines:/m);
     expect(yaml).not.toMatch(/^pipeline:/m);
+  });
+
+  it("does not double-emit when the imported config already has pipelines", () => {
+    // `pipelines` is unowned, so an imported list lives in passthrough and
+    // is emitted verbatim there — the wizard must not add a second block.
+    const draft = teamDraft({ name: "wizard-team" });
+    draft.passthrough.pipelines = [
+      { name: "imported", orchestrator: { model: "sonnet" }, agents: { pm: { prompt: "p" } } },
+    ];
+    const yaml = renderYaml(draft);
+    expect(yaml.match(/^pipelines:/gm)).toHaveLength(1);
+    expect(yaml).toMatch(/- name: "imported"/);
+    expect(yaml).not.toMatch(/wizard-team/);
   });
 });
 

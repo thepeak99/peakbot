@@ -71,6 +71,32 @@ describe("configJsonToDraft — passthrough for unmanaged keys", () => {
     expect(masked).toMatch(/^retry:/m);
     expect(masked).toMatch(/^conversation:/m);
   });
+
+  it("an imported `pipelines:` list round-trips JSON → draft → YAML unchanged", () => {
+    // The wizard does not own `pipelines`, so an existing team must survive
+    // import and re-render byte-compatibly — including the nested member map,
+    // the deepest structure passthrough has to carry.
+    const draft = configJsonToDraft({
+      providers: [{ name: "openrouter", type: "openrouter", api_key: "k", models: [{ name: "m", alias: "x" }] }],
+      default_model: "x",
+      pipelines: [
+        {
+          name: "review-team",
+          orchestrator: { model: "x", prompt: "You lead." },
+          agents: { reviewer: { model: "x", prompt: "Review diffs.", agents_md: true } },
+        },
+      ],
+    });
+    const yaml = renderYaml(draft);
+    expect(yaml).toMatch(/^pipelines:$/m);
+    expect(yaml).toMatch(/^ {2}- name: "review-team"$/m);
+    expect(yaml).toMatch(/^ {4}orchestrator:$/m);
+    expect(yaml).toMatch(/^ {6}model: "x"$/m);
+    expect(yaml).toMatch(/^ {6}prompt: "You lead\."$/m);
+    expect(yaml).toMatch(/^ {4}agents:$/m);
+    expect(yaml).toMatch(/^ {6}reviewer:$/m);
+    expect(yaml).toMatch(/^ {8}agents_md: true$/m);
+  });
 });
 
 // ---------- empty / malformed inputs ----------------------------------------

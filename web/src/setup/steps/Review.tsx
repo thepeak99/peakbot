@@ -1,5 +1,6 @@
 // Step 10 — Review. The YAML the wizard would write, the restart split, and
-// the Write config button.
+// the single Install button that writes the configuration and then runs the
+// binary install (POST /api/setup/install).
 //
 // The YAML is rendered client-side from the draft (renderYaml), so this
 // page is genuinely useful for judging the shape even before the network
@@ -8,19 +9,34 @@
 // Per plan §A-Q7 / §E.13, persona is real and Locations/Start-on-boot are
 // self-contained actions — nothing in the draft is "collected, not written"
 // anymore, so that block is gone.
+//
+// The handler runs the two API calls in sequence: writeConfig first (it
+// validates server-side; if it fails we don't even try the install), then
+// installBinary. If the config write succeeded but the install failed, the
+// error panel reports that the config was written so the user can retry
+// without losing it.
 
 import { useState } from "react";
-import { apiErrorMessage, writeConfig } from "../api";
+import { apiErrorMessage, installBinary, writeConfig } from "../api";
 import { classifyChange } from "../draft";
 import type { StepProps } from "../steps";
 import { renderYaml } from "../renderYaml";
 import { buttonClass, ghostButtonClass } from "../ui";
 
-type WriteState =
+type InstallState =
   | { kind: "idle" }
-  | { kind: "busy" }
-  | { kind: "ok"; path: string; backup: string | null }
-  | { kind: "err"; lines: string[] };
+  | { kind: "writing" }
+  | { kind: "installing"; configPath: string; backup: string | null }
+  | {
+      kind: "ok";
+      configPath: string;
+      backup: string | null;
+      installAction: string;
+      installTarget: string;
+      installPath: { status: string; by?: string; hint?: string };
+      installNotes: string[];
+    }
+  | { kind: "err"; lines: string[]; configWritten: { path: string; backup: string | null } | null };
 
 function topLevelKeys(yaml: string): string[] {
   return yaml
@@ -29,32 +45,51 @@ function topLevelKeys(yaml: string): string[] {
     .filter((key): key is string => !!key);
 }
 
+function pathVerdict(p: { status: string; by?: string; hint?: string }): string {
+  if (p.status === "on_path") return "On PATH";
+  if (p.status === "shadowed") return `Shadowed by ${p.by}`;
+  return "Not on PATH";
+}
+
 export function ReviewStep({ draft }: StepProps) {
-  const [write, setWrite] = useState<WriteState>({ kind: "idle" });
-  const [copied, setCopied] = useState<"yes" | "failed" | null>(null);
+  const [install, setInstall] = useState<InstallState>({ kind: "idle" });
 
   const yaml = renderYaml(draft);
   const keys = topLevelKeys(yaml);
   const reloadSafe = keys.filter((k) => classifyChange(k) === "reload-safe");
   const bootOnly = keys.filter((k) => classifyChange(k) === "boot-only");
 
-  const submit = async () => {
-    setWrite({ kind: "busy" });
+  const run = async () => {
+    const body = renderYaml(draft, { mask: false });
+    setInstall({ kind: "writing" });
+    let configPath: string;
+    let backup: string | null;
     try {
-      const body = renderYaml(draft, { mask: false });
-      const res = await writeConfig(body);
-      setWrite({ kind: "ok", path: res.path, backup: res.backup });
+      const write = await writeConfig(body);
+      configPath = write.path;
+      backup = write.backup;
     } catch (err) {
-      setWrite({ kind: "err", lines: apiErrorMessage(err) });
+      setInstall({ kind: "err", lines: apiErrorMessage(err), configWritten: null });
+      return;
     }
-  };
-
-  const copy = async () => {
+    setInstall({ kind: "installing", configPath, backup });
     try {
-      await navigator.clipboard.writeText(yaml);
-      setCopied("yes");
-    } catch {
-      setCopied("failed");
+      const res = await installBinary();
+      setInstall({
+        kind: "ok",
+        configPath,
+        backup,
+        installAction: res.action,
+        installTarget: res.target,
+        installPath: res.path,
+        installNotes: res.notes,
+      });
+    } catch (err) {
+      setInstall({
+        kind: "err",
+        lines: apiErrorMessage(err),
+        configWritten: { path: configPath, backup },
+      });
     }
   };
 
@@ -90,23 +125,51 @@ export function ReviewStep({ draft }: StepProps) {
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <button type="button" onClick={submit} disabled={write.kind === "busy"} className={buttonClass}>
-          {write.kind === "busy" ? "Writing…" : "Write config"}
+        <button
+          type="button"
+          onClick={run}
+          disabled={install.kind === "writing" || install.kind === "installing"}
+          className={buttonClass}
+        >
+          {install.kind === "writing"
+            ? "Writing config…"
+            : install.kind === "installing"
+              ? "Installing…"
+              : "Install"}
         </button>
-        <button type="button" onClick={copy} className={ghostButtonClass}>Copy YAML</button>
-        {copied === "yes" && <span className="text-xs text-emerald-400">✓ Copied</span>}
-        {copied === "failed" && <span className="text-xs text-zinc-500">Clipboard blocked — select the pane above and copy manually.</span>}
+        <a href="/" className={ghostButtonClass}>Cancel</a>
       </div>
 
-      {write.kind === "err" && (
-        <ul className="space-y-0.5 rounded-md border border-red-900/60 bg-red-950/30 px-3 py-2 text-xs text-red-300">
-          {write.lines.map((l) => <li key={l}>{l}</li>)}
-        </ul>
+      {install.kind === "err" && (
+        <div className="space-y-2 rounded-md border border-red-900/60 bg-red-950/30 px-3 py-2 text-xs text-red-300">
+          <ul className="space-y-0.5">
+            {install.lines.map((l) => <li key={l}>{l}</li>)}
+          </ul>
+          {install.configWritten && (
+            <p>
+              Note: your config was written to <code className="text-red-200">{install.configWritten.path}</code>
+              {install.configWritten.backup && (
+                <> (backup: <code className="text-red-200">{install.configWritten.backup}</code>)</>
+              )}. Retry the install above — your config is preserved.
+            </p>
+          )}
+        </div>
       )}
 
-      {write.kind === "ok" && (
+      {install.kind === "ok" && (
         <div className="space-y-2 rounded-md border border-emerald-800/60 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300">
-          <p>Wrote <code>{write.path}</code>{write.backup && <> (backup: <code>{write.backup}</code>)</>}.</p>
+          <p>
+            Wrote <code>{install.configPath}</code>
+            {install.backup && <> (backup: <code>{install.backup}</code>)</>}.
+          </p>
+          <p>
+            Installed to <code>{install.installTarget}</code> ({install.installAction}). PATH: {pathVerdict(install.installPath)}.
+          </p>
+          {install.installNotes.length > 0 && (
+            <ul className="list-disc space-y-0.5 pl-5 text-emerald-200/80">
+              {install.installNotes.map((n) => <li key={n}>{n}</li>)}
+            </ul>
+          )}
           <p>Restart PeakBot to use this config.</p>
           <div className="flex flex-wrap items-center gap-2">
             <a href="/" className={buttonClass}>Open Shifu</a>

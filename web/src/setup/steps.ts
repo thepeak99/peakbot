@@ -119,7 +119,7 @@ export const STEPS: Step[] = [
     title: "Multi-agent",
     optional: true,
     isComplete: (d) =>
-      d.pipeline.enabled === true && validateMultiAgent(d).length === 0,
+      d.pipeline.include === true && validateMultiAgent(d).length === 0,
     errors: validateMultiAgent,
     Component: MultiAgentStep,
   },

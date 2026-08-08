@@ -21,7 +21,7 @@ mod mcp_auth;
 mod memory_compaction;
 #[cfg(feature = "mock")]
 pub mod mock;
-mod pipeline;
+pub mod pipeline;
 mod providers;
 pub mod pty_runner;
 pub mod session;
@@ -52,7 +52,9 @@ pub use hooks::{
     AgentEvent, ModelPricing, SessionHook, SessionStats, SourcedEvent, TokenUsage,
     fetch_model_pricing,
 };
-pub use pipeline::{DelegateTool, SubAgentRegistry};
+pub use pipeline::{
+    DelegateTool, PipelineInfo, PipelineSet, PipelineSetError, ResolvedPipeline, SubAgentRegistry,
+};
 #[cfg(feature = "mock")]
 pub use providers::create_mock_agent;
 pub use providers::{
@@ -116,12 +118,12 @@ enum QueueMessage {
     /// handled by `handle_change_cwd`. Same rebuild seam as SwitchModel,
     /// different axis. See ticket #124.
     ChangeCwd(String),
-    /// Opt the current conversation into/out of sub-agents. Carries the
-    /// desired state. Dequeued between turns and handled by
-    /// `handle_set_subagents`: rejected once the conversation has turns
-    /// (locked), else recorded, persisted, and the agent rebuilt on the same
-    /// model/cwd so the `delegate` tool matches.
-    SetSubagentsEnabled(bool),
+    /// Bind the current conversation to a pipeline (`Some(name)`) or clear the
+    /// binding (`None`). Dequeued between turns and handled by
+    /// `handle_select_pipeline`: rejected once the conversation has turns
+    /// (locked), else recorded, persisted, and the agent rebuilt on that team's
+    /// orchestrator so the model, prompt and `delegate` roster all match.
+    SelectPipeline(Option<String>),
     /// One or more `bash_bg` processes have output ready. Payload is
     /// empty — the agent loop drains every bg buffer in one pass.
     /// Multiple notifications coalesce naturally (the drain returns
@@ -160,10 +162,18 @@ enum SubmitKind {
     /// `[img:…]` parsed but failed (missing file, too large, invalid token…).
     /// Surfaces as a system error; does not reach the LLM.
     InvalidAttachment(crate::vision::AttachmentError),
-    /// `/subagents on|off` — opt this conversation into/out of sub-agents.
-    /// `Some(bool)` is a valid on/off; `None` is a bare or malformed invocation
-    /// that should print usage + current state instead of toggling.
-    SubagentsCommand(Option<bool>),
+    /// `/pipeline [name|none|off]` — bind this conversation to a named team,
+    /// not an LLM turn.
+    PipelineCommand(PipelineSubmission),
+}
+
+/// What a `/pipeline` invocation asked for. Bare = show the catalogue;
+/// `none`/`off` = clear the binding; anything else = that team's name
+/// verbatim (names are user-typed and case-sensitive).
+#[derive(Debug)]
+enum PipelineSubmission {
+    List,
+    Set(Option<String>),
 }
 
 fn classify_submission(msg: &str) -> SubmitKind {
@@ -171,15 +181,20 @@ fn classify_submission(msg: &str) -> SubmitKind {
     if trimmed == "/stop" {
         return SubmitKind::StopCommand;
     }
-    // `/subagents [on|off]` — a per-conversation toggle, not an LLM turn.
+    // `/pipeline [name|none|off]` — a per-conversation binding, not an LLM
+    // turn. The whitespace filter keeps `/pipelines` (and any other longer
+    // word) out of this arm.
     if let Some(rest) = trimmed
-        .strip_prefix("/subagents")
+        .strip_prefix("/pipeline")
         .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
     {
-        return SubmitKind::SubagentsCommand(match rest.trim().to_ascii_lowercase().as_str() {
-            "on" | "true" | "1" | "yes" => Some(true),
-            "off" | "false" | "0" | "no" => Some(false),
-            _ => None,
+        let arg = rest.trim();
+        return SubmitKind::PipelineCommand(if arg.is_empty() {
+            PipelineSubmission::List
+        } else if matches!(arg.to_ascii_lowercase().as_str(), "none" | "off") {
+            PipelineSubmission::Set(None)
+        } else {
+            PipelineSubmission::Set(Some(arg.to_string()))
         });
     }
     // Preserve whitespace on commands — leading whitespace in "/ quit"
@@ -197,6 +212,97 @@ fn classify_submission(msg: &str) -> SubmitKind {
         Ok(_) => SubmitKind::UserMessage(msg.to_string()),
         Err(e) => SubmitKind::InvalidAttachment(e),
     }
+}
+
+/// The single producer of the `/model` refusal text. Every surface (REPL
+/// intercept, stdio, web, the controller) funnels through it so the wording —
+/// and the `fixed by pipeline` signal the user learns to recognise — stays
+/// identical.
+pub fn model_locked_message(pipeline: &str) -> String {
+    format!(
+        "the orchestrator's model is fixed by pipeline '{pipeline}'. \
+         Switch teams with /pipeline <name>, or /pipeline none to unlock /model."
+    )
+}
+
+/// What a `/pipeline <target>` request resolves to against the live selection.
+/// The read-only half of the command — shared by the controller (which can only
+/// report) and `handle_select_pipeline` (which also rebuilds), so the lock,
+/// idempotency and unknown-name rules exist exactly once.
+enum PipelineChoice {
+    /// Already bound to this target — silent no-op, no rebuild storm.
+    Unchanged,
+    /// Refused, with the message to show the user.
+    Refused(String),
+    /// Apply this binding (needs the agent-loop rebuild).
+    Apply(Option<String>),
+}
+
+/// Resolve a `/pipeline` target. `available` is the configured team names —
+/// the controller reads them off `AppState`, the agent loop off the boot-built
+/// `PipelineSet`; the rule is the same either way.
+fn resolve_pipeline_choice(
+    sm: &StateManager,
+    target: Option<&str>,
+    available: &[String],
+) -> PipelineChoice {
+    if sm.selected_pipeline().as_deref() == target {
+        return PipelineChoice::Unchanged;
+    }
+    // Locked after the first turn — the tool list and the orchestrator's model
+    // are fixed once the model has seen them.
+    if sm.conversation_has_turns() {
+        return PipelineChoice::Refused(
+            "the pipeline is locked once the conversation has started — /new for a fresh one."
+                .to_string(),
+        );
+    }
+    if let Some(name) = target
+        && !available.iter().any(|a| a == name)
+    {
+        let listed = if available.is_empty() {
+            "(none configured — add a `pipelines:` block to config.yaml and restart)".to_string()
+        } else {
+            available.join(", ")
+        };
+        return PipelineChoice::Refused(format!(
+            "unknown pipeline '{name}'. Available pipelines: {listed}"
+        ));
+    }
+    PipelineChoice::Apply(target.map(str::to_string))
+}
+
+/// Render the `/pipeline` listing from `AppState` — the catalogue stamped at
+/// session build, so the listing never re-reads config (and never disagrees
+/// with what the Agents panel shows).
+fn render_pipeline_list(state: &crate::ui::app_state::AppState) -> String {
+    if state.pipelines.is_empty() {
+        return "🧩 No pipelines configured. Add a `pipelines:` block to config.yaml and restart."
+            .to_string();
+    }
+    let mut msg = String::from("Available pipelines:\n");
+    for info in &state.pipelines {
+        let arrow = if state.selected_pipeline.as_deref() == Some(info.name.as_str()) {
+            "→ "
+        } else {
+            "  "
+        };
+        let members = info
+            .members
+            .iter()
+            .map(|(role, alias)| format!("{role} · {alias}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        msg.push_str(&format!(
+            "{arrow}{}  (orchestrator · {}) — {members}\n",
+            info.name, info.orchestrator_model
+        ));
+    }
+    msg.push_str(
+        "\nUse /pipeline <name> to select one, /pipeline none to clear \
+         (only before the first turn).",
+    );
+    msg
 }
 
 /// Completion result sent from agent loop back to event loop
@@ -265,16 +371,17 @@ pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
 /// `memory_enabled` gates the `memory.md` instructions: when false the
 /// section is omitted so the model is never told to read/update memory.md.
 ///
-/// `subagents_active` selects the recipe: when false (agentless) the crusader
-/// **persona** leads the prompt; when true (orchestrator) the persona is
-/// dropped — it would confuse an agent whose job is to coordinate a team — and
+/// `subagents_active` selects the recipe: when true (orchestrator)
 /// `orchestrator_prompt` (if set) is appended as extra framing. The core tool
 /// guidance, memory, skills, env block, and agents.md are shared by both.
 ///
-/// `persona` replaces the built-in persona at the head of the agentless recipe
-/// (plan §A-Q7). `None` / whitespace-only falls back to the built-in. The
-/// parameter is gated by `!subagents_active` so it never reaches the
-/// orchestrator recipe.
+/// `persona`, when set, leads **either** recipe (multi-pipeline amendment 1: a
+/// pipeline's `orchestrator.persona` replaces the global one; omitted, the
+/// global `persona:` applies to the orchestrator unchanged). `None` /
+/// whitespace-only counts as absent, and only then does `subagents_active`
+/// matter: the agentless recipe falls back to the built-in crusader persona,
+/// while the orchestrator leads with the core guidance — the crusader would
+/// confuse an agent whose job is to coordinate a team.
 pub fn build_system_prompt(
     skills: &SkillRegistry,
     shell_kind: Option<&ShellKind>,
@@ -286,17 +393,19 @@ pub fn build_system_prompt(
 ) -> String {
     let mut prompt = String::new();
 
-    if !subagents_active {
-        match persona.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(p) => {
-                prompt.push_str(p);
-                // Mirrors the built-in persona's trailing single `\n` so
-                // either branch produces the same byte boundary before
-                // `SYSTEM_PROMPT_CORE`.
-                prompt.push('\n');
-            }
-            None => prompt.push_str(SYSTEM_PROMPT_PERSONA),
+    match persona.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            prompt.push_str(p);
+            // Mirrors the built-in persona's trailing single `\n` so either
+            // branch produces the same byte boundary before
+            // `SYSTEM_PROMPT_CORE`.
+            prompt.push('\n');
         }
+        // The built-in crusader is the *agentless* default only. An
+        // orchestrator with no configured persona leads with the core
+        // guidance, exactly as it did before pipelines gained a `persona:`.
+        None if !subagents_active => prompt.push_str(SYSTEM_PROMPT_PERSONA),
+        None => {}
     }
     prompt.push_str(SYSTEM_PROMPT_CORE);
 
@@ -419,7 +528,10 @@ pub struct RebuildContext {
     pub max_turns: usize,
     pub todo_tool: Option<crate::tools::TodoTool>,
     pub bash_config: crate::config::BashConfig,
-    pub pipeline_registry: Option<Arc<crate::pipeline::SubAgentRegistry>>,
+    /// Every named team this install declares, resolved once at boot. The
+    /// rebuild seam looks the *selected* one up here to derive the
+    /// orchestrator's model, its prompt framing, and the delegate roster.
+    pub pipelines: Arc<crate::pipeline::PipelineSet>,
     /// Detected shell kind — OS-level, so it persists across `/model` switches.
     pub shell_kind: Option<crate::tools::ShellKind>,
     /// Skill registry — needed to rebuild the system prompt when `/cd`
@@ -437,14 +549,12 @@ pub struct RebuildContext {
     /// Built-in tool filter (blocklist/allowlist). Refreshed on config reload;
     /// consumed by `add_builtin_tools` when the agent is rebuilt.
     pub tools_filter: crate::config::ToolsConfig,
-    /// The orchestrator prompt addendum (from `pipeline.orchestrator_prompt`).
-    /// Appended to the system prompt when sub-agents are active — recomputed
-    /// on the subagents toggle and `/cd`.
-    pub orchestrator_prompt: Option<String>,
     /// The configured persona (from `persona:`). Replaces the built-in persona
-    /// at the head of the agentless recipe. Live-reloadable via `/new`,
-    /// `/model`, `/cd`, `/load` — the rebuild seam recomputes the prompt with
-    /// this value, and `persona` has no live handles behind it (just a string).
+    /// at the head of the agentless recipe. A selected pipeline's
+    /// `orchestrator.persona` overrides it for that team (amendment 1).
+    /// Live-reloadable via `/new`, `/model`, `/cd`, `/load` — the rebuild seam
+    /// recomputes the prompt with this value, and `persona` has no live handles
+    /// behind it (just a string).
     pub persona: Option<String>,
 }
 
@@ -898,35 +1008,21 @@ impl AgentRunner {
                             }
                             // Do not enqueue — the model is never called.
                         }
-                        SubmitKind::SubagentsCommand(choice) => match choice {
-                            Some(enabled) => {
+                        SubmitKind::PipelineCommand(choice) => match choice {
+                            PipelineSubmission::List => {
+                                if let Some(ref sm) = state_manager {
+                                    let msg = render_pipeline_list(&sm.get_state());
+                                    sm.add_system_message(msg);
+                                }
+                            }
+                            PipelineSubmission::Set(name) => {
+                                // Forward to the agent loop (sole owner of the
+                                // agent handle — the selection rebuilds it).
+                                // It re-validates and reports refusals.
                                 if let Some(ref sm) = state_manager {
                                     sm.increment_pending_input();
                                 }
-                                msg_tx
-                                    .send(QueueMessage::SetSubagentsEnabled(enabled))
-                                    .await
-                                    .ok();
-                            }
-                            None => {
-                                // Bare or malformed — print usage + current state.
-                                if let Some(ref sm) = state_manager {
-                                    let st = sm.get_state();
-                                    let now = if st.subagents_enabled { "on" } else { "off" };
-                                    let msg = if !st.pipeline_available {
-                                        "🧩 Sub-agents: no `pipeline:` configured — nothing to \
-                                         enable. Add a pipeline block to config.yaml and restart."
-                                            .to_string()
-                                    } else {
-                                        format!(
-                                            "🧩 Sub-agents are {now} for this conversation. \
-                                             Usage: /subagents on|off (only before the first turn). \
-                                             Your messages always go to the orchestrator, which \
-                                             decides what to delegate."
-                                        )
-                                    };
-                                    sm.add_system_message(msg);
-                                }
+                                msg_tx.send(QueueMessage::SelectPipeline(name)).await.ok();
                             }
                         },
                     }
@@ -967,18 +1063,15 @@ impl AgentRunner {
                     msg_tx.send(QueueMessage::ChangeCwd(path)).await.ok();
                 }
 
-                UiAction::SetSubagentsEnabled(enabled) => {
+                UiAction::SelectPipeline(name) => {
                     // Forward to the agent loop (sole owner of the agent
-                    // handle — the toggle may rebuild it). Counts as pending
+                    // handle — the selection rebuilds it). Counts as pending
                     // input so the status bar shows activity until the rebuild
                     // completes.
                     if let Some(ref sm) = state_manager {
                         sm.increment_pending_input();
                     }
-                    msg_tx
-                        .send(QueueMessage::SetSubagentsEnabled(enabled))
-                        .await
-                        .ok();
+                    msg_tx.send(QueueMessage::SelectPipeline(name)).await.ok();
                 }
             }
         }
@@ -1064,7 +1157,7 @@ impl AgentRunner {
                     | Some(QueueMessage::Command(_))
                     | Some(QueueMessage::SwitchModel(_))
                     | Some(QueueMessage::ChangeCwd(_))
-                    | Some(QueueMessage::SetSubagentsEnabled(_))
+                    | Some(QueueMessage::SelectPipeline(_))
                     | Some(QueueMessage::BackgroundOutputReady) => {
                         // Discarded — pending counter was already zeroed by
                         // the event loop's drain trigger. (SwitchModel is
@@ -1218,6 +1311,11 @@ impl AgentRunner {
                     if let Some(ref sm) = state_manager {
                         sm.set_running(true);
                     }
+                    // The pipeline the *current* conversation is on. `/load`
+                    // swaps the conversation (and with it the selection), so the
+                    // rebuild below needs the before-value to spot the change.
+                    let selection_before =
+                        state_manager.as_ref().and_then(|sm| sm.selected_pipeline());
                     Self::process_command_internal(&cmd, &state_manager, &config).await;
 
                     // `/load <arg>` may have just swapped the active
@@ -1229,6 +1327,7 @@ impl AgentRunner {
                     let lcmd = cmd.trim().to_ascii_lowercase();
                     if lcmd.starts_with("/load ") {
                         Self::maybe_rebuild_after_load(
+                            selection_before,
                             &mut agent,
                             &mut config,
                             &state_manager,
@@ -1345,12 +1444,12 @@ impl AgentRunner {
                     completion_tx.send(CompletionResult::CommandDone).ok();
                 }
 
-                Some(QueueMessage::SetSubagentsEnabled(enabled)) => {
+                Some(QueueMessage::SelectPipeline(name)) => {
                     if let Some(ref sm) = state_manager {
                         sm.set_running(true);
                     }
-                    let outcome = Self::handle_set_subagents(
-                        enabled,
+                    let outcome = Self::handle_select_pipeline(
+                        name,
                         &mut agent,
                         &mut config,
                         &state_manager,
@@ -1368,7 +1467,7 @@ impl AgentRunner {
                     if let Err(msg) = outcome
                         && let Some(ref sm) = state_manager
                     {
-                        sm.add_system_message(format!("❌ subagents: {msg}"));
+                        sm.add_system_message(format!("❌ /pipeline: {msg}"));
                     }
                     completion_tx.send(CompletionResult::CommandDone).ok();
                 }
@@ -1416,6 +1515,13 @@ impl AgentRunner {
         let sm_for_provider = state_manager
             .clone()
             .ok_or_else(|| "state manager required for /model".to_string())?;
+
+        // The authority for the refusal (covers stdio + web, which never see
+        // the REPL's intercept): a selected pipeline owns its orchestrator's
+        // model, so there is nothing for /model to switch.
+        if let Some(pipeline) = sm_for_provider.selected_pipeline() {
+            return Err(model_locked_message(&pipeline));
+        }
 
         // Re-read config + skills first so a newly-added alias resolves and
         // a new system prompt / registry is in play before we switch.
@@ -1482,18 +1588,22 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// Toggle the current conversation's sub-agent opt-in.
+    /// Bind the current conversation to a pipeline, or clear the binding.
     ///
-    /// The choice is locked once the conversation has real turns — flipping the
-    /// `delegate` tool mid-conversation would desync the tool list from the
-    /// wire history, so we refuse and tell the user. Before the first turn we
-    /// record the choice (persisted onto the conversation, mirrored into
-    /// `AppState`) and rebuild the agent on the *current* model/cwd so the
-    /// `delegate` tool appears or disappears. No conversation reset — unlike
-    /// `/model` and `/cd`, this doesn't start a new conversation.
+    /// The choice is locked once the conversation has real turns — swapping the
+    /// `delegate` roster (or the orchestrator's model) mid-conversation would
+    /// desync the tool list from the wire history, so we refuse and tell the
+    /// user. Before the first turn we record the choice (persisted onto the
+    /// conversation, mirrored into `AppState`) and rebuild the agent on that
+    /// team's orchestrator, so model, prompt and roster move together.
+    ///
+    /// No conversation reset — unlike `/model` and `/cd`. The conversation is
+    /// empty by construction (pre-first-turn) and minting a new id would break
+    /// the web UI's sticky `?convo=` binding; the wire id is re-stamped in place
+    /// instead.
     #[allow(clippy::too_many_arguments)]
-    async fn handle_set_subagents(
-        enabled: bool,
+    async fn handle_select_pipeline(
+        name: Option<String>,
         agent_slot: &mut Arc<DynAgent>,
         config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
@@ -1510,31 +1620,36 @@ impl AgentRunner {
             .clone()
             .ok_or_else(|| "state manager required".to_string())?;
 
-        // Locked after the first turn — the tool list is fixed once the model
-        // has seen it.
-        if sm.conversation_has_turns() {
-            return Err("locked once the conversation has started".into());
-        }
-
-        // No-op if already in the requested state (idempotent toggle).
-        if sm.subagents_enabled() == enabled {
-            return Ok(());
-        }
-
-        // Record + persist + mirror to AppState *before* the rebuild, so the
-        // rebuild seam's `subagents_enabled()` gate reads the new value.
-        sm.set_subagents_enabled(enabled);
-
-        // Rebuild the agent on the current model so `add_builtin_tools` re-runs
-        // with the delegate gate flipped. Resolve the live alias against the
-        // (freshly reloaded) registry.
-        let alias = sm.get_model_alias();
-        let Some(resolved) = ctx.registry.resolve(&alias) else {
-            return Err(format!("current model `{alias}` is no longer available"));
+        // Lock / idempotency / unknown-name, resolved against the boot-built
+        // set (the authority — `AppState.pipelines` is only its projection).
+        let available: Vec<String> = ctx.pipelines.iter().map(|p| p.name.clone()).collect();
+        let target = match resolve_pipeline_choice(&sm, name.as_deref(), &available) {
+            PipelineChoice::Unchanged => return Ok(()),
+            PipelineChoice::Refused(msg) => return Err(msg),
+            PipelineChoice::Apply(target) => target,
         };
-        let resolved = resolved.clone();
 
-        Self::rebuild_agent_for_resolved(
+        // The team owns the orchestrator's model; clearing the binding falls
+        // back to `default_model`.
+        let resolved = match &target {
+            Some(name) => ctx
+                .pipelines
+                .get(name)
+                .map(|p| p.orchestrator.clone())
+                .ok_or_else(|| format!("unknown pipeline '{name}'"))?,
+            None => ctx
+                .registry
+                .resolve(ctx.registry.default_alias())
+                .cloned()
+                .ok_or_else(|| "no default model configured".to_string())?,
+        };
+
+        // Record before the rebuild — the seam derives the roster, the prompt
+        // and the model from `selected_pipeline()`.
+        let previous = sm.selected_pipeline();
+        sm.set_selected_pipeline(target.clone());
+
+        if let Err(e) = Self::rebuild_agent_for_resolved(
             &resolved,
             agent_slot,
             config,
@@ -1546,16 +1661,30 @@ impl AgentRunner {
             ctx,
             active_sub_agent_hook,
         )
-        .await?;
+        .await
+        {
+            // A failed rebuild leaves the previous agent running — the
+            // selection must follow it back, or state and agent disagree.
+            sm.set_selected_pipeline(previous);
+            return Err(e);
+        }
 
-        sm.add_system_message(if enabled {
-            // Say where input goes at the moment the feature is turned on —
-            // that's when the "am I talking to a role now?" question appears.
-            "🧩 Sub-agents enabled for this conversation. Your messages always go to \
-             the orchestrator, which decides what to delegate."
-                .to_string()
-        } else {
-            "🧩 Sub-agents disabled for this conversation.".to_string()
+        sm.set_model(resolved.model_name.clone());
+        sm.set_provider_name(resolved.provider_name.clone());
+        sm.set_model_alias(resolved.alias.clone());
+        // Keep the persisted re-activation key truthful: the conversation keeps
+        // its id but now runs on the orchestrator's model.
+        sm.set_conversation_wire_id(resolved.provider_name.clone(), resolved.model_name.clone());
+
+        sm.add_system_message(match &target {
+            // Say where input goes at the moment a team is selected — that's
+            // when the "am I talking to a role now?" question appears.
+            Some(name) => format!(
+                "🧩 Pipeline '{name}' selected — orchestrator on {}. Your messages always go to \
+                 the orchestrator, which decides what to delegate.",
+                resolved.alias
+            ),
+            None => format!("🧩 Pipeline cleared — single agent on {}.", resolved.alias),
         });
 
         Ok(())
@@ -1704,7 +1833,7 @@ impl AgentRunner {
     /// Boot-only config is diffed and, if changed, flagged with a
     /// "restart to apply" warning: `mcp_servers` / `vector_db` (live
     /// subprocesses / DB handle), `web.*` (read once by the reaper), and
-    /// `pipeline` (a built sub-agent registry, not raw config).
+    /// `pipeline`/`pipelines` (a built `PipelineSet`, not raw config).
     ///
     /// Returns the warnings to surface (reload failure, boot-only diffs,
     /// skill-load failures) rather than emitting them here — the caller
@@ -1758,6 +1887,10 @@ impl AgentRunner {
             ("vector_db", config.vector_db != fresh.vector_db),
             ("web", config.web != fresh.web),
             ("pipeline", config.pipeline != fresh.pipeline),
+            // Both shapes must be diffed: the running `PipelineSet` is built
+            // once at boot, so an edited `pipelines:` would otherwise be
+            // adopted into config yet never reflected in the live teams.
+            ("pipelines", config.pipelines != fresh.pipelines),
             // `http` is baked into the HTTP clients at boot; it was missing
             // here, so edits were adopted into the config yet never applied.
             ("http", config.http != fresh.http),
@@ -1784,7 +1917,7 @@ impl AgentRunner {
         ctx.tools_filter = config.tools.clone();
         // `ctx.system_prompt` is recomputed by the rebuild seam that follows
         // every reload (it derives persona/orchestrator framing from the live
-        // subagents state), so it is not rebuilt here.
+        // pipeline selection), so it is not rebuilt here.
         ctx.searxng_config = config.searxng.clone();
         ctx.max_turns = config.agent_max_turns;
         ctx.bash_config = config.bash.clone();
@@ -1796,11 +1929,16 @@ impl AgentRunner {
     }
 
     /// Rebuild the live `DynAgent` against a `ResolvedModel` — the
-    /// **shared seam** between `/model <alias>` and `/load`. Builds
-    /// the agent, publishes the new `ProviderInfo` + `SessionHook`
-    /// through their shared cells, swaps the active config provider,
-    /// re-inits the context manager, and restarts the event-processor
-    /// task on the new receiver.
+    /// **shared seam** between `/model <alias>`, `/cd`, `/load`, `/new` and
+    /// `/pipeline`. Builds the agent, publishes the new `ProviderInfo` +
+    /// `SessionHook` through their shared cells, swaps the active config
+    /// provider, re-inits the context manager, and restarts the
+    /// event-processor task on the new receiver.
+    ///
+    /// `requested` is the model the *caller* asked for. When a pipeline is
+    /// selected it is overridden by that team's orchestrator: the team owns its
+    /// orchestrator, enforced here at the single point every path funnels
+    /// through, so no caller has to remember the rule.
     ///
     /// Does NOT reset the conversation (chat/stats/todos) and does NOT
     /// emit a system banner — those are caller-specific:
@@ -1813,7 +1951,7 @@ impl AgentRunner {
     /// regardless of trigger)*
     #[allow(clippy::too_many_arguments)]
     async fn rebuild_agent_for_resolved(
-        resolved: &ResolvedModel,
+        requested: &ResolvedModel,
         agent_slot: &mut Arc<DynAgent>,
         config: &mut Config,
         sm_for_provider: &Arc<StateManager>,
@@ -1824,6 +1962,18 @@ impl AgentRunner {
         ctx: &mut RebuildContext,
         active_sub_agent_hook: &crate::pipeline::ActiveSubAgentHook,
     ) -> Result<(), String> {
+        // The conversation's selection decides everything downstream: which
+        // model the orchestrator runs on, which roster `delegate` exposes, and
+        // which prompt recipe applies. Cloned (cheap — Arc'd registry) because
+        // `ctx` is mutated below.
+        let active: Option<crate::pipeline::ResolvedPipeline> = sm_for_provider
+            .selected_pipeline()
+            .and_then(|name| ctx.pipelines.get(&name).cloned());
+        let resolved = match &active {
+            Some(pipeline) => &pipeline.orchestrator,
+            None => requested,
+        };
+
         // Validate compaction model *before* mutating any state. When
         // compaction is enabled, a construction failure is fatal for the
         // switch — bail early with an honest error rather than silently
@@ -1867,30 +2017,29 @@ impl AgentRunner {
             Some(all)
         };
 
-        // Sub-agents are registered iff a pipeline is configured (registry
-        // present) AND this conversation opted in. Gating here — the single
-        // rebuild seam — keeps every rebuild path (`/model`, `/cd`, the
-        // subagents toggle) honouring the opt-in without duplicating the rule.
-        let subagents_active =
-            ctx.pipeline_registry.is_some() && sm_for_provider.subagents_enabled();
-        let boot_registry = if subagents_active {
-            ctx.pipeline_registry.as_deref()
-        } else {
-            None
-        };
+        // `delegate` is registered iff a pipeline is selected, and it exposes
+        // exactly that team's roster. Gating here — the single rebuild seam —
+        // keeps every path (`/model`, `/cd`, `/load`, `/new`, `/pipeline`)
+        // honouring the selection without duplicating the rule.
+        let boot_registry = active.as_ref().map(|p| p.registry.as_ref());
 
-        // Recompute the prompt here — the single seam — so persona/orchestrator
-        // framing always tracks the current subagents state and cwd. This makes
-        // the subagents toggle flip the persona without any caller having to
-        // rebuild the prompt itself.
+        // Recompute the prompt here — the single seam — so the orchestrator
+        // framing always tracks the current selection and cwd. A team's own
+        // `orchestrator.persona` replaces the global persona for it
+        // (amendment 1).
         ctx.system_prompt = build_system_prompt(
             &ctx.skills,
             ctx.shell_kind.as_ref(),
             &sm_for_provider.session_cwd(),
             ctx.memory_enabled,
-            subagents_active,
-            ctx.orchestrator_prompt.as_deref(),
-            ctx.persona.as_deref(),
+            active.is_some(),
+            active
+                .as_ref()
+                .and_then(|p| p.orchestrator_prompt.as_deref()),
+            active
+                .as_ref()
+                .and_then(|p| p.orchestrator_persona.as_deref())
+                .or(ctx.persona.as_deref()),
         );
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
@@ -1977,15 +2126,20 @@ impl AgentRunner {
     /// agent so the next prompt actually goes to the saved model.
     /// No-op when:
     /// - the running agent is already on the loaded conversation's
-    ///   wire id (alias may differ — that's fine),
+    ///   wire id (alias may differ — that's fine), its cwd, and its pipeline,
     /// - the registry isn't available,
     /// - the loaded conversation's wire id isn't in the registry.
+    ///
+    /// `selection_before` is the pipeline selected *before* the load: a
+    /// different one on the other side means a different tool list, so the
+    /// agent has to be rebuilt even when the wire id matches.
     ///
     /// The error path doesn't emit a system message: `/load` itself
     /// has already either rejected unavailability or accepted the load,
     /// and a no-op rebuild is the silent normal case.
     #[allow(clippy::too_many_arguments)]
     async fn maybe_rebuild_after_load(
+        selection_before: Option<String>,
         agent_slot: &mut Arc<DynAgent>,
         config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
@@ -2018,6 +2172,20 @@ impl AgentRunner {
 
         let wire_id_changed =
             sm.get_provider_name() != saved_provider || sm.get_model() != saved_model;
+
+        // Re-resolve the loaded conversation's pipeline against the live set:
+        // a team that has since been removed from config is dropped (and the
+        // user told), same rule as the resume path.
+        let saved_selection = sm.selected_pipeline();
+        let (active, warning) = ctx.pipelines.resolve_saved(saved_selection.as_deref());
+        let active_orchestrator = active.map(|p| p.orchestrator.clone());
+        if let Some(warning) = warning {
+            sm.set_selected_pipeline(None);
+            sm.add_system_message(warning);
+        }
+        // A different team means a different tool list, so this is a rebuild
+        // axis in its own right — even when the wire id is unchanged.
+        let selection_changed = sm.selected_pipeline() != selection_before;
 
         // Restore the saved cwd best-effort: only if it's non-empty (pre-cwd
         // files default to ""), still exists, and actually differs from the
@@ -2053,16 +2221,21 @@ impl AgentRunner {
         // the SM's current session_cwd — it is the authoritative value
         // for that conversation.
 
-        // Nothing to rebuild if neither axis moved.
-        if !wire_id_changed && !cwd_changed {
+        // Nothing to rebuild if no axis moved.
+        if !wire_id_changed && !cwd_changed && !selection_changed {
             return;
         }
-        let Some(resolved) = ctx.registry.find_by_wire_id(&saved_provider, &saved_model) else {
-            // /load already emitted the unavailability error — and yet
-            // somehow the slot got swapped. Defensive: do nothing.
-            return;
+        // The selected team owns the orchestrator; without one, the loaded
+        // conversation's saved wire id is the target.
+        let resolved = match active_orchestrator {
+            Some(orchestrator) => orchestrator,
+            None => match ctx.registry.find_by_wire_id(&saved_provider, &saved_model) {
+                Some(rm) => rm.clone(),
+                // /load already emitted the unavailability error — and yet
+                // somehow the slot got swapped. Defensive: do nothing.
+                None => return,
+            },
         };
-        let resolved = resolved.clone();
         let sm_for_provider = sm.clone();
         if let Err(e) = Self::rebuild_agent_for_resolved(
             &resolved,
@@ -3037,17 +3210,34 @@ impl AgentRunner {
                     return;
                 }
                 let current = sm.get_model_alias();
+                // A selected pipeline owns the orchestrator's model, so mark
+                // the fixed alias and swap the "how to switch" footer for the
+                // reason it can't be switched.
+                let locked_by = sm.selected_pipeline();
                 let mut msg = String::from("Available models:\n");
                 for alias in &aliases {
                     let arrow = if &current == alias { "→ " } else { "  " };
                     if let Some(resolved) = registry.resolve(alias) {
+                        let marker = match &locked_by {
+                            Some(pipeline) if &current == alias => {
+                                format!("  [fixed by pipeline '{pipeline}']")
+                            }
+                            _ => String::new(),
+                        };
                         msg.push_str(&format!(
-                            "{arrow}{alias}  ({} · {})\n",
+                            "{arrow}{alias}  ({} · {}){marker}\n",
                             resolved.provider_name, resolved.model_name
                         ));
                     }
                 }
-                msg.push_str("\nUse /model <alias> to switch (starts a new conversation).");
+                match locked_by {
+                    Some(pipeline) => {
+                        msg.push_str(&format!("\n{}", model_locked_message(&pipeline)))
+                    }
+                    None => {
+                        msg.push_str("\nUse /model <alias> to switch (starts a new conversation).")
+                    }
+                }
                 sm.add_system_message(msg);
             }
             _ if cmd_lower.starts_with("/model ") => {
@@ -3057,9 +3247,70 @@ impl AgentRunner {
                 // test harness) — emit a helpful diagnostic instead
                 // of silent inertness.
                 if let Some(sm) = state_manager {
+                    match sm.selected_pipeline() {
+                        Some(pipeline) => sm.add_system_message(format!(
+                            "❌ /model: {}",
+                            model_locked_message(&pipeline)
+                        )),
+                        None => sm.add_system_message(
+                            "❌ /model: not available in this build. Configure a `providers:` \
+                             block in config.yaml and restart. See `multi-model.md`."
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
+            _ if cmd_lower.trim_end() == "/pipeline" => {
+                // Rendered from `AppState` — the catalogue stamped at session
+                // build, so the listing can't disagree with the Agents panel.
+                if let Some(sm) = state_manager {
+                    let msg = render_pipeline_list(&sm.get_state());
+                    sm.add_system_message(msg);
+                }
+            }
+            _ if cmd_lower.starts_with("/pipeline ") => {
+                // The event loop routes `/pipeline <name>` to the agent loop
+                // (which owns the agent handle and can rebuild). Reaching here
+                // means no agent loop is attached, so only the read-only half
+                // of the command can be answered — same shape as `/model
+                // <alias>` above.
+                if let Some(sm) = state_manager {
+                    // Case matters: pipeline names are user-typed, so read the
+                    // target off the original command, not the lowered copy.
+                    let target = cmd
+                        .trim()
+                        .strip_prefix("/pipeline ")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    let target = match target.to_ascii_lowercase().as_str() {
+                        "none" | "off" => None,
+                        _ => Some(target),
+                    };
+                    let available: Vec<String> = sm
+                        .get_state()
+                        .pipelines
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
+                    match resolve_pipeline_choice(sm, target, &available) {
+                        PipelineChoice::Unchanged => {}
+                        PipelineChoice::Refused(msg) => {
+                            sm.add_system_message(format!("❌ /pipeline: {msg}"))
+                        }
+                        PipelineChoice::Apply(_) => sm.add_system_message(
+                            "❌ /pipeline: not available in this build (no agent loop attached)."
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
+            // Tombstone: `/subagents` became `/pipeline` when pipelines went
+            // from one anonymous team to a named list.
+            _ if cmd_lower.trim_end() == "/subagents" || cmd_lower.starts_with("/subagents ") => {
+                if let Some(sm) = state_manager {
                     sm.add_system_message(
-                        "❌ /model: not available in this build. Configure a `providers:` \
-                         block in config.yaml and restart. See `multi-model.md`."
+                        "🧩 /subagents is gone — use /pipeline to list the configured teams, \
+                         /pipeline <name> to select one, /pipeline none to clear."
                             .to_string(),
                     );
                 }
@@ -3642,10 +3893,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Agentless mode leads with the crusader persona; orchestrator mode
-    /// drops it (it would confuse an agent coordinating a team).
+    /// Agentless mode leads with the *built-in* crusader persona when nothing
+    /// is configured; orchestrator mode leads with the core guidance instead
+    /// (a configured persona does reach it — see
+    /// `tests/prompt_persona_tests.rs`).
     #[test]
-    fn system_prompt_persona_only_in_agentless_mode() {
+    fn system_prompt_builtin_persona_only_in_agentless_mode() {
         let skills = SkillRegistry::new();
         let cwd = std::env::current_dir().unwrap();
 
@@ -4630,52 +4883,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_subagents_parses_on_off_and_bare() {
-        for on in [
-            "/subagents on",
-            "/subagents TRUE",
-            "/subagents 1",
-            "  /subagents yes  ",
-        ] {
-            assert!(
-                matches!(
-                    classify_submission(on),
-                    SubmitKind::SubagentsCommand(Some(true))
-                ),
-                "{on:?} should be on"
-            );
-        }
-        for off in [
-            "/subagents off",
-            "/subagents false",
-            "/subagents 0",
-            "/subagents no",
-        ] {
-            assert!(
-                matches!(
-                    classify_submission(off),
-                    SubmitKind::SubagentsCommand(Some(false))
-                ),
-                "{off:?} should be off"
-            );
-        }
-        // Bare or malformed → None (usage/status, not a toggle).
-        assert!(matches!(
-            classify_submission("/subagents"),
-            SubmitKind::SubagentsCommand(None)
-        ));
-        assert!(matches!(
-            classify_submission("/subagents wat"),
-            SubmitKind::SubagentsCommand(None)
-        ));
-        // A command that merely starts with the same letters is NOT /subagents.
-        assert!(matches!(
-            classify_submission("/subagentsx"),
-            SubmitKind::Command(_)
-        ));
-    }
-
-    #[test]
     fn classify_empty_is_user_message() {
         // The Enter handler already drops empty buffers; defensive default.
         assert!(matches!(
@@ -4685,6 +4892,51 @@ mod tests {
         assert!(matches!(
             classify_submission("   "),
             SubmitKind::UserMessage(_)
+        ));
+    }
+
+    #[test]
+    fn classify_pipeline_bare_lists() {
+        assert!(matches!(
+            classify_submission("/pipeline"),
+            SubmitKind::PipelineCommand(PipelineSubmission::List)
+        ));
+    }
+
+    #[test]
+    fn classify_pipeline_single_word_selects() {
+        assert!(matches!(
+            classify_submission("/pipeline web-team"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(Some(s))) if s == "web-team"
+        ));
+    }
+
+    #[test]
+    fn classify_pipeline_spaced_name_selects_rest_of_line() {
+        // Names may contain spaces; parsing must take everything after "/pipeline ".
+        assert!(matches!(
+            classify_submission("/pipeline Generic Dev Team"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(Some(s))) if s == "Generic Dev Team"
+        ));
+    }
+
+    #[test]
+    fn classify_pipeline_none_clears() {
+        assert!(matches!(
+            classify_submission("/pipeline none"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(None))
+        ));
+        assert!(matches!(
+            classify_submission("/pipeline off"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(None))
+        ));
+    }
+
+    #[test]
+    fn classify_pipeline_trims_whitespace() {
+        assert!(matches!(
+            classify_submission("  /pipeline Generic Dev Team  "),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(Some(s))) if s == "Generic Dev Team"
         ));
     }
 
@@ -5437,5 +5689,351 @@ headers:
         );
         // ...but stats still moved.
         assert_eq!(sm.get_stats().total_api_calls, 1);
+    }
+    // ── Stage 1.2: /pipeline command + /model refusal + pipeline selection ──
+    //
+    // The three pillars of §4 of the multi-pipeline plan:
+    // 1. `/pipeline [name|none|off]` routing (SubmitKind::PipelineCommand).
+    // 2. `/model <alias>` refusal when a pipeline is selected — the
+    //    orchestrator's model is owned by the pipeline.
+    // 3. Bare `/model` listing marks the fixed alias with
+    //    `[fixed by pipeline 'x']`.
+    //
+    // These are RED against the §7 contracts: `PipelineCommand`,
+    // `model_locked_message`, `handle_select_pipeline` do not exist
+    // yet. The build will fail until Stage 1.2 lands.
+
+    /// `/pipeline` (bare, no arg) classifies as the List variant — the
+    /// controller will then emit a listing of the configured pipelines.
+    /// `/pipeline <name>` classifies as `Set(Some(name))`. `/pipeline
+    /// none` and `/pipeline off` both classify as `Set(None)` — the two
+    /// reserved "clear" spellings the plan §7 promises.
+    #[test]
+    fn classify_pipeline_command_variants() {
+        // Bare — List. Printed by the controller from AppState.
+        assert!(matches!(
+            classify_submission("/pipeline"),
+            SubmitKind::PipelineCommand(PipelineSubmission::List)
+        ));
+        assert!(matches!(
+            classify_submission("  /pipeline  "),
+            SubmitKind::PipelineCommand(PipelineSubmission::List)
+        ));
+
+        // Name — Set(Some(name)). The exact name string survives, no
+        // case-folding (orchestrator already gets the validated alias,
+        // and case matters because pipeline names are user-typed).
+        assert!(matches!(
+            classify_submission("/pipeline web-team"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(ref s)) if s.as_deref() == Some("web-team")
+        ));
+        assert!(matches!(
+            classify_submission("/pipeline research-crew"),
+            SubmitKind::PipelineCommand(PipelineSubmission::Set(ref s)) if s.as_deref() == Some("research-crew")
+        ));
+
+        // `none` and `off` — both clear the selection.
+        for clear in [
+            "/pipeline none",
+            "/pipeline off",
+            "/pipeline OFF",
+            "/pipeline None",
+        ] {
+            assert!(
+                matches!(
+                    classify_submission(clear),
+                    SubmitKind::PipelineCommand(PipelineSubmission::Set(None))
+                ),
+                "{clear:?} must clear the selection"
+            );
+        }
+
+        // Word-boundary guard: `/pipelines` (with an s) is NOT the
+        // pipeline command. The popup autocomplete completes to
+        // `/pipeline`, not `/pipelines`, but a user typing the plural
+        // by reflex used to slip into the with-args arm. Same prefix
+        // discipline as the existing `/subagents` test.
+        assert!(matches!(
+            classify_submission("/pipelines"),
+            SubmitKind::Command(_)
+        ));
+        // Prefix-only: `/pipelinex` isn't the pipeline command either.
+        assert!(matches!(
+            classify_submission("/pipelinex"),
+            SubmitKind::Command(_)
+        ));
+        // Mid-sentence slash stays chat content.
+        assert!(matches!(
+            classify_submission("TODO: /pipeline foo"),
+            SubmitKind::UserMessage(_)
+        ));
+    }
+
+    /// `model_locked_message(pipeline)` is the ONE producer for the
+    /// `/model` refusal (plan §4). Every surface — REPL intercept,
+    /// stdio, web — funnels through it so the wording stays consistent.
+    /// The phrase `fixed by pipeline` is the user-visible signal; the
+    /// pipeline name must appear so the user can locate the source.
+    #[test]
+    fn model_locked_message_mentions_fixed_by_pipeline_and_name() {
+        let msg = model_locked_message("web-team");
+        assert!(
+            msg.contains("fixed by pipeline"),
+            "refusal must use the canonical 'fixed by pipeline' phrase; got: {msg:?}"
+        );
+        assert!(
+            msg.contains("web-team"),
+            "refusal must name the pipeline so the user can locate it; got: {msg:?}"
+        );
+    }
+
+    /// Bare `/model` listing must mark the orchestrator's alias with
+    /// `[fixed by pipeline 'x']` when a pipeline is selected (plan §4
+    /// "bare /model listing marks `[fixed by pipeline 'x']`"). The
+    /// marking tells the user the alias is fixed and *why*, without
+    /// the pop-up listing going silent on the choice. Goes through
+    /// `process_command_internal` (the controller-level seam), with a
+    /// `selected_pipeline` already stamped via `set_selected_pipeline`.
+    #[tokio::test]
+    async fn bare_model_command_marks_fixed_alias_when_pipeline_selected() {
+        let sm = StateManager::new_arc();
+        let config = config_with_two_aliases();
+        // Stage a pipeline selection. The marker MUST name the
+        // pipeline ("web-team") and mark the alias that's fixed by it.
+        sm.set_selected_pipeline(Some("web-team".into()));
+
+        AgentRunner::process_command_internal("/model", &Some(sm.clone()), &config).await;
+
+        let msg = last_system_message(&sm);
+        assert!(
+            msg.contains("Available models:"),
+            "bare /model must still show the listing, got: {msg}"
+        );
+        // The marker must mention the pipeline name AND the alias is
+        // fixed. The exact alias will depend on which pipeline was
+        // selected; here `web-team` is a placeholder so we only check
+        // for the "fixed by pipeline" tag and the pipeline name.
+        assert!(
+            msg.contains("fixed by pipeline") && msg.contains("web-team"),
+            "the fixed alias must be marked with `[fixed by pipeline 'x']`; got: {msg}"
+        );
+    }
+
+    /// Bare `/model` listing WITHOUT a pipeline selection must NOT
+    /// mark any alias — it stays the same listing the no-pipeline
+    /// world already shows (plan §4 only adds the marker under a
+    /// pipeline). Companion to the marker test above.
+    #[tokio::test]
+    async fn bare_model_command_unmarked_when_no_pipeline_selected() {
+        let sm = StateManager::new_arc();
+        let config = config_with_two_aliases();
+        // Default — no pipeline selected.
+
+        AgentRunner::process_command_internal("/model", &Some(sm.clone()), &config).await;
+
+        let msg = last_system_message(&sm);
+        assert!(msg.contains("Available models:"));
+        assert!(
+            !msg.contains("fixed by pipeline"),
+            "no pipeline selected → no `[fixed by pipeline]` marker; got: {msg}"
+        );
+    }
+
+    /// Refusal assertion: when a pipeline is selected, `/model <other-alias>`
+    /// returns an Err whose message contains `fixed by pipeline` AND
+    /// the original model is NOT swapped. Goes through the
+    /// authoritative `handle_switch_model` (covers stdio + web per §4).
+    ///
+    /// We can't construct a real `AgentRunner` here (it requires a
+    /// provider + session hook), so this test asserts through
+    /// `process_command_internal` — the controller path the agent loop
+    /// ultimately funnels into. The actual `handle_switch_model`
+    /// refusal path is pinned by the `model_locked_message` test above
+    /// + the orchestrator-owns-model contract enforced by the
+    /// rebuild seam.
+    #[tokio::test]
+    async fn model_alias_command_refused_when_pipeline_selected() {
+        let sm = StateManager::new_arc();
+        let config = config_with_two_aliases();
+        // Stamp the pipeline selection. The user's saved wire id is
+        // `sonnet` (the default). Switching to `gpt4o` under a
+        // pipeline must be refused.
+        sm.set_selected_pipeline(Some("web-team".into()));
+        let alias_before = sm.get_model_alias();
+
+        AgentRunner::process_command_internal("/model gpt4o", &Some(sm.clone()), &config).await;
+
+        let msg = last_system_message(&sm);
+        assert!(
+            msg.contains("fixed by pipeline") || msg.contains("pipeline"),
+            "/model <alias> under a pipeline must surface a refusal mentioning pipeline; got: {msg}"
+        );
+        // The model must NOT have changed. Plan §4: "the orchestrator's
+        // model is now derived from the selection rather than stored
+        // beside it, the top model selector goes read-only and /model
+        // refuses".
+        assert_eq!(
+            sm.get_model_alias(),
+            alias_before,
+            "the alias must not change when /model is refused"
+        );
+    }
+
+    /// `handle_select_pipeline` is the renamed `handle_set_subagents`
+    /// (§7 contracts). Lock check: once the conversation has a real
+    /// turn, the handler refuses with an error so the conversation
+    /// history and tool list don't desync mid-turn. This is the
+    /// same lock rule today — `subagents_enabled` is "mutable only
+    /// before the first turn, frozen after" — applied to the new
+    /// field.
+    ///
+    /// Tested through the existing `process_command_internal` /\u00a0controll\u00e8r
+    /// dispatch rather than calling `handle_select_pipeline`
+    /// directly (constructing an AgentRunner requires a live provider
+    /// + session hook). The lock rule is the same; this test pins
+    /// that it fires when a turn has happened.
+    #[tokio::test]
+    async fn pipeline_selection_locked_after_first_turn() {
+        let sm = StateManager::new_arc();
+        let config = config_with_two_aliases();
+        // Seed a real user turn — the conversation now has turns.
+        sm.add_user_message("hi".into());
+        assert!(sm.conversation_has_turns());
+
+        // Send a /pipeline web-team submission through the same
+        // controller path. The handler must refuse (locked).
+        // process_command_internal currently has no /pipeline arm; the
+        // builder must add one in Stage 1.2 that calls
+        // handle_select_pipeline, which returns Err after the first
+        // turn.
+        AgentRunner::process_command_internal("/pipeline web-team", &Some(sm.clone()), &config)
+            .await;
+
+        // The conversation did NOT adopt the new selection.
+        assert_eq!(
+            sm.selected_pipeline().as_deref(),
+            None,
+            "selection must NOT change once the conversation has turns"
+        );
+        // And the user sees an error in the system stream.
+        let last = last_system_message(&sm);
+        assert!(
+            last.to_lowercase().contains("lock")
+                || last.to_lowercase().contains("first turn")
+                || last.to_lowercase().contains("started"),
+            "user must see an error explaining the lock; got: {last}"
+        );
+    }
+
+    /// `handle_select_pipeline` must be idempotent for the
+    /// already-selected name: selecting the current pipeline is a
+    /// silent no-op, not a rebuild storm. This is the same property
+    /// today's `handle_set_subagents` has (line ~1520:
+    /// "No-op if already in the requested state (idempotent toggle).").
+    /// The test asserts that picking the active selection produces NO
+    /// system message (no announcement, no rebuild trace) and leaves
+    /// the alias unchanged.
+    #[tokio::test]
+    async fn pipeline_selection_idempotent_for_current_name() {
+        let sm = StateManager::new_arc();
+        let config = config_with_two_aliases();
+        // Pre-stamp a selection.
+        sm.set_selected_pipeline(Some("web-team".into()));
+        let alias_before = sm.get_model_alias();
+        let chat_len_before = sm.get_state().chat.messages.len();
+
+        AgentRunner::process_command_internal("/pipeline web-team", &Some(sm.clone()), &config)
+            .await;
+
+        // No-op — no announcement system message, no alias flip.
+        assert_eq!(sm.selected_pipeline().as_deref(), Some("web-team"));
+        assert_eq!(sm.get_model_alias(), alias_before);
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            chat_len_before,
+            "idempotent re-selection must NOT add a system message (no rebuild storm)"
+        );
+    }
+
+    /// `handle_select_pipeline(unknown_name)` must reject with an
+    /// error that lists the available pipelines — same shape as
+    /// `handle_switch_model`'s unknown-alias error. Plan §4: the user
+    /// types a name after `/pipeline` and gets a list back when it's
+    /// wrong.
+    #[tokio::test]
+    async fn pipeline_selection_unknown_name_errors_listing_available() {
+        let sm = StateManager::new_arc();
+        let config = config_with_two_aliases();
+        // No selection yet.
+        assert_eq!(sm.selected_pipeline().as_deref(), None);
+
+        AgentRunner::process_command_internal(
+            "/pipeline nope-not-a-pipe",
+            &Some(sm.clone()),
+            &config,
+        )
+        .await;
+
+        // The selection is NOT applied.
+        assert_eq!(
+            sm.selected_pipeline().as_deref(),
+            None,
+            "an unknown pipeline name must NOT be silently applied"
+        );
+        let last = last_system_message(&sm);
+        assert!(
+            last.contains("nope-not-a-pipe"),
+            "error must name the bad name so the user can see the typo; got: {last}"
+        );
+        assert!(
+            last.contains("Available")
+                || last.contains("web-team")
+                || last.contains("Available pipelines"),
+            "error must list the available pipelines; got: {last}"
+        );
+    }
+
+    /// On failed selection, `handle_select_pipeline` MUST restore the
+    /// previous selection — the same fix the plan §4 calls out for the
+    /// existing toggle ("on failure: restore previous selection — fixes
+    /// a leak today's toggle has"). This test forces a failure by
+    /// selecting a pipeline name the registry doesn't know; without
+    /// the restore-before-set discipline the AppState would be left
+    /// holding an orphan name.
+    ///
+    /// Note: the full rebuild-failure path (the implementer's
+    /// `set_selected_pipeline(previous)` after a rebuild error) runs in
+    /// the agent loop and can't be triggered from `process_command_internal`
+    /// alone. This test pins the *observable* contract — an unknown
+    /// pipeline name MUST NOT mutate `selected_pipeline`, so the
+    /// previous selection survives. The deeper rebuild-restore
+    /// property is asserted by the StateManager mirror tests above
+    /// (which exercise `set_selected_pipeline` directly).
+    #[tokio::test]
+    async fn pipeline_selection_with_bad_name_does_not_mutate_previous() {
+        let sm = StateManager::new_arc();
+        let config = config_with_two_aliases();
+        // Pre-stamp a known-good selection so the test has a "previous"
+        // to fall back to.
+        sm.set_selected_pipeline(Some("web-team".into()));
+        let prior = sm.selected_pipeline();
+
+        AgentRunner::process_command_internal(
+            "/pipeline nope-not-a-pipe",
+            &Some(sm.clone()),
+            &config,
+        )
+        .await;
+
+        assert_eq!(
+            sm.selected_pipeline(),
+            prior,
+            "a failed selection must restore the previous selection (plan §4)"
+        );
+        assert_eq!(
+            sm.selected_pipeline().as_deref(),
+            Some("web-team"),
+            "the previous selection (web-team) must survive intact"
+        );
     }
 }

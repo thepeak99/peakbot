@@ -1,14 +1,18 @@
-// Step 9 — Multi-agent pipeline (optional). Enable it, give the orchestrator a
-// prompt, then one row per role.
+// Step 9 — Multi-agent pipeline (optional). Name the team, preset the
+// orchestrator, then one row per member role.
 //
 // The role's model select is fed by step 4's aliases — the flow's only real
 // cross-step dependency, and the one thing here worth building properly. Delete
 // an alias in Models and the rows that referenced it turn red immediately
 // (validateMultiAgent), which is exactly what the binary would refuse at boot.
+//
+// An imported config that already declares `pipelines:` is rendered read-only:
+// `pipelines` is not an owned key, so those teams pass through verbatim and
+// this step has nothing to edit without silently deleting them.
 
 import { useState } from "react";
 import type { PipelineAgentDraft, PipelineDraft } from "../draft";
-import { collectAliases } from "../draft";
+import { collectAliases, importedPipelines, pipelineName } from "../draft";
 import type { StepProps } from "../steps";
 import {
   Check,
@@ -89,7 +93,7 @@ function RoleRow({
   return (
     <div className="space-y-3 rounded-lg border border-zinc-800 p-3">
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="Role" hint="The key under pipeline.agents — one word.">
+        <Field label="Role" hint="The key under pipelines[].agents — one word.">
           <input
             value={agent.role ?? ""}
             onChange={(e) => onChange({ role: e.target.value })}
@@ -201,8 +205,20 @@ function RoleRow({
   );
 }
 
+/** Best-effort name of a passthrough pipeline entry — the read-only notice
+ *  shows what the wizard is leaving alone, so an unreadable entry still has to
+ *  render something. */
+function importedName(entry: unknown): string {
+  if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+    const name = (entry as Record<string, unknown>).name;
+    if (typeof name === "string" && name.trim()) return name;
+  }
+  return "(unnamed)";
+}
+
 export function MultiAgentStep({ draft, patch }: StepProps) {
   const aliases = collectAliases(draft);
+  const imported = importedPipelines(draft);
   const agents = draft.pipeline.agents ?? [];
   const set = (partial: Partial<PipelineDraft>) =>
     patch({ pipeline: { ...draft.pipeline, ...partial } });
@@ -215,33 +231,112 @@ export function MultiAgentStep({ draft, patch }: StepProps) {
 
   const setAgents = (next: PipelineAgentDraft[]) => set({ agents: next });
 
+  if (imported) {
+    return (
+      <div className="space-y-3">
+        <p className="rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-400">
+          {imported.length} pipeline{imported.length === 1 ? "" : "s"} already
+          configured — the wizard won&apos;t touch them.
+        </p>
+        <ul className="space-y-1 text-xs text-zinc-500">
+          {imported.map((entry, i) => (
+            <li key={i} className="rounded-md border border-zinc-800 px-3 py-2">
+              <code className="text-zinc-300">{importedName(entry)}</code>
+            </li>
+          ))}
+        </ul>
+        <p className="text-xs text-zinc-600">
+          Edit them in config.yaml — they are written back exactly as imported.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
       <Check
-        label="Enable the sub-agent pipeline"
-        hint="Boot-only: pipeline changes need a restart, not just /new."
-        checked={draft.pipeline.enabled ?? false}
-        onChange={(enabled) => set({ enabled })}
+        label="Add a sub-agent pipeline"
+        hint="Boot-only: pipelines changes need a restart, not just /new."
+        checked={draft.pipeline.include ?? false}
+        onChange={(include) => set({ include })}
       />
 
-      {draft.pipeline.enabled && (
+      {draft.pipeline.include && (
         <>
           <Field
-            label="orchestrator_prompt"
+            label="Pipeline name"
+            hint="What you type after /pipeline. No spaces; `none` is reserved."
+          >
+            <input
+              value={pipelineName(draft.pipeline)}
+              onChange={(e) => set({ name: e.target.value })}
+              placeholder="default"
+              spellCheck={false}
+              className={inputClass}
+            />
+          </Field>
+
+          <Field
+            label="Orchestrator model"
+            hint="Fixed for this pipeline — the UI can't change it later. Omit to inherit default_model."
+          >
+            <select
+              value={draft.pipeline.orchestratorModel ?? ""}
+              onChange={(e) =>
+                set({ orchestratorModel: e.target.value || undefined })
+              }
+              className={inputClass}
+            >
+              <option value="">(default_model)</option>
+              {aliases.map((a) => (
+                <option key={a} value={a}>
+                  {a}
+                </option>
+              ))}
+              {/* Keep a removed alias selectable so the error stays visible
+                  rather than silently snapping back to default_model. */}
+              {draft.pipeline.orchestratorModel &&
+                !aliases.includes(draft.pipeline.orchestratorModel) && (
+                  <option value={draft.pipeline.orchestratorModel}>
+                    {draft.pipeline.orchestratorModel} (missing)
+                  </option>
+                )}
+            </select>
+          </Field>
+
+          <Field
+            label="Orchestrator prompt"
             hint="Appended to the orchestrator's prompt. Sub-agents never see it."
           >
             <textarea
               value={draft.pipeline.orchestratorPrompt ?? ""}
-              onChange={(e) => set({ orchestratorPrompt: e.target.value })}
+              onChange={(e) =>
+                set({ orchestratorPrompt: e.target.value || undefined })
+              }
               rows={3}
               placeholder="You lead a small team. Delegate research and review…"
               className={`${inputClass} text-xs`}
             />
           </Field>
 
+          <Field
+            label="Orchestrator persona"
+            hint="Optional: replaces the global persona while this pipeline runs."
+          >
+            <textarea
+              value={draft.pipeline.orchestratorPersona ?? ""}
+              onChange={(e) =>
+                set({ orchestratorPersona: e.target.value || undefined })
+              }
+              rows={3}
+              className={`${inputClass} text-xs`}
+            />
+          </Field>
+
           {agents.length === 0 && (
             <p className="rounded-md border border-dashed border-zinc-800 px-3 py-6 text-center text-xs text-zinc-600">
-              No roles yet. Each role becomes a delegate target.
+              No roles yet. Each role becomes a delegate target — a pipeline
+              needs at least one.
             </p>
           )}
 

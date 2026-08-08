@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use peakbot::{
-    Config, FileStorage, ShellKind, SubAgentRegistry, Ui, get_config_file_path,
+    Config, FileStorage, ShellKind, Ui, get_config_file_path,
     install::{
         InstallAction, InstallOutcome, PathState, ServiceOp, ServicePlan, install_binary,
         install_target, path_state, resolve_token, service_op, web_token_path, write_web_token,
@@ -541,18 +541,15 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Pipeline. Shared across sessions via Arc. Roles resolve their model
-    // alias against the model registry at construction (unknown alias →
-    // clear boot error).
-    let pipeline_registry = if config.pipeline_enabled() {
-        let pipeline_config = config.pipeline().unwrap();
-        match SubAgentRegistry::new(pipeline_config, &model_registry, &skills.names()) {
-            Ok(reg) => Some(Arc::new(reg)),
-            Err(e) => anyhow::bail!("Invalid pipeline configuration: {e}"),
-        }
-    } else {
-        None
-    };
+    // Pipelines. One resolved set for the whole process, shared across sessions
+    // via Arc. Every team's orchestrator + roles resolve their model alias here
+    // (unknown alias → clear boot error), and a legacy `pipeline:` block is a
+    // hard error with a migration recipe.
+    let pipelines = Arc::new(peakbot::PipelineSet::build(
+        &config,
+        &model_registry,
+        Some(&skills.names()),
+    )?);
 
     // Mirror the registry's boot provider into `config.provider` so
     // `AgentRunner::new`'s compaction-model construction reads the active
@@ -609,7 +606,7 @@ async fn main() -> Result<()> {
         skill_warnings,
         mcp_handles: mcp_handles_arc.clone(),
         searxng_config,
-        pipeline_registry,
+        pipelines,
         vector_store,
         shell_kind,
         storage,

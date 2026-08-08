@@ -64,13 +64,13 @@ pub enum UiAction {
     /// stay race-free because nothing is mutated at the process level.
     ChangeCwd(String),
 
-    /// Opt the current conversation into (or out of) sub-agents — the Agents
-    /// panel "Enable subagents" checkbox. Only meaningful before the first
-    /// turn; the agent loop rejects it once the conversation has turns
+    /// Bind the current conversation to a named pipeline, or clear the binding
+    /// with `None` — the Agents panel selector. Only meaningful before the
+    /// first turn; the agent loop rejects it once the conversation has turns
     /// (the choice is locked for the life of the conversation) and otherwise
-    /// records it, persists it, and rebuilds the agent on the same model/cwd so
-    /// the `delegate` tool appears or disappears to match.
-    SetSubagentsEnabled(bool),
+    /// records it, persists it, and rebuilds the agent on that team's
+    /// orchestrator so model, prompt and `delegate` roster all match.
+    SelectPipeline(Option<String>),
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TodoItemAction {
@@ -131,8 +131,8 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("rename", "Rename the current conversation", true),
         SlashCommand::new("model", "List models, or switch with /model <alias>", true),
         SlashCommand::new(
-            "subagents",
-            "Enable/disable sub-agents for this conversation: /subagents on|off",
+            "pipeline",
+            "List pipelines, or bind this conversation with /pipeline <name>|none",
             true,
         ),
         SlashCommand::new(
@@ -343,7 +343,7 @@ mod tests {
                 "export",
                 "rename",
                 "model",
-                "subagents",
+                "pipeline",
                 "cd",
                 "bg",
                 "stop",

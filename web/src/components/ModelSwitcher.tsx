@@ -16,12 +16,16 @@ export function ModelSwitcher({
   // Open the dropdown upward instead of downward. Set when the chip lives in
   // the mobile bottom bar, where a downward menu would clip off-screen.
   dropUp = false,
+  // When set, the chip renders greyed/disabled, clicking does NOT open the
+  // dropdown, and a title tooltip explains why.
+  lockedReason = null,
 }: {
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
   onSwitch: (alias: string) => void;
   dropUp?: boolean;
+  lockedReason?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -55,11 +59,17 @@ export function ModelSwitcher({
   return (
     <div className="relative" ref={ref}>
       <button
-        onClick={() => setOpen((o) => !o)}
-        className="flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
-        title="Switch model"
+        onClick={() => {
+          if (!lockedReason) setOpen((o) => !o);
+        }}
+        className={`flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs transition-colors ${
+          lockedReason
+            ? "cursor-not-allowed text-zinc-500"
+            : "text-zinc-300 hover:bg-zinc-800"
+        }`}
+        title={lockedReason ?? "Switch model"}
       >
-        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+        <span className="h-1.5 w-1.5 rounded-full bg-zinc-600" />
         {activeAlias || "model"}
         <span className="text-zinc-600">▾</span>
       </button>

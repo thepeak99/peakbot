@@ -83,27 +83,32 @@ export function App() {
 
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
+  const [drawerTab, setDrawerTab] = useState<string | null>(null);
+  const drawerOpen = drawerTab !== null;
 
-  // Sub-agent watch. Two distinct facts, kept apart:
-  //  * `pipelineAvailable` — is a pipeline *configured*? (boot-only config).
-  //    Decides whether the opt-in is offered at all.
-  //  * `subagentsEnabled` — did the user opt THIS conversation in? (default
-  //    off, locked once the conversation has turns). Drives whether sub-agents
-  //    actually run. `view` scopes the transcript, todos, files and stats to
-  //    one lane via the message `source`.
-  const pipelineAvailable = state?.pipeline_available ?? false;
-  const subagentsEnabled = state?.subagents_enabled ?? false;
+  // Pipelines. ONE fact drives everything: `selected_pipeline` — the team this
+  // conversation is bound to, or null for single agent. `pipelines` is the
+  // boot-time catalogue (what the user may pick). Sub-agents run iff a
+  // pipeline is selected, so that single value also decides whether the
+  // per-lane views mean anything. `view` scopes the transcript, todos, files
+  // and stats to one lane via the message `source`.
+  const pipelines = state?.pipelines ?? [];
+  const selectedPipeline = state?.selected_pipeline ?? null;
+ // When a pipeline is selected, the model selector is locked to the
+  // orchestrator's model — the chip stays visible but is disabled.
+  const modelLockedReason = selectedPipeline
+    ? `fixed by pipeline ${selectedPipeline}`
+    : null;
   const [view, setView] = useState<ViewFilter>("global");
-  // Sub-agent views only make sense once the conversation actually opted in.
-  const effectiveView: ViewFilter =
-    pipelineAvailable && subagentsEnabled ? view : "global";
+  // Sub-agent views only make sense once a pipeline is actually selected.
+  const effectiveView: ViewFilter = selectedPipeline ? view : "global";
 
   // Sub-agent roster: one entry per delegation call, in call order (Phase 2 +
   // per-call). Zero backend — derived from the transcript. A role delegated to
   // more than once yields several entries; the panel suffixes those "#n".
   const roster = state ? deriveSubAgentRoster(state.chat.messages) : [];
-  // The opt-in locks once the conversation has a real turn (any user or agent
-  // message). System banners don't count — mirrors the backend's
+  // The pipeline selection locks once the conversation has a real turn (any
+  // user or agent message). System banners don't count — mirrors the backend's
   // `conversation_has_turns`.
   const conversationStarted = state
     ? state.chat.messages.some((m) => m.role === "user" || m.role === "agent")
@@ -198,10 +203,10 @@ export function App() {
       label: "Agents",
       content: (
         <AgentsPanel
-          pipelineAvailable={pipelineAvailable}
-          subagentsEnabled={subagentsEnabled}
+          pipelines={pipelines}
+          selected={selectedPipeline}
           locked={conversationStarted}
-          onToggle={(enabled) => send({ type: "set_subagents", enabled })}
+          onSelectPipeline={(name) => send({ type: "select_pipeline", name })}
           active={view}
           onSelect={setView}
           roster={roster}
@@ -209,14 +214,13 @@ export function App() {
           laneMessages={laneMessages}
         />
       ),
-      badge:
-        pipelineAvailable && subagentsEnabled ? roster.length : undefined,
+      badge: selectedPipeline ? roster.length : undefined,
     },
   ];
 
   return (
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-zinc-950 text-zinc-100">
-      <TopBar
+    <TopBar
         stats={stats}
         isRunning={isRunning}
         connected={connected}
@@ -233,7 +237,9 @@ export function App() {
         notifyEnabled={notify.enabled}
         notifyPermission={notify.permission}
         onToggleNotify={notify.toggle}
+        lockedReason={modelLockedReason}
       />
+  
 
       {error && (
         <div className="bg-red-950/70 px-4 py-1.5 text-center text-xs text-red-300">
@@ -291,6 +297,7 @@ export function App() {
                 showTop={showTop}
                 onBottom={scrollToBottom}
                 onTop={scrollToTop}
+                drawerOpen={drawerOpen}
               />
             )}
           </div>
@@ -311,7 +318,7 @@ export function App() {
         </main>
       </div>
 
-      <BottomBar
+   <BottomBar
         conversations={conversations}
         models={models}
         activeAlias={stats?.modelAlias || activeAlias}
@@ -321,9 +328,15 @@ export function App() {
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={(id) => switchConvo(id)}
+        lockedReason={modelLockedReason}
       />
+   
 
-      <TabbedDrawer tabs={tabs} />
+      <TabbedDrawer
+        tabs={tabs}
+        active={drawerTab}
+        onActiveChange={setDrawerTab}
+      />
     </div>
   );
 }

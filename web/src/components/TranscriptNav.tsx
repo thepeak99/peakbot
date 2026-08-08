@@ -14,6 +14,8 @@ interface Props {
   showTop: boolean;
   onBottom: () => void;
   onTop: () => void;
+  /** Side drawer is open — shift the buttons left so the drawer doesn't cover them. */
+  drawerOpen: boolean;
 }
 
 const BUTTON =
@@ -25,9 +27,14 @@ export function TranscriptNav({
   showTop,
   onBottom,
   onTop,
+  drawerOpen,
 }: Props) {
   return (
-    <div className="pointer-events-none absolute bottom-4 right-14 z-10 flex flex-col items-end gap-2">
+    <div
+      className={`pointer-events-none absolute bottom-4 right-14 z-10 flex flex-col items-end gap-2 transition-[right] duration-300 ease-out ${
+        drawerOpen ? "lg:right-[344px]" : ""
+      }`}
+    >
       {showTop && (
         <button
           onClick={onTop}

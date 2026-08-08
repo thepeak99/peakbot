@@ -34,6 +34,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time;
 
 use crate::PEAKBOT_VERSION;
+use crate::model_locked_message;
 use crate::state::StateManager;
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState};
@@ -1388,6 +1389,14 @@ impl ReplUi {
         let alias = rest.trim();
         if alias.is_empty() {
             return false; // treat as bare `/model`
+        }
+        // A selected pipeline owns the orchestrator's model — refuse before the
+        // confirm dialog, so the user isn't asked to approve a reset that the
+        // controller would then reject anyway.
+        if let Some(pipeline) = self.state_manager.selected_pipeline() {
+            self.state_manager
+                .add_system_message(format!("❌ /model: {}", model_locked_message(&pipeline)));
+            return true;
         }
         let Some(registry) = self.model_registry.clone() else {
             // No registry attached — let the controller handle it.
