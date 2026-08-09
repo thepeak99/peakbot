@@ -771,19 +771,6 @@ impl StateManager {
         self.reset_bash_panel();
     }
 
-    /// Replace all chat messages with the given list.
-    ///
-    /// Used after context compaction to persist the compacted history back
-    /// into StateManager (the single source of truth).
-    pub fn replace_chat_messages(&self, messages: Vec<ChatMessage>) {
-        // Drop orphan tool messages; the rig wire layer assumes pair integrity.
-        let messages = crate::tool_use_validator::sanitize_tool_pairs(messages);
-        let mut state = self.state.write().unwrap();
-        state.chat.messages = messages;
-        state.chat.auto_scroll = true;
-        self.notify_update(&state);
-    }
-
     /// Set whether the agent is currently running (processing a message).
     ///
     /// Stamps `run_started_at = Some(Instant::now())` when starting, and clears
@@ -1449,9 +1436,6 @@ impl StateManager {
                     }
                 })
                 .collect();
-
-            // Drop orphan tool messages; the rig wire layer assumes pair integrity.
-            let messages = crate::tool_use_validator::sanitize_tool_pairs(messages);
 
             // Restore persisted session stats *before* dropping the conv guard
             // so we don't race with a concurrent save.
@@ -3473,38 +3457,6 @@ mod tests {
         }
     }
 
-    /// Test that replace_chat_messages works correctly for compaction persistence.
-    #[test]
-    fn test_replace_chat_messages() {
-        let sm = StateManager::new();
-
-        // Add some messages
-        sm.add_user_message("Hello".to_string());
-        sm.add_assistant_message("Hi there".to_string());
-        sm.add_user_message("How are you?".to_string());
-        sm.add_assistant_message("I'm fine".to_string());
-        assert_eq!(sm.get_state().chat.messages.len(), 4);
-
-        // Replace with compacted messages (simulating compaction)
-        let compacted = vec![
-            ChatMessage::user("[Summary of previous conversation]".to_string()),
-            ChatMessage::user("How are you?".to_string()),
-            ChatMessage::agent("I'm fine".to_string()),
-        ];
-        sm.replace_chat_messages(compacted);
-
-        let state = sm.get_state();
-        assert_eq!(
-            state.chat.messages.len(),
-            3,
-            "Should have 3 messages after replace (summary + 2 recent)"
-        );
-        assert!(
-            state.chat.messages[0].content.contains("Summary"),
-            "First message should be the summary"
-        );
-    }
-
     // ─── compaction persistence roundtrip (issue #59) ────────────────────
     //
     // A compacted conversation must reload with its `compacted` flags and
@@ -3579,72 +3531,6 @@ mod tests {
             uncompacted, 3,
             "Summary + 2 recent — compaction must not be undone by reload"
         );
-    }
-
-    // ─── tool-pair sanitization at the conversation boundary ─────────────
-    //
-    // See [`crate::tool_use_validator`] for the design + unit-level
-    // coverage. These two tests pin the call-site wiring at the two
-    // boundaries the proposal identifies: `replace_chat_messages`
-    // (compaction) and `sync_from_conversation` (load).
-
-    #[test]
-    fn replace_chat_messages_sanitizes_after_compaction() {
-        use crate::ui::app_state::MessageRole;
-        let sm = StateManager::new();
-
-        // Compaction emitted a ToolCall but lost its matching ToolResult.
-        let corrupt = vec![
-            ChatMessage::user("hi".into()),
-            ChatMessage::tool_call("bash", "{}", Some("call_1".into())),
-            // Orphan: no ToolResult follows.
-            ChatMessage::agent("done".into()),
-        ];
-
-        sm.replace_chat_messages(corrupt);
-
-        let state = sm.get_state();
-        assert_eq!(
-            state.chat.messages.len(),
-            2,
-            "orphan ToolCall must be dropped at the boundary"
-        );
-        assert_eq!(state.chat.messages[0].role, MessageRole::User);
-        assert_eq!(state.chat.messages[1].role, MessageRole::Agent);
-    }
-
-    #[test]
-    fn sync_from_conversation_sanitizes_orphan_call() {
-        use crate::conversation::Conversation;
-        use crate::ui::app_state::MessageRole;
-
-        let sm = StateManager::new();
-
-        // Build a conversation with an orphan ToolCall (no matching
-        // ToolResult). This simulates a file truncated mid-write or
-        // hand-edited.
-        let mut conv = Conversation::new(
-            "test".into(),
-            "test-provider".into(),
-            "test-model".into(),
-            String::new(),
-        );
-        conv.add_user_message("hello".into());
-        conv.add_tool_call("bash".into(), "{}".into(), Some("call_1".into()));
-        // No matching ToolResult!
-        conv.add_assistant_message("done".into());
-
-        *sm.current_conversation.lock().unwrap() = Some(conv);
-        sm.sync_from_conversation();
-
-        let state = sm.get_state();
-        assert_eq!(
-            state.chat.messages.len(),
-            2,
-            "orphan ToolCall must be dropped on load"
-        );
-        assert_eq!(state.chat.messages[0].role, MessageRole::User);
-        assert_eq!(state.chat.messages[1].role, MessageRole::Agent);
     }
 
     /// Pin /load survival of an orchestrator `ToolCall`/`ToolResult` pair whose
