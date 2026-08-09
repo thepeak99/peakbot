@@ -3647,6 +3647,161 @@ mod tests {
         assert_eq!(state.chat.messages[1].role, MessageRole::Agent);
     }
 
+    /// Pin /load survival of an orchestrator `ToolCall`/`ToolResult` pair whose
+    /// adjacency is broken by a sub-agent's intervening turns. The load-time
+    /// sanitizer is lane-blind and matches only on adjacent `ToolCall` →
+    /// `ToolResult`; a `delegate` call followed by sub-agent rows followed by
+    /// the delegate result currently loses both orchestrator rows (#271).
+    #[test]
+    fn load_conversation_preserves_delegate_pair_split_by_sub_agent_turns() {
+        use crate::conversation::{Conversation, Message};
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+        use crate::ui::app_state::{MessageRole, MessageSource};
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+        use std::sync::Arc;
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let mut conv = Conversation::new(
+            "delegation".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
+        // Push via struct literals so sub-agent rows can carry
+        // `MessageSource::SubAgent { role }` — the `add_*` helpers hard-code Human.
+        conv.messages.push(Message::User {
+            content: "research this".into(),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::ToolCall {
+            tool_name: "delegate".into(),
+            arguments: "{}".into(),
+            call_id: Some("call-1".into()),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::ToolCall {
+            tool_name: "bash".into(),
+            arguments: "{}".into(),
+            call_id: Some("sub-1".into()),
+            compacted: false,
+            source: MessageSource::SubAgent {
+                role: "researcher".into(),
+            },
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::ToolResult {
+            tool_name: "bash".into(),
+            arguments: "{}".into(),
+            result: "sub output".into(),
+            call_id: Some("sub-1".into()),
+            compacted: false,
+            source: MessageSource::SubAgent {
+                role: "researcher".into(),
+            },
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::ToolResult {
+            tool_name: "delegate".into(),
+            arguments: "{}".into(),
+            result: "findings".into(),
+            call_id: Some("call-1".into()),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::Assistant {
+            content: "here is the answer".into(),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+
+        // Go through the real /load path so the MessageSource serde round-trip
+        // is exercised alongside `sync_from_conversation`.
+        let id = conv.id;
+        storage.save(&conv).unwrap();
+        sm.load_conversation(id).unwrap();
+
+        // (i) Transcript — the six rows must come back unchanged.
+        let msgs = &sm.get_state().chat.messages;
+        assert_eq!(
+            msgs.len(),
+            6,
+            "sub-agent turns must not cause /load to drop orchestrator tool rows"
+        );
+        assert_eq!(
+            msgs.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![
+                MessageRole::User,
+                MessageRole::ToolCall,
+                MessageRole::ToolCall,
+                MessageRole::ToolResult,
+                MessageRole::ToolResult,
+                MessageRole::Agent,
+            ]
+        );
+        assert_eq!(msgs[1].role, MessageRole::ToolCall);
+        assert_eq!(msgs[1].tool_name.as_deref(), Some("delegate"));
+        assert_eq!(msgs[1].call_id.as_deref(), Some("call-1"));
+        assert_eq!(msgs[1].source, MessageSource::Human);
+        assert_eq!(msgs[4].role, MessageRole::ToolResult);
+        assert_eq!(msgs[4].tool_name.as_deref(), Some("delegate"));
+        assert_eq!(msgs[4].call_id.as_deref(), Some("call-1"));
+        assert_eq!(msgs[4].source, MessageSource::Human);
+        assert_eq!(msgs[2].role, MessageRole::ToolCall);
+        assert_eq!(
+            msgs[2].source,
+            MessageSource::SubAgent {
+                role: "researcher".into()
+            }
+        );
+        assert_eq!(msgs[3].role, MessageRole::ToolResult);
+        assert_eq!(
+            msgs[3].source,
+            MessageSource::SubAgent {
+                role: "researcher".into()
+            }
+        );
+
+        // (ii) Wire — sub-agent rows are filtered out by `is_orchestrator_context`,
+        // and the surviving orchestrator rows form a `ToolCall` → `ToolResult`
+        // pair that the wire layer must emit intact.
+        let history = sm.get_agent_history();
+        assert_eq!(
+            history.len(),
+            4,
+            "wire history must carry the orchestrator tool pair alongside User+Agent"
+        );
+        let tc_id = match &history[1] {
+            RigMessage::Assistant { content, .. } => content
+                .iter()
+                .find_map(|c| match c {
+                    AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    _ => None,
+                })
+                .expect("delegate ToolCall at index 1"),
+            other => panic!("expected Assistant ToolCall at index 1, got {other:?}"),
+        };
+        let tr_id = match &history[2] {
+            RigMessage::User { content } => content
+                .iter()
+                .find_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.id.clone()),
+                    _ => None,
+                })
+                .expect("delegate ToolResult at index 2"),
+            other => panic!("expected User ToolResult at index 2, got {other:?}"),
+        };
+        assert_eq!(tc_id, "call-1");
+        assert_eq!(tr_id, "call-1");
+    }
+
     // ─── todo persistence roundtrip ──────────────────────────────────────
 
     /// Todo items round-trip through sync_to_conversation / sync_from_conversation.
