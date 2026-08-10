@@ -29,20 +29,19 @@ const STATE_SUBSCRIBER_BUFFER: usize = 64;
 /// tally is captured **before** the kill, not derived afterwards, so a stop
 /// that races with natural exits still reports the truth.
 ///
-/// #183: type signature per design §3.2 — `shell: bool` (not a count) because
-/// the foreground shell tool is single-call by construction
-/// ([`StateManager::set_bash_stdin_tx`] / [`StateManager::clear_bash_stdin_tx`],
-/// see `state_manager.rs:2315-2320`); "two concurrent foreground shells" is
-/// unrepresentable.
+/// #183: `shell: bool` (not a count) because the foreground shell tool is
+/// single-call by construction ([`StateManager::set_bash_stdin_tx`] /
+/// [`StateManager::clear_bash_stdin_tx`], see `state_manager.rs:2315-2320`);
+/// "two concurrent foreground shells" is unrepresentable. Background
+/// (`bash_bg`) processes are deliberately spared — they survive Stop and
+/// are only killed by the rebuild paths (`/new`, `/model`, `/load`, `/cd`,
+/// shutdown).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StopTally {
     /// A foreground shell (`bash` / `powershell`) was mid-call when the stop
     /// landed. The tool is single-call by construction — hence `bool`, not a
     /// count.
     pub shell: bool,
-    /// Background (`bash_bg`) processes that were running when the stop
-    /// landed.
-    pub bg: usize,
 }
 
 /// Manages AppState and distributes updates to subscribed Views.
@@ -2158,33 +2157,34 @@ impl StateManager {
         self.update_bg_state();
     }
 
-    /// Kill everything the current turn owns and report what died.
+    /// Kill what the current turn owns and report what died.
     ///
-    /// Order matters (design §4 step 5):
-    /// 1. snapshot `shell = state.bash_panel.is_running()` and
-    ///    `bg = self.bg_running_count()` — counts must be captured **before**
-    ///    any kill so the rendered message and the kill are in lock-step;
+    /// Steps (in order — order matters because the cancel must precede the
+    /// state-reset so a tool mid-await observes the cancelled token first):
+    /// 1. snapshot `shell = state.bash_panel.is_running()` — captured
+    ///    **before** the kill so the rendered message and the kill are in
+    ///    lock-step;
     /// 2. `self.turn_cancel.read().unwrap().cancel()` — drops the turn's
     ///    future at its next poll, unwinding the wire request, the tool call,
     ///    the sub-agent, and — via `PtyHandle::drop` — the foreground PTY
     ///    child (design §0.1 / T7 keystone);
-    /// 3. `self.clear_bg()` (existing, idempotent — SIGHUPs every bg child
-    ///    and repaints the `🛰 N bg` counter to 0);
-    /// 4. `self.clear_bash_stdin_tx()` (existing, idempotent);
-    /// 5. `self.reset_bash_panel()` (existing, idempotent).
+    /// 3. `self.clear_bash_stdin_tx()` then `self.reset_bash_panel()` —
+    ///    both idempotent.
+    ///
+    /// Background (`bash_bg`) processes are deliberately spared: Stop does
+    /// not touch them. The rebuild paths (`/new`, `/model`, `/load`, `/cd`,
+    /// shutdown) call [`StateManager::clear_bg`] directly.
     ///
     /// Idempotent: a second call kills nothing and returns
     /// `StopTally::default()` (the cancel of an already-cancelled token is a
-    /// no-op, the cleared-bg / cleared-stdin / reset-panel are all no-ops on
-    /// their respective already-cleaned-up states).
+    /// no-op, the cleared-stdin and reset-panel are no-ops on their
+    /// already-cleaned-up states).
     pub fn stop_turn_processes(&self) -> StopTally {
         let shell = self.state.read().unwrap().bash_panel.is_running();
-        let bg = self.bg_running_count();
         self.turn_cancel.read().unwrap().cancel();
-        self.clear_bg();
         self.clear_bash_stdin_tx();
         self.reset_bash_panel();
-        StopTally { shell, bg }
+        StopTally { shell }
     }
 
     /// Clear all per-process bg cooldowns so the next drain flushes every
@@ -6504,8 +6504,9 @@ mod tests {
     ///
     /// Asserts that calling `sm.stop_turn_processes()` on a fixture with two
     /// bg processes and a live foreground shell:
-    ///   1. returns the snapshotted tally `{ shell: true, bg: 2 }`,
-    ///   2. leaves `bg_running_count() == 0` (every bg child was SIGHUP'd),
+    ///   1. returns the snapshotted tally `{ shell: true }`,
+    ///   2. leaves `bg_running_count() == 2` — Stop deliberately spares bg
+    ///      (`clear_bg` lives on the rebuild paths, not Stop),
     ///   3. leaves `state.bash_panel.is_idle()` (panel was reset to Idle),
     ///   4. leaves `!has_active_bash_stdin()` (the foreground shell's stdin
     ///      slot was cleared),
@@ -6531,23 +6532,27 @@ mod tests {
             "fixture: bash stdin sender must be registered before stop_turn_processes"
         );
 
-        // The act — the production body (design §4 step 5) snapshots the
-        // tally, cancels the token, clears bg, clears stdin, resets the
-        // panel. The stub does none of that; the assertions below fail.
+        // The act — production body (design §4 step 5) snapshots the tally,
+        // cancels the token, clears stdin, resets the panel. Background
+        // processes are deliberately spared.
         let tally = sm.stop_turn_processes();
 
-        // (1) The tally reports both kinds of kill.
+        // (1) The tally reports the foreground-shell kill; bg is not
+        // reported because Stop does not kill bg.
         assert_eq!(
             tally,
-            StopTally { shell: true, bg: 2 },
-            "stop_turn_processes must return {{ shell: true, bg: 2 }} on the T1 fixture"
+            StopTally { shell: true },
+            "stop_turn_processes must return {{ shell: true }} on the T1 fixture"
         );
 
-        // (2) The bg registry is empty.
+        // (2) The bg registry is untouched — the two `sleep 30` children
+        // survive Stop. (`BgRegistry::drop` on the test teardown will
+        // SIGHUP them; that cleanup is per-StateManager, so it does not
+        // leak into other tests.)
         assert_eq!(
             sm.bg_running_count(),
-            0,
-            "stop_turn_processes must clear the bg registry (SIGHUP every child + repaint)"
+            2,
+            "stop_turn_processes must NOT kill bg — Stop spares them"
         );
 
         // (3) The bash panel is back to Idle.
@@ -6573,39 +6578,30 @@ mod tests {
 
     /// T2 — `stop_turn_processes_is_idempotent` (design §8, T2).
     ///
-    /// Asserts the honest form of the ticket's "`clear()` called exactly once
-    /// per StopMarker": the *one* stop-path call site for
-    /// `StateManager::clear_bg` is `stop_turn_processes`, and the *one*
-    /// call site for `stop_turn_processes` is `request_stop_and_drain`
-    /// (`lib.rs:898-923`) — so "exactly once" is structural (a code-review
-    /// property, not a runtime counter). This test pins the *idempotence*
-    /// half: a second call kills nothing and returns
-    /// `StopTally::default()`.
+    /// Pins the idempotence half: a second call kills nothing and returns
+    /// `StopTally::default()`. Background (`bash_bg`) processes are
+    /// deliberately spared by Stop in both calls, so they survive unchanged
+    /// — pinning that here too.
     ///
     /// Note: the second-call tally assertion *currently* passes on the stub
     /// (which always returns `default()`), so the test's RED signal is the
-    /// "leaves the registry empty after the first call" assertion below —
-    /// which fails on the stub because the first call doesn't clear the
-    /// registry.
+    /// "leaves the panel idle and the stdin slot cleared after the first
+    /// call" assertion — which fails on the stub because the first call
+    /// does not touch the panel or stdin.
     #[test]
     fn stop_turn_processes_is_idempotent() {
         let sm = build_t1_fixture();
 
-        // First call. Production: returns { shell: true, bg: 2 } and kills.
+        // First call. Production: returns { shell: true } and unwinds.
         let first = sm.stop_turn_processes();
         assert_eq!(
             first,
-            StopTally { shell: true, bg: 2 },
+            StopTally { shell: true },
             "first stop_turn_processes on the T1 fixture must report the tally"
         );
         // The structural "exactly once" property: after the first call,
-        // everything the first call would kill is already gone. Production
-        // satisfies this; the stub does not (it doesn't kill anything).
-        assert_eq!(
-            sm.bg_running_count(),
-            0,
-            "after the first stop_turn_processes, the bg registry must be empty"
-        );
+        // every state transition is already done — panel Idle, stdin slot
+        // cleared. Production satisfies this; the stub does not.
         assert!(
             sm.get_state().bash_panel.is_idle(),
             "after the first stop_turn_processes, the bash panel must be Idle"
@@ -6614,22 +6610,32 @@ mod tests {
             !sm.has_active_bash_stdin(),
             "after the first stop_turn_processes, the bash stdin sender must be cleared"
         );
+        // Background processes are untouched (Stop spares them) — both
+        // calls leave the same `bg_running_count()`.
+        assert_eq!(
+            sm.bg_running_count(),
+            2,
+            "stop must not touch bg — both bg children survive"
+        );
 
         // Second call. Production: a no-op that returns default() because
         // (a) cancel of an already-cancelled token is a no-op, (b)
-        // `clear_bg` on an empty registry is a no-op, (c) clearing an
-        // already-cleared stdin slot is a no-op, (d) resetting an already-
-        // Idle panel is a no-op.
+        // clearing an already-cleared stdin slot is a no-op, (c)
+        // resetting an already-Idle panel is a no-op.
         let second = sm.stop_turn_processes();
         assert_eq!(
             second,
             StopTally::default(),
             "a second stop_turn_processes on a clean fixture must return StopTally::default()"
         );
-        // The empty state survives the second call.
-        assert_eq!(sm.bg_running_count(), 0, "registry must stay empty");
+        // The state survives the second call.
         assert!(sm.get_state().bash_panel.is_idle(), "panel must stay Idle");
         assert!(!sm.has_active_bash_stdin(), "stdin slot must stay cleared");
+        assert_eq!(
+            sm.bg_running_count(),
+            2,
+            "second stop must still leave bg untouched"
+        );
     }
 
     /// T5 — `set_running_true_mints_a_fresh_token` (design §8, T5, D-D).

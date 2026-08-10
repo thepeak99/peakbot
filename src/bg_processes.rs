@@ -747,17 +747,20 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
     // #183 — T3: `clear_is_idempotent` (design §8, T3; ticket-named).
     //
-    // The ticket's first named test: "`BgRegistry::clear()` is idempotent
-    // and is called exactly once per StopMarker". This test pins the
-    // idempotence half against the existing implementation — the method
-    // already does the right thing today (it iterates the registry once
-    // and a second iteration on an empty registry is a no-op), so this
-    // test is GREEN on the current code. The "called exactly once per
-    // StopMarker" half is *structural* (see T2's doc-comment for the
-    // argument: `StateManager::clear_bg` has exactly one stop-path call
-    // site, namely `stop_turn_processes`, which has exactly one call
-    // site in `request_stop_and_drain`) and is therefore a code-review
-    // property, not a runtime counter.
+    // The ticket's first named test: "`BgRegistry::clear()` is idempotent".
+    // This test pins the idempotence half against the existing
+    // implementation — the method iterates the registry once and a second
+    // iteration on an empty registry is a no-op, so this test is GREEN on
+    // the current code.
+    //
+    // Note: `clear()` is *not* called from Stop — Stop deliberately spares
+    // background processes (`stop_turn_processes` never touches the bg
+    // registry). `clear()` is still called from the rebuild paths
+    // (`/new`, `/model`, `/load`, `/cd`, shutdown) via
+    // `StateManager::clear_bg`, where the structural "called exactly once
+    // per rebuild" property holds. Idempotence of `clear()` itself is the
+    // load-bearing half — it lets those rebuild paths call it without
+    // caring whether the registry is already empty.
     // ─────────────────────────────────────────────────────────────────────
 
     /// Ticket-named #183 test: a populated `BgRegistry`'s `clear()` is

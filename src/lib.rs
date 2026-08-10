@@ -232,34 +232,22 @@ pub fn model_locked_message(pipeline: &str) -> String {
 }
 
 /// Render a [`crate::state::StopTally`] into the system-message string the
-/// drain arm prints. Contract (design §5, byte-exact):
+/// drain arm prints. Contract (byte-exact):
 ///
-/// | `StopTally`              | Output                                                                     |
-/// |--------------------------|----------------------------------------------------------------------------|
-/// | `{ shell: true,  bg: 2 }` | `Agent stopped by user (killed 1 bash process, 2 background processes)`   |
-/// | `{ shell: false, bg: 1 }` | `Agent stopped by user (killed 1 background process)`                     |
-/// | `{ shell: true,  bg: 0 }` | `Agent stopped by user (killed 1 bash process)`                            |
-/// | `{ shell: false, bg: 0 }` | `Agent stopped by user`                                                    |
+/// | `StopTally`  | Output                                                |
+/// |--------------|-------------------------------------------------------|
+/// | `{ shell }`  | `Agent stopped by user (killed 1 bash process)`       |
+/// | `default()`  | `Agent stopped by user`                               |
 ///
-/// Both clauses are omitted when nothing was running, so an idle-ish stop
-/// reads exactly as it did before #183. Pure function so the T4 test
-/// pins it byte-exact and so neither stop arm can disagree on wording.
+/// The shell clause is omitted when no foreground shell was running, so an
+/// idle stop reads exactly as it did before #183. Pure function so the T4
+/// test pins it byte-exact and so neither stop arm can disagree on wording.
 fn stop_message(t: crate::state::StopTally) -> String {
-    let mut parts: Vec<String> = Vec::new();
     if t.shell {
-        parts.push("1 bash process".into());
+        "Agent stopped by user (killed 1 bash process)".to_string()
+    } else {
+        "Agent stopped by user".to_string()
     }
-    if t.bg > 0 {
-        parts.push(format!(
-            "{} background process{}",
-            t.bg,
-            if t.bg == 1 { "" } else { "es" }
-        ));
-    }
-    if parts.is_empty() {
-        return "Agent stopped by user".to_string();
-    }
-    format!("Agent stopped by user (killed {})", parts.join(", "))
 }
 
 /// What a `/pipeline <target>` request resolves to against the live selection.
@@ -925,16 +913,17 @@ impl AgentRunner {
         use std::sync::atomic::Ordering;
 
         // Helper: trigger a full /stop. Sets the drain flag, cancels the
-        // running agent, kills every in-flight process (foreground PTY
-        // child + every `bash_bg` child + clears the bash stdin slot),
-        // then sends `StopMarker` carrying the rendered tally. The drain
-        // arm in `agent_loop` just delivers the message — there is no
-        // second stop path. Reads the *currently active* SessionHook
-        // through the shared cell so it always cancels the live prompt —
-        // not a stale predecessor from before a `/model` switch. Fires the
-        // innermost running sub-agent hook (D6) as a belt-and-braces; the
-        // turn's cancellation token (read by `process_message_internal`'s
-        // `select!`) is the load-bearing cancel.
+        // running agent (foreground PTY child via the per-turn token +
+        // clears the bash stdin slot), then sends `StopMarker` carrying
+        // the rendered tally. The drain arm in `agent_loop` just delivers
+        // the message — there is no second stop path. Reads the
+        // *currently active* SessionHook through the shared cell so it
+        // always cancels the live prompt — not a stale predecessor from
+        // before a `/model` switch. Fires the innermost running
+        // sub-agent hook (D6) as a belt-and-braces; the turn's
+        // cancellation token (read by `process_message_internal`'s
+        // `select!`) is the load-bearing cancel. Background (`bash_bg`)
+        // processes are deliberately spared — they survive Stop.
         let request_stop_and_drain =
             |state_manager: &Option<Arc<StateManager>>,
              session_hook_cell: &SharedSessionHook,
@@ -958,9 +947,6 @@ impl AgentRunner {
                     crate::pipeline::fire_stop(&active_sub_agent_hook);
                     sm_ref.set_pending_input_count(0);
                     sm_ref.set_status(Some("Stop requested...".to_string()));
-                    // Kill eagerly (design §6 trade-off 3): the bg registry
-                    // would otherwise outlive Stop by the unwind, and a
-                    // wedged turn would never kill them at all.
                     let tally = sm_ref.stop_turn_processes();
                     msg_tx
                         .send(QueueMessage::StopMarker {
@@ -6117,12 +6103,11 @@ headers:
     // ─────────────────────────────────────────────────────────────────────
     // #183 — T4: `stop_message_renders_tally` (design §8, T4).
     //
-    // Pins the byte-exact rendered string for each of the four StopTally
-    // combinations enumerated in the design §5 table. The current code's
-    // stub returns the bare `"Agent stopped by user"` for every input,
-    // so the first three of the four assertions fail. The fourth (empty
-    // tally) passes on the stub because the bare sentence is exactly the
-    // expected output.
+    // Pins the byte-exact rendered string for each of the two StopTally
+    // combinations the contract enumerates (see `stop_message` doc-table).
+    // Against the current code's stub, the `shell: true` case fails (the
+    // stub returns the bare sentence) and the `default()` case passes (the
+    // bare sentence is the expected output).
     // ─────────────────────────────────────────────────────────────────────
 
     /// T4 — stop message rendering. Pure-function test, no fixtures.
@@ -6130,31 +6115,14 @@ headers:
     fn stop_message_renders_tally() {
         use crate::state::StopTally;
 
-        // (a) Shell + 2 background: the full message with both clauses.
+        // (a) A foreground shell was running: the with-clause sentence.
         assert_eq!(
-            super::stop_message(StopTally { shell: true, bg: 2 }),
-            "Agent stopped by user (killed 1 bash process, 2 background processes)",
-            "shell + 2 bg ⇒ both clauses joined with ', '"
-        );
-
-        // (b) No shell, 1 background: the bg clause alone, singular noun.
-        assert_eq!(
-            super::stop_message(StopTally {
-                shell: false,
-                bg: 1
-            }),
-            "Agent stopped by user (killed 1 background process)",
-            "no shell + 1 bg ⇒ singular '1 background process' (no 'es')"
-        );
-
-        // (c) Shell only, no background: the shell clause alone.
-        assert_eq!(
-            super::stop_message(StopTally { shell: true, bg: 0 }),
+            super::stop_message(StopTally { shell: true }),
             "Agent stopped by user (killed 1 bash process)",
-            "shell + 0 bg ⇒ shell clause only, no trailing comma"
+            "shell ⇒ with-clause ('killed 1 bash process')"
         );
 
-        // (d) Nothing was running: the bare sentence, identical to today.
+        // (b) Nothing was running: the bare sentence, identical to today.
         assert_eq!(
             super::stop_message(StopTally::default()),
             "Agent stopped by user",
