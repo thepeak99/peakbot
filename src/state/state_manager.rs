@@ -771,19 +771,6 @@ impl StateManager {
         self.reset_bash_panel();
     }
 
-    /// Replace all chat messages with the given list.
-    ///
-    /// Used after context compaction to persist the compacted history back
-    /// into StateManager (the single source of truth).
-    pub fn replace_chat_messages(&self, messages: Vec<ChatMessage>) {
-        // Drop orphan tool messages; the rig wire layer assumes pair integrity.
-        let messages = crate::tool_use_validator::sanitize_tool_pairs(messages);
-        let mut state = self.state.write().unwrap();
-        state.chat.messages = messages;
-        state.chat.auto_scroll = true;
-        self.notify_update(&state);
-    }
-
     /// Set whether the agent is currently running (processing a message).
     ///
     /// Stamps `run_started_at = Some(Instant::now())` when starting, and clears
@@ -1449,9 +1436,6 @@ impl StateManager {
                     }
                 })
                 .collect();
-
-            // Drop orphan tool messages; the rig wire layer assumes pair integrity.
-            let messages = crate::tool_use_validator::sanitize_tool_pairs(messages);
 
             // Restore persisted session stats *before* dropping the conv guard
             // so we don't race with a concurrent save.
@@ -3473,38 +3457,6 @@ mod tests {
         }
     }
 
-    /// Test that replace_chat_messages works correctly for compaction persistence.
-    #[test]
-    fn test_replace_chat_messages() {
-        let sm = StateManager::new();
-
-        // Add some messages
-        sm.add_user_message("Hello".to_string());
-        sm.add_assistant_message("Hi there".to_string());
-        sm.add_user_message("How are you?".to_string());
-        sm.add_assistant_message("I'm fine".to_string());
-        assert_eq!(sm.get_state().chat.messages.len(), 4);
-
-        // Replace with compacted messages (simulating compaction)
-        let compacted = vec![
-            ChatMessage::user("[Summary of previous conversation]".to_string()),
-            ChatMessage::user("How are you?".to_string()),
-            ChatMessage::agent("I'm fine".to_string()),
-        ];
-        sm.replace_chat_messages(compacted);
-
-        let state = sm.get_state();
-        assert_eq!(
-            state.chat.messages.len(),
-            3,
-            "Should have 3 messages after replace (summary + 2 recent)"
-        );
-        assert!(
-            state.chat.messages[0].content.contains("Summary"),
-            "First message should be the summary"
-        );
-    }
-
     // ─── compaction persistence roundtrip (issue #59) ────────────────────
     //
     // A compacted conversation must reload with its `compacted` flags and
@@ -3581,70 +3533,319 @@ mod tests {
         );
     }
 
-    // ─── tool-pair sanitization at the conversation boundary ─────────────
-    //
-    // See [`crate::tool_use_validator`] for the design + unit-level
-    // coverage. These two tests pin the call-site wiring at the two
-    // boundaries the proposal identifies: `replace_chat_messages`
-    // (compaction) and `sync_from_conversation` (load).
-
+    /// Pin /load survival of an orchestrator `ToolCall`/`ToolResult` pair whose
+    /// adjacency is broken by a sub-agent's intervening turns. The load-time
+    /// sanitizer is lane-blind and matches only on adjacent `ToolCall` →
+    /// `ToolResult`; a `delegate` call followed by sub-agent rows followed by
+    /// the delegate result currently loses both orchestrator rows (#271).
     #[test]
-    fn replace_chat_messages_sanitizes_after_compaction() {
-        use crate::ui::app_state::MessageRole;
-        let sm = StateManager::new();
+    fn load_conversation_preserves_delegate_pair_split_by_sub_agent_turns() {
+        use crate::conversation::{Conversation, Message};
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+        use crate::ui::app_state::{MessageRole, MessageSource};
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+        use std::sync::Arc;
 
-        // Compaction emitted a ToolCall but lost its matching ToolResult.
-        let corrupt = vec![
-            ChatMessage::user("hi".into()),
-            ChatMessage::tool_call("bash", "{}", Some("call_1".into())),
-            // Orphan: no ToolResult follows.
-            ChatMessage::agent("done".into()),
-        ];
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
 
-        sm.replace_chat_messages(corrupt);
-
-        let state = sm.get_state();
-        assert_eq!(
-            state.chat.messages.len(),
-            2,
-            "orphan ToolCall must be dropped at the boundary"
-        );
-        assert_eq!(state.chat.messages[0].role, MessageRole::User);
-        assert_eq!(state.chat.messages[1].role, MessageRole::Agent);
-    }
-
-    #[test]
-    fn sync_from_conversation_sanitizes_orphan_call() {
-        use crate::conversation::Conversation;
-        use crate::ui::app_state::MessageRole;
-
-        let sm = StateManager::new();
-
-        // Build a conversation with an orphan ToolCall (no matching
-        // ToolResult). This simulates a file truncated mid-write or
-        // hand-edited.
         let mut conv = Conversation::new(
-            "test".into(),
-            "test-provider".into(),
+            "delegation".into(),
+            "test-prov".into(),
             "test-model".into(),
             String::new(),
         );
-        conv.add_user_message("hello".into());
-        conv.add_tool_call("bash".into(), "{}".into(), Some("call_1".into()));
-        // No matching ToolResult!
-        conv.add_assistant_message("done".into());
+        // Push via struct literals so sub-agent rows can carry
+        // `MessageSource::SubAgent { role }` — the `add_*` helpers hard-code Human.
+        conv.messages.push(Message::User {
+            content: "research this".into(),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::ToolCall {
+            tool_name: "delegate".into(),
+            arguments: "{}".into(),
+            call_id: Some("call-1".into()),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::ToolCall {
+            tool_name: "bash".into(),
+            arguments: "{}".into(),
+            call_id: Some("sub-1".into()),
+            compacted: false,
+            source: MessageSource::SubAgent {
+                role: "researcher".into(),
+            },
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::ToolResult {
+            tool_name: "bash".into(),
+            arguments: "{}".into(),
+            result: "sub output".into(),
+            call_id: Some("sub-1".into()),
+            compacted: false,
+            source: MessageSource::SubAgent {
+                role: "researcher".into(),
+            },
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::ToolResult {
+            tool_name: "delegate".into(),
+            arguments: "{}".into(),
+            result: "findings".into(),
+            call_id: Some("call-1".into()),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+        conv.messages.push(Message::Assistant {
+            content: "here is the answer".into(),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
 
-        *sm.current_conversation.lock().unwrap() = Some(conv);
-        sm.sync_from_conversation();
+        // Go through the real /load path so the MessageSource serde round-trip
+        // is exercised alongside `sync_from_conversation`.
+        let id = conv.id;
+        storage.save(&conv).unwrap();
+        sm.load_conversation(id).unwrap();
 
-        let state = sm.get_state();
+        // (i) Transcript — the six rows must come back unchanged.
+        let msgs = &sm.get_state().chat.messages;
         assert_eq!(
-            state.chat.messages.len(),
-            2,
-            "orphan ToolCall must be dropped on load"
+            msgs.len(),
+            6,
+            "sub-agent turns must not cause /load to drop orchestrator tool rows"
         );
-        assert_eq!(state.chat.messages[0].role, MessageRole::User);
-        assert_eq!(state.chat.messages[1].role, MessageRole::Agent);
+        assert_eq!(
+            msgs.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![
+                MessageRole::User,
+                MessageRole::ToolCall,
+                MessageRole::ToolCall,
+                MessageRole::ToolResult,
+                MessageRole::ToolResult,
+                MessageRole::Agent,
+            ]
+        );
+        assert_eq!(msgs[1].role, MessageRole::ToolCall);
+        assert_eq!(msgs[1].tool_name.as_deref(), Some("delegate"));
+        assert_eq!(msgs[1].call_id.as_deref(), Some("call-1"));
+        assert_eq!(msgs[1].source, MessageSource::Human);
+        assert_eq!(msgs[4].role, MessageRole::ToolResult);
+        assert_eq!(msgs[4].tool_name.as_deref(), Some("delegate"));
+        assert_eq!(msgs[4].call_id.as_deref(), Some("call-1"));
+        assert_eq!(msgs[4].source, MessageSource::Human);
+        assert_eq!(msgs[2].role, MessageRole::ToolCall);
+        assert_eq!(
+            msgs[2].source,
+            MessageSource::SubAgent {
+                role: "researcher".into()
+            }
+        );
+        assert_eq!(msgs[3].role, MessageRole::ToolResult);
+        assert_eq!(
+            msgs[3].source,
+            MessageSource::SubAgent {
+                role: "researcher".into()
+            }
+        );
+
+        // (ii) Wire — sub-agent rows are filtered out by `is_orchestrator_context`,
+        // and the surviving orchestrator rows form a `ToolCall` → `ToolResult`
+        // pair that the wire layer must emit intact.
+        let history = sm.get_agent_history();
+        assert_eq!(
+            history.len(),
+            4,
+            "wire history must carry the orchestrator tool pair alongside User+Agent"
+        );
+        let tc_id = match &history[1] {
+            RigMessage::Assistant { content, .. } => content
+                .iter()
+                .find_map(|c| match c {
+                    AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    _ => None,
+                })
+                .expect("delegate ToolCall at index 1"),
+            other => panic!("expected Assistant ToolCall at index 1, got {other:?}"),
+        };
+        let tr_id = match &history[2] {
+            RigMessage::User { content } => content
+                .iter()
+                .find_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.id.clone()),
+                    _ => None,
+                })
+                .expect("delegate ToolResult at index 2"),
+            other => panic!("expected User ToolResult at index 2, got {other:?}"),
+        };
+        assert_eq!(tc_id, "call-1");
+        assert_eq!(tr_id, "call-1");
+    }
+
+    /// An orphan ToolCall persisted by a crash mid-tool must survive the load
+    /// into the display transcript (load no longer mutates) but never reach the
+    /// provider — repair happens at the wire boundary in `get_agent_history`,
+    /// not on the saved rows. Closes the gap left when
+    /// `sync_from_conversation_sanitizes_orphan_call` was deleted in #271.
+    #[test]
+    fn load_conversation_with_orphan_tool_call_yields_valid_wire_on_next_prompt() {
+        use crate::conversation::{Conversation, Message};
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+        use crate::ui::app_state::{MessageRole, MessageSource};
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+        use std::sync::Arc;
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let mut conv = Conversation::new(
+            "orphan-recovery".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
+        conv.messages.push(Message::User {
+            content: "run the thing".into(),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+        // Orphan: ToolCall with no following ToolResult, the shape left by a
+        // crash that landed the model message but never reached the result row.
+        conv.messages.push(Message::ToolCall {
+            tool_name: "bash".into(),
+            arguments: "{}".into(),
+            call_id: Some("call-9".into()),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+
+        let id = conv.id;
+        storage.save(&conv).unwrap();
+        sm.load_conversation(id).unwrap();
+
+        // (i) Load is honest — the orphan survives into the display transcript.
+        let msgs = &sm.get_state().chat.messages;
+        assert_eq!(
+            msgs.len(),
+            2,
+            "orphan must survive /load (load no longer sanitises the transcript)"
+        );
+        assert_eq!(msgs[1].role, MessageRole::ToolCall);
+        assert_eq!(msgs[1].call_id.as_deref(), Some("call-9"));
+
+        // (ii) Simulate the next user prompt; it is re-supplied to the
+        // provider separately and stripped from the wire history.
+        sm.add_user_message("what happened?".to_string());
+
+        let history = sm.get_agent_history();
+
+        // Wire invariant walk (forward): every ToolCall is immediately
+        // followed by a User carrying a matching ToolResult. Mirrors the
+        // idiom in `get_agent_history_repairs_wedged_bg_user_between_tool_call_and_result`.
+        for (idx, msg) in history.iter().enumerate() {
+            let RigMessage::Assistant { content, .. } = msg else {
+                continue;
+            };
+            let tool_call_ids: Vec<&str> = content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::ToolCall(tc) => Some(tc.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if tool_call_ids.is_empty() {
+                continue;
+            }
+            let next = history.get(idx + 1).unwrap_or_else(|| {
+                panic!("orphan ToolCall leaked to wire at idx {idx}: {history:?}")
+            });
+            let RigMessage::User {
+                content: next_content,
+            } = next
+            else {
+                panic!(
+                    "ToolCall at idx {idx} must be followed by a User message, got {next:?} (history: {history:?})"
+                );
+            };
+            let result_ids: Vec<&str> = next_content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                result_ids, tool_call_ids,
+                "ToolCall(s) at idx {idx} ({tool_call_ids:?}) must be immediately followed by ToolResult(s) with matching ids, got {result_ids:?} (history: {history:?})"
+            );
+        }
+
+        // Wire invariant walk (inverse): no ToolResult without its preceding
+        // matching ToolCall. Catches a ToolCall/Result reversal as well as a
+        // stray Result that sanitize would have stripped.
+        for (idx, msg) in history.iter().enumerate() {
+            let RigMessage::User { content } = msg else {
+                continue;
+            };
+            for c in content.iter() {
+                let UserContent::ToolResult(tr) = c else {
+                    continue;
+                };
+                let prev = if idx == 0 {
+                    panic!(
+                        "ToolResult {} at idx 0 has no preceding message: {history:?}",
+                        tr.id
+                    )
+                } else {
+                    &history[idx - 1]
+                };
+                let RigMessage::Assistant {
+                    content: prev_content,
+                    ..
+                } = prev
+                else {
+                    panic!(
+                        "ToolResult {} at idx {idx} must be preceded by an Assistant message, got {prev:?} (history: {history:?})",
+                        tr.id
+                    );
+                };
+                let prev_tc_ids: Vec<&str> = prev_content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::ToolCall(tc) => Some(tc.id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    prev_tc_ids.iter().any(|id| *id == tr.id),
+                    "ToolResult {} at idx {idx} has no preceding matching ToolCall (prev tool calls: {prev_tc_ids:?}, history: {history:?})",
+                    tr.id
+                );
+            }
+        }
+
+        // The orphan id must not appear in wire history at all.
+        for msg in &history {
+            let RigMessage::Assistant { content, .. } = msg else {
+                continue;
+            };
+            for c in content.iter() {
+                if let AssistantContent::ToolCall(tc) = c {
+                    assert_ne!(
+                        tc.id, "call-9",
+                        "orphan ToolCall leaked to the wire (history: {history:?})"
+                    );
+                }
+            }
+        }
     }
 
     // ─── todo persistence roundtrip ──────────────────────────────────────
