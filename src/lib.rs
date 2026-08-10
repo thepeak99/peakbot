@@ -225,6 +225,39 @@ pub fn model_locked_message(pipeline: &str) -> String {
     )
 }
 
+/// Render a [`crate::state::StopTally`] into the system-message string the
+/// drain arm prints. Contract (design §5, byte-exact):
+///
+/// | `StopTally`              | Output                                                                     |
+/// |--------------------------|----------------------------------------------------------------------------|
+/// | `{ shell: true,  bg: 2 }` | `Agent stopped by user (killed 1 bash process, 2 background processes)`   |
+/// | `{ shell: false, bg: 1 }` | `Agent stopped by user (killed 1 background process)`                     |
+/// | `{ shell: true,  bg: 0 }` | `Agent stopped by user (killed 1 bash process)`                            |
+/// | `{ shell: false, bg: 0 }` | `Agent stopped by user`                                                    |
+///
+/// Both clauses are omitted when nothing was running, so an idle-ish stop
+/// reads exactly as it did before #183.
+///
+/// #183: stub — currently returns the bare `"Agent stopped by user"` string
+/// for every input. The implementation task will build the per-clause strings
+/// (`"1 bash process"` / `"{n} background process{s}"` — pluralise on
+/// `bg == 1`), join with `", "`, and wrap in `(killed …)` or return the bare
+/// sentence when both clauses are absent.
+#[allow(dead_code)] // #183: stub is only referenced from `mod tests` until the implementation lands
+fn stop_message(t: crate::state::StopTally) -> String {
+    // #183: stub — implementation lands in the implementation task.
+    // Reference body (per design §5):
+    //   let mut parts: Vec<String> = Vec::new();
+    //   if t.shell { parts.push("1 bash process".into()); }
+    //   if t.bg > 0 {
+    //       parts.push(format!("{} background process{}", t.bg, if t.bg == 1 { "" } else { "es" }));
+    //   }
+    //   if parts.is_empty() { return "Agent stopped by user".to_string(); }
+    //   format!("Agent stopped by user (killed {})", parts.join(", "))
+    let _ = t;
+    "Agent stopped by user".to_string()
+}
+
 /// What a `/pipeline <target>` request resolves to against the live selection.
 /// The read-only half of the command — shared by the controller (which can only
 /// report) and `handle_select_pipeline` (which also rebuilds), so the lock,
@@ -6034,6 +6067,54 @@ headers:
             sm.selected_pipeline().as_deref(),
             Some("web-team"),
             "the previous selection (web-team) must survive intact"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #183 — T4: `stop_message_renders_tally` (design §8, T4).
+    //
+    // Pins the byte-exact rendered string for each of the four StopTally
+    // combinations enumerated in the design §5 table. The current code's
+    // stub returns the bare `"Agent stopped by user"` for every input,
+    // so the first three of the four assertions fail. The fourth (empty
+    // tally) passes on the stub because the bare sentence is exactly the
+    // expected output.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// T4 — stop message rendering. Pure-function test, no fixtures.
+    #[test]
+    fn stop_message_renders_tally() {
+        use crate::state::StopTally;
+
+        // (a) Shell + 2 background: the full message with both clauses.
+        assert_eq!(
+            super::stop_message(StopTally { shell: true, bg: 2 }),
+            "Agent stopped by user (killed 1 bash process, 2 background processes)",
+            "shell + 2 bg ⇒ both clauses joined with ', '"
+        );
+
+        // (b) No shell, 1 background: the bg clause alone, singular noun.
+        assert_eq!(
+            super::stop_message(StopTally {
+                shell: false,
+                bg: 1
+            }),
+            "Agent stopped by user (killed 1 background process)",
+            "no shell + 1 bg ⇒ singular '1 background process' (no 'es')"
+        );
+
+        // (c) Shell only, no background: the shell clause alone.
+        assert_eq!(
+            super::stop_message(StopTally { shell: true, bg: 0 }),
+            "Agent stopped by user (killed 1 bash process)",
+            "shell + 0 bg ⇒ shell clause only, no trailing comma"
+        );
+
+        // (d) Nothing was running: the bare sentence, identical to today.
+        assert_eq!(
+            super::stop_message(StopTally::default()),
+            "Agent stopped by user",
+            "empty tally ⇒ bare sentence (back-compat with pre-#183 wording)"
         );
     }
 }

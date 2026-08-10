@@ -49,6 +49,16 @@ ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
 # PTY backend for `bash_bg` long-running background processes.
 portable-pty = "0.9"
 
+# `tokio_util::sync::CancellationToken` — the per-turn cancel handle
+# the #183 design (`issue-183-design.md` §3.1) stores on `StateManager` and
+# races against `agent.prompt_with_history` in `process_message_internal`.
+# `sync` lives in tokio-util's default features (`tokio-util/src/lib.rs:57`),
+# so no features need to be enabled. Already in `Cargo.lock:5610` at 0.7.18
+# as a transitive dep via `rig-core`; this entry promotes it to direct so
+# the stub `turn_cancel_token()` and the real implementation can name the
+# type without a `cfg(test)` shim.
+tokio-util = { version = "0.7" }
+
 # MCP OAuth 2.1 (#19, src/mcp_auth.rs): one-shot localhost callback listener.
 # The `query` extractor URL-decodes auto (Linear `%3A`-encodes the auth code).
 # `ws` feature is for the default PeakBot WebSocket transport (src/ui/web/).
@@ -109,3 +119,10 @@ peakbot = { path = ".", features = ["mock"] }
 # Time-control helpers (`start_paused`, `tokio::time::advance`) for the
 # paused-time writer tests (T8/T10) — gated behind a dev-only feature.
 tokio = { version = "1", features = ["test-util"] }
+# #183 — `tokio_util::sync::CancellationToken` is the type the design names
+# in §5 for the per-turn cancellation token. It's a transitive dep today
+# (via `rig-core`); we promote it to a dev-dep so the T5/T6 stub signatures
+# can name the real type and the implementation task can drop the use in
+# without changing any test code. `sync` is in tokio-util's default features
+# (`tokio-util/src/lib.rs:57`), so no features need to be enabled.
+tokio-util = { version = "0.7" }

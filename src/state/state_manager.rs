@@ -18,10 +18,32 @@ use crate::ui::app_state::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Channel buffer size for state subscribers.
 const STATE_SUBSCRIBER_BUFFER: usize = 64;
+
+/// What a Stop actually killed. Snapshotted at the kill site so the message
+/// (rendered in `lib.rs::stop_message`) and the kill are in lock-step — the
+/// tally is captured **before** the kill, not derived afterwards, so a stop
+/// that races with natural exits still reports the truth.
+///
+/// #183: type signature per design §3.2 — `shell: bool` (not a count) because
+/// the foreground shell tool is single-call by construction
+/// ([`StateManager::set_bash_stdin_tx`] / [`StateManager::clear_bash_stdin_tx`],
+/// see `state_manager.rs:2315-2320`); "two concurrent foreground shells" is
+/// unrepresentable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StopTally {
+    /// A foreground shell (`bash` / `powershell`) was mid-call when the stop
+    /// landed. The tool is single-call by construction — hence `bool`, not a
+    /// count.
+    pub shell: bool,
+    /// Background (`bash_bg`) processes that were running when the stop
+    /// landed.
+    pub bg: usize,
+}
 
 /// Manages AppState and distributes updates to subscribed Views.
 /// Owns ContextManager internally; compaction triggers automatically.
@@ -85,6 +107,14 @@ pub struct StateManager {
     /// rebuilt so its tools re-snapshot this value.
     session_cwd: RwLock<std::path::PathBuf>,
 
+    // ── Turn cancellation (#183) ─────────────────────────────────────────────
+    /// Cancels the in-flight turn by dropping its future — which kills the
+    /// foreground PTY child through `PtyHandle::drop` and unwinds any running
+    /// sub-agent with it. Replaced with a fresh token by `set_running(true)`,
+    /// so a Stop pressed while idle can never poison the next turn.
+    /// Lock discipline: taken only synchronously, never across `.await`.
+    turn_cancel: RwLock<CancellationToken>,
+
     // ── Rendering Coalescence ─────────────────────────────────────────────────
     /// Monotonic counter for render coalescence — see `slow-messages.md` §4.4.
     revision: AtomicU64,
@@ -126,6 +156,13 @@ impl StateManager {
             bash_stdin_tx: RwLock::new(None),
             shell: RwLock::new(String::new()),
             session_cwd: RwLock::new(std::env::current_dir().unwrap_or_default()),
+            // #183: stub — fresh, never-cancelled token at construction.
+            // The implementation task will additionally re-mint on
+            // `set_running(true)` (design §3.1 invariant I1), so a stop
+            // pressed while idle can never poison the next turn. That
+            // re-mint lives next to `set_running`; the field itself is
+            // initialised here.
+            turn_cancel: RwLock::new(CancellationToken::new()),
             revision: AtomicU64::new(0),
         }
     }
@@ -793,6 +830,22 @@ impl StateManager {
     /// Check if the agent is currently running
     pub fn is_running(&self) -> bool {
         self.state.read().unwrap().is_running
+    }
+
+    /// The current turn's cancellation token. Cancelling it ⇒ the turn's
+    /// future is dropped at the next poll, which unwinds the in-flight
+    /// provider HTTP request, the in-flight tool call, the in-flight
+    /// sub-agent, and — via `PtyHandle::drop` — the foreground PTY child.
+    /// Cloning is cheap (Arc-backed).
+    ///
+    /// #183: stub — returns a fresh, never-cancelled token until the
+    /// implementation lands. Production behaviour (design §5): the token
+    /// is the per-turn token minted on `set_running(true)` and read here.
+    pub fn turn_cancel_token(&self) -> CancellationToken {
+        // #183: stub — design says "return the field's clone"; the
+        // stub does the same read but `set_running(true)` does not yet
+        // re-mint, so the field is the construction-time token.
+        self.turn_cancel.read().unwrap().clone()
     }
 
     /// Signal the UI to quit on its next tick (the `/exit` command path).
@@ -2099,6 +2152,40 @@ impl StateManager {
             reg.clear();
         }
         self.update_bg_state();
+    }
+
+    /// Kill everything the current turn owns and report what died.
+    ///
+    /// Production behaviour (design §4 step 5):
+    /// 1. snapshot `shell = state.bash_panel.is_running()` and
+    ///    `bg = self.bg_running_count()`;
+    /// 2. `self.turn_cancel_token().cancel()` (drops the turn's future →
+    ///    `PtyHandle::drop` → SIGHUP the foreground PTY child);
+    /// 3. `self.clear_bg()` (existing idempotent, SIGHUPs every bg child +
+    ///    repaints `🛰 N bg` to 0);
+    /// 4. `self.clear_bash_stdin_tx()` (existing, idempotent);
+    /// 5. `self.reset_bash_panel()` (existing, idempotent);
+    /// 6. return the snapshotted [`StopTally`].
+    ///
+    /// Idempotent: a second call kills nothing and returns
+    /// `StopTally::default()` (the cancel of an already-cancelled token is a
+    /// no-op, the cleared-bg / cleared-stdin / reset-panel are all no-ops on
+    /// their respective already-cleaned-up states).
+    ///
+    /// #183: stub — currently returns `StopTally::default()` and does NOT
+    /// cancel / clear / reset. Tests T1 and T2 fail on this stub.
+    pub fn stop_turn_processes(&self) -> StopTally {
+        // #183: stub — implementation lands in the implementation task.
+        // Per design §4 step 5, the real body is:
+        //   let shell = self.state.read().unwrap().bash_panel.is_running();
+        //   let bg = self.bg_running_count();
+        //   self.turn_cancel.read().unwrap().cancel();
+        //   self.clear_bg();
+        //   self.clear_bash_stdin_tx();
+        //   self.reset_bash_panel();
+        //   StopTally { shell, bg }
+        let _ = &self.turn_cancel; // suppress unused-field warning until wired
+        StopTally::default()
     }
 
     /// Clear all per-process bg cooldowns so the next drain flushes every
@@ -6354,6 +6441,238 @@ mod tests {
         assert!(
             count_b.load(Ordering::Relaxed) > 0,
             "producer B (add_assistant_message → persist_current) made no progress"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #183 — "Stop button stops *everything*"
+    //
+    // The contracts below are the test plan from `issue-183-design.md` §5
+    // (T1, T2, T5). They are written against the *new* API the design names
+    // (`StateManager::turn_cancel_token`, `StateManager::stop_turn_processes`,
+    // and the [`StopTally`] snapshot). Against the current code those
+    // methods are **signature-only stubs** (marked `// #183: stub` inline)
+    // that compile but do nothing — so these tests go RED on behaviour, not
+    // on a missing API.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use std::time::Duration;
+
+    /// Build the canonical T1 fixture: a `StateManager` with two live bg
+    /// processes (`sleep 30` — they take 30 s to exit naturally, so they're
+    /// still running when the test body finishes), a `Running` bash panel,
+    /// and a registered bash-stdin sender. Mirrors the design §8 T1 recipe.
+    fn build_t1_fixture() -> Arc<StateManager> {
+        let sm = StateManager::new_arc();
+        // The bg registry refuses starts until a notify channel is attached
+        // (see start_bg at `state_manager.rs:2043-2060`); do that first.
+        let (bg_tx, _bg_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        sm.attach_bg_notify(bg_tx);
+
+        // Mint a fresh turn token (in production: this is what the
+        // implementation does inside `set_running(true)`).
+        sm.set_running(true);
+
+        // Two bg PTY-attached processes, each running `sleep 30`.
+        for _ in 0..2 {
+            sm.start_bg(StartParams {
+                command: "sleep 30".into(),
+                capture_cap: 0,
+                cwd: None,
+                label: None,
+                cooldown: Duration::ZERO,
+                env: None,
+                shell: "sh".into(),
+            })
+            .expect("start_bg must succeed once a notify channel is attached");
+        }
+
+        // Foreground shell — drive the panel to Running directly. The pid
+        // value is a placeholder; the bash panel's pid field doesn't have
+        // to be a real process for the stop_turn_processes path.
+        sm.start_bash_panel("sleep 30".into(), 4242);
+
+        // Register a foreground bash stdin sender so the
+        // `!has_active_bash_stdin()` post-stop assertion has something to
+        // observe going away.
+        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        sm.set_bash_stdin_tx(stdin_tx);
+
+        sm
+    }
+
+    /// T1 — `stop_turn_processes_kills_and_reports` (design §8, T1).
+    ///
+    /// Asserts that calling `sm.stop_turn_processes()` on a fixture with two
+    /// bg processes and a live foreground shell:
+    ///   1. returns the snapshotted tally `{ shell: true, bg: 2 }`,
+    ///   2. leaves `bg_running_count() == 0` (every bg child was SIGHUP'd),
+    ///   3. leaves `state.bash_panel.is_idle()` (panel was reset to Idle),
+    ///   4. leaves `!has_active_bash_stdin()` (the foreground shell's stdin
+    ///      slot was cleared),
+    ///   5. leaves `turn_cancel_token().is_cancelled() == true` (the token
+    ///      that `process_message_internal` raced against was cancelled,
+    ///      which is what drops the turn's future at the next poll).
+    #[test]
+    fn stop_turn_processes_kills_and_reports() {
+        let sm = build_t1_fixture();
+
+        // Sanity: the fixture is actually in the state we expect.
+        assert_eq!(
+            sm.bg_running_count(),
+            2,
+            "fixture: both bg processes must be running before stop_turn_processes"
+        );
+        assert!(
+            !sm.get_state().bash_panel.is_idle(),
+            "fixture: bash panel must be Running before stop_turn_processes"
+        );
+        assert!(
+            sm.has_active_bash_stdin(),
+            "fixture: bash stdin sender must be registered before stop_turn_processes"
+        );
+
+        // The act — the production body (design §4 step 5) snapshots the
+        // tally, cancels the token, clears bg, clears stdin, resets the
+        // panel. The stub does none of that; the assertions below fail.
+        let tally = sm.stop_turn_processes();
+
+        // (1) The tally reports both kinds of kill.
+        assert_eq!(
+            tally,
+            StopTally { shell: true, bg: 2 },
+            "stop_turn_processes must return {{ shell: true, bg: 2 }} on the T1 fixture"
+        );
+
+        // (2) The bg registry is empty.
+        assert_eq!(
+            sm.bg_running_count(),
+            0,
+            "stop_turn_processes must clear the bg registry (SIGHUP every child + repaint)"
+        );
+
+        // (3) The bash panel is back to Idle.
+        assert!(
+            sm.get_state().bash_panel.is_idle(),
+            "stop_turn_processes must reset the bash panel to Idle"
+        );
+
+        // (4) The bash stdin sender is gone.
+        assert!(
+            !sm.has_active_bash_stdin(),
+            "stop_turn_processes must clear the bash-stdin sender"
+        );
+
+        // (5) The turn-cancel token is cancelled. Production: this is what
+        // `process_message_internal`'s `select!` observed and what made
+        // the turn's future be dropped.
+        assert!(
+            sm.turn_cancel_token().is_cancelled(),
+            "stop_turn_processes must cancel the turn's cancellation token"
+        );
+    }
+
+    /// T2 — `stop_turn_processes_is_idempotent` (design §8, T2).
+    ///
+    /// Asserts the honest form of the ticket's "`clear()` called exactly once
+    /// per StopMarker": the *one* stop-path call site for
+    /// `StateManager::clear_bg` is `stop_turn_processes`, and the *one*
+    /// call site for `stop_turn_processes` is `request_stop_and_drain`
+    /// (`lib.rs:898-923`) — so "exactly once" is structural (a code-review
+    /// property, not a runtime counter). This test pins the *idempotence*
+    /// half: a second call kills nothing and returns
+    /// `StopTally::default()`.
+    ///
+    /// Note: the second-call tally assertion *currently* passes on the stub
+    /// (which always returns `default()`), so the test's RED signal is the
+    /// "leaves the registry empty after the first call" assertion below —
+    /// which fails on the stub because the first call doesn't clear the
+    /// registry.
+    #[test]
+    fn stop_turn_processes_is_idempotent() {
+        let sm = build_t1_fixture();
+
+        // First call. Production: returns { shell: true, bg: 2 } and kills.
+        let first = sm.stop_turn_processes();
+        assert_eq!(
+            first,
+            StopTally { shell: true, bg: 2 },
+            "first stop_turn_processes on the T1 fixture must report the tally"
+        );
+        // The structural "exactly once" property: after the first call,
+        // everything the first call would kill is already gone. Production
+        // satisfies this; the stub does not (it doesn't kill anything).
+        assert_eq!(
+            sm.bg_running_count(),
+            0,
+            "after the first stop_turn_processes, the bg registry must be empty"
+        );
+        assert!(
+            sm.get_state().bash_panel.is_idle(),
+            "after the first stop_turn_processes, the bash panel must be Idle"
+        );
+        assert!(
+            !sm.has_active_bash_stdin(),
+            "after the first stop_turn_processes, the bash stdin sender must be cleared"
+        );
+
+        // Second call. Production: a no-op that returns default() because
+        // (a) cancel of an already-cancelled token is a no-op, (b)
+        // `clear_bg` on an empty registry is a no-op, (c) clearing an
+        // already-cleared stdin slot is a no-op, (d) resetting an already-
+        // Idle panel is a no-op.
+        let second = sm.stop_turn_processes();
+        assert_eq!(
+            second,
+            StopTally::default(),
+            "a second stop_turn_processes on a clean fixture must return StopTally::default()"
+        );
+        // The empty state survives the second call.
+        assert_eq!(sm.bg_running_count(), 0, "registry must stay empty");
+        assert!(sm.get_state().bash_panel.is_idle(), "panel must stay Idle");
+        assert!(!sm.has_active_bash_stdin(), "stdin slot must stay cleared");
+    }
+
+    /// T5 — `set_running_true_mints_a_fresh_token` (design §8, T5, D-D).
+    ///
+    /// Pins the freshness invariant: a `set_running(true)` write that
+    /// transitions the SM from idle to running must replace the turn-cancel
+    /// token with a fresh one. Concretely: after `stop_turn_processes()`
+    /// (which cancels the *current* turn's token), the token must read
+    /// cancelled; after `set_running(true)`, the next read must return a
+    /// fresh, uncancelled token (so the next turn starts on a clean slate).
+    #[test]
+    fn set_running_true_mints_a_fresh_token() {
+        let sm = StateManager::new_arc();
+        // No set_running() yet ⇒ no current turn. We mint the first turn
+        // explicitly so we have a known token to cancel.
+        sm.set_running(true);
+        let a = sm.turn_cancel_token();
+        assert!(
+            !a.is_cancelled(),
+            "freshly-minted token must not be cancelled"
+        );
+
+        // Stop the turn. Production: cancels `a`; with the stub, no-op.
+        sm.stop_turn_processes();
+        assert!(
+            a.is_cancelled(),
+            "stop_turn_processes must cancel the current turn's token"
+        );
+
+        // Start the next turn. Production: mints a fresh token `b` that is
+        // independent of `a`. The stub does not re-mint, so `b` equals
+        // `a` and inherits its cancelled state.
+        sm.set_running(true);
+        let b = sm.turn_cancel_token();
+        assert!(
+            !b.is_cancelled(),
+            "the next turn's token must be fresh (not cancelled from a prior turn)"
+        );
+        assert!(
+            a.is_cancelled(),
+            "the previous turn's token must remain cancelled \
+             (so a stale token from a prior turn cannot leak into the next turn)"
         );
     }
 }
