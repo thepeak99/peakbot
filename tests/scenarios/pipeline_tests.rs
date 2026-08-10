@@ -313,7 +313,6 @@ fn delegate_tool_for_registry(registry: std::sync::Arc<SubAgentRegistry>) -> Del
         max_turns: 0,
         skills: peakbot::SkillRegistry::default(),
         event_sink: None,
-        active_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
         retry: peakbot::config::RetryConfig::default(),
         timeouts: peakbot::config::TimeoutsConfig::default(),
     };

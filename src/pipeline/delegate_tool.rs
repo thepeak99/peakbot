@@ -13,9 +13,7 @@
 //! of the orchestrator wire by `get_agent_history`).
 
 use crate::config::{BashConfig, SearXngConfig};
-use crate::hooks::SessionHook;
 use crate::hooks::events::SourcedEvent;
-use crate::pipeline::ActiveSubAgentHook;
 use crate::pipeline::handoff;
 use crate::pipeline::registry::SubAgentRegistry;
 use crate::state::StateManager;
@@ -35,7 +33,7 @@ use crate::bg_processes::BgListEntry;
 /// genuinely needs the same build inputs the orchestrator had — searxng, the
 /// bash env, the session `StateManager` (session cwd + bg registry), the
 /// detected shell, the vector store, `max_turns` — plus the event sink to TEE
-/// its turns and the active-hook cell for stop routing.
+/// its turns.
 #[derive(Clone)]
 pub struct SubAgentDeps {
     pub registry: Arc<SubAgentRegistry>,
@@ -52,8 +50,6 @@ pub struct SubAgentDeps {
     /// The orchestrator's event sink. Sub-agent events are pushed here tagged
     /// `SubAgent { role }`. `None` under Ollama (hookless) — see `build_sub_agent`.
     pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
-    /// The cell holding the currently-running sub-agent hook, for `/stop`.
-    pub active_hook: ActiveSubAgentHook,
     /// Retry policy for a delegation's wire calls — the orchestrator's own.
     pub retry: crate::config::RetryConfig,
     /// Wall-clock budgets — the delegation's prompt loop reads `delegate_secs`
@@ -211,36 +207,6 @@ fn merge_role_env(base: &BashConfig, role_env: Option<&HashMap<String, String>>)
     BashConfig { env: Some(merged) }
 }
 
-/// Fire `request_stop` on the active sub-agent hook, if a delegation is
-/// running. A no-op when the cell is empty. Called by the `/stop` dispatcher
-/// alongside the orchestrator hook so a stop lands on the innermost running
-/// agent; the whole turn then unwinds out (D6).
-pub fn fire_stop(active: &ActiveSubAgentHook) {
-    if let Some(hook) = active.lock().unwrap().as_ref() {
-        hook.request_stop();
-    }
-}
-
-/// RAII guard: registers the running sub-agent hook in the shared cell on
-/// construction and clears it on drop — so the cell is cleared even if the
-/// sub-agent run panics or returns early.
-struct ActiveHookGuard<'a> {
-    cell: &'a ActiveSubAgentHook,
-}
-
-impl<'a> ActiveHookGuard<'a> {
-    fn set(cell: &'a ActiveSubAgentHook, hook: Arc<SessionHook>) -> Self {
-        *cell.lock().unwrap() = Some(hook);
-        Self { cell }
-    }
-}
-
-impl Drop for ActiveHookGuard<'_> {
-    fn drop(&mut self) {
-        *self.cell.lock().unwrap() = None;
-    }
-}
-
 /// Tool for delegating a task to a sub-agent.
 #[derive(Clone)]
 pub struct DelegateTool {
@@ -386,11 +352,6 @@ impl Tool for DelegateTool {
             error: e.to_string(),
         })?;
 
-        // Register the hook so `/stop` reaches this innermost agent. The guard
-        // clears the cell on any exit path. The failure path still needs the
-        // hook to read its history snapshot, hence the clone.
-        let _guard = ActiveHookGuard::set(&deps.active_hook, hook.clone());
-
         // Fresh history — pure agents-as-tools; no memory of prior delegations.
         let mut history = Vec::new();
         let mut attempt = 0;
@@ -456,20 +417,13 @@ impl Tool for DelegateTool {
                 handoff::build(&args.role, h, &role.model.provider_config).await
             }
             Ok(Ok(text)) => normalize_delegate_output(&args.role, text),
-            // A dead sub-agent still knows things. Everything but a user stop
-            // comes back as a summarised handoff so the orchestrator can decide
-            // what to re-delegate instead of re-running the same wall.
-            Ok(Err(e)) => match handoff::classify(e, hook.history_snapshot()) {
-                handoff::Handoff::Abort(err) => {
-                    // User-initiated cancel: no file, no note — return Err so the
-                    // orchestrator sees the stop take precedence.
-                    return Err(DelegateError::Run {
-                        role: args.role.clone(),
-                        error: err.to_string(),
-                    });
-                }
-                h => handoff::build(&args.role, h, &role.model.provider_config).await,
-            },
+            // A dead sub-agent still knows things. Every failure comes back as a
+            // summarised handoff so the orchestrator can decide what to
+            // re-delegate instead of re-running the same wall.
+            Ok(Err(e)) => {
+                let h = handoff::classify(e, hook.history_snapshot());
+                handoff::build(&args.role, h, &role.model.provider_config).await
+            }
         };
 
         // Report the delegation's footprint on the shared registry to the
@@ -544,6 +498,7 @@ fn validate_parent(list: &TodoList, parent_task_id: usize) -> Result<(), Delegat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::SessionHook;
     use crate::ui::app_state::MessageSource;
 
     fn bash_with(env: &[(&str, &str)]) -> BashConfig {
@@ -611,7 +566,6 @@ mod tests {
             max_turns: 0,
             skills: crate::skills::SkillRegistry::default(),
             event_sink: None,
-            active_hook: Arc::new(std::sync::Mutex::new(None)),
             retry: crate::config::RetryConfig::default(),
             timeouts: crate::config::TimeoutsConfig::default(),
         };
@@ -791,38 +745,6 @@ mod tests {
         let merged = merge_role_env(&base, None).env.expect("some env");
         assert_eq!(merged.get("BASE_ONLY").map(String::as_str), Some("keep"));
         assert_eq!(merged.len(), 1);
-    }
-
-    /// `fire_stop` requests stop on the active sub-agent hook — the mechanism
-    /// that lets `/stop` reach the innermost running agent (D6).
-    #[test]
-    fn fire_stop_requests_stop_on_active_hook() {
-        let hook = Arc::new(SessionHook::new(None));
-        let cell: ActiveSubAgentHook = Arc::new(std::sync::Mutex::new(Some(hook.clone())));
-        assert!(!hook.is_stop_requested());
-        fire_stop(&cell);
-        assert!(hook.is_stop_requested(), "stop must reach the active hook");
-    }
-
-    /// `fire_stop` is a no-op when no delegation is running (empty cell).
-    #[test]
-    fn fire_stop_none_is_noop() {
-        let cell: ActiveSubAgentHook = Arc::new(std::sync::Mutex::new(None));
-        fire_stop(&cell); // must not panic
-        assert!(cell.lock().unwrap().is_none());
-    }
-
-    /// The `ActiveHookGuard` clears the cell on drop, even on an early return
-    /// path — so a stop after a delegation ends can't hit a stale hook.
-    #[test]
-    fn active_hook_guard_clears_cell_on_drop() {
-        let cell: ActiveSubAgentHook = Arc::new(std::sync::Mutex::new(None));
-        let hook = Arc::new(SessionHook::new(None));
-        {
-            let _guard = ActiveHookGuard::set(&cell, hook);
-            assert!(cell.lock().unwrap().is_some(), "set registers the hook");
-        }
-        assert!(cell.lock().unwrap().is_none(), "drop clears the cell");
     }
 
     /// The events-only sub-agent hook stamps `SubAgent { role }` on its lane —
