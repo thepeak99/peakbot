@@ -156,12 +156,9 @@ impl StateManager {
             bash_stdin_tx: RwLock::new(None),
             shell: RwLock::new(String::new()),
             session_cwd: RwLock::new(std::env::current_dir().unwrap_or_default()),
-            // #183: stub — fresh, never-cancelled token at construction.
-            // The implementation task will additionally re-mint on
-            // `set_running(true)` (design §3.1 invariant I1), so a stop
-            // pressed while idle can never poison the next turn. That
-            // re-mint lives next to `set_running`; the field itself is
-            // initialised here.
+            // Initial token is fresh (never cancelled). `set_running(true)`
+            // re-mints on every turn start (D-D / invariant I1), so the
+            // construction-time value is only read until the first turn.
             turn_cancel: RwLock::new(CancellationToken::new()),
             revision: AtomicU64::new(0),
         }
@@ -813,18 +810,30 @@ impl StateManager {
     /// Stamps `run_started_at = Some(Instant::now())` when starting, and clears
     /// both the start-time and `status_message` when stopping. The `workin-baby`
     /// TUI indicator keys off these fields — do not split the state.
+    ///
+    /// **#183**: also re-mints the per-turn cancellation token on every
+    /// `true` write, so a Stop that fires while idle cannot poison the next
+    /// turn (design D-D, invariant I1). Lock discipline: the `turn_cancel`
+    /// write is taken after the `state` guard is released — never nested.
     pub fn set_running(&self, running: bool) {
-        let mut state = self.state.write().unwrap();
-        state.is_running = running;
-        state.run_started_at = if running {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        if !running {
-            state.status_message = None;
+        {
+            let mut state = self.state.write().unwrap();
+            state.is_running = running;
+            state.run_started_at = if running {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            if !running {
+                state.status_message = None;
+            }
+            self.notify_update(&state);
         }
-        self.notify_update(&state);
+        if running {
+            // Freshness (D-D): every start gets a never-cancelled token so a
+            // stale flag from a prior turn can't carry into this one.
+            *self.turn_cancel.write().unwrap() = CancellationToken::new();
+        }
     }
 
     /// Check if the agent is currently running
@@ -836,15 +845,10 @@ impl StateManager {
     /// future is dropped at the next poll, which unwinds the in-flight
     /// provider HTTP request, the in-flight tool call, the in-flight
     /// sub-agent, and — via `PtyHandle::drop` — the foreground PTY child.
-    /// Cloning is cheap (Arc-backed).
-    ///
-    /// #183: stub — returns a fresh, never-cancelled token until the
-    /// implementation lands. Production behaviour (design §5): the token
-    /// is the per-turn token minted on `set_running(true)` and read here.
+    /// Cloning is cheap (Arc-backed). Replaced with a fresh token by
+    /// [`Self::set_running`] on every `true` write (design D-D), so a Stop
+    /// pressed while idle cannot poison the next turn.
     pub fn turn_cancel_token(&self) -> CancellationToken {
-        // #183: stub — design says "return the field's clone"; the
-        // stub does the same read but `set_running(true)` does not yet
-        // re-mint, so the field is the construction-time token.
         self.turn_cancel.read().unwrap().clone()
     }
 
@@ -2156,36 +2160,31 @@ impl StateManager {
 
     /// Kill everything the current turn owns and report what died.
     ///
-    /// Production behaviour (design §4 step 5):
+    /// Order matters (design §4 step 5):
     /// 1. snapshot `shell = state.bash_panel.is_running()` and
-    ///    `bg = self.bg_running_count()`;
-    /// 2. `self.turn_cancel_token().cancel()` (drops the turn's future →
-    ///    `PtyHandle::drop` → SIGHUP the foreground PTY child);
-    /// 3. `self.clear_bg()` (existing idempotent, SIGHUPs every bg child +
-    ///    repaints `🛰 N bg` to 0);
+    ///    `bg = self.bg_running_count()` — counts must be captured **before**
+    ///    any kill so the rendered message and the kill are in lock-step;
+    /// 2. `self.turn_cancel.read().unwrap().cancel()` — drops the turn's
+    ///    future at its next poll, unwinding the wire request, the tool call,
+    ///    the sub-agent, and — via `PtyHandle::drop` — the foreground PTY
+    ///    child (design §0.1 / T7 keystone);
+    /// 3. `self.clear_bg()` (existing, idempotent — SIGHUPs every bg child
+    ///    and repaints the `🛰 N bg` counter to 0);
     /// 4. `self.clear_bash_stdin_tx()` (existing, idempotent);
-    /// 5. `self.reset_bash_panel()` (existing, idempotent);
-    /// 6. return the snapshotted [`StopTally`].
+    /// 5. `self.reset_bash_panel()` (existing, idempotent).
     ///
     /// Idempotent: a second call kills nothing and returns
     /// `StopTally::default()` (the cancel of an already-cancelled token is a
     /// no-op, the cleared-bg / cleared-stdin / reset-panel are all no-ops on
     /// their respective already-cleaned-up states).
-    ///
-    /// #183: stub — currently returns `StopTally::default()` and does NOT
-    /// cancel / clear / reset. Tests T1 and T2 fail on this stub.
     pub fn stop_turn_processes(&self) -> StopTally {
-        // #183: stub — implementation lands in the implementation task.
-        // Per design §4 step 5, the real body is:
-        //   let shell = self.state.read().unwrap().bash_panel.is_running();
-        //   let bg = self.bg_running_count();
-        //   self.turn_cancel.read().unwrap().cancel();
-        //   self.clear_bg();
-        //   self.clear_bash_stdin_tx();
-        //   self.reset_bash_panel();
-        //   StopTally { shell, bg }
-        let _ = &self.turn_cancel; // suppress unused-field warning until wired
-        StopTally::default()
+        let shell = self.state.read().unwrap().bash_panel.is_running();
+        let bg = self.bg_running_count();
+        self.turn_cancel.read().unwrap().cancel();
+        self.clear_bg();
+        self.clear_bash_stdin_tx();
+        self.reset_bash_panel();
+        StopTally { shell, bg }
     }
 
     /// Clear all per-process bg cooldowns so the next drain flushes every

@@ -1116,13 +1116,9 @@ impl SessionHook {
     /// `request_stop_and_drain` but **never consumed** by the hook — and would
     /// survive into the *next* turn, terminating it spuriously the moment the
     /// hook is polled. This method is the explicit reset the drain arm calls
-    /// after the turn has unwound (design §4 step 11).
-    ///
-    /// #183: stub — currently a no-op. The implementation task will
-    /// `store(false, Ordering::SeqCst)`.
+    /// after the turn has unwound (design §4 step 11, risk R2).
     pub fn clear_stop(&self) {
-        // #183: stub — implementation lands in the implementation task.
-        // Real body: self.stop_requested.store(false, Ordering::SeqCst);
+        self.stop_requested.store(false, Ordering::SeqCst);
     }
 
     /// The lane this hook stamps on its emitted events.

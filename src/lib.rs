@@ -106,7 +106,13 @@ enum QueueMessage {
         attachments: Vec<crate::vision::ImageAttachment>,
     },
     Command(String),
-    StopMarker, // Signals that stop was requested
+    /// Signals that stop was requested. Carries the already-rendered system
+    /// message so the kill site (which knows *what* died) and the print site
+    /// (which knows *when* to say it) can never disagree (#183). The string
+    /// is `stop_message(tally)` computed by the event-loop's drain chokepoint.
+    StopMarker {
+        message: String,
+    },
     /// Switch the active model and restart on a fresh conversation.
     /// Carries the validated alias (validation happens in the View
     /// before the action is sent). The agent loop dequeues this between
@@ -236,26 +242,24 @@ pub fn model_locked_message(pipeline: &str) -> String {
 /// | `{ shell: false, bg: 0 }` | `Agent stopped by user`                                                    |
 ///
 /// Both clauses are omitted when nothing was running, so an idle-ish stop
-/// reads exactly as it did before #183.
-///
-/// #183: stub — currently returns the bare `"Agent stopped by user"` string
-/// for every input. The implementation task will build the per-clause strings
-/// (`"1 bash process"` / `"{n} background process{s}"` — pluralise on
-/// `bg == 1`), join with `", "`, and wrap in `(killed …)` or return the bare
-/// sentence when both clauses are absent.
-#[allow(dead_code)] // #183: stub is only referenced from `mod tests` until the implementation lands
+/// reads exactly as it did before #183. Pure function so the T4 test
+/// pins it byte-exact and so neither stop arm can disagree on wording.
 fn stop_message(t: crate::state::StopTally) -> String {
-    // #183: stub — implementation lands in the implementation task.
-    // Reference body (per design §5):
-    //   let mut parts: Vec<String> = Vec::new();
-    //   if t.shell { parts.push("1 bash process".into()); }
-    //   if t.bg > 0 {
-    //       parts.push(format!("{} background process{}", t.bg, if t.bg == 1 { "" } else { "es" }));
-    //   }
-    //   if parts.is_empty() { return "Agent stopped by user".to_string(); }
-    //   format!("Agent stopped by user (killed {})", parts.join(", "))
-    let _ = t;
-    "Agent stopped by user".to_string()
+    let mut parts: Vec<String> = Vec::new();
+    if t.shell {
+        parts.push("1 bash process".into());
+    }
+    if t.bg > 0 {
+        parts.push(format!(
+            "{} background process{}",
+            t.bg,
+            if t.bg == 1 { "" } else { "es" }
+        ));
+    }
+    if parts.is_empty() {
+        return "Agent stopped by user".to_string();
+    }
+    format!("Agent stopped by user (killed {})", parts.join(", "))
 }
 
 /// What a `/pipeline <target>` request resolves to against the live selection.
@@ -920,14 +924,17 @@ impl AgentRunner {
     ) {
         use std::sync::atomic::Ordering;
 
-        // Helper: trigger a full /stop. Sets the drain flag, signals the
-        // running agent to cancel, sends StopMarker, and zeroes the queued
-        // counter so the status bar updates immediately. Reads the
-        // *currently active* SessionHook through the shared cell so it
-        // always cancels the live prompt — not a stale predecessor from
-        // before a `/model` switch. Also fires the innermost running
-        // sub-agent hook (if a `delegate` is in flight) so a stop lands on
-        // the sub-agent too — the whole turn then unwinds out (D6).
+        // Helper: trigger a full /stop. Sets the drain flag, cancels the
+        // running agent, kills every in-flight process (foreground PTY
+        // child + every `bash_bg` child + clears the bash stdin slot),
+        // then sends `StopMarker` carrying the rendered tally. The drain
+        // arm in `agent_loop` just delivers the message — there is no
+        // second stop path. Reads the *currently active* SessionHook
+        // through the shared cell so it always cancels the live prompt —
+        // not a stale predecessor from before a `/model` switch. Fires the
+        // innermost running sub-agent hook (D6) as a belt-and-braces; the
+        // turn's cancellation token (read by `process_message_internal`'s
+        // `select!`) is the load-bearing cancel.
         let request_stop_and_drain =
             |state_manager: &Option<Arc<StateManager>>,
              session_hook_cell: &SharedSessionHook,
@@ -941,17 +948,26 @@ impl AgentRunner {
                 let msg_tx = msg_tx.clone();
                 let drain_requested = drain_requested.clone();
                 async move {
-                    if !sm.as_ref().is_some_and(|sm| sm.is_running()) {
+                    // Idle guard (unchanged from pre-#183) — Stop while idle
+                    // is a no-op.
+                    let Some(sm_ref) = sm.as_ref().filter(|sm| sm.is_running()) else {
                         return;
-                    }
+                    };
                     drain_requested.store(true, Ordering::Release);
                     session_hook.request_stop();
                     crate::pipeline::fire_stop(&active_sub_agent_hook);
-                    if let Some(ref sm) = sm {
-                        sm.set_pending_input_count(0);
-                        sm.set_status(Some("Stop requested...".to_string()));
-                    }
-                    msg_tx.send(QueueMessage::StopMarker).await.ok();
+                    sm_ref.set_pending_input_count(0);
+                    sm_ref.set_status(Some("Stop requested...".to_string()));
+                    // Kill eagerly (design §6 trade-off 3): the bg registry
+                    // would otherwise outlive Stop by the unwind, and a
+                    // wedged turn would never kill them at all.
+                    let tally = sm_ref.stop_turn_processes();
+                    msg_tx
+                        .send(QueueMessage::StopMarker {
+                            message: stop_message(tally),
+                        })
+                        .await
+                        .ok();
                 }
             };
         // Ensure a boot conversation exists. Idempotent: `create_session`
@@ -1177,11 +1193,18 @@ impl AgentRunner {
             // queue contents until the marker arrives.
             if drain_requested.load(Ordering::Acquire) {
                 match msg {
-                    Some(QueueMessage::StopMarker) => {
+                    Some(QueueMessage::StopMarker { message }) => {
                         drain_requested.store(false, Ordering::Release);
+                        // R2 (#183): drop the AtomicBool the `request_stop`
+                        // chokepoint set. The token in
+                        // `process_message_internal`'s `select!` bypasses
+                        // every reader of `stop_requested`, so without this
+                        // the flag would survive into the next turn and
+                        // terminate it spuriously.
+                        session_hook_cell.read().unwrap().clear_stop();
                         if let Some(ref sm) = state_manager {
                             sm.set_status(None);
-                            sm.add_system_message("Agent stopped by user".to_string());
+                            sm.add_system_message(message);
                         }
                         completion_tx.send(CompletionResult::Stopped).ok();
                         continue;
@@ -1394,13 +1417,16 @@ impl AgentRunner {
                     completion_tx.send(CompletionResult::CommandDone).ok();
                 }
 
-                Some(QueueMessage::StopMarker) => {
+                Some(QueueMessage::StopMarker { message }) => {
                     // StopMarker outside drain mode — defensive: shouldn't
                     // happen because the event loop always sets drain_requested
                     // before sending. Treat as a benign acknowledgement.
+                    // Still call `clear_stop` (R2): if a future bug routes
+                    // through this arm, the flag must not leak.
+                    session_hook_cell.read().unwrap().clear_stop();
                     if let Some(ref sm) = state_manager {
                         sm.set_status(None);
-                        sm.add_system_message("Agent stopped by user".to_string());
+                        sm.add_system_message(message);
                     }
                     completion_tx.send(CompletionResult::Stopped).ok();
                 }
@@ -2461,6 +2487,17 @@ impl AgentRunner {
         // `production_resumption_payload_must_not_duplicate_toolresult`.
         let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
 
+        // Per-turn cancellation (#183): bind once at function entry. Cancelling
+        // this token drops the turn's future — every descendant (wire request,
+        // tool call, sub-agent, foreground PTY child via `PtyHandle::drop`) is
+        // a child of the awaited `prompt_with_history` below, so the unwind is
+        // complete. `biased` ensures the cancel arm wins on the same poll if
+        // both it and a ready response race.
+        let cancel = state_manager
+            .as_ref()
+            .map(|sm| sm.turn_cancel_token())
+            .unwrap_or_default();
+
         loop {
             // Compaction is handled at the wire boundary by SessionHook
             // (gate in `on_completion_call`). The handler below catches
@@ -2471,10 +2508,17 @@ impl AgentRunner {
             // override (the post-compaction case — see `history_override`
             // above).
             let mut history = derive_history_for_iteration(&mut history_override, state_manager);
-            let result = agent
-                .as_ref()
-                .prompt_with_history(current_turn.clone(), &mut history)
-                .await;
+            // Stop = drop this future. Everything the turn owns is below it
+            // (#183 design §0.1): the wire request, the tool call, the
+            // sub-agent, the PTY child that dies through `PtyHandle::drop`.
+            // There is deliberately no cancel arm inside the tools — adding
+            // one would shadow this one (outer-observes-inner race) and
+            // would still be unreachable code in production.
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return CompletionResult::Stopped,
+                r = agent.as_ref().prompt_with_history(current_turn.clone(), &mut history) => r,
+            };
 
             match result {
                 Ok(response) => {
