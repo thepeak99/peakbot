@@ -3688,6 +3688,166 @@ mod tests {
         assert_eq!(tr_id, "call-1");
     }
 
+    /// An orphan ToolCall persisted by a crash mid-tool must survive the load
+    /// into the display transcript (load no longer mutates) but never reach the
+    /// provider — repair happens at the wire boundary in `get_agent_history`,
+    /// not on the saved rows. Closes the gap left when
+    /// `sync_from_conversation_sanitizes_orphan_call` was deleted in #271.
+    #[test]
+    fn load_conversation_with_orphan_tool_call_yields_valid_wire_on_next_prompt() {
+        use crate::conversation::{Conversation, Message};
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+        use crate::ui::app_state::{MessageRole, MessageSource};
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+        use std::sync::Arc;
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let mut conv = Conversation::new(
+            "orphan-recovery".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
+        conv.messages.push(Message::User {
+            content: "run the thing".into(),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+        // Orphan: ToolCall with no following ToolResult, the shape left by a
+        // crash that landed the model message but never reached the result row.
+        conv.messages.push(Message::ToolCall {
+            tool_name: "bash".into(),
+            arguments: "{}".into(),
+            call_id: Some("call-9".into()),
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: chrono::Utc::now(),
+        });
+
+        let id = conv.id;
+        storage.save(&conv).unwrap();
+        sm.load_conversation(id).unwrap();
+
+        // (i) Load is honest — the orphan survives into the display transcript.
+        let msgs = &sm.get_state().chat.messages;
+        assert_eq!(
+            msgs.len(),
+            2,
+            "orphan must survive /load (load no longer sanitises the transcript)"
+        );
+        assert_eq!(msgs[1].role, MessageRole::ToolCall);
+        assert_eq!(msgs[1].call_id.as_deref(), Some("call-9"));
+
+        // (ii) Simulate the next user prompt; it is re-supplied to the
+        // provider separately and stripped from the wire history.
+        sm.add_user_message("what happened?".to_string());
+
+        let history = sm.get_agent_history();
+
+        // Wire invariant walk (forward): every ToolCall is immediately
+        // followed by a User carrying a matching ToolResult. Mirrors the
+        // idiom in `get_agent_history_repairs_wedged_bg_user_between_tool_call_and_result`.
+        for (idx, msg) in history.iter().enumerate() {
+            let RigMessage::Assistant { content, .. } = msg else {
+                continue;
+            };
+            let tool_call_ids: Vec<&str> = content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::ToolCall(tc) => Some(tc.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if tool_call_ids.is_empty() {
+                continue;
+            }
+            let next = history.get(idx + 1).unwrap_or_else(|| {
+                panic!("orphan ToolCall leaked to wire at idx {idx}: {history:?}")
+            });
+            let RigMessage::User {
+                content: next_content,
+            } = next
+            else {
+                panic!(
+                    "ToolCall at idx {idx} must be followed by a User message, got {next:?} (history: {history:?})"
+                );
+            };
+            let result_ids: Vec<&str> = next_content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                result_ids, tool_call_ids,
+                "ToolCall(s) at idx {idx} ({tool_call_ids:?}) must be immediately followed by ToolResult(s) with matching ids, got {result_ids:?} (history: {history:?})"
+            );
+        }
+
+        // Wire invariant walk (inverse): no ToolResult without its preceding
+        // matching ToolCall. Catches a ToolCall/Result reversal as well as a
+        // stray Result that sanitize would have stripped.
+        for (idx, msg) in history.iter().enumerate() {
+            let RigMessage::User { content } = msg else {
+                continue;
+            };
+            for c in content.iter() {
+                let UserContent::ToolResult(tr) = c else {
+                    continue;
+                };
+                let prev = if idx == 0 {
+                    panic!(
+                        "ToolResult {} at idx 0 has no preceding message: {history:?}",
+                        tr.id
+                    )
+                } else {
+                    &history[idx - 1]
+                };
+                let RigMessage::Assistant {
+                    content: prev_content,
+                    ..
+                } = prev
+                else {
+                    panic!(
+                        "ToolResult {} at idx {idx} must be preceded by an Assistant message, got {prev:?} (history: {history:?})",
+                        tr.id
+                    );
+                };
+                let prev_tc_ids: Vec<&str> = prev_content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::ToolCall(tc) => Some(tc.id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    prev_tc_ids.iter().any(|id| *id == tr.id),
+                    "ToolResult {} at idx {idx} has no preceding matching ToolCall (prev tool calls: {prev_tc_ids:?}, history: {history:?})",
+                    tr.id
+                );
+            }
+        }
+
+        // The orphan id must not appear in wire history at all.
+        for msg in &history {
+            let RigMessage::Assistant { content, .. } = msg else {
+                continue;
+            };
+            for c in content.iter() {
+                if let AssistantContent::ToolCall(tc) = c {
+                    assert_ne!(
+                        tc.id, "call-9",
+                        "orphan ToolCall leaked to the wire (history: {history:?})"
+                    );
+                }
+            }
+        }
+    }
+
     // ─── todo persistence roundtrip ──────────────────────────────────────
 
     /// Todo items round-trip through sync_to_conversation / sync_from_conversation.
