@@ -744,6 +744,52 @@ mod tests {
         assert_eq!(d[0].lines, vec!["second".to_string()]);
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // #183 — T3: `clear_is_idempotent` (design §8, T3; ticket-named).
+    //
+    // The ticket's first named test: "`BgRegistry::clear()` is idempotent".
+    // This test pins the idempotence half against the existing
+    // implementation — the method iterates the registry once and a second
+    // iteration on an empty registry is a no-op, so this test is GREEN on
+    // the current code.
+    //
+    // Note: `clear()` is *not* called from Stop — Stop deliberately spares
+    // background processes (`stop_turn_processes` never touches the bg
+    // registry). `clear()` is still called from the rebuild paths
+    // (`/new`, `/model`, `/load`, `/cd`, shutdown) via
+    // `StateManager::clear_bg`, where the structural "called exactly once
+    // per rebuild" property holds. Idempotence of `clear()` itself is the
+    // load-bearing half — it lets those rebuild paths call it without
+    // caring whether the registry is already empty.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Ticket-named #183 test: a populated `BgRegistry`'s `clear()` is
+    /// idempotent — calling it twice doesn't panic, the registry is empty
+    /// both times, and `running_count` is zero after each call. Uses
+    /// `insert_fake` to bypass real PTY spawn (no real children to leak)
+    /// and `dummy_killer` (defined in this test mod below) so the
+    /// `BgProcess` construction is self-contained.
+    #[test]
+    fn clear_is_idempotent() {
+        let mut r = BgRegistry::new();
+        // Populate with three fake processes, all Running.
+        for id in 1..=3u32 {
+            insert_fake(&mut r, id, Duration::ZERO, PtyStatus::Running, "line");
+        }
+        assert_eq!(r.proc_count(), 3, "fixture: 3 processes registered");
+        assert_eq!(r.running_count(), 3, "fixture: 3 processes running");
+
+        // First clear — kills every process, empties the registry.
+        r.clear();
+        assert_eq!(r.running_count(), 0, "first clear must zero running_count");
+        assert_eq!(r.proc_count(), 0, "first clear must empty the registry");
+
+        // Second clear — must be a no-op, not a panic, not a re-entry.
+        r.clear();
+        assert_eq!(r.running_count(), 0, "second clear must still be 0");
+        assert_eq!(r.proc_count(), 0, "second clear must leave registry empty");
+    }
+
     /// Dummy killer for tests that bypass real PTY spawning.
     fn dummy_killer() -> Box<dyn ChildKiller + Send + Sync> {
         #[derive(Debug)]

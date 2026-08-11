@@ -49,8 +49,6 @@ const NO_SUMMARY: &str = "No summary of its work is recoverable.";
 
 /// What a failed delegation becomes. Total over `PromptError`.
 pub(crate) enum Handoff {
-    /// User pressed stop — propagate as an error; the turn unwinds.
-    Abort(PromptError),
     /// The budget gate fired.
     ContextExceeded { history: Vec<Message> },
     /// Anything else.
@@ -85,12 +83,6 @@ pub(crate) fn classify(err: PromptError, snapshot: Vec<Message>) -> Handoff {
             chat_history,
             reason,
         } => {
-            if reason == "stop" {
-                return Handoff::Abort(PromptError::PromptCancelled {
-                    chat_history,
-                    reason,
-                });
-            }
             if reason == "subagent-context" {
                 return Handoff::ContextExceeded {
                     history: pick(chat_history, snapshot),
@@ -350,14 +342,6 @@ fn format_result(role: &str, header: Header, summary: Option<&str>) -> String {
 /// to an error — a failed *summary* must not turn into a failed *turn*.
 pub(crate) async fn build(role: &str, h: Handoff, cfg: &ProviderConfig) -> String {
     let (header, history) = match h {
-        // The caller unwinds `Abort` as an error; degrade rather than panic if
-        // one ever reaches here.
-        Handoff::Abort(e) => (
-            Header::Failed {
-                error: e.to_string(),
-            },
-            Vec::new(),
-        ),
         Handoff::ContextExceeded { history } => (Header::ContextExceeded, history),
         Handoff::Failed { error, history } => (Header::Failed { error }, history),
     };
@@ -464,22 +448,6 @@ mod tests {
     }
 
     // ── classify ────────────────────────────────────────────────────────────
-
-    /// `/stop` must stay an error so the whole turn unwinds — it is the one
-    /// failure the orchestrator must not "recover" from.
-    #[test]
-    fn classify_stop_aborts() {
-        let err = PromptError::PromptCancelled {
-            chat_history: vec![assistant_text("work")],
-            reason: "stop".to_string(),
-        };
-        match classify(err, vec![]) {
-            Handoff::Abort(PromptError::PromptCancelled { reason, .. }) => {
-                assert_eq!(reason, "stop");
-            }
-            _ => panic!("stop must classify as Abort"),
-        }
-    }
 
     /// The gate's own reason maps to the context header, carrying the history
     /// rig built for the cancellation.

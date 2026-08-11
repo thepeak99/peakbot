@@ -23,8 +23,6 @@ use std::sync::{Arc, Mutex};
 pub enum ProcessResult {
     /// Message processed successfully with response
     Success(String),
-    /// Agent was stopped
-    Stopped,
     /// Error occurred
     Error,
 }
@@ -145,7 +143,6 @@ impl TestRunner {
 
         match result {
             ProcessResult::Success(response) => response,
-            ProcessResult::Stopped => "Agent stopped".to_string(),
             ProcessResult::Error => "Error occurred".to_string(),
         }
     }
@@ -269,12 +266,6 @@ impl TestRunner {
                                 self.state_manager.set_running(false);
                                 return ProcessResult::Success(response);
                             }
-                            Err(PromptError::PromptCancelled { reason, .. })
-                                if reason == "stop" =>
-                            {
-                                self.state_manager.set_running(false);
-                                return ProcessResult::Stopped;
-                            }
                             Err(_) => {
                                 self.state_manager.set_running(false);
                                 return ProcessResult::Error;
@@ -290,11 +281,8 @@ impl TestRunner {
                     // edge cases before the next prompt.
                     continue;
                 }
-                Err(PromptError::PromptCancelled { reason, .. }) => {
+                Err(PromptError::PromptCancelled { .. }) => {
                     self.state_manager.set_running(false);
-                    if reason == "stop" {
-                        return ProcessResult::Stopped;
-                    }
                     return ProcessResult::Error;
                 }
                 Err(_) => {

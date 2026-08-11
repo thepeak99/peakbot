@@ -588,3 +588,336 @@ fn snapshot_for_panel(
         .collect();
     (status, tail)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Tests for issue #183 — "Stop button stops *everything*".
+    //!
+    //! The keystone assertion is `dropping_the_bash_call_future_kills_the_child`
+    //! (T7): the design's entire `Stop = drop the turn's future` strategy rests
+    //! on the fact that a `PtyHandle` owned by an `async fn` body lives in the
+    //! future's state machine. Dropping the future therefore runs
+    //! `PtyHandle::drop` → `killer.kill()` → SIGHUP to the PTY session leader.
+    //! If T7 is false on the current code, the whole design is wrong (see
+    //! design §9 R1 — fallback is a `Drop`-guard, not a token-in-every-tool).
+    //!
+    //! `cancelling_the_turn_kills_the_bash_child` (T6) is the production mirror:
+    //! the test wraps the bash call in a `select!` against the turn-cancel token
+    //! and asserts that `stop_turn_processes()` causes the future to be dropped
+    //! (and therefore the child killed) within the design's 500 ms budget.
+
+    use super::*;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::time::sleep;
+
+    /// Build a `BashArgs` whose child appends one timestamp line to `path` every
+    /// 100 ms forever. Used by both T6 and T7 as a live-process probe: the
+    /// child is alive iff the file is still growing.
+    fn long_running_writer_args(path: &std::path::Path) -> BashArgs {
+        BashArgs {
+            command: format!(
+                // `date` output is ~24-30 bytes depending on locale; 100 ms
+                // cadence gives us a few hundred lines in the first 500 ms
+                // window so a no-growth check has plenty of margin.
+                "while true; do date >> \"{}\"; sleep 0.1; done",
+                path.display()
+            ),
+            timeout_seconds: Some(300),
+            head: None,
+            tail: None,
+        }
+    }
+
+    /// Cheap file-size probe used as the "is the child still alive?" signal.
+    /// Avoids `libc::kill(pid, 0)` (no `libc` dev-dep — task says prefer
+    /// `/proc` or file growth), and works on every Unix without a `/proc` mount.
+    fn file_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// T7 — the keystone. Pins that dropping the `BashTool::call` future kills
+    /// the spawned PTY child. Run this first, before any other #183 work, and
+    /// report its result verbatim — the entire design rests on it.
+    ///
+    /// Mechanism (from design §0.1 + §9 R1): `BashTool::call` is an `async fn`
+    /// whose body-local `handle: PtyHandle` lives in the generator state. The
+    /// `PtyHandle::drop` impl (`pty_runner.rs:224-234`) calls
+    /// `self.killer.kill()` (SIGHUP on Unix). So dropping the future at any
+    /// await point should terminate the child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_bash_call_future_kills_the_child() {
+        let dir = TempDir::new().expect("tempdir");
+        let log = dir.path().join("t7_bash_child.log");
+        let args = long_running_writer_args(&log);
+
+        let tool = BashTool::default();
+        // `Box::pin` (not `tokio::pin!`) so that `drop(...)` actually drops
+        // the future state. `tokio::pin!` produces a `Pin<&mut F>` over a
+        // hidden variable — dropping that Pin only drops the reference, NOT
+        // the underlying future. The whole design hinges on a *real* drop,
+        // so we test the real one.
+        let mut fut: std::pin::Pin<Box<dyn std::future::Future<Output = _>>> =
+            Box::pin(tool.call(args));
+
+        // Let the child run for 500 ms — well past startup, so the PTY
+        // session leader is established and the reader thread is draining.
+        let timeout_outcome = tokio::time::timeout(Duration::from_millis(500), fut.as_mut()).await;
+        assert!(
+            timeout_outcome.is_err(),
+            "the 500 ms timeout must fire (child never exits on its own); \
+             if this fires, the test is racy or the child died prematurely"
+        );
+
+        // Real drop: drops the Box, which drops the future state, which
+        // drops the `handle: PtyHandle` captured in the async-fn body, which
+        // runs `PtyHandle::drop` → `killer.kill()` → SIGHUP.
+        drop(fut);
+
+        // Sanity: 500 ms of `date >> log; sleep 0.1` ⇒ file must be non-empty.
+        let len_after_drop = file_len(&log);
+        assert!(
+            len_after_drop > 0,
+            "the bash child should have written at least one line during \
+             the 500 ms activity window (got {len_after_drop} bytes)"
+        );
+
+        // Give a wedged child plenty of time to keep writing. If the kill
+        // mechanism (PtyHandle::drop → killer.kill() → SIGHUP) didn't fire,
+        // the file will grow noticeably.
+        sleep(Duration::from_secs(1)).await;
+        let len_after_sleep = file_len(&log);
+        assert_eq!(
+            len_after_drop, len_after_sleep,
+            "the bash child must NOT write after the future was dropped \
+             (file grew from {len_after_drop} to {len_after_sleep} bytes \
+             during the 1 s observation window — the child survived)"
+        );
+    }
+
+    /// T6 — `cancelling_the_turn_kills_the_bash_child` (design §8, T6;
+    /// ticket-named #2: "a synthetic bash child is killed when the
+    /// cancellation token fires").
+    ///
+    /// Mirrors production: a `tokio::select!` races the bash-call future
+    /// against the per-turn cancellation token. `stop_turn_processes()` must
+    /// fire the cancel (design §4 step 5.2), the select's cancelled arm must
+    /// win, the bash future must be dropped (T7's keystone property), and the
+    /// underlying PTY child must die. The test asserts (a) the racing task
+    /// joins within the design's 500 ms budget, and (b) the file the bash
+    /// child was writing to stops growing.
+    ///
+    /// Against the current code's stubs: `stop_turn_processes` is a no-op,
+    /// so the token never fires, the `cancelled()` future never resolves, the
+    /// bash-call future keeps the child alive, the task never joins — the
+    /// test goes RED on the `join.is_ok()` assertion. Against the
+    /// implementation: the join resolves inside 500 ms, the file stops
+    /// growing, GREEN.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_the_turn_kills_the_bash_child() {
+        let dir = TempDir::new().expect("tempdir");
+        let log = dir.path().join("t6_bash_child.log");
+        let args = long_running_writer_args(&log);
+
+        // Set up a real `StateManager` so we exercise the public cancel API
+        // the design names (`StateManager::turn_cancel_token` /
+        // `StateManager::stop_turn_processes`).
+        let sm = std::sync::Arc::new(crate::state::StateManager::new_arc());
+        // Production: mints the per-turn token. Stub: no-op.
+        sm.set_running(true);
+        let cancel = sm.turn_cancel_token();
+
+        let tool = BashTool::default();
+        // The future of the racing task.
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                // Arm 1: the cancel token wins → returns None.
+                _ = cancel.cancelled() => None,
+                // Arm 2: the bash call future completes (it never does
+                // here — the child runs forever) → returns Some(result).
+                r = tool.call(args) => Some(r),
+            }
+        });
+
+        // Let the bash child run for 500 ms so the file is provably alive
+        // and growing when the stop lands.
+        sleep(Duration::from_millis(500)).await;
+        let len_before_stop = file_len(&log);
+        assert!(
+            len_before_stop > 0,
+            "the bash child should have written at least one line \
+             during the 500 ms activity window (got {len_before_stop} bytes)"
+        );
+
+        // Act — production: cancels the token → the racing task's
+        // `cancelled()` arm wins → `tool.call` future is dropped → its
+        // `PtyHandle::drop` fires → SIGHUP. Stub: no-op, the cancel
+        // never fires, the task keeps running.
+        sm.stop_turn_processes();
+
+        // (a) The racing task must join within 500 ms.
+        let join_outcome = tokio::time::timeout(Duration::from_millis(500), task).await;
+        assert!(
+            join_outcome.is_ok(),
+            "the racing task must join within 500 ms after \
+             stop_turn_processes() — the cancel token did not fire, so the \
+             bash call future was never dropped, so the child kept running"
+        );
+        let join_outcome = join_outcome.unwrap();
+        assert!(
+            join_outcome.is_ok(),
+            "the racing task itself must not panic; got: {:?}",
+            join_outcome.err()
+        );
+        // Production: the select! returned None (cancel arm won).
+        let _selected = join_outcome.unwrap();
+        // (b) The file must stop growing.
+        let len_after = file_len(&log);
+        assert_eq!(
+            len_before_stop, len_after,
+            "the bash child must NOT write after the cancel; \
+             file grew from {len_before_stop} to {len_after} bytes during \
+             the join window — the child survived SIGHUP or SIGHUP wasn't sent"
+        );
+    }
+
+    /// T8 — `cancelling_unwinds_a_nested_bash_call_killing_the_child` (the
+    /// stakeholder's extra: Stop interrupts a sub-agent *mid-tool*, not just
+    /// at the next LLM boundary; design §0.1 + §4 step 6).
+    ///
+    /// What the design claims: the sub-agent's bash call is a *descendant*
+    /// future of the turn's `agent.prompt_with_history` future. Dropping the
+    /// top of that chain — the `select!` in `process_message_internal` —
+    /// unwinds every layer between it and the bash tool's `PtyHandle`,
+    /// including the `tokio::time::timeout` wrapper `DelegateTool::call`
+    /// uses for its wall-clock budget (`pipeline/delegate_tool.rs:402-436`)
+    /// and the one `TimeBudget::call` uses for every tool
+    /// (`tools/time_budget.rs:113-130`).
+    ///
+    /// T6 already pins the *one*-layer case: `select! { cancel, bash.call }`.
+    /// It would still pass on a regression that inserted an async wrapper
+    /// between the two that failed to propagate drop. T8 is the cheapest
+    /// pin of "a `tokio::time::timeout` wrapper between the cancel point
+    /// and the bash call does NOT swallow the drop": same file-growth
+    /// probe, same `stop_turn_processes` trigger, with the bash call
+    /// wrapped in `tokio::time::timeout` to mimic either the sub-agent
+    /// budget or the `TimeBudget` decorator.
+    ///
+    /// **What this test proves:** the `select! → timeout → bash.call`
+    /// shape, when the outermost `select!` is cancelled by
+    /// `stop_turn_processes()`, drops the bash call future (via the
+    /// `timeout` future) and therefore kills the PTY child (T7's
+    /// keystone property). Combined with T6 and T7, this gives us
+    /// `cancel → drop → [arbitrary `async` layers] → bash PtyHandle
+    /// drop → SIGHUP`.
+    ///
+    /// **What this test does NOT prove:** that rig's internal prompt loop
+    /// properly drops an in-flight tool future when its own future is
+    /// dropped mid-turn. That is a rig assumption, not a peakbot claim,
+    /// and would need a real (or fully-mocked) sub-agent to exercise.
+    /// The full-delegation test would require driving a delegate tool
+    /// call through `TestHarness` with a real `SubAgentRegistry` + a
+    /// mock model that emits a `bash` tool call — rejected here as
+    /// gold-plating (and, more importantly, the existing `TestRunner`
+    /// does not wire the turn-cancel token into its `select!`, so a
+    /// `TestHarness` test would exercise the *legacy* LLM-boundary stop
+    /// path, not the design's drop-cancellation path).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_unwinds_a_nested_bash_call_killing_the_child() {
+        let dir = TempDir::new().expect("tempdir");
+        let log = dir.path().join("t8_nested_bash_child.log");
+        let args = long_running_writer_args(&log);
+
+        // Set up a real `StateManager` so we exercise the same public
+        // cancel API T6 uses (`StateManager::turn_cancel_token` /
+        // `StateManager::stop_turn_processes`).
+        let sm = std::sync::Arc::new(crate::state::StateManager::new_arc());
+        sm.set_running(true);
+        let cancel = sm.turn_cancel_token();
+
+        let tool = BashTool::default();
+        // The racing task body mirrors the production chain in miniature:
+        //   outermost: the turn-cancel `select!` (orchestrator level);
+        //   middle:    a `tokio::time::timeout` (the wrapper the sub-agent
+        //              uses in `DelegateTool::call` and `TimeBudget` uses
+        //              for every tool — pick either, they're the same
+        //              shape);
+        //   innermost: the bash call future holding the `PtyHandle`.
+        // The design claim being pinned: cancelling the outermost future
+        // unwinds through the `timeout` future and drops the bash call
+        // future, which runs `PtyHandle::drop` and kills the child.
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                // Wrapping the bash call in a `tokio::time::timeout` is the
+                // critical shape under test: it adds an async layer between
+                // the select! and the bash call. A regression that made
+                // `tokio::time::timeout` swallow the drop (e.g. by holding
+                // the inner future in a `Pin<Box>` that doesn't propagate
+                // drop) would pass T6 and fail T8.
+                r = tokio::time::timeout(
+                    Duration::from_secs(300),
+                    tool.call(args),
+                ) => Some(r),
+            }
+        });
+
+        // Activity window — bash child has been writing for 500 ms.
+        sleep(Duration::from_millis(500)).await;
+        let len_before_stop = file_len(&log);
+        assert!(
+            len_before_stop > 0,
+            "the bash child should have written at least one line during \
+             the 500 ms activity window (got {len_before_stop} bytes)"
+        );
+
+        // Trigger Stop the same way production does: `request_stop_and_drain`
+        // calls `sm.stop_turn_processes()`, which cancels the per-turn
+        // token (`state_manager.rs:2180-2188`). The cancel arm of the
+        // `select!` wins, the `timeout` future is dropped, the bash call
+        // future inside it is dropped, `PtyHandle::drop` runs,
+        // `killer.kill()` SIGHUPs the child.
+        sm.stop_turn_processes();
+
+        // (a) The racing task must join within 500 ms. This is the
+        // *load-bearing* assertion: if the cancel arm doesn't win (or the
+        // intermediate `timeout` future blocks its arm in some way), the
+        // task keeps running and this times out. Production drops the
+        // whole subtree synchronously on the next poll, so the join
+        // resolves in microseconds — the 500 ms budget is generous.
+        let join_outcome = tokio::time::timeout(Duration::from_millis(500), task).await;
+        assert!(
+            join_outcome.is_ok(),
+            "the racing task must join within 500 ms after stop_turn_processes() — \
+             the cancel did not unwind the select! → timeout → bash.call chain, so the \
+             bash child was not dropped, so the child kept running. The whole point of \
+             the design is that the cascade is synchronous; if this fires, the cascade \
+             has a hole."
+        );
+        let join_outcome = join_outcome.unwrap();
+        assert!(
+            join_outcome.is_ok(),
+            "the racing task itself must not panic; got: {:?}",
+            join_outcome.err()
+        );
+        let _selected = join_outcome.unwrap();
+
+        // (b) The file must stop growing. This is the *child-is-dead*
+        // assertion. If SIGHUP didn't reach the bash child (or the child
+        // caught SIGHUP and ignored it — bash doesn't, but a `nohup`
+        // wrapper would), the file grows during the join window.
+        let len_after = file_len(&log);
+        assert_eq!(
+            len_before_stop, len_after,
+            "the bash child must NOT write after the cancel; \
+             file grew from {len_before_stop} to {len_after} bytes during \
+             the join window — the nested timeout wrapper did not propagate \
+             the drop, or SIGHUP was not sent"
+        );
+    }
+}

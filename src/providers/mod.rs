@@ -200,7 +200,6 @@ pub fn create_provider(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
-    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
 ) -> Result<(
@@ -225,7 +224,6 @@ pub fn create_provider(
                 shell_kind,
                 vector_store,
                 skills,
-                active_sub_agent_hook,
                 retry,
                 timeouts,
             )?;
@@ -251,7 +249,6 @@ pub fn create_provider(
                 shell_kind,
                 vector_store,
                 skills,
-                active_sub_agent_hook,
                 retry,
                 timeouts,
             )?;
@@ -277,7 +274,6 @@ pub fn create_provider(
                 shell_kind,
                 vector_store,
                 skills,
-                active_sub_agent_hook,
                 retry,
                 timeouts,
             )?;
@@ -303,7 +299,6 @@ pub fn create_provider(
                 shell_kind,
                 vector_store,
                 skills,
-                active_sub_agent_hook,
                 retry,
                 timeouts,
             )?;
@@ -329,7 +324,6 @@ pub fn create_provider(
                 shell_kind,
                 vector_store,
                 skills,
-                active_sub_agent_hook,
                 retry,
                 timeouts,
             )?;
@@ -568,10 +562,10 @@ where
     // Add DelegateTool if pipeline is enabled. It needs the same build
     // context the orchestrator had (to spawn fresh sub-agents), captured here
     // where that context is in scope. `sub_agent_wiring` carries the extra
-    // pieces (event sink, active-hook cell, max_turns) not already passed;
-    // the rest are cloned from this call's args. Requires a `state_manager`
-    // (sub-agents need session cwd + bg registry) — without one the delegate
-    // tool is simply not registered.
+    // pieces (event sink, max_turns) not already passed; the rest are cloned
+    // from this call's args. Requires a `state_manager` (sub-agents need
+    // session cwd + bg registry) — without one the delegate tool is simply
+    // not registered.
     if let (Some(registry), Some(wiring), Some(sm)) =
         (pipeline_registry, sub_agent_wiring, sm_for_delegate)
     {
@@ -586,7 +580,6 @@ where
             max_turns: wiring.max_turns,
             skills: wiring.skills,
             event_sink: wiring.event_sink,
-            active_hook: wiring.active_hook,
             retry: wiring.retry,
             timeouts: timeouts.clone(),
         };
@@ -619,11 +612,10 @@ fn wire_bash_tool(
 
 /// The extra sub-agent build context threaded into [`add_builtin_tools`] that
 /// it doesn't already receive as direct args: the orchestrator's event sink
-/// (sub-agent events TEE here tagged `SubAgent`), the active-hook cell (for
-/// `/stop` routing), `max_turns`, and the retry policy.
+/// (sub-agent events TEE here tagged `SubAgent`), `max_turns`, and the retry
+/// policy.
 pub(crate) struct SubAgentWiring {
     pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
-    pub active_hook: crate::pipeline::ActiveSubAgentHook,
     pub max_turns: usize,
     /// The discovered skills — each delegation renders this through the
     /// role's filter into the sub-agent preamble.
@@ -680,7 +672,6 @@ fn create_openrouter_agent(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
-    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
 ) -> Result<(
@@ -740,7 +731,6 @@ fn create_openrouter_agent(
         true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
-            active_hook: active_sub_agent_hook,
             retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
@@ -784,7 +774,6 @@ fn create_anthropic_agent(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
-    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
 ) -> Result<(
@@ -848,7 +837,6 @@ fn create_anthropic_agent(
         true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
-            active_hook: active_sub_agent_hook,
             retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
@@ -889,7 +877,6 @@ fn create_ollama_agent(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
-    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
 ) -> Result<(
@@ -925,7 +912,7 @@ fn create_ollama_agent(
 
     // Add built-in tools (including optional SearchTool and TodoTool).
     // Ollama has no event channel, so delegated sub-agents can't TEE their
-    // events here — `event_sink` is `None`; `/stop` still routes via the cell.
+    // events here — `event_sink` is `None`.
     let agent_builder = add_builtin_tools(
         agent_builder,
         searxng_config,
@@ -940,7 +927,6 @@ fn create_ollama_agent(
         true,
         Some(SubAgentWiring {
             event_sink: None,
-            active_hook: active_sub_agent_hook,
             retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
@@ -982,7 +968,6 @@ fn create_openai_agent(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
-    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
 ) -> Result<(
@@ -1044,7 +1029,6 @@ fn create_openai_agent(
         true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
-            active_hook: active_sub_agent_hook,
             retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
@@ -1086,7 +1070,6 @@ fn create_llamacpp_agent(
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
     skills: &crate::skills::SkillRegistry,
-    active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
 ) -> Result<(
@@ -1151,7 +1134,6 @@ fn create_llamacpp_agent(
         true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
-            active_hook: active_sub_agent_hook,
             retry: retry.clone(),
             max_turns,
             skills: skills.clone(),
@@ -1261,11 +1243,11 @@ pub fn create_mock_agent(
 /// `CompletionResponse` events flow to the orchestrator's shared receiver
 /// tagged `SubAgent { role }`, so cost rolls up and turns are TEE'd to the
 /// transcript. Returns the hook so the caller can register it as the active
-/// sub-agent hook for stop routing.
+/// sub-agent hook.
 ///
 /// **Ollama is hookless by type** (`DynAgent::Ollama` carries `()`), so a role
-/// on an Ollama model ignores `sink`/`source`: no event TEE, no cost roll-up,
-/// no stop for that lane. This matches Ollama's existing no-cost-tracking
+/// on an Ollama model ignores `sink`/`source`: no event TEE, no cost roll-up
+/// for that lane. This matches Ollama's existing no-cost-tracking
 /// behaviour — a documented degradation, not a silent surprise. The same
 /// applies to `context_budget`: an Ollama sub-agent gets neither the proactive
 /// gate nor a history snapshot, so an interrupted run is summarised only when
@@ -1445,7 +1427,7 @@ pub(crate) fn build_sub_agent(
         ProviderConfig::Ollama(c) => {
             // Ollama's DynAgent variant carries no hook — `sink`/`source` are
             // dropped for this lane (see the fn doc). The agent still runs and
-            // returns its output; only TEE/cost/stop are unavailable.
+            // returns its output; only TEE/cost are unavailable.
             let client = ollama::Client::builder()
                 .http_client(crate::http::client())
                 .base_url(&c.base_url)

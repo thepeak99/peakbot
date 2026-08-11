@@ -228,12 +228,6 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
             .or_else(|| deps.config.persona()),
     );
 
-    // Session-owned cell for the currently-running sub-agent hook (D6 stop
-    // routing). Created once here, shared with the boot agent's DelegateTool
-    // (via create_provider) and every `/model`-rebuilt agent (via AgentRunner),
-    // and read by the `/stop` dispatcher.
-    let active_sub_agent_hook: crate::pipeline::ActiveSubAgentHook = Default::default();
-
     // The `delegate` tool (and thus sub-agents) is registered iff a pipeline is
     // selected — and it exposes exactly that team's roster. A fresh session has
     // no selection, so the boot agent has no delegate until the user selects a
@@ -255,7 +249,6 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         deps.shell_kind.as_ref(),
         deps.vector_store.as_ref(),
         &deps.skills,
-        active_sub_agent_hook.clone(),
         &deps.config.retry,
         &deps.config.timeouts,
     )?;
@@ -344,7 +337,6 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         Some(state_manager.clone()),
         session_hook,
         context_size,
-        active_sub_agent_hook,
     )?
     .with_rebuild_context(rebuild_ctx);
 

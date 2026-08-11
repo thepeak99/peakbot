@@ -12,7 +12,6 @@ use rig_core::completion::message::AssistantContent;
 use rig_core::completion::{CompletionModel, CompletionResponse, message::Message};
 use rig_core::one_or_many::OneOrMany;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 
@@ -1014,8 +1013,6 @@ pub struct SessionHook {
     /// Reference to session stats for token tracking
     #[allow(dead_code)]
     stats: Arc<Mutex<SessionStats>>,
-    /// User requested stop
-    stop_requested: Arc<AtomicBool>,
     /// Weak reference to the `StateManager`, used by `on_completion_call` to
     /// gate in-loop compaction (see `mid-compaction.md` § 3 Step 1). Weak so
     /// the hook never extends the manager's lifetime — the agent owns the
@@ -1035,7 +1032,6 @@ impl SessionHook {
             event_sender,
             source: MessageSource::Human,
             stats: Arc::new(Mutex::new(SessionStats::new())),
-            stop_requested: Arc::new(AtomicBool::new(false)),
             state_manager: None,
             sub_agent: None,
         }
@@ -1050,7 +1046,6 @@ impl SessionHook {
             event_sender,
             source: MessageSource::Human,
             stats,
-            stop_requested: Arc::new(AtomicBool::new(false)),
             state_manager: None,
             sub_agent: None,
         }
@@ -1097,16 +1092,6 @@ impl SessionHook {
             .unwrap_or_default()
     }
 
-    /// Request the agent to stop
-    pub fn request_stop(&self) {
-        self.stop_requested.store(true, Ordering::SeqCst);
-    }
-
-    /// Whether a stop has been requested and not yet consumed by the loop.
-    pub fn is_stop_requested(&self) -> bool {
-        self.stop_requested.load(Ordering::SeqCst)
-    }
-
     /// The lane this hook stamps on its emitted events.
     pub fn source(&self) -> &MessageSource {
         &self.source
@@ -1125,7 +1110,6 @@ impl SessionHook {
                 event_sender: Some(sender),
                 source: MessageSource::Human,
                 stats: Arc::new(Mutex::new(SessionStats::new())),
-                stop_requested: Arc::new(AtomicBool::new(false)),
                 state_manager: None,
                 sub_agent: None,
             },
@@ -1303,19 +1287,10 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             });
         }
 
-        // Check for interruptions at LLM boundary (before tool execution)
-
-        // Stop flag check — only interruption handled here.
         // Context compaction is handled by ContextManager at the top of the
         // AgentRunner loop (before the next LLM call), not here. Terminating
         // mid-response would throw away the LLM's output and previously caused
         // an infinite retry loop (see compactfuck.md Bug #2 and #3).
-        if self.stop_requested.load(Ordering::SeqCst) {
-            self.stop_requested.store(false, Ordering::SeqCst);
-            tracing::info!("Stop requested, terminating");
-            return HookAction::terminate("stop");
-        }
-
         HookAction::Continue
     }
 

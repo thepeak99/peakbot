@@ -221,10 +221,10 @@ non-streaming (`agent.prompt`), so nothing arrives until the model is done and
 for LLM calls it acts as a ceiling on a single generation. Raise it if you run
 models that legitimately think for longer than 30 minutes. Without it, an
 upstream that accepts a request and never answers wedges the turn until the
-process dies — Stop can't help, because `stop_requested` is only checked *after*
-the call returns. Tools that set their own shorter total `.timeout()`
-(`fetch_url`, `fetch_page`, `web_search`) are unaffected: whichever fires first
-wins.
+process dies — Stop still works (the per-turn cancellation token drops the
+in-flight request) but the user waits for the wrapper's read to die before the
+turn unwinds. Tools that set their own shorter total `.timeout()` (`fetch_url`,
+`fetch_page`, `web_search`) are unaffected: whichever fires first wins.
 
 ### MCP servers
 
@@ -536,7 +536,7 @@ A sub-agent's preamble (`build_sub_agent_preamble`, rebuilt fresh per delegation
 
 ### Tools, isolation, stop
 
-Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). No sandbox in v1 — a sub-agent can write and run bash. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together (stop routes to the innermost hook via `ActiveSubAgentHook`); there is no resumption path.
+Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). No sandbox in v1 — a sub-agent can write and run bash. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together. With #183 the abort is **mid-tool**, not just at the next LLM boundary: dropping the orchestrator's turn future unwinds the in-flight delegation and its sub-tool (`bash`/etc.) along with it, so the sub-agent's PTY child dies via `PtyHandle::drop` at the same instant. There is no resumption path.
 
 Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`), unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`. The whole delegation is bounded by `timeouts.delegate_secs` (default 1 h); on expiry the transcript takes that same path — summarised and returned as `INTERRUPTED`, not discarded.
 
