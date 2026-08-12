@@ -38,7 +38,7 @@ export function TranscriptNav({
       {showTop && (
         <button
           onClick={onTop}
-          aria-label="Scroll to the top of the loaded transcript"
+          aria-label="Scroll to the top of the transcript"
           className={`pointer-events-auto ${BUTTON}`}
         >
           ↑ top

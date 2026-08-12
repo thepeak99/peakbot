@@ -7,12 +7,19 @@
 // the moment the user scrolled away, or `null` while pinned. That makes
 // "pinned" and "how many messages arrived since" derivations rather than
 // copies, so they cannot drift out of sync.
+//
+// This hook no longer scrolls. Scrolling the container is the virtualizer's
+// job (see issue #277) — all this hook owns is the pin state, the up-only
+// unpin trigger, and `repin()` to clear it. `scrollToBottom` / `scrollToTop`
+// have moved to the call sites that need them, since they need access to the
+// real scroll element and any compensation the virtualizer may be doing.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /** Distance from the bottom (px) still counted as "pinned". Slack enough to
- *  survive a half-line of overscroll and the composer's growth. */
-const PIN_THRESHOLD_PX = 80;
+ *  survive a half-line of overscroll and the composer's growth. Exported so
+ *  tests and the (future) virtualizer can share the same boundary. */
+export const PIN_THRESHOLD_PX = 80;
 
 /** How far down (px) before offering "back to top". */
 const TOP_BUTTON_PX = 400;
@@ -39,18 +46,11 @@ export function useTranscriptScroll(messageCount: number) {
   const unread =
     unpinnedAt === null ? 0 : Math.max(0, messageCount - unpinnedAt);
 
-  /** Scrolls to the newest message and re-pins. One function, because doing
-   *  either half alone leaves the UI lying about where the user is. */
-  const scrollToBottom = useCallback(() => {
+  /** Clear the unpinned state without touching the DOM. The scroll element's
+   *  position is something the caller (or the future virtualizer) decides;
+   *  this hook only tracks intent. */
+  const repin = useCallback(() => {
     setUnpinnedAt(null);
-    sectionRef.current?.scrollTo({
-      top: sectionRef.current.scrollHeight,
-      behavior: "smooth",
-    });
-  }, []);
-
-  const scrollToTop = useCallback(() => {
-    sectionRef.current?.scrollTo({ top: 0, behavior: "smooth" });
   }, []);
 
   // Scroll events fire far faster than paint. Sample at most once per frame,
@@ -69,6 +69,9 @@ export function useTranscriptScroll(messageCount: number) {
       // those as "the user left" would flash the button and, if the animation
       // were then superseded by a new message, silently kill auto-follow.
       // The 1px tolerance absorbs sub-pixel jitter at fractional zoom levels.
+      // The (future) virtualizer's compensating scroll writes must also never
+      // fake an unpin — they may write scrollTop downward without intent to
+      // leave.
       const movedUp = top < lastTop.current - 1;
       lastTop.current = top;
       if (isPinnedAt(el)) setUnpinnedAt(null);
@@ -85,7 +88,6 @@ export function useTranscriptScroll(messageCount: number) {
     pinned,
     unread,
     showTop,
-    scrollToBottom,
-    scrollToTop,
+    repin,
   };
 }
