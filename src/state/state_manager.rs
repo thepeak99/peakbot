@@ -1501,6 +1501,16 @@ impl StateManager {
                 conv.metadata.total_api_calls,
                 conv.metadata.total_cost,
             );
+            // total_input_tokens is lane-blind — when a sub-agent turn
+            // persisted mid-delegation, restore() seeded the orchestrator
+            // gate from it. Override with the lane-scoped field if present;
+            // legacy files (None) keep the total_input_tokens fallback for free.
+            if let Some(v) = conv.metadata.last_orchestrator_input_tokens {
+                self.stats
+                    .lock()
+                    .unwrap()
+                    .restore_orchestrator_input_tokens(v);
+            }
             // Rehydrate the per-lane breakdown so the Session panel can scope to
             // a sub-agent on resume instead of reading zeros.
             self.stats
@@ -1602,6 +1612,10 @@ impl StateManager {
             conv.metadata.total_output_tokens = stats.total_output_tokens;
             conv.metadata.total_api_calls = stats.total_api_calls;
             conv.metadata.total_cost = stats.total_cost;
+            // Lane-scoped orchestrator signal must round-trip independently
+            // from total_input_tokens — that field is lane-blind and gets
+            // overwritten by a sub-agent's last request mid-delegation.
+            conv.metadata.last_orchestrator_input_tokens = stats.last_orchestrator_input_tokens();
             conv.metadata.lanes = stats
                 .lanes_sorted()
                 .into_iter()
@@ -3050,6 +3064,157 @@ mod tests {
         assert_eq!(
             state.context.current_usage, 2000,
             "AppState.context.current_usage must follow last_input_tokens"
+        );
+    }
+
+    /// Regression: the orchestrator-scoped context meter must survive a
+    /// save/load round-trip even when the *last* persisted request was a
+    /// sub-agent's.
+    ///
+    /// Today `SessionStats::total_input_tokens` is lane-blind — it stores
+    /// the input tokens of the last request on *any* lane — and
+    /// `StateManager::sync_to_conversation` snapshots that value into
+    /// `conv.metadata.total_input_tokens` on every persist. When the
+    /// orchestrator's last API response was small (4_000) and a subsequent
+    /// sub-agent's last API response was large (60_000), the metadata
+    /// records 60_000. On `/load`, `SessionStats::restore` seeds
+    /// `last_orchestrator_input_tokens = Some(total_input_tokens)` from
+    /// that lane-blind value, and `sync_stats_to_ui` copies it into
+    /// `AppState.context.current_usage`. Result: the status bar shows the
+    /// sub-agent's context size (60_000), not the orchestrator's (4_000),
+    /// until the orchestrator's next response arrives.
+    ///
+    /// Scenario: orchestrator turn → sub-agent turn → save → fresh
+    /// `StateManager` loads the same conversation → assert the meter
+    /// shows the orchestrator's last input, not the sub-agent's.
+    #[test]
+    fn orchestrator_context_meter_does_not_show_subagent_after_save_load_reload() {
+        use crate::storage::InMemoryStorage;
+        use crate::ui::app_state::MessageSource;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        // 1. Mint a fresh conversation so we have something to persist.
+        sm.create_conversation(
+            "orch-vs-sub".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
+
+        // 2. Orchestrator turn — this is what the meter must keep showing.
+        sm.add_request(&MessageSource::Human, 4_000, 200, 0.01);
+        // 3. Sub-agent turn afterwards — must not move the orchestrator signal.
+        sm.add_request(
+            &MessageSource::SubAgent {
+                role: "researcher".into(),
+            },
+            60_000,
+            400,
+            0.02,
+        );
+
+        // Pre-persist sanity: the orchestrator-scoped signal must be the
+        // orchestrator's last input (4_000), not the sub-agent's (60_000).
+        // This part already works today; it's the load-side bug under test.
+        assert_eq!(
+            sm.stats_arc()
+                .lock()
+                .unwrap()
+                .last_orchestrator_input_tokens(),
+            Some(4_000),
+            "sub-agent request must not move the orchestrator-scoped signal"
+        );
+
+        // 4. Persist the conversation (this snapshots stats into metadata).
+        sm.save_conversation();
+        let conv_id = sm.get_current_conversation_id().expect("convo id");
+
+        // 5. Fresh session loading the same conversation from storage.
+        let sm2 = StateManager::new_arc_with_storage(storage.clone());
+        sm2.load_conversation(conv_id).expect("load conversation");
+
+        // 6a. The context meter (status bar / web Session panel) must show
+        // the orchestrator's last input (4_000), not the sub-agent's 60_000.
+        // Today `sync_stats_to_ui` copies the lane-blind `last_orchestrator_input_tokens`
+        // (poisoned by `restore` reading `total_input_tokens`) into
+        // `context.current_usage` — this assertion is what fails RED.
+        let state = sm2.get_state();
+        assert_eq!(
+            state.context.current_usage, 4_000,
+            "context meter must show the orchestrator's last input (4_000) \
+             after save/load, not the sub-agent's 60_000 (got {})",
+            state.context.current_usage
+        );
+
+        // 6b. The SessionStats-level signal must also be the orchestrator's
+        // value, not poisoned by the lane-blind `total_input_tokens` snapshot.
+        let stats_arc = sm2.stats_arc();
+        let loaded = stats_arc.lock().unwrap();
+        assert_eq!(
+            loaded.last_orchestrator_input_tokens(),
+            Some(4_000),
+            "loaded SessionStats must seed last_orchestrator_input_tokens from \
+             the orchestrator lane, not from the lane-blind total_input_tokens \
+             (got {:?})",
+            loaded.last_orchestrator_input_tokens()
+        );
+    }
+
+    /// Back-compat pin for the orchestrator-scope fix: a
+    /// `ConversationMetadata` JSON written before the fix (no
+    /// `last_orchestrator_input_tokens` field) must (a) still deserialize,
+    /// and (b) the `restore` path must still seed the orchestrator signal
+    /// from `total_input_tokens` rather than losing it entirely. This test
+    /// passes both before and after the fix — its purpose is to keep the
+    /// fix implementer from over-correcting and leaving legacy files with
+    /// `last_orchestrator_input_tokens() == None` after load.
+    #[test]
+    fn conversation_metadata_without_orchestrator_field_falls_back_to_total_input_tokens() {
+        use crate::conversation::{Conversation, ConversationMetadata};
+        use crate::storage::InMemoryStorage;
+
+        let legacy = r#"{
+            "message_count": 1,
+            "total_input_tokens": 999,
+            "total_output_tokens": 50,
+            "total_api_calls": 1,
+            "total_cost": 0.01
+        }"#;
+
+        // (a) Back-compat deserialize: a JSON without the new field must
+        // parse cleanly (the fix must add `#[serde(default)]`).
+        let meta: ConversationMetadata = serde_json::from_str(legacy)
+            .expect("legacy metadata without orchestrator field must still deserialize");
+
+        // (b) Load-path back-compat: with the new field absent, restore
+        // must seed `last_orchestrator_input_tokens = Some(total_input_tokens)`
+        // (the old behaviour) so a legacy file's orchestrator signal isn't
+        // silently dropped to None.
+        let storage = Arc::new(InMemoryStorage::default());
+        let mut conv = Conversation::new(
+            "legacy".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
+        conv.metadata = meta;
+        let id = conv.id;
+        storage.save(&conv).expect("save legacy");
+
+        let sm2 = StateManager::new_arc_with_storage(storage.clone());
+        sm2.load_conversation(id).expect("load legacy");
+
+        let stats = sm2.stats_arc();
+        let stats = stats.lock().unwrap();
+        assert_eq!(
+            stats.last_orchestrator_input_tokens(),
+            Some(999),
+            "back-compat: when last_orchestrator_input_tokens is absent, restore \
+             must fall back to Some(total_input_tokens) so the orchestrator \
+             signal isn't lost (got {:?})",
+            stats.last_orchestrator_input_tokens()
         );
     }
 

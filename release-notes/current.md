@@ -4,4 +4,6 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Fix:** Orchestrator context meter in the web Session panel / TUI status bar now correctly survives save/load after delegations — it no longer shows a sub-agent's context size.
+
 
