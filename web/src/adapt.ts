@@ -53,7 +53,7 @@ export function adaptMessage(m: WireChatMessage): ChatMessage {
   // the display string the TUI renders, so we pass it through verbatim.
   return {
     role: ROLE_MAP[m.role] ?? "system",
-    content: m.content,
+    content: m.content ?? "",
     timestamp: toClock(m.timestamp),
     toolName: m.tool_name ?? undefined,
     fromBackground: m.source?.kind === "background",

@@ -2,6 +2,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
+import { memo } from "react";
 import type { ChatMessage, MessageRole } from "../types";
 
 // Per-role visual treatment. Mirrors the TUI's role glyphs/colours so the
@@ -70,7 +71,29 @@ function isMarkdown(role: MessageRole): boolean {
   );
 }
 
-export function Message({ message }: { message: ChatMessage }) {
+// `sameMessage` is the value comparator for the memoised `Message` and is
+// imported by `Message.test.ts` alongside the component itself, so it lives
+// here for test ergonomics. No component tree imports it directly, so Fast
+// Refresh's "non-component export in a component file" hazard is moot.
+// eslint-disable-next-line react-refresh/only-export-components
+export function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
+  return (
+    a.role === b.role &&
+    a.content === b.content &&
+    a.timestamp === b.timestamp &&
+    a.toolName === b.toolName &&
+    a.fromBackground === b.fromBackground &&
+    a.subAgentRole === b.subAgentRole
+  );
+}
+
+// Unexported renderer. Wrapped by `memo` below so that, with the value comparator
+// (`sameMessage`), re-renders are skipped when the adapted message hasn't
+// actually changed. Identity comparison alone wouldn't help: every websocket
+// frame is a fresh `JSON.parse`, and `adaptMessage` allocates a new object per
+// call at the render site, so the prop reference never survives a re-render —
+// we need the structural comparison.
+function MessageView({ message }: { message: ChatMessage }) {
   const meta = ROLE_META[message.role];
   return (
     <div className={`rounded-lg border px-3.5 py-2.5 ${meta.bubble}`}>
@@ -112,3 +135,5 @@ export function Message({ message }: { message: ChatMessage }) {
     </div>
   );
 }
+
+export const Message = memo(MessageView, (a, b) => sameMessage(a.message, b.message));

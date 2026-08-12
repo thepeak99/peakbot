@@ -8,9 +8,9 @@
 // body is a 288px rail, below sm it spans 94vw. Replaces the old static aside
 // + separate mobile hamburger drawer.
 
-import { useEffect, useState } from "react";
-import { Message } from "./components/Message";
-import { WelcomeBanner } from "./components/WelcomeBanner";
+import { useRef, useState } from "react";
+import { Transcript, type TranscriptHandle } from "./components/Transcript";
+import { EmptyTranscript } from "./components/EmptyTranscript";
 import { BashPanel } from "./components/BashPanel";
 import { Composer } from "./components/Composer";
 import { TopBar } from "./components/TopBar";
@@ -21,17 +21,15 @@ import { TodoPanel } from "./components/TodoPanel";
 import { BgPanel } from "./components/BgPanel";
 import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
-import { TranscriptNav } from "./components/TranscriptNav";
 import { useAgent } from "./useAgent";
-import { useTranscriptScroll } from "./useTranscriptScroll";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
+import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
 import type { ViewFilter } from "./types";
 import {
   adaptBashPanel,
   adaptBg,
   adaptContext,
-  adaptMessage,
   adaptStats,
   adaptWelcome,
   deriveSubAgentRoster,
@@ -65,21 +63,9 @@ export function App() {
   useFavicon(isRunning);
 
   // Follow the newest message, but only while the user is pinned to the bottom
-  // (see `useTranscriptScroll`); scrolled up to read history, they stay put and
-  // `TranscriptNav` offers the way back.
+  // — the transcript owns that now (see `Transcript` + `useTranscriptScroll`).
   const messageCount = state?.chat.messages.length ?? 0;
-  const {
-    sectionRef,
-    onScroll,
-    pinned,
-    unread,
-    showTop,
-    scrollToBottom,
-    scrollToTop,
-  } = useTranscriptScroll(messageCount);
-  useEffect(() => {
-    if (pinned) scrollToBottom();
-  }, [messageCount, isRunning, pinned, scrollToBottom]);
+  const transcriptRef = useRef<TranscriptHandle>(null);
 
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
@@ -124,6 +110,16 @@ export function App() {
   const visibleMessages = state
     ? filterMessagesByView(state.chat.messages, effectiveView)
     : [];
+
+  // Remount token for the transcript. Switching conversation or view, or a
+  // transcript that got shorter (truncation/compaction), invalidates every
+  // measured row height and every scroll position — remounting is the whole
+  // reset story: fresh scroll element, fresh virtualizer, fresh pin state.
+  const id = `${state?.conversation?.id ?? "none"}|${effectiveView}`;
+  const [epoch, setEpoch] = useState<EpochState>({ id, count: 0, epoch: 0 });
+  const next = nextEpoch(epoch, id, visibleMessages.length);
+  if (next !== epoch) setEpoch(next); // React's documented adjust-during-render
+  const resetKey = epochKey(next);
 
   const stats = state ? adaptStats(state) : null;
   // Scope the Session panel to the watched view (Global keeps grand totals).
@@ -249,58 +245,42 @@ export function App() {
 
       <div className="flex min-h-0 flex-1">
         <main className="flex min-w-0 flex-1 flex-col">
-          {/* The nav buttons float over the transcript, so they must live in a
-              positioned wrapper *outside* the scrolling <section> — absolute
-              inside it would scroll away with the content. */}
-          <div className="relative flex min-h-0 flex-1 flex-col">
-            <section
-              ref={sectionRef}
-              onScroll={onScroll}
-              className="min-h-0 flex-1 overflow-y-auto mr-12 px-4 py-4 sm:px-6 md:px-8"
-            >
-              <div className="mx-auto max-w-5xl space-y-3">
-                {welcome && messageCount === 0 && (
-                  <WelcomeBanner welcome={welcome} />
-                )}
-                {scopeLabel && (
-                  <div className="flex items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300">
-                    <span>
-                      👁 Watching <span className="font-medium">{scopeLabel}</span>
-                      <span className="ml-2 text-sky-500/70">
-                        {visibleMessages.length} message
-                        {visibleMessages.length === 1 ? "" : "s"}
-                      </span>
-                    </span>
-                    <button
-                      onClick={() => setView("global")}
-                      className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40"
-                    >
-                      Clear
-                    </button>
-                  </div>
-                )}
-                {scopeLabel && visibleMessages.length === 0 && (
-                  <p className="rounded-md border border-dashed border-zinc-800 px-3 py-6 text-center text-xs text-zinc-600">
-                    No messages from {scopeLabel} yet.
-                  </p>
-                )}
-                {visibleMessages.map((m, i) => (
-                  <Message key={i} message={adaptMessage(m)} />
-                ))}
+          {/* The scope banner is a static bar above the transcript: the
+              scrolling element's only child must be the virtualizer's sized
+              container, or the row offsets stop matching the scroll offset. */}
+          {scopeLabel && (
+            <div className="mr-12 px-4 pt-4 sm:px-6 md:px-8">
+              <div className="mx-auto flex max-w-5xl items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300">
+                <span>
+                  👁 Watching <span className="font-medium">{scopeLabel}</span>
+                  <span className="ml-2 text-sky-500/70">
+                    {visibleMessages.length} message
+                    {visibleMessages.length === 1 ? "" : "s"}
+                  </span>
+                </span>
+                <button
+                  onClick={() => setView("global")}
+                  className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40"
+                >
+                  Clear
+                </button>
               </div>
-            </section>
+            </div>
+          )}
 
-            {hasTranscript && (
-              <TranscriptNav
-                pinned={pinned}
-                unread={unread}
-                showTop={showTop}
-                onBottom={scrollToBottom}
-                onTop={scrollToTop}
-                drawerOpen={drawerOpen}
-              />
-            )}
-          </div>
+          {visibleMessages.length > 0 ? (
+            <Transcript
+              key={resetKey}
+              messages={visibleMessages}
+              drawerOpen={drawerOpen}
+              ref={transcriptRef}
+            />
+          ) : (
+            <EmptyTranscript
+              welcome={messageCount === 0 ? welcome : null}
+              scopeLabel={scopeLabel}
+            />
+          )}
 
           <Composer
             isRunning={isRunning}
@@ -309,7 +289,7 @@ export function App() {
             onSend={(text) => {
               // Sending always re-pins: you expect to see your own message.
               send({ type: "send_message", text });
-              scrollToBottom();
+              transcriptRef.current?.jumpToLatest();
             }}
             onStop={() => send({ type: "stop" })}
             watchingRole={scopeLabel}

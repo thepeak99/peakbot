@@ -20,7 +20,7 @@ export interface WireMessageSource {
 
 export interface WireChatMessage {
   role: WireRole;
-  content: string;
+  content?: string;
   timestamp: string; // ISO 8601
   tool_name?: string;
   tool_args?: string;
