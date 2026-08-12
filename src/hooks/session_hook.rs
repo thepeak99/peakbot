@@ -259,6 +259,13 @@ impl SessionStats {
         self.last_orchestrator_input_tokens
     }
 
+    /// Override the orchestrator-scoped reading from a persisted snapshot
+    /// (lane-aware metadata on disk) so /load can correct a lane-blind
+    /// `total_input_tokens` left over from a mid-delegation save.
+    pub fn restore_orchestrator_input_tokens(&mut self, v: u64) {
+        self.last_orchestrator_input_tokens = Some(v);
+    }
+
     /// Reset the "live context size" signal to 0 *without* touching cumulative
     /// `total_*` bookkeeping or the API-call counter.
     ///

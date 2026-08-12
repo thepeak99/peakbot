@@ -33,6 +33,12 @@ pub struct ConversationMetadata {
     /// them. Every field accumulates over the conversation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lanes: Vec<LaneMetadata>,
+    /// Orchestrator-lane input tokens of the last orchestrator request — kept
+    /// lane-scoped on disk so a sub-agent turn persisted mid-delegation can't
+    /// blind the context meter on /load. `None` for pre-fix files; the load
+    /// path falls back to `total_input_tokens` in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_orchestrator_input_tokens: Option<u64>,
 }
 
 /// One persisted per-lane stats bucket. Serializable mirror of the hooks'
@@ -60,6 +66,7 @@ impl Default for ConversationMetadata {
             total_api_calls: 0,
             total_cost: 0.0,
             lanes: Vec::new(),
+            last_orchestrator_input_tokens: None,
         }
     }
 }
