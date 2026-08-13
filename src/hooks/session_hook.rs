@@ -12,6 +12,7 @@ use rig_core::completion::message::AssistantContent;
 use rig_core::completion::{CompletionModel, CompletionResponse, message::Message};
 use rig_core::one_or_many::OneOrMany;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 
@@ -1044,6 +1045,15 @@ pub struct SessionHook {
     /// strip seam per design §3.3; defaults `false` so a hook that was
     /// never told about the knob cannot accidentally start capturing.
     preserve_reasoning: bool,
+    /// Pairing id of the in-flight sniffed call, stashed by
+    /// `on_completion_call` for `on_completion_response` to echo. `Arc`
+    /// because `SessionHook: Clone` — the agent runs on a clone of the hook
+    /// the builder returned, and both must see the same counter.
+    sniff_id: Arc<AtomicU64>,
+    /// Provider/model names for the sniff record. The hook is generic over
+    /// the model *type*, which carries no name, so the pair is stamped in at
+    /// agent-build time via [`SessionHook::with_wire_label`].
+    wire: Option<crate::sniff::WireLabel>,
 }
 
 impl SessionHook {
@@ -1056,6 +1066,8 @@ impl SessionHook {
             state_manager: None,
             sub_agent: None,
             preserve_reasoning: false,
+            sniff_id: Arc::new(AtomicU64::new(0)),
+            wire: None,
         }
     }
 
@@ -1071,6 +1083,8 @@ impl SessionHook {
             state_manager: None,
             sub_agent: None,
             preserve_reasoning: false,
+            sniff_id: Arc::new(AtomicU64::new(0)),
+            wire: None,
         }
     }
 
@@ -1136,6 +1150,8 @@ impl SessionHook {
                 state_manager: None,
                 sub_agent: None,
                 preserve_reasoning: false,
+                sniff_id: Arc::new(AtomicU64::new(0)),
+                wire: None,
             },
             receiver,
         )
@@ -1155,6 +1171,15 @@ impl SessionHook {
     /// capture seam will consult on the next prompt.
     pub fn preserve_reasoning(&self) -> bool {
         self.preserve_reasoning
+    }
+
+    /// Stamp this hook with the provider/model names the `PEAKBOT_SNIFF`
+    /// records carry. Builder-style; returns `self` for chaining. Called at
+    /// every agent-build site, because that is the only place where the model
+    /// *type* the hook is generic over has a name.
+    pub fn with_wire_label(mut self, provider: String, model: String) -> Self {
+        self.wire = Some(crate::sniff::WireLabel { provider, model });
+        self
     }
 }
 
@@ -1295,6 +1320,20 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
     /// `last_input_tokens`), not here. See `mid-compaction.md` for the full
     /// design.
     async fn on_completion_call(&self, prompt: &Message, history: &[Message]) -> HookAction {
+        // Sniff first: the `req` line must be on disk before the call leaves,
+        // so a hung or killed request still leaves its input behind.
+        if crate::sniff::enabled() {
+            let id = crate::sniff::next_id();
+            self.sniff_id.store(id, Ordering::Relaxed);
+            crate::sniff::write_record(&crate::sniff::request_record(
+                id,
+                self.source.lane_label(),
+                self.wire.clone(),
+                prompt,
+                history,
+            ));
+        }
+
         if let Some(ref sender) = self.event_sender {
             let event = AgentEvent::CompletionRequest {
                 message_count: history.len() + 1,
@@ -1350,6 +1389,21 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
     ) -> HookAction {
         let usage = &response.usage;
         let input_tokens = input_context_tokens(usage);
+
+        // Log the provider-native `raw` next to rig's normalised `choice`:
+        // a thinking block present in one and missing from the other
+        // localises rig-mapping loss in a single glance (design §1).
+        if crate::sniff::enabled() {
+            let usage_json = serde_json::to_value(usage).unwrap_or(serde_json::Value::Null);
+            crate::sniff::write_record(&crate::sniff::response_record(
+                self.sniff_id.load(Ordering::Relaxed),
+                self.source.lane_label(),
+                self.wire.clone(),
+                &response.raw_response,
+                &response.choice,
+                &usage_json,
+            ));
+        }
 
         // Update the session stats with this request's usage
         // This is critical for ContextManager to track actual token counts

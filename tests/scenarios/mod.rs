@@ -12,6 +12,7 @@ mod context_tests;
 mod cross_agent_bg_visibility_tests;
 mod e2e_tests;
 mod event_tests;
+mod http_sniff;
 mod message_roundtrip;
 mod no_set_current_dir;
 mod persistence_tests;

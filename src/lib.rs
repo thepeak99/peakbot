@@ -27,6 +27,7 @@ pub mod pty_runner;
 pub mod reasoning;
 pub mod session;
 pub mod skills;
+pub mod sniff;
 pub mod state;
 pub mod storage;
 pub mod test_runner;
