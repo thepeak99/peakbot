@@ -88,4 +88,45 @@ describe("estimateRowHeight", () => {
     };
     expect(estimateRowHeight(bare)).toBe(MIN);
   });
+
+  // (f) Thinking blocks (Anthropic extended thinking, only on the wire when
+  // `display_reasoning` is on) must grow the estimate above a content-only
+  // peer. Otherwise expanding an assistant's thinking would punch a hole in
+  // the end-anchored virtualizer until measureElement self-corrects.
+  it("grows the estimate when thinking blocks are present", () => {
+    const withoutThinking = estimateRowHeight(msg("a".repeat(200)));
+    const withThinking = estimateRowHeight({
+      ...msg("a".repeat(200)),
+      thinking: [{ text: "x".repeat(2000) }],
+    });
+    expect(withThinking).toBeGreaterThan(withoutThinking);
+  });
+
+  // (f') Thinking absent and content empty must still produce MIN — the
+  // existing (e') invariant cannot be broken by adding thinking awareness.
+  it("returns MIN for an empty message even with an empty thinking array", () => {
+    const emptyThinking: WireChatMessage = {
+      role: "agent",
+      content: "",
+      timestamp: "2026-01-01T00:00:00Z",
+      thinking: [],
+    };
+    expect(estimateRowHeight(emptyThinking)).toBe(MIN);
+  });
+
+  // (f'') The thinking path must stay O(1) and must not throw on a malformed
+  // entry. The wire serializer guarantees only `{ text: string }` survives,
+  // but a custom client could send anything — defensiveness is cheap.
+  it("does not throw when a thinking block is missing the text field", () => {
+    const weird: WireChatMessage = {
+      role: "agent",
+      content: "",
+      timestamp: "2026-01-01T00:00:00Z",
+      // Cast away the wire-type literal — this is a robustness test for
+      // malformed input, not a happy-path fixture.
+      thinking: [{} as { text: string }],
+    };
+    expect(() => estimateRowHeight(weird)).not.toThrow();
+    expect(estimateRowHeight(weird)).toBeGreaterThanOrEqual(MIN);
+  });
 });

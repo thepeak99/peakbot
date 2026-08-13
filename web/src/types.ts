@@ -20,6 +20,11 @@ export interface ChatMessage {
   /** sub-agent role, when this turn came from a delegated sub-agent
    * (mirrors MessageSource::SubAgent) */
   subAgentRole?: string;
+  /** Anthropic thinking blocks for an assistant turn, in order. Populated only
+   * when the server-side `display_reasoning` gate is open; otherwise absent so
+   * the renderer emits nothing and users without the opt-in see no change.
+   * Always undefined for non-assistant messages. */
+  thinking?: string[];
 }
 
 // Which agent's view the UI is scoped to (chat/todo/stats). "global" = all
