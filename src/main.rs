@@ -445,6 +445,10 @@ async fn main() -> Result<()> {
         subscriber.init();
     }
 
+    // Arm the `PEAKBOT_SNIFF` debug log before any client exists, so no LLM
+    // call can slip past it. Off unless the env var names a path.
+    peakbot::sniff::init_from_env();
+
     // ── Shared setup ──────────────────────────────────────────────
 
     // Load configuration with metadata about what was found
