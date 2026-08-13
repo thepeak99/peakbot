@@ -28,7 +28,9 @@
 //!   - §9.8 res_record_keeps_raw_and_choice_separate                  → `res_record_keeps_raw_and_choice_separate`
 //!   - §9.9 init_then_two_records_produces_two_parseable_jsonl_lines  → `tests/sniff_file.rs::init_then_two_records_produces_two_parseable_jsonl_lines`
 //!   - §9.10 harness path produces req+res                            → `harness_drive_emits_req_and_res_lines_via_session_hook`
-//!   - "env unset → no-op" (user task, doc §4)                        → `enabled_is_false_when_init_was_never_called`
+//!   - "env unset → no-op" (user task, doc §4)                        → `tests/sniff_file.rs::enabled_is_false_when_init_was_never_called`
+//!     (moved there: the harness test below arms the process-global sink,
+//!     and only that binary serialises + disarms around every sink test)
 //!   - "id pairing across two fake lanes" (user task)                 → `ids_pair_across_two_fake_lanes`
 
 #![cfg(test)]
@@ -433,41 +435,6 @@ fn res_record_keeps_raw_and_choice_separate() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// File-sink state (doc §4, §9.10)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// "env unset → no file written / no-op" (doc §4). Before any test in this
-/// process has called `init`, `enabled()` must return false and
-/// `write_record` must be a no-op (no panic, no file created, no
-/// side-effect).
-///
-/// This is the only file-sink-state test in this binary: per the doc §9
-/// trap, the `OnceLock` is process-global and stays set once armed, so
-/// any test that calls `init` poisons this one. The remaining file-sink
-/// tests live in `tests/sniff_file.rs`, which is its own clean process.
-#[test]
-fn enabled_is_false_when_init_was_never_called() {
-    // We do NOT call sniff::init() in this test. Other tests in the
-    // integration binary may have done so via the harness test below;
-    // if so, this test is structurally RED because the OnceLock is
-    // already set — which is exactly the trap the design doc names.
-    // The harness test that calls init() is annotated to keep that
-    // expectation explicit.
-    //
-    // The intent: enabled() is the gate, and a process that has never
-    // armed the sniffer must report disabled.
-    assert!(
-        !sniff::enabled(),
-        "sniff::enabled() must be false when no path has been init'd in this process"
-    );
-
-    // write_record must be a no-op (no panic) when disabled.
-    let v: Value = serde_json::json!({"would_have_written": true});
-    sniff::write_record(&v);
-    // Nothing to assert beyond "didn't panic".
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Harness path (doc §9.10)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -503,9 +470,11 @@ async fn harness_drive_emits_req_and_res_lines_via_session_hook() {
     sniff::init(&path);
     assert!(sniff::enabled(), "init must enable the sniffer");
 
-    let (hook, _rx) = SessionHook::with_channel()
-        // RED until `with_wire_label` exists on SessionHook.
-        .with_wire_label("anthropic".to_string(), "claude-sonnet-4-5".to_string());
+    // `with_channel()` returns a tuple, and a tuple can carry no inherent
+    // method (nor a trait one without an import), so the builder lives on
+    // `SessionHook` itself, next to `with_source`/`with_preserve_reasoning`.
+    let (hook, _rx) = SessionHook::with_channel();
+    let hook = hook.with_wire_label("anthropic".to_string(), "claude-sonnet-4-5".to_string());
 
     let prompt = Message::user("hello");
     let history: Vec<Message> = vec![Message::user("prev turn")];
@@ -520,6 +489,8 @@ async fn harness_drive_emits_req_and_res_lines_via_session_hook() {
     // We construct it by driving the mock once, so the response type is
     // exactly what `on_completion_response` would see at runtime.
     let mock = MockCompletionModel::new();
+    // The mock replies from a queue; an empty queue is a `ProviderError`.
+    mock.add_response(peakbot::mock::MockResponse::text("hi"));
     let request = MockCompletionModel::make(&(), "claude-sonnet-4-5")
         .completion_request("test")
         .build();
@@ -568,7 +539,8 @@ async fn harness_drive_emits_req_and_res_lines_via_session_hook() {
     // A sub-agent hook uses a different lane label — make sure the
     // lane propagates through, since lane labels are the only thing the
     // reader has besides the id.
-    let (sub_hook, _sub_rx) = SessionHook::with_channel()
+    let (sub_hook, _sub_rx) = SessionHook::with_channel();
+    let sub_hook = sub_hook
         .with_wire_label("anthropic".to_string(), "claude-sonnet-4-5".to_string())
         .with_source(MessageSource::SubAgent {
             role: "reviewer".to_string(),

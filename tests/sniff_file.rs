@@ -36,6 +36,39 @@ use rig_core::completion::message::{AssistantContent, Message};
 use rig_core::one_or_many::OneOrMany;
 use serde_json::Value;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Isolation for the process-global sink (doc §9 "trap")
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The sink is ONE process-global slot, but each test below arms its own path,
+// so two of them running concurrently steal each other's lines (and the
+// "never armed" assertion depends on running first). Both problems die with
+// one lock: every test that touches the global takes `exclusive()`, which
+// serialises them AND disarms the sniffer on drop — including on panic — so
+// each test starts from the disabled state the binary boots in.
+//
+// This is isolation scaffolding only: no assertion is relaxed by it.
+
+static SINK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct Exclusive(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        // Disarm through the production API: `init_from_env` with no path
+        // is exactly the "off" edge (pinned by
+        // `init_from_env_unset_keeps_sniffer_disabled`).
+        // SAFETY: the guard we hold is what keeps other tests off this env var.
+        unsafe { std::env::remove_var("PEAKBOT_SNIFF") };
+        sniff::init_from_env();
+    }
+}
+
+fn exclusive() -> Exclusive {
+    // Poisoning just means a previous test failed; the lock still serialises.
+    Exclusive(SINK_GUARD.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// "env unset → no-op" — the simplest gate contract. Before any test in
 /// THIS binary has called `init`, the sniffer must report disabled.
 ///
@@ -48,6 +81,7 @@ use serde_json::Value;
 /// reviewer must use when running this binary.
 #[test]
 fn enabled_is_false_until_init_is_called() {
+    let _guard = exclusive();
     // We can't assert this AFTER another test has armed the sink — see
     // the binary header. Run with `--test-threads=1` or trust that this
     // test runs in isolation when the implementation isn't present.
@@ -62,6 +96,7 @@ fn enabled_is_false_until_init_is_called() {
 /// `dir` values.
 #[test]
 fn init_then_two_records_produces_two_parseable_jsonl_lines() {
+    let _guard = exclusive();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("sniff.jsonl");
 
@@ -109,6 +144,7 @@ fn init_then_two_records_produces_two_parseable_jsonl_lines() {
 /// defensively `remove_var` before calling `init_from_env`.
 #[test]
 fn init_from_env_unset_keeps_sniffer_disabled() {
+    let _guard = exclusive();
     // Remove first to guarantee the test runs against an unset env.
     // SAFETY: no other thread reads this env var inside this process.
     unsafe { std::env::remove_var("PEAKBOT_SNIFF") };
@@ -125,6 +161,7 @@ fn init_from_env_unset_keeps_sniffer_disabled() {
 /// values, no default directory.
 #[test]
 fn init_from_env_reads_peekbot_sniff_env() {
+    let _guard = exclusive();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("from_env.jsonl");
 
@@ -142,9 +179,6 @@ fn init_from_env_reads_peekbot_sniff_env() {
     // create it.
     let prompt = Message::user("hi");
     let history: Vec<Message> = vec![];
-    let raw = serde_json::json!({ "id": "msg_x" });
-    let choice = OneOrMany::one(AssistantContent::text("ok"));
-    let usage = serde_json::json!({"input_tokens":1,"output_tokens":1});
     let req = sniff::request_record(sniff::next_id(), "orchestrator", None, &prompt, &history);
     sniff::write_record(&req);
 
@@ -163,6 +197,7 @@ fn init_from_env_reads_peekbot_sniff_env() {
 /// we assert on the post-condition: `enabled() == false`.
 #[test]
 fn init_with_unopenable_path_warns_and_continues_disabled() {
+    let _guard = exclusive();
     // A path inside a non-existent directory is the cheapest way to
     // guarantee `create` fails on Unix. The directory does not exist;
     // opening `O_CREAT` inside it fails with ENOENT.
@@ -183,6 +218,7 @@ fn init_with_unopenable_path_warns_and_continues_disabled() {
 #[cfg(unix)]
 #[test]
 fn init_creates_file_with_mode_0600() {
+    let _guard = exclusive();
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -211,6 +247,7 @@ fn init_creates_file_with_mode_0600() {
 /// res line could land before the req line on disk.
 #[test]
 fn request_and_response_lines_emit_in_call_order() {
+    let _guard = exclusive();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("order.jsonl");
 
@@ -258,6 +295,7 @@ fn request_and_response_lines_emit_in_call_order() {
 #[cfg(unix)]
 #[test]
 fn write_failure_after_successful_open_warns_once_does_not_panic() {
+    let _guard = exclusive();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("gone.jsonl");
 
@@ -305,4 +343,34 @@ fn write_failure_after_successful_open_warns_once_does_not_panic() {
         sniff::write_record(&res);
     }
     // If we got here, the implementation did not panic on write failure.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Moved here from `tests/scenarios/http_sniff.rs` — same contract, but that
+// binary's harness test arms the sink and nothing there disarms it, so the
+// assertion was order-dependent. Here it runs under `exclusive()` like every
+// other sink test. Assertions unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// "env unset → no file written / no-op" (doc §4). Before any test in this
+/// process has called `init`, `enabled()` must return false and
+/// `write_record` must be a no-op (no panic, no file created, no
+/// side-effect).
+///
+/// This test was written in the integration binary, where the harness test
+/// arms the sink; it lives here instead so `exclusive()` guarantees the
+/// never-armed state it asserts on. The intent is unchanged: `enabled()` is
+/// the gate, and a process with no path armed must report disabled.
+#[test]
+fn enabled_is_false_when_init_was_never_called() {
+    let _guard = exclusive();
+    assert!(
+        !sniff::enabled(),
+        "sniff::enabled() must be false when no path has been init'd in this process"
+    );
+
+    // write_record must be a no-op (no panic) when disabled.
+    let v: Value = serde_json::json!({"would_have_written": true});
+    sniff::write_record(&v);
+    // Nothing to assert beyond "didn't panic".
 }

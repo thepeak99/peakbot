@@ -684,6 +684,19 @@ fn budget_all(tools: Vec<Box<dyn ToolDyn>>, cfg: &TimeoutsConfig) -> Vec<Box<dyn
         .collect()
 }
 
+/// Provider name + model for a sub-agent's sniff records. The five arms are
+/// the same mapping `Config::provider_name`/`Config::model` make, but a
+/// sub-agent is handed a bare `ProviderConfig`, not the whole `Config`.
+fn wire_label_of(config: &ProviderConfig) -> (String, String) {
+    match config {
+        ProviderConfig::OpenRouter(c) => ("openrouter".to_string(), c.model.clone()),
+        ProviderConfig::OpenAI(c) => ("openai".to_string(), c.model.clone()),
+        ProviderConfig::Anthropic(c) => ("anthropic".to_string(), c.model.clone()),
+        ProviderConfig::LlamaCpp(c) => ("llamacpp".to_string(), c.model.clone()),
+        ProviderConfig::Ollama(c) => ("ollama".to_string(), c.model.clone()),
+    }
+}
+
 /// Gate (`thought`) then budget (wall clock) a set of already-boxed MCP tools.
 /// The budget is outermost so it also covers the gate's own JSON work and so
 /// the timeout string is never mutated by the gate's nudge.
@@ -743,7 +756,8 @@ fn create_openrouter_agent(
     // Create session hook with stats tracking + compaction gate
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(Some(sender.clone()), session_stats)
-        .with_state_manager(&state_manager);
+        .with_state_manager(&state_manager)
+        .with_wire_label("openrouter".to_string(), model.clone());
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -844,7 +858,8 @@ fn create_anthropic_agent(
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(Some(sender.clone()), session_stats)
-        .with_state_manager(&state_manager);
+        .with_state_manager(&state_manager)
+        .with_wire_label("anthropic".to_string(), model.clone());
 
     let completion_model = client.completion_model(&model);
     // Build the model explicitly so prompt caching can be toggled — `client.agent()`
@@ -1059,7 +1074,8 @@ fn create_openai_agent(
     // Create session hook with stats tracking + compaction gate
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(Some(sender.clone()), session_stats)
-        .with_state_manager(&state_manager);
+        .with_state_manager(&state_manager)
+        .with_wire_label("openai".to_string(), model.clone());
 
     // Build agent with system prompt, hook, and built-in tools
     let agent_builder = client
@@ -1159,7 +1175,8 @@ fn create_llamacpp_agent(
     // Create session hook with stats tracking + compaction gate
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(Some(sender.clone()), session_stats)
-        .with_state_manager(&state_manager);
+        .with_state_manager(&state_manager)
+        .with_wire_label("llamacpp".to_string(), model.clone());
 
     // Build agent with system prompt, hook, and built-in tools
     let mut agent_builder = client
@@ -1244,7 +1261,8 @@ pub fn create_mock_agent(
     let session_stats = state_manager.stats_arc();
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let hook = SessionHook::with_context_tracking(Some(sender), session_stats)
-        .with_state_manager(&state_manager);
+        .with_state_manager(&state_manager)
+        .with_wire_label("mock".to_string(), "mock-model".to_string());
 
     // Build agent with mock model, session hook, and built-in tools
     let agent_builder = AgentBuilder::new(mock_model)
@@ -1333,10 +1351,12 @@ pub(crate) fn build_sub_agent(
 ) -> Result<(DynAgent, Arc<SessionHook>)> {
     // Events-only lane-tagged hook. No compaction gate (fresh context) — the
     // sub-agent gate terminates instead of compacting.
+    let (wire_provider, wire_model) = wire_label_of(config);
     let hook = SessionHook::new(sink)
         .with_source(crate::ui::app_state::MessageSource::SubAgent {
             role: role.to_string(),
         })
+        .with_wire_label(wire_provider, wire_model)
         .with_sub_agent_gate(context_budget);
 
     // A sub-agent never sees `delegate` (no nested delegation). It reaches the
