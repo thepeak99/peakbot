@@ -1518,11 +1518,13 @@ impl StateManager {
                         call_id,
                         compacted,
                         source,
+                        thinking,
                         timestamp,
                     } => {
                         let mut m = ChatMessage::tool_call(tool_name, arguments, call_id.clone());
                         m.compacted = *compacted;
                         m.source = source.clone();
+                        m.thinking = thinking.clone();
                         m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
@@ -1638,6 +1640,7 @@ impl StateManager {
                             call_id: msg.call_id.clone(),
                             compacted: msg.compacted,
                             source: msg.source.clone(),
+                            thinking: msg.thinking.clone(),
                             timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                         })
                     }
@@ -4170,6 +4173,7 @@ mod tests {
             call_id: Some("call-1".into()),
             compacted: false,
             source: MessageSource::Human,
+            thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
         });
         conv.messages.push(Message::ToolCall {
@@ -4180,6 +4184,7 @@ mod tests {
             source: MessageSource::SubAgent {
                 role: "researcher".into(),
             },
+            thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
         });
         conv.messages.push(Message::ToolResult {
@@ -4326,6 +4331,7 @@ mod tests {
             call_id: Some("call-9".into()),
             compacted: false,
             source: MessageSource::Human,
+            thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
         });
 

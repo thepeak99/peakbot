@@ -66,14 +66,12 @@ const THINKING_TEXT: &str = "ROUNDTRIP_DO_NOT_LEAK_THINKING_77a1";
 /// text. Mirrors the construction in `reasoning_preservation.rs`
 /// (around line 800) but adds `MockCompletionModel`/`MockModelResponse`
 /// imports for the hook's `PromptHook` turbofish.
-fn thinking_response(
-) -> rig_core::completion::CompletionResponse<peakbot::mock::completion_model::MockModelResponse>
-{
+fn thinking_response()
+-> rig_core::completion::CompletionResponse<peakbot::mock::completion_model::MockModelResponse> {
     use rig_core::completion::Usage as RigUsage;
     use rig_core::completion::message::Text as RigText;
 
-    let reasoning =
-        Reasoning::new_with_signature(THINKING_TEXT, Some(FAKE_SIGNATURE.to_string()));
+    let reasoning = Reasoning::new_with_signature(THINKING_TEXT, Some(FAKE_SIGNATURE.to_string()));
     let choice = OneOrMany::one(AssistantContent::Reasoning(reasoning));
     // Some completions return prose alongside reasoning — include a Text
     // block to ensure the staging race is exercised exactly the way the
@@ -148,7 +146,9 @@ async fn hook_stages_thinking_synchronously_for_next_assistant() {
         .messages
         .iter()
         .find(|m| {
-            m.role == MessageRole::Agent && m.source.is_orchestrator_lane() && !m.thinking.is_empty()
+            m.role == MessageRole::Agent
+                && m.source.is_orchestrator_lane()
+                && !m.thinking.is_empty()
         })
         .expect(
             "the orchestrator assistant row must carry the thinking block the hook staged; \
@@ -382,7 +382,8 @@ fn tool_call_thinking_survives_conversation_roundtrip() {
         .save(&fresh_conv)
         .expect("seed InMemoryStorage with the JSON-derived Conversation");
     let sm2 = Arc::new(StateManager::new_arc_with_storage(fresh_storage));
-    sm2.load_conversation(fresh_conv.id).expect("load into fresh SM");
+    sm2.load_conversation(fresh_conv.id)
+        .expect("load into fresh SM");
 
     let restored_state = sm2.get_state();
     let restored_tool_row = restored_state
