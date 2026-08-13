@@ -20,6 +20,7 @@ mod pipeline_tests;
 mod powershell_tests;
 mod queued_input_tests;
 mod reasoning_preservation;
+mod reasoning_persistence;
 mod state_only_in_outbound;
 mod stats_tests;
 mod stop_tests;
