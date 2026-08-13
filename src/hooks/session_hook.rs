@@ -1150,6 +1150,12 @@ impl SessionHook {
         self.preserve_reasoning = preserve;
         self
     }
+
+    /// Observation seam for the `preserve_reasoning` knob — the value the
+    /// capture seam will consult on the next prompt.
+    pub fn preserve_reasoning(&self) -> bool {
+        self.preserve_reasoning
+    }
 }
 
 /// Provider-agnostic input token count. Under caching, `input_tokens` is

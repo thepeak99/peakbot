@@ -37,7 +37,7 @@ use rig_core::providers::ollama;
 use rig_core::providers::openai;
 use rig_core::providers::openrouter;
 use rig_core::tool::ToolDyn;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Provider info - metadata about the current provider
@@ -796,6 +796,22 @@ fn create_openrouter_agent(
     Ok((agent, info, receiver, hook))
 }
 
+/// Build the Anthropic `SessionHook` with `preserve_reasoning` already
+/// applied. `AgentBuilder::hook` stores the value by `Clone`, so any
+/// configuration on the returned hook must happen *before* it reaches the
+/// rig agent — patching it afterwards leaves the agent's embedded hook on
+/// `preserve_reasoning: false` forever.
+pub fn build_anthropic_session_hook(
+    sender: tokio::sync::mpsc::UnboundedSender<crate::hooks::events::SourcedEvent>,
+    session_stats: Arc<Mutex<crate::hooks::SessionStats>>,
+    state_manager: &Arc<StateManager>,
+    preserve_reasoning: bool,
+) -> SessionHook {
+    SessionHook::with_context_tracking(Some(sender), session_stats)
+        .with_state_manager(state_manager)
+        .with_preserve_reasoning(preserve_reasoning)
+}
+
 /// Create Anthropic agent and info. `base_url` fronts hosted Claude or a
 /// local Anthropic-compatible server (e.g. llama-server `/v1/messages`);
 /// the tool-result channel carries images, hence `view_image` is here.
@@ -842,9 +858,18 @@ fn create_anthropic_agent(
     // One decision feeds both `[img:…]` acceptance and `view_image` registration.
     let supports_vision = resolve_supports_vision(config.vision, "anthropic", &model);
 
+    // Resolve `preserve_reasoning` before the rig agent captures the hook
+    // by clone — `with_preserve_reasoning` on a hook already handed to
+    // `.hook(...)` is a no-op for the agent's embedded copy.
+    let preserve_reasoning = resolve_preserve_reasoning(config.preserve_reasoning, None);
+
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let hook = SessionHook::with_context_tracking(Some(sender.clone()), session_stats)
-        .with_state_manager(&state_manager);
+    let hook = build_anthropic_session_hook(
+        sender.clone(),
+        session_stats,
+        &state_manager,
+        preserve_reasoning,
+    );
 
     let completion_model = client.completion_model(&model);
     // Build the model explicitly so prompt caching can be toggled — `client.agent()`
@@ -897,16 +922,12 @@ fn create_anthropic_agent(
         supports_pricing: false,
         supports_vision,
         // `build_provider_config` already resolved the model vs provider
-        // overrides into `AnthropicConfig.preserve_reasoning`. Re-run the
-        // helper here so the final ProviderInfo value is never produced by a
-        // second, divergent default expression.
-        preserve_reasoning: resolve_preserve_reasoning(config.preserve_reasoning, None),
+        // overrides into `AnthropicConfig.preserve_reasoning`. Reuse the
+        // local computed above so the value that drives the hook and the
+        // value on `ProviderInfo` cannot diverge.
+        preserve_reasoning,
         display_reasoning: resolve_display_reasoning(config.display_reasoning, None),
     };
-
-    // Hand the resolved bool to the SessionHook so the capture seam honours
-    // the knob from the first prompt.
-    let hook = hook.with_preserve_reasoning(info.preserve_reasoning);
 
     Ok((agent, info, receiver, hook))
 }

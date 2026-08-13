@@ -59,7 +59,8 @@ pub use pipeline::{
 #[cfg(feature = "mock")]
 pub use providers::create_mock_agent;
 pub use providers::{
-    CompactionModel, DynAgent, ProviderInfo, create_compaction_model, create_provider,
+    CompactionModel, DynAgent, ProviderInfo, build_anthropic_session_hook, create_compaction_model,
+    create_provider,
 };
 
 use rig_core::completion::{Message, PromptError};
