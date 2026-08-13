@@ -1416,20 +1416,34 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             );
         }
 
+        // Extract content and reasoning from response using rig's API.
+        let parts = extract_content_from_response(&response.choice);
+
+        // Strip seam (design §3.3): knob-off means the blocks never
+        // exist for us — not stored, not persisted, not rendered, not
+        // replayed. Anywhere later would leave signatures on disk that
+        // a knob flip could silently resurrect.
+        let thinking = if self.preserve_reasoning {
+            parts.thinking
+        } else {
+            Vec::new()
+        };
+
+        // Stage here, not from the event-processor task: rig awaits this hook
+        // inline and `prompt_with_history` only returns afterwards, so the main
+        // loop's `add_assistant_message` is guaranteed to see the blocks. The
+        // spawned task had no such happens-before edge and lost text-turn
+        // thinking. The gate is the lane predicate — sub-agent hooks DO carry a
+        // StateManager (`build_sub_agent`), so "no manager" would prove nothing.
+        if !thinking.is_empty()
+            && self.source.is_orchestrator_lane()
+            && let Some(weak) = self.state_manager.as_ref()
+            && let Some(sm) = weak.upgrade()
+        {
+            sm.stage_thinking_for_next_assistant(thinking.clone());
+        }
+
         if let Some(ref sender) = self.event_sender {
-            // Extract content and reasoning from response using rig's API.
-            let parts = extract_content_from_response(&response.choice);
-
-            // Strip seam (design §3.3): knob-off means the blocks never
-            // exist for us — not stored, not persisted, not rendered, not
-            // replayed. Anywhere later would leave signatures on disk that
-            // a knob flip could silently resurrect.
-            let thinking = if self.preserve_reasoning {
-                parts.thinking
-            } else {
-                Vec::new()
-            };
-
             // Emit event with per-request token counts; cost is computed in CostHandler.
             let event = AgentEvent::CompletionResponse {
                 content: parts.text,
