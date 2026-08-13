@@ -541,6 +541,8 @@ mod tests {
                 prompt_caching: None,
                 vision: None,
                 context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
             }],
         };
         let model_registry =

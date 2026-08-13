@@ -204,6 +204,8 @@ fn two_registries_with_shared_reviewer() -> (SubAgentRegistry, SubAgentRegistry)
                 prompt_caching: None,
                 vision: None,
                 context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
             },
             ModelEntry {
                 name: "anthropic/claude-3.7-sonnet".into(),
@@ -214,6 +216,8 @@ fn two_registries_with_shared_reviewer() -> (SubAgentRegistry, SubAgentRegistry)
                 prompt_caching: None,
                 vision: None,
                 context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
             },
         ],
     };

@@ -396,7 +396,7 @@ mod tests {
     use super::*;
     use rig_core::OneOrMany;
     use rig_core::completion::CompletionError;
-    use rig_core::completion::message::{Text, ToolCall, ToolFunction, ToolResult};
+    use rig_core::completion::message::{Reasoning, Text, ToolCall, ToolFunction, ToolResult};
     use rig_core::tool::ToolSetError;
 
     fn user_text(t: &str) -> Message {
@@ -953,6 +953,56 @@ mod tests {
         assert!(
             out.ends_with(FAILED_GUIDANCE),
             "rendered handoff must end with FAILED_GUIDANCE so the orchestrator knows how to react; got:\n{out}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Contract 7b — see design §8.7.
+    //
+    // The handoff summariser (the LLM called to compress a sub-agent's
+    // transcript when the delegation fails) must NEVER see thinking text.
+    // The current `render_transcript` already drops `AssistantContent::
+    // Reasoning(_)` and `Image(_)` (handoff.rs:213) — this test pins that
+    // behaviour with a sentinel so a future "let's give the summariser
+    // more context" refactor cannot quietly break it.
+    //
+    // RED-MODE: PASS-IMMEDIATELY / REGRESSION-LOCK. The test compiles
+    // today (the existing `render_transcript` is unchanged) and asserts
+    // the existing correct behaviour. After the design lands, it
+    // continues to pass. The contract is "don't break this".
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Render an assistant reasoning block with a sentinel; the rendered
+    /// transcript must not contain it. Regression lock for the existing
+    /// `Reasoning(_)` skip arm in `render_transcript`.
+    #[test]
+    fn render_transcript_drops_assistant_reasoning() {
+        const SENTINEL: &str = "DO_NOT_LEAK_THINKING_SENTINEL_77a1";
+
+        let history = vec![
+            user_text("delegate task"),
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::Reasoning(
+                    Reasoning::new_with_signature(SENTINEL, Some("sig-handoff".to_string())),
+                )),
+            },
+            assistant_text("actual sub-agent reply"),
+        ];
+
+        let out = render_transcript(&history);
+        assert!(
+            !out.contains(SENTINEL),
+            "thinking text must NOT appear in the handoff transcript — leak found:\n{out}"
+        );
+        assert!(
+            !out.contains("sig-handoff"),
+            "thinking signature must NOT appear in the handoff transcript — leak found:\n{out}"
+        );
+        // The user-visible reply still flows through.
+        assert!(
+            out.contains("Assistant: actual sub-agent reply"),
+            "the prose reply must still appear in the rendered handoff; got:\n{out}"
         );
     }
 }

@@ -415,6 +415,8 @@ mod tests {
                 prompt_caching: None,
                 vision: None,
                 context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
             }],
         };
         Arc::new(
@@ -653,6 +655,8 @@ pipelines:
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
                 ModelEntry {
                     name: "google/gemini-2.0-flash-001".into(),
@@ -663,6 +667,8 @@ pipelines:
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
             ],
         };

@@ -149,6 +149,19 @@ pub struct AnthropicConfig {
     /// provider; also gates `view_image` registration). `Some(b)` forces.
     #[serde(default)]
     pub vision: Option<bool>,
+    /// Provider-wide override for Anthropic thinking-block capture.
+    /// `None` (default) defers to the per-model entry; `Some(b)` forces —
+    /// useful when a deployment 400s on thinking blocks and you want to
+    /// kill capture for every model on this provider without editing each
+    /// model line. Resolved once at agent-build time by
+    /// [`crate::providers::resolve_preserve_reasoning`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve_reasoning: Option<bool>,
+    /// Provider-wide override for the web transcript's thinking-block
+    /// display. Same pattern as `preserve_reasoning`: `None` defers to
+    /// the model, `Some(b)` forces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_reasoning: Option<bool>,
 }
 
 /// Configuration for LlamaCpp provider (uses OpenAI-compatible completions API)
@@ -802,6 +815,8 @@ impl Config {
                     prompt_caching: caching,
                     vision,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 }],
             };
             return ModelRegistry::build(
@@ -2266,6 +2281,8 @@ provider:
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 }],
             }],
             default_model: Some("sonnet".into()),
@@ -2296,6 +2313,8 @@ provider:
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 }],
             }],
             default_model: Some("ghost".into()), // intentionally wrong
@@ -2342,6 +2361,8 @@ provider:
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 }],
             }],
             default_model: Some("sonnet".into()),
@@ -3734,5 +3755,58 @@ pipelines:
             "empty per-repo pipelines must preserve master pipelines"
         );
         assert_eq!(master.pipelines[0].name, "alpha");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Reasoning-preservation knobs on `AnthropicConfig` (design §2.2 / §8 — T2).
+    //
+    // The provider-level `preserve_reasoning: Option<bool>` and
+    // `display_reasoning: Option<bool>` override the per-model defaults.
+    // `None` = inherit model; `Some(b)` = force. They must parse cleanly
+    // and existing configs without the fields must still load.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The provider-level `preserve_reasoning` field parses; absent
+    /// defaults to `None` (inherit model).
+    #[test]
+    fn anthropic_config_preserve_reasoning_parses_and_defaults_to_none() {
+        let yaml = r#"
+model: "claude-3-5-sonnet-latest"
+api_key: "sk-test"
+preserve_reasoning: false
+"#;
+        let cfg: AnthropicConfig =
+            serde_yaml::from_str(yaml).expect("provider-level preserve_reasoning parses");
+        assert_eq!(cfg.preserve_reasoning, Some(false));
+
+        let yaml_default = r#"
+model: "claude-3-5-sonnet-latest"
+api_key: "sk-test"
+"#;
+        let cfg_default: AnthropicConfig =
+            serde_yaml::from_str(yaml_default).expect("legacy config without field parses");
+        assert_eq!(cfg_default.preserve_reasoning, None);
+    }
+
+    /// The provider-level `display_reasoning` field parses; absent
+    /// defaults to `None` (inherit model).
+    #[test]
+    fn anthropic_config_display_reasoning_parses_and_defaults_to_none() {
+        let yaml = r#"
+model: "claude-3-5-sonnet-latest"
+api_key: "sk-test"
+display_reasoning: true
+"#;
+        let cfg: AnthropicConfig =
+            serde_yaml::from_str(yaml).expect("provider-level display_reasoning parses");
+        assert_eq!(cfg.display_reasoning, Some(true));
+
+        let yaml_default = r#"
+model: "claude-3-5-sonnet-latest"
+api_key: "sk-test"
+"#;
+        let cfg_default: AnthropicConfig =
+            serde_yaml::from_str(yaml_default).expect("legacy config without field parses");
+        assert_eq!(cfg_default.display_reasoning, None);
     }
 }

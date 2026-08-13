@@ -24,6 +24,7 @@ pub mod mock;
 pub mod pipeline;
 mod providers;
 pub mod pty_runner;
+pub mod reasoning;
 pub mod session;
 pub mod skills;
 pub mod state;
@@ -2325,7 +2326,12 @@ impl AgentRunner {
         let SourcedEvent { source, event } = sourced;
 
         match event {
-            AgentEvent::CompletionResponse { content, usage, .. } => {
+            AgentEvent::CompletionResponse {
+                content,
+                usage,
+                thinking,
+                ..
+            } => {
                 // Roll tokens/cost into session stats, keyed by lane: the
                 // parent `/stats` sees sub-agent cost too, and can break it
                 // down per role.
@@ -2339,8 +2345,19 @@ impl AgentRunner {
                 // transcript: once here on its `🧩 role` lane (it *said* it) and
                 // once as the orchestrator's `delegate` ToolResult (it *received*
                 // it) — distinct lanes, not a duplicate bug.
-                if !source.is_orchestrator_lane() && !content.trim().is_empty() {
+                if !thinking.is_empty() && !source.is_orchestrator_lane() {
+                    // Sub-agent emitted thinking — carry blocks onto its lane
+                    // so the rebuilt orchestrator wire never sees them
+                    // (is_orchestrator_lane filter on the rebuild side).
+                    sm.add_assistant_message_with_thinking(source, content, thinking);
+                } else if !source.is_orchestrator_lane() && !content.trim().is_empty() {
                     sm.add_assistant_message_sourced(source, content);
+                } else if !thinking.is_empty() {
+                    // Orchestrator lane with thinking but no fresh prose here
+                    // (the prose landed via `prompt_with_history`'s return).
+                    // Drop a no-content stub so the thinking blocks ride on
+                    // a real transcript row.
+                    sm.add_assistant_message_with_thinking(source, String::new(), thinking);
                 }
             }
             AgentEvent::ToolCall {
@@ -4583,6 +4600,8 @@ mod tests {
                         prompt_caching: None,
                         vision: None,
                         context_size: None,
+                        preserve_reasoning: true,
+                        display_reasoning: false,
                     },
                     ModelEntry {
                         name: "openai/gpt-4o".into(),
@@ -4593,6 +4612,8 @@ mod tests {
                         prompt_caching: None,
                         vision: None,
                         context_size: None,
+                        preserve_reasoning: true,
+                        display_reasoning: false,
                     },
                 ],
             }],
@@ -5510,6 +5531,8 @@ headers:
                 event: AgentEvent::CompletionResponse {
                     content: "done".to_string(),
                     reasoning: None,
+                    thinking: vec![],
+
                     usage: TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
@@ -5621,6 +5644,8 @@ headers:
                 event: AgentEvent::CompletionResponse {
                     content: "The diff looks solid; one nit on naming.".to_string(),
                     reasoning: None,
+                    thinking: vec![],
+
                     usage: TokenUsage {
                         input_tokens: 10,
                         output_tokens: 8,
@@ -5664,6 +5689,8 @@ headers:
                 event: AgentEvent::CompletionResponse {
                     content: "I'll handle that.".to_string(),
                     reasoning: None,
+                    thinking: vec![],
+
                     usage: TokenUsage {
                         input_tokens: 5,
                         output_tokens: 3,

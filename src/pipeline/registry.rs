@@ -181,6 +181,8 @@ mod tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
                 ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),
@@ -191,6 +193,8 @@ mod tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
             ],
         };

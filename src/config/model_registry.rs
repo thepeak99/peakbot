@@ -88,6 +88,25 @@ pub struct ModelEntry {
     /// backward compatibility.
     #[serde(default, alias = "context_window_override", alias = "context_window")]
     pub context_size: Option<usize>,
+    /// Capture Anthropic thinking blocks from this model into the
+    /// transcript and replay them verbatim (signature included) at the
+    /// wire on the next turn. The Anthropic provider's tool-loop
+    /// contract requires it; default-on so a bare `config.yaml` just
+    /// works. A plain `bool`, not `Option<bool>`, because "unset" and
+    /// "true" behave identically — the provider-level override is what
+    /// outranks it.
+    #[serde(default = "default_true_bool")]
+    pub preserve_reasoning: bool,
+    /// Show captured thinking blocks in the web transcript (default off:
+    /// blocks are captured and replayed but rendered nowhere).
+    /// Server-side gated at wire-build time; signatures never reach the
+    /// browser.
+    #[serde(default)]
+    pub display_reasoning: bool,
+}
+
+fn default_true_bool() -> bool {
+    true
 }
 
 /// A model resolved against a provider — alias canonicalised, full
@@ -427,6 +446,12 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
             max_tokens: model.max_tokens.unwrap_or(default_max_tokens()),
             prompt_caching: model.prompt_caching.clone().unwrap_or_default(),
             vision: model.vision,
+            // Per-model value lifts into the provider config so the runtime
+            // resolution helper sees the model side in one place; the provider
+            // override (None → defer to model) is consulted via the same
+            // AnthropicConfig field at wire-build time.
+            preserve_reasoning: Some(model.preserve_reasoning),
+            display_reasoning: Some(model.display_reasoning),
         }),
         ProviderType::LlamaCpp => ProviderConfig::LlamaCpp(LlamaCppConfig {
             api_key: prov.api_key.clone(),
@@ -491,6 +516,8 @@ mod tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
                 ModelEntry {
                     name: "anthropic/claude-opus-4".into(),
@@ -501,6 +528,8 @@ mod tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
             ],
         }
@@ -522,6 +551,8 @@ mod tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
                 ModelEntry {
                     name: "o3".into(), // no alias — addressable by name
@@ -532,6 +563,8 @@ mod tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
             ],
         }
@@ -590,6 +623,8 @@ mod tests {
                 prompt_caching: None,
                 vision: None,
                 context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
             }],
         };
         let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
@@ -707,6 +742,8 @@ mod tests {
                 prompt_caching: None,
                 vision: None,
                 context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
             }],
         };
         let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
@@ -736,6 +773,8 @@ mod tests {
                 prompt_caching: None,
                 vision: None,
                 context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
             }],
         };
         let reg = ModelRegistry::build(&[prov], Some("ollama/qwen2.5-coder:14b"))
@@ -763,7 +802,9 @@ mod tests {
                     extra_params: None,
                     prompt_caching: None,
                     vision: None,
-                    context_size: None, // → auto-detect → 200_000
+                    context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false, // → auto-detect → 200_000
                 },
                 ModelEntry {
                     name: "custom-model-no-table-entry".into(),
@@ -773,7 +814,9 @@ mod tests {
                     extra_params: None,
                     prompt_caching: None,
                     vision: None,
-                    context_size: Some(42), // explicit → 42
+                    context_size: Some(42),
+                    preserve_reasoning: true,
+                    display_reasoning: false, // explicit → 42
                 },
             ],
         };
@@ -814,6 +857,8 @@ mod tests {
                 prompt_caching: None,
                 vision: None,
                 context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
             }],
         };
         let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
@@ -885,6 +930,95 @@ models:
             ProviderConfig::Anthropic(c) => assert_eq!(c.vision, Some(true)),
             other => panic!("expected Anthropic config, got {other:?}"),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Reasoning-preservation knobs (design §2.2 / §8 — Tasks T2).
+    //
+    // The `preserve_reasoning` and `display_reasoning` fields on
+    // `ModelEntry` must parse cleanly and propagate into the built
+    // `ProviderConfig::Anthropic`. Existing configs without the fields
+    // must still parse (the default-on / default-off semantics live in
+    // design §2.1).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The new `preserve_reasoning` field parses, defaults to `true`,
+    /// and propagates into the built `ProviderConfig::Anthropic`.
+    #[test]
+    fn model_entry_preserve_reasoning_parses_and_propagates() {
+        let yaml = "
+name: local
+type: anthropic
+base_url: http://localhost:8080
+models:
+  - name: qwen3-28b
+    alias: qwen
+    preserve_reasoning: false
+  - name: sonnet
+    alias: sonnet
+    # preserve_reasoning omitted → default-true
+";
+        let prov: ProviderEntry =
+            serde_yaml::from_str(yaml).expect("preserve_reasoning field parses");
+        assert_eq!(prov.models[0].preserve_reasoning, false);
+        assert_eq!(prov.models[1].preserve_reasoning, true); // default
+
+        let reg = ModelRegistry::build(std::slice::from_ref(&prov), Some("qwen"))
+            .expect("registry builds");
+        match &reg.resolve("qwen").unwrap().provider_config {
+            ProviderConfig::Anthropic(c) => assert_eq!(c.preserve_reasoning, Some(false)),
+            other => panic!("expected Anthropic config, got {other:?}"),
+        }
+    }
+
+    /// The new `display_reasoning` field parses, defaults to `false`,
+    /// and propagates into the built `ProviderConfig::Anthropic`.
+    #[test]
+    fn model_entry_display_reasoning_parses_and_propagates() {
+        let yaml = "
+name: local
+type: anthropic
+base_url: http://localhost:8080
+models:
+  - name: claude-with-thinking-on
+    alias: show
+    display_reasoning: true
+  - name: claude-default
+    alias: noshow
+    # display_reasoning omitted → default-false
+";
+        let prov: ProviderEntry =
+            serde_yaml::from_str(yaml).expect("display_reasoning field parses");
+        assert_eq!(prov.models[0].display_reasoning, true);
+        assert_eq!(prov.models[1].display_reasoning, false);
+
+        let reg = ModelRegistry::build(std::slice::from_ref(&prov), Some("show"))
+            .expect("registry builds");
+        match &reg.resolve("show").unwrap().provider_config {
+            ProviderConfig::Anthropic(c) => assert_eq!(c.display_reasoning, Some(true)),
+            other => panic!("expected Anthropic config, got {other:?}"),
+        }
+    }
+
+    /// An existing config (no `preserve_reasoning` / `display_reasoning`
+    /// fields anywhere) must still parse — the new fields are
+    /// `#[serde(default)]` and `deny_unknown_fields` will not reject them.
+    #[test]
+    fn legacy_model_entry_without_reasoning_fields_still_parses() {
+        let yaml = "
+name: openrouter
+type: openrouter
+api_key: sk
+models:
+  - name: anthropic/claude-3.7-sonnet
+    alias: sonnet
+    max_tokens: 8192
+";
+        let prov: ProviderEntry =
+            serde_yaml::from_str(yaml).expect("legacy config without new fields still parses");
+        // Defaults: preserve=true, display=false.
+        assert_eq!(prov.models[0].preserve_reasoning, true);
+        assert_eq!(prov.models[0].display_reasoning, false);
     }
 
     // ── find_by_wire_id ──────────────────────────────────────────────────
