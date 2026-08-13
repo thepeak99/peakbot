@@ -24,6 +24,7 @@ pub mod mock;
 pub mod pipeline;
 mod providers;
 pub mod pty_runner;
+pub mod reasoning;
 pub mod session;
 pub mod skills;
 pub mod state;
@@ -2044,6 +2045,21 @@ impl AgentRunner {
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 
+        // Thread the resolved reasoning gates into the shared StateManager
+        // (single seam for `/model`, `/cd`, `/load`, `/new`, `/pipeline`).
+        // The wire gate is provider-name AND preserve_reasoning: a Claude
+        // transcript must stop replaying `Reasoning` the moment a foreign
+        // provider owns the wire. The display gate mirrors the resolved
+        // provider/model `display_reasoning` override.
+        //
+        // Sub-agents share this StateManager but never touch these gates
+        // (`build_sub_agent` produces no `ProviderInfo`): the gates describe
+        // the *orchestrator's* wire, which is the only history rebuilt from
+        // this state — a sub-agent runs on a fresh, lane-filtered history.
+        sm_for_provider
+            .set_wire_reasoning(new_info.name == "anthropic" && new_info.preserve_reasoning);
+        sm_for_provider.set_display_reasoning(new_info.display_reasoning);
+
         // Publish through the shared cells *first* so the event_loop's
         // /stop and vision-gate paths immediately see the new state.
         {
@@ -2325,7 +2341,12 @@ impl AgentRunner {
         let SourcedEvent { source, event } = sourced;
 
         match event {
-            AgentEvent::CompletionResponse { content, usage, .. } => {
+            AgentEvent::CompletionResponse {
+                content,
+                usage,
+                thinking,
+                ..
+            } => {
                 // Roll tokens/cost into session stats, keyed by lane: the
                 // parent `/stats` sees sub-agent cost too, and can break it
                 // down per role.
@@ -2339,8 +2360,22 @@ impl AgentRunner {
                 // transcript: once here on its `🧩 role` lane (it *said* it) and
                 // once as the orchestrator's `delegate` ToolResult (it *received*
                 // it) — distinct lanes, not a duplicate bug.
-                if !source.is_orchestrator_lane() && !content.trim().is_empty() {
+                if !thinking.is_empty() && !source.is_orchestrator_lane() {
+                    // Sub-agent emitted thinking — carry blocks onto its lane
+                    // so the rebuilt orchestrator wire never sees them
+                    // (is_orchestrator_lane filter on the rebuild side).
+                    sm.add_assistant_message_with_thinking(source, content, thinking);
+                } else if !source.is_orchestrator_lane() && !content.trim().is_empty() {
                     sm.add_assistant_message_sourced(source, content);
+                } else if !thinking.is_empty() {
+                    // Orchestrator lane with thinking but no fresh prose here
+                    // (the prose landed via `prompt_with_history`'s return).
+                    // Stage the blocks on StateManager so the upcoming prose
+                    // row (or the first tool-call row if there is no prose)
+                    // carries them in a single ChatMessage — no phantom empty
+                    // assistant row (CONCERN 6). The LLM wire is unchanged
+                    // because `get_agent_history` gathers blocks across the run.
+                    sm.stage_thinking_for_next_assistant(thinking);
                 }
             }
             AgentEvent::ToolCall {
@@ -4573,6 +4608,8 @@ mod tests {
                 kind: ProviderType::OpenRouter,
                 api_key: Some("sk-test".into()),
                 base_url: None,
+                preserve_reasoning: None,
+                display_reasoning: None,
                 models: vec![
                     ModelEntry {
                         name: "anthropic/claude-3.7-sonnet".into(),
@@ -4583,6 +4620,8 @@ mod tests {
                         prompt_caching: None,
                         vision: None,
                         context_size: None,
+                        preserve_reasoning: true,
+                        display_reasoning: false,
                     },
                     ModelEntry {
                         name: "openai/gpt-4o".into(),
@@ -4593,6 +4632,8 @@ mod tests {
                         prompt_caching: None,
                         vision: None,
                         context_size: None,
+                        preserve_reasoning: true,
+                        display_reasoning: false,
                     },
                 ],
             }],
@@ -4650,6 +4691,186 @@ mod tests {
             !msg.contains("not available in this build"),
             "must NOT emit the legacy-build diagnostic for trailing-whitespace bare /model, \
              got: {msg}"
+        );
+    }
+
+    // --- /model switch: reasoning wire gate ---------------------------------
+
+    /// Two providers under one registry: an Anthropic model (thinking blocks
+    /// are its wire contract) and an Ollama model (they are poison there).
+    #[cfg(feature = "mock")]
+    fn registry_with_anthropic_and_ollama() -> crate::config::ModelRegistry {
+        use crate::config::{ModelEntry, ProviderEntry, ProviderType};
+
+        let model = |name: &str, alias: &str| ModelEntry {
+            name: name.into(),
+            alias: Some(alias.into()),
+            max_tokens: None,
+            temperature: None,
+            extra_params: None,
+            prompt_caching: None,
+            vision: None,
+            context_size: Some(200_000),
+            preserve_reasoning: true,
+            display_reasoning: false,
+        };
+
+        let providers = vec![
+            ProviderEntry {
+                name: "anthropic".into(),
+                kind: ProviderType::Anthropic,
+                api_key: Some("sk-ant-test".into()),
+                base_url: None,
+                preserve_reasoning: None,
+                display_reasoning: None,
+                models: vec![model("claude-sonnet-4", "claude")],
+            },
+            ProviderEntry {
+                name: "ollama".into(),
+                kind: ProviderType::Ollama,
+                api_key: None,
+                base_url: Some("http://localhost:11434".into()),
+                models: vec![model("llama3", "local")],
+                preserve_reasoning: None,
+                display_reasoning: None,
+            },
+        ];
+
+        crate::config::ModelRegistry::build(&providers, Some("claude")).expect("registry builds")
+    }
+
+    #[cfg(feature = "mock")]
+    fn rebuild_ctx_for(registry: crate::config::ModelRegistry) -> RebuildContext {
+        RebuildContext {
+            registry: Arc::new(registry),
+            system_prompt: "test prompt".into(),
+            mcp_handles: Arc::new(Vec::new()),
+            searxng_config: None,
+            max_turns: 4,
+            todo_tool: None,
+            bash_config: crate::config::BashConfig::default(),
+            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
+            shell_kind: None,
+            skills: crate::skills::SkillRegistry::default(),
+            vector_store: None,
+            memory_enabled: false,
+            tools_filter: crate::config::ToolsConfig::default(),
+            persona: None,
+        }
+    }
+
+    /// Switching `/model` from an Anthropic model to a non-Anthropic one must
+    /// CLOSE the wire-reasoning gate, so a transcript captured under Claude
+    /// stops replaying `Reasoning` content the moment Ollama owns the wire
+    /// (an Anthropic signature on a foreign wire is a hard 400 at best).
+    ///
+    /// Entry point is `rebuild_agent_for_resolved` — the shared seam that
+    /// `handle_switch_model` (and `/cd`, `/load`, `/new`, `/pipeline`)
+    /// delegates to, and the site that sets the gate. Driving
+    /// `handle_switch_model` itself would first call `Config::reload()`,
+    /// which reads the *machine's* real config directory and would swap this
+    /// test's registry for whatever the developer has installed — an
+    /// environment-dependent test, not a stronger one.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn model_switch_anthropic_to_ollama_closes_wire_reasoning_gate() {
+        use crate::reasoning::ThinkingBlock;
+        use crate::ui::app_state::MessageSource;
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage};
+
+        let sm = StateManager::new_arc();
+
+        // A transcript captured under Claude: one assistant turn carrying a
+        // signed thinking block, plus a trailing user turn.
+        sm.add_user_message("first question".into());
+        sm.add_assistant_message_with_thinking(
+            MessageSource::Human,
+            "answer".into(),
+            vec![ThinkingBlock::Thinking {
+                text: "deliberation".into(),
+                signature: "SIG-ANTHROPIC".into(),
+            }],
+        );
+        sm.add_user_message("second question".into());
+
+        let has_reasoning = |history: &[RigMessage]| {
+            history.iter().any(|m| match m {
+                RigMessage::Assistant { content, .. } => content
+                    .iter()
+                    .any(|c| matches!(c, AssistantContent::Reasoning(_))),
+                _ => false,
+            })
+        };
+
+        let mut config = Config {
+            // Compaction off: the rebuild seam validates a compaction model
+            // when it's on, which is orthogonal to what this test pins.
+            context: crate::config::ContextConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let mut ctx = rebuild_ctx_for(registry_with_anthropic_and_ollama());
+        let (mock_agent, mock_info, _rx, mock_hook, _mock_model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        let mut agent_slot: Arc<DynAgent> = Arc::new(mock_agent);
+        let hook_cell: SharedSessionHook = Arc::new(std::sync::RwLock::new(mock_hook));
+        let info_cell: SharedProviderInfo = Arc::new(std::sync::RwLock::new(Arc::new(mock_info)));
+        let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+        let sm_opt = Some(sm.clone());
+
+        // ── Switch to Anthropic: gate OPEN, blocks reach the wire ──────────
+        let claude = ctx
+            .registry
+            .resolve("claude")
+            .expect("alias claude")
+            .clone();
+        AgentRunner::rebuild_agent_for_resolved(
+            &claude,
+            &mut agent_slot,
+            &mut config,
+            &sm,
+            &hook_cell,
+            &info_cell,
+            &mut event_processor,
+            &sm_opt,
+            &mut ctx,
+        )
+        .await
+        .expect("rebuild onto anthropic");
+
+        assert!(
+            has_reasoning(&sm.get_agent_history()),
+            "on Anthropic with preserve_reasoning on, the rebuilt wire must carry Reasoning",
+        );
+
+        // ── Switch to Ollama: gate CLOSED, no block survives the rebuild ───
+        let local = ctx.registry.resolve("local").expect("alias local").clone();
+        AgentRunner::rebuild_agent_for_resolved(
+            &local,
+            &mut agent_slot,
+            &mut config,
+            &sm,
+            &hook_cell,
+            &info_cell,
+            &mut event_processor,
+            &sm_opt,
+            &mut ctx,
+        )
+        .await
+        .expect("rebuild onto ollama");
+
+        let history = sm.get_agent_history();
+        assert!(
+            !has_reasoning(&history),
+            "after switching to a non-Anthropic provider the wire must carry no Reasoning",
+        );
+        let json = serde_json::to_string(&history).expect("encode wire");
+        assert!(
+            !json.contains("SIG-ANTHROPIC"),
+            "an Anthropic signature must never reach a foreign provider's wire; got: {json}",
         );
     }
 
@@ -5510,6 +5731,8 @@ headers:
                 event: AgentEvent::CompletionResponse {
                     content: "done".to_string(),
                     reasoning: None,
+                    thinking: vec![],
+
                     usage: TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
@@ -5621,6 +5844,8 @@ headers:
                 event: AgentEvent::CompletionResponse {
                     content: "The diff looks solid; one nit on naming.".to_string(),
                     reasoning: None,
+                    thinking: vec![],
+
                     usage: TokenUsage {
                         input_tokens: 10,
                         output_tokens: 8,
@@ -5664,6 +5889,8 @@ headers:
                 event: AgentEvent::CompletionResponse {
                     content: "I'll handle that.".to_string(),
                     reasoning: None,
+                    thinking: vec![],
+
                     usage: TokenUsage {
                         input_tokens: 5,
                         output_tokens: 3,

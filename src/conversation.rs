@@ -107,6 +107,12 @@ pub enum Message {
         compacted: bool,
         #[serde(default, skip_serializing_if = "MessageSource::is_human")]
         source: MessageSource,
+        /// Lossless Anthropic-style thinking blocks captured with this
+        /// assistant turn. Replayed verbatim at the wire boundary by
+        /// `StateManager::get_agent_history`. Pre-existing conversation
+        /// files (no `thinking` key) deserialise to `vec![]`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking: Vec<crate::reasoning::ThinkingBlock>,
         /// Timestamp when message was generated
         timestamp: DateTime<Utc>,
     },
@@ -171,6 +177,21 @@ impl Message {
             content,
             compacted: false,
             source: MessageSource::Human,
+            thinking: Vec::new(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Create a new assistant message carrying captured thinking blocks.
+    pub fn assistant_with_thinking(
+        content: String,
+        thinking: Vec<crate::reasoning::ThinkingBlock>,
+    ) -> Self {
+        Message::Assistant {
+            content,
+            compacted: false,
+            source: MessageSource::Human,
+            thinking,
             timestamp: Utc::now(),
         }
     }
@@ -319,6 +340,18 @@ impl Conversation {
     /// Add an assistant message to the conversation
     pub fn add_assistant_message(&mut self, content: String) {
         self.messages.push(Message::assistant(content));
+        self.metadata.message_count = self.messages.len();
+        self.updated_at = Utc::now();
+    }
+
+    /// Add an assistant message carrying captured thinking blocks.
+    pub fn add_assistant_message_with_thinking(
+        &mut self,
+        content: String,
+        thinking: Vec<crate::reasoning::ThinkingBlock>,
+    ) {
+        self.messages
+            .push(Message::assistant_with_thinking(content, thinking));
         self.metadata.message_count = self.messages.len();
         self.updated_at = Utc::now();
     }
@@ -994,6 +1027,7 @@ mod tests {
             source: MessageSource::SubAgent {
                 role: "reviewer".into(),
             },
+            thinking: Vec::new(),
             timestamp: Utc::now(),
         });
         conv.messages.push(Message::User {

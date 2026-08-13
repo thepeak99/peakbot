@@ -55,6 +55,18 @@ pub struct ProviderInfo {
     /// `[img:…]` submissions when the active model cannot see — emits a
     /// system error rather than silently dropping the images.
     pub supports_vision: bool,
+    /// Resolved once at agent-build from
+    /// `(model.preserve_reasoning, provider.preserve_reasoning)` via
+    /// [`resolve_preserve_reasoning`]. Driving knob for the SessionHook
+    /// capture seam (`with_preserve_reasoning`) and the StateManager
+    /// wire-side gate together — when false, no thinking block survives
+    /// capture or replay for this provider+model.
+    pub preserve_reasoning: bool,
+    /// Resolved counterpart of `preserve_reasoning` for the web
+    /// transcript display path. Drives the server-side gate that
+    /// decides whether `thinking` reaches the browser; defaults to
+    /// false (wire-only / invisible).
+    pub display_reasoning: bool,
 }
 
 /// Whether `[img:…]` attachments may flow to this provider+model. Anthropic
@@ -73,6 +85,31 @@ pub fn resolve_supports_vision(
     model: &str,
 ) -> bool {
     vision_override.unwrap_or_else(|| supports_vision_for(provider_name, model))
+}
+
+/// Resolved decision for the `preserve_reasoning` capture knob.
+///
+/// Provider override wins over the model override (the provider block is the
+/// coarser, more deliberate escape hatch — a deployment that 400s on thinking
+/// wants one switch, not a per-model edit). `None` on both → `true`:
+/// Anthropic replay needs the blocks to keep tool loops alive, and dropping
+/// is what breaks them.
+pub fn resolve_preserve_reasoning(
+    model_override: Option<bool>,
+    provider_override: Option<bool>,
+) -> bool {
+    provider_override.or(model_override).unwrap_or(true)
+}
+
+/// Same hierarchy as [`resolve_preserve_reasoning`], but the unset default
+/// is `false` — thinking blocks are captured and replayed by default, but
+/// invisible in the web transcript unless the user opts the model (or the
+/// provider) in.
+pub fn resolve_display_reasoning(
+    model_override: Option<bool>,
+    provider_override: Option<bool>,
+) -> bool {
+    provider_override.or(model_override).unwrap_or(false)
 }
 
 /// Tool-free completion model for compaction summarization.
@@ -752,6 +789,8 @@ fn create_openrouter_agent(
         model: model.clone(),
         supports_pricing: true,
         supports_vision: resolve_supports_vision(config.vision, "openrouter", &model),
+        preserve_reasoning: false,
+        display_reasoning: false,
     };
 
     Ok((agent, info, receiver, hook))
@@ -857,7 +896,17 @@ fn create_anthropic_agent(
         model: model.clone(),
         supports_pricing: false,
         supports_vision,
+        // `build_provider_config` already resolved the model vs provider
+        // overrides into `AnthropicConfig.preserve_reasoning`. Re-run the
+        // helper here so the final ProviderInfo value is never produced by a
+        // second, divergent default expression.
+        preserve_reasoning: resolve_preserve_reasoning(config.preserve_reasoning, None),
+        display_reasoning: resolve_display_reasoning(config.display_reasoning, None),
     };
+
+    // Hand the resolved bool to the SessionHook so the capture seam honours
+    // the knob from the first prompt.
+    let hook = hook.with_preserve_reasoning(info.preserve_reasoning);
 
     Ok((agent, info, receiver, hook))
 }
@@ -948,6 +997,12 @@ fn create_ollama_agent(
         model: model.clone(),
         supports_pricing: false,
         supports_vision: resolve_supports_vision(config.vision, "ollama", &model),
+        // Non-Anthropic provider: no Anthropic-style thinking blocks flow
+        // through the wire. The StateManager provider gate is what keeps a
+        // reloaded Claude transcript from leaking reasoning into this
+        // provider's turn.
+        preserve_reasoning: false,
+        display_reasoning: false,
     };
 
     Ok((agent, info))
@@ -1050,6 +1105,8 @@ fn create_openai_agent(
         model: model.clone(),
         supports_pricing: true,
         supports_vision: resolve_supports_vision(config.vision, "openai", &model),
+        preserve_reasoning: false,
+        display_reasoning: false,
     };
 
     Ok((agent, info, receiver, hook))
@@ -1155,6 +1212,8 @@ fn create_llamacpp_agent(
         model: model.clone(),
         supports_pricing: true,
         supports_vision: resolve_supports_vision(config.vision, "llamacpp", &model),
+        preserve_reasoning: false,
+        display_reasoning: false,
     };
 
     Ok((agent, info, receiver, hook))
@@ -1218,6 +1277,10 @@ pub fn create_mock_agent(
         // Mock is used by integration tests — keep vision enabled so those
         // tests can exercise both code paths.
         supports_vision: true,
+        // Mock's purpose-built for tests exercising reasoning flows; default
+        // preserves the integration with the capture/wire seams.
+        preserve_reasoning: true,
+        display_reasoning: false,
     };
 
     Ok((
@@ -1495,12 +1558,16 @@ mod tests {
             model: "anthropic/claude-3.5-sonnet".into(),
             supports_pricing: true,
             supports_vision: crate::vision::model_supports_vision("anthropic/claude-3.5-sonnet"),
+            preserve_reasoning: false,
+            display_reasoning: false,
         };
         let vision_no = ProviderInfo {
             name: "openrouter".into(),
             model: "qwen/qwq-32b".into(),
             supports_pricing: true,
             supports_vision: crate::vision::model_supports_vision("qwen/qwq-32b"),
+            preserve_reasoning: false,
+            display_reasoning: false,
         };
         assert!(vision_ok.supports_vision);
         assert!(!vision_no.supports_vision);
@@ -1684,6 +1751,8 @@ mod tests {
             max_tokens: 64,
             prompt_caching: crate::config::AnthropicCaching::Off,
             vision: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
         });
         let model = create_compaction_model(&cfg, None).expect("construction must succeed");
         let err = model
@@ -1883,5 +1952,56 @@ mod tests {
             std::future::pending::<()>().await;
             unreachable!("never returns");
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Resolution helpers (design §2.1 / §8 — Task T2).
+    //
+    // `resolve_preserve_reasoning` and `resolve_display_reasoning` apply
+    // the design's resolution rules:
+    //   - provider_override wins over model_override (provider is the
+    //     coarser, more deliberate escape hatch).
+    //   - `None` here defaults to `true` for preserve and `false` for
+    //     display (the wire-only / invisible defaults).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `resolve_preserve_reasoning`: provider wins over model; unset
+    /// defaults to `true`.
+    #[test]
+    fn resolve_preserve_reasoning_hierarchy() {
+        // Both unset → true (the design's default-on).
+        assert!(resolve_preserve_reasoning(None, None));
+
+        // Model says on, provider silent → true.
+        assert!(resolve_preserve_reasoning(Some(true), None));
+
+        // Model says off, provider silent → false.
+        assert!(!resolve_preserve_reasoning(Some(false), None));
+
+        // Model says on, provider overrules off → false (provider wins).
+        assert!(!resolve_preserve_reasoning(Some(true), Some(false)));
+
+        // Model says off, provider overrules on → true (provider wins).
+        assert!(resolve_preserve_reasoning(Some(false), Some(true)));
+    }
+
+    /// `resolve_display_reasoning`: same hierarchy, but the unset default
+    /// is `false` (wire-only / invisible by default).
+    #[test]
+    fn resolve_display_reasoning_hierarchy() {
+        // Both unset → false (the design's default-off).
+        assert!(!resolve_display_reasoning(None, None));
+
+        // Model says on, provider silent → true.
+        assert!(resolve_display_reasoning(Some(true), None));
+
+        // Model says off, provider silent → false.
+        assert!(!resolve_display_reasoning(Some(false), None));
+
+        // Provider overrules off → false.
+        assert!(!resolve_display_reasoning(Some(true), Some(false)));
+
+        // Provider overrules on → true.
+        assert!(resolve_display_reasoning(Some(false), Some(true)));
     }
 }

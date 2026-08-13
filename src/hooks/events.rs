@@ -70,8 +70,19 @@ pub enum AgentEvent {
         /// Text content from the model. Prose only: empty when the turn
         /// produced no text (e.g. a pure tool call).
         content: String,
-        /// Reasoning/thinking from the model (if present)
+        /// Reasoning/thinking from the model (if present). Flattened
+        /// display string — see [`CompletionResponse::thinking`] for
+        /// the lossless wire-replay carrier.
         reasoning: Option<String>,
+        /// Lossless Anthropic-style thinking blocks captured from the
+        /// response. Empty on every non-Anthropic provider, when the
+        /// model did not think, or when the `preserve_reasoning` knob
+        /// is off at the SessionHook capture seam. Kept verbatim with
+        /// their signatures so `get_agent_history` can replay them
+        /// into the same rig assistant message as a `ToolCall`, per
+        /// Anthropic's wire contract.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking: Vec<crate::reasoning::ThinkingBlock>,
         /// Token usage for this response
         usage: TokenUsage,
         /// Timestamp

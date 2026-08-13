@@ -432,7 +432,9 @@ mod tests {
         ])
         .unwrap();
 
-        let (text, reasoning) = extract_content_from_response(&choice);
+        let parts = extract_content_from_response(&choice);
+        let text = parts.text;
+        let reasoning = parts.reasoning;
         assert_eq!(text, "Reading the file.");
         assert!(!text.contains("[tool call]"));
         assert!(reasoning.is_none());
@@ -446,7 +448,9 @@ mod tests {
         ])
         .unwrap();
 
-        let (text, reasoning) = extract_content_from_response(&split);
+        let parts = extract_content_from_response(&split);
+        let text = parts.text;
+        let reasoning = parts.reasoning;
         assert_eq!(text, "a\nb");
         assert!(reasoning.is_none());
     }
@@ -463,7 +467,9 @@ mod tests {
             serde_json::json!({"path": "a.txt"}),
         ));
 
-        let (text, reasoning) = extract_content_from_response(&choice);
+        let parts = extract_content_from_response(&choice);
+        let text = parts.text;
+        let reasoning = parts.reasoning;
         assert!(text.is_empty());
         assert!(reasoning.is_none());
     }
@@ -478,7 +484,9 @@ mod tests {
         ])
         .unwrap();
 
-        let (text, reasoning) = extract_content_from_response(&choice);
+        let parts = extract_content_from_response(&choice);
+        let text = parts.text;
+        let reasoning = parts.reasoning;
         assert_eq!(text, "Here it is.");
         assert!(!text.contains("[image]"));
         assert!(reasoning.is_none());
@@ -1030,6 +1038,12 @@ pub struct SessionHook {
     /// budget gate plus the per-request history snapshot the delegate tool
     /// reads to summarise an interrupted delegation.
     sub_agent: Option<SubAgentGate>,
+    /// Resolved-at-construction copy of the provider's
+    /// `preserve_reasoning` knob. When `false`, the capture seam drops
+    /// every thinking block before it can reach `AgentEvent` — single
+    /// strip seam per design §3.3; defaults `false` so a hook that was
+    /// never told about the knob cannot accidentally start capturing.
+    preserve_reasoning: bool,
 }
 
 impl SessionHook {
@@ -1041,6 +1055,7 @@ impl SessionHook {
             stats: Arc::new(Mutex::new(SessionStats::new())),
             state_manager: None,
             sub_agent: None,
+            preserve_reasoning: false,
         }
     }
 
@@ -1055,6 +1070,7 @@ impl SessionHook {
             stats,
             state_manager: None,
             sub_agent: None,
+            preserve_reasoning: false,
         }
     }
 
@@ -1119,9 +1135,20 @@ impl SessionHook {
                 stats: Arc::new(Mutex::new(SessionStats::new())),
                 state_manager: None,
                 sub_agent: None,
+                preserve_reasoning: false,
             },
             receiver,
         )
+    }
+
+    /// Tell this hook whether to capture Anthropic thinking blocks at the
+    /// capture seam. Builder-style; returns `self` for chaining. Defaults
+    /// to `false` on the struct; the Anthropic agent-build path passes the
+    /// resolved bool so its captures honour the configured knob from the
+    /// first prompt.
+    pub fn with_preserve_reasoning(mut self, preserve: bool) -> Self {
+        self.preserve_reasoning = preserve;
+        self
     }
 }
 
@@ -1135,12 +1162,60 @@ fn input_context_tokens(usage: &rig_core::completion::Usage) -> u64 {
         .max(usage.input_tokens)
 }
 
-/// Extract text and reasoning from the response choice
-fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (String, Option<String>) {
+/// Everything we keep from one assistant response.
+struct AssistantParts {
+    /// Prose for the transcript.
+    text: String,
+    /// Flattened reasoning text — the existing display/telemetry string.
+    /// Kept as-is so nothing downstream of the current behaviour moves.
+    reasoning: Option<String>,
+    /// Lossless thinking blocks for wire replay. Empty when the knob is
+    /// off, when the provider is not Anthropic, or when the model did
+    /// not think. Order is wire order.
+    thinking: Vec<crate::reasoning::ThinkingBlock>,
+}
+
+/// Map one rig `ReasoningContent` to one or zero `ThinkingBlock`s.
+///
+/// `ReasoningContent::Summary` is OpenAI-shaped and never carries a
+/// signature, so it doesn't reach the thinking-array path — it only
+/// contributes to the flattened display string.
+fn reasoning_content_to_thinking(
+    rc: &rig_core::completion::message::ReasoningContent,
+) -> Option<crate::reasoning::ThinkingBlock> {
+    use crate::reasoning::ThinkingBlock;
+    use rig_core::completion::message::ReasoningContent;
+    match rc {
+        ReasoningContent::Text { text, signature } => Some(ThinkingBlock::Thinking {
+            text: text.clone(),
+            // Anthropic: signature is a provider-issued MAC, opaque in / opaque
+            // out. The wire seam later drops the block when this is empty
+            // (replaying an unsigned block is a guaranteed 400).
+            signature: signature.clone().unwrap_or_default(),
+        }),
+        ReasoningContent::Redacted { data } => Some(ThinkingBlock::Redacted { data: data.clone() }),
+        // Encrypted is the same wall as Redacted from a routing standpoint:
+        // opaque ciphertext to replay, nothing to display, summarise, or log.
+        // Same variant simplifies the boundary — there is one type-level
+        // "opaque" payload, not two.
+        ReasoningContent::Encrypted(data) => Some(ThinkingBlock::Redacted { data: data.clone() }),
+        // Summary is OpenAI-shaped reasoning summary text — Anthropic has no
+        // signature to honour, and the design routes summaries through the
+        // display string only.
+        ReasoningContent::Summary(_) => None,
+        _ => None,
+    }
+}
+
+/// Extract text, reasoning, and the lossless thinking blocks from the
+/// response choice. The thinking-blocks path runs for every rig
+/// AssistantContent variant today; the SessionHook capture seam
+/// applies the `preserve_reasoning` knob and zeroes the vec when off.
+fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> AssistantParts {
     let mut text = String::new();
     let mut reasoning = None;
+    let mut thinking: Vec<crate::reasoning::ThinkingBlock> = Vec::new();
 
-    // Try to iterate over the contents
     for item in choice.iter() {
         match item {
             AssistantContent::Text(t) => {
@@ -1150,9 +1225,14 @@ fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (Strin
                 text.push_str(&t.to_string());
             }
             AssistantContent::Reasoning(r) => {
-                // Extract reasoning text from the Reasoning struct
+                // Build the existing display string for backwards compatibility
+                // (the display path and stats counters read it) and the lossless
+                // thinking-block vec in one pass.
                 let mut reasonings = String::new();
                 for rc in &r.content {
+                    if let Some(block) = reasoning_content_to_thinking(rc) {
+                        thinking.push(block);
+                    }
                     match rc {
                         rig_core::completion::message::ReasoningContent::Text {
                             text: t, ..
@@ -1182,7 +1262,11 @@ fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> (Strin
         }
     }
 
-    (text, reasoning)
+    AssistantParts {
+        text,
+        reasoning,
+        thinking,
+    }
 }
 
 impl<M: CompletionModel> PromptHook<M> for SessionHook {
@@ -1273,13 +1357,24 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         }
 
         if let Some(ref sender) = self.event_sender {
-            // Extract content and reasoning from response using rig's API
-            let (content, reasoning) = extract_content_from_response(&response.choice);
+            // Extract content and reasoning from response using rig's API.
+            let parts = extract_content_from_response(&response.choice);
+
+            // Strip seam (design §3.3): knob-off means the blocks never
+            // exist for us — not stored, not persisted, not rendered, not
+            // replayed. Anywhere later would leave signatures on disk that
+            // a knob flip could silently resurrect.
+            let thinking = if self.preserve_reasoning {
+                parts.thinking
+            } else {
+                Vec::new()
+            };
 
             // Emit event with per-request token counts; cost is computed in CostHandler.
             let event = AgentEvent::CompletionResponse {
-                content,
-                reasoning,
+                content: parts.text,
+                reasoning: parts.reasoning,
+                thinking,
                 usage: EventTokenUsage {
                     input_tokens,
                     output_tokens: usage.output_tokens,

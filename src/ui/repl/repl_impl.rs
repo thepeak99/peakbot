@@ -3873,6 +3873,8 @@ mod model_popup_tests {
             kind: ProviderType::OpenRouter,
             api_key: Some("sk-or-test".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![
                 ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),
@@ -3883,6 +3885,8 @@ mod model_popup_tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
                 ModelEntry {
                     name: "anthropic/claude-opus-4".into(),
@@ -3893,6 +3897,8 @@ mod model_popup_tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
             ],
         };

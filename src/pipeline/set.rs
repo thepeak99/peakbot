@@ -333,6 +333,8 @@ mod tests {
             kind: ProviderType::OpenRouter,
             api_key: Some("sk-or-test".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![
                 ModelEntry {
                     name: "google/gemini-2.0-flash-001".into(),
@@ -343,6 +345,8 @@ mod tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
                 ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),
@@ -353,6 +357,8 @@ mod tests {
                     prompt_caching: None,
                     vision: None,
                     context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
                 },
             ],
         };

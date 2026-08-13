@@ -17,6 +17,7 @@ mod persistence_tests;
 mod pipeline_tests;
 mod powershell_tests;
 mod queued_input_tests;
+mod reasoning_preservation;
 mod state_only_in_outbound;
 mod stats_tests;
 mod stop_tests;

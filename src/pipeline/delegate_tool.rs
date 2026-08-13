@@ -532,6 +532,8 @@ mod tests {
             kind: ProviderType::OpenAI,
             api_key: Some("sk-test".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![ModelEntry {
                 name: "gpt-4o".into(),
                 alias: Some("gpt4".into()),
@@ -541,6 +543,8 @@ mod tests {
                 prompt_caching: None,
                 vision: None,
                 context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
             }],
         };
         let model_registry =

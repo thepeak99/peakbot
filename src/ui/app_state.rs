@@ -251,6 +251,85 @@ pub struct ChatMessage {
     /// See `bash-background.md` open Q6.
     #[serde(default, skip_serializing_if = "MessageSource::is_human")]
     pub source: MessageSource,
+
+    /// Anthropic thinking blocks captured from the response that
+    /// produced this message. Replayed verbatim (signature included)
+    /// at the wire boundary in `StateManager::get_agent_history`;
+    /// empty for every non-Anthropic message and for the on-disk JSON
+    /// of pre-existing conversations.
+    ///
+    /// Wire (web snapshot) shape: the browser only ever sees the text
+    /// portion. Signatures and `Redacted` ciphertext are stripped via
+    /// the custom serializer below — they are useless for display and
+    /// signature data has no business in a DOM or a devtools tab.
+    #[serde(
+        default,
+        serialize_with = "serialize_thinking_for_wire",
+        deserialize_with = "deserialize_thinking_for_wire",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub thinking: Vec<crate::reasoning::ThinkingBlock>,
+}
+
+/// Server-side web-snapshot serializer: drop signatures and
+/// `Redacted` payloads. The browser only wants display-shaped text;
+/// converting in here (rather than at the channel boundary) means a
+/// stray render can never surface signed bytes.
+fn serialize_thinking_for_wire<S>(
+    blocks: &[crate::reasoning::ThinkingBlock],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::Serialize;
+    #[derive(Serialize)]
+    struct ThinkingWireText<'a> {
+        text: &'a str,
+    }
+    let visible: Vec<ThinkingWireText<'_>> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            crate::reasoning::ThinkingBlock::Thinking { text, .. } => {
+                Some(ThinkingWireText { text })
+            }
+            crate::reasoning::ThinkingBlock::Redacted { .. } => None,
+        })
+        .collect();
+    visible.serialize(serializer)
+}
+
+/// Wire → StateManager deserializer. The wire carries
+/// `Vec<{ text: String }>` (display-shaped only), but the
+/// `ChatMessage.thinking` field is the lossless `ThinkingBlock` —
+/// restore it with empty signatures on load. Redacted entries from
+/// the wire (if a custom client somehow emits them) decode as the
+/// lossless variant too; the round-trip stays faithful.
+fn deserialize_thinking_for_wire<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<crate::reasoning::ThinkingBlock>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct ThinkingWireText {
+        text: String,
+    }
+    let wire: Vec<ThinkingWireText> = Vec::deserialize(deserializer)?;
+    Ok(wire
+        .into_iter()
+        .map(|t| crate::reasoning::ThinkingBlock::Thinking {
+            text: t.text,
+            // Signatures are not transmitted over the web snapshot;
+            // round-trip loses them by design (they are credentials-ish
+            // and have no display use). The StateManager rebuild path
+            // can still see the block — its signature will be empty,
+            // so `get_agent_history` drops it at the wire-strip seam
+            // (replaying an unsigned block is a guaranteed 400).
+            signature: String::new(),
+        })
+        .collect())
 }
 
 impl ChatMessage {
@@ -266,6 +345,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Human,
         }
     }
@@ -289,6 +369,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Human,
         }
     }
@@ -309,6 +390,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Background { proc_ids },
         }
     }
@@ -325,6 +407,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Human,
         }
     }
@@ -341,6 +424,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Human,
         }
     }
@@ -357,6 +441,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Human,
         }
     }
@@ -378,6 +463,7 @@ impl ChatMessage {
             tool_result: None,
             call_id,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Human,
         }
     }
@@ -396,6 +482,7 @@ impl ChatMessage {
             tool_result: Some(result.to_string()),
             call_id,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Human,
         }
     }
@@ -417,6 +504,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Human,
         }
     }
@@ -437,6 +525,7 @@ impl ChatMessage {
             tool_result: None,
             call_id: None,
             compacted: false,
+            thinking: Vec::new(),
             source: MessageSource::Human,
         }
     }
@@ -706,7 +795,14 @@ pub const ORCHESTRATOR_LANE: &str = "orchestrator";
 /// Distinguishes background-process-driven synthetic turns from
 /// human-typed input so the renderer can style them and the persisted
 /// transcript records the source. See `bash-background.md` open Q6.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+///
+/// **Deserialization back-compat:** accepts BOTH the legacy string form
+/// (`"source": "Human"`, `"source": "SubAgent"`, `"source": "Background"`)
+/// that pre-v6 conversation files use AND the current tagged form
+/// (`"source": {"kind": "human"}`). The legacy form is a bare string;
+/// every variant decodes to the carrier with empty/default fields. The
+/// serialization side stays tagged — only legacy *loads* are tolerated.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageSource {
     /// Typed by the human OR a normal assistant/tool flow.
@@ -726,6 +822,56 @@ pub enum MessageSource {
         /// The pipeline role that produced this turn.
         role: String,
     },
+}
+
+impl<'de> serde::Deserialize<'de> for MessageSource {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        // Tagged shape — the only form the current code emits.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged {
+            Human,
+            Background { proc_ids: Vec<u32> },
+            SubAgent { role: String },
+        }
+
+        // Accept either a string (legacy pre-v6 form) or a tagged map.
+        // String maps to a Human / Background{vec![]} / SubAgent{""} —
+        // enough to round-trip every pre-v6 file we have on disk, where
+        // the carrier data was not persisted.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Legacy(String),
+            Tagged(Tagged),
+        }
+
+        let shape = Shape::deserialize(deserializer)?;
+        match shape {
+            Shape::Legacy(s) => match s.as_str() {
+                "Human" | "human" => Ok(MessageSource::Human),
+                "Background" | "background" => Ok(MessageSource::Background {
+                    proc_ids: Vec::new(),
+                }),
+                "SubAgent" | "sub_agent" | "subagent" => Ok(MessageSource::SubAgent {
+                    role: String::new(),
+                }),
+                other => Err(D::Error::custom(format!(
+                    "unknown legacy MessageSource variant: {other}"
+                ))),
+            },
+            Shape::Tagged(Tagged::Human) => Ok(MessageSource::Human),
+            Shape::Tagged(Tagged::Background { proc_ids }) => {
+                Ok(MessageSource::Background { proc_ids })
+            }
+            Shape::Tagged(Tagged::SubAgent { role }) => Ok(MessageSource::SubAgent { role }),
+        }
+    }
 }
 
 impl MessageSource {

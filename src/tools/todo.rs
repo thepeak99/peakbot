@@ -51,10 +51,50 @@ pub struct AddTaskResult {
 }
 
 /// The todo list manager
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct TodoList {
     tasks: Vec<TodoItem>,
     next_id: usize,
+}
+
+/// Custom deserializer for [`TodoList`] that accepts both the current
+/// struct shape (`{"tasks":[…],"next_id":N}`) and the legacy array shape
+/// (`[…]`). Pre-todo-list conversation files serialised the slot as an
+/// empty array; a strict struct deserializer 400s on those (see contract 8
+/// in `tests/scenarios/reasoning_preservation.rs`). The legacy array is
+/// treated as an empty list with `next_id = 1` — there's nothing else
+/// it could meaningfully mean.
+impl<'de> Deserialize<'de> for TodoList {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            /// Legacy / stub form: a JSON array. Either empty (the common
+            /// pre-todo file) or a sequence of `TodoItem` we accept
+            /// verbatim (best-effort; `next_id` is inferred from `max(id)+1`).
+            Legacy(Vec<TodoItem>),
+            /// Current form: a struct with both fields.
+            Struct {
+                tasks: Vec<TodoItem>,
+                next_id: usize,
+            },
+        }
+
+        let shape = Shape::deserialize(deserializer)?;
+        match shape {
+            Shape::Legacy(items) => {
+                let next_id = items.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+                Ok(TodoList {
+                    tasks: items,
+                    next_id,
+                })
+            }
+            Shape::Struct { tasks, next_id } => Ok(TodoList { tasks, next_id }),
+        }
+    }
 }
 
 impl TodoList {
