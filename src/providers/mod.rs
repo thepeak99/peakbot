@@ -94,7 +94,6 @@ pub fn resolve_supports_vision(
 /// wants one switch, not a per-model edit). `None` on both → `true`:
 /// Anthropic replay needs the blocks to keep tool loops alive, and dropping
 /// is what breaks them.
-#[allow(dead_code)] // exercised by the cfg(test) module below; public API for future /model + cross-provider code paths.
 pub fn resolve_preserve_reasoning(
     model_override: Option<bool>,
     provider_override: Option<bool>,
@@ -106,7 +105,6 @@ pub fn resolve_preserve_reasoning(
 /// is `false` — thinking blocks are captured and replayed by default, but
 /// invisible in the web transcript unless the user opts the model (or the
 /// provider) in.
-#[allow(dead_code)] // exercised by the cfg(test) module below; public API for future /model + cross-provider code paths.
 pub fn resolve_display_reasoning(
     model_override: Option<bool>,
     provider_override: Option<bool>,
@@ -898,12 +896,12 @@ fn create_anthropic_agent(
         model: model.clone(),
         supports_pricing: false,
         supports_vision,
-        // build_provider_config merged the model side into AnthropicConfig
-        // already (Some(model.preserve_reasoning)), and the provider-level
-        // override rides in the same Option (Some(provider.preserve_reasoning)
-        // would overwrite when set). The defaults here match §2.1.
-        preserve_reasoning: config.preserve_reasoning.unwrap_or(true),
-        display_reasoning: config.display_reasoning.unwrap_or(false),
+        // `build_provider_config` already resolved the model vs provider
+        // overrides into `AnthropicConfig.preserve_reasoning`. Re-run the
+        // helper here so the final ProviderInfo value is never produced by a
+        // second, divergent default expression.
+        preserve_reasoning: resolve_preserve_reasoning(config.preserve_reasoning, None),
+        display_reasoning: resolve_display_reasoning(config.display_reasoning, None),
     };
 
     // Hand the resolved bool to the SessionHook so the capture seam honours

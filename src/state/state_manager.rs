@@ -124,6 +124,23 @@ pub struct StateManager {
     /// even on a freshly loaded Anthropic transcript. Set from the
     /// active `ProviderInfo` (`provider == "anthropic" && info.preserve_reasoning`).
     wire_reasoning: RwLock<bool>,
+
+    // ── Display reasoning gate (design §5) ─────────────────────────────────
+    /// True → the web snapshot carries thinking text on `ChatMessage` rows;
+    /// false (default) → thinking is stripped server-side before any
+    /// broadcast to browsers. Signatures are never transmitted regardless.
+    display_reasoning: RwLock<bool>,
+
+    // ── Pending thinking coalescence (design §4 / CONCERN 6) ───────────────
+    /// Captured Anthropic thinking blocks for the orchestrator's current
+    /// assistant turn. The `CompletionResponse` event arrives before the
+    /// prose is appended via `add_assistant_message`, so we stage the blocks
+    /// here and attach them to the first orchestrator message added for the
+    /// turn (prose or tool call). This avoids the phantom empty assistant
+    /// row that the previous implementation produced. The LLM wire is
+    /// unaffected because `get_agent_history` gathers thinking across the
+    /// run regardless of which `ChatMessage` row carries the blocks.
+    pending_thinking: RwLock<Vec<crate::reasoning::ThinkingBlock>>,
 }
 
 impl StateManager {
@@ -169,13 +186,18 @@ impl StateManager {
             revision: AtomicU64::new(0),
             // Default `true` — matches `resolve_preserve_reasoning`'s default
             // (design §2.1: "Unset anywhere → `true`: on Anthropic, replaying
-            // thinking is what the API wants"). The Anthropic agent-build
-            // path is the only thing that consults `set_wire_reasoning` —
-            // it explicitly flips the gate off when the active provider
-            // is not Anthropic (design §3.4 cross-provider gate). OpenRouter
-            // / Ollama / etc. likewise leave it on at construction and rely
-            // on `build_provider_config` to flip it off before any rebuild.
+            // thinking is what the API wants"). The agent-build paths
+            // explicitly set this from `ProviderInfo` after `create_provider`
+            // returns; a non-Anthropic provider flips the gate off so a
+            // loaded Claude transcript cannot leak signatures onto a
+            // foreign wire.
             wire_reasoning: RwLock::new(true),
+            // Default `false` — matches `resolve_display_reasoning`'s default
+            // (design §5: thinking is invisible by default). Set from
+            // `ProviderInfo` at the same sites as `wire_reasoning` so the
+            // web snapshot is gated server-side.
+            display_reasoning: RwLock::new(false),
+            pending_thinking: RwLock::new(Vec::new()),
         }
     }
 
@@ -776,8 +798,10 @@ impl StateManager {
     /// ```
     pub fn subscribe(&self) -> mpsc::Receiver<AppState> {
         let (sender, receiver) = mpsc::channel(STATE_SUBSCRIBER_BUFFER);
-        // Send current state immediately so subscriber is up-to-date
-        let current = self.state.read().unwrap().clone();
+        // Send current state immediately so subscriber is up-to-date.
+        // Apply the same display-reasoning gate as every broadcast.
+        let mut current = self.state.read().unwrap().clone();
+        self.strip_thinking_from_app_state(&mut current);
         let _ = sender.try_send(current);
         self.subscribers.write().unwrap().push(sender);
         receiver
@@ -1013,7 +1037,8 @@ impl StateManager {
         // `notify_update`, so this is the single source of truth.
         self.revision.fetch_add(1, Ordering::Release);
 
-        let state = state.clone();
+        let mut state = state.clone();
+        self.strip_thinking_from_app_state(&mut state);
         let mut dead = Vec::new();
         let mut subs = self.subscribers.write().unwrap();
         for (i, sender) in subs.iter().enumerate() {
@@ -1025,6 +1050,20 @@ impl StateManager {
         // Remove dead subscribers in reverse order
         for i in dead.into_iter().rev() {
             subs.remove(i);
+        }
+    }
+
+    /// Server-side gate for `display_reasoning` (design §5). When the gate
+    /// is closed, clears every `ChatMessage.thinking` vector on the
+    /// provided `AppState` clone so the broadcast snapshot contains no
+    /// thinking field (the custom serializer skips empty vecs). The
+    /// persisted state and the LLM wire are untouched.
+    fn strip_thinking_from_app_state(&self, state: &mut AppState) {
+        let display_reasoning = *self.display_reasoning.read().unwrap();
+        if !display_reasoning {
+            for msg in &mut state.chat.messages {
+                msg.thinking.clear();
+            }
         }
     }
 
@@ -1674,6 +1713,7 @@ impl StateManager {
     /// every wire request, including the first one of a new prompt, so this
     /// site doesn't need its own check. See `mid-compaction.md` § 3 Step 4.
     pub fn add_user_message(&self, content: String) {
+        self.clear_pending_thinking();
         let msg = ChatMessage::user(content);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -1686,6 +1726,7 @@ impl StateManager {
     /// renderer can style the row and the transcript records which
     /// background processes contributed.
     pub fn add_user_message_from_background(&self, content: String, proc_ids: Vec<u32>) {
+        self.clear_pending_thinking();
         let msg = ChatMessage::user_from_background(content, proc_ids);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -1702,6 +1743,7 @@ impl StateManager {
         content: String,
         attachments: Vec<crate::vision::ImageAttachment>,
     ) {
+        self.clear_pending_thinking();
         let msg = ChatMessage::user_with_attachments(content, attachments);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -1710,15 +1752,34 @@ impl StateManager {
     }
 
     /// One place builds the assistant ChatMessage, so a new field can never be
-    /// forgotten by half the callers.
+    /// forgotten by half the callers. For the orchestrator lane, also
+    /// consumes any `pending_thinking` staged by the earlier
+    /// `CompletionResponse` event and attaches it to this message, avoiding
+    /// a separate empty-content row (CONCERN 6).
     fn push_assistant(
         &self,
         source: MessageSource,
         content: String,
         thinking: Vec<crate::reasoning::ThinkingBlock>,
     ) {
+        let is_orchestrator = source.is_orchestrator_lane();
         let mut msg = ChatMessage::agent(content).with_source(source);
-        msg.thinking = thinking;
+        msg.thinking = if is_orchestrator {
+            // Adopt whatever the turn's `CompletionResponse` staged, unless the
+            // caller supplied blocks itself — an explicit argument always wins,
+            // and `take_` clears the staging slot either way so the blocks can
+            // never leak onto a later turn.
+            let staged = self.take_pending_thinking();
+            if thinking.is_empty() {
+                staged
+            } else {
+                thinking
+            }
+        } else {
+            // Sub-agent lane: its blocks ride on its own row and it must not
+            // consume the orchestrator's staged set.
+            thinking
+        };
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
             tracing::error!("Failed to persist assistant message: {}", e);
@@ -1771,6 +1832,34 @@ impl StateManager {
         *self.wire_reasoning.write().unwrap() = on;
     }
 
+    /// Display-gate bool set from `ProviderInfo.display_reasoning`.
+    ///
+    /// When false (the default), every web snapshot broadcast strips
+    /// `ChatMessage.thinking` from the cloned `AppState` before it
+    /// reaches subscribers. Signatures are never transmitted either way.
+    pub fn set_display_reasoning(&self, on: bool) {
+        *self.display_reasoning.write().unwrap() = on;
+    }
+
+    /// Stage captured thinking blocks for the orchestrator's next assistant
+    /// message. Used by `process_event_for_ui` when the `CompletionResponse`
+    /// event arrives before the prose row is appended.
+    pub fn stage_thinking_for_next_assistant(
+        &self,
+        thinking: Vec<crate::reasoning::ThinkingBlock>,
+    ) {
+        let mut pending = self.pending_thinking.write().unwrap();
+        pending.extend(thinking);
+    }
+
+    fn clear_pending_thinking(&self) {
+        self.pending_thinking.write().unwrap().clear();
+    }
+
+    fn take_pending_thinking(&self) -> Vec<crate::reasoning::ThinkingBlock> {
+        std::mem::take(&mut *self.pending_thinking.write().unwrap())
+    }
+
     /// Add a tool call message to chat and persist immediately.
     ///
     /// `source` tags the producing lane: [`MessageSource::Human`] for the
@@ -1784,7 +1873,11 @@ impl StateManager {
         args: String,
         call_id: Option<String>,
     ) {
-        let msg = ChatMessage::tool_call(&tool_name, &args, call_id).with_source(source);
+        let is_orchestrator = source.is_orchestrator_lane();
+        let mut msg = ChatMessage::tool_call(&tool_name, &args, call_id).with_source(source);
+        if is_orchestrator {
+            msg.thinking = self.take_pending_thinking();
+        }
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
             tracing::error!("Failed to persist tool call: {}", e);
@@ -1838,20 +1931,14 @@ impl StateManager {
 
         // If the very last message of the orchestrator's live context is a User
         // message, exclude it. It will be supplied separately as the prompt
-        // argument to prompt_with_history(). Only exclude it when it's truly
-        // trailing — if there are assistant/tool messages after it, it's part of
-        // the conversation history and must be kept.
-        //
-        // EXCEPTION (contract 10, design §6.1): once compaction has touched this
-        // conversation, "trailing user" is no longer reliably the dispatch
-        // path's current turn — the model has already seen a compacted
-        // summary, so a User row is just another uncompacted orchestrator
-        // turn that must reach the wire. Without this exception a
-        // post-compaction transcript would lose the freshest user turn in
-        // every `/load` resume. See the
-        // `compaction_drops_compacted_messages_but_preserves_survivor_messages`
-        // test in `tests/scenarios/reasoning_preservation.rs`.
-        let any_compacted_in_chat = state.chat.messages.iter().any(|m| m.compacted);
+        // argument to prompt_with_history() (or by the post-compaction
+        // resumption path), so including it here would duplicate the current
+        // turn. Only exclude it when it's truly trailing — if there are
+        // assistant/tool messages after it, it's part of the conversation
+        // history and must be kept. This applies even after compaction:
+        // `build_current_turn_message` already returns the latest non-compacted
+        // user message as the prompt, and `build_resumption_for_compaction`
+        // supplies the last live message itself.
         let last_live = state
             .chat
             .messages
@@ -1859,13 +1946,9 @@ impl StateManager {
             .enumerate()
             .rev()
             .find(|(_, msg)| msg.is_orchestrator_context());
-        let skip_last_idx = if any_compacted_in_chat {
-            None
-        } else {
-            last_live
-                .filter(|(_, msg)| msg.role == MessageRole::User)
-                .map(|(i, _)| i)
-        };
+        let skip_last_idx = last_live
+            .filter(|(_, msg)| msg.role == MessageRole::User)
+            .map(|(i, _)| i);
 
         let live: Vec<&crate::ui::app_state::ChatMessage> = state
             .chat

@@ -3873,6 +3873,8 @@ mod model_popup_tests {
             kind: ProviderType::OpenRouter,
             api_key: Some("sk-or-test".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![
                 ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),

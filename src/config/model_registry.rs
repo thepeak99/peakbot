@@ -21,6 +21,7 @@ use crate::config::{
     AnthropicConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig, OpenRouterConfig, ProviderConfig,
     ProviderType,
 };
+use crate::providers::{resolve_display_reasoning, resolve_preserve_reasoning};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -46,6 +47,17 @@ pub struct ProviderEntry {
     /// Models exposed by this provider.
     #[serde(default)]
     pub models: Vec<ModelEntry>,
+    /// Provider-wide override for `preserve_reasoning`. When `Some`, it
+    /// outranks every per-model `preserve_reasoning` value; when `None`, each
+    /// model's own value applies. This is the escape hatch for a deployment
+    /// where thinking blocks 400 across every Anthropic model.
+    #[serde(default)]
+    pub preserve_reasoning: Option<bool>,
+    /// Provider-wide override for `display_reasoning`. When `Some`, it
+    /// outranks every per-model `display_reasoning` value; when `None`, each
+    /// model's own value controls whether thinking text reaches the browser.
+    #[serde(default)]
+    pub display_reasoning: Option<bool>,
 }
 
 /// One model declared inside a provider's `models:` list.
@@ -446,12 +458,18 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
             max_tokens: model.max_tokens.unwrap_or(default_max_tokens()),
             prompt_caching: model.prompt_caching.clone().unwrap_or_default(),
             vision: model.vision,
-            // Per-model value lifts into the provider config so the runtime
-            // resolution helper sees the model side in one place; the provider
-            // override (None → defer to model) is consulted via the same
-            // AnthropicConfig field at wire-build time.
-            preserve_reasoning: Some(model.preserve_reasoning),
-            display_reasoning: Some(model.display_reasoning),
+            // Resolve model vs provider override here so the runtime path just
+            // reads the resolved boolean. The provider override wins per
+            // design §2.1; unset defaults to `true` for capture and `false`
+            // for display.
+            preserve_reasoning: Some(resolve_preserve_reasoning(
+                Some(model.preserve_reasoning),
+                prov.preserve_reasoning,
+            )),
+            display_reasoning: Some(resolve_display_reasoning(
+                Some(model.display_reasoning),
+                prov.display_reasoning,
+            )),
         }),
         ProviderType::LlamaCpp => ProviderConfig::LlamaCpp(LlamaCppConfig {
             api_key: prov.api_key.clone(),
@@ -506,6 +524,8 @@ mod tests {
             kind: ProviderType::OpenRouter,
             api_key: Some("sk-or-test".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![
                 ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),
@@ -541,6 +561,8 @@ mod tests {
             kind: ProviderType::OpenAI,
             api_key: Some("sk-test".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![
                 ModelEntry {
                     name: "gpt-4o".into(),
@@ -614,6 +636,8 @@ mod tests {
             kind: ProviderType::LlamaCpp,
             api_key: Some("sk-test".into()),
             base_url: Some("https://ai.patchnotes.com/v1".into()),
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![ModelEntry {
                 name: "minimax/MiniMax-M2.7".into(),
                 alias: None,
@@ -733,6 +757,8 @@ mod tests {
             kind: ProviderType::OpenRouter,
             api_key: Some("sk-or-test".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![ModelEntry {
                 name: "minimax/MiniMax-M2.7".into(),
                 alias: None,
@@ -764,6 +790,8 @@ mod tests {
             kind: ProviderType::Ollama,
             api_key: None,
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![ModelEntry {
                 name: "qwen2.5-coder:14b".into(),
                 alias: None,
@@ -793,6 +821,8 @@ mod tests {
             kind: ProviderType::OpenRouter,
             api_key: Some("sk".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![
                 ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),
@@ -848,6 +878,8 @@ mod tests {
             kind: ProviderType::LlamaCpp,
             api_key: Some("sk".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![ModelEntry {
                 name: "minimax/MiniMax-M2.7".into(),
                 alias: None,
@@ -1019,6 +1051,47 @@ models:
         // Defaults: preserve=true, display=false.
         assert_eq!(prov.models[0].preserve_reasoning, true);
         assert_eq!(prov.models[0].display_reasoning, false);
+    }
+
+    /// Provider-level `preserve_reasoning: false` outranks a per-model
+    /// `preserve_reasoning: true`, and provider-level `display_reasoning: true`
+    /// outranks a per-model `display_reasoning: false` (design §2.1).
+    #[test]
+    fn provider_level_reasoning_override_outranks_model_level() {
+        let yaml = "
+name: local
+type: anthropic
+base_url: http://localhost:8080
+preserve_reasoning: false
+display_reasoning: true
+models:
+  - name: claude-think
+    alias: think
+    preserve_reasoning: true
+    display_reasoning: false
+";
+        let prov: ProviderEntry =
+            serde_yaml::from_str(yaml).expect("provider-level reasoning overrides parse");
+        assert_eq!(prov.preserve_reasoning, Some(false));
+        assert_eq!(prov.display_reasoning, Some(true));
+
+        let reg = ModelRegistry::build(std::slice::from_ref(&prov), Some("think"))
+            .expect("registry builds");
+        match &reg.resolve("think").unwrap().provider_config {
+            ProviderConfig::Anthropic(c) => {
+                assert_eq!(
+                    c.preserve_reasoning,
+                    Some(false),
+                    "provider preserve=false must outrank model preserve=true"
+                );
+                assert_eq!(
+                    c.display_reasoning,
+                    Some(true),
+                    "provider display=true must outrank model display=false"
+                );
+            }
+            other => panic!("expected Anthropic config, got {other:?}"),
+        }
     }
 
     // ── find_by_wire_id ──────────────────────────────────────────────────

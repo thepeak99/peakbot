@@ -194,6 +194,8 @@ fn two_registries_with_shared_reviewer() -> (SubAgentRegistry, SubAgentRegistry)
         kind: ProviderType::OpenRouter,
         api_key: Some("sk-test".into()),
         base_url: None,
+        preserve_reasoning: None,
+        display_reasoning: None,
         models: vec![
             ModelEntry {
                 name: "google/gemini-2.0-flash-001".into(),

@@ -25,11 +25,11 @@
 #![allow(clippy::needless_borrow)]
 
 use peakbot::storage::{ConversationStorage, FileStorage, InMemoryStorage};
-use peakbot::ui::app_state::{ChatMessage, MessageRole, MessageSource};
+use peakbot::ui::app_state::{MessageRole, MessageSource};
 use peakbot::{Conversation, StateManager};
 use rig_core::completion::message::{
     AssistantContent, Message as RigMessage, Reasoning, ReasoningContent, Text, ToolCall,
-    ToolFunction,
+    ToolFunction, UserContent,
 };
 use rig_core::one_or_many::OneOrMany;
 use std::sync::Arc;
@@ -475,17 +475,65 @@ fn compaction_drops_compacted_messages_but_preserves_survivor_messages() {
     sm.add_user_message("Latest question.".to_string());
 
     let history = sm.get_agent_history();
+    let current_turn = sm
+        .build_current_turn_message()
+        .expect("latest non-compacted user is the current turn prompt");
 
-    // The compacted user message must NOT appear in the wire.
-    let user_msgs: Vec<&RigMessage> = history
+    // The compacted user message must NOT appear in the wire, and the trailing
+    // user must not appear in `history` either: it is the *current turn*, which
+    // the dispatch path supplies separately as the `prompt` argument of
+    // `prompt_with_history`. So only "Question 1" survives in history.
+    //
+    // (This assertion used to expect 2 — that was written against a short-lived
+    // "don't strip the trailing user once anything is compacted" exception,
+    // which duplicated the current turn on the wire: once inside `history`,
+    // once as the prompt. The exception is gone; see the "exactly once" check
+    // below, which is the real contract.)
+    let history_users: Vec<&RigMessage> = history
         .iter()
         .filter(|m| matches!(m, RigMessage::User { .. }))
         .collect();
     assert_eq!(
-        user_msgs.len(),
-        2,
-        "compacted user message must be excluded from the wire (got {} user messages)",
-        user_msgs.len(),
+        history_users.len(),
+        1,
+        "compacted user message must be excluded from history, and the trailing user \
+         must be stripped because it is re-supplied as the prompt (got {} user messages \
+         in history)",
+        history_users.len(),
+    );
+
+    // The latest user message survives exactly once: stripped from history
+    // and re-supplied as the current turn prompt, not duplicated and not lost.
+    let all_user_texts: Vec<String> = history
+        .iter()
+        .chain(std::iter::once(&current_turn))
+        .filter_map(|m| match m {
+            RigMessage::User { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !all_user_texts
+            .iter()
+            .any(|t| t.contains("Follow-up to be compacted")),
+        "compacted user text must never reach the wire"
+    );
+    assert_eq!(
+        all_user_texts
+            .iter()
+            .filter(|t| t.contains("Latest question."))
+            .count(),
+        1,
+        "latest user message must appear exactly once across history + prompt, not duplicated"
     );
 }
 
@@ -626,37 +674,87 @@ fn knob_off_drops_thinking_from_wire() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Contract 13 — Display default invisible.
+// Contract 13 — Display default invisible (server-side gating).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// With `display_reasoning == false` (the default), the web state snapshot
-/// JSON must contain no `thinking` field on message rows. With it true,
-/// the text is included but the signature is NEVER sent — signatures are
-/// opaque credentials; sending them to the browser is a credential leak.
+/// pushed to subscribers via `StateManager::subscribe` must contain no
+/// `thinking` field on any `ChatMessage` row. With it true, the text is
+/// included but the signature is NEVER sent — signatures are opaque
+/// credentials; sending them to the browser is a credential leak.
 ///
-/// The wire-builder lives on the Rust backend; the `thinking` field is
-/// `skip_serializing_if = "Vec::is_empty"`. This test asserts the
-/// serialisation contract independent of the transport.
+/// This pins the server-side gate (BLOCKER 2) end-to-end: the
+/// `strip_thinking_from_app_state` helper inside `notify_update` /
+/// `subscribe` clears `thinking` on every broadcast clone when the gate is
+/// closed. Signatures never reach the wire regardless of the gate.
 #[test]
 fn display_default_drops_thinking_from_snapshot_and_never_leaks_signature() {
-    // Off: empty Vec → no field on the wire.
-    let m_off = ChatMessage::agent("hi".into());
-    let json_off = serde_json::to_string(&m_off).expect("encode");
+    // Subscribing first and draining the initial push makes this
+    // deterministic without any sleeping: `notify_update` pushes through
+    // `mpsc::Sender::try_send` synchronously on the mutating thread, so the
+    // snapshot is already queued by the time the `add_*` call returns.
+
+    // ── Off: default gate (false) — the broadcast must carry no thinking ──
+    let sm_off = StateManager::new();
+    let mut rx_off = sm_off.subscribe();
+    let _initial = rx_off.try_recv().expect("subscribe pushes initial state");
+
+    sm_off.add_assistant_message_with_thinking(
+        MessageSource::Human,
+        "hi".into(),
+        vec![peakbot::reasoning::ThinkingBlock::Thinking {
+            text: "thinking text not for browser".into(),
+            signature: FAKE_SIGNATURE.into(),
+        }],
+    );
+
+    let snapshot_off = rx_off
+        .try_recv()
+        .expect("a snapshot must be broadcast after add_assistant_message_with_thinking");
+    let json_off = serde_json::to_string(&snapshot_off).expect("encode");
     assert!(
         !json_off.contains("\"thinking\""),
         "with display_reasoning=false, the snapshot must not contain a `thinking` field; got: {json_off}",
     );
+    assert!(
+        !json_off.contains("thinking text not for browser"),
+        "with display_reasoning=false, thinking text must not leak; got: {json_off}",
+    );
 
-    // On: the field IS present, contains only text, never the signature.
-    let mut m_on = ChatMessage::agent("hi".into());
-    m_on.thinking = vec![peakbot::reasoning::ThinkingBlock::Thinking {
-        text: "user-readable thinking".into(),
-        signature: FAKE_SIGNATURE.into(),
-    }];
-    let json_on = serde_json::to_string(&m_on).expect("encode");
+    // The gate is display-only: the blocks are still on the live state (and
+    // therefore still reach the LLM wire via `get_agent_history`).
+    assert!(
+        sm_off
+            .get_state()
+            .chat
+            .messages
+            .iter()
+            .any(|m| !m.thinking.is_empty()),
+        "the display gate must not strip blocks from the live state — the wire needs them",
+    );
+
+    // ── On: gate open — the text rides along, the signature never does ──
+    let sm_on = StateManager::new();
+    sm_on.set_display_reasoning(true);
+    let mut rx_on = sm_on.subscribe();
+    let _initial = rx_on.try_recv().expect("subscribe pushes initial state");
+
+    sm_on.add_assistant_message_with_thinking(
+        MessageSource::Human,
+        "hi".into(),
+        vec![peakbot::reasoning::ThinkingBlock::Thinking {
+            text: "user-readable thinking".into(),
+            signature: FAKE_SIGNATURE.into(),
+        }],
+    );
+
+    let snapshot_on = rx_on
+        .try_recv()
+        .expect("a snapshot must be broadcast after add_assistant_message_with_thinking");
+    let json_on = serde_json::to_string(&snapshot_on).expect("encode");
     assert!(
         json_on.contains("\"thinking\""),
-        "the thinking field must be present when populated",
+        "the thinking field must be present when display_reasoning=true; got: {json_on}",
     );
     assert!(
         !json_on.contains(FAKE_SIGNATURE),
@@ -664,7 +762,7 @@ fn display_default_drops_thinking_from_snapshot_and_never_leaks_signature() {
     );
     assert!(
         json_on.contains("user-readable thinking"),
-        "the text must reach the browser when display_reasoning=true",
+        "the text must reach the browser when display_reasoning=true; got: {json_on}",
     );
 }
 

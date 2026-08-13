@@ -142,25 +142,6 @@ impl<S: ConversationStorage> ConversationManager<S> {
         Ok(())
     }
 
-    /// Add an assistant message carrying thinking blocks to the current
-    /// conversation. Same persistence semantics as
-    /// [`Conversation::add_assistant_message_with_thinking`]; the blocks
-    /// ride on the assistant turn and replay verbatim at the wire boundary.
-    pub fn add_assistant_message_with_thinking(
-        &mut self,
-        content: String,
-        thinking: Vec<crate::reasoning::ThinkingBlock>,
-    ) -> Result<()> {
-        if let Some(ref mut conv) = self.current_conversation {
-            conv.add_assistant_message_with_thinking(content, thinking);
-
-            if self.config.auto_save {
-                self.save()?;
-            }
-        }
-        Ok(())
-    }
-
     /// Add a tool call to the current conversation (without auto-save)
     pub fn add_tool_call(
         &mut self,

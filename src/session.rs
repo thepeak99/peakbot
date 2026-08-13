@@ -253,6 +253,16 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         &deps.config.timeouts,
     )?;
 
+    // Thread the resolved reasoning gates into the shared StateManager.
+    // These are the same booleans that ride in `ProviderInfo`; setting them
+    // here (right after the agent is built) is the boot half of the pair —
+    // `AgentRunner::rebuild_agent_for_resolved` is the other, and between
+    // them every provider swap re-derives the gates from the provider that
+    // now owns the wire. See that site for the sub-agent semantics.
+    state_manager
+        .set_wire_reasoning(provider_info.name == "anthropic" && provider_info.preserve_reasoning);
+    state_manager.set_display_reasoning(provider_info.display_reasoning);
+
     // Stamp the wire identity `(provider_name, model)` and the display
     // alias for the booted model (resumed model or registry default).
     state_manager.set_model(provider_info.model.clone());
@@ -406,6 +416,8 @@ mod tests {
             kind: ProviderType::Ollama,
             api_key: None,
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![ModelEntry {
                 name: "llama3".to_string(),
                 alias: Some("local".to_string()),
@@ -645,6 +657,8 @@ pipelines:
             kind: ProviderType::OpenRouter,
             api_key: Some("sk-test".into()),
             base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
             models: vec![
                 ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),

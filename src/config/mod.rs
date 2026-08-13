@@ -799,6 +799,8 @@ impl Config {
                 extra,
                 caching,
                 vision,
+                preserve_reasoning,
+                display_reasoning,
             ) = describe_legacy(&self.provider);
             let synthetic_alias = "default".to_string();
             let provider_entry = ProviderEntry {
@@ -806,6 +808,8 @@ impl Config {
                 kind: kind.clone(),
                 api_key,
                 base_url,
+                preserve_reasoning,
+                display_reasoning,
                 models: vec![ModelEntry {
                     name: model_name,
                     alias: Some(synthetic_alias.clone()),
@@ -815,8 +819,8 @@ impl Config {
                     prompt_caching: caching,
                     vision,
                     context_size: None,
-                    preserve_reasoning: true,
-                    display_reasoning: false,
+                    preserve_reasoning: preserve_reasoning.unwrap_or(true),
+                    display_reasoning: display_reasoning.unwrap_or(false),
                 }],
             };
             return ModelRegistry::build(
@@ -869,6 +873,8 @@ fn describe_legacy(
     Option<serde_json::Value>,
     Option<AnthropicCaching>,
     Option<bool>,
+    Option<bool>,
+    Option<bool>,
 ) {
     match p {
         ProviderConfig::OpenRouter(c) => (
@@ -881,6 +887,8 @@ fn describe_legacy(
             None,
             None,
             c.vision,
+            None,
+            None,
         ),
         ProviderConfig::OpenAI(c) => (
             ProviderType::OpenAI,
@@ -892,6 +900,8 @@ fn describe_legacy(
             None,
             None,
             c.vision,
+            None,
+            None,
         ),
         ProviderConfig::Anthropic(c) => (
             ProviderType::Anthropic,
@@ -903,6 +913,8 @@ fn describe_legacy(
             None,
             Some(c.prompt_caching.clone()),
             c.vision,
+            c.preserve_reasoning,
+            c.display_reasoning,
         ),
         ProviderConfig::LlamaCpp(c) => (
             ProviderType::LlamaCpp,
@@ -914,6 +926,8 @@ fn describe_legacy(
             c.extra_params.clone(),
             None,
             c.vision,
+            None,
+            None,
         ),
         ProviderConfig::Ollama(c) => (
             ProviderType::Ollama,
@@ -926,6 +940,8 @@ fn describe_legacy(
             None,
             None,
             c.vision,
+            None,
+            None,
         ),
     }
 }
@@ -2272,6 +2288,8 @@ provider:
                 kind: ProviderType::OpenRouter,
                 api_key: Some("sk".into()),
                 base_url: None,
+                preserve_reasoning: None,
+                display_reasoning: None,
                 models: vec![ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),
                     alias: Some("sonnet".into()),
@@ -2304,6 +2322,8 @@ provider:
                 kind: ProviderType::OpenRouter,
                 api_key: None,
                 base_url: None,
+                preserve_reasoning: None,
+                display_reasoning: None,
                 models: vec![ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),
                     alias: Some("sonnet".into()),
@@ -2352,6 +2372,8 @@ provider:
                 kind: ProviderType::OpenRouter,
                 api_key: Some("sk-or-real-key".into()),
                 base_url: None,
+                preserve_reasoning: None,
+                display_reasoning: None,
                 models: vec![ModelEntry {
                     name: "anthropic/claude-3.7-sonnet".into(),
                     alias: Some("sonnet".into()),
