@@ -60,7 +60,8 @@ pub use pipeline::{
 #[cfg(feature = "mock")]
 pub use providers::create_mock_agent;
 pub use providers::{
-    CompactionModel, DynAgent, ProviderInfo, create_compaction_model, create_provider,
+    CompactionModel, DynAgent, ProviderInfo, build_anthropic_session_hook, create_compaction_model,
+    create_provider,
 };
 
 use rig_core::completion::{Message, PromptError};
@@ -2368,15 +2369,6 @@ impl AgentRunner {
                     sm.add_assistant_message_with_thinking(source, content, thinking);
                 } else if !source.is_orchestrator_lane() && !content.trim().is_empty() {
                     sm.add_assistant_message_sourced(source, content);
-                } else if !thinking.is_empty() {
-                    // Orchestrator lane with thinking but no fresh prose here
-                    // (the prose landed via `prompt_with_history`'s return).
-                    // Stage the blocks on StateManager so the upcoming prose
-                    // row (or the first tool-call row if there is no prose)
-                    // carries them in a single ChatMessage — no phantom empty
-                    // assistant row (CONCERN 6). The LLM wire is unchanged
-                    // because `get_agent_history` gathers blocks across the run.
-                    sm.stage_thinking_for_next_assistant(thinking);
                 }
             }
             AgentEvent::ToolCall {

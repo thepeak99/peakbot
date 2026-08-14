@@ -83,8 +83,21 @@ export function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
     a.timestamp === b.timestamp &&
     a.toolName === b.toolName &&
     a.fromBackground === b.fromBackground &&
-    a.subAgentRole === b.subAgentRole
+    a.subAgentRole === b.subAgentRole &&
+    sameThinking(a.thinking, b.thinking)
   );
+}
+
+// Array comparison for the optional `thinking` field. Length first (cheap
+// short-circuit), then per-index string equality. Reference compare wouldn't
+// work — `adaptMessage` allocates a fresh array per call at every render, so
+// two equal transcripts would always allocate different objects.
+function sameThinking(a: string[] | undefined, b: string[] | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 // Unexported renderer. Wrapped by `memo` below so that, with the value comparator
@@ -117,6 +130,9 @@ function MessageView({ message }: { message: ChatMessage }) {
         )}
         <span className="ml-auto tabular-nums text-zinc-600">{message.timestamp}</span>
       </div>
+      {message.thinking && message.thinking.length > 0 && (
+        <ThinkingBlocks blocks={message.thinking} />
+      )}
       {isMarkdown(message.role) ? (
         <div className="markdown-body text-sm leading-relaxed text-zinc-200">
           <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} rehypePlugins={[rehypeHighlight]}>
@@ -133,6 +149,40 @@ function MessageView({ message }: { message: ChatMessage }) {
         </div>
       )}
     </div>
+  );
+}
+
+// Anthropic thinking blocks, rendered as a collapsible group above the
+// assistant's prose. Native `<details>` is collapsed-by-default when the `open`
+// attribute is absent — no JS state, no dependency. One `<details>` per
+// `Message` (not per block): collapsing the group is the common case, and
+// splitting it into N toggles just hides each block behind a click. Inside the
+// group each block is a separate `whitespace-pre-wrap` paragraph so individual
+// blocks stay distinct visually if the user expands.
+//
+// The contents are rendering as raw text, not markdown — thinking is reasoning
+// scratchpad, not authored prose, so code fences / links / headings would be
+// noise at best and misleading at worst.
+function ThinkingBlocks({ blocks }: { blocks: string[] }) {
+  const summary =
+    blocks.length === 1 ? "Thinking" : `Thinking (${blocks.length})`;
+  return (
+    <details className="mb-1.5 rounded border border-zinc-800/60 bg-zinc-900/30 px-2.5 py-1.5 text-[11px] leading-relaxed text-zinc-400 group">
+      <summary className="flex cursor-pointer list-none items-center gap-1.5 font-medium text-zinc-500 select-none marker:hidden">
+        <span aria-hidden className="text-[9px] transition-transform group-open:rotate-90">▸</span>
+        {summary}
+      </summary>
+      <div className="mt-1.5 space-y-1.5 border-t border-zinc-800/60 pt-1.5">
+        {blocks.map((text, i) => (
+          // Index is a stable identity within the message — append-only,
+          // never reordered, and sameMessage skips re-renders when the array
+          // content is unchanged.
+          <div key={i} className="whitespace-pre-wrap break-words font-mono text-[11px] text-zinc-400">
+            {text}
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 

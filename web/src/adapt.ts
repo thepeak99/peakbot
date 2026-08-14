@@ -51,6 +51,16 @@ function toClock(iso: string): string {
 export function adaptMessage(m: WireChatMessage): ChatMessage {
   // ToolCall/ToolResult carry structured fields; the `content` already holds
   // the display string the TUI renders, so we pass it through verbatim.
+  // Thinking blocks are flattened to plain strings — the wire serializer has
+  // already dropped signatures and Redacted entries (src/ui/app_state.rs
+  // `serialize_thinking_for_wire`), so each entry is `{ text: string }`. An
+  // empty array is normalised to undefined so the renderer can use a single
+  // truthy check and sameMessage can compare "absent" with "empty" the same
+  // way it already does for the other optional fields.
+  const thinking =
+    m.thinking && m.thinking.length > 0
+      ? m.thinking.map((b) => b.text)
+      : undefined;
   return {
     role: ROLE_MAP[m.role] ?? "system",
     content: m.content ?? "",
@@ -59,6 +69,7 @@ export function adaptMessage(m: WireChatMessage): ChatMessage {
     fromBackground: m.source?.kind === "background",
     subAgentRole:
       m.source?.kind === "sub_agent" ? m.source.role : undefined,
+    thinking,
   };
 }
 

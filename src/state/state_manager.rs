@@ -1518,11 +1518,13 @@ impl StateManager {
                         call_id,
                         compacted,
                         source,
+                        thinking,
                         timestamp,
                     } => {
                         let mut m = ChatMessage::tool_call(tool_name, arguments, call_id.clone());
                         m.compacted = *compacted;
                         m.source = source.clone();
+                        m.thinking = thinking.clone();
                         m.timestamp = timestamp.with_timezone(&chrono::Local);
                         m
                     }
@@ -1638,6 +1640,7 @@ impl StateManager {
                             call_id: msg.call_id.clone(),
                             compacted: msg.compacted,
                             source: msg.source.clone(),
+                            thinking: msg.thinking.clone(),
                             timestamp: msg.timestamp.with_timezone(&chrono::Utc),
                         })
                     }
@@ -1753,9 +1756,9 @@ impl StateManager {
 
     /// One place builds the assistant ChatMessage, so a new field can never be
     /// forgotten by half the callers. For the orchestrator lane, also
-    /// consumes any `pending_thinking` staged by the earlier
-    /// `CompletionResponse` event and attaches it to this message, avoiding
-    /// a separate empty-content row (CONCERN 6).
+    /// consumes any `pending_thinking` staged by this turn's
+    /// `SessionHook::on_completion_response` and attaches it to this message,
+    /// avoiding a separate empty-content row (CONCERN 6).
     fn push_assistant(
         &self,
         source: MessageSource,
@@ -1842,14 +1845,26 @@ impl StateManager {
     }
 
     /// Stage captured thinking blocks for the orchestrator's next assistant
-    /// message. Used by `process_event_for_ui` when the `CompletionResponse`
-    /// event arrives before the prose row is appended.
+    /// message. Called synchronously from `SessionHook::on_completion_response`:
+    /// rig awaits that hook inline and `prompt_with_history` returns only
+    /// afterwards, so the next `push_assistant`/`add_tool_call` is guaranteed
+    /// to see what this staged.
+    ///
+    /// Replaces the slot rather than appending — a non-empty slot here always
+    /// means a consumer was skipped, and accumulating would splice one
+    /// response's reasoning onto another's row.
     pub fn stage_thinking_for_next_assistant(
         &self,
         thinking: Vec<crate::reasoning::ThinkingBlock>,
     ) {
         let mut pending = self.pending_thinking.write().unwrap();
-        pending.extend(thinking);
+        if !pending.is_empty() {
+            tracing::warn!(
+                dropped = pending.len(),
+                "overwriting staged thinking blocks — a consumer row was skipped"
+            );
+        }
+        *pending = thinking;
     }
 
     fn clear_pending_thinking(&self) {
@@ -4158,6 +4173,7 @@ mod tests {
             call_id: Some("call-1".into()),
             compacted: false,
             source: MessageSource::Human,
+            thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
         });
         conv.messages.push(Message::ToolCall {
@@ -4168,6 +4184,7 @@ mod tests {
             source: MessageSource::SubAgent {
                 role: "researcher".into(),
             },
+            thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
         });
         conv.messages.push(Message::ToolResult {
@@ -4314,6 +4331,7 @@ mod tests {
             call_id: Some("call-9".into()),
             compacted: false,
             source: MessageSource::Human,
+            thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
         });
 

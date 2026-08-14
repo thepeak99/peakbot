@@ -28,6 +28,14 @@ export interface WireChatMessage {
   call_id?: string;
   compacted?: boolean;
   source?: WireMessageSource;
+  /** Anthropic thinking blocks carried verbatim when `display_reasoning` is on
+   * (server-side gate, src/state/state_manager.rs). Only the display-shaped
+   * text reaches the browser — signatures and Redacted payloads are stripped
+   * at the wire serializer (src/ui/app_state.rs `serialize_thinking_for_wire`),
+   * and the whole field is omitted when empty. A message without `thinking`
+   * is the default (no `display_reasoning` or no blocks); absent ⇔ empty for
+   * the renderer. */
+  thinking?: { text: string }[];
 }
 
 export interface WireChat {

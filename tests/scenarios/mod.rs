@@ -3,6 +3,7 @@
 //! Each scenario file tests a specific domain through the full agent loop.
 //! Unit tests for individual components live in their respective source files.
 
+mod anthropic_provider_build;
 mod bash_tests;
 mod bg_tests;
 mod chat_render_tests;
@@ -18,6 +19,7 @@ mod persistence_tests;
 mod pipeline_tests;
 mod powershell_tests;
 mod queued_input_tests;
+mod reasoning_persistence;
 mod reasoning_preservation;
 mod state_only_in_outbound;
 mod stats_tests;

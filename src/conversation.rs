@@ -129,6 +129,12 @@ pub enum Message {
         compacted: bool,
         #[serde(default, skip_serializing_if = "MessageSource::is_human")]
         source: MessageSource,
+        /// Lossless Anthropic-style thinking blocks captured with the response
+        /// that requested this tool call — mirrors [`Message::Assistant`], and
+        /// is what makes reasoning survive `/load` on tool-call turns. Absent
+        /// in pre-existing files → `vec![]`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking: Vec<crate::reasoning::ThinkingBlock>,
         /// Timestamp when tool was called
         timestamp: DateTime<Utc>,
     },
@@ -197,6 +203,9 @@ impl Message {
     }
 
     /// Create a new tool call message
+    ///
+    /// Thinking blocks are attached by `sync_to_conversation` (which builds the
+    /// variant directly); callers of this constructor have none to give.
     pub fn tool_call(tool_name: String, arguments: String, call_id: Option<String>) -> Self {
         Message::ToolCall {
             tool_name,
@@ -204,6 +213,7 @@ impl Message {
             call_id,
             compacted: false,
             source: MessageSource::Human,
+            thinking: Vec::new(),
             timestamp: Utc::now(),
         }
     }
