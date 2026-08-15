@@ -4,3 +4,5 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- **Fixed overlapping messages in the chat transcript.** The virtualized list no longer wipes its measured row heights on container width changes, so rows keep their real heights instead of collapsing onto each other.
+
