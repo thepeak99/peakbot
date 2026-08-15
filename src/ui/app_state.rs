@@ -269,6 +269,21 @@ pub struct ChatMessage {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub thinking: Vec<crate::reasoning::ThinkingBlock>,
+
+    /// The model response that produced this row.
+    ///
+    /// Minted once per response by `StateManager::begin_response`; every
+    /// `ToolCall` row and the `Agent` row of that response carry the same
+    /// value. This is the ONLY thing that makes a response boundary visible
+    /// after the fact — it cannot be inferred from row adjacency (every
+    /// ToolCall follows a ToolResult).
+    ///
+    /// `None` means "unknown": a row persisted before this field existed, a
+    /// sub-agent row, or a row appended with no response open. Rows with
+    /// `None` NEVER contribute `Reasoning` to the wire — replaying a block
+    /// whose group is unknown is the 400 this field exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<u64>,
 }
 
 /// Server-side web-snapshot serializer: drop signatures and
@@ -347,6 +362,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Human,
+            response_id: None,
         }
     }
 
@@ -371,6 +387,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Human,
+            response_id: None,
         }
     }
 
@@ -392,6 +409,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Background { proc_ids },
+            response_id: None,
         }
     }
 
@@ -409,6 +427,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Human,
+            response_id: None,
         }
     }
 
@@ -426,6 +445,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Human,
+            response_id: None,
         }
     }
 
@@ -443,6 +463,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Human,
+            response_id: None,
         }
     }
 
@@ -465,6 +486,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Human,
+            response_id: None,
         }
     }
 
@@ -484,6 +506,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Human,
+            response_id: None,
         }
     }
 
@@ -506,6 +529,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Human,
+            response_id: None,
         }
     }
 
@@ -527,6 +551,7 @@ impl ChatMessage {
             compacted: false,
             thinking: Vec::new(),
             source: MessageSource::Human,
+            response_id: None,
         }
     }
 

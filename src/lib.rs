@@ -2375,13 +2375,15 @@ impl AgentRunner {
                 tool_name,
                 arguments,
                 call_id,
+                response_id,
                 ..
             } => {
                 // Indicator phase → show the tool name in the working banner
                 // (see `workin-baby.md` §6). Cleared on the matching result.
                 sm.set_status(Some(tool_name.clone()));
-                // Add to chat AND persist, stamped with the producing lane.
-                sm.add_tool_call(source, tool_name, arguments, call_id);
+                // Add to chat AND persist, stamped with the producing lane and
+                // the response that requested the call.
+                sm.add_tool_call(source, response_id, tool_name, arguments, call_id);
             }
             AgentEvent::ToolResult {
                 tool_name,
@@ -4768,7 +4770,6 @@ mod tests {
     #[tokio::test]
     async fn model_switch_anthropic_to_ollama_closes_wire_reasoning_gate() {
         use crate::reasoning::ThinkingBlock;
-        use crate::ui::app_state::MessageSource;
         use rig_core::completion::message::{AssistantContent, Message as RigMessage};
 
         let sm = StateManager::new_arc();
@@ -4776,14 +4777,15 @@ mod tests {
         // A transcript captured under Claude: one assistant turn carrying a
         // signed thinking block, plus a trailing user turn.
         sm.add_user_message("first question".into());
-        sm.add_assistant_message_with_thinking(
-            MessageSource::Human,
-            "answer".into(),
-            vec![ThinkingBlock::Thinking {
-                text: "deliberation".into(),
-                signature: "SIG-ANTHROPIC".into(),
-            }],
-        );
+        // Orchestrator lane: the blocks reach the row through the open
+        // response, which is also what stamps its `response_id` — a row with
+        // no response group never replays reasoning, so opening one is what
+        // makes the "gate open" half of this test observable at all.
+        sm.begin_response(vec![ThinkingBlock::Thinking {
+            text: "deliberation".into(),
+            signature: "SIG-ANTHROPIC".into(),
+        }]);
+        sm.add_assistant_message("answer".into());
         sm.add_user_message("second question".into());
 
         let has_reasoning = |history: &[RigMessage]| {
@@ -5560,6 +5562,7 @@ headers:
         sm.add_assistant_message("I'll run ls for you".to_string());
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
@@ -5660,6 +5663,7 @@ headers:
         sm.add_assistant_message("I'll run ls for you".to_string());
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
@@ -5768,6 +5772,7 @@ headers:
                     tool_name: "bash".to_string(),
                     arguments: r#"{"command":"ls"}"#.to_string(),
                     call_id: Some("c1".to_string()),
+                    response_id: None,
                     timestamp: chrono::Utc::now(),
                 },
             },
@@ -5804,6 +5809,7 @@ headers:
                     tool_name: "bash".to_string(),
                     arguments: "{}".to_string(),
                     call_id: None,
+                    response_id: None,
                     timestamp: chrono::Utc::now(),
                 },
             },

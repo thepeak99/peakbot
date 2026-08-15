@@ -115,6 +115,11 @@ pub enum Message {
         thinking: Vec<crate::reasoning::ThinkingBlock>,
         /// Timestamp when message was generated
         timestamp: DateTime<Utc>,
+        /// The model response that produced this row — mirrors
+        /// [`crate::ui::app_state::ChatMessage::response_id`]. `None` for
+        /// every pre-existing file; such rows never replay reasoning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<u64>,
     },
     /// Tool invocation (captures what the model asked the tool to do)
     ToolCall {
@@ -137,6 +142,11 @@ pub enum Message {
         thinking: Vec<crate::reasoning::ThinkingBlock>,
         /// Timestamp when tool was called
         timestamp: DateTime<Utc>,
+        /// The model response that requested this tool call — mirrors
+        /// [`crate::ui::app_state::ChatMessage::response_id`]. `None` for
+        /// every pre-existing file; such rows never replay reasoning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<u64>,
     },
     /// Tool execution result
     ToolResult {
@@ -185,6 +195,7 @@ impl Message {
             source: MessageSource::Human,
             thinking: Vec::new(),
             timestamp: Utc::now(),
+            response_id: None,
         }
     }
 
@@ -199,6 +210,7 @@ impl Message {
             source: MessageSource::Human,
             thinking,
             timestamp: Utc::now(),
+            response_id: None,
         }
     }
 
@@ -215,6 +227,7 @@ impl Message {
             source: MessageSource::Human,
             thinking: Vec::new(),
             timestamp: Utc::now(),
+            response_id: None,
         }
     }
 
@@ -1039,6 +1052,7 @@ mod tests {
             },
             thinking: Vec::new(),
             timestamp: Utc::now(),
+            response_id: None,
         });
         conv.messages.push(Message::User {
             content: "[bg output]".into(),
