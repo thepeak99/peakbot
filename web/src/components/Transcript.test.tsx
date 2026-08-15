@@ -319,6 +319,7 @@ beforeEach(() => {
     },
     set(this: Element, _value: number): void {
       // No-op: see comment above.
+      void _value;
     },
   });
   Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
@@ -360,11 +361,8 @@ afterEach(() => {
 // reach for. Typed locally so TypeScript is happy; the assignment uses
 // `globalThis` so the prototype getters above can read it.
 declare global {
-  // eslint-disable-next-line no-var
   var __realRowHeight: ((idx: number) => number) | undefined;
-  // eslint-disable-next-line no-var
   var __sectionEl: HTMLElement | undefined;
-  // eslint-disable-next-line no-var
   var __sectionWidth: number;
 }
 
@@ -416,7 +414,7 @@ function readLayout(realHeights: number[]): RowLayout[] {
     const idx = Number(el.getAttribute("data-index"));
     const style = (el as HTMLElement).style.transform;
     // The Transcript writes `transform: translateY(<start>px)` verbatim.
-    const m = /translateY\(([0-9.\-]+)px\)/.exec(style);
+    const m = /translateY\(([0-9.-]+)px\)/.exec(style);
     if (!m) continue;
     rows.push({
       index: idx,
