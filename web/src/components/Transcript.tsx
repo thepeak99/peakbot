@@ -87,18 +87,19 @@ export function Transcript({ messages, drawerOpen, ref }: Props) {
   useEffect(() => {
     const el = sectionRef.current;
     if (!el) return;
-    // Row heights depend on the width: text rewraps. Rows that are currently
-    // unmounted keep the height they were measured at, so after a resize,
-    // rotation or drawer toggle the total size is wrong until each row is
-    // visited again. Throw those measurements away on a width change (height
-    // changes are just the viewport growing — re-measuring on those would
-    // fight the virtualizer's own measurement pass).
+    // Rows are `w-full`, so when the section's width actually reflows the
+    // rows (window resize, breakpoint flip) the library's per-row
+    // ResizeObserver on `measureElement` re-measures them itself. Do NOT
+    // call `virtualizer.measure()` here: when the width changes WITHOUT
+    // reflowing the rows (overlay drawer) it wipes `itemSizeCache` and
+    // nothing re-measures them, so consecutive rows overlap. Keep the
+    // re-pin behavior — if a width change moved the scroll origin, the
+    // user is now off the bottom and needs to be re-snapped.
     let lastWidth = el.clientWidth;
     const observer = new ResizeObserver(() => {
       const width = el.clientWidth;
       if (width === lastWidth) return;
       lastWidth = width;
-      virtualizer.measure();
       if (pinnedRef.current) virtualizer.scrollToEnd();
     });
     observer.observe(el);
