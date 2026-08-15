@@ -1429,18 +1429,23 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             Vec::new()
         };
 
-        // Stage here, not from the event-processor task: rig awaits this hook
-        // inline and `prompt_with_history` only returns afterwards, so the main
-        // loop's `add_assistant_message` is guaranteed to see the blocks. The
-        // spawned task had no such happens-before edge and lost text-turn
-        // thinking. The gate is the lane predicate — sub-agent hooks DO carry a
-        // StateManager (`build_sub_agent`), so "no manager" would prove nothing.
-        if !thinking.is_empty()
-            && self.source.is_orchestrator_lane()
+        // Open the response here, not from the event-processor task: rig awaits
+        // this hook inline and `prompt_with_history` only returns afterwards, so
+        // the main loop's `add_assistant_message` is guaranteed to see the
+        // blocks. The spawned task had no such happens-before edge and lost
+        // text-turn thinking. The gate is the lane predicate — sub-agent hooks DO
+        // carry a StateManager (`build_sub_agent`), so "no manager" would prove
+        // nothing.
+        //
+        // Note there is deliberately no `!thinking.is_empty()` condition: a
+        // response that emitted no thinking still ends the previous response's
+        // group, and rows appended after it must NOT inherit the previous
+        // response's blocks.
+        if self.source.is_orchestrator_lane()
             && let Some(weak) = self.state_manager.as_ref()
             && let Some(sm) = weak.upgrade()
         {
-            sm.stage_thinking_for_next_assistant(thinking.clone());
+            sm.begin_response(thinking.clone());
         }
 
         if let Some(ref sender) = self.event_sender {
@@ -1510,10 +1515,23 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         args: &str,
     ) -> ToolCallHookAction {
         if let Some(ref sender) = self.event_sender {
+            // Stamp the call with the response that requested it. The
+            // transcript row is appended later by the event-processing task,
+            // which cannot recover this after the fact — off the orchestrator
+            // lane there is no response to name.
+            let response_id = if self.source.is_orchestrator_lane() {
+                self.state_manager
+                    .as_ref()
+                    .and_then(|weak| weak.upgrade())
+                    .and_then(|sm| sm.current_response_id())
+            } else {
+                None
+            };
             let event = AgentEvent::ToolCall {
                 tool_name: tool_name.to_string(),
                 arguments: args.to_string(),
                 call_id: tool_call_id.or(Some(internal_call_id.to_string())),
+                response_id,
                 timestamp: Utc::now(),
             };
             let _ = sender.send(SourcedEvent {

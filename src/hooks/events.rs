@@ -98,6 +98,13 @@ pub enum AgentEvent {
         arguments: String,
         /// Optional tool call ID
         call_id: Option<String>,
+        /// The model response that requested this call, captured at hook
+        /// time on the orchestrator lane. Carried on the event because the
+        /// transcript row is appended later, by the event-processing task,
+        /// which has no other way to know which response it belongs to.
+        /// `None` off the orchestrator lane and on pre-existing event logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<u64>,
         /// Timestamp when tool was called
         timestamp: DateTime<Utc>,
     },

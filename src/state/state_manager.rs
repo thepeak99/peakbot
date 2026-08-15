@@ -131,16 +131,18 @@ pub struct StateManager {
     /// broadcast to browsers. Signatures are never transmitted regardless.
     display_reasoning: RwLock<bool>,
 
-    // ── Pending thinking coalescence (design §4 / CONCERN 6) ───────────────
-    /// Captured Anthropic thinking blocks for the orchestrator's current
-    /// assistant turn. The `CompletionResponse` event arrives before the
-    /// prose is appended via `add_assistant_message`, so we stage the blocks
-    /// here and attach them to the first orchestrator message added for the
-    /// turn (prose or tool call). This avoids the phantom empty assistant
-    /// row that the previous implementation produced. The LLM wire is
-    /// unaffected because `get_agent_history` gathers thinking across the
-    /// run regardless of which `ChatMessage` row carries the blocks.
-    pending_thinking: RwLock<Vec<crate::reasoning::ThinkingBlock>>,
+    // ── Open response slot (design §4 / CONCERN 6) ─────────────────────────
+    /// The response currently being materialised into transcript rows.
+    /// See [`ResponseSlot`].
+    response: RwLock<ResponseSlot>,
+}
+
+/// The response currently being materialised into transcript rows.
+/// `id` is monotonic per process and never reset (a stale row can then
+/// never collide with a live response); `id == 0` means "no response yet".
+struct ResponseSlot {
+    id: u64,
+    thinking: Vec<crate::reasoning::ThinkingBlock>,
 }
 
 impl StateManager {
@@ -197,7 +199,10 @@ impl StateManager {
             // `ProviderInfo` at the same sites as `wire_reasoning` so the
             // web snapshot is gated server-side.
             display_reasoning: RwLock::new(false),
-            pending_thinking: RwLock::new(Vec::new()),
+            response: RwLock::new(ResponseSlot {
+                id: 0,
+                thinking: Vec::new(),
+            }),
         }
     }
 
@@ -1504,12 +1509,14 @@ impl StateManager {
                         source,
                         thinking,
                         timestamp,
+                        response_id,
                     } => {
                         let mut m = ChatMessage::agent(content.clone());
                         m.compacted = *compacted;
                         m.source = source.clone();
                         m.thinking = thinking.clone();
                         m.timestamp = timestamp.with_timezone(&chrono::Local);
+                        m.response_id = *response_id;
                         m
                     }
                     ConvMsg::ToolCall {
@@ -1520,12 +1527,14 @@ impl StateManager {
                         source,
                         thinking,
                         timestamp,
+                        response_id,
                     } => {
                         let mut m = ChatMessage::tool_call(tool_name, arguments, call_id.clone());
                         m.compacted = *compacted;
                         m.source = source.clone();
                         m.thinking = thinking.clone();
                         m.timestamp = timestamp.with_timezone(&chrono::Local);
+                        m.response_id = *response_id;
                         m
                     }
                     ConvMsg::ToolResult {
@@ -1551,6 +1560,21 @@ impl StateManager {
                     }
                 })
                 .collect();
+
+            // Resume response ids ABOVE everything the loaded transcript
+            // already used. Restarting from the in-memory counter would let a
+            // fresh response mint an id a persisted row already carries, and
+            // the rebuild helper would then splice two unrelated groups into
+            // one wire bundle — the original 400 in a new shape.
+            let persisted_high_water = messages
+                .iter()
+                .filter_map(|m| m.response_id)
+                .max()
+                .unwrap_or(0);
+            {
+                let mut slot = self.response.write().unwrap();
+                slot.id = slot.id.max(persisted_high_water);
+            }
 
             // Restore persisted session stats *before* dropping the conv guard
             // so we don't race with a concurrent save.
@@ -1630,6 +1654,7 @@ impl StateManager {
                         source: msg.source.clone(),
                         thinking: msg.thinking.clone(),
                         timestamp: msg.timestamp.with_timezone(&chrono::Utc),
+                        response_id: msg.response_id,
                     }),
                     MessageRole::ToolCall => {
                         let tool_name = msg.tool_name.clone()?;
@@ -1642,6 +1667,7 @@ impl StateManager {
                             source: msg.source.clone(),
                             thinking: msg.thinking.clone(),
                             timestamp: msg.timestamp.with_timezone(&chrono::Utc),
+                            response_id: msg.response_id,
                         })
                     }
                     MessageRole::ToolResult => {
@@ -1716,7 +1742,7 @@ impl StateManager {
     /// every wire request, including the first one of a new prompt, so this
     /// site doesn't need its own check. See `mid-compaction.md` § 3 Step 4.
     pub fn add_user_message(&self, content: String) {
-        self.clear_pending_thinking();
+        self.clear_response_thinking();
         let msg = ChatMessage::user(content);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -1729,7 +1755,7 @@ impl StateManager {
     /// renderer can style the row and the transcript records which
     /// background processes contributed.
     pub fn add_user_message_from_background(&self, content: String, proc_ids: Vec<u32>) {
-        self.clear_pending_thinking();
+        self.clear_response_thinking();
         let msg = ChatMessage::user_from_background(content, proc_ids);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -1746,7 +1772,7 @@ impl StateManager {
         content: String,
         attachments: Vec<crate::vision::ImageAttachment>,
     ) {
-        self.clear_pending_thinking();
+        self.clear_response_thinking();
         let msg = ChatMessage::user_with_attachments(content, attachments);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -1755,10 +1781,9 @@ impl StateManager {
     }
 
     /// One place builds the assistant ChatMessage, so a new field can never be
-    /// forgotten by half the callers. For the orchestrator lane, also
-    /// consumes any `pending_thinking` staged by this turn's
-    /// `SessionHook::on_completion_response` and attaches it to this message,
-    /// avoiding a separate empty-content row (CONCERN 6).
+    /// forgotten by half the callers. On the orchestrator lane the row is
+    /// stamped with the open response and adopts that response's staged
+    /// thinking blocks, avoiding a separate empty-content row (CONCERN 6).
     fn push_assistant(
         &self,
         source: MessageSource,
@@ -1767,22 +1792,19 @@ impl StateManager {
     ) {
         let is_orchestrator = source.is_orchestrator_lane();
         let mut msg = ChatMessage::agent(content).with_source(source);
-        msg.thinking = if is_orchestrator {
-            // Adopt whatever the turn's `CompletionResponse` staged, unless the
-            // caller supplied blocks itself — an explicit argument always wins,
-            // and `take_` clears the staging slot either way so the blocks can
-            // never leak onto a later turn.
-            let staged = self.take_pending_thinking();
-            if thinking.is_empty() {
-                staged
-            } else {
-                thinking
-            }
+        if is_orchestrator {
+            // The open response is the single source of truth here: the
+            // `thinking` argument is IGNORED on this lane. Blocks handed in
+            // by a caller carry no response group, and a group-less block
+            // replayed at the wire seam is the Anthropic 400.
+            let id = self.current_response_id();
+            msg.response_id = id;
+            msg.thinking = id.map(|i| self.claim_thinking(i)).unwrap_or_default();
         } else {
             // Sub-agent lane: its blocks ride on its own row and it must not
-            // consume the orchestrator's staged set.
-            thinking
-        };
+            // consume the orchestrator's open response.
+            msg.thinking = thinking;
+        }
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
             tracing::error!("Failed to persist assistant message: {}", e);
@@ -1814,6 +1836,10 @@ impl StateManager {
     /// `ChatMessage` so `get_agent_history` can replay them into the same
     /// rig `Message::Assistant` as a `ToolCall`, per Anthropic's tool-loop
     /// contract.
+    ///
+    /// **Non-orchestrator lanes only**: on the orchestrator lane the blocks
+    /// come from the open response ([`Self::begin_response`]) and this
+    /// argument is ignored.
     pub fn add_assistant_message_with_thinking(
         &self,
         source: MessageSource,
@@ -1844,35 +1870,67 @@ impl StateManager {
         *self.display_reasoning.write().unwrap() = on;
     }
 
-    /// Stage captured thinking blocks for the orchestrator's next assistant
-    /// message. Called synchronously from `SessionHook::on_completion_response`:
-    /// rig awaits that hook inline and `prompt_with_history` returns only
-    /// afterwards, so the next `push_assistant`/`add_tool_call` is guaranteed
-    /// to see what this staged.
+    /// Open a new model response and stage the thinking blocks it produced.
     ///
-    /// Replaces the slot rather than appending — a non-empty slot here always
-    /// means a consumer was skipped, and accumulating would splice one
-    /// response's reasoning onto another's row.
-    pub fn stage_thinking_for_next_assistant(
-        &self,
-        thinking: Vec<crate::reasoning::ThinkingBlock>,
-    ) {
-        let mut pending = self.pending_thinking.write().unwrap();
-        if !pending.is_empty() {
+    /// Called synchronously from `SessionHook::on_completion_response` for
+    /// EVERY orchestrator response — thinking-bearing or not. That is the
+    /// whole point: the returned id is the only record of where one
+    /// response ends and the next begins, and a response that emitted no
+    /// thinking still has to close the previous one's group. Rig awaits
+    /// that hook inline and `prompt_with_history` returns only afterwards,
+    /// so the next `push_assistant`/`add_tool_call` is guaranteed to see
+    /// what this opened.
+    ///
+    /// Replaces the staged blocks rather than appending — a non-empty slot
+    /// here always means a consumer was skipped, and accumulating would
+    /// splice one response's reasoning onto another's row.
+    pub fn begin_response(&self, thinking: Vec<crate::reasoning::ThinkingBlock>) -> u64 {
+        let mut slot = self.response.write().unwrap();
+        if !slot.thinking.is_empty() {
             tracing::warn!(
-                dropped = pending.len(),
+                dropped = slot.thinking.len(),
                 "overwriting staged thinking blocks — a consumer row was skipped"
             );
         }
-        *pending = thinking;
+        // Monotonic and never reset: a row holding a stale id can then never
+        // collide with a live response (see `claim_thinking`).
+        slot.id += 1;
+        slot.thinking = thinking;
+        slot.id
     }
 
-    fn clear_pending_thinking(&self) {
-        self.pending_thinking.write().unwrap().clear();
+    /// The id of the response currently open, or `None` if no response has
+    /// been opened yet on this process (`id == 0`).
+    pub fn current_response_id(&self) -> Option<u64> {
+        let id = self.response.read().unwrap().id;
+        (id != 0).then_some(id)
     }
 
-    fn take_pending_thinking(&self) -> Vec<crate::reasoning::ThinkingBlock> {
-        std::mem::take(&mut *self.pending_thinking.write().unwrap())
+    /// Drain the staged blocks **iff** they belong to response `id`.
+    ///
+    /// A row that claims a response which is no longer open gets nothing and
+    /// leaves the slot alone — otherwise a late-arriving row would steal the
+    /// *next* response's reasoning and replay it in front of tool calls it
+    /// was never generated with (the Anthropic 400 this whole mechanism
+    /// exists to prevent).
+    fn claim_thinking(&self, id: u64) -> Vec<crate::reasoning::ThinkingBlock> {
+        let mut slot = self.response.write().unwrap();
+        if slot.id != id {
+            tracing::debug!(
+                claimed = id,
+                open = slot.id,
+                "stale response claim — thinking blocks left with the open response"
+            );
+            return Vec::new();
+        }
+        std::mem::take(&mut slot.thinking)
+    }
+
+    /// Drop the open response's blocks without closing the response.
+    /// Never touches `id`: the id is a boundary marker, and rewinding it
+    /// would let a later row collide with an already-materialised group.
+    fn clear_response_thinking(&self) {
+        self.response.write().unwrap().thinking.clear();
     }
 
     /// Add a tool call message to chat and persist immediately.
@@ -1881,9 +1939,17 @@ impl StateManager {
     /// orchestrator, [`MessageSource::SubAgent`] for a sub-agent's turn (so
     /// the renderer labels it and `get_agent_history` filters it out of the
     /// orchestrator wire context).
+    ///
+    /// `response_id` is the response that requested this call, captured at
+    /// hook time and carried on `AgentEvent::ToolCall`. On the orchestrator
+    /// lane it is stamped onto the row and used to claim that response's
+    /// thinking blocks; off-lane rows never carry either (a sub-agent's
+    /// reasoning rides on its own lane and must not enter the
+    /// orchestrator's response groups).
     pub fn add_tool_call(
         &self,
         source: MessageSource,
+        response_id: Option<u64>,
         tool_name: String,
         args: String,
         call_id: Option<String>,
@@ -1891,7 +1957,10 @@ impl StateManager {
         let is_orchestrator = source.is_orchestrator_lane();
         let mut msg = ChatMessage::tool_call(&tool_name, &args, call_id).with_source(source);
         if is_orchestrator {
-            msg.thinking = self.take_pending_thinking();
+            msg.response_id = response_id;
+            msg.thinking = response_id
+                .map(|id| self.claim_thinking(id))
+                .unwrap_or_default();
         }
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -2000,6 +2069,13 @@ impl StateManager {
         Self::convert_history_to_rig(&sanitized, wire_reasoning)
     }
 
+    /// Convert ONE chat row to a rig message (the compaction-resumption
+    /// prompt seam).
+    ///
+    /// Never emits `Reasoning`: one row is not a response, and replaying its
+    /// blocks alone would split a response's thinking from the tool_uses it
+    /// was generated with. [`Self::convert_history_to_rig`] is the only
+    /// constructor of `AssistantContent::Reasoning`.
     fn last_msg_to_rig(
         msg: &crate::ui::app_state::ChatMessage,
     ) -> rig_core::completion::message::Message {
@@ -2076,27 +2152,44 @@ impl StateManager {
 
     /// Convert a sanitised chat slice into the rig wire array.
     ///
-    /// The conversion has two shapes:
-    ///   - **Thinking-bearing assistant run** (Agent + 1+ ToolCall(s)
-    ///     carrying at least one `ThinkingBlock`): coalesced into ONE
+    /// An `Agent|ToolCall|ToolResult` run is first split into **segments**:
+    /// maximal contiguous slices whose `Agent`/`ToolCall` rows share the same
+    /// `response_id` (`ToolResult` rows join whichever segment is open). A run
+    /// spans as many model responses as the tool loop took, and Anthropic
+    /// verifies a thinking block's signature against the response it was
+    /// issued with — replaying three responses' blocks in front of five
+    /// tool_uses is a 400. The boundary cannot be inferred from row
+    /// adjacency (rig's tool concurrency is 1, so rows are always
+    /// `TC,TR,TC,TR…`), which is exactly why it is recorded.
+    ///
+    /// Each segment then converts in one of two shapes:
+    ///   - **Thinking-bearing segment** (its rows carry at least one
+    ///     replayable `ThinkingBlock`): coalesced into ONE
     ///     `RigMessage::Assistant` whose content order is
-    ///     `[Reasoning…, Text?, ToolCall…]`. Anthropic's wire contract.
+    ///     `[Reasoning…, Text?, ToolCall…]`, followed by one
+    ///     `RigMessage::User` per `ToolResult` of that segment. Anthropic's
+    ///     wire contract.
     ///   - **No thinking**: one `RigMessage::Assistant` per Agent row and
     ///     one per ToolCall row — byte-identical to the pre-change
     ///     output for every non-Anthropic provider and every knob-off
     ///     run.
     ///
-    /// `wire_reasoning=false` collapses the first case into the second
-    /// (all blocks filtered) so a foreign provider running a Claude
-    /// transcript cannot 400.
+    /// Blocks are dropped (collapsing the first case into the second) when
+    /// `wire_reasoning == false` — so a foreign provider running a Claude
+    /// transcript cannot 400 — and when the segment's `response_id` is
+    /// `None`, because a block whose response group is unknown has nothing
+    /// to anchor its signature to.
+    ///
+    /// This is the ONLY constructor of `AssistantContent::Reasoning`; see
+    /// [`Self::last_msg_to_rig`] for why the single-row converter never
+    /// emits one.
     fn convert_history_to_rig(
         sanitized: &[crate::ui::app_state::ChatMessage],
         wire_reasoning: bool,
     ) -> Vec<rig_core::completion::message::Message> {
-        use crate::ui::app_state::{ChatMessage, MessageRole};
+        use crate::ui::app_state::MessageRole;
         use rig_core::completion::message::{
-            AssistantContent, Message as RigMessage, Reasoning, Text, ToolCall, ToolFunction,
-            ToolResult, ToolResultContent, UserContent,
+            Message as RigMessage, Text, ToolResult, ToolResultContent, UserContent,
         };
         use rig_core::one_or_many::OneOrMany;
 
@@ -2136,159 +2229,34 @@ impl StateManager {
                     }
                     let run = &sanitized[run_start..j];
 
-                    let agent_row = run.iter().find(|m| m.role == MessageRole::Agent);
-                    let tool_call_rows: Vec<&ChatMessage> = run
-                        .iter()
-                        .filter(|m| m.role == MessageRole::ToolCall)
-                        .collect();
-                    let tool_result_rows: Vec<&ChatMessage> = run
-                        .iter()
-                        .filter(|m| m.role == MessageRole::ToolResult)
-                        .collect();
-
-                    let blocks: Vec<crate::reasoning::ThinkingBlock> = run
-                        .iter()
-                        .flat_map(|m| m.thinking.iter().cloned())
-                        .collect();
-                    let blocks_kept: Vec<crate::reasoning::ThinkingBlock> = if wire_reasoning {
-                        blocks
-                            .into_iter()
-                            .filter(|b| match b {
-                                crate::reasoning::ThinkingBlock::Thinking { signature, .. } => {
-                                    !signature.is_empty()
-                                }
-                                crate::reasoning::ThinkingBlock::Redacted { .. } => true,
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                    if blocks_kept.is_empty() {
-                        // No-thinking path — must be BYTE-IDENTICAL to the pre-change
-                        // per-message rebuild (design §3.2: "byte-identical"). Iterate
-                        // the run in transcript order and emit each row on its own,
-                        // matching the legacy single-message-per-ChatMessage shape.
-                        // The reasoning-bearing branch below is the only one that
-                        // coalesces. ToolResults are emitted inline here so the
-                        // transcript order matches the legacy per-row output; the
-                        // after-block re-emission below is therefore skipped (the
-                        // thinking-bearing branch is the only caller that needs it).
-                        for m in run {
-                            match m.role {
-                                MessageRole::Agent => {
-                                    out.push(RigMessage::Assistant {
-                                        id: None,
-                                        content: OneOrMany::one(AssistantContent::Text(Text::new(
-                                            m.content.clone(),
-                                        ))),
-                                    });
-                                }
-                                MessageRole::ToolCall => {
-                                    let Some(tool_name) = m.tool_name.as_deref() else {
-                                        continue;
-                                    };
-                                    let args_str = m.tool_args.as_deref().unwrap_or("{}");
-                                    let arguments = serde_json::from_str(args_str).unwrap_or(
-                                        serde_json::Value::Object(serde_json::Map::new()),
-                                    );
-                                    let call_id =
-                                        m.call_id.clone().unwrap_or_else(|| tool_name.to_string());
-                                    out.push(RigMessage::Assistant {
-                                        id: None,
-                                        content: OneOrMany::one(AssistantContent::ToolCall(
-                                            ToolCall::new(
-                                                call_id,
-                                                ToolFunction::new(tool_name.to_string(), arguments),
-                                            ),
-                                        )),
-                                    });
-                                }
-                                MessageRole::ToolResult => {
-                                    let Some(tool_name) = m.tool_name.as_deref() else {
-                                        continue;
-                                    };
-                                    let result_text = m.tool_result.as_deref().unwrap_or("");
-                                    let call_id =
-                                        m.call_id.clone().unwrap_or_else(|| tool_name.to_string());
-                                    out.push(RigMessage::User {
-                                        content: OneOrMany::one(UserContent::ToolResult(
-                                            ToolResult {
-                                                id: call_id,
-                                                call_id: None,
-                                                content: ToolResultContent::from_tool_output(
-                                                    result_text,
-                                                ),
-                                            },
-                                        )),
-                                    });
-                                }
-                                _ => {}
+                    // Split the run into per-response segments BEFORE
+                    // emitting anything. A contiguous run spans as many model
+                    // responses as the tool loop took, and each response's
+                    // thinking blocks are signed against the tool_uses of
+                    // THAT response only. `run[seg_start]` is always an
+                    // Agent/ToolCall row (the run starts with one, and a
+                    // segment only ever ends on one).
+                    let mut seg_start = 0;
+                    while seg_start < run.len() {
+                        let key = run[seg_start].response_id;
+                        let mut seg_end = seg_start + 1;
+                        while seg_end < run.len() {
+                            let m = &run[seg_end];
+                            // ToolResults carry no response of their own —
+                            // they join whichever segment is open.
+                            if m.role == MessageRole::ToolResult || m.response_id == key {
+                                seg_end += 1;
+                            } else {
+                                break;
                             }
                         }
-                    } else {
-                        let mut content: Vec<AssistantContent> = Vec::new();
-                        for b in &blocks_kept {
-                            match b {
-                                crate::reasoning::ThinkingBlock::Thinking { text, signature } => {
-                                    content.push(AssistantContent::Reasoning(
-                                        Reasoning::new_with_signature(
-                                            text,
-                                            Some(signature.clone()),
-                                        ),
-                                    ));
-                                }
-                                crate::reasoning::ThinkingBlock::Redacted { data } => {
-                                    content.push(AssistantContent::Reasoning(Reasoning::redacted(
-                                        data.clone(),
-                                    )));
-                                }
-                            }
-                        }
-                        if let Some(agent) = agent_row
-                            && !agent.content.is_empty()
-                        {
-                            content.push(AssistantContent::Text(Text::new(agent.content.clone())));
-                        }
-                        for tc in &tool_call_rows {
-                            let Some(tool_name) = tc.tool_name.as_deref() else {
-                                continue;
-                            };
-                            let args_str = tc.tool_args.as_deref().unwrap_or("{}");
-                            let arguments = serde_json::from_str(args_str)
-                                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                            let call_id =
-                                tc.call_id.clone().unwrap_or_else(|| tool_name.to_string());
-                            content.push(AssistantContent::ToolCall(ToolCall::new(
-                                call_id,
-                                ToolFunction::new(tool_name.to_string(), arguments),
-                            )));
-                        }
-                        out.push(RigMessage::Assistant {
-                            id: None,
-                            content: OneOrMany::many(content)
-                                .expect("non-empty: at least one thinking block"),
-                        });
-
-                        // Thinking-bearing path: ToolResults stay as separate
-                        // Message::User entries (not coalesced into the
-                        // Assistant message — only Thinking+Text+ToolCall go
-                        // together per the Anthropic wire contract).
-                        for tr in &tool_result_rows {
-                            let Some(tool_name) = tr.tool_name.as_deref() else {
-                                continue;
-                            };
-                            let result_text = tr.tool_result.as_deref().unwrap_or("");
-                            let call_id =
-                                tr.call_id.clone().unwrap_or_else(|| tool_name.to_string());
-                            out.push(RigMessage::User {
-                                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                                    id: call_id,
-                                    call_id: None,
-                                    content: ToolResultContent::from_tool_output(result_text),
-                                })),
-                            });
-                        }
+                        Self::push_response_segment_to_rig(
+                            &mut out,
+                            &run[seg_start..seg_end],
+                            key,
+                            wire_reasoning,
+                        );
+                        seg_start = seg_end;
                     }
 
                     i = j;
@@ -2315,6 +2283,169 @@ impl StateManager {
             }
         }
         out
+    }
+
+    /// Emit ONE response segment: the rows of a single model response (plus
+    /// the ToolResults that came back for it) in transcript order.
+    ///
+    /// `key` is the segment's `response_id`. `None` means the rows don't know
+    /// which response produced them (legacy transcript, sub-agent row, row
+    /// appended with no response open) — such a segment never replays
+    /// reasoning, because a signature with no group is exactly what Anthropic
+    /// rejects.
+    fn push_response_segment_to_rig(
+        out: &mut Vec<rig_core::completion::message::Message>,
+        segment: &[crate::ui::app_state::ChatMessage],
+        key: Option<u64>,
+        wire_reasoning: bool,
+    ) {
+        use crate::ui::app_state::{ChatMessage, MessageRole};
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, Reasoning, Text, ToolCall, ToolFunction,
+            ToolResult, ToolResultContent, UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+
+        let agent_row = segment.iter().find(|m| m.role == MessageRole::Agent);
+        let tool_call_rows: Vec<&ChatMessage> = segment
+            .iter()
+            .filter(|m| m.role == MessageRole::ToolCall)
+            .collect();
+        let tool_result_rows: Vec<&ChatMessage> = segment
+            .iter()
+            .filter(|m| m.role == MessageRole::ToolResult)
+            .collect();
+
+        let blocks: Vec<crate::reasoning::ThinkingBlock> = segment
+            .iter()
+            .flat_map(|m| m.thinking.iter().cloned())
+            .collect();
+        let blocks_kept: Vec<crate::reasoning::ThinkingBlock> = if wire_reasoning && key.is_some() {
+            blocks
+                .into_iter()
+                .filter(|b| match b {
+                    crate::reasoning::ThinkingBlock::Thinking { signature, .. } => {
+                        !signature.is_empty()
+                    }
+                    crate::reasoning::ThinkingBlock::Redacted { .. } => true,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if blocks_kept.is_empty() {
+            // No-thinking path — must be BYTE-IDENTICAL to the pre-change
+            // per-message rebuild (design §3.2: "byte-identical"). Iterate
+            // the segment in transcript order and emit each row on its own,
+            // matching the legacy single-message-per-ChatMessage shape.
+            // The reasoning-bearing branch below is the only one that
+            // coalesces. ToolResults are emitted inline here so the
+            // transcript order matches the legacy per-row output; the
+            // after-block re-emission below is therefore skipped (the
+            // thinking-bearing branch is the only caller that needs it).
+            for m in segment {
+                match m.role {
+                    MessageRole::Agent => {
+                        out.push(RigMessage::Assistant {
+                            id: None,
+                            content: OneOrMany::one(AssistantContent::Text(Text::new(
+                                m.content.clone(),
+                            ))),
+                        });
+                    }
+                    MessageRole::ToolCall => {
+                        let Some(tool_name) = m.tool_name.as_deref() else {
+                            continue;
+                        };
+                        let args_str = m.tool_args.as_deref().unwrap_or("{}");
+                        let arguments = serde_json::from_str(args_str)
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                        let call_id = m.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+                        out.push(RigMessage::Assistant {
+                            id: None,
+                            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                                call_id,
+                                ToolFunction::new(tool_name.to_string(), arguments),
+                            ))),
+                        });
+                    }
+                    MessageRole::ToolResult => {
+                        let Some(tool_name) = m.tool_name.as_deref() else {
+                            continue;
+                        };
+                        let result_text = m.tool_result.as_deref().unwrap_or("");
+                        let call_id = m.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+                        out.push(RigMessage::User {
+                            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                                id: call_id,
+                                call_id: None,
+                                content: ToolResultContent::from_tool_output(result_text),
+                            })),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            let mut content: Vec<AssistantContent> = Vec::new();
+            for b in &blocks_kept {
+                match b {
+                    crate::reasoning::ThinkingBlock::Thinking { text, signature } => {
+                        content.push(AssistantContent::Reasoning(Reasoning::new_with_signature(
+                            text,
+                            Some(signature.clone()),
+                        )));
+                    }
+                    crate::reasoning::ThinkingBlock::Redacted { data } => {
+                        content.push(AssistantContent::Reasoning(Reasoning::redacted(
+                            data.clone(),
+                        )));
+                    }
+                }
+            }
+            if let Some(agent) = agent_row
+                && !agent.content.is_empty()
+            {
+                content.push(AssistantContent::Text(Text::new(agent.content.clone())));
+            }
+            for tc in &tool_call_rows {
+                let Some(tool_name) = tc.tool_name.as_deref() else {
+                    continue;
+                };
+                let args_str = tc.tool_args.as_deref().unwrap_or("{}");
+                let arguments = serde_json::from_str(args_str)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                let call_id = tc.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+                content.push(AssistantContent::ToolCall(ToolCall::new(
+                    call_id,
+                    ToolFunction::new(tool_name.to_string(), arguments),
+                )));
+            }
+            out.push(RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::many(content).expect("non-empty: at least one thinking block"),
+            });
+
+            // Thinking-bearing path: ToolResults stay as separate
+            // Message::User entries (not coalesced into the
+            // Assistant message — only Thinking+Text+ToolCall go
+            // together per the Anthropic wire contract).
+            for tr in &tool_result_rows {
+                let Some(tool_name) = tr.tool_name.as_deref() else {
+                    continue;
+                };
+                let result_text = tr.tool_result.as_deref().unwrap_or("");
+                let call_id = tr.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+                out.push(RigMessage::User {
+                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                        id: call_id,
+                        call_id: None,
+                        content: ToolResultContent::from_tool_output(result_text),
+                    })),
+                });
+            }
+        }
     }
 
     /// Build the `rig_core::Message` representing the current user turn — the one
@@ -3784,6 +3915,7 @@ mod tests {
         sm.add_user_message("List the files".to_string());
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
@@ -3827,6 +3959,7 @@ mod tests {
         let sm = StateManager::new();
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             r#"{"command":"ls -la"}"#.to_string(),
             Some("call_42".to_string()),
@@ -3872,6 +4005,7 @@ mod tests {
         let sm = StateManager::new();
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_42".to_string()),
@@ -3919,6 +4053,7 @@ mod tests {
         sm.add_user_message("List files".to_string());
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
@@ -4175,6 +4310,7 @@ mod tests {
             source: MessageSource::Human,
             thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
+            response_id: None,
         });
         conv.messages.push(Message::ToolCall {
             tool_name: "bash".into(),
@@ -4186,6 +4322,7 @@ mod tests {
             },
             thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
+            response_id: None,
         });
         conv.messages.push(Message::ToolResult {
             tool_name: "bash".into(),
@@ -4213,6 +4350,7 @@ mod tests {
             source: MessageSource::Human,
             thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
+            response_id: None,
         });
 
         // Go through the real /load path so the MessageSource serde round-trip
@@ -4333,6 +4471,7 @@ mod tests {
             source: MessageSource::Human,
             thinking: Vec::new(),
             timestamp: chrono::Utc::now(),
+            response_id: None,
         });
 
         let id = conv.id;
@@ -4550,6 +4689,7 @@ mod tests {
             source: crate::ui::app_state::MessageSource::Human,
             thinking: Vec::new(),
             timestamp: t_agent,
+            response_id: None,
         });
 
         let sm = StateManager::new();
@@ -5080,6 +5220,7 @@ mod tests {
         sm.add_user_message("look".to_string());
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "view_image".to_string(),
             r#"{"path":"/tmp/x.png"}"#.to_string(),
             Some("call_1".to_string()),
@@ -5202,6 +5343,7 @@ mod tests {
         sm.add_assistant_message("thinking".to_string());
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             "{}".to_string(),
             Some("call_x".to_string()),
@@ -5276,6 +5418,7 @@ mod tests {
         sm.add_assistant_message("thinking".to_string());
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             "{}".to_string(),
             Some("call_x".to_string()),
@@ -5503,6 +5646,7 @@ mod tests {
         sm.add_assistant_message("I'll run ls for you".to_string());
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
@@ -6012,6 +6156,7 @@ mod tests {
         sm.add_user_message("List files".to_string());
         sm.add_tool_call(
             MessageSource::Human,
+            None,
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
             Some("call_1".to_string()),
@@ -6384,6 +6529,7 @@ mod tests {
         sm.add_assistant_message("orch a".to_string());
         sm.add_tool_call(
             crate::ui::app_state::MessageSource::Human,
+            None,
             "bash".to_string(),
             "{}".to_string(),
             Some("orch-tc-1".to_string()),
@@ -6396,6 +6542,7 @@ mod tests {
         for i in 0..10 {
             sm.add_tool_call(
                 sub.clone(),
+                None,
                 "bash".to_string(),
                 format!("{{\"i\":{i}}}"),
                 Some(format!("sub-tc-{i}")),
@@ -6478,6 +6625,7 @@ mod tests {
         sm.add_assistant_message("a2".to_string());
         sm.add_tool_call(
             crate::ui::app_state::MessageSource::Human,
+            None,
             "delegate".to_string(),
             r#"{"role":"researcher","task":"survey"}"#.to_string(),
             Some("c1".to_string()),
@@ -6493,6 +6641,7 @@ mod tests {
         for i in 0..5 {
             sm.add_tool_call(
                 sub.clone(),
+                None,
                 "bash".to_string(),
                 format!("{{\"i\":{i}}}"),
                 Some(format!("sub-c-{i}")),
@@ -7201,6 +7350,550 @@ mod tests {
             a.is_cancelled(),
             "the previous turn's token must remain cancelled \
              (so a stale token from a prior turn cannot leak into the next turn)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Per-response segmentation — unit tests for the `begin_response` /
+    // `current_response_id` / `claim_thinking` triplet, the `response_id`
+    // field on `Message::ToolCall` (persisted high-water-mark resumption),
+    // and `last_msg_to_rig`'s wire-side drop of thinking on a lone ToolCall
+    // row.
+    //
+    // These live here (not in the integration scenarios) because they
+    // exercise private seams — `last_msg_to_rig`, `claim_thinking`,
+    // `Message::Assistant { response_id, .. }` construction — that
+    // aren't reachable from `tests/`.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// **T8 — `last_msg_to_rig` never emits reasoning for a single
+    /// ToolCall row.**
+    ///
+    /// `build_resumption_for_compaction` calls `last_msg_to_rig` on the
+    /// *single trailing row* of the live context. When that row is a
+    /// `Message::ToolCall` carrying thinking, the wire conversion must
+    /// NOT emit a `Reasoning` block — the row stands alone on the
+    /// prompt seam (Anthropic 400s on a lone signature outside an
+    /// assistant bundle).
+    #[test]
+    #[allow(unreachable_patterns)] // rig's AssistantContent is non_exhaustive; the trailing _ catches future variants
+    fn last_msg_to_rig_never_emits_reasoning() {
+        let mut msg = ChatMessage::tool_call("bash", "{}", Some("c1".to_string()));
+        msg.thinking = vec![crate::reasoning::ThinkingBlock::Thinking {
+            text: "thinking text".to_string(),
+            signature: "sig.SGXabc123XYZ-==".to_string(),
+        }];
+        let rig = StateManager::last_msg_to_rig(&msg);
+        match rig {
+            rig_core::completion::message::Message::Assistant { content, .. } => {
+                let kinds: Vec<&str> = content
+                    .iter()
+                    .map(|c| match c {
+                        rig_core::completion::message::AssistantContent::Reasoning(_) => {
+                            "Reasoning"
+                        }
+                        rig_core::completion::message::AssistantContent::Text(_) => "Text",
+                        rig_core::completion::message::AssistantContent::ToolCall(_) => "ToolCall",
+                        rig_core::completion::message::AssistantContent::Image(_) => "Image",
+                        _ => "Other",
+                    })
+                    .collect();
+                assert_eq!(
+                    kinds,
+                    vec!["ToolCall"],
+                    "last_msg_to_rig on a ToolCall row must emit exactly [ToolCall] — no Reasoning, even when the row carries thinking",
+                );
+            }
+            other => panic!("last_msg_to_rig(ToolCall) must be Message::Assistant, got {other:?}"),
+        }
+    }
+
+    /// **T9 — A stale `response_id` does not steal another response's
+    /// thinking.**
+    ///
+    /// `add_tool_call(Human, Some(a), …)` after `begin_response(b)` has
+    /// already opened response b's slot must:
+    ///   - leave the b slot untouched (still holding b's blocks),
+    ///   - record ZERO thinking blocks on the appended ToolCall row,
+    ///
+    /// so a later `add_tool_call(Human, Some(b), …)` still finds b's
+    /// blocks in the slot. This is the load-bearing regression lock
+    /// for the "every row that does not know its response never
+    /// replays reasoning" contract.
+    #[test]
+    fn stale_response_id_does_not_steal_another_responses_thinking() {
+        let sm = StateManager::new();
+
+        let a = sm.begin_response(vec![crate::reasoning::ThinkingBlock::Thinking {
+            text: "alpha".to_string(),
+            signature: "sig.AAA-==".to_string(),
+        }]);
+        let b = sm.begin_response(vec![crate::reasoning::ThinkingBlock::Thinking {
+            text: "beta".to_string(),
+            signature: "sig.BBB-==".to_string(),
+        }]);
+
+        // Append a ToolCall claiming response a — but b's slot is
+        // currently active. The row must adopt NO blocks; b's slot
+        // must remain untouched.
+        sm.add_tool_call(
+            MessageSource::Human,
+            Some(a),
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("c1".to_string()),
+        );
+
+        let state = sm.get_state();
+        let tool_row = state
+            .chat
+            .messages
+            .iter()
+            .find(|m| {
+                m.role == crate::ui::app_state::MessageRole::ToolCall
+                    && m.call_id.as_deref() == Some("c1")
+            })
+            .expect("the stale-id ToolCall row must exist");
+        assert!(
+            tool_row.thinking.is_empty(),
+            "a row claimed against a stale response id must NOT adopt another response's thinking — got {:?}",
+            tool_row.thinking,
+        );
+
+        // Now append a second ToolCall claiming response b. The slot
+        // must still hold b's blocks, and the row must adopt them.
+        sm.add_tool_call(
+            MessageSource::Human,
+            Some(b),
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("c2".to_string()),
+        );
+
+        let state = sm.get_state();
+        let second_row = state
+            .chat
+            .messages
+            .iter()
+            .find(|m| {
+                m.role == crate::ui::app_state::MessageRole::ToolCall
+                    && m.call_id.as_deref() == Some("c2")
+            })
+            .expect("the b-id ToolCall row must exist");
+        assert_eq!(
+            second_row.thinking,
+            vec![crate::reasoning::ThinkingBlock::Thinking {
+                text: "beta".to_string(),
+                signature: "sig.BBB-==".to_string(),
+            }],
+            "a row claimed against the current response must adopt the slot's blocks verbatim — b's slot was untouched by the stale claim",
+        );
+    }
+
+    /// **T10 — `response_id`s resume above the persisted high-water
+    /// mark.**
+    ///
+    /// After loading a conversation whose persisted rows carry
+    /// `response_id` up to 7, the next `begin_response(vec![])` must
+    /// return 8 — NOT 1. Otherwise the freshly-loaded StateManager
+    /// could mint a duplicate response id and the rebuild helper would
+    /// splice rows from two unrelated conversations into one wire
+    /// bundle, repeating the original 400 in a new shape.
+    #[test]
+    fn response_ids_resume_above_the_persisted_high_water_mark() {
+        use crate::conversation::{Conversation, Message as ConvMsg};
+        use crate::ui::app_state::MessageRole;
+
+        // Build a `Conversation` whose persisted rows carry
+        // `response_id` values up to 7. We use `sync_to_conversation`
+        // on a hand-built `ChatMessage` set so the field is set
+        // directly.
+        let mut conv = Conversation::new(
+            "hwm-test".into(),
+            "anthropic".into(),
+            "claude-3-5-sonnet-latest".into(),
+            String::new(),
+        );
+        conv.add_user_message("go".into());
+        conv.messages.push(ConvMsg::ToolCall {
+            tool_name: "bash".to_string(),
+            arguments: "{}".to_string(),
+            call_id: Some("c1".to_string()),
+            compacted: false,
+            source: MessageSource::Human,
+            thinking: vec![],
+            timestamp: chrono::Utc::now(),
+            response_id: Some(7),
+        });
+
+        // Wire the conversation through a fresh StateManager so
+        // `begin_response` can read the persisted high-water mark.
+        let storage: Arc<dyn crate::storage::ConversationStorage> =
+            Arc::new(crate::storage::InMemoryStorage::default());
+        storage.save(&conv).expect("seed storage");
+        let sm = StateManager::new_arc_with_storage(storage);
+        sm.load_conversation(conv.id).expect("load");
+
+        // Pre-implementation sanity: the row's `response_id` round-
+        // trips through `sync_from_conversation`. The field doesn't
+        // exist on `ConvMsg::ToolCall` today — this assertion is the
+        // RED compile-error anchor.
+        let state = sm.get_state();
+        let tool_row = state
+            .chat
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::ToolCall)
+            .expect("loaded ToolCall row must exist");
+        assert_eq!(
+            tool_row.response_id,
+            Some(7),
+            "the persisted response_id (7) must round-trip into ChatMessage on load",
+        );
+
+        // The new response id must be strictly above the persisted
+        // high-water mark (7), not restart from 1.
+        let next_id = sm.begin_response(vec![]);
+        assert_eq!(
+            next_id, 8,
+            "begin_response must return max(persisted response_id) + 1 (= 8), got the value above — a fresh start from 1 would mint a duplicate id and silently merge rows from two conversations",
+        );
+    }
+
+    // ── Byte-identity guard for the per-response segmentation ────────────
+    //
+    // The segmentation rewrite is only allowed to change the wire for the
+    // case it exists to fix (a run spanning several responses, with
+    // replayable blocks). Everything else must come out byte-identical to
+    // the pre-change rebuild. `legacy_convert_history_to_rig` below is that
+    // pre-change rebuild, copied verbatim: one flat-mapped block set per
+    // RUN, no `response_id` anywhere. The test compares serialised wire
+    // JSON, so "identical" means identical bytes, not merely equal shape.
+
+    /// The pre-change `convert_history_to_rig`, kept as a reference
+    /// implementation for the byte-identity property. Do not "fix" this —
+    /// its bug (flat-mapping thinking across a whole run) is the point of
+    /// comparison.
+    fn legacy_convert_history_to_rig(
+        sanitized: &[ChatMessage],
+        wire_reasoning: bool,
+    ) -> Vec<rig_core::completion::message::Message> {
+        use crate::ui::app_state::MessageRole;
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, Reasoning, Text, ToolCall, ToolFunction,
+            ToolResult, ToolResultContent, UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+
+        let mut out: Vec<RigMessage> = Vec::new();
+        let mut i = 0;
+        while i < sanitized.len() {
+            let msg = &sanitized[i];
+            match msg.role {
+                MessageRole::User => {
+                    out.push(RigMessage::User {
+                        content: super::user_content_from_chat_message(msg),
+                    });
+                    i += 1;
+                }
+                MessageRole::Summary => {
+                    out.push(RigMessage::User {
+                        content: OneOrMany::one(UserContent::Text(Text::new(format!(
+                            "[Conversation summary] {}",
+                            msg.content
+                        )))),
+                    });
+                    i += 1;
+                }
+                MessageRole::System => {
+                    i += 1;
+                }
+                MessageRole::Agent | MessageRole::ToolCall => {
+                    let run_start = i;
+                    let mut j = i;
+                    while j < sanitized.len() {
+                        match sanitized[j].role {
+                            MessageRole::Agent
+                            | MessageRole::ToolCall
+                            | MessageRole::ToolResult => j += 1,
+                            _ => break,
+                        }
+                    }
+                    let run = &sanitized[run_start..j];
+
+                    let agent_row = run.iter().find(|m| m.role == MessageRole::Agent);
+                    let tool_call_rows: Vec<&ChatMessage> = run
+                        .iter()
+                        .filter(|m| m.role == MessageRole::ToolCall)
+                        .collect();
+                    let tool_result_rows: Vec<&ChatMessage> = run
+                        .iter()
+                        .filter(|m| m.role == MessageRole::ToolResult)
+                        .collect();
+
+                    let blocks: Vec<crate::reasoning::ThinkingBlock> = run
+                        .iter()
+                        .flat_map(|m| m.thinking.iter().cloned())
+                        .collect();
+                    let blocks_kept: Vec<crate::reasoning::ThinkingBlock> = if wire_reasoning {
+                        blocks
+                            .into_iter()
+                            .filter(|b| match b {
+                                crate::reasoning::ThinkingBlock::Thinking { signature, .. } => {
+                                    !signature.is_empty()
+                                }
+                                crate::reasoning::ThinkingBlock::Redacted { .. } => true,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    if blocks_kept.is_empty() {
+                        for m in run {
+                            match m.role {
+                                MessageRole::Agent => {
+                                    out.push(RigMessage::Assistant {
+                                        id: None,
+                                        content: OneOrMany::one(AssistantContent::Text(Text::new(
+                                            m.content.clone(),
+                                        ))),
+                                    });
+                                }
+                                MessageRole::ToolCall => {
+                                    let Some(tool_name) = m.tool_name.as_deref() else {
+                                        continue;
+                                    };
+                                    let args_str = m.tool_args.as_deref().unwrap_or("{}");
+                                    let arguments = serde_json::from_str(args_str).unwrap_or(
+                                        serde_json::Value::Object(serde_json::Map::new()),
+                                    );
+                                    let call_id =
+                                        m.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+                                    out.push(RigMessage::Assistant {
+                                        id: None,
+                                        content: OneOrMany::one(AssistantContent::ToolCall(
+                                            ToolCall::new(
+                                                call_id,
+                                                ToolFunction::new(tool_name.to_string(), arguments),
+                                            ),
+                                        )),
+                                    });
+                                }
+                                MessageRole::ToolResult => {
+                                    let Some(tool_name) = m.tool_name.as_deref() else {
+                                        continue;
+                                    };
+                                    let result_text = m.tool_result.as_deref().unwrap_or("");
+                                    let call_id =
+                                        m.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+                                    out.push(RigMessage::User {
+                                        content: OneOrMany::one(UserContent::ToolResult(
+                                            ToolResult {
+                                                id: call_id,
+                                                call_id: None,
+                                                content: ToolResultContent::from_tool_output(
+                                                    result_text,
+                                                ),
+                                            },
+                                        )),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else {
+                        let mut content: Vec<AssistantContent> = Vec::new();
+                        for b in &blocks_kept {
+                            match b {
+                                crate::reasoning::ThinkingBlock::Thinking { text, signature } => {
+                                    content.push(AssistantContent::Reasoning(
+                                        Reasoning::new_with_signature(
+                                            text,
+                                            Some(signature.clone()),
+                                        ),
+                                    ));
+                                }
+                                crate::reasoning::ThinkingBlock::Redacted { data } => {
+                                    content.push(AssistantContent::Reasoning(Reasoning::redacted(
+                                        data.clone(),
+                                    )));
+                                }
+                            }
+                        }
+                        if let Some(agent) = agent_row
+                            && !agent.content.is_empty()
+                        {
+                            content.push(AssistantContent::Text(Text::new(agent.content.clone())));
+                        }
+                        for tc in &tool_call_rows {
+                            let Some(tool_name) = tc.tool_name.as_deref() else {
+                                continue;
+                            };
+                            let args_str = tc.tool_args.as_deref().unwrap_or("{}");
+                            let arguments = serde_json::from_str(args_str)
+                                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                            let call_id =
+                                tc.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+                            content.push(AssistantContent::ToolCall(ToolCall::new(
+                                call_id,
+                                ToolFunction::new(tool_name.to_string(), arguments),
+                            )));
+                        }
+                        out.push(RigMessage::Assistant {
+                            id: None,
+                            content: OneOrMany::many(content)
+                                .expect("non-empty: at least one thinking block"),
+                        });
+
+                        for tr in &tool_result_rows {
+                            let Some(tool_name) = tr.tool_name.as_deref() else {
+                                continue;
+                            };
+                            let result_text = tr.tool_result.as_deref().unwrap_or("");
+                            let call_id =
+                                tr.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+                            out.push(RigMessage::User {
+                                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                                    id: call_id,
+                                    call_id: None,
+                                    content: ToolResultContent::from_tool_output(result_text),
+                                })),
+                            });
+                        }
+                    }
+
+                    i = j;
+                }
+                MessageRole::ToolResult => {
+                    let tool_name = match msg.tool_name.as_deref() {
+                        Some(n) => n,
+                        None => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    let result_text = msg.tool_result.as_deref().unwrap_or("");
+                    let call_id = msg.call_id.clone().unwrap_or_else(|| tool_name.to_string());
+                    out.push(RigMessage::User {
+                        content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                            id: call_id,
+                            call_id: None,
+                            content: ToolResultContent::from_tool_output(result_text),
+                        })),
+                    });
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Build a two-response transcript: r1 issues c1 and c2, r2 issues c3.
+    /// `blocks` decides whether the rows carry thinking; `ids` decides
+    /// whether they carry a `response_id` at all.
+    fn two_response_transcript(blocks: bool, ids: bool) -> Vec<ChatMessage> {
+        let sig = |s: &str| crate::reasoning::ThinkingBlock::Thinking {
+            text: format!("plan {s}"),
+            signature: format!("sig.{s}-=="),
+        };
+        let mut rows = vec![ChatMessage::user("go".to_string())];
+        for (call, resp, tag) in [("c1", 1u64, "A"), ("c2", 1, "A"), ("c3", 2, "B")] {
+            let mut tc = ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some(call.into()));
+            if ids {
+                tc.response_id = Some(resp);
+            }
+            // Only the first call of each response carries that response's
+            // blocks — the same shape `claim_thinking` produces.
+            if blocks && (call == "c1" || call == "c3") {
+                tc.thinking = vec![sig(tag)];
+            }
+            rows.push(tc);
+            rows.push(ChatMessage::tool_result(
+                "bash",
+                r#"{"command":"ls"}"#,
+                "ok",
+                Some(call.into()),
+            ));
+        }
+        let mut agent = ChatMessage::agent("done".to_string());
+        if ids {
+            agent.response_id = Some(2);
+        }
+        rows.push(agent);
+        rows
+    }
+
+    fn wire_json(msgs: &[rig_core::completion::message::Message]) -> String {
+        serde_json::to_string(msgs).expect("rig messages serialise")
+    }
+
+    /// The four cases the rewrite must leave BYTE-IDENTICAL to the
+    /// pre-change rebuild.
+    ///
+    /// The one case that deliberately differs — a transcript with blocks
+    /// but no `response_id` (a legacy file) — is pinned the other way by
+    /// `rows_without_response_id_never_replay_reasoning`: those blocks are
+    /// dropped, which is what heals the reported 400 for existing
+    /// conversations.
+    #[test]
+    fn segmentation_is_byte_identical_to_the_legacy_rebuild_for_unchanged_cases() {
+        // 1. wire_reasoning == false — blocks and ids present, gate closed.
+        let t = two_response_transcript(true, true);
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(&t, false)),
+            wire_json(&legacy_convert_history_to_rig(&t, false)),
+            "with the wire gate closed the rebuild must be byte-identical to the legacy one",
+        );
+
+        // 2. No captured blocks anywhere (ids still present).
+        let t = two_response_transcript(false, true);
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(&t, true)),
+            wire_json(&legacy_convert_history_to_rig(&t, true)),
+            "a transcript with no thinking blocks must be byte-identical to the legacy rebuild",
+        );
+
+        // 3. All-`None` transcript (legacy rows), no blocks.
+        let t = two_response_transcript(false, false);
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(&t, true)),
+            wire_json(&legacy_convert_history_to_rig(&t, true)),
+            "an all-None transcript must be byte-identical to the legacy rebuild",
+        );
+
+        // 4. A run that is a single response — blocks, ids, gate open. The
+        //    whole run is one segment, so the coalesced shape is unchanged.
+        let mut t = two_response_transcript(true, true);
+        for m in t.iter_mut() {
+            if m.response_id.is_some() {
+                m.response_id = Some(1);
+            }
+            // Fold r2's blocks into the single response too.
+            if m.call_id.as_deref() == Some("c3")
+                && m.role == crate::ui::app_state::MessageRole::ToolCall
+            {
+                m.thinking = vec![crate::reasoning::ThinkingBlock::Thinking {
+                    text: "plan B".to_string(),
+                    signature: "sig.B-==".to_string(),
+                }];
+            }
+        }
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(&t, true)),
+            wire_json(&legacy_convert_history_to_rig(&t, true)),
+            "a run that is a single response must be byte-identical to the legacy rebuild",
+        );
+
+        // Poison check: the ONE case the rewrite exists to change must NOT
+        // be byte-identical. Without this, every assertion above could pass
+        // for a rebuild that never segments at all.
+        let t = two_response_transcript(true, true);
+        assert_ne!(
+            wire_json(&StateManager::convert_history_to_rig(&t, true)),
+            wire_json(&legacy_convert_history_to_rig(&t, true)),
+            "a two-response run with replayable blocks MUST differ from the legacy rebuild — \
+             that difference is the fix",
         );
     }
 }

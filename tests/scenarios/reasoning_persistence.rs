@@ -280,20 +280,21 @@ fn tool_call_thinking_survives_conversation_roundtrip() {
     // Seed a user message so the conversation is non-trivial.
     sm.add_user_message("read a.txt".to_string());
 
-    // ── Stage thinking blocks and add a tool call that adopts them. ─────
+    // ── Open a response with thinking blocks; the tool call adopts them. ─
     //
-    // The "stage → add_tool_call" path already works in memory today:
-    // add_tool_call at state_manager.rs:~1876-1880 adopts staged blocks
-    // onto the orchestrator's ToolCall row when the source is
-    // orchestrator-lane. The ChatMessage is therefore correctly populated;
-    // it is the persistence side (sync_to_conversation + serde) that
-    // drops the blocks — that's what T2 pins.
-    sm.stage_thinking_for_next_assistant(vec![peakbot::reasoning::ThinkingBlock::Thinking {
+    // The "begin_response → add_tool_call" path already works in memory
+    // today: add_tool_call adopts the open response's blocks onto the
+    // orchestrator's ToolCall row when the source is orchestrator-lane. The
+    // ChatMessage is therefore correctly populated; it is the persistence
+    // side (sync_to_conversation + serde) that drops the blocks — that's
+    // what T2 pins.
+    let r1 = sm.begin_response(vec![peakbot::reasoning::ThinkingBlock::Thinking {
         text: THINKING_TEXT.to_string(),
         signature: FAKE_SIGNATURE.to_string(),
     }]);
     sm.add_tool_call(
         MessageSource::Human,
+        Some(r1),
         "file_read".to_string(),
         r#"{"path":"a.txt"}"#.to_string(),
         Some("c1".to_string()),
@@ -405,5 +406,294 @@ fn tool_call_thinking_survives_conversation_roundtrip() {
         restored_tool_row.call_id.as_deref(),
         Some("c1"),
         "sanity: the call_id must also round-trip (regression lock)",
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T6 — Legacy conversation JSON with thinking but no response_id loads
+// cleanly, and re-save stays byte-identical (no `response_id` key).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A pre-fix conversation JSON whose `ToolCall` row already carries a
+/// `thinking` array (post T2 — the schema gained the field) but predates
+/// the per-response-id field. The loaded `ChatMessage` must report
+/// `response_id == None` (the field's default), and re-serialising the
+/// `Conversation` must NOT introduce a `response_id` key — the field is
+/// `skip_serializing_if = "Option::is_none"` so legacy round-trips stay
+/// byte-identical and don't grow spurious keys.
+///
+/// The wire rebuild must also drop the unloaded signature: a row with
+/// `response_id == None` has no response group to anchor against, so
+/// `get_agent_history` carries zero `Reasoning` content (mirrors T5).
+///
+/// Pre-implementation: `Message::ToolCall` has no `response_id` field.
+/// Reading `restored_tool_row.response_id` fails to compile, which is
+/// the RED signal for "the field is missing on the persisted variant".
+#[test]
+fn legacy_conversation_json_with_thinking_but_no_response_id_loads_and_wires_clean() {
+    // Legacy conversation JSON: ToolCall row carries a thinking array
+    // with a real signature (post-T2 schema), but NO `response_id` key.
+    // The `ToolCall` shape mirrors `reasoning_preservation.rs`'s
+    // `old_conversation_json_without_thinking_key_loads_and_resaves_byte_identical`
+    // but adds the `thinking` array and drops the `response_id`.
+    let json = r#"{
+        "id": "22222222-2222-2222-2222-222222222222",
+        "name": "legacy-thinking-no-response-id",
+        "created_at": "2025-01-01T00:00:00Z",
+        "updated_at": "2025-01-01T00:00:00Z",
+        "messages": [
+            { "role": "User", "content": "go", "compacted": false, "source": "Human", "timestamp": "2025-01-01T00:00:00Z" },
+            {
+                "role": "ToolCall",
+                "tool_name": "bash",
+                "arguments": "{\"command\":\"ls\"}",
+                "call_id": "c1",
+                "compacted": false,
+                "source": "Human",
+                "thinking": [
+                    { "kind": "thinking", "text": "legacy thinking", "signature": "sig.SGXabc123XYZ-==" }
+                ],
+                "timestamp": "2025-01-01T00:00:01Z"
+            }
+        ],
+        "provider_name": "anthropic",
+        "model": "claude-3-5-sonnet-latest",
+        "cwd": "",
+        "metadata": {
+            "message_count": 2,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_api_calls": 0,
+            "total_cost": 0.0,
+            "lanes": []
+        },
+        "todos": []
+    }"#;
+
+    // ── (1) Load side: parses cleanly (the response_id field must be
+    //         #[serde(default)] on Message::ToolCall so legacy files
+    //         don't break) ──────────────────────────────────────────────
+    let conv: Conversation = serde_json::from_str(json).expect(
+        "legacy JSON without response_id must parse cleanly — the field is #[serde(default)]",
+    );
+
+    // Wire the loaded conversation into a StateManager so we can assert
+    // the wire-side drop of the unattached signature.
+    let storage: Arc<dyn peakbot::storage::ConversationStorage> =
+        Arc::new(peakbot::storage::InMemoryStorage::default());
+    storage.save(&conv).expect("seed InMemoryStorage");
+    let sm = Arc::new(StateManager::new_arc_with_storage(storage));
+    sm.load_conversation(conv.id).expect("load into SM");
+
+    // The restored ToolCall row reports response_id = None. This is the
+    // RED compile-error anchor: the field doesn't exist on
+    // `Message::ToolCall` yet.
+    let state = sm.get_state();
+    let restored_tool_row = state
+        .chat
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::ToolCall)
+        .expect("restored ChatMessage must contain the ToolCall row");
+    assert_eq!(
+        restored_tool_row.response_id, None,
+        "a row from a legacy JSON (no response_id key) must report response_id == None on load",
+    );
+
+    // ── (2) Wire side: get_agent_history carries no Reasoning. ──────────
+    //
+    // The row's thinking block has a real signature, but its response_id
+    // is None — so per T5 the rebuild helper must drop it. Otherwise
+    // Anthropic would 400 on the unattached signature.
+    let history = sm.get_agent_history();
+    let any_reasoning = history.iter().any(|m| match m {
+        RigMessage::Assistant { content, .. } => content
+            .iter()
+            .any(|c| matches!(c, AssistantContent::Reasoning(_))),
+        _ => false,
+    });
+    assert!(
+        !any_reasoning,
+        "rows with response_id=None (legacy JSON) must not replay their thinking — no response group",
+    );
+
+    // ── (3) Re-save side: no `response_id` key is introduced. ──────────
+    //
+    // The fix adds response_id with `skip_serializing_if = "Option::is_none"`,
+    // so legacy round-trips stay byte-identical — a stray `response_id`
+    // key on a legacy file would be a regression of the same flavour
+    // as the `thinking` regression locked by
+    // `old_conversation_json_without_thinking_key_loads_and_resaves_byte_identical`
+    // in `reasoning_preservation.rs`.
+    let round_tripped = serde_json::to_string(&conv).expect("re-serialise legacy conv");
+    assert!(
+        !round_tripped.contains("\"response_id\""),
+        "legacy JSON without response_id must not gain a `response_id` key on round-trip; got: {round_tripped}",
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T7a — response_id round-trips through save → load → get_agent_history.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the T1 fixture (two responses, distinct signatures, distinct
+/// tool calls), persist it, load it back through a fresh StateManager,
+/// and assert the rebuild helper STILL yields two split assistant
+/// messages with disjoint signature sets.
+///
+/// This is the load-bearing regression lock for `/load`: a conversation
+/// that worked at runtime must keep working after a save/load round
+/// trip. The `response_id` field must round-trip through both
+/// `Message::Assistant` and `Message::ToolCall`, AND the rebuild helper
+/// must consult the restored id (not some in-memory counter) so the
+/// post-load wire is byte-identical to the pre-save wire.
+///
+/// Pre-implementation: `begin_response`, the new `add_tool_call` arity,
+/// and the `response_id` field on `Message::ToolCall`/`Message::Assistant`
+/// don't exist. The test fails to compile (RED for the right reason).
+#[test]
+fn response_id_round_trips_through_save_and_load() {
+    let storage: Arc<dyn peakbot::storage::ConversationStorage> =
+        Arc::new(peakbot::storage::InMemoryStorage::default());
+
+    // ── Build the fixture on a fresh StateManager. ──────────────────────
+    let sm = Arc::new(StateManager::new_arc_with_storage(storage.clone()));
+    sm.create_conversation(
+        "response-id-roundtrip".into(),
+        "anthropic".into(),
+        "claude-3-5-sonnet-latest".into(),
+        String::new(),
+    );
+    sm.add_user_message("go".to_string());
+
+    // r1: thinking A + bash + todo.
+    let r1 = sm.begin_response(vec![peakbot::reasoning::ThinkingBlock::Thinking {
+        text: "alpha".to_string(),
+        signature: "sig.AAA-==".to_string(),
+    }]);
+    sm.add_tool_call(
+        MessageSource::Human,
+        Some(r1),
+        "bash".to_string(),
+        r#"{"command":"ls"}"#.to_string(),
+        Some("c1".to_string()),
+    );
+    sm.add_tool_result(
+        MessageSource::Human,
+        "bash".to_string(),
+        r#"{"command":"ls"}"#.to_string(),
+        "ok".to_string(),
+        Some("c1".to_string()),
+    );
+    sm.add_tool_call(
+        MessageSource::Human,
+        Some(r1),
+        "todo".to_string(),
+        r#"{"action":"create","title":"a"}"#.to_string(),
+        Some("c2".to_string()),
+    );
+    sm.add_tool_result(
+        MessageSource::Human,
+        "todo".to_string(),
+        r#"{"action":"create","title":"a"}"#.to_string(),
+        "ok".to_string(),
+        Some("c2".to_string()),
+    );
+
+    // r2: thinking B + todo.
+    let r2 = sm.begin_response(vec![peakbot::reasoning::ThinkingBlock::Thinking {
+        text: "beta".to_string(),
+        signature: "sig.BBB-==".to_string(),
+    }]);
+    sm.add_tool_call(
+        MessageSource::Human,
+        Some(r2),
+        "todo".to_string(),
+        r#"{"action":"create","title":"b"}"#.to_string(),
+        Some("c3".to_string()),
+    );
+    sm.add_tool_result(
+        MessageSource::Human,
+        "todo".to_string(),
+        r#"{"action":"create","title":"b"}"#.to_string(),
+        "ok".to_string(),
+        Some("c3".to_string()),
+    );
+
+    // ── Persist the current conversation. ──────────────────────────────
+    let conv_id = sm
+        .get_current_conversation_id()
+        .expect("conversation must be created");
+
+    // ── Load the conversation into a FRESH StateManager. ───────────────
+    let sm2 = Arc::new(StateManager::new_arc_with_storage(storage.clone()));
+    sm2.load_conversation(conv_id).expect("load into fresh SM");
+
+    // ── Assert: the rebuilt wire still has two split assistant msgs. ───
+    let history = sm2.get_agent_history();
+    let assistants: Vec<&OneOrMany<AssistantContent>> = history
+        .iter()
+        .filter_map(|m| match m {
+            RigMessage::Assistant { content, .. } => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        2,
+        "after save → load, the wire must STILL yield two Message::Assistant entries (response_id round-trips through Message::ToolCall); got {}",
+        assistants.len(),
+    );
+
+    // Collect signature sets per message; they must be DISJOINT — r1's
+    // signature must not appear in the r2 message and vice versa.
+    fn sigs_of(c: &OneOrMany<AssistantContent>) -> Vec<String> {
+        c.iter()
+            .filter_map(|x| match x {
+                AssistantContent::Reasoning(r) => r.content.iter().find_map(|rc| match rc {
+                    rig_core::completion::message::ReasoningContent::Text { signature, .. } => {
+                        signature.clone()
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let sigs_first = sigs_of(assistants[0]);
+    let sigs_second = sigs_of(assistants[1]);
+    use std::collections::BTreeSet;
+    let set_first: BTreeSet<String> = sigs_first.iter().cloned().collect();
+    let set_second: BTreeSet<String> = sigs_second.iter().cloned().collect();
+    assert_eq!(
+        set_first,
+        BTreeSet::from(["sig.AAA-==".to_string()]),
+        "after save → load, the first assistant's signature SET must equal {{sig.AAA-==}}",
+    );
+    assert_eq!(
+        set_second,
+        BTreeSet::from(["sig.BBB-==".to_string()]),
+        "after save → load, the second assistant's signature SET must equal {{sig.BBB-==}}",
+    );
+
+    // And the tool-call ids are still partitioned correctly.
+    fn ids_of(c: &OneOrMany<AssistantContent>) -> Vec<String> {
+        c.iter()
+            .filter_map(|x| match x {
+                AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    assert_eq!(
+        ids_of(assistants[0]),
+        vec!["c1".to_string(), "c2".to_string()],
+        "after save → load, the first assistant's tool calls must be [c1, c2]",
+    );
+    assert_eq!(
+        ids_of(assistants[1]),
+        vec!["c3".to_string()],
+        "after save → load, the second assistant's tool call must be [c3]",
     );
 }

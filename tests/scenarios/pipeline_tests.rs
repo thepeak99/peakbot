@@ -36,6 +36,7 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
     // This IS the input the orchestrator should see.
     sm.add_tool_call(
         MessageSource::Human,
+        None,
         "delegate".to_string(),
         r#"{"role":"researcher","task":"survey the codebase","parent_task_id":1}"#.to_string(),
         Some("call-1".to_string()),
@@ -46,6 +47,7 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
     // orchestrator wire.
     sm.add_tool_call(
         sub_agent("researcher"),
+        None,
         "bash".to_string(),
         r#"{"command":"grep -r TODO"}"#.to_string(),
         Some("sub-call-1".to_string()),

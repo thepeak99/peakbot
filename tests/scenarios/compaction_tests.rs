@@ -1454,6 +1454,7 @@ async fn delegation_then_compaction_keeps_wire_valid() {
     // ToolResult(delegate, "call-1") → trailing assistant.
     harness.state_manager.add_tool_call(
         MessageSource::Human,
+        None,
         "delegate".to_string(),
         r#"{"role":"researcher","task":"survey","parent_task_id":1}"#.to_string(),
         Some("call-1".to_string()),
@@ -1463,6 +1464,7 @@ async fn delegation_then_compaction_keeps_wire_valid() {
     };
     harness.state_manager.add_tool_call(
         sub.clone(),
+        None,
         "bash".to_string(),
         r#"{"command":"echo SUBAGENT_SECRET step 1"}"#.to_string(),
         Some("sub-c-1".to_string()),
@@ -1480,6 +1482,7 @@ async fn delegation_then_compaction_keeps_wire_valid() {
     );
     harness.state_manager.add_tool_call(
         sub.clone(),
+        None,
         "bash".to_string(),
         r#"{"command":"echo SUBAGENT_SECRET step 2"}"#.to_string(),
         Some("sub-c-2".to_string()),
@@ -1619,4 +1622,165 @@ async fn delegation_then_compaction_keeps_wire_valid() {
 
     // Sanity: the summary text we queued appears in the resulting plan.
     let _ = result; // result is used to drive the assertions above; quiet unused.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T7b — Resumption after compaction splits by response.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// After a mid-action compaction the resumptive dispatch path goes
+/// through `build_resumption_for_compaction` (not
+/// `build_current_turn_message` + `get_agent_history`), because the last
+/// live row is a ToolResult rather than a fresh user turn.
+///
+/// T7b pins: the resumption HISTORY produced for the segmented fixture
+/// carries the two split assistant messages — NOT the single coalesced
+/// Assistant the per-row helper would emit if consulted in isolation —
+/// and the resumption PROMPT is the trailing ToolResult carrying zero
+/// reasoning (a ToolResult is a User-content row, never an Assistant
+/// row, so there is nothing to split; the contract is just "no
+/// reasoning attached").
+///
+/// This is the load-bearing regression lock for
+/// `build_resumption_for_compaction`: if a future implementer forgets to
+/// route the segmentation through it (and only patches
+/// `get_agent_history`), `/compact` would silently resume with a
+/// single-mismatched-signature assistant and Anthropic would 400.
+///
+/// Pre-implementation: `begin_response` and the new `add_tool_call`
+/// arity don't exist. The test fails to compile (RED for the right
+/// reason).
+#[test]
+fn resumption_after_compaction_splits_by_response() {
+    use peakbot::StateManager;
+    use peakbot::ui::app_state::MessageSource;
+    use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+    use rig_core::one_or_many::OneOrMany;
+
+    let sm = StateManager::new();
+
+    // ── Build the T1 fixture on a fresh StateManager. ──────────────────
+    sm.add_user_message("go".to_string());
+
+    let r1 = sm.begin_response(vec![peakbot::reasoning::ThinkingBlock::Thinking {
+        text: "alpha".to_string(),
+        signature: "sig.AAA-==".to_string(),
+    }]);
+    sm.add_tool_call(
+        MessageSource::Human,
+        Some(r1),
+        "bash".to_string(),
+        r#"{"command":"ls"}"#.to_string(),
+        Some("c1".to_string()),
+    );
+    sm.add_tool_result(
+        MessageSource::Human,
+        "bash".to_string(),
+        r#"{"command":"ls"}"#.to_string(),
+        "file1\nfile2".to_string(),
+        Some("c1".to_string()),
+    );
+    sm.add_tool_call(
+        MessageSource::Human,
+        Some(r1),
+        "todo".to_string(),
+        r#"{"action":"create","title":"a"}"#.to_string(),
+        Some("c2".to_string()),
+    );
+    sm.add_tool_result(
+        MessageSource::Human,
+        "todo".to_string(),
+        r#"{"action":"create","title":"a"}"#.to_string(),
+        "ok".to_string(),
+        Some("c2".to_string()),
+    );
+
+    let r2 = sm.begin_response(vec![peakbot::reasoning::ThinkingBlock::Thinking {
+        text: "beta".to_string(),
+        signature: "sig.BBB-==".to_string(),
+    }]);
+    sm.add_tool_call(
+        MessageSource::Human,
+        Some(r2),
+        "todo".to_string(),
+        r#"{"action":"create","title":"b"}"#.to_string(),
+        Some("c3".to_string()),
+    );
+    // The trailing live row is a ToolResult (mid-action compaction
+    // scenario — like the existing
+    // build_resumption_for_compaction_does_not_duplicate_user_prompt).
+    sm.add_tool_result(
+        MessageSource::Human,
+        "todo".to_string(),
+        r#"{"action":"create","title":"b"}"#.to_string(),
+        "ok".to_string(),
+        Some("c3".to_string()),
+    );
+
+    let (prompt, history) = sm
+        .build_resumption_for_compaction()
+        .expect("mid-action compaction fixture must produce a resumption");
+
+    // ── History: must carry two split assistant messages. ─────────────
+    let assistants: Vec<&OneOrMany<AssistantContent>> = history
+        .iter()
+        .filter_map(|m| match m {
+            RigMessage::Assistant { content, .. } => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        2,
+        "resumption history must split the two-response run into two Message::Assistant entries; got {}",
+        assistants.len(),
+    );
+
+    // Per-message signature SETS must be disjoint and partition correctly.
+    let mut sigs_seen: Vec<String> = Vec::new();
+    for c in assistants {
+        for x in c.iter() {
+            if let AssistantContent::Reasoning(r) = x
+                && let Some(sig) = r.content.iter().find_map(|rc| match rc {
+                    rig_core::completion::message::ReasoningContent::Text { signature, .. } => {
+                        signature.clone()
+                    }
+                    _ => None,
+                })
+            {
+                sigs_seen.push(sig);
+            }
+        }
+    }
+    assert_eq!(
+        sigs_seen,
+        vec!["sig.AAA-==".to_string(), "sig.BBB-==".to_string()],
+        "resumption history must carry the two signatures in transcript order — NOT a single SIG_A-only bundle (the bug) and NOT a single SIG_B-only bundle (forgetting r1 entirely)",
+    );
+
+    // ── Prompt: the trailing ToolResult for c3 — User content, NO
+    //    Assistant content, NO Reasoning. The compaction helper hands
+    //    the model the result of the last tool call it ran, not an
+    //    Assistant message. ─────────────────────────────────────────────
+    match &prompt {
+        RigMessage::User { content } => {
+            let tr = content.iter().find_map(|c| match c {
+                UserContent::ToolResult(tr) => Some(tr.id.as_str()),
+                _ => None,
+            });
+            assert_eq!(
+                tr,
+                Some("c3"),
+                "resumption prompt must be the trailing ToolResult (c3) — not an Assistant, not a User-text",
+            );
+            // UserContent has no Reasoning variant by construction; if a
+            // future refactor ever coalesced User+Assistant on the prompt
+            // seam, the outer `match &prompt` above would have caught
+            // it (the `other => panic!` branch). So no extra inner check.
+        }
+        other => panic!(
+            "resumption prompt must be a User message carrying the trailing ToolResult, got {:?}",
+            other,
+        ),
+    }
 }
