@@ -123,9 +123,15 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         state_manager.set_shell(sk.executable().to_string());
     }
 
-    // The pipeline catalogue every View reads (Agents panel roster). Stamped
-    // once — it is a projection of the boot-built set, never mutated.
-    state_manager.set_pipelines(deps.pipelines.infos());
+    // On resume, prefer a set rebuilt from the conversation's per-repo
+    // config so a team in `.peakbot/config.yaml` survives; any rebuild
+    // failure falls back to `deps.pipelines`. Cwd is the saved value.
+    let pipelines: Arc<PipelineSet> = match resume {
+        Some(id) => reload_pipelines_for_resume(&state_manager, deps, id)
+            .unwrap_or_else(|| deps.pipelines.clone()),
+        None => deps.pipelines.clone(),
+    };
+    state_manager.set_pipelines(pipelines.infos());
 
     // The conversation's pipeline selection. A fresh session has none; a
     // resumed one adopts its saved team, or drops it with a warning when that
@@ -134,7 +140,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     let saved_pipeline = resume
         .and_then(|id| state_manager.peek_conversation_pipeline(id).ok())
         .flatten();
-    let (active, pipeline_warning) = deps.pipelines.resolve_saved(saved_pipeline.as_deref());
+    let (active, pipeline_warning) = pipelines.resolve_saved(saved_pipeline.as_deref());
     state_manager.set_selected_pipeline(active.map(|p| p.name.clone()));
 
     let todo_tool = TodoTool::new(state_manager.clone());
@@ -384,6 +390,34 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         conversation_id,
         _run_handle: run_handle,
     })
+}
+
+/// Rebuild the pipeline set from the conversation's per-repo config on
+/// resume. Returns `None` for every failure mode (no saved cwd, gone
+/// dir, no `.peakbot/config.yaml`, bad YAML, registry/set build error)
+/// so the caller can fall back to `deps.pipelines` unchanged.
+fn reload_pipelines_for_resume(
+    state_manager: &StateManager,
+    deps: &SessionDeps,
+    id: Uuid,
+) -> Option<Arc<PipelineSet>> {
+    let cwd = state_manager
+        .peek_conversation_cwd(id)
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let path = PathBuf::from(&cwd);
+    if !path.is_dir() {
+        return None;
+    }
+    // Without a per-repo file the boot set is authoritative — an empty
+    // set from `reload_for` would silently drop boot-declared teams.
+    if !path.join(".peakbot/config.yaml").is_file() {
+        return None;
+    }
+    let fresh = Config::reload_for(&path).ok()?;
+    let registry = fresh.build_model_registry().ok()?;
+    let set = PipelineSet::build(&fresh, &registry, Some(&deps.skills.names())).ok()?;
+    Some(Arc::new(set))
 }
 
 #[cfg(test)]
@@ -828,6 +862,248 @@ pipelines:
         assert_eq!(
             session.model_alias, "sonnet",
             "fresh session must boot the registry default"
+        );
+    }
+
+    // ── Stage 2: resume must read the conversation's per-repo config ────
+    //
+    // The pipeline catalogue in `SessionDeps.pipelines` is built once, at
+    // boot, from the *boot cwd*. In-session verbs (`/load`, `/cd`) re-read
+    // the conversation's per-repo `.peakbot/config.yaml` and rebuild the
+    // set on the fly (see `reload_session_config` in `src/lib.rs`). The
+    // **resume path** in `create_session` skips that step — it just calls
+    // `deps.pipelines.resolve_saved(saved)` and drops the selection when
+    // the saved name is missing, with a "no longer configured" warning.
+    //
+    // That drops the pipeline for any conversation whose team is declared
+    // only in the conversation's directory's `.peakbot/config.yaml` and
+    // not in the boot cwd's config. The tests below pin the contract:
+    // resume must peek the saved cwd, re-read merged config from there,
+    // rebuild the set, and use the rebuilt set for resolution. On any
+    // reload/build failure the existing fallback to `deps.pipelines` must
+    // stay in place (no panic, no error).
+
+    /// Regression for the resume-must-read-per-repo-config bug:
+    ///
+    /// Boot `SessionDeps` with NO pipelines (the boot cwd has no
+    /// `pipelines:` block). Persist a conversation whose `cwd` is a
+    /// tempdir containing `.peakbot/config.yaml` that declares pipeline
+    /// `per-repo-team` with a valid model alias. On resume, the saved
+    /// cwd's per-repo config must be re-read and the saved selection
+    /// resolved against the freshly-rebuilt set — i.e. the session
+    /// must boot with `selected_pipeline = Some("per-repo-team")` and
+    /// NO "no longer configured" warning.
+    ///
+    /// Today this fails: `deps.pipelines` is empty, so `resolve_saved`
+    /// returns `(None, Some(warning))` and the pipeline is dropped. The
+    /// fix peeks the saved cwd, calls `Config::reload_for` against it,
+    /// rebuilds a `PipelineSet` from the merged config, and uses that
+    /// for both `set_pipelines` and `resolve_saved`.
+    #[tokio::test]
+    async fn create_session_resume_with_pipeline_declared_in_per_repo_config() {
+        // Boot SessionDeps: registry has both `sonnet` and `flash` so a
+        // per-repo-declared pipeline that references either alias builds
+        // cleanly. Pipelines set is empty: the boot cwd has no
+        // `pipelines:` block, so the only place `per-repo-team` can come
+        // from is the conversation's own directory's config.
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let deps = test_deps_with_pipelines(
+            registry_two_aliases(),
+            storage.clone(),
+            Arc::new(crate::pipeline::PipelineSet::default()),
+        );
+
+        // Build a tempdir to stand in for the conversation's saved repo.
+        // It must exist as a directory (resume adopts the saved cwd iff
+        // it still points at a directory) and it must contain a
+        // per-repo `.peakbot/config.yaml` that declares the pipeline.
+        let repo_dir = tempfile::tempdir().expect("create repo tempdir");
+        let peakbot_dir = repo_dir.path().join(".peakbot");
+        std::fs::create_dir_all(&peakbot_dir).expect("create .peakbot dir");
+        let per_repo_yaml = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-test
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: sonnet
+      - name: google/gemini-2.0-flash-001
+        alias: flash
+default_model: sonnet
+pipelines:
+  - name: per-repo-team
+    orchestrator:
+      model: sonnet
+    agents:
+      reviewer:
+        model: flash
+        prompt: review
+";
+        std::fs::write(peakbot_dir.join("config.yaml"), per_repo_yaml)
+            .expect("write per-repo .peakbot/config.yaml");
+
+        // Persist a conversation bound to that cwd with pipeline
+        // `per-repo-team` selected.
+        let mut saved = Conversation::new(
+            "per-repo-pipeline".into(),
+            "openrouter".into(),
+            "google/gemini-2.0-flash-001".into(),
+            repo_dir.path().to_string_lossy().into_owned(),
+        );
+        saved.pipeline = Some("per-repo-team".into());
+        let saved_id = saved.id;
+        storage.save(&saved).expect("save conversation");
+
+        // Resuming must read the per-repo config and resolve the saved
+        // selection — without the fix this drops the selection and emits
+        // the "no longer configured" warning.
+        let session = create_session(&deps, Some(saved_id)).expect("create_session");
+
+        // The saved selection must survive the resume — `selected_pipeline`
+        // is the single nullable fact every downstream surface reads.
+        assert_eq!(
+            session.state_manager.selected_pipeline().as_deref(),
+            Some("per-repo-team"),
+            "resume must pick up the per-repo-declared pipeline, not drop \
+             it as unconfigured (deps.pipelines is intentionally empty so \
+             the only source of `per-repo-team` is the saved cwd's \
+             .peakbot/config.yaml)"
+        );
+        // With the team selected, the orchestrator alias must win — the
+        // conversation's saved wire id is `flash`, but the pipeline's
+        // orchestrator is `sonnet` (per `Stage 1.2` contract above).
+        assert_eq!(
+            session.model_alias, "sonnet",
+            "with per-repo-team selected, the pipeline's orchestrator \
+             alias (`sonnet`) must beat the saved wire id (`flash`)"
+        );
+
+        // And the "no longer configured" warning must NOT be emitted —
+        // the pipeline IS configured, just not where the boot-time set
+        // looked. Scan every system message for the warning's key phrase.
+        let state = session.state_manager.get_state();
+        let spurious_warning = state.chat.messages.iter().any(|m| {
+            matches!(m.role, crate::ui::app_state::MessageRole::System)
+                && m.content.contains("per-repo-team")
+                && (m.content.contains("no longer") || m.content.contains("configured"))
+        });
+        assert!(
+            !spurious_warning,
+            "a pipeline declared in the saved cwd's per-repo config must \
+             NOT trigger the 'no longer configured' warning; system \
+             messages were: {:#?}",
+            state
+                .chat
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role, crate::ui::app_state::MessageRole::System))
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression-guard for the fix's fallback path: when the per-repo
+    /// reload succeeds but the rebuilt `PipelineSet` is empty (or the
+    /// build fails), the resume path must fall back to `deps.pipelines`
+    /// rather than erroring out. The "no longer configured" warning
+    /// must still be emitted when the saved selection truly is missing
+    /// from BOTH sets.
+    ///
+    /// Today this passes for the wrong reason — the per-repo config is
+    /// never read, so the empty `deps.pipelines` is used and the
+    /// warning is emitted by today's `resolve_saved` call. After the
+    /// fix, the per-repo config IS read (and its broken pipeline is
+    /// dropped at build time); the implementer must catch that and
+    /// fall back to `deps.pipelines` to keep this test green.
+    #[tokio::test]
+    async fn create_session_resume_with_invalid_per_repo_pipeline_falls_back_gracefully() {
+        // Boot SessionDeps: pipelines set is empty (same as the happy
+        // path above). Registry has `sonnet` so an unknown alias in the
+        // per-repo YAML triggers `UnknownOrchestrator` at build time.
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
+        let deps = test_deps_with_pipelines(
+            registry_two_aliases(),
+            storage.clone(),
+            Arc::new(crate::pipeline::PipelineSet::default()),
+        );
+
+        // Tempdir + a per-repo config that names an UNKNOWN model alias
+        // (`does-not-exist`) as the orchestrator. `PipelineSet::build`
+        // rejects this with `UnknownOrchestrator`; the fix must catch
+        // that and fall back to `deps.pipelines`. Today the per-repo
+        // config is ignored entirely so the test passes against the
+        // empty `deps.pipelines`.
+        let repo_dir = tempfile::tempdir().expect("create repo tempdir");
+        let peakbot_dir = repo_dir.path().join(".peakbot");
+        std::fs::create_dir_all(&peakbot_dir).expect("create .peakbot dir");
+        let per_repo_yaml = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-test
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: sonnet
+default_model: sonnet
+pipelines:
+  - name: per-repo-team
+    orchestrator:
+      model: does-not-exist
+    agents:
+      reviewer:
+        prompt: review
+";
+        std::fs::write(peakbot_dir.join("config.yaml"), per_repo_yaml)
+            .expect("write per-repo .peakbot/config.yaml");
+
+        let mut saved = Conversation::new(
+            "per-repo-bad-pipeline".into(),
+            "openrouter".into(),
+            "google/gemini-2.0-flash-001".into(),
+            repo_dir.path().to_string_lossy().into_owned(),
+        );
+        saved.pipeline = Some("per-repo-team".into());
+        let saved_id = saved.id;
+        storage.save(&saved).expect("save conversation");
+
+        // Must NOT panic or return Err — `create_session` always
+        // returns a usable session so the web UI can render the
+        // conversation even when its saved pipeline is unresolvable.
+        let session = create_session(&deps, Some(saved_id)).expect(
+            "create_session must succeed even when the per-repo \
+             pipelines block is malformed — fall back to deps.pipelines",
+        );
+
+        // Both the per-repo-rebuilt set AND deps.pipelines are empty, so
+        // the saved selection is dropped.
+        assert_eq!(
+            session.state_manager.selected_pipeline().as_deref(),
+            None,
+            "an invalid per-repo pipeline must NOT be selected; the fix \
+             falls back to deps.pipelines (also empty here), so the saved \
+             selection is dropped"
+        );
+        // The "no longer configured" warning must still fire — same
+        // wording and trigger as today's `resolve_saved` fallback.
+        let state = session.state_manager.get_state();
+        let warning_present = state.chat.messages.iter().any(|m| {
+            matches!(m.role, crate::ui::app_state::MessageRole::System)
+                && m.content.contains("per-repo-team")
+                && (m.content.contains("no longer") || m.content.contains("configured"))
+        });
+        assert!(
+            warning_present,
+            "with the pipeline truly unresolvable, the 'no longer \
+             configured' warning must still be surfaced; system \
+             messages were: {:#?}",
+            state
+                .chat
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role, crate::ui::app_state::MessageRole::System))
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
         );
     }
 }
