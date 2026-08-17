@@ -439,3 +439,133 @@ fn same_role_name_routes_to_selected_teams_model() {
          that's the cross-pipeline conflict Stage 1.2 has to scope correctly"
     );
 }
+
+// ── Ticket pipelines-reload.md §8 test 15: dangling-selection ⇒ no delegate ─
+//
+// Invariant I-2 from the ticket: "an unresolvable selection is inert, not
+// broken. ... A dangling name yields no orchestrator override and no
+// `delegate` tool (`src/providers/mod.rs:606-624`) — the exact same agent
+// as `None`."
+//
+// We can't drive `rebuild_agent_for_resolved` end-to-end from the
+// integration crate (it needs a live mock provider + session hook), but
+// we CAN pin the seam where the decision is taken: `boot_registry` is
+// `None` whenever the rebuild seam's `active = sm.selected_pipeline()
+// .and_then(|name| ctx.pipelines.get(&name))` lookup returns `None`
+// (a dangling name). `DelegateTool` built over an empty
+// `SubAgentRegistry` is what `boot_registry = None` looks like to the
+// delegate code path; its `definition()` must therefore expose an empty
+// role enum — no role can be delegated to. The companion unit test
+// `src/lib.rs::tests::dangling_selection_resolves_to_none_at_the_rebuild_seam`
+// pins the lookup itself; this one pins the downstream effect on the
+// tool the LLM can actually call.
+
+use peakbot::config::PipelineConfig;
+use peakbot::pipeline::PipelineSet;
+
+/// A minimal `ModelRegistry` — only its existence is needed; the empty
+/// `Members` argument means `SubAgentRegistry::new` never consults the
+/// model registry, so any well-formed one suffices. Reuses the
+/// `flash`/`sonnet` fixture the rest of the file already builds via
+/// `two_registries_with_shared_reviewer` — extracting it once here so
+/// the assertion below stays focused on the dangling-selection contract.
+fn minimal_model_registry() -> peakbot::config::ModelRegistry {
+    use peakbot::config::{ModelEntry, ProviderEntry, ProviderType};
+    let prov = ProviderEntry {
+        name: "openrouter".into(),
+        kind: ProviderType::OpenRouter,
+        api_key: Some("sk-test".into()),
+        base_url: None,
+        preserve_reasoning: None,
+        display_reasoning: None,
+        models: vec![ModelEntry {
+            name: "google/gemini-2.0-flash-001".into(),
+            alias: Some("flash".into()),
+            max_tokens: None,
+            temperature: None,
+            extra_params: None,
+            prompt_caching: None,
+            vision: None,
+            context_size: None,
+            preserve_reasoning: true,
+            display_reasoning: false,
+        }],
+    };
+    peakbot::config::ModelRegistry::build(std::slice::from_ref(&prov), Some("flash"))
+        .expect("minimal registry builds")
+}
+
+/// Build a `DelegateTool` whose `SubAgentDeps.registry` is the empty
+/// `SubAgentRegistry` — the shape the rebuild seam produces when
+/// `boot_registry = None` (no selected pipeline / dangling selection).
+/// Reuses the `delegate_tool_for_registry` harness from above.
+fn delegate_tool_with_empty_registry() -> DelegateTool {
+    let empty_registry = peakbot::pipeline::SubAgentRegistry::new(
+        &PipelineConfig {
+            enabled: true,
+            orchestrator_prompt: None,
+            agents: peakbot::config::Members::default(),
+        },
+        &minimal_model_registry(),
+        &[],
+    )
+    .expect(
+        "empty Members produces an empty SubAgentRegistry without consulting the model registry",
+    );
+    delegate_tool_for_registry(std::sync::Arc::new(empty_registry))
+}
+
+/// The dangling-selection contract: a `DelegateTool` built on top of an
+/// empty `SubAgentRegistry` (what `boot_registry = None` produces) MUST
+/// expose an empty role enum — no role is invokable. A non-empty role
+/// enum here would mean a dangling selection still hands the orchestrator
+/// a `delegate` tool that names a role whose team doesn't exist.
+#[tokio::test]
+async fn selected_pipeline_that_vanishes_yields_no_delegate_tool() {
+    let tool = delegate_tool_with_empty_registry();
+    let def = Tool::definition(&tool, String::new()).await;
+
+    // The schema's `role.description` lists every invokable role. With
+    // an empty registry this MUST NOT contain any role name from the
+    // fixtures used elsewhere in this file (so a future regression
+    // that hard-codes roles in the schema — e.g. "Available roles:
+    // reviewer, tester, writer" — would fail this pin).
+    let role_desc = def
+        .parameters
+        .get("properties")
+        .and_then(|p| p.get("role"))
+        .and_then(|r| r.get("description"))
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+
+    assert!(
+        !role_desc.contains("reviewer"),
+        "the empty-registry delegate tool must NOT name any role (e.g. \
+         'reviewer'); a dangling selection that still exposes a \
+         delegate tool with roles is I-2 (src/providers/mod.rs:606-624) \
+         violation. Got: {role_desc}"
+    );
+    assert!(
+        !role_desc.contains("tester"),
+        "empty-registry delegate must NOT name `tester` either; got: {role_desc}"
+    );
+    assert!(
+        !role_desc.contains("writer"),
+        "empty-registry delegate must NOT name `writer` either; got: {role_desc}"
+    );
+
+    // Cross-check: `PipelineSet::default()` is empty, so any selection
+    // lookup against it (the rebuild seam's `ctx.pipelines.get(&name)`)
+    // yields None — exactly the dangling case. The unit test
+    // `src/lib.rs::tests::dangling_selection_resolves_to_none_at_the_rebuild_seam`
+    // exercises that lookup directly with a real selection.
+    assert!(
+        PipelineSet::default().is_empty(),
+        "PipelineSet::default() must be empty (sanity)"
+    );
+    assert!(
+        PipelineSet::default().get("ghost").is_none(),
+        "PipelineSet::default().get(\"ghost\") must be None — this is the \
+         lookup shape the rebuild seam's dangling case relies on"
+    );
+}

@@ -1759,13 +1759,18 @@ fn load_yaml_config() -> anyhow::Result<(Option<Config>, Option<std::path::PathB
     Ok((Some(config), Some(config_path)))
 }
 
-/// Load per-repository configuration from `.peakbot/config.yaml` in the current working directory.
+/// Load per-repository configuration from `<dir>/.peakbot/config.yaml`.
 /// If the file exists and is valid, returns the parsed config.
 /// If the file doesn't exist, returns None silently.
 /// If the file is malformed, logs a warning and returns None.
-fn load_per_repo_config() -> Option<Config> {
-    // Look for .peakbot/config.yaml in the current working directory
-    let per_repo_path = std::env::current_dir().ok()?.join(".peakbot/config.yaml");
+///
+/// `dir` is always supplied by the caller: post-boot the process cwd is
+/// NOT the session cwd (nothing ever calls `set_current_dir`), so reading
+/// `std::env::current_dir()` here would silently return the wrong repo's
+/// config after `/cd`. (Invariant I-5 — the base directory for per-repo
+/// config is an argument, not ambient state.)
+fn load_per_repo_config(dir: &std::path::Path) -> Option<Config> {
+    let per_repo_path = dir.join(".peakbot/config.yaml");
 
     if !per_repo_path.exists() {
         tracing::debug!("No per-repo config found at {}", per_repo_path.display());
@@ -1803,7 +1808,12 @@ impl Config {
         // A malformed master config is fatal — see `load_yaml_config`.
         let (master, config_file_path) = load_yaml_config()?;
         let config_file_found = master.is_some();
-        let config = Self::merge_sources(master, load_per_repo_config());
+        // The ONE legitimate process-cwd read: at boot it really is the
+        // session cwd. Every post-boot path passes the dir explicitly.
+        let per_repo = std::env::current_dir()
+            .ok()
+            .and_then(|d| load_per_repo_config(&d));
+        let config = Self::merge_sources(master, per_repo);
 
         config.tools.validate().map_err(anyhow::Error::msg)?;
         config.timeouts.validate().map_err(anyhow::Error::msg)?;
@@ -1815,20 +1825,20 @@ impl Config {
         })
     }
 
-    /// Re-read config from disk (master + per-repo merge) for a live
-    /// session, without touching process-wide `SessionDeps`. Same
-    /// precedence as [`Config::load`], but returns a bare `Config` and
-    /// maps a malformed-master error to `Err(reason)` so the caller can
-    /// keep the previous config and warn instead of crashing.
-    ///
-    /// A missing master file behaves like boot (defaults + per-repo).
-    pub fn reload() -> Result<Config, String> {
+    /// Re-read master + `<cwd>/.peakbot/config.yaml` for a live session.
+    /// Replaces `reload()` — `cwd` must be the directory the session WILL
+    /// be in after the calling verb completes (target for `/cd`, current
+    /// `session_cwd` for the other verbs). Same precedence as
+    /// [`Config::load`]; a malformed-master error maps to `Err(reason)`
+    /// so the caller can keep the previous config and warn instead of
+    /// crashing.
+    pub fn reload_for(cwd: &std::path::Path) -> Result<Config, String> {
         let master = load_yaml_config().map_err(|e| e.to_string())?.0;
-        Ok(Self::merge_sources(master, load_per_repo_config()))
+        Ok(Self::merge_sources(master, load_per_repo_config(cwd)))
     }
 
     /// Pure merge of the two config sources over defaults — the
-    /// testable core shared by [`Config::load`] and [`Config::reload`].
+    /// testable core shared by [`Config::load`] and [`Config::reload_for`].
     /// Master (if present) replaces defaults; per-repo (if present) is
     /// merged on top with top-level key override.
     fn merge_sources(master: Option<Config>, per_repo: Option<Config>) -> Config {
@@ -3830,5 +3840,183 @@ api_key: "sk-test"
         let cfg_default: AnthropicConfig =
             serde_yaml::from_str(yaml_default).expect("legacy config without field parses");
         assert_eq!(cfg_default.display_reasoning, None);
+    }
+
+    // =========================================================================
+    // Reload-safe `pipelines:` (ticket pipelines-reload.md §8, tests 1–5).
+    //
+    // The headline change is `load_per_repo_config(dir: &Path)` — the
+    // process cwd is no longer read here, so `/cd` into a repo with its
+    // own `.peakbot/config.yaml` finally reads THAT repo's config instead
+    // of the boot tree's. Test #1 is the regression pin for the
+    // load-bearing bug; tests #2–#5 lock the merge semantics against
+    // the new signature.
+    // =========================================================================
+
+    /// `load_per_repo_config` must read from the directory it is handed,
+    /// not from `std::env::current_dir()`. Two tempdirs, only A has a
+    /// `.peakbot/config.yaml` with `pipelines:` — the assertion is that
+    /// `load_per_repo_config(A)` is `Some` with that pipeline and
+    /// `load_per_repo_config(B)` is `None`, **without the test ever
+    /// touching the process cwd** (which `agents.md` is documented to
+    /// leak into prompts).
+    ///
+    /// This is the regression pin for the "after /cd the reload re-reads
+    /// the OLD repo" bug — see the §1 SUMMARY in the ticket.
+    #[test]
+    fn per_repo_config_is_read_from_the_given_dir_not_the_process_cwd() {
+        let tmp_a = tempfile::tempdir().expect("tmpdir A");
+        let tmp_b = tempfile::tempdir().expect("tmpdir B");
+
+        // Only A has a per-repo file with a `pipelines:` block.
+        let peakbot_a = tmp_a.path().join(".peakbot");
+        std::fs::create_dir_all(&peakbot_a).expect("mkdir .peakbot in A");
+        std::fs::write(
+            peakbot_a.join("config.yaml"),
+            "pipelines:\n  - name: alpha\n    orchestrator: {}\n    agents:\n      r:\n        prompt: p\n",
+        )
+        .expect("write A");
+
+        // Sanity: the process cwd is somewhere else. This matters because
+        // the OLD implementation (`std::env::current_dir()`) would have
+        // returned None when run from the repo root — the bug shipped
+        // BECAUSE tests didn't assert the cwd path. Recording the cwd
+        // here documents the precondition; the test will still pass on
+        // any cwd because the assertion is on A vs. B.
+        let cwd_before = std::env::current_dir().expect("current_dir");
+
+        let from_a = super::load_per_repo_config(tmp_a.path());
+        let from_b = super::load_per_repo_config(tmp_b.path());
+
+        // cwd was never touched — the test would still pass if the impl
+        // moved it, but recording it catches the more obvious cheating
+        // path of "set cwd to A first".
+        assert_eq!(
+            std::env::current_dir().expect("current_dir after"),
+            cwd_before,
+            "the test itself must not mutate the process cwd (else the \
+             regression pin is meaningless — it'd pass on the OLD impl \
+             too by setting cwd = A first)"
+        );
+
+        let cfg_a = from_a.expect("A has a .peakbot/config.yaml and must be parsed");
+        assert_eq!(
+            cfg_a.pipelines.len(),
+            1,
+            "A's per-repo config must carry its pipelines: block"
+        );
+        assert_eq!(cfg_a.pipelines[0].name, "alpha");
+        assert!(
+            from_b.is_none(),
+            "B has no .peakbot/config.yaml; must silently return None"
+        );
+    }
+
+    /// Wholesale-override rule for `pipelines:` — per-repo's non-empty
+    /// list replaces the master's. Same shape as the existing
+    /// `stage11_merge_with_per_repo_pipelines_overrides_master`, but
+    /// driven through `merge_sources(master, per_repo)` directly (the
+    /// private seam the new code calls), so a future refactor of
+    /// `merge_with` doesn't break the reload path while leaving the
+    /// direct-merge test green.
+    #[test]
+    fn per_repo_pipelines_override_master_wholesale_via_merge_sources() {
+        let master = Config {
+            pipelines: vec![PipelineDef {
+                name: "alpha".into(),
+                orchestrator: OrchestratorDef::default(),
+                agents: Members::default(),
+            }],
+            ..Config::default()
+        };
+        let per_repo = Config {
+            pipelines: vec![PipelineDef {
+                name: "beta".into(),
+                orchestrator: OrchestratorDef::default(),
+                agents: Members::default(),
+            }],
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(per_repo));
+        let names: Vec<&str> = merged.pipelines.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["beta"],
+            "non-empty per-repo pipelines must replace the master list \
+             wholesale (mirrors the providers: rule at src/config/mod.rs:1646-1650)"
+        );
+    }
+
+    /// An absent / empty `pipelines:` in the per-repo config must NOT
+    /// clobber the master's pipelines. Pins the "non-empty overrides"
+    /// half of `merge_with` for `pipelines:` (`:1634-1639`).
+    ///
+    /// This is the case that hits `/cd` from a repo with no
+    /// `pipelines:` into a master that declares one — the master teams
+    /// must survive.
+    #[test]
+    fn empty_per_repo_pipelines_keep_master_pipelines_via_merge_sources() {
+        let master = Config {
+            pipelines: vec![PipelineDef {
+                name: "alpha".into(),
+                orchestrator: OrchestratorDef::default(),
+                agents: Members::default(),
+            }],
+            ..Config::default()
+        };
+        // Per-repo with `pipelines: []` (explicit empty) — the "absent"
+        // case is also pinned here because `Config::default().pipelines`
+        // is empty, so the same assertion covers both.
+        let per_repo = Config::default();
+        assert!(
+            per_repo.pipelines.is_empty(),
+            "fixture: per-repo has no pipelines"
+        );
+        let merged = Config::merge_sources(Some(master), Some(per_repo));
+        assert_eq!(
+            merged.pipelines.len(),
+            1,
+            "empty per-repo pipelines must preserve the master list"
+        );
+        assert_eq!(merged.pipelines[0].name, "alpha");
+    }
+
+    /// Malformed YAML at `<dir>/.peakbot/config.yaml` must NOT panic or
+    /// return `Err` — `load_per_repo_config` is intentionally infallible
+    /// (`Option<Config>`), so a typo'd per-repo config degrades to
+    /// "no per-repo overlay" with a `tracing::warn!` instead of crashing
+    /// the session. Pre-existing behaviour (`:1788-1791`); the test pins
+    /// it against the new `dir: &Path` signature.
+    #[test]
+    fn malformed_per_repo_config_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let peakbot = tmp.path().join(".peakbot");
+        std::fs::create_dir_all(&peakbot).expect("mkdir .peakbot");
+        std::fs::write(
+            peakbot.join("config.yaml"),
+            "this: is: not: valid: yaml: [unterminated",
+        )
+        .expect("write malformed");
+
+        let result = super::load_per_repo_config(tmp.path());
+        assert!(
+            result.is_none(),
+            "malformed per-repo YAML must degrade to None (warn-and-ignore), \
+             not crash the caller; got: {result:?}"
+        );
+    }
+
+    /// No `<dir>/.peakbot/config.yaml` at all — silent `None`. The
+    /// `None`-on-missing contract is the difference between "this repo
+    /// has its own config" and "no per-repo overlay, fall through to
+    /// master"; without it, every `load_per_repo_config` would have to
+    /// log a "no config" debug line on the common path.
+    #[test]
+    fn missing_per_repo_config_is_silent() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        assert!(
+            super::load_per_repo_config(tmp.path()).is_none(),
+            "no .peakbot/config.yaml in the dir must silently return None"
+        );
     }
 }

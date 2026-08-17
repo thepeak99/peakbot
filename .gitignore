@@ -15,3 +15,6 @@ output
 .test/
 
 scripts
+
+# Local wire-sniff dumps (can contain request/response bodies — never commit)
+sniff-bug.jsonl
