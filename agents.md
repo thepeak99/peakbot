@@ -136,9 +136,11 @@ Editing `config.yaml` or skills does not require a restart: each session verb re
 | `providers:` / `default_model` (new aliases resolve) | `mcp_servers` (live subprocesses) |
 | skills + system prompt | `vector_db` (redb/HNSW handle) |
 | `searxng.*`, `bash.env`, `agent_max_turns` | `web.*` (read once by the session reaper) |
-| `cost_tracking`, `context.*`, `retry.*`, `memory.*`, `timeouts.*` | `pipeline` / `pipelines` (built sub-agent registry) |
-| `tools.*` (built-in filter) | `provider` (legacy block) |
-| | `http.*` (published once into the client factory) |
+| `cost_tracking`, `context.*`, `retry.*`, `memory.*`, `timeouts.*` | `provider` (legacy block) |
+| `tools.*` (built-in filter) | `http.*` (published once into the client factory) |
+| `pipelines:` (rebuilt from per-repo config; see note) | legacy `pipeline:` (hard boot error — `PipelineSet::build` rejects it) |
+
+`pipelines:` is now hot-reloadable on `/cd`, `/new`, `/model`, `/load`. The rebuild runs **after** the skill re-scan (so a role's `skills:` filter is validated against fresh names) and **before** `adopt_reloaded` (so it still has `&fresh_config`). A bad `pipelines:` block warns and keeps the previous set; the rest of the config is still adopted. The per-conversation selection on a non-empty conversation is **locked** (the existing "locked after first turn" rule is unchanged) — picking a team mid-conversation would risk mid-flight tool-list drift, so the reconciler only acts on a freshly minted conversation. Nothing is auto-selected: a local `.peakbot/config.yaml` declaring `pipelines:` makes teams *available*, never *active*. Legacy `pipeline:` is still a hard build error at boot — no silent adaptation, no silent zero-pipeline boot.
 
 There is deliberately no filesystem watcher — reload is explicit, to avoid heisenbugs mid-turn.
 

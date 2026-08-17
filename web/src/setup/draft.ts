@@ -452,6 +452,10 @@ const RELOAD_SAFE_KEYS = new Set([
   "memory",
   "timeouts",
   "tools",
+  // `pipelines:` is rebuilt at every session verb (/cd, /new, /model, /load)
+  // — see ticket pipelines-reload.md. The legacy `pipeline:` key stays
+  // boot-only (and is a hard build error in `PipelineSet::build`).
+  "pipelines",
 ]);
 
 /** Classify a top-level config key. Unrecognised keys default to

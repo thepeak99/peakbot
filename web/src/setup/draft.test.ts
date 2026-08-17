@@ -390,8 +390,9 @@ describe("classifyChange (restart matrix from agents.md)", () => {
     "timeouts",
     "tools",
     "skills",
+    "pipelines",
   ];
-  const BOOT_ONLY = ["mcp_servers", "vector_db", "web", "pipeline", "pipelines", "http"];
+  const BOOT_ONLY = ["mcp_servers", "vector_db", "web", "pipeline", "http"];
 
   for (const k of RELOAD_SAFE) {
     it(`classifies ${k} as reload-safe`, () => {
@@ -407,6 +408,25 @@ describe("classifyChange (restart matrix from agents.md)", () => {
 
   it("defaults unknown keys to boot-only (conservative — better to say 'restart' than lie)", () => {
     expect(classifyChange("totally_unrelated_thing")).toBe("boot-only");
+  });
+
+  // ---------- ticket pipelines-reload.md ------------------------------------
+  //
+  // Two focused pins added alongside the existing matrix above (the
+  // matrix is a smoke test of the whole Set; these pin the specific
+  // ticket move). They will be RED until `RELOAD_SAFE_KEYS` in
+  // `draft.ts` gains `"pipelines"` (task 6 of the ticket's
+  // implementation plan).
+  it("classifies 'pipelines' as reload-safe (ticket pipelines-reload.md task 6)", () => {
+    expect(classifyChange("pipelines")).toBe("reload-safe");
+  });
+  it("keeps 'pipeline' (the legacy single-pipeline shape) boot-only", () => {
+    // Amendment 5: `pipeline:` is a hard boot error in
+    // `PipelineSet::build`, so reloading it would be wrong. The
+    // `classifyChange` default for unknown keys is already boot-only,
+    // so this also asserts that `"pipeline"` is NOT in
+    // `RELOAD_SAFE_KEYS`.
+    expect(classifyChange("pipeline")).toBe("boot-only");
   });
 });
 

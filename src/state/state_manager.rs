@@ -1115,6 +1115,12 @@ impl StateManager {
         // Snapshot the selection under the state lock and release it *before*
         // locking the conversation — never hold both guards together (plan §4).
         // `/new` mints on the current pipeline (D2: the selection survives).
+        // I-3: we deliberately do NOT clear `AppState.selected_pipeline` here —
+        // the live mirror must keep agreeing with the current conversation's
+        // `pipeline`, or the rebuild seam drops `delegate` on a team the freshly
+        // persisted conversation still names (and `/load` resurrects it).
+        // Dropping a selection the fresh config no longer defines is the
+        // reconciler's job at the verb call sites, not the mint's.
         let selected = self.state.read().unwrap().selected_pipeline.clone();
         let mut conv = Conversation::new(name, provider_name, model, cwd);
         conv.pipeline = selected;
@@ -3313,6 +3319,39 @@ mod tests {
         assert_eq!(
             sm.get_current_conversation().unwrap().pipeline.as_deref(),
             Some("web-team")
+        );
+    }
+
+    /// **I-3 divergence pin.** `Conversation.pipeline` (persisted truth) and
+    /// `AppState.selected_pipeline` (live mirror) must agree for the CURRENT
+    /// conversation at every point a rebuild can observe them — the rebuild
+    /// seam derives the active team from the mirror
+    /// (`src/lib.rs`: `sm.selected_pipeline().and_then(|n| ctx.pipelines.get(n))`),
+    /// so a mint that stamps the conversation but clears the mirror leaves the
+    /// agent without `delegate` while the file still says "web-team", and
+    /// `/load` on that file resurrects a team the user thought they'd left.
+    /// Documented behaviour: agents.md — "`/new` keeps the current selection."
+    #[test]
+    fn create_conversation_keeps_live_mirror_and_persisted_pipeline_in_sync() {
+        let sm = StateManager::new();
+        sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
+        sm.set_selected_pipeline(Some("web-team".into()));
+
+        // The `/new` / `/cd` / `/model` mint.
+        sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
+
+        assert_eq!(
+            sm.get_current_conversation().unwrap().pipeline.as_deref(),
+            Some("web-team"),
+            "persisted truth: the minted conversation carries the selection"
+        );
+        assert_eq!(
+            sm.selected_pipeline().as_deref(),
+            Some("web-team"),
+            "live mirror MUST agree with the current conversation's `pipeline` — \
+             clearing it here strands the rebuild seam on single-agent mode \
+             (no `delegate`, orchestrator model reverted) while the persisted \
+             conversation still names the team (I-3 divergence)"
         );
     }
 

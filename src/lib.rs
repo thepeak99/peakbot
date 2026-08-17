@@ -305,7 +305,8 @@ fn resolve_pipeline_choice(
 /// with what the Agents panel shows).
 fn render_pipeline_list(state: &crate::ui::app_state::AppState) -> String {
     if state.pipelines.is_empty() {
-        return "🧩 No pipelines configured. Add a `pipelines:` block to config.yaml and restart."
+        return "🧩 No pipelines configured. Add a `pipelines:` block to config.yaml (or this \
+                repo's .peakbot/config.yaml) — /new picks it up."
             .to_string();
     }
     let mut msg = String::from("Available pipelines:\n");
@@ -331,6 +332,43 @@ fn render_pipeline_list(state: &crate::ui::app_state::AppState) -> String {
          (only before the first turn).",
     );
     msg
+}
+
+/// One line when the set of pipeline NAMES changed, else `None` (silence).
+/// Roster-only changes (same names, different members) update the
+/// catalogue silently — the Agents panel shows them via `set_pipelines`,
+/// but `names_joined()` is unchanged so the chat shouldn't get a
+/// redundant line. (Ticket §5.2/pipeline-catalogue-message.)
+fn pipeline_catalogue_message(before: &PipelineSet, after: &PipelineSet) -> Option<String> {
+    if before.names_joined() == after.names_joined() {
+        return None;
+    }
+    Some(if after.is_empty() {
+        "🧩 No pipelines configured here.".to_string()
+    } else {
+        format!(
+            "🧩 Pipelines available here: {} — /pipeline <name> to select.",
+            after.names_joined()
+        )
+    })
+}
+
+/// Drop a live selection that no longer resolves in the fresh `PipelineSet`.
+/// Returns the warning to emit, or `None` for a no-op (no selection, or
+/// the selection still resolves). Writes persisted truth via
+/// `set_selected_pipeline` (invariant I-3), so the caller is responsible
+/// for ensuring the current conversation has no turns — see the call
+/// sites in `handle_change_cwd`, `handle_switch_model`, and
+/// `refresh_agent_after_new`. Never auto-selects (ticket §5.5).
+fn reconcile_pipeline_selection(ctx: &RebuildContext, sm: &Arc<StateManager>) -> Option<String> {
+    let name = sm.selected_pipeline()?;
+    if ctx.pipelines.get(&name).is_some() {
+        return None;
+    }
+    sm.set_selected_pipeline(None);
+    Some(format!(
+        "⚠ Pipeline '{name}' is not configured here — continuing without a pipeline."
+    ))
 }
 
 /// Completion result sent from agent loop back to event loop
@@ -1519,7 +1557,12 @@ impl AgentRunner {
         // a new system prompt / registry is in play before we switch.
         // Warnings are surfaced *after* the conversation reset below so
         // `reset_conversation_state()` can't wipe them from the chat.
-        let reload_warnings = Self::reload_session_config(config, ctx, &sm_for_provider);
+        let reload_warnings = Self::reload_session_config(
+            config,
+            ctx,
+            &sm_for_provider,
+            &sm_for_provider.session_cwd(),
+        );
 
         let Some(resolved) = ctx.registry.resolve(alias) else {
             let available = ctx.registry.aliases_sorted().join(", ");
@@ -1569,6 +1612,16 @@ impl AgentRunner {
             "🔁 New conversation on {} ({} · {})",
             resolved.alias, resolved.provider_name, resolved.model_name
         ));
+
+        // Reconcile the live pipeline selection against the fresh set.
+        // Same shape as /cd: the new conversation is freshly minted
+        // (zero turns), so the `set_selected_pipeline(None)` write
+        // targets persisted truth for THAT conversation, not the
+        // outgoing one (invariant I-3 / hazard #3).
+        let mut reload_warnings = reload_warnings;
+        if let Some(warning) = reconcile_pipeline_selection(ctx, &sm_for_provider) {
+            reload_warnings.push(warning);
+        }
 
         // Surface reload/skill warnings now — after the reset — so they
         // persist in the fresh conversation instead of being cleared.
@@ -1733,8 +1786,11 @@ impl AgentRunner {
         // Re-read config + skills before resolving so a config edit lands
         // on this /cd. The prompt is rebuilt again below against the new
         // cwd; this refreshes the registry + skills the resolve relies on.
+        // `session_cwd` is the **target** dir — we pass it explicitly
+        // because process cwd never moves (no `set_current_dir`), so the
+        // per-repo config and the skill re-scan must read the NEW tree.
         // Warnings are surfaced after the conversation reset below.
-        let reload_warnings = Self::reload_session_config(config, ctx, &sm);
+        let mut reload_warnings = Self::reload_session_config(config, ctx, &sm, target);
 
         let resolved = ctx
             .registry
@@ -1797,6 +1853,17 @@ impl AgentRunner {
 
         sm.add_system_message(format!("📁 New conversation in {path}"));
 
+        // Reconcile the live pipeline selection against the fresh set.
+        // Safe here, not inside the reload: by step 7 the current
+        // conversation is the freshly minted one (zero turns), so the
+        // `set_selected_pipeline(None)` write targets persisted truth
+        // for THIS conversation (invariant I-3 / hazard #3). The
+        // catalogue message is already in `reload_warnings` from the
+        // reload seam above.
+        if let Some(warning) = reconcile_pipeline_selection(ctx, &sm) {
+            reload_warnings.push(warning);
+        }
+
         // Surface reload/skill warnings after the reset so they persist.
         for warning in reload_warnings {
             sm.add_system_message(warning);
@@ -1809,31 +1876,53 @@ impl AgentRunner {
     /// YAML/skill edits take effect on a session verb (`/new`, `/model`,
     /// `/cd`, `/load`) without a restart. Mutates `config` (ancillary
     /// fields only — **never** `config.provider`, owned by the resolve
-    /// step) and `ctx` (registry, skills, system prompt, and the trivial
-    /// config-clone artifacts: searxng, max_turns, bash).
+    /// step) and `ctx` (registry, skills, system prompt, pipeline set,
+    /// and the trivial config-clone artifacts: searxng, max_turns,
+    /// bash).
+    ///
+    /// `session_cwd` is the directory the session WILL be in after this
+    /// verb completes — the base for both `.peakbot/config.yaml` and the
+    /// skill re-scan. `/cd` must pass its TARGET (the session cwd is
+    /// still the old dir when this runs); the other verbs pass the
+    /// current `session_cwd`. (Invariant I-5.)
     ///
     /// Fallible edges are handled at the boundary: a malformed YAML or a
     /// bad `default_model` (registry build error) warns and **keeps the
     /// previous config** — the session survives. Both fallible steps run
     /// before any mutation, so a failure leaves no partial state.
     ///
+    /// Pipelines are rebuilt here (after the skill re-scan, before
+    /// `adopt_reloaded`) — see task 3 for the ordering rationale. A bad
+    /// `pipelines:` block warns and keeps the previous set; the rest of
+    /// the config is still adopted. The `ctx.pipelines` field and the
+    /// `AppState` catalogue are stamped together (invariant I-4) so the
+    /// Agents panel and the running agent can never disagree.
+    ///
+    /// `orchestrator_prompt`/`orchestrator_persona` are filed under
+    /// the per-pipeline `ResolvedPipeline` and surfaced by the rebuild
+    /// seam — never written into `ctx.system_prompt` here (that runs
+    /// after the registry/cwd flip on the calling verb).
+    ///
     /// Boot-only config is diffed and, if changed, flagged with a
     /// "restart to apply" warning: `mcp_servers` / `vector_db` (live
     /// subprocesses / DB handle), `web.*` (read once by the reaper), and
-    /// `pipeline`/`pipelines` (a built `PipelineSet`, not raw config).
+    /// `http` (baked into the HTTP client factory). The legacy `pipeline:`
+    /// key stays boot-only via `PipelineSet::build` (`LegacyBlock`).
     ///
     /// Returns the warnings to surface (reload failure, boot-only diffs,
-    /// skill-load failures) rather than emitting them here — the caller
-    /// owns *when* they land, so a following `reset_conversation_state()`
-    /// (as `/model` and `/cd` do) can't wipe them from the chat.
+    /// skill-load failures, pipeline-rebuild failure) rather than
+    /// emitting them here — the caller owns *when* they land, so a
+    /// following `reset_conversation_state()` (as `/model` and `/cd` do)
+    /// can't wipe them from the chat.
     fn reload_session_config(
         config: &mut Config,
         ctx: &mut RebuildContext,
         sm: &Arc<StateManager>,
+        session_cwd: &std::path::Path,
     ) -> Vec<String> {
         let mut warnings = Vec::new();
         // Boundary parse — keep previous config on any failure.
-        let fresh = match Config::reload() {
+        let fresh = match Config::reload_for(session_cwd) {
             Ok(c) => c,
             Err(reason) => {
                 warnings.push(format!(
@@ -1868,16 +1957,16 @@ impl AgentRunner {
             return warnings;
         }
 
-        // Diff boot-only keys against the still-current config and warn.
+        // Diff still-boot-only keys against the still-current config and warn.
+        // `pipelines` / `pipeline` are exempt: the running `PipelineSet` is
+        // rebuilt below from the fresh config, so a successful build supersedes
+        // the diff and a failed build surfaces its own warning (no need to
+        // also report "restart to apply" — that would mislead the user into
+        // restarting when the reload was already attempted).
         for (label, changed) in [
             ("mcp_servers", config.mcp_servers != fresh.mcp_servers),
             ("vector_db", config.vector_db != fresh.vector_db),
             ("web", config.web != fresh.web),
-            ("pipeline", config.pipeline != fresh.pipeline),
-            // Both shapes must be diffed: the running `PipelineSet` is built
-            // once at boot, so an edited `pipelines:` would otherwise be
-            // adopted into config yet never reflected in the live teams.
-            ("pipelines", config.pipelines != fresh.pipelines),
             // `http` is baked into the HTTP clients at boot; it was missing
             // here, so edits were adopted into the config yet never applied.
             ("http", config.http != fresh.http),
@@ -1887,12 +1976,32 @@ impl AgentRunner {
             }
         }
 
-        // Re-scan skills against the session cwd and collect any load failures
-        // so `/cd`/`/load`/`/new`/`/model` report a broken skill instead of
-        // silently dropping it.
-        let (skills, skill_warnings) = load_default_skills(&sm.session_cwd());
+        // Re-scan skills against the session cwd — using the new
+        // `session_cwd` argument, not the stale `sm.session_cwd()`, so
+        // `/cd` finally picks up the target repo's `.agents/skills`.
+        // (Same root-cause fix as the per-repo config read above.)
+        let (skills, skill_warnings) = load_default_skills(session_cwd);
         ctx.skills = skills;
         warnings.extend(skill_warnings);
+
+        // Build the fresh `PipelineSet` AFTER the skill re-scan (a role's
+        // `skills:` filter is validated against the fresh names here —
+        // `src/pipeline/set.rs:74`) and BEFORE `adopt_reloaded` (we still
+        // need `&fresh` and the new registry). A bad `pipelines:` block
+        // is local — `providers:`, `tools:`, skills and the prompt are
+        // all still valid, so we warn and keep the previous set; the rest
+        // of the config is adopted. The set and the catalogue are stamped
+        // together (invariant I-4).
+        let new_pipelines =
+            match PipelineSet::build(&fresh, &new_registry, Some(&ctx.skills.names())) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    warnings.push(format!(
+                        "⚠ config reload: pipelines invalid ({e}) — keeping the previous pipelines."
+                    ));
+                    None
+                }
+            };
 
         // Commit. `config.provider` is preserved across the swap — the
         // resolve step owns it, and this is the invariant the regression
@@ -1911,6 +2020,18 @@ impl AgentRunner {
         // `persona` is live-reloadable (no handles behind it). Mirroring it
         // here is what makes `/new` after a config edit pick up the new text.
         ctx.persona = config.persona.clone();
+
+        // Pipelines + catalogue — stamped together (I-4). The catalogue is
+        // always refreshed on a successful build, even when the names are
+        // unchanged: a roster-only change (e.g. a member's model flipped)
+        // must reach the Agents panel; it just doesn't deserve a chat line.
+        if let Some(set) = new_pipelines {
+            if let Some(msg) = pipeline_catalogue_message(&ctx.pipelines, &set) {
+                warnings.push(msg);
+            }
+            sm.set_pipelines(set.infos());
+            ctx.pipelines = Arc::new(set);
+        }
 
         warnings
     }
@@ -2151,6 +2272,25 @@ impl AgentRunner {
         let Some(sm) = state_manager else { return };
         let Some(ctx) = rebuild_ctx else { return };
 
+        // Hoist the conversation read ABOVE the reload so the per-repo
+        // config and the skill re-scan can target the right tree. The
+        // `/load` restore below applies `set_session_cwd` AFTER the reload,
+        // so passing `sm.session_cwd()` would re-read the *pre-load* tree
+        // and could then `resolve_saved`-drop a team that the target
+        // tree actually defines. Hoist also catches the impossible
+        // no-current-conversation `/load` early — don't half-apply a
+        // reload we won't rebuild for.
+        let Some(conv) = sm.get_current_conversation() else {
+            return;
+        };
+        let saved_cwd = conv.cwd.clone();
+        let saved_dir = (!saved_cwd.is_empty()).then(|| std::path::PathBuf::from(&saved_cwd));
+        let restore_to = saved_dir.clone().filter(|p| p.is_dir());
+        // `Some` ⇒ we will flip to it; `None` and reload still runs on
+        // the current session cwd (so an empty / gone saved cwd doesn't
+        // strand the reload against the wrong tree).
+        let reload_cwd = restore_to.clone().unwrap_or_else(|| sm.session_cwd());
+
         // Re-read config + skills before resolving the saved wire id, so a
         // config/skill edit lands on this /load. Refreshes the registry the
         // find-by-wire-id below relies on, plus skills/system prompt (the
@@ -2158,16 +2298,12 @@ impl AgentRunner {
         // The conversation was already loaded by the /load handler, so
         // warnings are safe to surface immediately.
         let sm_arc = sm.clone();
-        for warning in Self::reload_session_config(config, ctx, &sm_arc) {
+        for warning in Self::reload_session_config(config, ctx, &sm_arc, &reload_cwd) {
             sm.add_system_message(warning);
         }
 
-        let Some(conv) = sm.get_current_conversation() else {
-            return;
-        };
         let saved_provider = conv.provider_name.clone();
         let saved_model = conv.model.clone();
-        let saved_cwd = conv.cwd.clone();
 
         let wire_id_changed =
             sm.get_provider_name() != saved_provider || sm.get_model() != saved_model;
@@ -2191,30 +2327,32 @@ impl AgentRunner {
         // current session cwd. The comparison is against `sm.session_cwd()`
         // (the per-session source of truth), not the process-global cwd —
         // every change is per-session. A gone path is warned about, not
-        // fatal — the load already succeeded.
+        // fatal — the load already succeeded. `saved_dir` / `restore_to`
+        // were derived above from the hoisted conversation read so the
+        // reload could target the right tree.
         let current_session_cwd = sm.session_cwd();
         let mut cwd_changed = false;
-        if !saved_cwd.is_empty() {
-            let target = std::path::PathBuf::from(&saved_cwd);
-            if target.is_dir() {
-                if target != current_session_cwd {
-                    // Kill bg processes rooted in the previous tree. The
-                    // rebuild seam below recomputes the prompt for the restored
-                    // cwd/agents.md (it reads `sm.session_cwd()`).
-                    // Per-session only — no `set_current_dir`, so the
-                    // process-global cwd is untouched and concurrent web
-                    // sessions in other trees stay race-free.
-                    sm.clear_bg();
-                    sm.set_session_cwd(target.clone());
-                    sm.update_welcome_cwd(target);
-                    cwd_changed = true;
-                }
-                // else: already on the right tree — no work, no rebuild.
-            } else {
-                sm.add_system_message(format!(
-                    "⚠ /load: saved working directory no longer exists: {saved_cwd}"
-                ));
+        if let Some(target) = restore_to {
+            if target != current_session_cwd {
+                // Kill bg processes rooted in the previous tree. The
+                // rebuild seam below recomputes the prompt for the restored
+                // cwd/agents.md (it reads `sm.session_cwd()`).
+                // Per-session only — no `set_current_dir`, so the
+                // process-global cwd is untouched and concurrent web
+                // sessions in other trees stay race-free.
+                sm.clear_bg();
+                sm.set_session_cwd(target.clone());
+                sm.update_welcome_cwd(target);
+                cwd_changed = true;
             }
+            // else: already on the right tree — no work, no rebuild.
+        } else if saved_dir.is_some() {
+            // `saved_dir` was `Some` (the saved cwd was non-empty) but
+            // `is_dir()` returned false → the path is gone. Warn but
+            // don't fatal — the load already succeeded.
+            sm.add_system_message(format!(
+                "⚠ /load: saved working directory no longer exists: {saved_cwd}"
+            ));
         }
         // An empty `saved_cwd` (from a pre-cwd conversation file) keeps
         // the SM's current session_cwd — it is the authoritative value
@@ -2282,8 +2420,19 @@ impl AgentRunner {
         let sm_arc = sm.clone();
 
         // `/new` already reset to a fresh conversation before this runs, so
-        // reload/skill warnings are safe to surface immediately.
-        for warning in Self::reload_session_config(config, ctx, &sm_arc) {
+        // reload/skill warnings are safe to surface immediately. The
+        // reconciler runs right after the reload — the fresh conversation
+        // is zero-turn, so the `set_selected_pipeline(None)` write targets
+        // it (invariant I-3) — and the rebuild then sees the cleared
+        // selection.
+        let mut reload_warnings = Vec::new();
+        for warning in Self::reload_session_config(config, ctx, &sm_arc, &sm.session_cwd()) {
+            reload_warnings.push(warning);
+        }
+        if let Some(warning) = reconcile_pipeline_selection(ctx, sm) {
+            reload_warnings.push(warning);
+        }
+        for warning in reload_warnings {
             sm.add_system_message(warning);
         }
 
@@ -4762,7 +4911,7 @@ mod tests {
     /// Entry point is `rebuild_agent_for_resolved` — the shared seam that
     /// `handle_switch_model` (and `/cd`, `/load`, `/new`, `/pipeline`)
     /// delegates to, and the site that sets the gate. Driving
-    /// `handle_switch_model` itself would first call `Config::reload()`,
+    /// `handle_switch_model` itself would first call `Config::reload_for(...)`,
     /// which reads the *machine's* real config directory and would swap this
     /// test's registry for whatever the developer has installed — an
     /// environment-dependent test, not a stronger one.
@@ -6282,6 +6431,561 @@ headers:
             super::stop_message(StopTally::default()),
             "Agent stopped by user",
             "empty tally ⇒ bare sentence (back-compat with pre-#183 wording)"
+        );
+    }
+
+    // =========================================================================
+    // Reload-safe `pipelines:` (ticket pipelines-reload.md §8, tests 8–14 + 15).
+    //
+    // The two private helpers the design extracts — `pipeline_catalogue_message`
+    // and `reconcile_pipeline_selection` — are the testable seams. They are
+    // *module-private*, but the tests inside `mod tests { use super::*; }`
+    // reach them directly. RED-by-design: these fns do not exist yet — the
+    // compile errors are the "missing API" signal to the implementer.
+    //
+    // `tests/scenarios/pipeline_tests.rs::selected_pipeline_that_vanishes_…`
+    // pins the same contract at the delegate-tool seam (test 15 in the
+    // design's enumeration); the unit-test here pins the rebuild seam's
+    // lookup pattern at the same site (`src/lib.rs:1955-1957`).
+    // =========================================================================
+
+    /// A two-model registry mirroring the fixture in
+    /// `src/pipeline/set.rs::tests` — inlined here because that helper
+    /// is private to that module. Aliased `flash` (default) + `sonnet`.
+    fn two_model_registry() -> crate::config::ModelRegistry {
+        use crate::config::{ModelEntry, ProviderEntry, ProviderType};
+        let prov = ProviderEntry {
+            name: "openrouter".into(),
+            kind: ProviderType::OpenRouter,
+            api_key: Some("sk-or-test".into()),
+            base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
+            models: vec![
+                ModelEntry {
+                    name: "google/gemini-2.0-flash-001".into(),
+                    alias: Some("flash".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    extra_params: None,
+                    prompt_caching: None,
+                    vision: None,
+                    context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
+                },
+                ModelEntry {
+                    name: "anthropic/claude-3.7-sonnet".into(),
+                    alias: Some("sonnet".into()),
+                    max_tokens: None,
+                    temperature: None,
+                    extra_params: None,
+                    prompt_caching: None,
+                    vision: None,
+                    context_size: None,
+                    preserve_reasoning: true,
+                    display_reasoning: false,
+                },
+            ],
+        };
+        crate::config::ModelRegistry::build(std::slice::from_ref(&prov), Some("flash"))
+            .expect("registry builds")
+    }
+
+    /// YAML preamble: a `providers:` list with two aliases and a
+    /// default. Same shape as the fixture in
+    /// `src/pipeline/set.rs::tests::PROVIDERS` and
+    /// `src/config/mod.rs::tests::STAGE11_PROVIDERS_YAML` so the YAML
+    /// fragments can be pasted in either place.
+    const PROVIDERS: &str = "\
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-or-test
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: sonnet
+      - name: google/gemini-2.0-flash-001
+        alias: flash
+default_model: flash
+";
+
+    // ----- pipeline_catalogue_message ----------------------------------------
+
+    /// `pipeline_catalogue_message(before, after)` is the "is there
+    /// anything the user wants to know about the new roster?" decision.
+    /// It MUST be silent when the set of *names* didn't change — the
+    /// roster may have changed (e.g. one team's `reviewer` model flipped
+    /// from `flash` to `sonnet`) but `names_joined()` is identical, so
+    /// the chat doesn't get a redundant line for a panel-only update.
+    #[test]
+    fn pipeline_catalogue_message_is_silent_when_names_unchanged() {
+        use crate::pipeline::PipelineSet;
+        let a = PipelineSet::default();
+        let b = PipelineSet::default();
+        assert!(
+            super::pipeline_catalogue_message(&a, &b).is_none(),
+            "two empty sets must be silent — no team added or removed"
+        );
+
+        // Same names, different order? `names_joined` is order-independent,
+        // so it must also be silent. (Defends against a future impl that
+        // uses `iter()` for equality and would falsely flag a reorder.)
+        let yaml = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: web-team
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+  - name: research-crew
+    orchestrator: {{}}
+    agents:
+      r2:
+        prompt: p
+"
+        );
+        let cfg: crate::config::Config =
+            serde_yaml::from_str(&yaml).expect("two-pipeline YAML parses");
+        let set = PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
+        assert!(
+            super::pipeline_catalogue_message(&set, &set).is_none(),
+            "the set compared with itself must be silent"
+        );
+    }
+
+    /// Empty → {a, b} yields a single `🧩` line containing every new
+    /// name AND pointing the user at `/pipeline <name>`. The exact
+    /// format string is the user-facing discoverability mechanism
+    /// (ticket §5.5: "The `🧩` line is the whole discoverability
+    /// mechanism").
+    #[test]
+    fn pipeline_catalogue_message_lists_new_names() {
+        use crate::pipeline::PipelineSet;
+        let before = PipelineSet::default();
+
+        let yaml = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: alpha
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+  - name: beta
+    orchestrator: {{}}
+    agents:
+      r2:
+        prompt: p
+"
+        );
+        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
+        let after = PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
+
+        let msg = super::pipeline_catalogue_message(&before, &after)
+            .expect("empty → {alpha, beta} must produce one line");
+        assert!(
+            msg.contains("alpha") && msg.contains("beta"),
+            "the line must name every new pipeline; got: {msg}"
+        );
+        assert!(
+            msg.contains("/pipeline"),
+            "the line must point the user at `/pipeline <name>`; got: {msg}"
+        );
+    }
+
+    /// `{a}` → empty yields the "no pipelines configured" sentence
+    /// verbatim — distinct from the "🧩 Pipelines available here" line
+    /// so the two cases are visually different in the chat. The
+    /// verbatim text is what `render_pipeline_list` shows at boot, so a
+    /// single source of truth keeps them in sync.
+    #[test]
+    fn pipeline_catalogue_message_reports_emptied_set() {
+        use crate::pipeline::PipelineSet;
+        let yaml = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: alpha
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
+        let before =
+            PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
+        let after = PipelineSet::default();
+        let msg = super::pipeline_catalogue_message(&before, &after)
+            .expect("non-empty → empty must produce the emptied-set line");
+        assert_eq!(
+            msg, "🧩 No pipelines configured here.",
+            "exact verbatim text — also rendered by `render_pipeline_list` for boot-time silence"
+        );
+    }
+
+    // ----- reconcile_pipeline_selection --------------------------------------
+
+    /// A selection that vanishes from the new set MUST be dropped
+    /// (cleared from `AppState` AND the conversation's persisted
+    /// `pipeline`), and the function returns the canonical
+    /// "⚠ Pipeline '{name}' is not configured here…" warning. Two
+    /// assertions in one test because they are two halves of the same
+    /// outcome — a clear-only-without-warning would still leave the UI
+    /// showing a phantom name, and a warning-without-clear would leave
+    /// the next rebuild rebuilding against a ghost.
+    #[test]
+    fn reconcile_drops_selection_missing_from_new_set() {
+        let sm = StateManager::new_arc();
+        // Pre-stage: conversation has zero turns, pipeline selected.
+        sm.set_selected_pipeline(Some("ghost".into()));
+        assert_eq!(sm.selected_pipeline().as_deref(), Some("ghost"));
+
+        let ctx = RebuildContext {
+            registry: Arc::new(two_model_registry()),
+            system_prompt: String::new(),
+            mcp_handles: Arc::new(Vec::new()),
+            searxng_config: None,
+            max_turns: 0,
+            todo_tool: None,
+            bash_config: crate::config::BashConfig::default(),
+            // Empty set — `ghost` is NOT here.
+            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
+            shell_kind: None,
+            skills: crate::skills::SkillRegistry::default(),
+            vector_store: None,
+            memory_enabled: false,
+            tools_filter: crate::config::ToolsConfig::default(),
+            persona: None,
+        };
+
+        let warning = super::reconcile_pipeline_selection(&ctx, &sm)
+            .expect("missing selection must emit the canonical warning");
+
+        assert!(
+            warning.contains("ghost"),
+            "the warning must name the dropped selection so the user can \
+             understand what vanished; got: {warning}"
+        );
+        assert!(
+            warning.contains("not configured") || warning.contains("continuing without a pipeline"),
+            "the warning must use the canonical 'not configured / continuing \
+             without a pipeline' wording from ticket §5.4; got: {warning}"
+        );
+        assert_eq!(
+            sm.selected_pipeline(),
+            None,
+            "the selection MUST be cleared — AppState mirrors it, so a \
+             future rebuild_agent_for_resolved would re-derive a phantom"
+        );
+    }
+
+    /// A selection that survives the rebuild is left alone — no
+    /// warning, no state write. The reconcile is a *drop*-only
+    /// operation; never auto-select (ticket §5.5).
+    #[test]
+    fn reconcile_keeps_selection_present_in_new_set() {
+        let sm = StateManager::new_arc();
+        sm.set_selected_pipeline(Some("web-team".into()));
+
+        // Build a set that DOES contain `web-team`.
+        let yaml = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: web-team
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
+        let set = crate::pipeline::PipelineSet::build(&cfg, &two_model_registry(), Some(&[]))
+            .expect("set builds");
+        let ctx = RebuildContext {
+            registry: Arc::new(two_model_registry()),
+            system_prompt: String::new(),
+            mcp_handles: Arc::new(Vec::new()),
+            searxng_config: None,
+            max_turns: 0,
+            todo_tool: None,
+            bash_config: crate::config::BashConfig::default(),
+            pipelines: Arc::new(set),
+            shell_kind: None,
+            skills: crate::skills::SkillRegistry::default(),
+            vector_store: None,
+            memory_enabled: false,
+            tools_filter: crate::config::ToolsConfig::default(),
+            persona: None,
+        };
+
+        let chat_len_before = sm.get_state().chat.messages.len();
+        let result = super::reconcile_pipeline_selection(&ctx, &sm);
+        assert!(
+            result.is_none(),
+            "selection still resolves → no warning; got: {result:?}"
+        );
+        assert_eq!(
+            sm.selected_pipeline().as_deref(),
+            Some("web-team"),
+            "the live selection MUST NOT be touched when it still resolves"
+        );
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            chat_len_before,
+            "no-op reconcile must NOT add a system message"
+        );
+    }
+
+    /// No selection at all → silent, no state write. The fresh-session
+    /// baseline (D2). Without this pin, a future impl that defaults to
+    /// `Some("default")` would invent a selection out of thin air.
+    #[test]
+    fn reconcile_is_silent_with_no_selection() {
+        let sm = StateManager::new_arc();
+        // No `set_selected_pipeline` — fresh baseline.
+        assert_eq!(sm.selected_pipeline(), None);
+
+        let ctx = RebuildContext {
+            registry: Arc::new(two_model_registry()),
+            system_prompt: String::new(),
+            mcp_handles: Arc::new(Vec::new()),
+            searxng_config: None,
+            max_turns: 0,
+            todo_tool: None,
+            bash_config: crate::config::BashConfig::default(),
+            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
+            shell_kind: None,
+            skills: crate::skills::SkillRegistry::default(),
+            vector_store: None,
+            memory_enabled: false,
+            tools_filter: crate::config::ToolsConfig::default(),
+            persona: None,
+        };
+
+        let chat_len_before = sm.get_state().chat.messages.len();
+        let result = super::reconcile_pipeline_selection(&ctx, &sm);
+        assert!(
+            result.is_none(),
+            "no selection → no warning; got: {result:?}"
+        );
+        assert_eq!(sm.selected_pipeline(), None);
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            chat_len_before,
+            "no-op reconcile must NOT add a system message"
+        );
+    }
+
+    /// **Hazard #3** — the *contract* test for the reconciler's
+    /// precondition. The reconciler writes persisted truth via
+    /// `set_selected_pipeline` (I-3), so it must NEVER run on the
+    /// outgoing conversation. `/cd`/`/model`/`/new` all mint a fresh
+    /// conversation AFTER the reload, so the reconciler only ever sees
+    /// the *new* (zero-turn) conversation. The reverse — running the
+    /// reconciler on a conversation that already has turns — would
+    /// silently clobber the persisted `pipeline` of a conversation
+    /// the user is mid-way through.
+    ///
+    /// We don't have a direct knob to invoke the reconcile "on the
+    /// outgoing conversation" (that's the bug we're guarding against),
+    /// so the test pins the SAFE sequence instead: simulate the
+    /// outgoing conversation (turns + selection), mint a new
+    /// conversation, then assert the OUTGOING conversation's
+    /// persisted `pipeline` is unchanged (peeked, not loaded — a load
+    /// would itself mutate `current_conversation` and obscure the
+    /// invariant). A regression that "helpfully" calls the
+    /// reconciler before `create_conversation` would clear the
+    /// outgoing selection — the test catches it.
+    #[test]
+    fn reconcile_does_not_touch_a_conversation_with_turns() {
+        // `peek_conversation_pipeline` requires storage; the helper
+        // wires InMemoryStorage and is the same one the existing tests
+        // in this module use for /load / /save paths.
+        let sm = sm_with_storage();
+        // Outgoing conversation: at least one real turn + a selection.
+        sm.create_conversation(
+            "outgoing".into(),
+            "openrouter".into(),
+            "openai/gpt-4o-mini".into(),
+            String::new(),
+        );
+        sm.set_selected_pipeline(Some("web-team".into()));
+        sm.add_user_message("hi there".into());
+        assert!(sm.conversation_has_turns(), "fixture: outgoing has a turn");
+
+        // Snapshot the outgoing conversation's id and persisted
+        // pipeline BEFORE minting the new one.
+        let outgoing_id = sm
+            .get_current_conversation_id()
+            .expect("outgoing conversation");
+        let outgoing_pipeline = sm
+            .peek_conversation_pipeline(outgoing_id)
+            .expect("peek outgoing pipeline");
+        assert_eq!(
+            outgoing_pipeline.as_deref(),
+            Some("web-team"),
+            "fixture: outgoing conversation's persisted pipeline is 'web-team'"
+        );
+
+        // Mimic `/cd` step 7: create_conversation(...) on the *new* one.
+        sm.create_conversation(
+            "incoming".into(),
+            "openrouter".into(),
+            "openai/gpt-4o-mini".into(),
+            "/tmp/new-tree".into(),
+        );
+        // The current conversation is now `incoming`, which carried the
+        // selection onto its own `pipeline` (D2 — see the mirror assertion
+        // below). `mirror_conversation_to_state` does not touch
+        // `selected_pipeline`, so nothing about this mint can move the
+        // *outgoing* conversation's persisted value.
+
+        // Peek the OUTGOING conversation's persisted `pipeline` — it
+        // must still be the original selection, untouched by the
+        // new-conversation mint.
+        let outgoing_after = sm
+            .peek_conversation_pipeline(outgoing_id)
+            .expect("peek outgoing pipeline after mint");
+        assert_eq!(
+            outgoing_after.as_deref(),
+            Some("web-team"),
+            "outgoing conversation's persisted pipeline MUST survive the \
+             new-conversation mint — this is what stops the reconciler \
+             from clobbering a conversation the user is mid-way through"
+        );
+        // D2 / agents.md ("`/new` keeps the current selection"): the mint
+        // carries the selection, and the live mirror must agree with the new
+        // conversation's persisted `pipeline` (I-3) or the rebuild seam
+        // demotes the fresh conversation to single-agent mode. Dropping a
+        // now-invalid name is the reconciler's job, which runs *after* this
+        // mint — and can only do it because the mirror is still set here.
+        assert_eq!(
+            sm.selected_pipeline().as_deref(),
+            Some("web-team"),
+            "the mint carries the selection into the new conversation, in \
+             both the live mirror and its persisted `pipeline`"
+        );
+        assert_eq!(
+            sm.get_current_conversation().unwrap().pipeline.as_deref(),
+            Some("web-team"),
+            "…and the new conversation's persisted `pipeline` agrees (I-3)"
+        );
+    }
+
+    // ----- dangling-selection seam pin (test 15, in lib.rs rather than
+    // tests/scenarios/...). Driving the full `rebuild_agent_for_resolved`
+    // requires the mock agent harness; the cheapest end-to-end pin is the
+    // seam where the decision is made: `active = sm.selected_pipeline()
+    // .and_then(|name| ctx.pipelines.get(&name))`. A dangling selection
+    // resolves to `None` here, so `boot_registry` is `None`, so the
+    // `delegate` tool is NOT registered. This test makes that explicit
+    // — and would fail if the seam started using e.g. `pipelines.iter().find()`
+    // (which would silently re-find a *different* team named the same way).
+
+    #[cfg(feature = "mock")]
+    #[test]
+    fn dangling_selection_resolves_to_none_at_the_rebuild_seam() {
+        use crate::pipeline::PipelineSet;
+        let sm = StateManager::new_arc();
+        sm.set_selected_pipeline(Some("ghost".into()));
+
+        // Build a set that DOES NOT contain `ghost` — the bug case.
+        let yaml = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: web-team
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
+        let set = PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
+        let ctx = RebuildContext {
+            registry: Arc::new(two_model_registry()),
+            system_prompt: String::new(),
+            mcp_handles: Arc::new(Vec::new()),
+            searxng_config: None,
+            max_turns: 0,
+            todo_tool: None,
+            bash_config: crate::config::BashConfig::default(),
+            pipelines: Arc::new(set),
+            shell_kind: None,
+            skills: crate::skills::SkillRegistry::default(),
+            vector_store: None,
+            memory_enabled: false,
+            tools_filter: crate::config::ToolsConfig::default(),
+            persona: None,
+        };
+
+        // This is the seam pin: the EXACT lookup the rebuild seam does
+        // at `src/lib.rs:1955-1957`. A dangling name MUST yield None —
+        // not a fallback to the first team, not a panic, not a "first
+        // team wins" silent misroute.
+        let active: Option<crate::pipeline::ResolvedPipeline> = sm
+            .selected_pipeline()
+            .and_then(|name| ctx.pipelines.get(&name).cloned());
+        assert!(
+            active.is_none(),
+            "a selection that vanished from the set must yield no active \
+             pipeline — the rebuild seam gates `delegate` on `active.is_some()` \
+             (src/lib.rs:2021), so anything other than None produces a phantom tool"
+        );
+    }
+
+    /// The other half of the seam pin, and the reason the mirror must survive
+    /// a mint: after `/new` (or `/cd`, or `/model`) the seam lookup must STILL
+    /// resolve a still-valid team, or the fresh conversation silently drops to
+    /// single-agent mode — no `delegate`, orchestrator model reverted to
+    /// `requested` — while its persisted `pipeline` still names the team.
+    /// Documented behaviour: agents.md — "`/new` keeps the current selection."
+    #[test]
+    fn selection_survives_a_new_conversation_mint_at_the_rebuild_seam() {
+        use crate::pipeline::PipelineSet;
+        let sm = StateManager::new_arc();
+        let yaml = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: web-team
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
+        let set = PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
+
+        sm.set_selected_pipeline(Some("web-team".into()));
+        // The `/new` mint: `process_command_internal("/new")` does exactly this
+        // (reset + create_conversation) BEFORE `refresh_agent_after_new` reaches
+        // the rebuild seam, so whatever the mint leaves in the mirror is what
+        // the new conversation's agent is built from.
+        sm.reset_conversation_state();
+        sm.create_conversation(
+            "fresh".into(),
+            "openrouter".into(),
+            "flash".into(),
+            String::new(),
+        );
+
+        let active = sm
+            .selected_pipeline()
+            .and_then(|name| set.get(&name).cloned());
+        assert!(
+            active.is_some(),
+            "a still-valid selection MUST survive the mint and resolve at the \
+             rebuild seam — None here means `/new` silently demotes the session \
+             to single agent (no `delegate`) even though the freshly minted \
+             conversation persists `pipeline: web-team`"
+        );
+        assert_eq!(
+            sm.get_current_conversation().unwrap().pipeline.as_deref(),
+            Some("web-team"),
+            "…and persisted truth agrees with the mirror (I-3)"
         );
     }
 }

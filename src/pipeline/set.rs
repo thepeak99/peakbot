@@ -998,4 +998,140 @@ pipelines:
             "no selection → no warning (D2, fresh session baseline); got: {warning:?}"
         );
     }
+
+    // ----------------------------------------------------------------------
+    // Reload-safe `pipelines:` (ticket pipelines-reload.md §8, tests 6–7).
+    //
+    // These pin *why* the rebuild seam must run `PipelineSet::build`
+    // AFTER the skill re-scan (the §4.1 ordering argument), and that the
+    // in-memory merge of master + per-repo flows through to the set
+    // without ever touching the filesystem — i.e. the §3 "the headline
+    // request is blocked by that bug, not by the pipeline code" claim
+    // has an end-to-end in-memory version.
+    // ----------------------------------------------------------------------
+
+    /// A role whose `skills:` filter names a skill that isn't in the
+    /// caller's `known_skills` list MUST be rejected with
+    /// `PipelineSetError::SubAgent(SubAgentError::BadSkillFilter)`.
+    /// The same YAML + `Some(&["foo"])` must build cleanly. Together
+    /// they pin the load-bearing rule: rebuild after the skill re-scan,
+    /// because a role whose skill was just introduced in the target
+    /// repo would otherwise be wrongly rejected at the OLD `known_skills`
+    /// (the pre-reload snapshot).
+    #[test]
+    fn build_rejects_role_skill_filter_absent_from_known_skills() {
+        use crate::config::{AgentDefinition, Members, OrchestratorDef, PipelineDef, SkillFilter};
+        use crate::pipeline::PipelineSetError;
+        use std::collections::HashMap;
+
+        let mut members = HashMap::new();
+        members.insert(
+            "writer".to_string(),
+            AgentDefinition {
+                model: None,
+                prompt: "writes docs".to_string(),
+                env: None,
+                skills: SkillFilter {
+                    enabled: true,
+                    disabled: vec![],
+                    only: vec!["foo".into()],
+                },
+                agents_md: false,
+            },
+        );
+        let cfg = Config {
+            pipelines: vec![PipelineDef {
+                name: "docs".into(),
+                orchestrator: OrchestratorDef::default(),
+                agents: Members(members),
+            }],
+            ..Config::default()
+        };
+
+        // The known-skills list is EMPTY — `foo` is unknown → BadSkillFilter.
+        // The error must be the SubAgent variant (the §3.4 validation table
+        // names "Role problems | existing `SubAgentError` messages wrapped
+        // with `pipeline '{name}':`"), NOT e.g. an `UnknownModel` or a
+        // successful build that silently dropped the role.
+        let err = PipelineSet::build(&cfg, &two_model_registry(), Some(&[]))
+            .expect_err("role skills-only with an absent skill must be rejected");
+        match err {
+            PipelineSetError::SubAgent { ref source, .. } => {
+                use crate::pipeline::registry::SubAgentError;
+                assert!(
+                    matches!(source, SubAgentError::BadSkillFilter(_)),
+                    "the wrapped error must be BadSkillFilter; got: {source:?}"
+                );
+            }
+            other => panic!("expected SubAgent(BadSkillFilter), got: {other:?}"),
+        }
+
+        // Same call with the skill now in `known_skills` — must build.
+        let set = PipelineSet::build(&cfg, &two_model_registry(), Some(&["foo".into()]))
+            .expect("known_skills containing the role's filter must allow the build");
+        assert!(
+            set.get("docs").is_some(),
+            "the pipeline must build when the role's skill is in known_skills"
+        );
+    }
+
+    /// The in-memory, no-disk version of the whole feature:
+    /// `PipelineSet::build` over a `Config` whose `pipelines:` came from
+    /// the per-repo overlay must surface exactly those pipelines (i.e.
+    /// the wholesale-override rule survived end-to-end through the
+    /// builder, with no silent drop, no default-model flip, no roster
+    /// leak from a stale `PipelineSet`). Same shape as the existing
+    /// `stage11_merge_with_per_repo_pipelines_overrides_master` but
+    /// driven through `PipelineSet::build`, so a regression in `build`
+    /// (e.g. a default-model fallback that lost the per-repo teams)
+    /// cannot slip past a merge-only test.
+    ///
+    /// Avoids `Config::merge_sources` (private to `config/mod.rs`) by
+    /// constructing the merged shape directly: the override rule is
+    /// "the per-repo `pipelines:` REPLACES the master's" — that is
+    /// exactly `merged.pipelines = per_repo.pipelines`. No reason to
+    /// pull the private seam through here when the assertion only
+    /// cares about what `build` does with the resulting `Config`.
+    #[test]
+    fn build_from_merged_config_yields_the_per_repo_pipelines() {
+        let yaml_alpha = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: alpha
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let yaml_beta = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: beta
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let master: Config = serde_yaml::from_str(&yaml_alpha).expect("master parses");
+        let per_repo: Config = serde_yaml::from_str(&yaml_beta).expect("per_repo parses");
+
+        // Manual mirror of `merge_sources(Some(master), Some(per_repo))`
+        // for the `pipelines:` field — same shape as the wholesale-
+        // override rule in `merge_with` (`:1634-1639`).
+        let mut merged = master;
+        merged.pipelines = per_repo.pipelines;
+
+        let set = PipelineSet::build(&merged, &two_model_registry(), Some(&[]))
+            .expect("merged config must build under the per-repo override");
+
+        let names: Vec<String> = set.infos().into_iter().map(|i| i.name).collect();
+        assert_eq!(
+            names,
+            vec!["beta".to_string()],
+            "the resolved set must contain exactly the per-repo pipeline (alpha was \
+             overridden wholesale by the merge rule); got: {names:?}"
+        );
+    }
 }
