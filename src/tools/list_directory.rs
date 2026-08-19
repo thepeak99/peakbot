@@ -108,7 +108,12 @@ impl Tool for ListDirectoryTool {
             "List directory completed successfully"
         );
 
-        Ok(entries.join("\n"))
+        let result = if entries.is_empty() {
+            "(empty directory)".to_string()
+        } else {
+            entries.join("\n")
+        };
+        Ok(result)
     }
 }
 
@@ -150,4 +155,35 @@ fn collect_entries(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // Contract: an empty directory must NOT yield an empty tool result —
+    // an empty tool-result string crashes some LLM providers. The exact
+    // placeholder wording is left to the implementation, so this test
+    // asserts non-emptiness only, never a specific string.
+    #[tokio::test]
+    async fn empty_directory_returns_non_empty_placeholder() {
+        let dir = tempdir().unwrap();
+
+        let tool = ListDirectoryTool::new(dir.path().to_path_buf());
+        let args: ListDirectoryArgs = serde_json::from_value(json!({
+            "path": dir.path().to_string_lossy().to_string()
+        }))
+        .unwrap();
+
+        let out = tool
+            .call(args)
+            .await
+            .expect("listing an existing empty directory should succeed");
+        assert!(
+            !out.is_empty(),
+            "list_directory on an empty directory returned an empty string; \
+             expected a non-empty placeholder message"
+        );
+    }
 }
