@@ -11,7 +11,7 @@ lands; do not restate the plan here.
 
 | # | Title | Role | Status | Deps | Acceptance criterion (short) | PR |
 |---|---|---|---|---|---|---|
-| T1 | Per-conversation temp path in `FileStorage::save` | Junior | done | — | Two threads saving different conversations 50× concurrently ⇒ both files parse, each with its own id; temp name starts `.tmp` and `.` | |
+| T1 | Per-conversation temp path in `FileStorage::save` | Junior | done | — | Two threads saving different conversations 50× concurrently ⇒ both files parse, each with its own id; temp name starts `.tmp` and `.` | #309 |
 | T2 | `image_cache` module: `ImageRef`, `dir()`, `spill()`, `path_for()` | Mid | pending | — | Same bytes twice ⇒ one file, same id; `path_for` rejects traversal / bad grammar / missing file; read-only dir ⇒ `None`, no panic | |
 | T3 | `view_image`: `pub const NAME`, spill on call, optional `image_ref` in output, `image_ref_from_output`, description sentence | Mid | pending | T2 | Spill bytes == source bytes; base64 + `type`/`mimeType` unchanged; both existing rig/Anthropic wire tests pass unchanged | |
 | T4 | `ChatMessage.images` + ctor extraction + `format_tool_result` arm + `elide_binary_payload` | Mid | pending | T3 | 2 MB `view_image` row ⇒ `tool_result.len() < 512`, `images` intact, `content == "🖼 shot.png"`; bash row untouched; elide is a fixpoint | |
