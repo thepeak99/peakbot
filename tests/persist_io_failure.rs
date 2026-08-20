@@ -10,11 +10,12 @@
 //! still byte-identical and still parses.
 //!
 //! The failure-forcing trick: `FileStorage::save` writes a temp file at
-//! `<storage_dir>/.tmp.json` then renames it to `<storage_dir>/<uuid>.json`.
-//! After the first good save, `.tmp.json` no longer exists (renamed away).
-//! Pre-creating a DIRECTORY at that path makes the next `fs::write` to it
-//! return `IsADirectory` — a portable I/O error that does not depend on
-//! uid (root bypasses chmod-based tricks, this works for everyone).
+//! `<storage_dir>/.tmp.<uuid>.json` then renames it to
+//! `<storage_dir>/<uuid>.json`. After the first good save, that temp file no
+//! longer exists (renamed away). Pre-creating a DIRECTORY at that path makes
+//! the next `fs::write` to it return `IsADirectory` — a portable I/O error
+//! that does not depend on uid (root bypasses chmod-based tricks, this works
+//! for everyone).
 
 #![cfg(test)]
 
@@ -45,7 +46,7 @@ fn save_returns_err_and_preserves_existing_file_on_write_failure() {
     let expected_msg_count = good.messages.len();
 
     // Plant a directory at the temp-path the next save will try to write to.
-    let temp_path = storage_dir.join(".tmp.json");
+    let temp_path = storage_dir.join(format!(".tmp.{}.json", good.id));
     fs::create_dir(&temp_path).expect("must be able to plant a dir at .tmp.json");
 
     // A modified conversation so the second save would differ from the first.
