@@ -1,5 +1,6 @@
 //! `file_str_replace`: replace exact text in an existing file.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use rig_core::completion::ToolDefinition;
@@ -115,6 +116,22 @@ If editing fails, read the file first with `file_read` to get exact content, the
     }
 }
 
+/// Splice `new_str` into every range. Ranges must be sorted ascending and
+/// pairwise disjoint (guaranteed by the matchers, invariant I3) — one path
+/// handles both the single-match and `replace_all` cases, so a match is
+/// never re-searched literally and can never silently match nothing.
+fn splice(content: &str, ranges: &[Range<usize>], new_str: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for range in ranges {
+        result.push_str(&content[cursor..range.start]);
+        result.push_str(new_str);
+        cursor = range.end;
+    }
+    result.push_str(&content[cursor..]);
+    result
+}
+
 /// Core logic, factored out so the tests can drive it without going through the Rig Tool trait.
 pub(crate) fn run(
     path: &str,
@@ -131,12 +148,22 @@ pub(crate) fn run(
         ));
     }
 
+    // An empty (or whitespace-only) old_str can only mean "insert at every
+    // byte offset" — never a sensible edit, and catastrophic under
+    // replace_all (today: `String::replace("", new_str)` corrupts the
+    // file). Reject at the boundary, before any read or match attempt.
+    if old_str.trim().is_empty() {
+        return Err(FileEditError::Validation(
+            "old_str must not be empty".into(),
+        ));
+    }
+
     let new_str = new_str.unwrap_or("");
     let content = read_file(path)?;
 
     let match_result = progressive_match(&content, old_str);
 
-    let (count, position, match_level) = match match_result {
+    let (ranges, match_level): (Vec<Range<usize>>, MatchLevel) = match match_result {
         MatchResult::NoMatch => {
             return Err(FileEditError::Validation(format!(
                 "String not found in file '{}'\n\n\
@@ -152,7 +179,7 @@ Tip: Include 2-3 lines of surrounding context in old_str for better matching.",
         }
         MatchResult::MultipleMatches { ranges, level } => {
             if replace_all {
-                (ranges.len(), ranges[0].start, level)
+                (ranges, level)
             } else {
                 let line_nums: Vec<usize> = ranges
                     .iter()
@@ -169,23 +196,20 @@ Tip: Read the file first with file_read to see exact formatting.",
                 )));
             }
         }
-        MatchResult::UniqueMatch { range, level } => (1, range.start, level),
+        MatchResult::UniqueMatch { range, level } => (vec![range], level),
     };
 
-    let new_content = if replace_all && count > 1 {
-        content.replace(old_str, new_str)
-    } else {
-        content.replacen(old_str, new_str, 1)
-    };
+    let count = ranges.len();
+    let new_content = splice(&content, &ranges, new_str);
     write_file(path, &new_content)?;
 
-    let replacement_msg = if replace_all && count > 1 {
+    let replacement_msg = if count > 1 {
         format!("Replaced all {} occurrences", count)
     } else {
         "Replaced 1 occurrence".to_string()
     };
 
-    let replacement_line = content[..position].lines().count();
+    let replacement_line = content[..ranges[0].start].lines().count();
     let new_lines: Vec<&str> = new_content.lines().collect();
     let start = replacement_line.saturating_sub(SNIPPET_CONTEXT_LINES);
     let end = (replacement_line + SNIPPET_CONTEXT_LINES + new_str.matches('\n').count() + 1)
@@ -194,7 +218,7 @@ Tip: Read the file first with file_read to see exact formatting.",
 
     let mut warnings = Vec::new();
 
-    if replace_all && count > 1 {
+    if count > 1 {
         warnings.push(format!(
             "⚠️  Global replacement: {} occurrences changed. Review carefully.",
             count
