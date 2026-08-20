@@ -225,7 +225,9 @@ impl FileStorage {
 
 impl ConversationStorage for FileStorage {
     fn save(&self, conversation: &Conversation) -> Result<()> {
-        let temp_path = self.storage_dir.join(".tmp.json");
+        let temp_path = self
+            .storage_dir
+            .join(format!(".tmp.{}.json", conversation.id));
         let final_path = self.conversation_path(conversation.id);
 
         // Stream: 256 KiB fixed buffer recycles forever; grows in ~256 KiB
