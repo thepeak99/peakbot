@@ -16,6 +16,7 @@ mod conversation_manager;
 mod conversation_title;
 mod hooks;
 pub mod http;
+pub mod image_cache;
 pub mod install;
 mod mcp_auth;
 mod memory_compaction;
