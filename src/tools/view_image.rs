@@ -27,12 +27,34 @@ pub enum ViewImageError {
 pub struct ViewImageArgs {
     /// Path to the image file. Supports `/abs`, `./rel`, and `~/home` forms.
     path: String,
+    /// Models routinely omit optional params, so the serde default and the
+    /// schema default must both be `true` — see `auto_resize_defaults_to_true_in_serde_and_in_the_schema`.
+    #[serde(default = "default_true")]
+    auto_resize: bool,
 }
 
-/// rig serializes a tool's `Output` to JSON via serde. These field names and
-/// the `type: "image"` tag are the exact contract `from_tool_output` parses.
+/// `#[serde(default)]` on a `bool` yields `false`; this named fn is what
+/// actually makes the default `true`.
+const fn default_true() -> bool {
+    true
+}
+
+/// rig parses two shapes (`ToolResultContent::from_tool_output`). `Plain`
+/// yields exactly one Image block — today's contract, byte-identical.
+/// `Resized` yields `[Text, Image]`, the only channel through which a
+/// notice actually reaches the model (an extra field bolted onto `Plain`
+/// is silently dropped by rig, never seen by the model).
 #[derive(Debug, Serialize)]
-pub struct ViewImageOutput {
+#[serde(untagged)]
+pub enum ViewImageOutput {
+    Plain(PlainImage),
+    Resized(ResizedImage),
+}
+
+/// These field names and the `type: "image"` tag are the exact contract
+/// `from_tool_output` parses.
+#[derive(Debug, Serialize)]
+pub struct PlainImage {
     #[serde(rename = "type")]
     kind: &'static str,
     data: String,
@@ -40,6 +62,45 @@ pub struct ViewImageOutput {
     mime_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_ref: Option<ImageRef>,
+}
+
+/// `response` becomes rig's Text block; `parts[0]` becomes the Image block.
+#[derive(Debug, Serialize)]
+pub struct ResizedImage {
+    response: String,
+    parts: [PlainImage; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_ref: Option<ImageRef>,
+}
+
+impl ViewImageOutput {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Plain(p) => p.kind,
+            Self::Resized(r) => r.parts[0].kind,
+        }
+    }
+
+    fn data(&self) -> &str {
+        match self {
+            Self::Plain(p) => &p.data,
+            Self::Resized(r) => &r.parts[0].data,
+        }
+    }
+
+    fn mime_type(&self) -> &str {
+        match self {
+            Self::Plain(p) => &p.mime_type,
+            Self::Resized(r) => &r.parts[0].mime_type,
+        }
+    }
+
+    fn image_ref(&self) -> Option<ImageRef> {
+        match self {
+            Self::Plain(p) => p.image_ref.clone(),
+            Self::Resized(r) => r.image_ref.clone(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -59,7 +120,9 @@ impl Tool for ViewImageTool {
                 capture — rather than reading its raw bytes as text. Supported formats: PNG, JPEG, \
                 GIF, WEBP (max 10 MB). Provide a filesystem path (`/abs/path.png`, `./rel.png`, or \
                 `~/path.png`). The image is fed directly into your vision context. It is loaded \
-                for the current turn only; call this tool again later if you need to see it again."
+                for the current turn only; call this tool again later if you need to see it again. \
+                Oversized images are downscaled to fit automatically; pass auto_resize:false to \
+                send the original unmodified."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -67,6 +130,11 @@ impl Tool for ViewImageTool {
                     "path": {
                         "type": "string",
                         "description": "Filesystem path to the image (e.g. /tmp/shot.png, ./diagram.jpg, ~/pics/ui.webp)."
+                    },
+                    "auto_resize": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Downscale the image if it would exceed this endpoint's image size limit (default true). Set false to send the file untouched; an oversized file then fails with an error instead."
                     }
                 },
                 "required": ["path"]
@@ -102,12 +170,12 @@ impl Tool for ViewImageTool {
             "view_image tool executed"
         );
 
-        Ok(ViewImageOutput {
+        Ok(ViewImageOutput::Plain(PlainImage {
             kind: "image",
             data,
             mime_type,
             image_ref,
-        })
+        }))
     }
 }
 
@@ -118,6 +186,8 @@ impl Tool for ViewImageTool {
 struct PartialViewImageOutput {
     #[serde(default, rename = "data")]
     _data: serde::de::IgnoredAny,
+    #[serde(default, rename = "parts")]
+    _parts: serde::de::IgnoredAny,
     #[serde(default)]
     image_ref: Option<ImageRef>,
 }
@@ -156,12 +226,13 @@ mod tests {
         let out = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
-        assert_eq!(out.kind, "image");
-        assert_eq!(out.mime_type, "image/png");
-        assert_eq!(STANDARD.decode(out.data).unwrap(), b"fake png bytes");
+        assert_eq!(out.kind(), "image");
+        assert_eq!(out.mime_type(), "image/png");
+        assert_eq!(STANDARD.decode(out.data()).unwrap(), b"fake png bytes");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -174,6 +245,7 @@ mod tests {
         let out = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
@@ -230,6 +302,7 @@ mod tests {
         let err = ViewImageTool
             .call(ViewImageArgs {
                 path: "/does/not/exist-view-image-xyz.png".to_string(),
+                auto_resize: true,
             })
             .await
             .expect_err("should error");
@@ -250,6 +323,7 @@ mod tests {
         let err = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect_err("should error");
@@ -372,13 +446,13 @@ mod tests {
         let out = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
 
         let image_ref = out
-            .image_ref
-            .clone()
+            .image_ref()
             .expect("expected image_ref to be Some after a successful spill");
         let spilled_path = image_cache::path_for(&image_ref.id)
             .expect("image_cache::path_for should resolve the id the tool just spilled");
@@ -407,19 +481,20 @@ mod tests {
         let out = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
 
-        assert_eq!(out.kind, "image");
-        assert_eq!(out.mime_type, "image/jpeg");
+        assert_eq!(out.kind(), "image");
+        assert_eq!(out.mime_type(), "image/jpeg");
         assert_eq!(
-            STANDARD.decode(&out.data).expect("base64 decode"),
+            STANDARD.decode(out.data()).expect("base64 decode"),
             bytes,
             "data must still carry the FULL image, unabridged, after adding image_ref"
         );
 
-        if let Some(r) = &out.image_ref {
+        if let Some(r) = out.image_ref() {
             cleanup_spill(&r.id);
         }
         cleanup_source(&path);
@@ -438,14 +513,12 @@ mod tests {
         let out = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
 
-        let image_ref = out
-            .image_ref
-            .clone()
-            .expect("expected image_ref to be Some");
+        let image_ref = out.image_ref().expect("expected image_ref to be Some");
         assert_eq!(
             image_ref.display_name, "shot.png",
             "display_name must be the source file's basename, not the full path"
@@ -474,14 +547,12 @@ mod tests {
         let out = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
 
-        let image_ref = out
-            .image_ref
-            .clone()
-            .expect("expected image_ref to be Some");
+        let image_ref = out.image_ref().expect("expected image_ref to be Some");
         assert_eq!(
             image_ref.display_name, expected_basename,
             "unicode basenames must pass through to display_name unmodified"
@@ -506,21 +577,23 @@ mod tests {
         let first = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("first call should load");
         let second = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("second call should load");
 
         let first_ref = first
-            .image_ref
+            .image_ref()
             .expect("first call's image_ref should be Some");
         let second_ref = second
-            .image_ref
+            .image_ref()
             .expect("second call's image_ref should be Some");
         assert_eq!(
             first_ref.id, second_ref.id,
@@ -548,13 +621,11 @@ mod tests {
         let out = ViewImageTool
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
-        let expected_ref = out
-            .image_ref
-            .clone()
-            .expect("expected image_ref to be Some");
+        let expected_ref = out.image_ref().expect("expected image_ref to be Some");
 
         let json = serde_json::to_string(&out).expect("serialize output");
         assert!(
@@ -609,12 +680,12 @@ mod tests {
 
     #[test]
     fn image_ref_omitted_from_json_when_none_not_serialized_as_null() {
-        let out = ViewImageOutput {
+        let out = ViewImageOutput::Plain(PlainImage {
             kind: "image",
             data: "AAAA".to_string(),
             mime_type: "image/png".to_string(),
             image_ref: None,
-        };
+        });
         let json = serde_json::to_string(&out).expect("serialize");
         assert!(
             !json.contains("image_ref"),
@@ -625,7 +696,7 @@ mod tests {
 
     #[test]
     fn image_ref_present_in_json_with_id_and_display_name_when_some() {
-        let out = ViewImageOutput {
+        let out = ViewImageOutput::Plain(PlainImage {
             kind: "image",
             data: "AAAA".to_string(),
             mime_type: "image/png".to_string(),
@@ -633,7 +704,7 @@ mod tests {
                 id: format!("{}.png", "ab".repeat(32)),
                 display_name: "shot.png".to_string(),
             }),
-        };
+        });
         let value: serde_json::Value = serde_json::to_value(&out).expect("to_value");
         assert_eq!(
             value["image_ref"]["display_name"].as_str(),
@@ -669,12 +740,12 @@ mod tests {
 
     #[test]
     fn output_with_none_image_ref_still_serializes_and_round_trips_and_extracts_none() {
-        let out = ViewImageOutput {
+        let out = ViewImageOutput::Plain(PlainImage {
             kind: "image",
             data: STANDARD.encode(b"still a real image payload"),
             mime_type: "image/png".to_string(),
             image_ref: None,
-        };
+        });
         let json = serde_json::to_string(&out).expect("serialize");
 
         let content = ToolResultContent::from_tool_output(json.clone());
