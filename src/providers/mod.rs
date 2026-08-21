@@ -1794,6 +1794,7 @@ mod tests {
             vision: None,
             preserve_reasoning: None,
             display_reasoning: None,
+            max_image_base64_bytes: 5 * 1024 * 1024,
         });
         let model = create_compaction_model(&cfg, None).expect("construction must succeed");
         let err = model
