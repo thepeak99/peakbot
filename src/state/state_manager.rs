@@ -5760,6 +5760,119 @@ mod tests {
         );
     }
 
+    /// The straddle case B3.3 exists to catch. A naive fix would sanitize
+    /// `messages[..last_idx]` alone, which orphans the ToolCall whose
+    /// ToolResult is the tail — `sanitize_tool_pairs` then deletes the
+    /// orphan and the prompt becomes a ToolResult with no matching
+    /// `tool_use`, a guaranteed hard 400. Sanitizing the full live sequence
+    /// (including the tail) before splitting keeps the pair intact.
+    ///
+    /// **RED today**: `build_resumption_for_compaction` does not sanitize
+    /// at all yet, so this currently passes only by accident of ordering —
+    /// pinned so the eventual sanitize-then-split implementation is proven
+    /// against the straddle shape specifically.
+    #[test]
+    fn resumption_keeps_a_toolcall_result_pair_across_the_split() {
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage};
+
+        let sm = StateManager::new();
+        sm.add_user_message("read the file".to_string());
+        sm.add_assistant_message("looking".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("c1".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "bash".to_string(),
+            "{}".to_string(),
+            "ok".to_string(),
+            Some("c1".to_string()),
+        );
+
+        let (prompt, history) = sm
+            .build_resumption_for_compaction()
+            .expect("non-empty conversation must produce resumption");
+
+        let prompt_text = extract_resumption_text(&prompt);
+        assert!(
+            prompt_text.contains("ok"),
+            "prompt must be the ToolResult tail, got: {prompt_text}"
+        );
+
+        let last = history
+            .last()
+            .expect("history must not be empty when a pair straddles the split");
+        let tc_id = match last {
+            RigMessage::Assistant { content, .. } => content.iter().find_map(|c| match c {
+                AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        assert_eq!(
+            tc_id.as_deref(),
+            Some("c1"),
+            "the ToolCall matching the tail ToolResult must survive as history's \
+             last entry, not be orphaned and dropped; history={history:?}"
+        );
+    }
+
+    /// No orphan ToolCall (one with no matching ToolResult in the live
+    /// sequence) may survive into the resumption history — it is a
+    /// guaranteed hard 400 on the wire.
+    ///
+    /// **RED today**: `build_resumption_for_compaction` performs no
+    /// sanitization, so the orphan ToolCall passes straight through.
+    #[test]
+    fn resumption_drops_an_orphan_toolcall() {
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage};
+
+        let sm = StateManager::new();
+        sm.add_user_message("read the file".to_string());
+        sm.add_assistant_message("looking".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("c1".to_string()),
+        );
+        // No matching tool_result — "c1" is orphaned. Another assistant
+        // row follows so the ToolCall is not the live tail.
+        sm.add_assistant_message("never got a result".to_string());
+
+        let (_prompt, history) = sm
+            .build_resumption_for_compaction()
+            .expect("non-empty conversation must produce resumption");
+
+        let has_orphan_tool_call = history.iter().any(|m| {
+            matches!(m, RigMessage::Assistant { content, .. }
+                if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_))))
+        });
+        assert!(
+            !has_orphan_tool_call,
+            "an orphan ToolCall must not survive into resumption history; history={history:?}"
+        );
+    }
+
+    /// No-regression guard for the `last_idx == 0` → `head.is_empty()`
+    /// guard-clause swap: a single-message transcript still has nothing to
+    /// resume from and must return `None`.
+    #[test]
+    fn resumption_returns_none_for_a_single_message_transcript() {
+        let sm = StateManager::new();
+        sm.add_user_message("only message".to_string());
+
+        assert!(
+            sm.build_resumption_for_compaction().is_none(),
+            "a single-message transcript is a fresh turn, not a resumption"
+        );
+    }
+
     /// Extract text from a rig Message for test assertions.
     fn extract_resumption_text(msg: &rig_core::completion::message::Message) -> String {
         use rig_core::completion::message::{AssistantContent, ToolResultContent, UserContent};
