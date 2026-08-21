@@ -21,6 +21,19 @@ pub const NAME: &str = "view_image";
 pub enum ViewImageError {
     #[error(transparent)]
     Load(#[from] AttachmentError),
+    /// `auto_resize: false` on an image whose base64 payload exceeds the
+    /// endpoint's ceiling (§A1/A2). Model-visible: rig feeds `e.to_string()`
+    /// back as the tool result, so the model can read this and retry.
+    #[error(
+        "image is too large for this endpoint: {path} encodes to {base64_bytes} base64 bytes, \
+         over the {ceiling} byte limit. Re-run with auto_resize true (the default) to downscale \
+         it automatically."
+    )]
+    TooLarge {
+        path: String,
+        base64_bytes: usize,
+        ceiling: usize,
+    },
 }
 
 #[derive(Deserialize)]
@@ -400,6 +413,38 @@ mod tests {
             ViewImageError::Load(AttachmentError::UnsupportedMediaType(_))
         ));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -- TEST PLAN #10: auto_resize: false on an oversized image must fail
+    //    fast with a model-readable, actionable error (§A1).
+    //
+    // NOT driven through ViewImageTool::call: the ceiling check needs a
+    // configured ceiling (ViewImageTool::new(max_image_base64_bytes), §A6),
+    // and wiring that into call()/providers/mod.rs is explicitly out of
+    // scope for this RED-tests pass. This pins the error type's contract
+    // directly — see GAPS in the report for the full end-to-end version.
+
+    #[test]
+    fn auto_resize_false_on_oversized_image_errors_without_calling_the_model() {
+        let err = ViewImageError::TooLarge {
+            path: "/tmp/x.png".to_string(),
+            base64_bytes: 11_663_068,
+            ceiling: 5 * 1024 * 1024,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auto_resize"),
+            "error must mention auto_resize as the off-switch/retry path: {msg}"
+        );
+        assert!(
+            msg.contains("11663068"),
+            "error must contain the actual base64 byte count: {msg}"
+        );
+        assert!(
+            msg.contains("5242880"),
+            "error must contain the ceiling byte count: {msg}"
+        );
+        assert!(matches!(err, ViewImageError::TooLarge { .. }));
     }
 
     // ==================================================================
