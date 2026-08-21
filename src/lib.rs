@@ -5889,16 +5889,15 @@ headers:
 
     // ── Defect 3: retry loop resends a stale turn ───────────────────────
     //
-    // The retry arm (`process_message_internal`, ~lib.rs:2711-2749) rebuilds
-    // `history` fresh every iteration via `derive_history_for_iteration`, but
-    // never refreshes `current_turn` — it resends the ORIGINAL user prompt.
-    // When the failing wire call is a continuation *inside* an already
-    // in-flight turn (a tool call + result already persisted), the retry
-    // duplicates the user turn: once as the trailing entry of history, once
-    // again as the prompt. Observed twice in production (wire captures:
-    // requests 3-5 each carried the original "read /tmp/screencap.png"
-    // prompt on top of a history that already contained the completed tool
-    // exchange). See `tickets/pr-b-retry-correctness.md`, Defect 3.
+    // The retry arm rebuilt `history` fresh every iteration via
+    // `derive_history_for_iteration` but left `current_turn` at the original
+    // user prompt. When the failing wire call was a continuation *inside* an
+    // already in-flight turn (tool call + result persisted), the retry sent
+    // the user turn twice: once as the tail of history, once as the prompt.
+    // Observed twice in production (wire captures: requests 3-5 each carried
+    // the original "read /tmp/screencap.png" prompt on top of a history that
+    // already contained the completed tool exchange). See
+    // `tickets/pr-b-retry-correctness.md`, Defect 3.
 
     /// *The arm-level pin.* Drives the real `process_message_internal` with
     /// a transient 429 injected into the mock model, so the assertion lands
