@@ -259,6 +259,74 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// THE load-bearing test (TEST PLAN #11). rig's `from_tool_output` drops
+    /// any extra field bolted onto the plain `{type, data, mimeType}` shape
+    /// (message.rs:913-988) — a `notice` field there would silently never
+    /// reach the model. Only the `[response, parts]` hybrid shape does. This
+    /// test proves a `Resized` output actually produces `[Text, Image]`
+    /// model-visible content, not just JSON that happens to contain the
+    /// right words. A `notice` field bolted onto the plain shape fails here
+    /// with `content.len() == 1`.
+    #[test]
+    fn resized_output_reaches_the_model_as_text_plus_image() {
+        let notice = "Auto-resized to fit this endpoint's image ceiling (5.00 MB base64): \
+            4128x2208 png, 11.12 MB base64 -> 1568x839 png, 1.61 MB base64. Fine detail may be \
+            lost; pass auto_resize false to send the original unmodified."
+            .to_string();
+        let out = ViewImageOutput::Resized(ResizedImage {
+            response: notice,
+            parts: [PlainImage {
+                kind: "image",
+                data: STANDARD.encode(b"resized png bytes"),
+                mime_type: "image/png".to_string(),
+                image_ref: None,
+            }],
+            image_ref: None,
+        });
+        let json = serde_json::to_string(&out).expect("serialize");
+
+        let content = ToolResultContent::from_tool_output(json);
+        assert_eq!(
+            content.len(),
+            2,
+            "a Resized output must reach the model as exactly two blocks: Text then Image"
+        );
+
+        let ToolResultContent::Text(text) = content.first() else {
+            panic!(
+                "content[0] must be a Text block, got: {:?}",
+                content.first()
+            );
+        };
+        assert!(
+            text.text.contains("4128x2208"),
+            "notice must carry the original dimensions: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("1568x839"),
+            "notice must carry the new dimensions: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("5.00 MB"),
+            "notice must carry the ceiling: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("auto_resize"),
+            "notice must mention the auto_resize off-switch: {}",
+            text.text
+        );
+
+        let rest = content.rest();
+        let second = rest.first().expect("a second content block");
+        assert!(
+            matches!(second, ToolResultContent::Image(_)),
+            "content[1] must be an Image block, got: {second:?}"
+        );
+    }
+
     /// Pin the wire shape: rig 0.36 flattened the source as a duplicate
     /// `type` key; rig 0.38 nests it under `source`. A regression fails here.
     #[test]
