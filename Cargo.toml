@@ -103,6 +103,9 @@ ruvector-core = { version = "=2.2.0", default-features = false, features = ["hns
 pdf_oxide = { version = "0.3", default-features = false, features = ["legacy-crypto"] }
 # DOCX text extraction (pure-Rust; quick-xml + zip + thiserror).
 docx-lite = "0.2"
+# Already linked via `pdf_oxide` (Cargo.lock:2206) with exactly these codecs
+# enabled — declaring it direct adds ZERO crates and ZERO compile time.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Chunk hashing for idempotent re-index.
 sha2 = "0.10"
 
