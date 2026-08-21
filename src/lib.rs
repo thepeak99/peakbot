@@ -2576,7 +2576,7 @@ impl AgentRunner {
         let mut retry_count = 0;
         // One-shot override for the post-compaction iteration. The compact
         // arm fills this with the resumption-shape history returned by
-        // `build_resumption_for_compaction()`; the loop top consumes it
+        // `build_resumption_from_tail()`; the loop top consumes it
         // via `.take()` on the very next iteration so the resumption
         // payload reaches the wire intact. Without this override, the
         // top-of-loop `get_agent_history()` re-derives history from
@@ -2672,24 +2672,20 @@ impl AgentRunner {
                     // uses the last User as the prompt), mid-action resumption
                     // must continue from whatever message the hook terminated
                     // with — which may be a ToolResult or Agent response, not
-                    // necessarily a User. `build_resumption_for_compaction` handles
-                    // this correctly by finding the actual last non-compacted
-                    // message as the prompt and everything before it as history.
+                    // necessarily a User. `refresh_attempt_from_transcript`
+                    // handles this correctly by finding the actual last
+                    // non-compacted message as the prompt and everything
+                    // before it as history — the same helper the retry arm
+                    // uses, so the two can never drift apart again.
                     //
-                    // If it returns None (empty state or fresh turn), fall back
-                    // to the normal initial-dispatch path for safety.
-                    if let Some((p, h)) = sm.build_resumption_for_compaction() {
-                        current_turn = p;
-                        // Stash the resumption-shape history in the loop-local
-                        // one-shot override. The next iteration's top-of-loop
-                        // will consume it via `.take()` instead of calling
-                        // `get_agent_history()`. This is the load-bearing
-                        // line — without it, the trailing non-User message
-                        // (typically a ToolResult after a tool round-trip)
-                        // would be duplicated on the wire because
-                        // `get_agent_history()` only strips trailing User.
-                        history_override = Some(h);
-                    } else if let Some(turn) = sm.build_current_turn_message() {
+                    // If it returns false (empty state or fresh turn), fall
+                    // back to the normal initial-dispatch path for safety.
+                    if !refresh_attempt_from_transcript(
+                        sm,
+                        &mut current_turn,
+                        &mut history_override,
+                    ) && let Some(turn) = sm.build_current_turn_message()
+                    {
                         current_turn = turn;
                     }
 
@@ -2708,21 +2704,28 @@ impl AgentRunner {
                     return CompletionResult::Error;
                 }
 
-                Err(_e) => {
+                Err(e) => {
                     // Only transient failures (rate limits, 5xx, transport
                     // drops) are worth retrying; a deterministic 401 / bad
                     // request / MaxTurnsError bails immediately. See #111.
-                    if !crate::providers::retry::is_transient_prompt_error(&_e) {
+                    if !crate::providers::retry::is_transient_prompt_error(&e) {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
-                            sm.add_system_message(format!("❌ LLM request failed: {_e}"));
+                            sm.add_system_message(format!(
+                                "❌ LLM request failed: {}",
+                                crate::ui::app_state::truncate_str(&e.to_string(), 2000)
+                            ));
                         }
                         return CompletionResult::Error;
                     }
                     if retry_count >= config.retry().max_retries {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
-                            sm.add_system_message("❌ Max number of retries exceeded".to_string());
+                            sm.add_system_message(format!(
+                                "❌ LLM request failed after {} retries: {}",
+                                config.retry().max_retries,
+                                crate::ui::app_state::truncate_str(&e.to_string(), 2000)
+                            ));
                         }
                         return CompletionResult::Error;
                     }
@@ -2732,7 +2735,7 @@ impl AgentRunner {
                         attempt = retry_count + 1,
                         max_retries = config.retry().max_retries,
                         backoff_ms = delay.as_millis(),
-                        error = %_e,
+                        error = %e,
                         "LLM request failed transiently; backing off before retry"
                     );
                     if let Some(sm) = state_manager {
@@ -2742,6 +2745,18 @@ impl AgentRunner {
                             config.retry().max_retries,
                             delay.as_secs_f64()
                         )));
+                    }
+                    // The wire call may have failed *mid-turn*, after a tool
+                    // round-trip was already executed and persisted. Re-derive
+                    // the attempt so the retry continues from the transcript
+                    // tail instead of replaying the original user turn on top
+                    // of a history that already contains it.
+                    if let Some(sm) = state_manager {
+                        refresh_attempt_from_transcript(
+                            sm,
+                            &mut current_turn,
+                            &mut history_override,
+                        );
                     }
                     tokio::time::sleep(delay).await;
                     retry_count += 1;
@@ -3527,7 +3542,7 @@ impl AgentRunner {
 ///    from `StateManager` (the source of truth, single trailing-User strip).
 /// 2. **Post-compaction iteration**: `override_` was filled by the compact
 ///    arm with the resumption-shape history from
-///    `StateManager::build_resumption_for_compaction()`. We `.take()` it so
+///    `StateManager::build_resumption_from_tail()`. We `.take()` it so
 ///    the next iteration falls back to the normal path.
 ///
 /// **Why this exists as a separate function:** the production bug fixed
@@ -3552,6 +3567,28 @@ fn derive_history_for_iteration(
             .as_ref()
             .map(|sm| sm.get_agent_history())
             .unwrap_or_default(),
+    }
+}
+
+/// Re-derive the next wire attempt — prompt AND history together — from the
+/// transcript's live tail. Taking them from one snapshot is the whole point:
+/// a prompt captured before a tool round-trip landed, replayed on a history
+/// captured after it, duplicates the user turn (Defect 3).
+///
+/// `false` means there is nothing to resume from (a fresh, single-message
+/// turn); the caller keeps the turn it already holds, which is correct there.
+fn refresh_attempt_from_transcript(
+    sm: &StateManager,
+    current_turn: &mut rig_core::completion::message::Message,
+    history_override: &mut Option<Vec<rig_core::completion::message::Message>>,
+) -> bool {
+    match sm.build_resumption_from_tail() {
+        Some((prompt, history)) => {
+            *current_turn = prompt;
+            *history_override = Some(history);
+            true
+        }
+        None => false,
     }
 }
 
@@ -5617,7 +5654,7 @@ headers:
     // These tests pin the exact data shape that
     // `AgentRunner::process_message_internal` constructs after the
     // SessionHook fires `terminate("compact")`. The bug we're guarding
-    // against is subtle: `build_resumption_for_compaction` returns the
+    // against is subtle: `build_resumption_from_tail` returns the
     // correct `(prompt, history)` tuple, but if the loop discards the
     // returned history and re-derives it via `get_agent_history()` on
     // the next iteration, the resumption message ends up duplicated on
@@ -5688,7 +5725,7 @@ headers:
     /// **The bug.** After a tool round-trip the chat ends in a
     /// `ToolResult`. When mid-action compaction fires, the production
     /// loop must use the resumption tuple's history (returned alongside
-    /// the prompt by `build_resumption_for_compaction`) — NOT a fresh
+    /// the prompt by `build_resumption_from_tail`) — NOT a fresh
     /// `get_agent_history()` call, which still includes the trailing
     /// ToolResult and would duplicate it on the wire.
     ///
@@ -5728,7 +5765,7 @@ headers:
         // The compact arm sets current_turn = prompt and stashes
         // resumption_history into the one-shot override.
         let (prompt, resumption_history) = sm
-            .build_resumption_for_compaction()
+            .build_resumption_from_tail()
             .expect("non-empty conversation must produce a resumption");
         let mut history_override = Some(resumption_history);
 
@@ -5798,7 +5835,7 @@ headers:
 
     /// **The bug.** This is the *original* data-shape pin, kept as a
     /// no-regression for the underlying mismatch between
-    /// `build_resumption_for_compaction` (returns the full resumption
+    /// `build_resumption_from_tail` (returns the full resumption
     /// shape) and `get_agent_history` (only strips trailing User).
     /// If anyone "fixes" `get_agent_history` to also strip trailing
     /// ToolResult — masking the lib.rs bug instead of fixing the
@@ -5827,7 +5864,7 @@ headers:
         );
 
         let (prompt, _) = sm
-            .build_resumption_for_compaction()
+            .build_resumption_from_tail()
             .expect("non-empty conversation must produce a resumption");
         // This is the BROKEN pattern (re-derive history from state).
         // get_agent_history() doesn't strip trailing non-User messages,
@@ -5848,6 +5885,247 @@ headers:
             history_count, 1,
             "naive get_agent_history() ALSO has the marker (the source of the duplication)"
         );
+    }
+
+    // ── Defect 3: retry loop resends a stale turn ───────────────────────
+    //
+    // The retry arm rebuilt `history` fresh every iteration via
+    // `derive_history_for_iteration` but left `current_turn` at the original
+    // user prompt. When the failing wire call was a continuation *inside* an
+    // already in-flight turn (tool call + result persisted), the retry sent
+    // the user turn twice: once as the tail of history, once as the prompt.
+    // Observed twice in production (wire captures: requests 3-5 each carried
+    // the original "read /tmp/screencap.png" prompt on top of a history that
+    // already contained the completed tool exchange). See
+    // `tickets/pr-b-retry-correctness.md`, Defect 3.
+
+    /// *The arm-level pin.* Drives the real `process_message_internal` with
+    /// a transient 429 injected into the mock model, so the assertion lands
+    /// on the SECOND wire payload the **retry arm itself** built — not on
+    /// the helper's return value, which the three `refresh_attempt_from_*`
+    /// tests below already cover.
+    ///
+    /// Removing or short-circuiting the `refresh_attempt_from_transcript`
+    /// call in the transient-retry arm (`process_message_internal`, the
+    /// block immediately before `tokio::time::sleep(delay)`) makes this
+    /// fail with `2 != 1` — the duplicated user turn from the production
+    /// trace.
+    ///
+    /// The completed tool round-trip is written straight to the transcript:
+    /// in production those rows arrive on the async event-processing task,
+    /// and awaiting that here would only add a race. What the arm reads is
+    /// the transcript tail, and the tail is identical either way.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn retry_arm_resumes_from_the_tail_after_a_tool_roundtrip() {
+        let sm = StateManager::new_arc();
+        sm.add_user_message("read /tmp/screencap.png".to_string());
+        sm.add_assistant_message("I'll look at it".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "view_image".to_string(),
+            r#"{"path":"/tmp/screencap.png"}"#.to_string(),
+            Some("c1".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "view_image".to_string(),
+            r#"{"path":"/tmp/screencap.png"}"#.to_string(),
+            "ok".to_string(),
+            Some("c1".to_string()),
+        );
+
+        let (agent, _info, _events, _hook, model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        // A 429 is transient (`is_transient_prompt_error`), so the arm under
+        // test runs; the second attempt succeeds and ends the turn.
+        model.add_response(crate::mock::MockResponse::error(
+            "429 rate limited by provider",
+        ));
+        model.add_response(crate::mock::MockResponse::text("done"));
+
+        let config = Config {
+            retry: crate::config::RetryConfig {
+                max_retries: 1,
+                initial_delay_ms: 1,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let current_turn = sm
+            .build_current_turn_message()
+            .expect("the original user turn was dispatched");
+        let agent: Arc<DynAgent> = Arc::new(agent);
+        let sm_opt = Some(sm.clone());
+
+        let result =
+            AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await;
+        assert!(
+            matches!(result, CompletionResult::Success),
+            "the retried attempt must succeed and end the turn"
+        );
+
+        let requests = model.get_recorded_requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one failed attempt plus exactly one retry"
+        );
+        // `chat_history` is the whole wire payload — history ++ [prompt].
+        let retry_payload = &requests[1].chat_history;
+        assert_eq!(
+            count_occurrences(retry_payload, "read /tmp/screencap.png"),
+            1,
+            "the retry must resume from the transcript tail: the user turn \
+             belongs on the wire exactly once, but the retry arm resent it \
+             as the prompt on top of a history that already contained it. \
+             Payload: {retry_payload:?}"
+        );
+    }
+
+    /// After a tool round-trip has landed, `refresh_attempt_from_transcript`
+    /// must promote the ToolResult tail to `current_turn` and stash
+    /// everything before it — including the matching ToolCall — into
+    /// `history_override`. The pair must survive the split intact.
+    #[test]
+    fn refresh_attempt_from_transcript_after_tool_roundtrip_promotes_the_toolresult() {
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+        sm.add_user_message("read /tmp/screencap.png".to_string());
+        sm.add_assistant_message("I'll look at it".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "view_image".to_string(),
+            r#"{"path":"/tmp/screencap.png"}"#.to_string(),
+            Some("c1".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "view_image".to_string(),
+            r#"{"path":"/tmp/screencap.png"}"#.to_string(),
+            "ok".to_string(),
+            Some("c1".to_string()),
+        );
+
+        let mut current_turn = sm
+            .build_current_turn_message()
+            .expect("the original user turn was dispatched");
+        let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
+
+        let refreshed =
+            refresh_attempt_from_transcript(&sm, &mut current_turn, &mut history_override);
+        assert!(
+            refreshed,
+            "a tool round-trip landed; there is a tail to resume from"
+        );
+
+        match &current_turn {
+            RigMessage::User { content } => match content.first_ref() {
+                UserContent::ToolResult(tr) => assert_eq!(tr.id, "c1"),
+                other => panic!("expected ToolResult content, got {other:?}"),
+            },
+            other => panic!("expected User message, got {other:?}"),
+        }
+
+        let history = history_override
+            .as_ref()
+            .expect("history_override must be Some after a successful refresh");
+        let last = history.last().expect("history must not be empty");
+        let tc_id = match last {
+            RigMessage::Assistant { content, .. } => content.iter().find_map(|c| match c {
+                AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        assert_eq!(
+            tc_id.as_deref(),
+            Some("c1"),
+            "the matching ToolCall must be the last entry of history; got {history:?}"
+        );
+    }
+
+    /// No-tool-call retry path (e.g. a 429 on the very first wire call): the
+    /// live tail is still the User row, so there is nothing to resume from.
+    /// The helper must leave `current_turn` and `history_override` alone.
+    #[test]
+    fn refresh_attempt_from_transcript_on_a_fresh_turn_leaves_the_turn_alone() {
+        let sm = StateManager::new();
+        sm.add_user_message("just a fresh question".to_string());
+
+        let original_turn = sm
+            .build_current_turn_message()
+            .expect("the user turn was dispatched");
+        let mut current_turn = original_turn.clone();
+        let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
+
+        let refreshed =
+            refresh_attempt_from_transcript(&sm, &mut current_turn, &mut history_override);
+
+        assert!(
+            !refreshed,
+            "a fresh single-message turn has nothing to resume from"
+        );
+        assert_eq!(
+            count_occurrences(std::slice::from_ref(&current_turn), "just a fresh question"),
+            count_occurrences(
+                std::slice::from_ref(&original_turn),
+                "just a fresh question"
+            ),
+            "current_turn must be unchanged when there is nothing to resume from"
+        );
+        assert!(
+            history_override.is_none(),
+            "history_override must stay None when there is nothing to resume from"
+        );
+    }
+
+    /// A multimodal user turn (image attachment) retried before any tool
+    /// call must keep its image content after refresh — guards against a
+    /// `last_msg_to_rig` regression that would silently drop vision on
+    /// retry.
+    #[test]
+    fn refresh_attempt_from_transcript_preserves_user_image_attachments() {
+        use crate::vision::{ImageAttachment, ImageSource};
+        use rig_core::completion::message::{ImageMediaType, Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+        sm.add_user_message_with_attachments(
+            "what is in this image?".to_string(),
+            vec![ImageAttachment {
+                display_name: "screencap.png".to_string(),
+                source: ImageSource::Base64 {
+                    bytes: vec![1, 2, 3, 4],
+                    media_type: ImageMediaType::PNG,
+                },
+                detail: None,
+            }],
+        );
+        // A second user-facing row so the retry has a tail to consider —
+        // an assistant turn precedes the retried attempt in production;
+        // here we retry the very first (and only) turn, mirroring a 429
+        // on the initial wire call with an image attached.
+        let mut current_turn = sm
+            .build_current_turn_message()
+            .expect("the multimodal user turn was dispatched");
+        let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
+
+        let _ = refresh_attempt_from_transcript(&sm, &mut current_turn, &mut history_override);
+
+        match &current_turn {
+            RigMessage::User { content } => {
+                assert!(
+                    content.iter().any(|c| matches!(c, UserContent::Image(_))),
+                    "refreshed prompt must still carry the image attachment; content={content:?}"
+                );
+            }
+            other => panic!("expected User message, got {other:?}"),
+        }
     }
 
     // ── Phase 3: event lane tag + cost roll-up ──────────────────────────

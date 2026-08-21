@@ -218,7 +218,7 @@ impl TestRunner {
                     // (cleared last_input_tokens in apply_compaction)
                     // prevents the hook from re-terminating immediately.
                     //
-                    // Use build_resumption_for_compaction to get the correct
+                    // Use build_resumption_from_tail to get the correct
                     // resumption prompt (whatever the last message is) and
                     // history (everything before it). This handles mid-action
                     // resumption correctly when the last message is not a User
@@ -247,8 +247,7 @@ impl TestRunner {
 
                     // Try resumption path first (handles mid-action correctly).
                     // This consumes one response from the main agent queue.
-                    if let Some((prompt, h)) = self.state_manager.build_resumption_for_compaction()
-                    {
+                    if let Some((prompt, h)) = self.state_manager.build_resumption_from_tail() {
                         // Re-enter the agent loop with the resumption prompt and history.
                         // The mock agent's prompt_with_history takes `&str`, so
                         // we need to extract the text content from the prompt.
@@ -357,7 +356,7 @@ fn extract_prompt_text(msg: &rig_core::completion::message::Message) -> String {
     match msg {
         rig_core::completion::message::Message::User { content } => {
             // OneOrMany has first + rest fields, not enum variants.
-            // Check for ToolResult content first (from build_resumption_for_compaction).
+            // Check for ToolResult content first (from build_resumption_from_tail).
             let first = content.first_ref();
             if let UserContent::ToolResult(tr) = first {
                 // ToolResult wraps ToolResultContent::Text

@@ -1,15 +1,16 @@
 //! Transient-error classification and backoff for the provider layer.
 //!
-//! `rig-core` strips the HTTP status from its error variants, folding any
-//! non-2xx into `CompletionError::ProviderError(text)` / `ResponseError(text)`
-//! (#111). With no status on the wire, transience is detected by:
-//!   * `CompletionError::HttpError(_)` — always transient (transport-level)
-//!   * `ProviderError(msg)` / `ResponseError(msg)` — transient iff `msg`
-//!     matches a known marker (see `TRANSIENT_MESSAGE_MARKERS`).
+//! `rig_core::http_client::Error` carries a real, typed HTTP status
+//! (`InvalidStatusCode` / `InvalidStatusCodeWithMessage`) for every non-2xx
+//! response, so `CompletionError::HttpError` is classified by inspecting that
+//! status via `is_retryable_status` — not assumed transient. Only
+//! `ProviderError(text)` / `ResponseError(text)` arrive as bare strings (a
+//! provider-level error envelope, not a transport failure), so those still
+//! fall back to substring matching against `TRANSIENT_MESSAGE_MARKERS`.
 //!
 //! Substring matching is fragile — a localized or reworded rate-limit that
-//! omits every marker classifies as *permanent* and the turn is lost. A
-//! robust fix needs an upstream patch preserving the status code.
+//! omits every marker classifies as *permanent* and the turn is lost. That
+//! fallback is out of scope here; it needs provider-by-provider evidence.
 
 use crate::config::RetryConfig;
 use rig_core::completion::{CompletionError, PromptError};
@@ -32,12 +33,37 @@ const TRANSIENT_MESSAGE_MARKERS: &[&str] = &[
     "overloaded",
 ];
 
+/// Statuses worth another attempt: the request was fine, the server or the
+/// moment was not. Everything else 4xx is a permanent contract violation —
+/// the payload is identical on every retry, so retrying only delays the
+/// error and buries the message.
+fn is_retryable_status(status: http::StatusCode) -> bool {
+    status == http::StatusCode::REQUEST_TIMEOUT // 408
+        || status == http::StatusCode::TOO_MANY_REQUESTS // 429
+        || status.is_server_error() // 5xx, incl. Anthropic's 529
+}
+
+/// Classify `rig_core::http_client::Error`. Exhaustive, no wildcard: a rig
+/// upgrade that adds a variant must fail this build, not silently default.
+fn is_transient_http_error(err: &rig_core::http_client::Error) -> bool {
+    use rig_core::http_client::Error as E;
+    match err {
+        // A real response with a real status — ask the status.
+        E::InvalidStatusCode(s) | E::InvalidStatusCodeWithMessage(s, _) => is_retryable_status(*s),
+        // Transport: connection reset, TLS, DNS, timeout, truncated body.
+        E::Instance(_) | E::StreamEnded => true,
+        // We built or read the request/response wrong. Deterministic.
+        E::Protocol(_) | E::InvalidHeaderValue(_) | E::NoHeaders | E::InvalidContentType(_) => {
+            false
+        }
+    }
+}
+
 /// Whether a `CompletionError` is worth retrying. See module docs for why
 /// we fall back to message-substring matching.
 fn is_transient_completion_error(err: &CompletionError) -> bool {
     match err {
-        // Transport-level errors (TCP reset, TLS, timeout) are always transient.
-        CompletionError::HttpError(_) => true,
+        CompletionError::HttpError(e) => is_transient_http_error(e),
         // rig providers strip the status into the message; substring-match.
         CompletionError::ProviderError(msg) | CompletionError::ResponseError(msg) => {
             let lower = msg.to_ascii_lowercase();
@@ -94,7 +120,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_error_is_always_transient() {
+    fn transport_errors_are_transient() {
         assert!(is_transient_completion_error(&CompletionError::HttpError(
             rig_core::http_client::Error::StreamEnded
         )));
@@ -236,5 +262,114 @@ mod tests {
         };
         // 0 * anything = 0 — no delay, no panic.
         assert_eq!(backoff_delay(5, &cfg), Duration::from_millis(0));
+    }
+
+    /// rig's `http_client::Error` carries a real, typed status
+    /// (`InvalidStatusCode`/`InvalidStatusCodeWithMessage`) — the module doc's
+    /// claim that rig "strips the HTTP status" is false. Today the
+    /// `HttpError(_) => true` arm ignores that status entirely, so a permanent
+    /// 4xx is retried three times with an identical payload — the production
+    /// incident this test names: a 400 "image exceeds 10 MB maximum" retried
+    /// for ~64s before failing with a generic "max retries exceeded" that
+    /// discarded the endpoint's own explanation.
+    #[test]
+    fn hard_4xx_is_not_transient() {
+        use http::StatusCode;
+        use rig_core::http_client::Error;
+
+        let body = "messages.2.content.0.tool_result.content.0.image.source.base64: \
+                     image exceeds 10 MB maximum: 11663068 bytes > 10485760 bytes";
+
+        for code in [400u16, 401, 403, 404, 413, 422] {
+            let status = StatusCode::from_u16(code).unwrap();
+            let msg = if code == 400 {
+                body.to_string()
+            } else {
+                format!("{code} error")
+            };
+            let e = CompletionError::HttpError(Error::InvalidStatusCodeWithMessage(status, msg));
+            assert!(
+                !is_transient_completion_error(&e),
+                "HTTP {code} must not be transient — it is a permanent contract \
+                 violation, retrying sends the identical payload again"
+            );
+        }
+    }
+
+    /// Guard against over-correcting defect 2: the statuses that genuinely
+    /// mean "try again" must stay transient, through both status-carrying
+    /// variants rig can produce. 529 is Anthropic's overloaded code, folded
+    /// into `is_server_error()` alongside the standard 5xx range.
+    #[test]
+    fn retryable_statuses_stay_transient() {
+        use http::StatusCode;
+        use rig_core::http_client::Error;
+
+        for code in [408u16, 429, 500, 502, 503, 504, 529] {
+            let status = StatusCode::from_u16(code).unwrap();
+
+            let bare = CompletionError::HttpError(Error::InvalidStatusCode(status));
+            assert!(
+                is_transient_completion_error(&bare),
+                "HTTP {code} (InvalidStatusCode) must stay transient"
+            );
+
+            let with_msg = CompletionError::HttpError(Error::InvalidStatusCodeWithMessage(
+                status,
+                "retry me".to_string(),
+            ));
+            assert!(
+                is_transient_completion_error(&with_msg),
+                "HTTP {code} (InvalidStatusCodeWithMessage) must stay transient"
+            );
+        }
+    }
+
+    /// Non-status `http_client::Error` variants split into two buckets:
+    /// genuine transport failures (connection reset, truncated stream) are
+    /// worth retrying, while errors from PeakBot/rig building or reading the
+    /// request/response wrong are deterministic and won't change on retry.
+    #[test]
+    fn transport_errors_stay_transient() {
+        use rig_core::http_client::Error;
+
+        let stream_ended = CompletionError::HttpError(Error::StreamEnded);
+        assert!(is_transient_completion_error(&stream_ended));
+
+        let instance = CompletionError::HttpError(Error::Instance(
+            std::io::Error::other("connection reset").into(),
+        ));
+        assert!(is_transient_completion_error(&instance));
+
+        let no_headers = CompletionError::HttpError(Error::NoHeaders);
+        assert!(!is_transient_completion_error(&no_headers));
+
+        let bad_header_value =
+            http::HeaderValue::from_bytes(b"\n").expect_err("newline is not a legal header byte");
+        let invalid_header =
+            CompletionError::HttpError(Error::InvalidHeaderValue(bad_header_value));
+        assert!(!is_transient_completion_error(&invalid_header));
+    }
+
+    /// End-to-end pin of the user-visible fix: a 400 must stop the retry loop
+    /// immediately (attempt 0, full budget) rather than spending the retry
+    /// budget on an identical doomed payload. This is the "~64s → ~0s" change.
+    #[test]
+    fn next_retry_delay_returns_none_for_a_400() {
+        use http::StatusCode;
+        use rig_core::http_client::Error;
+
+        let cfg = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 1000,
+            max_delay_ms: 8000,
+            backoff_factor: 2.0,
+        };
+        let body = "image exceeds 10 MB maximum: 11663068 bytes > 10485760 bytes";
+        let err = PromptError::CompletionError(CompletionError::HttpError(
+            Error::InvalidStatusCodeWithMessage(StatusCode::BAD_REQUEST, body.to_string()),
+        ));
+
+        assert_eq!(next_retry_delay(&err, 0, &cfg), None);
     }
 }

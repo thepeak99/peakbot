@@ -2027,7 +2027,7 @@ impl StateManager {
         // assistant/tool messages after it, it's part of the conversation
         // history and must be kept. This applies even after compaction:
         // `build_current_turn_message` already returns the latest non-compacted
-        // user message as the prompt, and `build_resumption_for_compaction`
+        // user message as the prompt, and `build_resumption_from_tail`
         // supplies the last live message itself.
         let last_live = state
             .chat
@@ -2049,7 +2049,7 @@ impl StateManager {
             // transcript (for display + persistence) but must NEVER enter the
             // orchestrator model's context. `is_orchestrator_context()` is the
             // single definition of this set — see also `uncompacted_message_count`,
-            // `ContextManager::compact`, `build_resumption_for_compaction`.
+            // `ContextManager::compact`, `build_resumption_from_tail`.
             .filter(|(_, msg)| msg.is_orchestrator_context())
             .filter(|(i, _)| Some(*i) != skip_last_idx)
             .map(|(_, msg)| msg)
@@ -2484,26 +2484,37 @@ impl StateManager {
         })
     }
 
-    /// Build the resumption prompt and history for resuming after compaction.
+    /// Build the next wire attempt — prompt and history together — from the
+    /// live transcript's tail. Used both to resume after mid-action
+    /// compaction and to re-derive a retry attempt after a tool round-trip.
     ///
     /// This is distinct from `build_current_turn_message` + `get_agent_history`
     /// because those methods are designed for **initial dispatch** (fresh user
     /// turns), where the trailing User is always the current turn.
     ///
-    /// After mid-action compaction, the state looks like:
+    /// After a mid-action interruption, the state looks like:
     ///
     /// ```text
-    /// [User, Agent, ToolCall, ToolResult]  ← compaction fires here
+    /// [User, Agent, ToolCall, ToolResult]  ← interruption happens here
     /// ```
     ///
-    /// The resumption prompt should be the **last non-compacted message** (e.g.
-    /// the ToolResult), and history should be everything before it
+    /// The resumption prompt should be the **last live message** (e.g. the
+    /// ToolResult), and history should be everything before it
     /// ([User, Agent, ToolCall]).
+    ///
+    /// Sanitized with [`sanitize_tool_pairs`] over the **full live sequence,
+    /// including the tail, before splitting** — never over the head slice
+    /// alone. Sanitizing the head alone orphans the ToolCall whose ToolResult
+    /// is the tail; `sanitize_tool_pairs` deletes orphan calls, so the prompt
+    /// would become a ToolResult with no matching `tool_use` — a guaranteed
+    /// hard 400 on the single most common shape here.
     ///
     /// Returns `None` when there is no resumption needed — empty conversation
     /// or fresh turn. In that case the caller falls back to the normal
     /// `build_current_turn_message` / `get_agent_history` path.
-    pub fn build_resumption_for_compaction(
+    ///
+    /// [`sanitize_tool_pairs`]: crate::tool_use_validator::sanitize_tool_pairs
+    pub fn build_resumption_from_tail(
         &self,
     ) -> Option<(
         rig_core::completion::message::Message,
@@ -2512,18 +2523,17 @@ impl StateManager {
         let state = self.state.read().unwrap();
         let messages = &state.chat.messages;
 
-        // Find the last message of the orchestrator's live context (whatever its role)
-        let last_live = messages
+        let live: Vec<&crate::ui::app_state::ChatMessage> = messages
             .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, m)| m.is_orchestrator_context());
+            .filter(|m| m.is_orchestrator_context())
+            .collect();
+        let sanitized = crate::tool_use_validator::sanitize_tool_pairs(live);
+        let (tail, head) = sanitized.split_last()?;
 
-        let (last_idx, last_msg) = last_live?;
-
-        // If there's only one message, it's a fresh turn — not a mid-action
-        // resumption. Return None so the caller uses the normal path.
-        if last_idx == 0 {
+        // If there's only one live message, it's a fresh turn — not a
+        // mid-action resumption. Return None so the caller uses the normal
+        // path.
+        if head.is_empty() {
             return None;
         }
 
@@ -2531,11 +2541,8 @@ impl StateManager {
         // `get_agent_history` so a post-compaction resume replays survivors'
         // thinking blocks in the same thinking-first wire order — the
         // one place where forgetting the change produces a live 400.
-        let history_msgs: Vec<crate::ui::app_state::ChatMessage> = messages[..last_idx]
-            .iter()
-            .filter(|m| m.is_orchestrator_context())
-            .cloned()
-            .collect();
+        let history_msgs: Vec<crate::ui::app_state::ChatMessage> =
+            head.iter().map(|m| (*m).clone()).collect();
         let wire_reasoning = *self.wire_reasoning.read().unwrap();
         let history = Self::convert_history_to_rig(&history_msgs, wire_reasoning);
 
@@ -2543,7 +2550,7 @@ impl StateManager {
         // Mirror the pre-change shape — for a single message at the tail of
         // the transcript, the resumption helper keeps it as a one-element
         // rig message regardless of whether it carries thinking.
-        let prompt = Self::last_msg_to_rig(last_msg);
+        let prompt = Self::last_msg_to_rig(tail);
 
         Some((prompt, history))
     }
@@ -5667,7 +5674,7 @@ mod tests {
         }
     }
 
-    /// `build_resumption_for_compaction` returns the last non-compacted message
+    /// `build_resumption_from_tail` returns the last non-compacted message
     /// (whatever its role) as the prompt, with everything before it as history.
     ///
     /// This is the load-bearing regression pin for the "crazy loop" bug: when
@@ -5675,7 +5682,7 @@ mod tests {
     /// model response), the resumption prompt must be the ToolResult, not the
     /// stale User that `build_current_turn_message` always returns.
     #[test]
-    fn build_resumption_for_compaction_does_not_duplicate_user_prompt() {
+    fn build_resumption_from_tail_does_not_duplicate_user_prompt() {
         let sm = StateManager::new();
 
         // Simulate mid-action state: User → Agent → ToolCall → ToolResult
@@ -5699,7 +5706,7 @@ mod tests {
         );
 
         let (prompt, history) = sm
-            .build_resumption_for_compaction()
+            .build_resumption_from_tail()
             .expect("non-empty conversation must produce resumption");
 
         // The prompt must be the ToolResult — NOT the User message.
@@ -5723,26 +5730,26 @@ mod tests {
 
     /// Defensive boundary: empty state must return None, not panic.
     #[test]
-    fn build_resumption_for_compaction_returns_none_on_empty_state() {
+    fn build_resumption_from_tail_returns_none_on_empty_state() {
         let sm = StateManager::new();
         assert!(
-            sm.build_resumption_for_compaction().is_none(),
+            sm.build_resumption_from_tail().is_none(),
             "empty state must return None"
         );
     }
 
     /// No-regression for fresh-turn compaction (compaction fires before any
     /// tool round-trip). In this case the last message IS a User, so both
-    /// `build_resumption_for_compaction` and `build_current_turn_message` should
+    /// `build_resumption_from_tail` and `build_current_turn_message` should
     /// agree on the User.
     #[test]
-    fn build_resumption_for_compaction_handles_trailing_user() {
+    fn build_resumption_from_tail_handles_trailing_user() {
         let sm = StateManager::new();
         sm.add_user_message("a fresh turn".to_string());
         sm.add_assistant_message("hi".to_string());
 
         let (prompt, history) = sm
-            .build_resumption_for_compaction()
+            .build_resumption_from_tail()
             .expect("non-empty conversation must produce resumption");
 
         // The prompt should be the Assistant message ("hi"), not the User.
@@ -5760,6 +5767,119 @@ mod tests {
         );
     }
 
+    /// The straddle case B3.3 exists to catch. A naive fix would sanitize
+    /// `messages[..last_idx]` alone, which orphans the ToolCall whose
+    /// ToolResult is the tail — `sanitize_tool_pairs` then deletes the
+    /// orphan and the prompt becomes a ToolResult with no matching
+    /// `tool_use`, a guaranteed hard 400. Sanitizing the full live sequence
+    /// (including the tail) before splitting keeps the pair intact.
+    ///
+    /// **RED today**: `build_resumption_from_tail` does not sanitize
+    /// at all yet, so this currently passes only by accident of ordering —
+    /// pinned so the eventual sanitize-then-split implementation is proven
+    /// against the straddle shape specifically.
+    #[test]
+    fn resumption_keeps_a_toolcall_result_pair_across_the_split() {
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage};
+
+        let sm = StateManager::new();
+        sm.add_user_message("read the file".to_string());
+        sm.add_assistant_message("looking".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("c1".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "bash".to_string(),
+            "{}".to_string(),
+            "ok".to_string(),
+            Some("c1".to_string()),
+        );
+
+        let (prompt, history) = sm
+            .build_resumption_from_tail()
+            .expect("non-empty conversation must produce resumption");
+
+        let prompt_text = extract_resumption_text(&prompt);
+        assert!(
+            prompt_text.contains("ok"),
+            "prompt must be the ToolResult tail, got: {prompt_text}"
+        );
+
+        let last = history
+            .last()
+            .expect("history must not be empty when a pair straddles the split");
+        let tc_id = match last {
+            RigMessage::Assistant { content, .. } => content.iter().find_map(|c| match c {
+                AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        assert_eq!(
+            tc_id.as_deref(),
+            Some("c1"),
+            "the ToolCall matching the tail ToolResult must survive as history's \
+             last entry, not be orphaned and dropped; history={history:?}"
+        );
+    }
+
+    /// No orphan ToolCall (one with no matching ToolResult in the live
+    /// sequence) may survive into the resumption history — it is a
+    /// guaranteed hard 400 on the wire.
+    ///
+    /// **RED today**: `build_resumption_from_tail` performs no
+    /// sanitization, so the orphan ToolCall passes straight through.
+    #[test]
+    fn resumption_drops_an_orphan_toolcall() {
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage};
+
+        let sm = StateManager::new();
+        sm.add_user_message("read the file".to_string());
+        sm.add_assistant_message("looking".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("c1".to_string()),
+        );
+        // No matching tool_result — "c1" is orphaned. Another assistant
+        // row follows so the ToolCall is not the live tail.
+        sm.add_assistant_message("never got a result".to_string());
+
+        let (_prompt, history) = sm
+            .build_resumption_from_tail()
+            .expect("non-empty conversation must produce resumption");
+
+        let has_orphan_tool_call = history.iter().any(|m| {
+            matches!(m, RigMessage::Assistant { content, .. }
+                if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_))))
+        });
+        assert!(
+            !has_orphan_tool_call,
+            "an orphan ToolCall must not survive into resumption history; history={history:?}"
+        );
+    }
+
+    /// No-regression guard for the `last_idx == 0` → `head.is_empty()`
+    /// guard-clause swap: a single-message transcript still has nothing to
+    /// resume from and must return `None`.
+    #[test]
+    fn resumption_returns_none_for_a_single_message_transcript() {
+        let sm = StateManager::new();
+        sm.add_user_message("only message".to_string());
+
+        assert!(
+            sm.build_resumption_from_tail().is_none(),
+            "a single-message transcript is a fresh turn, not a resumption"
+        );
+    }
+
     /// Extract text from a rig Message for test assertions.
     fn extract_resumption_text(msg: &rig_core::completion::message::Message) -> String {
         use rig_core::completion::message::{AssistantContent, ToolResultContent, UserContent};
@@ -5767,7 +5887,7 @@ mod tests {
         match msg {
             rig_core::completion::message::Message::User { content } => {
                 // OneOrMany has first + rest fields, not enum variants.
-                // Check for ToolResult content first (from build_resumption_for_compaction).
+                // Check for ToolResult content first (from build_resumption_from_tail).
                 let first = content.first_ref();
                 if let UserContent::ToolResult(tr) = first {
                     // ToolResult wraps ToolResultContent::Text
@@ -7408,7 +7528,7 @@ mod tests {
     /// **T8 — `last_msg_to_rig` never emits reasoning for a single
     /// ToolCall row.**
     ///
-    /// `build_resumption_for_compaction` calls `last_msg_to_rig` on the
+    /// `build_resumption_from_tail` calls `last_msg_to_rig` on the
     /// *single trailing row* of the live context. When that row is a
     /// `Message::ToolCall` carrying thinking, the wire conversion must
     /// NOT emit a `Reasoning` block — the row stands alone on the
