@@ -3562,6 +3562,27 @@ fn derive_history_for_iteration(
     }
 }
 
+/// Re-derive the next wire attempt — prompt AND history together — from the
+/// transcript's live tail. Taking them from one snapshot is the whole point:
+/// a prompt captured before a tool round-trip landed, replayed on a history
+/// captured after it, duplicates the user turn (Defect 3).
+///
+/// `false` means there is nothing to resume from (a fresh, single-message
+/// turn); the caller keeps the turn it already holds, which is correct there.
+///
+/// Not yet implemented — this is the stub the RED tests
+/// `refresh_attempt_from_transcript_*` compile against. See
+/// `tickets/pr-b-retry-correctness.md`, Defect 3, B3.1.
+#[allow(dead_code)]
+fn refresh_attempt_from_transcript(
+    sm: &StateManager,
+    current_turn: &mut rig_core::completion::message::Message,
+    history_override: &mut Option<Vec<rig_core::completion::message::Message>>,
+) -> bool {
+    let _ = (sm, current_turn, history_override);
+    todo!("Defect 3 fix: see tickets/pr-b-retry-correctness.md B3.1")
+}
+
 /// Handle for a connected MCP server.
 ///
 /// Holds both the tools and the service connection. The service connection
@@ -5855,6 +5876,213 @@ headers:
             history_count, 1,
             "naive get_agent_history() ALSO has the marker (the source of the duplication)"
         );
+    }
+
+    // ── Defect 3: retry loop resends a stale turn ───────────────────────
+    //
+    // The retry arm (`process_message_internal`, ~lib.rs:2711-2749) rebuilds
+    // `history` fresh every iteration via `derive_history_for_iteration`, but
+    // never refreshes `current_turn` — it resends the ORIGINAL user prompt.
+    // When the failing wire call is a continuation *inside* an already
+    // in-flight turn (a tool call + result already persisted), the retry
+    // duplicates the user turn: once as the trailing entry of history, once
+    // again as the prompt. Observed twice in production (wire captures:
+    // requests 3-5 each carried the original "read /tmp/screencap.png"
+    // prompt on top of a history that already contained the completed tool
+    // exchange). See `tickets/pr-b-retry-correctness.md`, Defect 3.
+
+    /// *The RED test that proves the bug bites.* Reproduces exactly what
+    /// today's retry arm builds: `history` re-derived fresh from
+    /// `StateManager`, `prompt` left as the original user turn. After a
+    /// tool round-trip has landed, the user turn ends up on the wire twice
+    /// — once inside history, once as the prompt.
+    ///
+    /// **Today this asserts `2 == 1` and fails** — that is correct RED.
+    #[test]
+    fn retry_after_tool_roundtrip_must_not_resend_the_original_user_turn() {
+        let sm = Arc::new(StateManager::new());
+        sm.add_user_message("read /tmp/screencap.png".to_string());
+        sm.add_assistant_message("I'll look at it".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "view_image".to_string(),
+            r#"{"path":"/tmp/screencap.png"}"#.to_string(),
+            Some("c1".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "view_image".to_string(),
+            r#"{"path":"/tmp/screencap.png"}"#.to_string(),
+            "ok".to_string(),
+            Some("c1".to_string()),
+        );
+
+        // Exactly what the retry arm builds today: history is re-derived,
+        // the prompt is whatever `current_turn` was captured as at the
+        // start of the turn — never refreshed.
+        let mut ovr: Option<Vec<rig_core::completion::message::Message>> = None;
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let history = derive_history_for_iteration(&mut ovr, &sm_opt);
+        let prompt = sm
+            .build_current_turn_message()
+            .expect("the original user turn was dispatched");
+
+        // The wire payload is `history ++ [prompt]`.
+        let occurrences = count_occurrences(&history, "read /tmp/screencap.png")
+            + count_occurrences(std::slice::from_ref(&prompt), "read /tmp/screencap.png");
+
+        assert_eq!(
+            occurrences,
+            1,
+            "the user turn must appear exactly once on the wire; found it in \
+             history AND as the prompt — the duplicated turn from the \
+             production trace (history_count={}, prompt_count={})",
+            count_occurrences(&history, "read /tmp/screencap.png"),
+            count_occurrences(std::slice::from_ref(&prompt), "read /tmp/screencap.png"),
+        );
+    }
+
+    /// After a tool round-trip has landed, `refresh_attempt_from_transcript`
+    /// must promote the ToolResult tail to `current_turn` and stash
+    /// everything before it — including the matching ToolCall — into
+    /// `history_override`. The pair must survive the split intact.
+    #[test]
+    fn refresh_attempt_from_transcript_after_tool_roundtrip_promotes_the_toolresult() {
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+        sm.add_user_message("read /tmp/screencap.png".to_string());
+        sm.add_assistant_message("I'll look at it".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "view_image".to_string(),
+            r#"{"path":"/tmp/screencap.png"}"#.to_string(),
+            Some("c1".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "view_image".to_string(),
+            r#"{"path":"/tmp/screencap.png"}"#.to_string(),
+            "ok".to_string(),
+            Some("c1".to_string()),
+        );
+
+        let mut current_turn = sm
+            .build_current_turn_message()
+            .expect("the original user turn was dispatched");
+        let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
+
+        let refreshed =
+            refresh_attempt_from_transcript(&sm, &mut current_turn, &mut history_override);
+        assert!(
+            refreshed,
+            "a tool round-trip landed; there is a tail to resume from"
+        );
+
+        match &current_turn {
+            RigMessage::User { content } => match content.first_ref() {
+                UserContent::ToolResult(tr) => assert_eq!(tr.id, "c1"),
+                other => panic!("expected ToolResult content, got {other:?}"),
+            },
+            other => panic!("expected User message, got {other:?}"),
+        }
+
+        let history = history_override
+            .as_ref()
+            .expect("history_override must be Some after a successful refresh");
+        let last = history.last().expect("history must not be empty");
+        let tc_id = match last {
+            RigMessage::Assistant { content, .. } => content.iter().find_map(|c| match c {
+                AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        assert_eq!(
+            tc_id.as_deref(),
+            Some("c1"),
+            "the matching ToolCall must be the last entry of history; got {history:?}"
+        );
+    }
+
+    /// No-tool-call retry path (e.g. a 429 on the very first wire call): the
+    /// live tail is still the User row, so there is nothing to resume from.
+    /// The helper must leave `current_turn` and `history_override` alone.
+    #[test]
+    fn refresh_attempt_from_transcript_on_a_fresh_turn_leaves_the_turn_alone() {
+        let sm = StateManager::new();
+        sm.add_user_message("just a fresh question".to_string());
+
+        let original_turn = sm
+            .build_current_turn_message()
+            .expect("the user turn was dispatched");
+        let mut current_turn = original_turn.clone();
+        let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
+
+        let refreshed =
+            refresh_attempt_from_transcript(&sm, &mut current_turn, &mut history_override);
+
+        assert!(
+            !refreshed,
+            "a fresh single-message turn has nothing to resume from"
+        );
+        assert_eq!(
+            count_occurrences(std::slice::from_ref(&current_turn), "just a fresh question"),
+            count_occurrences(
+                std::slice::from_ref(&original_turn),
+                "just a fresh question"
+            ),
+            "current_turn must be unchanged when there is nothing to resume from"
+        );
+        assert!(
+            history_override.is_none(),
+            "history_override must stay None when there is nothing to resume from"
+        );
+    }
+
+    /// A multimodal user turn (image attachment) retried before any tool
+    /// call must keep its image content after refresh — guards against a
+    /// `last_msg_to_rig` regression that would silently drop vision on
+    /// retry.
+    #[test]
+    fn refresh_attempt_from_transcript_preserves_user_image_attachments() {
+        use crate::vision::{ImageAttachment, ImageSource};
+        use rig_core::completion::message::{ImageMediaType, Message as RigMessage, UserContent};
+
+        let sm = StateManager::new();
+        sm.add_user_message_with_attachments(
+            "what is in this image?".to_string(),
+            vec![ImageAttachment {
+                display_name: "screencap.png".to_string(),
+                source: ImageSource::Base64 {
+                    bytes: vec![1, 2, 3, 4],
+                    media_type: ImageMediaType::PNG,
+                },
+                detail: None,
+            }],
+        );
+        // A second user-facing row so the retry has a tail to consider —
+        // an assistant turn precedes the retried attempt in production;
+        // here we retry the very first (and only) turn, mirroring a 429
+        // on the initial wire call with an image attached.
+        let mut current_turn = sm
+            .build_current_turn_message()
+            .expect("the multimodal user turn was dispatched");
+        let mut history_override: Option<Vec<rig_core::completion::message::Message>> = None;
+
+        let _ = refresh_attempt_from_transcript(&sm, &mut current_turn, &mut history_override);
+
+        match &current_turn {
+            RigMessage::User { content } => {
+                assert!(
+                    content.iter().any(|c| matches!(c, UserContent::Image(_))),
+                    "refreshed prompt must still carry the image attachment; content={content:?}"
+                );
+            }
+            other => panic!("expected User message, got {other:?}"),
+        }
     }
 
     // ── Phase 3: event lane tag + cost roll-up ──────────────────────────
