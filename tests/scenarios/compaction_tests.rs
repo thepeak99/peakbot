@@ -1629,7 +1629,7 @@ async fn delegation_then_compaction_keeps_wire_valid() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// After a mid-action compaction the resumptive dispatch path goes
-/// through `build_resumption_for_compaction` (not
+/// through `build_resumption_from_tail` (not
 /// `build_current_turn_message` + `get_agent_history`), because the last
 /// live row is a ToolResult rather than a fresh user turn.
 ///
@@ -1642,7 +1642,7 @@ async fn delegation_then_compaction_keeps_wire_valid() {
 /// reasoning attached").
 ///
 /// This is the load-bearing regression lock for
-/// `build_resumption_for_compaction`: if a future implementer forgets to
+/// `build_resumption_from_tail`: if a future implementer forgets to
 /// route the segmentation through it (and only patches
 /// `get_agent_history`), `/compact` would silently resume with a
 /// single-mismatched-signature assistant and Anthropic would 400.
@@ -1708,7 +1708,7 @@ fn resumption_after_compaction_splits_by_response() {
     );
     // The trailing live row is a ToolResult (mid-action compaction
     // scenario — like the existing
-    // build_resumption_for_compaction_does_not_duplicate_user_prompt).
+    // build_resumption_from_tail_does_not_duplicate_user_prompt).
     sm.add_tool_result(
         MessageSource::Human,
         "todo".to_string(),
@@ -1718,7 +1718,7 @@ fn resumption_after_compaction_splits_by_response() {
     );
 
     let (prompt, history) = sm
-        .build_resumption_for_compaction()
+        .build_resumption_from_tail()
         .expect("mid-action compaction fixture must produce a resumption");
 
     // ── History: must carry two split assistant messages. ─────────────
