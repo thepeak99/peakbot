@@ -476,10 +476,16 @@ mod tests {
             "expected a successful edit, got: {:?}",
             result.err()
         );
-        // Bug B (str_replace.rs's literal `replacen`) is still present by
-        // design in this PR, so the fuzzy match here is a silent no-op on
-        // disk. Asserting the write actually landed is PR B's job (§7
-        // case 14); this test only pins "does not panic and returns Ok".
+
+        // The match covers the whole last line ("        return final_result;",
+        // 28 bytes, indentation included per I5); the splice must actually
+        // land on disk, not silently no-op behind a reported success.
+        let expected = format!("{}REPLACED", &content[..content.len() - 28]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            expected,
+            "Bug B: fuzzy match reported success but did not rewrite the file"
+        );
     }
 
     #[test]
@@ -534,6 +540,238 @@ mod tests {
         assert!(
             msg.contains("[1, 3]"),
             "expected the two literal-match lines [1, 3], got: {msg}"
+        );
+    }
+
+    // ── str_replace: splice by range (PR B, file-edit-offset-fix.md §7 cases 14-19) ──
+    //
+    // Every test in this section reads the file back off disk after the
+    // call. A test that only checks the returned success string is exactly
+    // the test that let Bug B ship: `str_replace.rs`'s literal
+    // `content.replacen(old_str, new_str, 1)` searches for `old_str`
+    // verbatim even when the match came from the whitespace-normalized
+    // matcher, so it matches nothing, and the file is rewritten
+    // byte-identical while the tool reports "Replaced 1 occurrence".
+
+    #[test]
+    fn str_replace_normalized_match_writes_new_bytes_to_disk() {
+        // §7 case 14 — THE load-bearing proof of Bug B. "TARGET\n" is not
+        // literally present (the real line is "TARGET   \n"), so this only
+        // matches via whitespace normalization.
+        let original = "alpha\nTARGET   \nbeta\n";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("case14.txt");
+        std::fs::write(&path, original).unwrap();
+
+        let result = str_replace::run(path.to_str().unwrap(), "TARGET\n", Some("REPLACED"), false);
+        let msg = result.expect("expected a successful edit");
+        assert!(msg.contains("Replaced 1 occurrence"), "got: {msg}");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(
+            on_disk, original,
+            "Bug B: file reported as edited but bytes on disk are unchanged"
+        );
+        assert!(
+            !on_disk.contains("TARGET"),
+            "old_str must be gone: {on_disk:?}"
+        );
+        assert!(
+            on_disk.contains("REPLACED"),
+            "new_str must be present: {on_disk:?}"
+        );
+        assert_eq!(on_disk, "alpha\nREPLACED   \nbeta\n");
+    }
+
+    #[test]
+    fn str_replace_normalized_match_with_differing_orig_norm_lengths_splices_correctly() {
+        // §7 case 15 — Bug B + case 11 combined: the matched span is 13
+        // original bytes ("foo   \nline_b") but only 10 normalized bytes
+        // ("foo\nline_b"). A literal replacen for the 10-byte needle either
+        // misses entirely or would (if it coincidentally matched something
+        // else) hit the wrong bytes; splicing by the resolved range does
+        // not shift regardless of the length difference.
+        let original = "prefix\nfoo   \nline_b\nsuffix";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("case15.txt");
+        std::fs::write(&path, original).unwrap();
+
+        let result = str_replace::run(
+            path.to_str().unwrap(),
+            "foo\nline_b",
+            Some("bar\nqux"),
+            false,
+        );
+        assert!(result.is_ok(), "expected success, got: {:?}", result.err());
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "prefix\nbar\nqux\nsuffix"
+        );
+    }
+
+    #[test]
+    fn str_replace_normalized_match_replace_all_splices_every_range() {
+        // §7 case 16 — replace_all across three whitespace-normalized
+        // matches, each with a DIFFERENT amount of trailing whitespace, so
+        // a shared/incorrect offset could not accidentally pass. Every
+        // range must be spliced and the reported count must equal the
+        // number of ranges actually spliced.
+        let original = "TARGET  \nfiller\nTARGET \nfiller\nTARGET   \n";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("case16.txt");
+        std::fs::write(&path, original).unwrap();
+
+        let result = str_replace::run(path.to_str().unwrap(), "TARGET\n", Some("X"), true);
+        let msg = result.expect("expected a successful edit");
+        assert!(msg.contains("Replaced all 3 occurrences"), "got: {msg}");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "X  \nfiller\nX \nfiller\nX   \n"
+        );
+    }
+
+    #[test]
+    fn str_replace_normalized_match_deletion_removes_matched_range_only() {
+        // §7 case 17 — `new_str` omitted (deletion) through a fuzzy match:
+        // only the matched "TARGET" bytes vanish; the trailing spaces and
+        // newline the matcher did not claim survive verbatim (invariant I5).
+        let original = "alpha\nTARGET   \nbeta\n";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("case17.txt");
+        std::fs::write(&path, original).unwrap();
+
+        let result = str_replace::run(path.to_str().unwrap(), "TARGET\n", None, false);
+        assert!(result.is_ok(), "expected success, got: {:?}", result.err());
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha\n   \nbeta\n"
+        );
+    }
+
+    #[test]
+    fn str_replace_exact_match_deleting_large_block_near_end_does_not_panic() {
+        // §7 case 18 — Bug C: the snippet window computes `start` from a
+        // line number in the OLD content but clamps `end` to the NEW
+        // content's length. Deleting the last 10 of 200 lines and replacing
+        // them with much shorter text must not panic, and the resulting
+        // bytes must be exactly right.
+        let lines: Vec<String> = (0..200).map(|i| format!("line{i:04}")).collect();
+        let original = lines.join("\n") + "\n";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("case18.txt");
+        std::fs::write(&path, &original).unwrap();
+
+        let old_str = lines[190..200].join("\n") + "\n";
+        assert!(
+            original.contains(&old_str),
+            "fixture must contain the exact block verbatim"
+        );
+
+        let result = str_replace::run(path.to_str().unwrap(), &old_str, Some("SHORT"), false);
+        assert!(result.is_ok(), "must not panic, got: {:?}", result.err());
+
+        let expected = format!("{}\nSHORT", lines[..190].join("\n"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn str_replace_empty_old_str_is_rejected_and_leaves_file_untouched() {
+        // §7 case 19 — an empty `old_str` can only mean "insert at every
+        // byte offset", which is never a sensible edit and is catastrophic
+        // under `replace_all` (today: `String::replace("", new_str)`
+        // inserts `new_str` at every position). Must be rejected at the
+        // boundary before any write.
+        let original = "abc";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty_needle.txt");
+        std::fs::write(&path, original).unwrap();
+
+        let err = str_replace::run(path.to_str().unwrap(), "", Some("X"), true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("empty"),
+            "expected a message naming the empty old_str, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "file must be untouched by a rejected edit"
+        );
+    }
+
+    #[test]
+    fn str_replace_exact_match_replace_all_unchanged_behaviour() {
+        // Regression guard — literal multi-occurrence replace_all must
+        // behave byte-for-byte the same after the splice rewrite. Already
+        // correct today (Bug B only affects the fuzzy path); pin it so the
+        // splice/replace_all collapse (B2) cannot regress the common case.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("case_exact_pin.txt");
+        std::fs::write(&path, "x x x").unwrap();
+
+        let msg = str_replace::run(path.to_str().unwrap(), "x", Some("y"), true)
+            .expect("exact replace_all should succeed");
+        assert!(msg.contains("Replaced all 3 occurrences"), "got: {msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "y y y");
+    }
+
+    #[test]
+    fn str_replace_normalized_match_in_crlf_file_preserves_untouched_line_endings() {
+        // §7 case 9/B — a fuzzy match inside a CRLF file must splice by
+        // byte range (2-byte separators) without corrupting the CRLF
+        // endings on lines outside the replaced range.
+        let original = "aaa\r\nbbb\r\nTARGET\r\n";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crlf.txt");
+        std::fs::write(&path, original).unwrap();
+
+        let result = str_replace::run(path.to_str().unwrap(), "TARGET\n", Some("REPLACED"), false);
+        assert!(result.is_ok(), "expected success, got: {:?}", result.err());
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "aaa\r\nbbb\r\nREPLACED\r\n"
+        );
+    }
+
+    #[test]
+    fn str_replace_normalized_match_near_multibyte_utf8_produces_valid_utf8() {
+        // §7 case 10/B — the match sits right after a multi-byte codepoint
+        // and trailing whitespace that get stripped by normalization;
+        // splicing at the mapped byte range must not land mid-codepoint on
+        // either side. `read_to_string` itself would fail on invalid UTF-8.
+        let original = "h\u{e9}llo   \nTARGET";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("utf8.txt");
+        std::fs::write(&path, original).unwrap();
+
+        let result = str_replace::run(path.to_str().unwrap(), "TARGET\n", Some("日本語"), false);
+        assert!(result.is_ok(), "expected success, got: {:?}", result.err());
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "h\u{e9}llo   \n日本語");
+    }
+
+    #[test]
+    fn str_replace_ambiguous_fuzzy_match_writes_nothing() {
+        // Regression guard — an ambiguous match, fuzzy or exact, must
+        // error and never reach the splice; the file on disk must stay
+        // byte-identical. `splice` handles N ranges, so it must not be
+        // reachable on this path.
+        let (content, old_str) = ambiguous_fuzzy_fixture();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ambiguous_fuzzy.txt");
+        std::fs::write(&path, &content).unwrap();
+
+        let err = str_replace::run(path.to_str().unwrap(), &old_str, Some("X"), false).unwrap_err();
+        assert!(matches!(err, FileEditError::Validation(_)));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "file must be untouched"
         );
     }
 
