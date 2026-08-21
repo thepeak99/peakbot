@@ -2576,7 +2576,7 @@ impl AgentRunner {
         let mut retry_count = 0;
         // One-shot override for the post-compaction iteration. The compact
         // arm fills this with the resumption-shape history returned by
-        // `build_resumption_for_compaction()`; the loop top consumes it
+        // `build_resumption_from_tail()`; the loop top consumes it
         // via `.take()` on the very next iteration so the resumption
         // payload reaches the wire intact. Without this override, the
         // top-of-loop `get_agent_history()` re-derives history from
@@ -2672,24 +2672,20 @@ impl AgentRunner {
                     // uses the last User as the prompt), mid-action resumption
                     // must continue from whatever message the hook terminated
                     // with — which may be a ToolResult or Agent response, not
-                    // necessarily a User. `build_resumption_for_compaction` handles
-                    // this correctly by finding the actual last non-compacted
-                    // message as the prompt and everything before it as history.
+                    // necessarily a User. `refresh_attempt_from_transcript`
+                    // handles this correctly by finding the actual last
+                    // non-compacted message as the prompt and everything
+                    // before it as history — the same helper the retry arm
+                    // uses, so the two can never drift apart again.
                     //
-                    // If it returns None (empty state or fresh turn), fall back
-                    // to the normal initial-dispatch path for safety.
-                    if let Some((p, h)) = sm.build_resumption_for_compaction() {
-                        current_turn = p;
-                        // Stash the resumption-shape history in the loop-local
-                        // one-shot override. The next iteration's top-of-loop
-                        // will consume it via `.take()` instead of calling
-                        // `get_agent_history()`. This is the load-bearing
-                        // line — without it, the trailing non-User message
-                        // (typically a ToolResult after a tool round-trip)
-                        // would be duplicated on the wire because
-                        // `get_agent_history()` only strips trailing User.
-                        history_override = Some(h);
-                    } else if let Some(turn) = sm.build_current_turn_message() {
+                    // If it returns false (empty state or fresh turn), fall
+                    // back to the normal initial-dispatch path for safety.
+                    if !refresh_attempt_from_transcript(
+                        sm,
+                        &mut current_turn,
+                        &mut history_override,
+                    ) && let Some(turn) = sm.build_current_turn_message()
+                    {
                         current_turn = turn;
                     }
 
@@ -2749,6 +2745,18 @@ impl AgentRunner {
                             config.retry().max_retries,
                             delay.as_secs_f64()
                         )));
+                    }
+                    // The wire call may have failed *mid-turn*, after a tool
+                    // round-trip was already executed and persisted. Re-derive
+                    // the attempt so the retry continues from the transcript
+                    // tail instead of replaying the original user turn on top
+                    // of a history that already contains it.
+                    if let Some(sm) = state_manager {
+                        refresh_attempt_from_transcript(
+                            sm,
+                            &mut current_turn,
+                            &mut history_override,
+                        );
                     }
                     tokio::time::sleep(delay).await;
                     retry_count += 1;
@@ -3534,7 +3542,7 @@ impl AgentRunner {
 ///    from `StateManager` (the source of truth, single trailing-User strip).
 /// 2. **Post-compaction iteration**: `override_` was filled by the compact
 ///    arm with the resumption-shape history from
-///    `StateManager::build_resumption_for_compaction()`. We `.take()` it so
+///    `StateManager::build_resumption_from_tail()`. We `.take()` it so
 ///    the next iteration falls back to the normal path.
 ///
 /// **Why this exists as a separate function:** the production bug fixed
@@ -3569,18 +3577,19 @@ fn derive_history_for_iteration(
 ///
 /// `false` means there is nothing to resume from (a fresh, single-message
 /// turn); the caller keeps the turn it already holds, which is correct there.
-///
-/// Not yet implemented — this is the stub the RED tests
-/// `refresh_attempt_from_transcript_*` compile against. See
-/// `tickets/pr-b-retry-correctness.md`, Defect 3, B3.1.
-#[allow(dead_code)]
 fn refresh_attempt_from_transcript(
     sm: &StateManager,
     current_turn: &mut rig_core::completion::message::Message,
     history_override: &mut Option<Vec<rig_core::completion::message::Message>>,
 ) -> bool {
-    let _ = (sm, current_turn, history_override);
-    todo!("Defect 3 fix: see tickets/pr-b-retry-correctness.md B3.1")
+    match sm.build_resumption_from_tail() {
+        Some((prompt, history)) => {
+            *current_turn = prompt;
+            *history_override = Some(history);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Handle for a connected MCP server.
@@ -5645,7 +5654,7 @@ headers:
     // These tests pin the exact data shape that
     // `AgentRunner::process_message_internal` constructs after the
     // SessionHook fires `terminate("compact")`. The bug we're guarding
-    // against is subtle: `build_resumption_for_compaction` returns the
+    // against is subtle: `build_resumption_from_tail` returns the
     // correct `(prompt, history)` tuple, but if the loop discards the
     // returned history and re-derives it via `get_agent_history()` on
     // the next iteration, the resumption message ends up duplicated on
@@ -5716,7 +5725,7 @@ headers:
     /// **The bug.** After a tool round-trip the chat ends in a
     /// `ToolResult`. When mid-action compaction fires, the production
     /// loop must use the resumption tuple's history (returned alongside
-    /// the prompt by `build_resumption_for_compaction`) — NOT a fresh
+    /// the prompt by `build_resumption_from_tail`) — NOT a fresh
     /// `get_agent_history()` call, which still includes the trailing
     /// ToolResult and would duplicate it on the wire.
     ///
@@ -5756,7 +5765,7 @@ headers:
         // The compact arm sets current_turn = prompt and stashes
         // resumption_history into the one-shot override.
         let (prompt, resumption_history) = sm
-            .build_resumption_for_compaction()
+            .build_resumption_from_tail()
             .expect("non-empty conversation must produce a resumption");
         let mut history_override = Some(resumption_history);
 
@@ -5826,7 +5835,7 @@ headers:
 
     /// **The bug.** This is the *original* data-shape pin, kept as a
     /// no-regression for the underlying mismatch between
-    /// `build_resumption_for_compaction` (returns the full resumption
+    /// `build_resumption_from_tail` (returns the full resumption
     /// shape) and `get_agent_history` (only strips trailing User).
     /// If anyone "fixes" `get_agent_history` to also strip trailing
     /// ToolResult — masking the lib.rs bug instead of fixing the
@@ -5855,7 +5864,7 @@ headers:
         );
 
         let (prompt, _) = sm
-            .build_resumption_for_compaction()
+            .build_resumption_from_tail()
             .expect("non-empty conversation must produce a resumption");
         // This is the BROKEN pattern (re-derive history from state).
         // get_agent_history() doesn't strip trailing non-User messages,
@@ -5920,13 +5929,17 @@ headers:
 
         // Exactly what the retry arm builds today: history is re-derived,
         // the prompt is whatever `current_turn` was captured as at the
-        // start of the turn — never refreshed.
+        // start of the turn — never refreshed. Reproduced here through the
+        // shared helper the fix (Defect 3, B3.1/B3.2) actually calls, so
+        // this proves the wire payload the retry arm produces, not just
+        // the helper's return value in isolation.
         let mut ovr: Option<Vec<rig_core::completion::message::Message>> = None;
         let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
-        let history = derive_history_for_iteration(&mut ovr, &sm_opt);
-        let prompt = sm
+        let mut prompt = sm
             .build_current_turn_message()
             .expect("the original user turn was dispatched");
+        refresh_attempt_from_transcript(&sm, &mut prompt, &mut ovr);
+        let history = derive_history_for_iteration(&mut ovr, &sm_opt);
 
         // The wire payload is `history ++ [prompt]`.
         let occurrences = count_occurrences(&history, "read /tmp/screencap.png")
