@@ -3,9 +3,6 @@
 //! the caller declared — so a `.png` that is really a JPEG comes back as a
 //! real PNG and its `mimeType` stops lying.
 
-// Dead until view_image calls fit_under_ceiling (PR A wiring, ticket A3).
-#![allow(dead_code)]
-
 use image::GenericImageView;
 use image::ImageFormat;
 use rig_core::completion::message::ImageMediaType;

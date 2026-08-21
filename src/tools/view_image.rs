@@ -92,6 +92,9 @@ pub struct ResizedImage {
     image_ref: Option<ImageRef>,
 }
 
+/// Test-only ergonomic accessors — production code builds/matches the enum
+/// directly (`call`), but the fixtures below read it back a lot.
+#[cfg(test)]
 impl ViewImageOutput {
     fn kind(&self) -> &'static str {
         match self {
@@ -908,7 +911,9 @@ mod tests {
 
     #[tokio::test]
     async fn definition_description_mentions_reloading_for_current_turn() {
-        let def = ViewImageTool::new(TEST_CEILING).definition(String::new()).await;
+        let def = ViewImageTool::new(TEST_CEILING)
+            .definition(String::new())
+            .await;
         assert!(
             def.description.contains("current turn"),
             "description should tell the model the image is loaded for the current turn \
@@ -933,7 +938,9 @@ mod tests {
              default_true fn is mandatory"
         );
 
-        let def = ViewImageTool::new(TEST_CEILING).definition(String::new()).await;
+        let def = ViewImageTool::new(TEST_CEILING)
+            .definition(String::new())
+            .await;
         assert_eq!(
             def.parameters["properties"]["auto_resize"]["default"],
             serde_json::json!(true),
@@ -1176,5 +1183,166 @@ mod tests {
             value["content"][0]["content"][1]["source"]["type"], "base64",
             "the second tool-result content block must be a base64 image source: {value}"
         );
+    }
+
+    // ==================================================================
+    // End-to-end proof (§A6 wiring): every test above either constructs
+    // `ViewImageOutput` directly or drives `call()` on a tiny under-ceiling
+    // fixture — none of them exercises `fit_under_ceiling` through the real
+    // tool. These two do: a real, decodable, oversized PNG through
+    // `ViewImageTool::call`, both with and without `auto_resize`.
+    // ==================================================================
+
+    /// A real, decodable PNG whose base64 payload exceeds `ceiling`: a flat
+    /// `width`x`height` image (cheap to encode) with private ancillary
+    /// chunks spliced in before IEND. PNG decoders skip unknown
+    /// non-critical chunks, so the file still decodes, but only re-encoding
+    /// (which drops unknown chunks) can shrink it back down.
+    fn oversized_png(width: u32, height: u32, ceiling: usize) -> Vec<u8> {
+        use image::{ImageFormat, Rgb, RgbImage};
+
+        let img = RgbImage::from_pixel(width, height, Rgb([12, 34, 56]));
+        let mut base = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut base), ImageFormat::Png)
+            .expect("encode base png");
+
+        let iend = base.len() - 12; // trailing IEND: 4 len + 4 type + 4 crc
+        let mut out = base[..iend].to_vec();
+        let mib_needed = ceiling / (1024 * 1024) + 2;
+        for i in 0..mib_needed {
+            let data = vec![0x5Au8 ^ (i as u8); 1_048_576];
+            out.extend(png_chunk(b"Pkbj", &data));
+        }
+        out.extend_from_slice(&base[iend..]);
+        out
+    }
+
+    fn png_chunk(typ: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::with_capacity(12 + data.len());
+        chunk.extend((data.len() as u32).to_be_bytes());
+        chunk.extend(typ);
+        chunk.extend(data);
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(typ);
+        crc_input.extend_from_slice(data);
+        chunk.extend(crc32(&crc_input).to_be_bytes());
+        chunk
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (0xFFFF_FFFF ^ (crc & 1)));
+            }
+        }
+        !crc
+    }
+
+    #[tokio::test]
+    async fn oversized_image_auto_resize_true_reaches_model_as_text_plus_image_end_to_end() {
+        let ceiling = 1024 * 1024; // 1 MiB — small enough to keep the fixture fast
+        let bytes = oversized_png(2000, 1200, ceiling);
+        assert!(
+            base64::encoded_len(bytes.len(), true).expect("len fits usize") > ceiling,
+            "fixture must start over the ceiling"
+        );
+        // What `fit_under_ceiling` will compute for these exact bytes — used
+        // to assert on the *real* dimensions rather than guessing them.
+        let expected_report = fit_under_ceiling(
+            bytes.clone(),
+            rig_core::completion::message::ImageMediaType::PNG,
+            ceiling,
+        )
+        .expect("fixture must fit")
+        .resize
+        .expect("fixture must require a resize");
+        let path = write_png(&bytes);
+
+        let out = ViewImageTool::new(ceiling)
+            .call(ViewImageArgs {
+                path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
+            })
+            .await
+            .expect("an oversized image with auto_resize:true must still succeed");
+
+        let json = serde_json::to_string(&out).expect("serialize");
+        let content = ToolResultContent::from_tool_output(json);
+        assert_eq!(
+            content.len(),
+            2,
+            "a resized output must reach the model as exactly [Text, Image]"
+        );
+
+        let ToolResultContent::Text(text) = content.first() else {
+            panic!(
+                "content[0] must be a Text block, got: {:?}",
+                content.first()
+            );
+        };
+        let from_dims = format!("{}x{}", expected_report.from.0, expected_report.from.1);
+        let to_dims = format!("{}x{}", expected_report.to.0, expected_report.to.1);
+        assert!(
+            text.text.contains(&from_dims),
+            "notice must carry the original dimensions ({from_dims}): {}",
+            text.text
+        );
+        assert!(
+            text.text.contains(&to_dims),
+            "notice must carry the new dimensions ({to_dims}): {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("1.00 MB base64"),
+            "notice must carry the ceiling: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("auto_resize"),
+            "notice must mention the auto_resize off-switch: {}",
+            text.text
+        );
+
+        let rest = content.rest();
+        let second = rest.first().expect("a second content block");
+        assert!(
+            matches!(second, ToolResultContent::Image(_)),
+            "content[1] must be an Image block, got: {second:?}"
+        );
+
+        if let Some(r) = out.image_ref() {
+            cleanup_spill(&r.id);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn oversized_image_auto_resize_false_errors_too_large_end_to_end() {
+        let ceiling = 1024 * 1024;
+        let bytes = oversized_png(2000, 1200, ceiling);
+        let path = write_png(&bytes);
+
+        let err = ViewImageTool::new(ceiling)
+            .call(ViewImageArgs {
+                path: path.to_string_lossy().into_owned(),
+                auto_resize: false,
+            })
+            .await
+            .expect_err("an oversized image with auto_resize:false must be refused");
+
+        assert!(matches!(err, ViewImageError::TooLarge { .. }), "got: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auto_resize"),
+            "error must mention the off-switch: {msg}"
+        );
+        assert!(
+            msg.contains(&ceiling.to_string()),
+            "error must contain the ceiling byte count: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
