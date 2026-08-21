@@ -1,15 +1,16 @@
 //! Transient-error classification and backoff for the provider layer.
 //!
-//! `rig-core` strips the HTTP status from its error variants, folding any
-//! non-2xx into `CompletionError::ProviderError(text)` / `ResponseError(text)`
-//! (#111). With no status on the wire, transience is detected by:
-//!   * `CompletionError::HttpError(_)` — always transient (transport-level)
-//!   * `ProviderError(msg)` / `ResponseError(msg)` — transient iff `msg`
-//!     matches a known marker (see `TRANSIENT_MESSAGE_MARKERS`).
+//! `rig_core::http_client::Error` carries a real, typed HTTP status
+//! (`InvalidStatusCode` / `InvalidStatusCodeWithMessage`) for every non-2xx
+//! response, so `CompletionError::HttpError` is classified by inspecting that
+//! status via `is_retryable_status` — not assumed transient. Only
+//! `ProviderError(text)` / `ResponseError(text)` arrive as bare strings (a
+//! provider-level error envelope, not a transport failure), so those still
+//! fall back to substring matching against `TRANSIENT_MESSAGE_MARKERS`.
 //!
 //! Substring matching is fragile — a localized or reworded rate-limit that
-//! omits every marker classifies as *permanent* and the turn is lost. A
-//! robust fix needs an upstream patch preserving the status code.
+//! omits every marker classifies as *permanent* and the turn is lost. That
+//! fallback is out of scope here; it needs provider-by-provider evidence.
 
 use crate::config::RetryConfig;
 use rig_core::completion::{CompletionError, PromptError};
@@ -32,12 +33,37 @@ const TRANSIENT_MESSAGE_MARKERS: &[&str] = &[
     "overloaded",
 ];
 
+/// Statuses worth another attempt: the request was fine, the server or the
+/// moment was not. Everything else 4xx is a permanent contract violation —
+/// the payload is identical on every retry, so retrying only delays the
+/// error and buries the message.
+fn is_retryable_status(status: http::StatusCode) -> bool {
+    status == http::StatusCode::REQUEST_TIMEOUT // 408
+        || status == http::StatusCode::TOO_MANY_REQUESTS // 429
+        || status.is_server_error() // 5xx, incl. Anthropic's 529
+}
+
+/// Classify `rig_core::http_client::Error`. Exhaustive, no wildcard: a rig
+/// upgrade that adds a variant must fail this build, not silently default.
+fn is_transient_http_error(err: &rig_core::http_client::Error) -> bool {
+    use rig_core::http_client::Error as E;
+    match err {
+        // A real response with a real status — ask the status.
+        E::InvalidStatusCode(s) | E::InvalidStatusCodeWithMessage(s, _) => is_retryable_status(*s),
+        // Transport: connection reset, TLS, DNS, timeout, truncated body.
+        E::Instance(_) | E::StreamEnded => true,
+        // We built or read the request/response wrong. Deterministic.
+        E::Protocol(_) | E::InvalidHeaderValue(_) | E::NoHeaders | E::InvalidContentType(_) => {
+            false
+        }
+    }
+}
+
 /// Whether a `CompletionError` is worth retrying. See module docs for why
 /// we fall back to message-substring matching.
 fn is_transient_completion_error(err: &CompletionError) -> bool {
     match err {
-        // Transport-level errors (TCP reset, TLS, timeout) are always transient.
-        CompletionError::HttpError(_) => true,
+        CompletionError::HttpError(e) => is_transient_http_error(e),
         // rig providers strip the status into the message; substring-match.
         CompletionError::ProviderError(msg) | CompletionError::ResponseError(msg) => {
             let lower = msg.to_ascii_lowercase();
@@ -94,7 +120,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_error_is_always_transient() {
+    fn transport_errors_are_transient() {
         assert!(is_transient_completion_error(&CompletionError::HttpError(
             rig_core::http_client::Error::StreamEnded
         )));

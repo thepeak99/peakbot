@@ -2708,21 +2708,28 @@ impl AgentRunner {
                     return CompletionResult::Error;
                 }
 
-                Err(_e) => {
+                Err(e) => {
                     // Only transient failures (rate limits, 5xx, transport
                     // drops) are worth retrying; a deterministic 401 / bad
                     // request / MaxTurnsError bails immediately. See #111.
-                    if !crate::providers::retry::is_transient_prompt_error(&_e) {
+                    if !crate::providers::retry::is_transient_prompt_error(&e) {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
-                            sm.add_system_message(format!("❌ LLM request failed: {_e}"));
+                            sm.add_system_message(format!(
+                                "❌ LLM request failed: {}",
+                                crate::ui::app_state::truncate_str(&e.to_string(), 2000)
+                            ));
                         }
                         return CompletionResult::Error;
                     }
                     if retry_count >= config.retry().max_retries {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
-                            sm.add_system_message("❌ Max number of retries exceeded".to_string());
+                            sm.add_system_message(format!(
+                                "❌ LLM request failed after {} retries: {}",
+                                config.retry().max_retries,
+                                crate::ui::app_state::truncate_str(&e.to_string(), 2000)
+                            ));
                         }
                         return CompletionResult::Error;
                     }
@@ -2732,7 +2739,7 @@ impl AgentRunner {
                         attempt = retry_count + 1,
                         max_retries = config.retry().max_retries,
                         backoff_ms = delay.as_millis(),
-                        error = %_e,
+                        error = %e,
                         "LLM request failed transiently; backing off before retry"
                     );
                     if let Some(sm) = state_manager {
