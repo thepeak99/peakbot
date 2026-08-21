@@ -44,7 +44,7 @@ impl Tool for FileStrReplaceTool {
             description: "Replace exact text in an existing file.\n\n\
 PREFER THIS TOOL OVER BASH/SED for in-place edits because:\n\
 - Provides clear diffs for review\n\
-- Automatically handles whitespace differences (exact → whitespace-normalized → flexible)\n\
+- Automatically handles whitespace differences (exact → whitespace-normalized)\n\
 - Refuses ambiguous matches unless `replace_all: true` is set\n\
 - Works across all platforms (sed syntax varies)\n\n\
 `old_str` must appear exactly once in the file unless `replace_all: true`. \
@@ -136,7 +136,7 @@ pub(crate) fn run(
 
     let match_result = progressive_match(&content, old_str);
 
-    let (count, position, match_level, confidence) = match match_result {
+    let (count, position, match_level) = match match_result {
         MatchResult::NoMatch => {
             return Err(FileEditError::Validation(format!(
                 "String not found in file '{}'\n\n\
@@ -150,30 +150,26 @@ Tip: Include 2-3 lines of surrounding context in old_str for better matching.",
                 old_str.lines().take(5).collect::<Vec<_>>().join("\n  ")
             )));
         }
-        MatchResult::MultipleMatches { count, positions } => {
+        MatchResult::MultipleMatches { ranges, level } => {
             if replace_all {
-                (count, positions[0], MatchLevel::Exact, 1.0)
+                (ranges.len(), ranges[0].start, level)
             } else {
-                let line_nums: Vec<usize> = positions
+                let line_nums: Vec<usize> = ranges
                     .iter()
-                    .map(|&pos| content[..pos].lines().count() + 1)
+                    .map(|r| content[..r.start].lines().count() + 1)
                     .collect();
                 return Err(FileEditError::Validation(format!(
                     "String appears {} times in '{}' at lines {:?}.\n\n\
 To replace all occurrences, use: replace_all: true\n\
 To replace a specific occurrence, include more surrounding context in old_str to make it unique.\n\n\
 Tip: Read the file first with file_read to see exact formatting.",
-                    count,
+                    ranges.len(),
                     path.display(),
                     line_nums
                 )));
             }
         }
-        MatchResult::UniqueMatch {
-            position,
-            match_level,
-            confidence,
-        } => (1, position, match_level, confidence),
+        MatchResult::UniqueMatch { range, level } => (1, range.start, level),
     };
 
     let new_content = if replace_all && count > 1 {
@@ -207,9 +203,8 @@ Tip: Read the file first with file_read to see exact formatting.",
 
     if match_level != MatchLevel::Exact {
         warnings.push(format!(
-            "ℹ️  Match required {} (confidence: {:.0}%). Consider reading file first for exact match.",
-            match_level.as_str(),
-            confidence * 100.0
+            "ℹ️  Match required {}. Consider reading file first for exact match.",
+            match_level.as_str()
         ));
     }
 
