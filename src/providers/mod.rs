@@ -24,7 +24,7 @@ use crate::state::StateManager;
 use crate::tools::{
     BashBgTool, BashTool, FetchPageTool, FetchUrlTool, FileCreateTool, FileInsertTool,
     FileReadTool, FileStrReplaceTool, ListDirectoryTool, PdfReadTool, PowerShellTool, SearchTool,
-    ShellKind, ThinkTool, TodoTool,
+    ShellKind, ThinkTool, TodoTool, ViewImageTool,
 };
 use anyhow::{Context, Result};
 use rig_core::agent::{Agent, AgentBuilder};
@@ -487,7 +487,7 @@ fn add_builtin_tools<M, P>(
     state_manager: Option<Arc<StateManager>>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
-    register_view_image: bool,
+    view_image: Option<ViewImageTool>,
     wire_bash_panel: bool,
     sub_agent_wiring: Option<SubAgentWiring>,
     timeouts: &TimeoutsConfig,
@@ -591,9 +591,11 @@ where
     }
 
     // `view_image` needs a tool-result channel that carries images — only
-    // Anthropic. Other providers swap/err/drop the image, so registration is gated.
-    if register_view_image {
-        tools.push(gate(Box::new(crate::tools::ViewImageTool)));
+    // Anthropic. Other providers swap/err/drop the image, so registration is
+    // gated by the caller passing `None`; `Some` implies both "registered"
+    // and "configured" (§A6 — the ceiling can no longer go missing).
+    if let Some(t) = view_image {
+        tools.push(gate(Box::new(t)));
     }
 
     // Add DelegateTool if pipeline is enabled. It needs the same build
@@ -778,7 +780,7 @@ fn create_openrouter_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
-        false,
+        None,
         true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
@@ -912,7 +914,7 @@ fn create_anthropic_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
-        supports_vision,
+        supports_vision.then(|| ViewImageTool::new(config.max_image_base64_bytes)),
         true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
@@ -1008,7 +1010,7 @@ fn create_ollama_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
-        false,
+        None,
         true,
         Some(SubAgentWiring {
             event_sink: None,
@@ -1117,7 +1119,7 @@ fn create_openai_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
-        false,
+        None,
         true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
@@ -1225,7 +1227,7 @@ fn create_llamacpp_agent(
         Some(state_manager.clone()),
         shell_kind,
         vector_store,
-        false,
+        None,
         true,
         Some(SubAgentWiring {
             event_sink: Some(sender),
@@ -1414,7 +1416,7 @@ pub(crate) fn build_sub_agent(
                 Some(state_manager),
                 shell_kind,
                 vector_store,
-                false,
+                None,
                 false,
                 None,
                 timeouts,
@@ -1448,7 +1450,7 @@ pub(crate) fn build_sub_agent(
                 Some(state_manager),
                 shell_kind,
                 vector_store,
-                false,
+                None,
                 false,
                 None,
                 timeouts,
@@ -1486,7 +1488,7 @@ pub(crate) fn build_sub_agent(
                 Some(state_manager),
                 shell_kind,
                 vector_store,
-                supports_vision,
+                supports_vision.then(|| ViewImageTool::new(c.max_image_base64_bytes)),
                 false,
                 None,
                 timeouts,
@@ -1521,7 +1523,7 @@ pub(crate) fn build_sub_agent(
                 Some(state_manager),
                 shell_kind,
                 vector_store,
-                false,
+                None,
                 false,
                 None,
                 timeouts,
@@ -1555,7 +1557,7 @@ pub(crate) fn build_sub_agent(
                 Some(state_manager),
                 shell_kind,
                 vector_store,
-                false,
+                None,
                 false,
                 None,
                 timeouts,

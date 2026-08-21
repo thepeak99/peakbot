@@ -3,6 +3,7 @@
 //! registration is gated to that provider.
 
 use crate::image_cache::{self, ImageRef};
+use crate::tools::image_fit::{self, fit_under_ceiling};
 use crate::vision::{AttachmentError, ImageSource, load_image_from_path};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -34,6 +35,11 @@ pub enum ViewImageError {
         base64_bytes: usize,
         ceiling: usize,
     },
+    /// `fit_under_ceiling` gave up (unsupported format, undecodable bytes,
+    /// codec failure, or an unattainable ceiling). Model-visible so it can
+    /// see the concrete reason instead of a generic failure.
+    #[error("could not fit image under this endpoint's ceiling: {0}")]
+    Fit(#[from] image_fit::FitError),
 }
 
 #[derive(Deserialize)]
@@ -116,8 +122,20 @@ impl ViewImageOutput {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct ViewImageTool;
+/// The tool's construction site (`providers/mod.rs`) is the only place that
+/// ever builds one, and nothing (de)serialises it — a bare struct held only
+/// long enough to satisfy `Tool`.
+pub struct ViewImageTool {
+    max_image_base64_bytes: usize,
+}
+
+impl ViewImageTool {
+    pub fn new(max_image_base64_bytes: usize) -> Self {
+        Self {
+            max_image_base64_bytes,
+        }
+    }
+}
 
 impl Tool for ViewImageTool {
     const NAME: &'static str = NAME;
@@ -160,21 +178,40 @@ impl Tool for ViewImageTool {
         // media-type inference, and the format allowlist all live there.
         let attachment = load_image_from_path(Path::new(&args.path))?;
 
-        let (data, mime_type, image_ref) = match attachment.source {
-            ImageSource::Base64 { bytes, media_type } => {
-                let mime_type = media_type.to_mime_type().to_string();
-                let display_name = Path::new(&args.path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| args.path.clone());
-                // A spill failure (unsupported type, I/O error, ...) must
-                // never fail the call — the model still gets the image.
-                let image_ref = image_cache::spill(&bytes, media_type, &display_name);
-                (STANDARD.encode(bytes), mime_type, image_ref)
-            }
+        let (bytes, media_type) = match attachment.source {
+            ImageSource::Base64 { bytes, media_type } => (bytes, media_type),
             // load_image_from_path only ever returns Base64.
             ImageSource::Url(_) => unreachable!("this should never happen"),
         };
+
+        // auto_resize:false must refuse an oversized image without ever
+        // decoding it; fit_under_ceiling has no notion of auto_resize, so
+        // the gate that turns "over ceiling" into a hard error lives here.
+        if !args.auto_resize
+            && let Some(base64_bytes) = base64::encoded_len(bytes.len(), true)
+            && base64_bytes > self.max_image_base64_bytes
+        {
+            return Err(ViewImageError::TooLarge {
+                path: args.path,
+                base64_bytes,
+                ceiling: self.max_image_base64_bytes,
+            });
+        }
+
+        let mime_type = media_type.to_mime_type().to_string();
+        let fitted = fit_under_ceiling(bytes, media_type.clone(), self.max_image_base64_bytes)?;
+
+        let display_name = Path::new(&args.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| args.path.clone());
+        // image_ref.id is a content address (sha256) of these bytes: spill
+        // over the bytes we're about to send, not the source file, or the
+        // id would address a payload nobody — model or GET /images/{id} —
+        // ever actually sees (§A5). A spill failure must never fail the
+        // call — the model still gets the image.
+        let image_ref = image_cache::spill(&fitted.bytes, media_type, &display_name);
+        let data = STANDARD.encode(&fitted.bytes);
 
         tracing::info!(
             target: "peakbot",
@@ -183,13 +220,50 @@ impl Tool for ViewImageTool {
             "view_image tool executed"
         );
 
-        Ok(ViewImageOutput::Plain(PlainImage {
-            kind: "image",
-            data,
-            mime_type,
-            image_ref,
-        }))
+        let output = match fitted.resize {
+            None => ViewImageOutput::Plain(PlainImage {
+                kind: "image",
+                data,
+                mime_type,
+                image_ref,
+            }),
+            Some(report) => ViewImageOutput::Resized(ResizedImage {
+                response: resize_notice(&report, self.max_image_base64_bytes, &mime_type),
+                parts: [PlainImage {
+                    kind: "image",
+                    data,
+                    mime_type,
+                    image_ref: None,
+                }],
+                image_ref,
+            }),
+        };
+
+        Ok(output)
     }
+}
+
+/// The exact wording is specified verbatim (§A4): one line, no `"` and no
+/// newline — rig does `response.to_string()` on the JSON string, so any
+/// quote or newline here would arrive escaped in front of the model.
+fn resize_notice(report: &image_fit::ResizeReport, ceiling: usize, mime_type: &str) -> String {
+    let format_name = mime_type.strip_prefix("image/").unwrap_or(mime_type);
+    format!(
+        "Auto-resized to fit this endpoint's image ceiling ({}): {}x{} {format_name}, {} -> \
+         {}x{} {format_name}, {}. Fine detail may be lost; pass auto_resize false to send the \
+         original unmodified.",
+        format_mb_base64(ceiling),
+        report.from.0,
+        report.from.1,
+        format_mb_base64(report.from_b64),
+        report.to.0,
+        report.to.1,
+        format_mb_base64(report.to_b64),
+    )
+}
+
+fn format_mb_base64(bytes: usize) -> String {
+    format!("{:.2} MB base64", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Mirrors only the fields we need from a serialized `ViewImageOutput`.
@@ -222,6 +296,10 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
+    /// Matches `AnthropicConfig`'s default (`config::mod.rs`) — none of
+    /// these fixtures approach it, so its exact value is irrelevant to them.
+    const TEST_CEILING: usize = 5 * 1024 * 1024;
+
     fn write_png(bytes: &[u8]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "peakbot-view-image-{}-{}.png",
@@ -236,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn loads_image_as_image_json() {
         let path = write_png(b"fake png bytes");
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
@@ -255,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn output_roundtrips_into_rig_image_tool_result() {
         let path = write_png(b"x");
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
@@ -380,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_file_errors() {
-        let err = ViewImageTool
+        let err = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: "/does/not/exist-view-image-xyz.png".to_string(),
                 auto_resize: true,
@@ -401,7 +479,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"hi").unwrap();
-        let err = ViewImageTool
+        let err = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
@@ -556,7 +634,7 @@ mod tests {
             &format!("byte-identical-{}", uuid::Uuid::new_v4()),
         );
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
@@ -591,7 +669,7 @@ mod tests {
             &format!("full-payload-{}", uuid::Uuid::new_v4()),
         );
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
@@ -623,7 +701,7 @@ mod tests {
         // from one equal to just the basename (correct).
         let path = write_temp_image(&bytes, "png", true, "shot");
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
@@ -657,7 +735,7 @@ mod tests {
         let path = write_temp_image(&bytes, "png", true, stem);
         let expected_basename = path.file_name().unwrap().to_string_lossy().into_owned();
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
@@ -687,14 +765,14 @@ mod tests {
             &format!("dedupe-{}", uuid::Uuid::new_v4()),
         );
 
-        let first = ViewImageTool
+        let first = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
             })
             .await
             .expect("first call should load");
-        let second = ViewImageTool
+        let second = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
@@ -731,7 +809,7 @@ mod tests {
             &format!("large-{}", uuid::Uuid::new_v4()),
         );
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
                 auto_resize: true,
@@ -830,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn definition_description_mentions_reloading_for_current_turn() {
-        let def = ViewImageTool.definition(String::new()).await;
+        let def = ViewImageTool::new(TEST_CEILING).definition(String::new()).await;
         assert!(
             def.description.contains("current turn"),
             "description should tell the model the image is loaded for the current turn \
@@ -855,7 +933,7 @@ mod tests {
              default_true fn is mandatory"
         );
 
-        let def = ViewImageTool.definition(String::new()).await;
+        let def = ViewImageTool::new(TEST_CEILING).definition(String::new()).await;
         assert_eq!(
             def.parameters["properties"]["auto_resize"]["default"],
             serde_json::json!(true),
