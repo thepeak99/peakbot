@@ -3,7 +3,10 @@
 //! the caller declared — so a `.png` that is really a JPEG comes back as a
 //! real PNG and its `mimeType` stops lying.
 
+use image::GenericImageView;
+use image::ImageFormat;
 use rig_core::completion::message::ImageMediaType;
+use std::io::Cursor;
 
 #[derive(Debug)]
 pub(crate) struct Fitted {
@@ -46,12 +49,87 @@ const fn base64_len(raw: usize) -> usize {
     raw.div_ceil(3) * 4
 }
 
+/// Anthropic downsamples anything longer server-side; more pixels buy nothing.
+const FIRST_EDGE: u32 = 1568;
+const MIN_EDGE: u32 = 64;
+/// 1568 → 784 → 392 → 196 → 98 → 49 — terminates by construction.
+const MAX_STEPS: u32 = 6;
+
+/// The declared format's name, for the refusal message.
+fn declared_format_name(media_type: ImageMediaType) -> &'static str {
+    match media_type {
+        ImageMediaType::PNG => "PNG",
+        ImageMediaType::JPEG => "JPEG",
+        ImageMediaType::GIF => "GIF",
+        ImageMediaType::WEBP => "WEBP",
+        ImageMediaType::HEIC => "HEIC",
+        ImageMediaType::HEIF => "HEIF",
+        ImageMediaType::SVG => "SVG",
+    }
+}
+
 pub(crate) fn fit_under_ceiling(
     bytes: Vec<u8>,
     media_type: ImageMediaType,
     ceiling_b64: usize,
 ) -> Result<Fitted, FitError> {
-    todo!()
+    let from_b64 = base64_len(bytes.len());
+    // Common path: under the ceiling the bytes ship as-is — decoding is pure cost.
+    if from_b64 <= ceiling_b64 {
+        return Ok(Fitted {
+            bytes,
+            resize: None,
+        });
+    }
+
+    let target = match media_type {
+        ImageMediaType::PNG => ImageFormat::Png,
+        ImageMediaType::JPEG => ImageFormat::Jpeg,
+        // `image` decodes only frame 1; "resizing" an animated GIF would destroy it.
+        _ => return Err(FitError::UnsupportedFormat(declared_format_name(media_type))),
+    };
+
+    // Magic bytes, not the extension: a lying extension is corrected for free.
+    let true_format = image::guess_format(&bytes).map_err(|_| FitError::Undecodable)?;
+    let img = image::load_from_memory_with_format(&bytes, true_format)
+        .map_err(|e| FitError::Decode(e.to_string()))?;
+    let from = img.dimensions();
+
+    // Never upscale: a small image with a bloated payload fits by re-encoding alone.
+    let mut edge = FIRST_EDGE.min(from.0.max(from.1));
+    let mut last_b64 = 0;
+    for _ in 0..MAX_STEPS {
+        // Halving, not a computed scale factor: compressed size is entropy, not a
+        // function of pixel count, so any "factor" would be a guess.
+        // Triangle: no ringing on 1-px UI lines — the right trade for screenshots.
+        let cand = img.resize(edge, edge, image::imageops::FilterType::Triangle);
+        let mut cursor = Cursor::new(Vec::new());
+        cand.write_to(&mut cursor, target)
+            .map_err(|e| FitError::Encode(e.to_string()))?;
+        let out = cursor.into_inner();
+        let to_b64 = base64_len(out.len());
+        if to_b64 <= ceiling_b64 {
+            return Ok(Fitted {
+                bytes: out,
+                resize: Some(ResizeReport {
+                    from,
+                    to: cand.dimensions(),
+                    from_b64,
+                    to_b64,
+                }),
+            });
+        }
+        last_b64 = to_b64;
+        edge /= 2;
+        if edge < MIN_EDGE {
+            break;
+        }
+    }
+    Err(FitError::CannotFit {
+        last_b64,
+        edge,
+        ceiling: ceiling_b64,
+    })
 }
 
 #[cfg(test)]
