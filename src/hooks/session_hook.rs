@@ -1586,6 +1586,10 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             let event = AgentEvent::ToolCall {
                 tool_name: tool_name.to_string(),
                 arguments: args.to_string(),
+                // rig 0.38.2 never hands hooks the provider's real tool_call.id
+                // (mod.rs builds the wire result from it two lines later) — this
+                // is PeakBot's own correlation handle, paired by equality with
+                // the ToolResult row in `sanitize_tool_pairs`.
                 call_id: tool_call_id.or(Some(internal_call_id.to_string())),
                 response_id,
                 timestamp: Utc::now(),
@@ -1614,6 +1618,7 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
                 arguments: args.to_string(),
                 result: result.to_string(),
                 success: !result.starts_with("Error:"),
+                // Correlation handle, not the provider's id — see on_tool_call above.
                 call_id: tool_call_id.or(Some(internal_call_id.to_string())),
                 timestamp: Utc::now(),
             };
