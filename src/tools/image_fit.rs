@@ -394,6 +394,7 @@ mod tests {
             fit_under_ceiling(png, ImageMediaType::PNG, 8).expect_err("ceiling 8 is impossible");
         let elapsed = start.elapsed();
         assert!(matches!(err, FitError::CannotFit { .. }), "got: {err}");
-        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+        // Liveness bound, not a perf target: ~5.4 s observed on a cold CI box.
+        assert!(elapsed < Duration::from_secs(60), "took {elapsed:?}");
     }
 }
