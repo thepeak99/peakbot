@@ -1001,6 +1001,62 @@ mod tests {
         assert!(matches!(action, HookAction::Continue));
         assert!(hook.history_snapshot().is_empty());
     }
+
+    /// rig 0.38.2's `PromptHook` never hands the hook the provider's real
+    /// tool id (`tool_call.id`, the `toolu_…`) — only `tool_call.call_id`
+    /// (`None` on every provider PeakBot registers) and a rig-internal
+    /// nanoid (`hooks.rs:116-136`, `prompt_request/mod.rs:972`). So the
+    /// `call_id` persisted here is PeakBot's own correlation handle, not
+    /// the provider's. What actually matters — and what
+    /// `sanitize_tool_pairs` (`tool_use_validator.rs:41-44`) depends on,
+    /// since it pairs call/result rows on `call_id` equality — is that the
+    /// call row and its result row agree. This pins that property so a
+    /// future id change can't silently break pairing and delete history at
+    /// the wire boundary.
+    #[tokio::test]
+    async fn tool_call_and_tool_result_rows_share_one_call_id() {
+        let (hook, mut rx) = SessionHook::with_channel();
+        let internal_id = "internal-1";
+        let args = r#"{"path":"/tmp/x.txt"}"#;
+
+        let _ = rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_call(
+            &hook,
+            "file_read",
+            None,
+            internal_id,
+            args,
+        )
+        .await;
+        let _ = rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_result(
+            &hook,
+            "file_read",
+            None,
+            internal_id,
+            args,
+            "ok",
+        )
+        .await;
+
+        let call_event = rx.try_recv().expect("on_tool_call must emit an event");
+        let result_event = rx.try_recv().expect("on_tool_result must emit an event");
+
+        let call_id = match call_event.event {
+            AgentEvent::ToolCall { call_id, .. } => call_id,
+            other => panic!("expected AgentEvent::ToolCall, got {other:?}"),
+        };
+        let result_id = match result_event.event {
+            AgentEvent::ToolResult { call_id, .. } => call_id,
+            other => panic!("expected AgentEvent::ToolResult, got {other:?}"),
+        };
+
+        assert!(call_id.is_some(), "ToolCall row must carry a call_id");
+        assert!(result_id.is_some(), "ToolResult row must carry a call_id");
+        assert_eq!(
+            call_id, result_id,
+            "the ToolCall and ToolResult rows for one round-trip must share \
+             exactly one call_id, or sanitize_tool_pairs will silently drop the pair"
+        );
+    }
 }
 
 /// Sub-agent-only hook state. `SessionHook: Clone` shallow-copies Arc handles,
