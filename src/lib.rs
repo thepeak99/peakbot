@@ -5900,16 +5900,26 @@ headers:
     // prompt on top of a history that already contained the completed tool
     // exchange). See `tickets/pr-b-retry-correctness.md`, Defect 3.
 
-    /// *The RED test that proves the bug bites.* Reproduces exactly what
-    /// today's retry arm builds: `history` re-derived fresh from
-    /// `StateManager`, `prompt` left as the original user turn. After a
-    /// tool round-trip has landed, the user turn ends up on the wire twice
-    /// — once inside history, once as the prompt.
+    /// *The arm-level pin.* Drives the real `process_message_internal` with
+    /// a transient 429 injected into the mock model, so the assertion lands
+    /// on the SECOND wire payload the **retry arm itself** built — not on
+    /// the helper's return value, which the three `refresh_attempt_from_*`
+    /// tests below already cover.
     ///
-    /// **Today this asserts `2 == 1` and fails** — that is correct RED.
-    #[test]
-    fn retry_after_tool_roundtrip_must_not_resend_the_original_user_turn() {
-        let sm = Arc::new(StateManager::new());
+    /// Removing or short-circuiting the `refresh_attempt_from_transcript`
+    /// call in the transient-retry arm (`process_message_internal`, the
+    /// block immediately before `tokio::time::sleep(delay)`) makes this
+    /// fail with `2 != 1` — the duplicated user turn from the production
+    /// trace.
+    ///
+    /// The completed tool round-trip is written straight to the transcript:
+    /// in production those rows arrive on the async event-processing task,
+    /// and awaiting that here would only add a race. What the arm reads is
+    /// the transcript tail, and the tail is identical either way.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn retry_arm_resumes_from_the_tail_after_a_tool_roundtrip() {
+        let sm = StateManager::new_arc();
         sm.add_user_message("read /tmp/screencap.png".to_string());
         sm.add_assistant_message("I'll look at it".to_string());
         sm.add_tool_call(
@@ -5927,32 +5937,53 @@ headers:
             Some("c1".to_string()),
         );
 
-        // Exactly what the retry arm builds today: history is re-derived,
-        // the prompt is whatever `current_turn` was captured as at the
-        // start of the turn — never refreshed. Reproduced here through the
-        // shared helper the fix (Defect 3, B3.1/B3.2) actually calls, so
-        // this proves the wire payload the retry arm produces, not just
-        // the helper's return value in isolation.
-        let mut ovr: Option<Vec<rig_core::completion::message::Message>> = None;
-        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
-        let mut prompt = sm
+        let (agent, _info, _events, _hook, model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        // A 429 is transient (`is_transient_prompt_error`), so the arm under
+        // test runs; the second attempt succeeds and ends the turn.
+        model.add_response(crate::mock::MockResponse::error(
+            "429 rate limited by provider",
+        ));
+        model.add_response(crate::mock::MockResponse::text("done"));
+
+        let config = Config {
+            retry: crate::config::RetryConfig {
+                max_retries: 1,
+                initial_delay_ms: 1,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let current_turn = sm
             .build_current_turn_message()
             .expect("the original user turn was dispatched");
-        refresh_attempt_from_transcript(&sm, &mut prompt, &mut ovr);
-        let history = derive_history_for_iteration(&mut ovr, &sm_opt);
+        let agent: Arc<DynAgent> = Arc::new(agent);
+        let sm_opt = Some(sm.clone());
 
-        // The wire payload is `history ++ [prompt]`.
-        let occurrences = count_occurrences(&history, "read /tmp/screencap.png")
-            + count_occurrences(std::slice::from_ref(&prompt), "read /tmp/screencap.png");
+        let result =
+            AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await;
+        assert!(
+            matches!(result, CompletionResult::Success),
+            "the retried attempt must succeed and end the turn"
+        );
 
+        let requests = model.get_recorded_requests();
         assert_eq!(
-            occurrences,
+            requests.len(),
+            2,
+            "one failed attempt plus exactly one retry"
+        );
+        // `chat_history` is the whole wire payload — history ++ [prompt].
+        let retry_payload = &requests[1].chat_history;
+        assert_eq!(
+            count_occurrences(retry_payload, "read /tmp/screencap.png"),
             1,
-            "the user turn must appear exactly once on the wire; found it in \
-             history AND as the prompt — the duplicated turn from the \
-             production trace (history_count={}, prompt_count={})",
-            count_occurrences(&history, "read /tmp/screencap.png"),
-            count_occurrences(std::slice::from_ref(&prompt), "read /tmp/screencap.png"),
+            "the retry must resume from the transcript tail: the user turn \
+             belongs on the wire exactly once, but the retry arm resent it \
+             as the prompt on top of a history that already contained it. \
+             Payload: {retry_payload:?}"
         );
     }
 
