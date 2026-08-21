@@ -3,6 +3,9 @@
 //! the caller declared — so a `.png` that is really a JPEG comes back as a
 //! real PNG and its `mimeType` stops lying.
 
+// Dead until view_image calls fit_under_ceiling (PR A wiring, ticket A3).
+#![allow(dead_code)]
+
 use image::GenericImageView;
 use image::ImageFormat;
 use rig_core::completion::message::ImageMediaType;
@@ -86,7 +89,11 @@ pub(crate) fn fit_under_ceiling(
         ImageMediaType::PNG => ImageFormat::Png,
         ImageMediaType::JPEG => ImageFormat::Jpeg,
         // `image` decodes only frame 1; "resizing" an animated GIF would destroy it.
-        _ => return Err(FitError::UnsupportedFormat(declared_format_name(media_type))),
+        _ => {
+            return Err(FitError::UnsupportedFormat(declared_format_name(
+                media_type,
+            )));
+        }
     };
 
     // Magic bytes, not the extension: a lying extension is corrected for free.
