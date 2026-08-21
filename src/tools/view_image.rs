@@ -124,13 +124,8 @@ struct PartialViewImageOutput {
 
 /// Extracts the `image_ref` from a tool's serialized JSON output, or `None`
 /// if it isn't a `view_image` output (or carries no ref). Never panics.
-// Unreachable from outside the crate (`mod tools` and `mod view_image` are both
-// private), and T4 — transcript elision in `ui::app_state` — is the incoming
-// caller. Drop this allow when T4 wires it up. Note this also covers
-// `PartialViewImageOutput`, which is only reachable through this fn.
-// `#[expect]` is not usable here: under `cfg(test)` the tests below *do* call
-// this, so the expectation would go unfulfilled and fail `--all-targets`.
-#[allow(dead_code)]
+/// Also covers `PartialViewImageOutput`, which is only reachable through
+/// this fn. Called by `ui::app_state` (T4) to populate `ChatMessage.images`.
 pub fn image_ref_from_output(json: &str) -> Option<ImageRef> {
     serde_json::from_str::<PartialViewImageOutput>(json)
         .ok()?

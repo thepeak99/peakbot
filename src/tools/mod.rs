@@ -15,7 +15,7 @@ mod think;
 mod thought_gate;
 pub(crate) mod time_budget;
 pub mod todo;
-mod view_image;
+pub(crate) mod view_image;
 
 pub use bash::BashTool;
 pub use bash_bg::BashBgTool;

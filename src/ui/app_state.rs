@@ -5,8 +5,10 @@
 //! with existing PeakBot types (TodoList, SessionStats, etc.).
 
 use crate::TodoStatus;
+use crate::image_cache::ImageRef;
 use crate::pipeline::PipelineInfo;
 use crate::tools::todo::TodoItem as CoreTodoItem;
+use crate::tools::view_image;
 use crate::ui::ui_trait::TodoItemAction;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
@@ -211,6 +213,11 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<crate::vision::ImageAttachment>,
 
+    /// Images to DISPLAY with this row, by reference. Never model input —
+    /// that is `attachments`. Empty for every row but a `view_image` result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::image_cache::ImageRef>,
+
     /// Timestamp when message was created
     pub timestamp: DateTime<Local>,
 
@@ -354,6 +361,7 @@ impl ChatMessage {
             role: MessageRole::User,
             content,
             attachments: Vec::new(),
+            images: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -379,6 +387,7 @@ impl ChatMessage {
             role: MessageRole::User,
             content,
             attachments,
+            images: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -401,6 +410,7 @@ impl ChatMessage {
             role: MessageRole::User,
             content,
             attachments: Vec::new(),
+            images: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -419,6 +429,7 @@ impl ChatMessage {
             role: MessageRole::Agent,
             content,
             attachments: Vec::new(),
+            images: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -437,6 +448,7 @@ impl ChatMessage {
             role: MessageRole::System,
             content,
             attachments: Vec::new(),
+            images: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -455,6 +467,7 @@ impl ChatMessage {
             role: MessageRole::Summary,
             content,
             attachments: Vec::new(),
+            images: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -478,6 +491,7 @@ impl ChatMessage {
             role: MessageRole::ToolCall,
             content,
             attachments: Vec::new(),
+            images: Vec::new(),
             timestamp: Local::now(),
             tool_name: Some(tool_name.to_string()),
             tool_args: Some(args.to_string()),
@@ -493,11 +507,13 @@ impl ChatMessage {
     /// Create a new tool result message with truncation to top 2-3 lines.
     /// Stores raw tool_name, args, result, and call_id for lossless persistence.
     pub fn tool_result(tool_name: &str, args: &str, result: &str, call_id: Option<String>) -> Self {
-        let content = format_tool_result(tool_name, result);
+        let images = image_refs_from_tool_output(tool_name, result);
+        let content = format_tool_result(tool_name, result, &images);
         Self {
             role: MessageRole::ToolResult,
             content,
             attachments: Vec::new(),
+            images,
             timestamp: Local::now(),
             tool_name: Some(tool_name.to_string()),
             tool_args: Some(args.to_string()),
@@ -521,6 +537,7 @@ impl ChatMessage {
             role: MessageRole::System,
             content,
             attachments: Vec::new(),
+            images: Vec::new(),
             timestamp: Local::now(),
             tool_name: None,
             tool_args: None,
@@ -540,6 +557,7 @@ impl ChatMessage {
             role,
             content,
             attachments: Vec::new(),
+            images: Vec::new(),
             timestamp: NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
                 .unwrap()
                 .and_local_timezone(Local)
@@ -573,6 +591,50 @@ impl ChatMessage {
     /// context — its own context died with the delegation.
     pub fn is_orchestrator_context(&self) -> bool {
         !self.compacted && self.source.is_orchestrator_lane()
+    }
+
+    /// Drop the raw wire payload of a tool-result row that is no longer in
+    /// the orchestrator's live context (W1). Pure; idempotent; re-derives
+    /// `content`; a no-op for every row that carries no binary payload. The
+    /// row's `images` are untouched — that is how the picture survives (W2).
+    // No production caller yet — the three sites that enforce W1 (elide on
+    // append, on compaction, and on load) are T6/T7; only the unit tests
+    // below exercise this today. Drop this allow when T6 wires up the first
+    // production caller (same situation `image_ref_from_output` was in
+    // before T4). `#[expect]` is not usable here: under `cfg(test)` the
+    // tests below *do* call this, so the expectation goes unfulfilled and
+    // fails `--all-targets`.
+    #[allow(dead_code)]
+    pub(crate) fn elide_binary_payload(&mut self) {
+        const NOTICE_PREFIX: &str = "[image not retained in the transcript: ";
+
+        if self.tool_name.as_deref() != Some(view_image::NAME) {
+            return;
+        }
+        let Some(result) = self.tool_result.as_ref() else {
+            return;
+        };
+        if result.starts_with(NOTICE_PREFIX) {
+            return; // already elided — idempotent fixpoint
+        }
+
+        // `display_name` is model-influenced and unbounded — `view_image`
+        // falls back to the whole `args.path` when the path has no file
+        // name — so cap it. Without this the "notice" for a pathological
+        // path is itself kilobytes, which defeats the point of eliding.
+        let display_name = truncate_str(
+            self.images
+                .first()
+                .map(|r| r.display_name.as_str())
+                .unwrap_or("image"),
+            80,
+        );
+        let dropped_kb = result.len() / 1024;
+        self.tool_result = Some(format!(
+            "{NOTICE_PREFIX}{display_name} — {dropped_kb} KB of base64 dropped after the \
+             turn. Call view_image again to load it.]"
+        ));
+        self.content = format_tool_result(view_image::NAME, "", &self.images);
     }
 }
 
@@ -626,15 +688,36 @@ pub(crate) fn format_tool_call(tool_name: &str, args: &str) -> String {
 }
 
 /// Format tool result with truncation to top 2-3 lines
-pub(crate) fn format_tool_result(tool_name: &str, result: &str) -> String {
+pub(crate) fn format_tool_result(tool_name: &str, result: &str, images: &[ImageRef]) -> String {
     // Special handling per tool type
     match tool_name {
         "bash" => format_bash_result(result),
         "file_read" => format_file_read_result(result),
         "list_directory" => format_list_directory_result(result),
         "web_search" => format_search_result(result),
+        view_image::NAME => format_view_image_result(images),
         _ => format_generic_result(result),
     }
+}
+
+/// A `view_image` row renders as exactly one line — the raw base64 payload
+/// never belongs in the transcript, before OR after elision.
+fn format_view_image_result(images: &[ImageRef]) -> String {
+    match images.first() {
+        Some(r) => format!("🖼 {}", r.display_name),
+        None => "🖼 image".to_string(),
+    }
+}
+
+/// `view_image` output carries at most one ref; every other tool's result
+/// is never parsed as one, no matter how it happens to be shaped.
+fn image_refs_from_tool_output(tool_name: &str, result: &str) -> Vec<ImageRef> {
+    if tool_name != view_image::NAME {
+        return Vec::new();
+    }
+    view_image::image_ref_from_output(result)
+        .into_iter()
+        .collect()
 }
 
 pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
@@ -1839,5 +1922,498 @@ mod tests {
             result,
             result.chars().count()
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // T4: `ChatMessage.images`, ctor extraction, `format_tool_result`'s
+    // `view_image` arm, and `elide_binary_payload`.
+    //
+    // Written BEFORE the implementation exists — every test below is
+    // expected to fail to COMPILE today (missing field `images`, missing
+    // fn `elide_binary_payload`, missing 3rd param on `format_tool_result`,
+    // and `crate::tools::view_image` being private — the last one is a
+    // real gap T4 must also close; see the delivery report).
+    //
+    // Isolation: no filesystem. `ImageRef`s are fabricated directly and
+    // `view_image` tool output is built as a JSON string by hand (via
+    // `ImageRef`'s own `Serialize` impl, so the wire shape can never
+    // drift from `src/image_cache.rs`). `image_cache::spill` is never
+    // called.
+    // ══════════════════════════════════════════════════════════════════
+
+    use crate::image_cache::ImageRef;
+    use crate::tools::view_image;
+
+    /// A well-formed (but never-spilled) `ImageRef`. The id satisfies
+    /// `image_cache::path_for`'s grammar (`^[0-9a-f]{64}\.(png|jpg|jpeg|gif|webp)$`)
+    /// without ever touching `image_cache::spill`, so no real file backs it.
+    fn make_ref(display_name: &str) -> ImageRef {
+        ImageRef {
+            id: format!("{}.png", "ab".repeat(32)), // 64 hex chars + ext
+            display_name: display_name.to_string(),
+        }
+    }
+
+    /// Builds the exact wire JSON `ViewImageTool::call` produces, using
+    /// `ImageRef`'s real `Serialize` impl so the shape can't drift from
+    /// `src/image_cache.rs`. `image_ref` is omitted (not `null`) when `None`,
+    /// mirroring `ViewImageOutput`'s `skip_serializing_if`.
+    fn view_image_json(image_ref: Option<&ImageRef>, data: &str) -> String {
+        let mut obj = serde_json::json!({
+            "type": "image",
+            "data": data,
+            "mimeType": "image/png",
+        });
+        if let Some(r) = image_ref {
+            obj["image_ref"] = serde_json::to_value(r).expect("ImageRef serializes");
+        }
+        obj.to_string()
+    }
+
+    /// A representative `bash` tool result, used as the regression-guard
+    /// baseline throughout this section.
+    fn bash_sample_result() -> &'static str {
+        "Exit code: 0\nSTDOUT:\nhello world\nSTDERR:\n"
+    }
+
+    /// Today's (pre-T4) exact `content` for `ChatMessage::tool_result("bash",
+    /// ..., bash_sample_result(), ...)`. Captured from the current
+    /// `format_bash_result` before any T4 code exists — this is the
+    /// regression-guard baseline for criterion 2.
+    const BASH_CONTENT_BASELINE: &str = "✅ Exit 0 | hello world";
+
+    /// Today's (pre-T4) exact serialization of a representative
+    /// `ChatMessage::tool_result("bash", ...)` row with a fixed timestamp,
+    /// captured from the current struct shape (no `images` field exists
+    /// yet). This is the regression-guard baseline for criterion 8, and
+    /// doubles as "old JSON with no images key" for criterion 10.
+    ///
+    /// The `timestamp` value is a `{ts}` hole rather than a literal:
+    /// `DateTime<Local>` serializes with the *machine's* UTC offset, so a
+    /// hardcoded offset would pin this baseline to a single timezone and
+    /// fail everywhere else (a `TZ=UTC` CI runner included). Everything the
+    /// baseline actually guards — the field set, the field order, and which
+    /// keys are skipped when empty — stays literal.
+    const BASH_MESSAGE_JSON_TEMPLATE: &str = r#"{"role":"toolresult","content":"✅ Exit 0 | hello world","timestamp":{ts},"tool_name":"bash","tool_args":"{\"command\":\"echo hi\"}","tool_result":"Exit code: 0\nSTDOUT:\nhello world\nSTDERR:\n","call_id":"call_1","compacted":false}"#;
+
+    /// `BASH_MESSAGE_JSON_TEMPLATE` with the timestamp rendered in the
+    /// machine's local offset — i.e. the bytes pre-T4 code would have
+    /// written on *this* host.
+    fn bash_message_json_baseline() -> String {
+        let ts = serde_json::to_string(&fixed_local_ts()).expect("timestamp serializes");
+        BASH_MESSAGE_JSON_TEMPLATE.replace("{ts}", &ts)
+    }
+
+    /// The fixed local timestamp baked into the baseline above.
+    fn fixed_local_ts() -> DateTime<Local> {
+        use chrono::NaiveDateTime;
+        NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+            .unwrap()
+            .and_local_timezone(Local)
+            .unwrap()
+    }
+
+    /// Rebuilds, via the real `ChatMessage::tool_result` constructor, the
+    /// exact message that produced `bash_message_json_baseline()`.
+    fn bash_baseline_message() -> ChatMessage {
+        let mut msg = ChatMessage::tool_result(
+            "bash",
+            r#"{"command":"echo hi"}"#,
+            bash_sample_result(),
+            Some("call_1".to_string()),
+        );
+        msg.timestamp = fixed_local_ts();
+        msg
+    }
+
+    // ── format_tool_result: pure function-level tests ───────────────────
+    // These call `format_tool_result(tool_name, result, images)` directly
+    // (the 3-arg signature T4 introduces) so a failure here is
+    // attributable to the formatting arm itself, independent of the
+    // constructor's extraction step tested further below.
+
+    /// Criterion 1 (function-level half): a `view_image` row with exactly
+    /// one ref renders as exactly one line, `🖼 <display_name>`.
+    #[test]
+    fn format_tool_result_view_image_with_ref_returns_single_emoji_line() {
+        let r = make_ref("shot.png");
+        let content = format_tool_result(view_image::NAME, "irrelevant raw json", &[r]);
+        assert_eq!(content, "🖼 shot.png");
+        assert_eq!(content.lines().count(), 1, "must be exactly one line");
+    }
+
+    /// Item 3 of the spec ("If there is no ref, fall back to something
+    /// sensible — decide and state what you assert"): DECISION — with no
+    /// ref, the row still renders as one `🖼`-prefixed line using the
+    /// generic label `"image"` (there is no display name to show; we do
+    /// NOT fall back to the old three-line base64 dump, since that is
+    /// exactly the regression this arm exists to fix).
+    #[test]
+    fn format_tool_result_view_image_with_no_refs_uses_generic_fallback_label() {
+        let content = format_tool_result(view_image::NAME, "irrelevant raw json", &[]);
+        assert_eq!(
+            content, "🖼 image",
+            "DECISION: no-ref fallback is the generic label \"image\" behind the same 🖼 prefix"
+        );
+        assert_eq!(content.lines().count(), 1, "must still be exactly one line");
+    }
+
+    /// The arm must derive its content from the `images` parameter, never
+    /// by re-parsing `result` itself — that parse happens once, in the
+    /// constructor's extraction step. A garbage `result` string must not
+    /// change the outcome, and must not panic.
+    #[test]
+    fn format_tool_result_view_image_ignores_raw_result_string_uses_images_param() {
+        let r = make_ref("shot.png");
+        let content =
+            format_tool_result(view_image::NAME, "{completely bogus, not json at all", &[r]);
+        assert_eq!(content, "🖼 shot.png");
+    }
+
+    #[test]
+    fn format_tool_result_view_image_unicode_display_name_line() {
+        let name =
+            "\u{30b9}\u{30af}\u{30ea}\u{30fc}\u{30f3}\u{30b7}\u{30e7}\u{30c3}\u{30c8} 001.png";
+        let r = make_ref(name);
+        let content = format_tool_result(view_image::NAME, "irrelevant", &[r]);
+        assert_eq!(content, format!("🖼 {name}"));
+    }
+
+    /// Boundary: an empty display name is a degenerate but legal
+    /// `ImageRef`. Pin the exact rendering rather than leaving it to
+    /// implementer whim.
+    #[test]
+    fn format_tool_result_view_image_empty_display_name_line() {
+        let r = make_ref("");
+        let content = format_tool_result(view_image::NAME, "irrelevant", &[r]);
+        assert_eq!(content, "🖼 ");
+    }
+
+    /// Regression guard at the function level: adding the 3rd `images`
+    /// parameter must not change `bash`'s existing formatting.
+    #[test]
+    fn format_tool_result_bash_arm_unchanged_by_new_signature() {
+        let content = format_tool_result("bash", bash_sample_result(), &[]);
+        assert_eq!(content, BASH_CONTENT_BASELINE);
+    }
+
+    /// Smoke test: the other existing arms (`file_read`, `list_directory`,
+    /// `web_search`, and the generic fallback) must keep working — not
+    /// panic, not silently swallow the `images` parameter into their own
+    /// output — after the signature grows a 3rd parameter.
+    #[test]
+    fn format_tool_result_other_arms_do_not_panic_with_empty_images_slice() {
+        let _ = format_tool_result("file_read", "     1\thello\n", &[]);
+        let _ = format_tool_result("list_directory", "total 0\n", &[]);
+        let _ = format_tool_result("web_search", "[]", &[]);
+        let _ = format_tool_result("some_unknown_tool", "anything at all", &[]);
+    }
+
+    // ── ChatMessage::tool_result: constructor-level tests ────────────────
+
+    /// Criterion 1 (end-to-end): the constructor extracts the ref from a
+    /// real `view_image` output JSON and derives `content` from it.
+    #[test]
+    fn tool_result_view_image_extracts_single_image_ref_and_emoji_content() {
+        let r = make_ref("shot.png");
+        let json = view_image_json(Some(&r), "AAAA");
+        let msg = ChatMessage::tool_result(view_image::NAME, "{}", &json, None);
+
+        assert_eq!(msg.images.len(), 1);
+        assert_eq!(msg.images[0], r);
+        assert_eq!(msg.content, "🖼 shot.png");
+    }
+
+    /// Criterion 2: `bash` extracts no images, and `content` is UNCHANGED
+    /// from today's behaviour (the captured baseline).
+    #[test]
+    fn tool_result_bash_has_no_images_and_content_matches_today_baseline() {
+        let msg = ChatMessage::tool_result(
+            "bash",
+            r#"{"command":"echo hi"}"#,
+            bash_sample_result(),
+            Some("call_1".to_string()),
+        );
+        assert!(msg.images.is_empty());
+        assert_eq!(msg.content, BASH_CONTENT_BASELINE);
+    }
+
+    /// The extraction guard is `tool_name == view_image::NAME` — a `bash`
+    /// row whose result happens to be a byte-identical `view_image`-shaped
+    /// JSON object (carrying a real `image_ref`) must still extract NO
+    /// images, because the tool name says it isn't a `view_image` result.
+    #[test]
+    fn tool_result_ignores_image_ref_shaped_json_for_non_view_image_tool_name() {
+        let r = make_ref("shot.png");
+        let json = view_image_json(Some(&r), "AAAA");
+        let msg = ChatMessage::tool_result("bash", "{}", &json, None);
+        assert!(
+            msg.images.is_empty(),
+            "a non-view_image tool_name must never extract an image, no matter the result shape"
+        );
+    }
+
+    /// A `view_image` output with the `image_ref` field entirely absent
+    /// (e.g. a spill failure) must not panic, must yield no images, and
+    /// must still render as a single sensible line (this pins the same
+    /// fallback decided above, reached through the real constructor).
+    #[test]
+    fn tool_result_view_image_with_missing_ref_field_has_empty_images_and_fallback_content() {
+        let json = view_image_json(None, "AAAA");
+        let msg = ChatMessage::tool_result(view_image::NAME, "{}", &json, None);
+        assert!(msg.images.is_empty());
+        assert_eq!(msg.content, "🖼 image");
+    }
+
+    /// A `view_image` "result" that isn't valid JSON at all (corrupt data,
+    /// truncated persistence, a hand-edited transcript) must not panic and
+    /// must degrade to zero images plus the same generic fallback.
+    #[test]
+    fn tool_result_view_image_malformed_json_result_has_empty_images_and_no_panic() {
+        let msg = ChatMessage::tool_result(view_image::NAME, "{}", "not json at all {{{", None);
+        assert!(msg.images.is_empty());
+        assert_eq!(msg.content, "🖼 image");
+    }
+
+    // ── ChatMessage::elide_binary_payload ────────────────────────────────
+
+    /// Criterion 3: a ~2 MB `view_image` row shrinks to a short stored
+    /// notice, its `images` are byte-for-byte unchanged, and `content`
+    /// stays the one-line emoji rendering.
+    #[test]
+    fn elide_binary_payload_shrinks_large_view_image_row_under_512_bytes_and_preserves_ref_and_content()
+     {
+        let r = make_ref("shot.png");
+        let huge_data = "A".repeat(2_000_000);
+        let json = view_image_json(Some(&r), &huge_data);
+        let mut msg = ChatMessage::tool_result(view_image::NAME, "{}", &json, None);
+
+        // Sanity: the row really did start out large.
+        assert!(
+            msg.tool_result.as_ref().unwrap().len() > 1_000_000,
+            "test setup sanity: stored tool_result should start out multi-MB"
+        );
+        assert_eq!(msg.images, vec![r.clone()]);
+        assert_eq!(msg.content, "🖼 shot.png");
+
+        msg.elide_binary_payload();
+
+        assert!(
+            msg.tool_result.as_ref().is_some_and(|s| s.len() < 512),
+            "tool_result must shrink to < 512 bytes after elision, got {:?} bytes",
+            msg.tool_result.as_ref().map(|s| s.len())
+        );
+        assert_eq!(
+            msg.images,
+            vec![r],
+            "images must survive elision untouched (W2)"
+        );
+        assert_eq!(
+            msg.content, "🖼 shot.png",
+            "content must still be the one-line emoji rendering after elision"
+        );
+    }
+
+    /// Criterion 4: eliding a `bash` row is a complete no-op — byte-equal
+    /// serialization before and after.
+    #[test]
+    fn elide_binary_payload_leaves_bash_row_byte_equal() {
+        let mut msg = bash_baseline_message();
+        let before = serde_json::to_string(&msg).expect("serialize before");
+        msg.elide_binary_payload();
+        let after = serde_json::to_string(&msg).expect("serialize after");
+        assert_eq!(
+            before, after,
+            "eliding a non-view_image row must be a pure no-op"
+        );
+    }
+
+    /// Criterion 5: a row with `tool_result: None` (e.g. a `ToolCall` row,
+    /// even one tagged with the `view_image` tool name) must be untouched
+    /// and must not panic.
+    #[test]
+    fn elide_binary_payload_on_none_tool_result_is_noop_and_does_not_panic() {
+        let mut msg = ChatMessage::tool_call(view_image::NAME, "{}", None);
+        assert!(msg.tool_result.is_none(), "test setup sanity");
+        let before = serde_json::to_string(&msg).expect("serialize before");
+        msg.elide_binary_payload();
+        let after = serde_json::to_string(&msg).expect("serialize after");
+        assert_eq!(before, after, "a row with no tool_result must be untouched");
+    }
+
+    /// Criterion 6: eliding twice is byte-equal to eliding once — no
+    /// growth, no double-wrapping of the notice.
+    ///
+    /// This is `f(f(x)) == f(x)` applied to a *single* instance: elide once,
+    /// snapshot the serialization, elide the same instance again, and
+    /// compare. Using one instance (rather than constructing two separate
+    /// `ChatMessage`s) means there is exactly one `timestamp` value in play
+    /// by construction — the test can't flake on `Local::now()` skew
+    /// between two independent stamps.
+    #[test]
+    fn elide_binary_payload_is_a_byte_equal_fixpoint_when_applied_twice() {
+        let r = make_ref("shot.png");
+        let huge_data = "A".repeat(2_000_000);
+        let json = view_image_json(Some(&r), &huge_data);
+
+        let mut msg = ChatMessage::tool_result(view_image::NAME, "{}", &json, None);
+        msg.elide_binary_payload();
+        let once = serde_json::to_string(&msg).expect("serialize after first elision");
+
+        msg.elide_binary_payload();
+        let twice = serde_json::to_string(&msg).expect("serialize after second elision");
+
+        assert_eq!(
+            once, twice,
+            "eliding twice must be byte-equal to eliding once"
+        );
+    }
+
+    /// Criterion 7 + the "< 512 bytes" load-bearing requirement together:
+    /// the notice mentions the display name and stays well under 512
+    /// bytes.
+    #[test]
+    fn elide_binary_payload_notice_mentions_display_name_and_is_short() {
+        let r = make_ref("shot.png");
+        let huge_data = "A".repeat(2_000_000);
+        let json = view_image_json(Some(&r), &huge_data);
+        let mut msg = ChatMessage::tool_result(view_image::NAME, "{}", &json, None);
+
+        msg.elide_binary_payload();
+
+        let notice = msg
+            .tool_result
+            .expect("tool_result must remain Some after elision");
+        assert!(
+            notice.contains("shot.png"),
+            "elision notice must mention the display name; got: {notice}"
+        );
+        assert!(
+            notice.len() < 512,
+            "elision notice must be < 512 bytes, was {} bytes",
+            notice.len()
+        );
+    }
+
+    /// The "< 512 bytes" bound must hold for a display name the model
+    /// controls: `view_image` falls back to the entire `args.path` when the
+    /// path has no file name, and multi-byte characters make a
+    /// character-count cap alone insufficient. A 4 KB name of 4-byte
+    /// characters is the worst realistic case.
+    #[test]
+    fn elide_binary_payload_notice_stays_short_for_a_pathological_display_name() {
+        let r = ImageRef {
+            id: format!("{}.png", "ab".repeat(32)),
+            display_name: "\u{1f600}".repeat(1_000), // 4 KB of 4-byte chars
+        };
+        let json = view_image_json(Some(&r), &"A".repeat(50_000));
+        let mut msg = ChatMessage::tool_result(view_image::NAME, "{}", &json, None);
+
+        msg.elide_binary_payload();
+
+        let notice = msg
+            .tool_result
+            .expect("tool_result must remain Some after elision");
+        assert!(
+            notice.len() < 512,
+            "notice must stay bounded regardless of display name length, was {} bytes",
+            notice.len()
+        );
+        assert_eq!(
+            msg.images,
+            vec![r],
+            "truncation is display-only — the stored ref keeps the full name"
+        );
+    }
+
+    /// Criterion 11: elision must be pure — no filesystem, no spill-cache
+    /// consultation. Proven by fabricating a ref whose id is well-formed
+    /// (passes `image_cache::path_for`'s grammar) but backed by NO real
+    /// spilled file (never went through `image_cache::spill`). Elision
+    /// must still succeed and preserve the ref unchanged.
+    #[test]
+    fn elide_binary_payload_never_touches_filesystem_for_ref_with_no_spilled_file() {
+        // Grammar-valid (64 hex chars + known ext) but content-address of
+        // nothing this test ever wrote to the spill cache.
+        let bogus_id = format!("{}.png", "0".repeat(64));
+        let r = ImageRef {
+            id: bogus_id.clone(),
+            display_name: "phantom.png".to_string(),
+        };
+        let data = "A".repeat(50_000);
+        let json = view_image_json(Some(&r), &data);
+        let mut msg = ChatMessage::tool_result(view_image::NAME, "{}", &json, None);
+
+        msg.elide_binary_payload();
+
+        assert_eq!(
+            msg.images,
+            vec![r],
+            "elision must preserve a ref whose backing file does not exist on disk"
+        );
+        assert!(msg.tool_result.as_ref().is_some_and(|s| s.len() < 512));
+        assert_eq!(msg.content, "🖼 phantom.png");
+    }
+
+    /// Boundary: zero-length base64 `data`. Must elide cleanly (no
+    /// division-by-zero-style edge bugs in whatever size math the notice
+    /// computes) and must not panic.
+    #[test]
+    fn elide_binary_payload_on_zero_length_data_view_image_row_is_noop_safe() {
+        let r = make_ref("empty.png");
+        let json = view_image_json(Some(&r), "");
+        let mut msg = ChatMessage::tool_result(view_image::NAME, "{}", &json, None);
+
+        msg.elide_binary_payload();
+
+        assert_eq!(msg.images, vec![r]);
+        assert!(msg.tool_result.as_ref().is_some_and(|s| s.len() < 512));
+    }
+
+    // ── Serde compatibility ───────────────────────────────────────────────
+
+    /// Criterion 8: with `images` empty, serialization is BYTE-IDENTICAL
+    /// to today's pre-T4 output — no `"images":[]` key must appear.
+    #[test]
+    fn chat_message_with_empty_images_serializes_byte_identical_to_pre_t4_baseline() {
+        let msg = bash_baseline_message();
+        assert!(msg.images.is_empty(), "test setup sanity");
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, bash_message_json_baseline());
+        assert!(
+            !json.contains("images"),
+            "the images key must be entirely absent when empty; got: {json}"
+        );
+    }
+
+    /// Criterion 9: a message with a non-empty `images` round-trips
+    /// through serialize → deserialize, preserving every ref.
+    #[test]
+    fn chat_message_with_images_round_trips_through_serde() {
+        let r = make_ref("shot.png");
+        let json_payload = view_image_json(Some(&r), "AAAA");
+        let msg = ChatMessage::tool_result(view_image::NAME, "{}", &json_payload, None);
+        assert_eq!(msg.images, vec![r.clone()], "test setup sanity");
+
+        let wire = serde_json::to_string(&msg).expect("serialize");
+        let back: ChatMessage = serde_json::from_str(&wire).expect("deserialize");
+
+        assert_eq!(back.images, vec![r]);
+        assert_eq!(back.content, msg.content);
+    }
+
+    /// Criterion 10: an OLD `ChatMessage` JSON blob — no `images` key at
+    /// all, exactly what pre-T4 code persisted — must still deserialize,
+    /// yielding `images == []` via `#[serde(default)]`.
+    #[test]
+    fn deserializing_pre_t4_json_without_images_key_yields_empty_images() {
+        let baseline = bash_message_json_baseline();
+        assert!(
+            !baseline.contains("images"),
+            "sanity: baseline fixture must not itself contain an images key"
+        );
+        let parsed: ChatMessage =
+            serde_json::from_str(&baseline).expect("old JSON must still parse");
+        assert!(parsed.images.is_empty());
     }
 }
