@@ -794,6 +794,39 @@ mod tests {
         );
     }
 
+    // -- TEST PLAN #9: auto_resize defaults to true in BOTH serde and the
+    //    schema. Two sources of truth, deliberately duplicated (serde
+    //    cannot emit JSON Schema) — this is the anti-drift pin holding
+    //    them together.
+
+    #[tokio::test]
+    async fn auto_resize_defaults_to_true_in_serde_and_in_the_schema() {
+        let args: ViewImageArgs =
+            serde_json::from_str(r#"{"path":"x"}"#).expect("path alone must parse");
+        assert!(
+            args.auto_resize,
+            "auto_resize must default to true when the model omits it — \
+             #[serde(default)] on a bool defaults to false, so the named \
+             default_true fn is mandatory"
+        );
+
+        let def = ViewImageTool.definition(String::new()).await;
+        assert_eq!(
+            def.parameters["properties"]["auto_resize"]["default"],
+            serde_json::json!(true),
+            "schema must declare the same default the serde side uses, got: {}",
+            def.parameters
+        );
+        let required = def.parameters["required"]
+            .as_array()
+            .expect("required must be an array");
+        assert!(
+            !required.iter().any(|v| v.as_str() == Some("auto_resize")),
+            "auto_resize must be optional (defaultable), not required: {:?}",
+            required
+        );
+    }
+
     // -- 10. a spill failure must not fail the tool call -------------------
     //
     // We cannot honestly force `image_cache::spill` to fail from outside
@@ -825,6 +858,200 @@ mod tests {
         assert!(
             super::image_ref_from_output(&json).is_none(),
             "image_ref_from_output must return None for an output with no image_ref, not error"
+        );
+    }
+
+    // -- TEST PLAN #12: the Plain shape is byte-identical to the pre-change
+    //    contract. Guards the two protected pins against accidental drift.
+
+    #[test]
+    fn unresized_output_is_byte_identical_to_the_pre_change_shape() {
+        let out = ViewImageOutput::Plain(PlainImage {
+            kind: "image",
+            data: "AAAA".to_string(),
+            mime_type: "image/png".to_string(),
+            image_ref: None,
+        });
+        let json = serde_json::to_string(&out).expect("serialize");
+        assert_eq!(
+            json, r#"{"type":"image","data":"AAAA","mimeType":"image/png"}"#,
+            "Plain must serialize to exactly the pre-change shape when image_ref is None"
+        );
+
+        let out_with_ref = ViewImageOutput::Plain(PlainImage {
+            kind: "image",
+            data: "AAAA".to_string(),
+            mime_type: "image/png".to_string(),
+            image_ref: Some(ImageRef {
+                id: format!("{}.png", "ab".repeat(32)),
+                display_name: "shot.png".to_string(),
+            }),
+        });
+        let json_with_ref = serde_json::to_string(&out_with_ref).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json_with_ref).expect("valid json");
+        assert_eq!(value["type"], "image");
+        assert_eq!(value["data"], "AAAA");
+        assert_eq!(value["mimeType"], "image/png");
+        assert!(
+            value.get("response").is_none() && value.get("parts").is_none(),
+            "Plain must never carry response/parts — that's rig's discriminator for Resized: {value}"
+        );
+
+        let content = ToolResultContent::from_tool_output(json);
+        assert_eq!(content.len(), 1);
+        assert!(matches!(content.first(), ToolResultContent::Image(_)));
+    }
+
+    // -- TEST PLAN #13: the spilled artifact addresses the bytes actually
+    //    sent to the model — the id is a content address (§A5).
+
+    #[tokio::test]
+    async fn resized_image_ref_addresses_the_bytes_that_were_sent() {
+        use sha2::{Digest, Sha256};
+
+        // Bytes representing what fit_under_ceiling would hand back after a
+        // successful downscale: smaller than a "source" payload we compare
+        // against below.
+        let resized_bytes = unique_bytes("resized-ref-addressing", 512);
+        let source_bytes_larger = {
+            let mut v = unique_bytes("resized-ref-source", 4096);
+            v.extend(std::iter::repeat_n(0xAA, 4096));
+            v
+        };
+        assert!(
+            resized_bytes.len() < source_bytes_larger.len(),
+            "test setup: resized must be strictly smaller than source"
+        );
+
+        let display_name = format!("resized-ref-{}.png", uuid::Uuid::new_v4());
+        let image_ref = image_cache::spill(
+            &resized_bytes,
+            rig_core::completion::message::ImageMediaType::PNG,
+            &display_name,
+        )
+        .expect("spill must succeed for a supported media type");
+
+        let mut hasher = Sha256::new();
+        hasher.update(&resized_bytes);
+        let expected_id = format!(
+            "{}.png",
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            image_ref.id, expected_id,
+            "image_ref.id must be sha256(resized bytes) + extension"
+        );
+
+        let out = ViewImageOutput::Resized(ResizedImage {
+            response: "notice".to_string(),
+            parts: [PlainImage {
+                kind: "image",
+                data: STANDARD.encode(&resized_bytes),
+                mime_type: "image/png".to_string(),
+                image_ref: None,
+            }],
+            image_ref: Some(image_ref.clone()),
+        });
+
+        let decoded_data = STANDARD.decode(out.data()).expect("data decodes");
+        assert_eq!(
+            decoded_data, resized_bytes,
+            "the base64 data field must be the same bytes that were spilled"
+        );
+
+        let spilled_path =
+            image_cache::path_for(&image_ref.id).expect("path_for must resolve the id");
+        let on_disk = std::fs::read(&spilled_path).expect("read spilled file");
+        assert_eq!(
+            on_disk, decoded_data,
+            "the file on disk at path_for(id) must equal the bytes sent to the model"
+        );
+        assert!(
+            on_disk.len() < source_bytes_larger.len(),
+            "the spilled artifact must be the (smaller) resized bytes, not the (larger) source"
+        );
+
+        cleanup_spill(&image_ref.id);
+    }
+
+    // -- TEST PLAN #14: image_ref_from_output stays O(1) on the Resized
+    //    shape too — the whole reason parts is typed IgnoredAny.
+
+    #[test]
+    fn image_ref_from_output_is_allocation_free_on_the_resized_shape() {
+        // >= 4 MB of base64 payload inside `parts`, entirely synthetic — no
+        // fit_under_ceiling call needed, we only need a big JSON string.
+        let big_data = STANDARD.encode(vec![0u8; 4 * 1024 * 1024]);
+        let expected_ref = ImageRef {
+            id: format!("{}.png", "cd".repeat(32)),
+            display_name: "big-resized.png".to_string(),
+        };
+        let out = ViewImageOutput::Resized(ResizedImage {
+            response: "Auto-resized notice".to_string(),
+            parts: [PlainImage {
+                kind: "image",
+                data: big_data,
+                mime_type: "image/png".to_string(),
+                image_ref: None,
+            }],
+            image_ref: Some(expected_ref.clone()),
+        });
+        let json = serde_json::to_string(&out).expect("serialize");
+        assert!(
+            json.len() >= 4 * 1024 * 1024,
+            "fixture sanity check: serialized output should be at least 4 MB, was {} bytes",
+            json.len()
+        );
+
+        // `parts` is typed IgnoredAny on the deserialize side (PartialViewImageOutput),
+        // so this call must not materialise the multi-MB payload it skips over.
+        let extracted = super::image_ref_from_output(&json)
+            .expect("image_ref_from_output must extract the ref from the Resized shape");
+        assert_eq!(extracted, expected_ref);
+    }
+
+    // -- TEST PLAN #15: the hybrid shape's Anthropic wire form is
+    //    text-then-image, mirroring anthropic_image_tool_result_wire_shape_has_nested_source.
+
+    #[test]
+    fn anthropic_resized_tool_result_wire_shape_is_text_then_image() {
+        use rig_core::completion::message::{
+            Message as GenericMessage, ToolResult, ToolResultContent as RigToolResultContent,
+            UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+        use rig_core::providers::anthropic::completion::Message as AnthropicMessage;
+
+        let generic = GenericMessage::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "call_1".into(),
+                call_id: None,
+                content: OneOrMany::many(vec![
+                    RigToolResultContent::text("Auto-resized to fit the ceiling"),
+                    RigToolResultContent::image_base64(
+                        "AAAA",
+                        Some(rig_core::completion::message::ImageMediaType::PNG),
+                        None,
+                    ),
+                ])
+                .expect("two-element content"),
+            })),
+        };
+
+        let wire = AnthropicMessage::try_from(generic).expect("convert to anthropic message");
+        let value = serde_json::to_value(&wire).expect("serialize anthropic message");
+
+        assert_eq!(
+            value["content"][0]["content"][0]["type"], "text",
+            "the first tool-result content block must be text: {value}"
+        );
+        assert_eq!(
+            value["content"][0]["content"][1]["source"]["type"], "base64",
+            "the second tool-result content block must be a base64 image source: {value}"
         );
     }
 }
