@@ -3163,6 +3163,7 @@ dependencies = [
  "futures",
  "gethostname",
  "http",
+ "image",
  "insta",
  "mime_guess",
  "open",

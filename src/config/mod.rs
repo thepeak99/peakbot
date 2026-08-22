@@ -149,6 +149,13 @@ pub struct AnthropicConfig {
     /// provider; also gates `view_image` registration). `Some(b)` forces.
     #[serde(default)]
     pub vision: Option<bool>,
+    /// Maximum size, in **base64** bytes, of a single image in a tool result
+    /// on this endpoint — the number the API's limit actually counts, not
+    /// the raw file size. Default 5 MiB (api.anthropic.com's documented
+    /// ceiling). Proxies and gateways enforce their own; raise this to
+    /// match yours.
+    #[serde(default = "default_max_image_base64_bytes")]
+    pub max_image_base64_bytes: usize,
     /// Provider-wide override for Anthropic thinking-block capture.
     /// `None` (default) defers to the per-model entry; `Some(b)` forces —
     /// useful when a deployment 400s on thinking blocks and you want to
@@ -201,6 +208,14 @@ fn default_openai_url() -> String {
 
 fn default_anthropic_url() -> String {
     "https://api.anthropic.com".to_string()
+}
+
+/// api.anthropic.com's documented image-size ceiling, measured in base64
+/// bytes (the number the API actually counts). Safe-by-default: works on
+/// the canonical endpoint out of the box; proxies that allow more raise
+/// `max_image_base64_bytes` explicitly.
+fn default_max_image_base64_bytes() -> usize {
+    5 * 1024 * 1024
 }
 
 fn default_llamacpp_url() -> String {
@@ -3840,6 +3855,57 @@ api_key: "sk-test"
         let cfg_default: AnthropicConfig =
             serde_yaml::from_str(yaml_default).expect("legacy config without field parses");
         assert_eq!(cfg_default.display_reasoning, None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // `max_image_base64_bytes` on `AnthropicConfig` (PR-A §A2, TEST PLAN #17).
+    //
+    // Measured on the base64 length, not raw bytes — the number the API's
+    // image-size limit actually counts. Default 5 MiB (api.anthropic.com's
+    // documented ceiling); a typo'd key must be a hard startup error, not a
+    // silent default, per `#[serde(deny_unknown_fields)]` on the struct.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn anthropic_max_image_base64_bytes_defaults_to_5_mib() {
+        let yaml_absent = r#"
+model: "claude-3-5-sonnet-latest"
+api_key: "sk-test"
+"#;
+        let cfg: AnthropicConfig =
+            serde_yaml::from_str(yaml_absent).expect("config without the key must still parse");
+        assert_eq!(
+            cfg.max_image_base64_bytes,
+            5 * 1024 * 1024,
+            "absent key must default to 5 MiB"
+        );
+
+        let yaml_override = r#"
+model: "claude-3-5-sonnet-latest"
+api_key: "sk-test"
+max_image_base64_bytes: 10485760
+"#;
+        let cfg_override: AnthropicConfig =
+            serde_yaml::from_str(yaml_override).expect("explicit override must parse");
+        assert_eq!(
+            cfg_override.max_image_base64_bytes,
+            10 * 1024 * 1024,
+            "an explicit value must override the default"
+        );
+
+        let yaml_typo = r#"
+model: "claude-3-5-sonnet-latest"
+api_key: "sk-test"
+max_image_bytes: 10485760
+"#;
+        let err = serde_yaml::from_str::<AnthropicConfig>(yaml_typo).expect_err(
+            "a typo'd key (max_image_bytes) must be a hard error, not silently ignored",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_image_bytes") || msg.to_lowercase().contains("unknown field"),
+            "error should point at the unrecognized key: {msg}"
+        );
     }
 
     // =========================================================================

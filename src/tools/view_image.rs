@@ -3,6 +3,7 @@
 //! registration is gated to that provider.
 
 use crate::image_cache::{self, ImageRef};
+use crate::tools::image_fit::{self, fit_under_ceiling};
 use crate::vision::{AttachmentError, ImageSource, load_image_from_path};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -21,18 +22,58 @@ pub const NAME: &str = "view_image";
 pub enum ViewImageError {
     #[error(transparent)]
     Load(#[from] AttachmentError),
+    /// `auto_resize: false` on an image whose base64 payload exceeds the
+    /// endpoint's ceiling (§A1/A2). Model-visible: rig feeds `e.to_string()`
+    /// back as the tool result, so the model can read this and retry.
+    #[error(
+        "image is too large for this endpoint: {path} encodes to {base64_bytes} base64 bytes, \
+         over the {ceiling} byte limit. Re-run with auto_resize true (the default) to downscale \
+         it automatically."
+    )]
+    TooLarge {
+        path: String,
+        base64_bytes: usize,
+        ceiling: usize,
+    },
+    /// `fit_under_ceiling` gave up (unsupported format, undecodable bytes,
+    /// codec failure, or an unattainable ceiling). Model-visible so it can
+    /// see the concrete reason instead of a generic failure.
+    #[error("could not fit image under this endpoint's ceiling: {0}")]
+    Fit(#[from] image_fit::FitError),
 }
 
 #[derive(Deserialize)]
 pub struct ViewImageArgs {
     /// Path to the image file. Supports `/abs`, `./rel`, and `~/home` forms.
     path: String,
+    /// Models routinely omit optional params, so the serde default and the
+    /// schema default must both be `true` — see `auto_resize_defaults_to_true_in_serde_and_in_the_schema`.
+    #[serde(default = "default_true")]
+    auto_resize: bool,
 }
 
-/// rig serializes a tool's `Output` to JSON via serde. These field names and
-/// the `type: "image"` tag are the exact contract `from_tool_output` parses.
+/// `#[serde(default)]` on a `bool` yields `false`; this named fn is what
+/// actually makes the default `true`.
+const fn default_true() -> bool {
+    true
+}
+
+/// rig parses two shapes (`ToolResultContent::from_tool_output`). `Plain`
+/// yields exactly one Image block — today's contract, byte-identical.
+/// `Resized` yields `[Text, Image]`, the only channel through which a
+/// notice actually reaches the model (an extra field bolted onto `Plain`
+/// is silently dropped by rig, never seen by the model).
 #[derive(Debug, Serialize)]
-pub struct ViewImageOutput {
+#[serde(untagged)]
+pub enum ViewImageOutput {
+    Plain(PlainImage),
+    Resized(ResizedImage),
+}
+
+/// These field names and the `type: "image"` tag are the exact contract
+/// `from_tool_output` parses.
+#[derive(Debug, Serialize)]
+pub struct PlainImage {
     #[serde(rename = "type")]
     kind: &'static str,
     data: String,
@@ -42,8 +83,62 @@ pub struct ViewImageOutput {
     image_ref: Option<ImageRef>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct ViewImageTool;
+/// `response` becomes rig's Text block; `parts[0]` becomes the Image block.
+#[derive(Debug, Serialize)]
+pub struct ResizedImage {
+    response: String,
+    parts: [PlainImage; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_ref: Option<ImageRef>,
+}
+
+/// Test-only ergonomic accessors — production code builds/matches the enum
+/// directly (`call`), but the fixtures below read it back a lot.
+#[cfg(test)]
+impl ViewImageOutput {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Plain(p) => p.kind,
+            Self::Resized(r) => r.parts[0].kind,
+        }
+    }
+
+    fn data(&self) -> &str {
+        match self {
+            Self::Plain(p) => &p.data,
+            Self::Resized(r) => &r.parts[0].data,
+        }
+    }
+
+    fn mime_type(&self) -> &str {
+        match self {
+            Self::Plain(p) => &p.mime_type,
+            Self::Resized(r) => &r.parts[0].mime_type,
+        }
+    }
+
+    fn image_ref(&self) -> Option<ImageRef> {
+        match self {
+            Self::Plain(p) => p.image_ref.clone(),
+            Self::Resized(r) => r.image_ref.clone(),
+        }
+    }
+}
+
+/// The tool's construction site (`providers/mod.rs`) is the only place that
+/// ever builds one, and nothing (de)serialises it — a bare struct held only
+/// long enough to satisfy `Tool`.
+pub struct ViewImageTool {
+    max_image_base64_bytes: usize,
+}
+
+impl ViewImageTool {
+    pub fn new(max_image_base64_bytes: usize) -> Self {
+        Self {
+            max_image_base64_bytes,
+        }
+    }
+}
 
 impl Tool for ViewImageTool {
     const NAME: &'static str = NAME;
@@ -59,7 +154,9 @@ impl Tool for ViewImageTool {
                 capture — rather than reading its raw bytes as text. Supported formats: PNG, JPEG, \
                 GIF, WEBP (max 10 MB). Provide a filesystem path (`/abs/path.png`, `./rel.png`, or \
                 `~/path.png`). The image is fed directly into your vision context. It is loaded \
-                for the current turn only; call this tool again later if you need to see it again."
+                for the current turn only; call this tool again later if you need to see it again. \
+                Oversized images are downscaled to fit automatically; pass auto_resize:false to \
+                send the original unmodified."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -67,6 +164,11 @@ impl Tool for ViewImageTool {
                     "path": {
                         "type": "string",
                         "description": "Filesystem path to the image (e.g. /tmp/shot.png, ./diagram.jpg, ~/pics/ui.webp)."
+                    },
+                    "auto_resize": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Downscale the image if it would exceed this endpoint's image size limit (default true). Set false to send the file untouched; an oversized file then fails with an error instead."
                     }
                 },
                 "required": ["path"]
@@ -79,21 +181,40 @@ impl Tool for ViewImageTool {
         // media-type inference, and the format allowlist all live there.
         let attachment = load_image_from_path(Path::new(&args.path))?;
 
-        let (data, mime_type, image_ref) = match attachment.source {
-            ImageSource::Base64 { bytes, media_type } => {
-                let mime_type = media_type.to_mime_type().to_string();
-                let display_name = Path::new(&args.path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| args.path.clone());
-                // A spill failure (unsupported type, I/O error, ...) must
-                // never fail the call — the model still gets the image.
-                let image_ref = image_cache::spill(&bytes, media_type, &display_name);
-                (STANDARD.encode(bytes), mime_type, image_ref)
-            }
+        let (bytes, media_type) = match attachment.source {
+            ImageSource::Base64 { bytes, media_type } => (bytes, media_type),
             // load_image_from_path only ever returns Base64.
             ImageSource::Url(_) => unreachable!("this should never happen"),
         };
+
+        // auto_resize:false must refuse an oversized image without ever
+        // decoding it; fit_under_ceiling has no notion of auto_resize, so
+        // the gate that turns "over ceiling" into a hard error lives here.
+        if !args.auto_resize
+            && let Some(base64_bytes) = base64::encoded_len(bytes.len(), true)
+            && base64_bytes > self.max_image_base64_bytes
+        {
+            return Err(ViewImageError::TooLarge {
+                path: args.path,
+                base64_bytes,
+                ceiling: self.max_image_base64_bytes,
+            });
+        }
+
+        let mime_type = media_type.to_mime_type().to_string();
+        let fitted = fit_under_ceiling(bytes, media_type.clone(), self.max_image_base64_bytes)?;
+
+        let display_name = Path::new(&args.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| args.path.clone());
+        // image_ref.id is a content address (sha256) of these bytes: spill
+        // over the bytes we're about to send, not the source file, or the
+        // id would address a payload nobody — model or GET /images/{id} —
+        // ever actually sees (§A5). A spill failure must never fail the
+        // call — the model still gets the image.
+        let image_ref = image_cache::spill(&fitted.bytes, media_type, &display_name);
+        let data = STANDARD.encode(&fitted.bytes);
 
         tracing::info!(
             target: "peakbot",
@@ -102,13 +223,50 @@ impl Tool for ViewImageTool {
             "view_image tool executed"
         );
 
-        Ok(ViewImageOutput {
-            kind: "image",
-            data,
-            mime_type,
-            image_ref,
-        })
+        let output = match fitted.resize {
+            None => ViewImageOutput::Plain(PlainImage {
+                kind: "image",
+                data,
+                mime_type,
+                image_ref,
+            }),
+            Some(report) => ViewImageOutput::Resized(ResizedImage {
+                response: resize_notice(&report, self.max_image_base64_bytes, &mime_type),
+                parts: [PlainImage {
+                    kind: "image",
+                    data,
+                    mime_type,
+                    image_ref: None,
+                }],
+                image_ref,
+            }),
+        };
+
+        Ok(output)
     }
+}
+
+/// The exact wording is specified verbatim (§A4): one line, no `"` and no
+/// newline — rig does `response.to_string()` on the JSON string, so any
+/// quote or newline here would arrive escaped in front of the model.
+fn resize_notice(report: &image_fit::ResizeReport, ceiling: usize, mime_type: &str) -> String {
+    let format_name = mime_type.strip_prefix("image/").unwrap_or(mime_type);
+    format!(
+        "Auto-resized to fit this endpoint's image ceiling ({}): {}x{} {format_name}, {} -> \
+         {}x{} {format_name}, {}. Fine detail may be lost; pass auto_resize false to send the \
+         original unmodified.",
+        format_mb_base64(ceiling),
+        report.from.0,
+        report.from.1,
+        format_mb_base64(report.from_b64),
+        report.to.0,
+        report.to.1,
+        format_mb_base64(report.to_b64),
+    )
+}
+
+fn format_mb_base64(bytes: usize) -> String {
+    format!("{:.2} MB base64", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Mirrors only the fields we need from a serialized `ViewImageOutput`.
@@ -118,6 +276,8 @@ impl Tool for ViewImageTool {
 struct PartialViewImageOutput {
     #[serde(default, rename = "data")]
     _data: serde::de::IgnoredAny,
+    #[serde(default, rename = "parts")]
+    _parts: serde::de::IgnoredAny,
     #[serde(default)]
     image_ref: Option<ImageRef>,
 }
@@ -139,6 +299,10 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
+    /// Matches `AnthropicConfig`'s default (`config::mod.rs`) — none of
+    /// these fixtures approach it, so its exact value is irrelevant to them.
+    const TEST_CEILING: usize = 5 * 1024 * 1024;
+
     fn write_png(bytes: &[u8]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "peakbot-view-image-{}-{}.png",
@@ -153,15 +317,16 @@ mod tests {
     #[tokio::test]
     async fn loads_image_as_image_json() {
         let path = write_png(b"fake png bytes");
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
-        assert_eq!(out.kind, "image");
-        assert_eq!(out.mime_type, "image/png");
-        assert_eq!(STANDARD.decode(out.data).unwrap(), b"fake png bytes");
+        assert_eq!(out.kind(), "image");
+        assert_eq!(out.mime_type(), "image/png");
+        assert_eq!(STANDARD.decode(out.data()).unwrap(), b"fake png bytes");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -171,9 +336,10 @@ mod tests {
     #[tokio::test]
     async fn output_roundtrips_into_rig_image_tool_result() {
         let path = write_png(b"x");
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
@@ -185,6 +351,74 @@ mod tests {
             "expected rig to parse our output as an Image tool result"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE load-bearing test (TEST PLAN #11). rig's `from_tool_output` drops
+    /// any extra field bolted onto the plain `{type, data, mimeType}` shape
+    /// (message.rs:913-988) — a `notice` field there would silently never
+    /// reach the model. Only the `[response, parts]` hybrid shape does. This
+    /// test proves a `Resized` output actually produces `[Text, Image]`
+    /// model-visible content, not just JSON that happens to contain the
+    /// right words. A `notice` field bolted onto the plain shape fails here
+    /// with `content.len() == 1`.
+    #[test]
+    fn resized_output_reaches_the_model_as_text_plus_image() {
+        let notice = "Auto-resized to fit this endpoint's image ceiling (5.00 MB base64): \
+            4128x2208 png, 11.12 MB base64 -> 1568x839 png, 1.61 MB base64. Fine detail may be \
+            lost; pass auto_resize false to send the original unmodified."
+            .to_string();
+        let out = ViewImageOutput::Resized(ResizedImage {
+            response: notice,
+            parts: [PlainImage {
+                kind: "image",
+                data: STANDARD.encode(b"resized png bytes"),
+                mime_type: "image/png".to_string(),
+                image_ref: None,
+            }],
+            image_ref: None,
+        });
+        let json = serde_json::to_string(&out).expect("serialize");
+
+        let content = ToolResultContent::from_tool_output(json);
+        assert_eq!(
+            content.len(),
+            2,
+            "a Resized output must reach the model as exactly two blocks: Text then Image"
+        );
+
+        let ToolResultContent::Text(text) = content.first() else {
+            panic!(
+                "content[0] must be a Text block, got: {:?}",
+                content.first()
+            );
+        };
+        assert!(
+            text.text.contains("4128x2208"),
+            "notice must carry the original dimensions: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("1568x839"),
+            "notice must carry the new dimensions: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("5.00 MB"),
+            "notice must carry the ceiling: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("auto_resize"),
+            "notice must mention the auto_resize off-switch: {}",
+            text.text
+        );
+
+        let rest = content.rest();
+        let second = rest.first().expect("a second content block");
+        assert!(
+            matches!(second, ToolResultContent::Image(_)),
+            "content[1] must be an Image block, got: {second:?}"
+        );
     }
 
     /// Pin the wire shape: rig 0.36 flattened the source as a duplicate
@@ -227,9 +461,10 @@ mod tests {
 
     #[tokio::test]
     async fn missing_file_errors() {
-        let err = ViewImageTool
+        let err = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: "/does/not/exist-view-image-xyz.png".to_string(),
+                auto_resize: true,
             })
             .await
             .expect_err("should error");
@@ -247,9 +482,10 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"hi").unwrap();
-        let err = ViewImageTool
+        let err = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect_err("should error");
@@ -258,6 +494,38 @@ mod tests {
             ViewImageError::Load(AttachmentError::UnsupportedMediaType(_))
         ));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -- TEST PLAN #10: auto_resize: false on an oversized image must fail
+    //    fast with a model-readable, actionable error (§A1).
+    //
+    // NOT driven through ViewImageTool::call: the ceiling check needs a
+    // configured ceiling (ViewImageTool::new(max_image_base64_bytes), §A6),
+    // and wiring that into call()/providers/mod.rs is explicitly out of
+    // scope for this RED-tests pass. This pins the error type's contract
+    // directly — see GAPS in the report for the full end-to-end version.
+
+    #[test]
+    fn auto_resize_false_on_oversized_image_errors_without_calling_the_model() {
+        let err = ViewImageError::TooLarge {
+            path: "/tmp/x.png".to_string(),
+            base64_bytes: 11_663_068,
+            ceiling: 5 * 1024 * 1024,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auto_resize"),
+            "error must mention auto_resize as the off-switch/retry path: {msg}"
+        );
+        assert!(
+            msg.contains("11663068"),
+            "error must contain the actual base64 byte count: {msg}"
+        );
+        assert!(
+            msg.contains("5242880"),
+            "error must contain the ceiling byte count: {msg}"
+        );
+        assert!(matches!(err, ViewImageError::TooLarge { .. }));
     }
 
     // ==================================================================
@@ -369,16 +637,16 @@ mod tests {
             &format!("byte-identical-{}", uuid::Uuid::new_v4()),
         );
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
 
         let image_ref = out
-            .image_ref
-            .clone()
+            .image_ref()
             .expect("expected image_ref to be Some after a successful spill");
         let spilled_path = image_cache::path_for(&image_ref.id)
             .expect("image_cache::path_for should resolve the id the tool just spilled");
@@ -404,22 +672,23 @@ mod tests {
             &format!("full-payload-{}", uuid::Uuid::new_v4()),
         );
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
 
-        assert_eq!(out.kind, "image");
-        assert_eq!(out.mime_type, "image/jpeg");
+        assert_eq!(out.kind(), "image");
+        assert_eq!(out.mime_type(), "image/jpeg");
         assert_eq!(
-            STANDARD.decode(&out.data).expect("base64 decode"),
+            STANDARD.decode(out.data()).expect("base64 decode"),
             bytes,
             "data must still carry the FULL image, unabridged, after adding image_ref"
         );
 
-        if let Some(r) = &out.image_ref {
+        if let Some(r) = out.image_ref() {
             cleanup_spill(&r.id);
         }
         cleanup_source(&path);
@@ -435,17 +704,15 @@ mod tests {
         // from one equal to just the basename (correct).
         let path = write_temp_image(&bytes, "png", true, "shot");
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
 
-        let image_ref = out
-            .image_ref
-            .clone()
-            .expect("expected image_ref to be Some");
+        let image_ref = out.image_ref().expect("expected image_ref to be Some");
         assert_eq!(
             image_ref.display_name, "shot.png",
             "display_name must be the source file's basename, not the full path"
@@ -471,17 +738,15 @@ mod tests {
         let path = write_temp_image(&bytes, "png", true, stem);
         let expected_basename = path.file_name().unwrap().to_string_lossy().into_owned();
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
 
-        let image_ref = out
-            .image_ref
-            .clone()
-            .expect("expected image_ref to be Some");
+        let image_ref = out.image_ref().expect("expected image_ref to be Some");
         assert_eq!(
             image_ref.display_name, expected_basename,
             "unicode basenames must pass through to display_name unmodified"
@@ -503,24 +768,26 @@ mod tests {
             &format!("dedupe-{}", uuid::Uuid::new_v4()),
         );
 
-        let first = ViewImageTool
+        let first = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("first call should load");
-        let second = ViewImageTool
+        let second = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("second call should load");
 
         let first_ref = first
-            .image_ref
+            .image_ref()
             .expect("first call's image_ref should be Some");
         let second_ref = second
-            .image_ref
+            .image_ref()
             .expect("second call's image_ref should be Some");
         assert_eq!(
             first_ref.id, second_ref.id,
@@ -545,16 +812,14 @@ mod tests {
             &format!("large-{}", uuid::Uuid::new_v4()),
         );
 
-        let out = ViewImageTool
+        let out = ViewImageTool::new(TEST_CEILING)
             .call(ViewImageArgs {
                 path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
             })
             .await
             .expect("should load");
-        let expected_ref = out
-            .image_ref
-            .clone()
-            .expect("expected image_ref to be Some");
+        let expected_ref = out.image_ref().expect("expected image_ref to be Some");
 
         let json = serde_json::to_string(&out).expect("serialize output");
         assert!(
@@ -609,12 +874,12 @@ mod tests {
 
     #[test]
     fn image_ref_omitted_from_json_when_none_not_serialized_as_null() {
-        let out = ViewImageOutput {
+        let out = ViewImageOutput::Plain(PlainImage {
             kind: "image",
             data: "AAAA".to_string(),
             mime_type: "image/png".to_string(),
             image_ref: None,
-        };
+        });
         let json = serde_json::to_string(&out).expect("serialize");
         assert!(
             !json.contains("image_ref"),
@@ -625,7 +890,7 @@ mod tests {
 
     #[test]
     fn image_ref_present_in_json_with_id_and_display_name_when_some() {
-        let out = ViewImageOutput {
+        let out = ViewImageOutput::Plain(PlainImage {
             kind: "image",
             data: "AAAA".to_string(),
             mime_type: "image/png".to_string(),
@@ -633,7 +898,7 @@ mod tests {
                 id: format!("{}.png", "ab".repeat(32)),
                 display_name: "shot.png".to_string(),
             }),
-        };
+        });
         let value: serde_json::Value = serde_json::to_value(&out).expect("to_value");
         assert_eq!(
             value["image_ref"]["display_name"].as_str(),
@@ -646,12 +911,49 @@ mod tests {
 
     #[tokio::test]
     async fn definition_description_mentions_reloading_for_current_turn() {
-        let def = ViewImageTool.definition(String::new()).await;
+        let def = ViewImageTool::new(TEST_CEILING)
+            .definition(String::new())
+            .await;
         assert!(
             def.description.contains("current turn"),
             "description should tell the model the image is loaded for the current turn \
              and that it can call the tool again later to re-load it; got: {}",
             def.description
+        );
+    }
+
+    // -- TEST PLAN #9: auto_resize defaults to true in BOTH serde and the
+    //    schema. Two sources of truth, deliberately duplicated (serde
+    //    cannot emit JSON Schema) — this is the anti-drift pin holding
+    //    them together.
+
+    #[tokio::test]
+    async fn auto_resize_defaults_to_true_in_serde_and_in_the_schema() {
+        let args: ViewImageArgs =
+            serde_json::from_str(r#"{"path":"x"}"#).expect("path alone must parse");
+        assert!(
+            args.auto_resize,
+            "auto_resize must default to true when the model omits it — \
+             #[serde(default)] on a bool defaults to false, so the named \
+             default_true fn is mandatory"
+        );
+
+        let def = ViewImageTool::new(TEST_CEILING)
+            .definition(String::new())
+            .await;
+        assert_eq!(
+            def.parameters["properties"]["auto_resize"]["default"],
+            serde_json::json!(true),
+            "schema must declare the same default the serde side uses, got: {}",
+            def.parameters
+        );
+        let required = def.parameters["required"]
+            .as_array()
+            .expect("required must be an array");
+        assert!(
+            !required.iter().any(|v| v.as_str() == Some("auto_resize")),
+            "auto_resize must be optional (defaultable), not required: {:?}",
+            required
         );
     }
 
@@ -669,12 +971,12 @@ mod tests {
 
     #[test]
     fn output_with_none_image_ref_still_serializes_and_round_trips_and_extracts_none() {
-        let out = ViewImageOutput {
+        let out = ViewImageOutput::Plain(PlainImage {
             kind: "image",
             data: STANDARD.encode(b"still a real image payload"),
             mime_type: "image/png".to_string(),
             image_ref: None,
-        };
+        });
         let json = serde_json::to_string(&out).expect("serialize");
 
         let content = ToolResultContent::from_tool_output(json.clone());
@@ -687,5 +989,360 @@ mod tests {
             super::image_ref_from_output(&json).is_none(),
             "image_ref_from_output must return None for an output with no image_ref, not error"
         );
+    }
+
+    // -- TEST PLAN #12: the Plain shape is byte-identical to the pre-change
+    //    contract. Guards the two protected pins against accidental drift.
+
+    #[test]
+    fn unresized_output_is_byte_identical_to_the_pre_change_shape() {
+        let out = ViewImageOutput::Plain(PlainImage {
+            kind: "image",
+            data: "AAAA".to_string(),
+            mime_type: "image/png".to_string(),
+            image_ref: None,
+        });
+        let json = serde_json::to_string(&out).expect("serialize");
+        assert_eq!(
+            json, r#"{"type":"image","data":"AAAA","mimeType":"image/png"}"#,
+            "Plain must serialize to exactly the pre-change shape when image_ref is None"
+        );
+
+        let out_with_ref = ViewImageOutput::Plain(PlainImage {
+            kind: "image",
+            data: "AAAA".to_string(),
+            mime_type: "image/png".to_string(),
+            image_ref: Some(ImageRef {
+                id: format!("{}.png", "ab".repeat(32)),
+                display_name: "shot.png".to_string(),
+            }),
+        });
+        let json_with_ref = serde_json::to_string(&out_with_ref).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json_with_ref).expect("valid json");
+        assert_eq!(value["type"], "image");
+        assert_eq!(value["data"], "AAAA");
+        assert_eq!(value["mimeType"], "image/png");
+        assert!(
+            value.get("response").is_none() && value.get("parts").is_none(),
+            "Plain must never carry response/parts — that's rig's discriminator for Resized: {value}"
+        );
+
+        let content = ToolResultContent::from_tool_output(json);
+        assert_eq!(content.len(), 1);
+        assert!(matches!(content.first(), ToolResultContent::Image(_)));
+    }
+
+    // -- TEST PLAN #13: the spilled artifact addresses the bytes actually
+    //    sent to the model — the id is a content address (§A5).
+
+    #[tokio::test]
+    async fn resized_image_ref_addresses_the_bytes_that_were_sent() {
+        use sha2::{Digest, Sha256};
+
+        // Bytes representing what fit_under_ceiling would hand back after a
+        // successful downscale: smaller than a "source" payload we compare
+        // against below.
+        let resized_bytes = unique_bytes("resized-ref-addressing", 512);
+        let source_bytes_larger = {
+            let mut v = unique_bytes("resized-ref-source", 4096);
+            v.extend(std::iter::repeat_n(0xAA, 4096));
+            v
+        };
+        assert!(
+            resized_bytes.len() < source_bytes_larger.len(),
+            "test setup: resized must be strictly smaller than source"
+        );
+
+        let display_name = format!("resized-ref-{}.png", uuid::Uuid::new_v4());
+        let image_ref = image_cache::spill(
+            &resized_bytes,
+            rig_core::completion::message::ImageMediaType::PNG,
+            &display_name,
+        )
+        .expect("spill must succeed for a supported media type");
+
+        let mut hasher = Sha256::new();
+        hasher.update(&resized_bytes);
+        let expected_id = format!(
+            "{}.png",
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            image_ref.id, expected_id,
+            "image_ref.id must be sha256(resized bytes) + extension"
+        );
+
+        let out = ViewImageOutput::Resized(ResizedImage {
+            response: "notice".to_string(),
+            parts: [PlainImage {
+                kind: "image",
+                data: STANDARD.encode(&resized_bytes),
+                mime_type: "image/png".to_string(),
+                image_ref: None,
+            }],
+            image_ref: Some(image_ref.clone()),
+        });
+
+        let decoded_data = STANDARD.decode(out.data()).expect("data decodes");
+        assert_eq!(
+            decoded_data, resized_bytes,
+            "the base64 data field must be the same bytes that were spilled"
+        );
+
+        let spilled_path =
+            image_cache::path_for(&image_ref.id).expect("path_for must resolve the id");
+        let on_disk = std::fs::read(&spilled_path).expect("read spilled file");
+        assert_eq!(
+            on_disk, decoded_data,
+            "the file on disk at path_for(id) must equal the bytes sent to the model"
+        );
+        assert!(
+            on_disk.len() < source_bytes_larger.len(),
+            "the spilled artifact must be the (smaller) resized bytes, not the (larger) source"
+        );
+
+        cleanup_spill(&image_ref.id);
+    }
+
+    // -- TEST PLAN #14: image_ref_from_output stays O(1) on the Resized
+    //    shape too — the whole reason parts is typed IgnoredAny.
+
+    #[test]
+    fn image_ref_from_output_is_allocation_free_on_the_resized_shape() {
+        // >= 4 MB of base64 payload inside `parts`, entirely synthetic — no
+        // fit_under_ceiling call needed, we only need a big JSON string.
+        let big_data = STANDARD.encode(vec![0u8; 4 * 1024 * 1024]);
+        let expected_ref = ImageRef {
+            id: format!("{}.png", "cd".repeat(32)),
+            display_name: "big-resized.png".to_string(),
+        };
+        let out = ViewImageOutput::Resized(ResizedImage {
+            response: "Auto-resized notice".to_string(),
+            parts: [PlainImage {
+                kind: "image",
+                data: big_data,
+                mime_type: "image/png".to_string(),
+                image_ref: None,
+            }],
+            image_ref: Some(expected_ref.clone()),
+        });
+        let json = serde_json::to_string(&out).expect("serialize");
+        assert!(
+            json.len() >= 4 * 1024 * 1024,
+            "fixture sanity check: serialized output should be at least 4 MB, was {} bytes",
+            json.len()
+        );
+
+        // `parts` is typed IgnoredAny on the deserialize side (PartialViewImageOutput),
+        // so this call must not materialise the multi-MB payload it skips over.
+        let extracted = super::image_ref_from_output(&json)
+            .expect("image_ref_from_output must extract the ref from the Resized shape");
+        assert_eq!(extracted, expected_ref);
+    }
+
+    // -- TEST PLAN #15: the hybrid shape's Anthropic wire form is
+    //    text-then-image, mirroring anthropic_image_tool_result_wire_shape_has_nested_source.
+
+    #[test]
+    fn anthropic_resized_tool_result_wire_shape_is_text_then_image() {
+        use rig_core::completion::message::{
+            Message as GenericMessage, ToolResult, ToolResultContent as RigToolResultContent,
+            UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+        use rig_core::providers::anthropic::completion::Message as AnthropicMessage;
+
+        let generic = GenericMessage::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "call_1".into(),
+                call_id: None,
+                content: OneOrMany::many(vec![
+                    RigToolResultContent::text("Auto-resized to fit the ceiling"),
+                    RigToolResultContent::image_base64(
+                        "AAAA",
+                        Some(rig_core::completion::message::ImageMediaType::PNG),
+                        None,
+                    ),
+                ])
+                .expect("two-element content"),
+            })),
+        };
+
+        let wire = AnthropicMessage::try_from(generic).expect("convert to anthropic message");
+        let value = serde_json::to_value(&wire).expect("serialize anthropic message");
+
+        assert_eq!(
+            value["content"][0]["content"][0]["type"], "text",
+            "the first tool-result content block must be text: {value}"
+        );
+        assert_eq!(
+            value["content"][0]["content"][1]["source"]["type"], "base64",
+            "the second tool-result content block must be a base64 image source: {value}"
+        );
+    }
+
+    // ==================================================================
+    // End-to-end proof (§A6 wiring): every test above either constructs
+    // `ViewImageOutput` directly or drives `call()` on a tiny under-ceiling
+    // fixture — none of them exercises `fit_under_ceiling` through the real
+    // tool. These two do: a real, decodable, oversized PNG through
+    // `ViewImageTool::call`, both with and without `auto_resize`.
+    // ==================================================================
+
+    /// A real, decodable PNG whose base64 payload exceeds `ceiling`: a flat
+    /// `width`x`height` image (cheap to encode) with private ancillary
+    /// chunks spliced in before IEND. PNG decoders skip unknown
+    /// non-critical chunks, so the file still decodes, but only re-encoding
+    /// (which drops unknown chunks) can shrink it back down.
+    fn oversized_png(width: u32, height: u32, ceiling: usize) -> Vec<u8> {
+        use image::{ImageFormat, Rgb, RgbImage};
+
+        let img = RgbImage::from_pixel(width, height, Rgb([12, 34, 56]));
+        let mut base = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut base), ImageFormat::Png)
+            .expect("encode base png");
+
+        let iend = base.len() - 12; // trailing IEND: 4 len + 4 type + 4 crc
+        let mut out = base[..iend].to_vec();
+        let mib_needed = ceiling / (1024 * 1024) + 2;
+        for i in 0..mib_needed {
+            let data = vec![0x5Au8 ^ (i as u8); 1_048_576];
+            out.extend(png_chunk(b"Pkbj", &data));
+        }
+        out.extend_from_slice(&base[iend..]);
+        out
+    }
+
+    fn png_chunk(typ: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::with_capacity(12 + data.len());
+        chunk.extend((data.len() as u32).to_be_bytes());
+        chunk.extend(typ);
+        chunk.extend(data);
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(typ);
+        crc_input.extend_from_slice(data);
+        chunk.extend(crc32(&crc_input).to_be_bytes());
+        chunk
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (0xFFFF_FFFF ^ (crc & 1)));
+            }
+        }
+        !crc
+    }
+
+    #[tokio::test]
+    async fn oversized_image_auto_resize_true_reaches_model_as_text_plus_image_end_to_end() {
+        let ceiling = 1024 * 1024; // 1 MiB — small enough to keep the fixture fast
+        let bytes = oversized_png(2000, 1200, ceiling);
+        assert!(
+            base64::encoded_len(bytes.len(), true).expect("len fits usize") > ceiling,
+            "fixture must start over the ceiling"
+        );
+        // What `fit_under_ceiling` will compute for these exact bytes — used
+        // to assert on the *real* dimensions rather than guessing them.
+        let expected_report = fit_under_ceiling(
+            bytes.clone(),
+            rig_core::completion::message::ImageMediaType::PNG,
+            ceiling,
+        )
+        .expect("fixture must fit")
+        .resize
+        .expect("fixture must require a resize");
+        let path = write_png(&bytes);
+
+        let out = ViewImageTool::new(ceiling)
+            .call(ViewImageArgs {
+                path: path.to_string_lossy().into_owned(),
+                auto_resize: true,
+            })
+            .await
+            .expect("an oversized image with auto_resize:true must still succeed");
+
+        let json = serde_json::to_string(&out).expect("serialize");
+        let content = ToolResultContent::from_tool_output(json);
+        assert_eq!(
+            content.len(),
+            2,
+            "a resized output must reach the model as exactly [Text, Image]"
+        );
+
+        let ToolResultContent::Text(text) = content.first() else {
+            panic!(
+                "content[0] must be a Text block, got: {:?}",
+                content.first()
+            );
+        };
+        let from_dims = format!("{}x{}", expected_report.from.0, expected_report.from.1);
+        let to_dims = format!("{}x{}", expected_report.to.0, expected_report.to.1);
+        assert!(
+            text.text.contains(&from_dims),
+            "notice must carry the original dimensions ({from_dims}): {}",
+            text.text
+        );
+        assert!(
+            text.text.contains(&to_dims),
+            "notice must carry the new dimensions ({to_dims}): {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("1.00 MB base64"),
+            "notice must carry the ceiling: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains("auto_resize"),
+            "notice must mention the auto_resize off-switch: {}",
+            text.text
+        );
+
+        let rest = content.rest();
+        let second = rest.first().expect("a second content block");
+        assert!(
+            matches!(second, ToolResultContent::Image(_)),
+            "content[1] must be an Image block, got: {second:?}"
+        );
+
+        if let Some(r) = out.image_ref() {
+            cleanup_spill(&r.id);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn oversized_image_auto_resize_false_errors_too_large_end_to_end() {
+        let ceiling = 1024 * 1024;
+        let bytes = oversized_png(2000, 1200, ceiling);
+        let path = write_png(&bytes);
+
+        let err = ViewImageTool::new(ceiling)
+            .call(ViewImageArgs {
+                path: path.to_string_lossy().into_owned(),
+                auto_resize: false,
+            })
+            .await
+            .expect_err("an oversized image with auto_resize:false must be refused");
+
+        assert!(matches!(err, ViewImageError::TooLarge { .. }), "got: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auto_resize"),
+            "error must mention the off-switch: {msg}"
+        );
+        assert!(
+            msg.contains(&ceiling.to_string()),
+            "error must contain the ceiling byte count: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

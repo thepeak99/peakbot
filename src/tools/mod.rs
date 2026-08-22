@@ -6,6 +6,7 @@ mod fetch_page;
 mod fetch_url;
 pub mod file_edit;
 mod file_read;
+pub(crate) mod image_fit;
 mod list_directory;
 mod pdf_read;
 mod powershell;

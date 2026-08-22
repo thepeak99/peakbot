@@ -470,6 +470,7 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
                 Some(model.display_reasoning),
                 prov.display_reasoning,
             )),
+            max_image_base64_bytes: super::default_max_image_base64_bytes(),
         }),
         ProviderType::LlamaCpp => ProviderConfig::LlamaCpp(LlamaCppConfig {
             api_key: prov.api_key.clone(),
