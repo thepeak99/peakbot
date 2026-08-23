@@ -7,7 +7,7 @@
 //! image-link-rewrite follow-up task implements it.
 
 use crate::image_cache::{self, ImageRef};
-use crate::ui::app_state::AppState;
+use crate::ui::app_state::{AppState, MessageRole};
 use axum::extract::Path;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -77,14 +77,35 @@ impl ImageLinks {
     /// Takes `AppState` BY VALUE: the caller must own a detached copy, so this
     /// can never be applied to `StateManager`'s shared state (and therefore can
     /// never reach disk via `sync_to_conversation`).
-    #[allow(dead_code)] // dead until the image-link-rewrite task lands
-    #[allow(unused_variables)] // params kept verbatim for the follow-up task
-    pub(crate) fn rewrite(&mut self, state: AppState, cwd: &FsPath) -> AppState {
-        unimplemented!("image-link-rewrite: rewrite outbound snapshot image links")
+    #[allow(dead_code)] // caller (forward_state wiring) lands in the next task
+    pub(crate) fn rewrite(&mut self, mut state: AppState, cwd: &FsPath) -> AppState {
+        for msg in state.chat.messages.iter_mut() {
+            if !msg.images.is_empty() {
+                // Spilled refs are already content addresses: no filesystem
+                // access, and the original 🖼 text must be gone (the SPA
+                // re-shows it only as an image-load-error fallback).
+                msg.content = msg
+                    .images
+                    .iter()
+                    .map(|r| format!("![{}](/images/{})", escape_alt(&r.display_name), r.id))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            } else if msg.role == MessageRole::Agent {
+                // A relative path inside tool output means "relative to that
+                // file", not the session cwd — resolving it would show the
+                // wrong image, so only Agent rows get path rewriting.
+                msg.content = rewrite_markdown_images(&msg.content, |target| {
+                    self.resolve(target, cwd)
+                        .map(|r| format!("/images/{}", r.id))
+                })
+                .into_owned();
+            }
+            // else: ToolResult without images, User, … — left untouched.
+        }
+        state
     }
 
     /// `None` = this target does not resolve to a servable local image.
-    #[allow(dead_code)] // only ImageLinks::rewrite (follow-up task) calls this
     fn resolve(&mut self, target: &str, cwd: &FsPath) -> Option<ImageRef> {
         // Policy skips run before any filesystem access: URLs, data URIs, and
         // already-rewritten /images/ ids are not local paths.
