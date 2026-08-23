@@ -106,6 +106,13 @@ mod tests {
     use super::rewrite_markdown_images;
     use std::borrow::Cow;
     use std::cell::RefCell;
+    use super::ImageLinks;
+    use crate::image_cache::ImageRef;
+    use crate::ui::app_state::{AppState, ChatMessage, MessageRole, MessageSource};
+    use rig_core::completion::message::ImageMediaType;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+    use tempfile::TempDir;
 
     /// Alt texts of every image node, in document order — reparse-based
     /// assertions avoid pinning the implementation's escape spelling.
@@ -280,5 +287,294 @@ mod tests {
             Some("/images/abc.png".to_string())
         });
         assert_eq!(out, "![a](/images/abc.png)");
+    }
+
+    // -- resolve(): policy + filesystem + caching ------------------------
+
+    /// Unique bytes per test: the spill dir is process-wide, so distinct
+    /// content keeps parallel tests' content addresses from colliding.
+    fn unique_bytes(seed: &str) -> Vec<u8> {
+        format!("peakbot-image-link-red-{seed}-{}", uuid::Uuid::new_v4()).into_bytes()
+    }
+
+    /// Independent sha256-hex, so id assertions don't mirror the implementation.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Best-effort removal of a file this suite spilled into the process-wide
+    /// cache dir; that dir is shared state and is never asserted on.
+    fn cleanup_spilled(id: &str) {
+        if let Some(path) = crate::image_cache::path_for(id) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Removes its file on drop (including unwind) so a RED panic cannot
+    /// litter the real home dir.
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn resolve_returns_none_for_a_remote_target() {
+        // The file exists locally under the same name: the scheme check must
+        // run before any path resolution, or this target would resolve.
+        let cwd = TempDir::new().expect("tempdir");
+        std::fs::write(cwd.path().join("img.png"), unique_bytes("remote")).expect("write");
+        let mut links = ImageLinks::default();
+        assert_eq!(links.resolve("https://example.com/img.png", cwd.path()), None);
+    }
+
+    #[test]
+    fn resolve_returns_none_for_a_data_uri_target() {
+        let cwd = TempDir::new().expect("tempdir");
+        let bytes = unique_bytes("data-uri");
+        std::fs::write(cwd.path().join("img.png"), &bytes).expect("write");
+        let mut links = ImageLinks::default();
+        use base64::Engine;
+        let uri = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
+
+        assert_eq!(links.resolve(&uri, cwd.path()), None);
+    }
+
+    #[test]
+    fn resolve_returns_none_for_an_already_rewritten_images_target() {
+        // The id is real and its file exists in the cache: `/images/` is the
+        // URL namespace, not a path, so this must be skipped without I/O.
+        let bytes = unique_bytes("already-rewritten");
+        let ref_ = crate::image_cache::spill(&bytes, ImageMediaType::PNG, "x.png")
+            .expect("spill");
+        let mut links = ImageLinks::default();
+        let cwd = TempDir::new().expect("tempdir");
+        assert_eq!(links.resolve(&format!("/images/{}", ref_.id), cwd.path()), None);
+        cleanup_spilled(&ref_.id);
+    }
+
+    #[test]
+    fn resolve_resolves_a_relative_target_against_the_supplied_cwd() {
+        let cwd = TempDir::new().expect("tempdir");
+        let bytes = unique_bytes("relative");
+        std::fs::write(cwd.path().join("rel.png"), &bytes).expect("write");
+
+        let mut links = ImageLinks::default();
+        let r = links.resolve("rel.png", cwd.path()).expect("relative target must resolve");
+
+        assert_eq!(r.id, format!("{}.png", sha256_hex(&bytes)));
+        assert_eq!(r.display_name, "rel.png");
+        let path = crate::image_cache::path_for(&r.id)
+            .expect("the spilled file must be servable under the returned id");
+        assert_eq!(std::fs::read(&path).expect("read"), bytes);
+        cleanup_spilled(&r.id);
+    }
+
+    #[test]
+    fn resolve_resolves_an_absolute_target_regardless_of_cwd() {
+        let file_dir = TempDir::new().expect("tempdir");
+        let cwd = TempDir::new().expect("tempdir"); // unrelated and empty
+        let bytes = unique_bytes("absolute");
+        let file = file_dir.path().join("abs.png");
+        std::fs::write(&file, &bytes).expect("write");
+
+        let mut links = ImageLinks::default();
+        let r = links
+            .resolve(file.to_str().expect("utf8 path"), cwd.path())
+            .expect("absolute target must resolve against itself, not cwd");
+        assert_eq!(r.id, format!("{}.png", sha256_hex(&bytes)));
+        cleanup_spilled(&r.id);
+    }
+
+    #[test]
+    fn resolve_expands_a_tilde_target_to_the_home_dir() {
+        // Writes one uniquely-named dotfile into the real home dir (removed
+        // on drop); the expectation is built from home_dir(), nothing pinned.
+        let home = std::env::home_dir().expect("HOME is set in the test environment");
+        let name = format!(".peakbot-red-tilde-{}.png", uuid::Uuid::new_v4());
+        let file = home.join(&name);
+        let _guard = RemoveOnDrop(file.clone());
+        let bytes = unique_bytes("tilde");
+        std::fs::write(&file, &bytes).expect("write");
+
+        let cwd = TempDir::new().expect("tempdir"); // unrelated: ~ must not use cwd
+        let mut links = ImageLinks::default();
+        let r = links
+            .resolve(format!("~/{name}").as_str(), cwd.path())
+            .expect("~ target must expand to the home dir");
+        assert_eq!(r.id, format!("{}.png", sha256_hex(&bytes)));
+        cleanup_spilled(&r.id);
+    }
+
+    #[test]
+    fn resolve_returns_none_for_a_missing_file() {
+        let cwd = TempDir::new().expect("tempdir");
+        let mut links = ImageLinks::default();
+        assert_eq!(links.resolve("no-such-file.png", cwd.path()), None);
+    }
+
+    #[test]
+    fn resolve_returns_none_for_a_non_allowlisted_extension() {
+        let cwd = TempDir::new().expect("tempdir");
+        std::fs::write(cwd.path().join("notes.txt"), b"not an image").expect("write");
+        let mut links = ImageLinks::default();
+        assert_eq!(links.resolve("notes.txt", cwd.path()), None);
+    }
+
+    #[test]
+    fn resolve_returns_none_for_a_file_over_max_image_bytes() {
+        // Sparse via set_len: no blocks are allocated, so the 10MB+1 file is instant.
+        let cwd = TempDir::new().expect("tempdir");
+        let file = cwd.path().join("big.png");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&file)
+            .expect("create")
+            .set_len((crate::vision::MAX_IMAGE_BYTES + 1) as u64)
+            .expect("set_len");
+
+        let mut links = ImageLinks::default();
+        assert_eq!(links.resolve("big.png", cwd.path()), None);
+    }
+
+    #[test]
+    fn resolve_caches_a_positive_hit_and_does_not_reread_the_body() {
+        // Proof: after the first resolve the body is made unreadable (chmod
+        // 000) while metadata stays intact — a cache hit still returns the
+        // same id, a re-read would die with EACCES. If ever run as root the
+        // chmod is a no-op and the proof degrades to id stability.
+        let cwd = TempDir::new().expect("tempdir");
+        let file = cwd.path().join("cached.png");
+        let bytes = unique_bytes("positive-cache");
+        std::fs::write(&file, &bytes).expect("write");
+
+        let mut links = ImageLinks::default();
+        let first = links.resolve("cached.png", cwd.path()).expect("first resolve");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0)).expect("chmod");
+        }
+        let second = links
+            .resolve("cached.png", cwd.path())
+            .expect("second resolve must hit the cache, not re-read the body");
+        assert_eq!(first.id, second.id);
+        cleanup_spilled(&first.id);
+    }
+
+    #[test]
+    fn resolve_caches_a_negative_result_for_a_missing_file() {
+        let cwd = TempDir::new().expect("tempdir");
+        let mut links = ImageLinks::default();
+        assert_eq!(links.resolve("ghost.png", cwd.path()), None);
+        assert_eq!(links.resolve("ghost.png", cwd.path()), None);
+    }
+
+    #[test]
+    fn resolve_picks_up_a_file_that_appears_after_a_negative_result() {
+        // A chart written after the first snapshot must show up on the next
+        // rewrite — a memoized Absent would hide it forever (same bug class
+        // as the staleness test below).
+        let cwd = TempDir::new().expect("tempdir");
+        let mut links = ImageLinks::default();
+        assert_eq!(links.resolve("late.png", cwd.path()), None);
+
+        let bytes = unique_bytes("late");
+        std::fs::write(cwd.path().join("late.png"), &bytes).expect("write");
+        let r = links.resolve("late.png", cwd.path()).expect("file now exists");
+        assert_eq!(r.id, format!("{}.png", sha256_hex(&bytes)));
+        cleanup_spilled(&r.id);
+    }
+
+    #[test]
+    fn resolve_returns_a_new_id_when_the_file_content_changes() {
+        // A regenerated chart that silently never updates is the bug this
+        // test exists to prevent: same path, new bytes ⇒ new content address.
+        let cwd = TempDir::new().expect("tempdir");
+        let file = cwd.path().join("chart.png");
+        let old = unique_bytes("stale-old");
+        std::fs::write(&file, &old).expect("write");
+
+        let mut links = ImageLinks::default();
+        let first = links.resolve("chart.png", cwd.path()).expect("first resolve");
+
+
+        // Distinct lengths plus an explicit future mtime force the (len,
+        // mtime) stamp to change regardless of filesystem mtime granularity.
+        let new = unique_bytes("stale-new-different-length");
+        std::fs::write(&file, &new).expect("overwrite");
+        let times = std::fs::FileTimes::new()
+            .set_modified(SystemTime::now() + Duration::from_secs(3600));
+        std::fs::File::open(&file).expect("open").set_times(times).expect("set_times");
+
+
+
+        let second = links.resolve("chart.png", cwd.path()).expect("second resolve");
+        assert_ne!(first.id, second.id, "changed content must mint a new id");
+        assert_eq!(second.id, format!("{}.png", sha256_hex(&new)));
+        cleanup_spilled(&first.id);
+        cleanup_spilled(&second.id);
+    }
+
+    #[test]
+    fn resolve_dedupes_two_targets_with_identical_content_to_one_id() {
+        let cwd = TempDir::new().expect("tempdir");
+        let bytes = unique_bytes("dedupe");
+        std::fs::write(cwd.path().join("a.png"), &bytes).expect("write a");
+        std::fs::write(cwd.path().join("b.png"), &bytes).expect("write b");
+
+        let mut links = ImageLinks::default();
+        let ra = links.resolve("a.png", cwd.path()).expect("a resolves");
+        let rb = links.resolve("b.png", cwd.path()).expect("b resolves");
+        assert_eq!(ra.id, rb.id, "identical bytes must share one content address");
+        assert_eq!(ra.display_name, "a.png");
+        assert_eq!(rb.display_name, "b.png");
+        cleanup_spilled(&ra.id);
+    }
+
+    #[test]
+    fn resolve_keeps_its_cache_bounded_across_many_distinct_targets() {
+        // Pins the property, not the eviction spelling: the map never holds
+        // more than 1024 entries and stays correct across the clear (an
+        // early target re-resolves to the same id from disk).
+        let cwd = TempDir::new().expect("tempdir");
+        let mut links = ImageLinks::default();
+        let first_bytes = unique_bytes("bound-first");
+        std::fs::write(cwd.path().join("first.png"), &first_bytes).expect("write");
+        let first = links.resolve("first.png", cwd.path()).expect("first resolves");
+
+        let mut spilled = vec![first.id.clone()];
+        for i in 0..1024 {
+            let name = format!("f{i:04}.png");
+            std::fs::write(cwd.path().join(&name), unique_bytes("bound")).expect("write");
+            let r = links.resolve(&name, cwd.path()).expect("must resolve");
+            spilled.push(r.id);
+        }
+
+        assert!(
+            links.0.len() <= 1024,
+            "cache grew to {} entries",
+            links.0.len()
+        );
+        let again = links
+            .resolve("first.png", cwd.path())
+            .expect("re-resolves after the clear");
+        assert_eq!(again.id, first.id);
+        for id in &spilled {
+            cleanup_spilled(id);
+        }
     }
 }
