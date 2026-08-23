@@ -92,13 +92,91 @@ impl ImageLinks {
 }
 
 /// Rewrite every markdown image whose target `f` maps to `Some(id)`.
-#[allow(dead_code)] // dead until the image-link-rewrite task lands
-#[allow(unused_variables)] // params kept verbatim for the follow-up task
+///
+/// Pure markdown mechanics — no I/O, no policy: every target found is passed
+/// to `f` (remote-URL skipping lives in `resolve`). A `None` answer leaves
+/// that span byte-identical, so we splice selectively into the original
+/// string instead of rebuilding the document from events.
+#[allow(dead_code)] // caller lands in the ImageLinks::rewrite follow-up task
 fn rewrite_markdown_images(
     src: &str,
-    f: impl FnMut(&str) -> Option<String>,
+    mut f: impl FnMut(&str) -> Option<String>,
 ) -> std::borrow::Cow<'_, str> {
-    unimplemented!("image-link-rewrite: rewrite markdown image targets")
+    // Fast path: 0 of 345 sampled assistant messages contain `![`, so the
+    // common case must not parse or allocate.
+    if !src.contains("![") {
+        return std::borrow::Cow::Borrowed(src);
+    }
+
+    // Collect (span, replacement) pairs first — splicing during iteration
+    // would invalidate the later offsets.
+    let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut image: Option<(std::ops::Range<usize>, String, String)> = None; // span, dest, alt
+
+    for (event, range) in pulldown_cmark::Parser::new(src).into_offset_iter() {
+        match event {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { dest_url, .. }) => {
+                // Image tags cannot nest; the range spans the whole node.
+                image = Some((range, dest_url.to_string(), String::new()));
+            }
+            pulldown_cmark::Event::Text(t) => {
+                if let Some((_, _, alt)) = image.as_mut() {
+                    alt.push_str(&t);
+                }
+            }
+            pulldown_cmark::Event::Code(t) => {
+                if let Some((_, _, alt)) = image.as_mut() {
+                    alt.push_str(&t);
+                }
+            }
+            pulldown_cmark::Event::SoftBreak => {
+                if let Some((_, _, alt)) = image.as_mut() {
+                    alt.push('\n');
+                }
+            }
+
+            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Image) => {
+                if let Some((span, dest, alt)) = image.take()
+                    && let Some(new_target) = f(&dest)
+                {
+                    let mut replacement = String::with_capacity(alt.len() + new_target.len() + 6);
+                    replacement.push_str("![");
+                    replacement.push_str(&escape_alt(&alt));
+                    replacement.push_str("](");
+                    replacement.push_str(&new_target);
+                    replacement.push(')');
+                    replacements.push((span, replacement));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if replacements.is_empty() {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let mut out = String::with_capacity(src.len() + replacements.len() * 8);
+    let mut last = 0;
+    for (span, replacement) in replacements {
+        out.push_str(&src[last..span.start]);
+        out.push_str(&replacement);
+        last = span.end;
+    }
+    out.push_str(&src[last..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Escape `\` and `]` (backslash first) so a spliced alt re-parses to the
+/// same text.
+fn escape_alt(alt: &str) -> String {
+    let mut out = String::with_capacity(alt.len());
+    for c in alt.chars() {
+        if c == '\\' || c == ']' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
