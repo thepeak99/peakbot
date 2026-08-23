@@ -84,10 +84,68 @@ impl ImageLinks {
     }
 
     /// `None` = this target does not resolve to a servable local image.
-    #[allow(dead_code)] // dead until the image-link-rewrite task lands
-    #[allow(unused_variables)] // params kept verbatim for the follow-up task
+    #[allow(dead_code)] // only ImageLinks::rewrite (follow-up task) calls this
     fn resolve(&mut self, target: &str, cwd: &FsPath) -> Option<ImageRef> {
-        unimplemented!("image-link-rewrite: resolve a link target to an image ref")
+        // Policy skips run before any filesystem access: URLs, data URIs, and
+        // already-rewritten /images/ ids are not local paths.
+        if target.contains("://") || target.starts_with("data:") || target.starts_with("/images/") {
+            return None;
+        }
+
+        let abs = match target.strip_prefix('~') {
+            Some(rest) => dirs::home_dir()?.join(rest.trim_start_matches('/')),
+            None if FsPath::new(target).is_absolute() => PathBuf::from(target),
+            None => cwd.join(target),
+        };
+
+        // One stat per link per frame is deliberate: a regenerated chart.png
+        // must update, so the (len, mtime) stamp is re-checked every time.
+        let md = std::fs::metadata(&abs).ok();
+        let stamp = md
+            .as_ref()
+            .map(|md| (md.len(), md.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+
+        // Keyed on the resolved path: ChatMessage has no id and positional
+        // indices shift under compaction, so the path is the only stable key
+        // (it also dedupes the same file across messages).
+        match (self.0.get(&abs), stamp.as_ref()) {
+            (Some(Entry::Absent), None) => return None, // cached negative
+            (
+                Some(Entry::Present {
+                    stamp: cached,
+                    image,
+                }),
+                Some(st),
+            ) if *cached == *st => {
+                return image.clone(); // cached positive
+            }
+            _ => {}
+        }
+
+        // Miss: recompute. load_image_from_path is the single "servable local
+        // image" gate (extension allow-list + MAX_IMAGE_BYTES via its own stat).
+        let image = stamp.and_then(|_| {
+            let att = crate::vision::load_image_from_path(&abs).ok()?;
+            let crate::vision::ImageSource::Base64 { bytes, media_type } = att.source else {
+                return None;
+            };
+            crate::image_cache::spill(&bytes, media_type, &att.display_name)
+        });
+
+        let entry = match stamp {
+            None => Entry::Absent,
+            Some(st) => Entry::Present {
+                stamp: st,
+                image: image.clone(),
+            },
+        };
+
+        // Bound: clear-all at 1024 — no LRU state, self-healing, normally 0-10.
+        if self.0.len() >= 1024 {
+            self.0.clear();
+        }
+        self.0.insert(abs, entry);
+        image
     }
 }
 
