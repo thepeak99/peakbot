@@ -77,7 +77,6 @@ impl ImageLinks {
     /// Takes `AppState` BY VALUE: the caller must own a detached copy, so this
     /// can never be applied to `StateManager`'s shared state (and therefore can
     /// never reach disk via `sync_to_conversation`).
-    #[allow(dead_code)] // caller (forward_state wiring) lands in the next task
     pub(crate) fn rewrite(&mut self, mut state: AppState, cwd: &FsPath) -> AppState {
         for msg in state.chat.messages.iter_mut() {
             if !msg.images.is_empty() {

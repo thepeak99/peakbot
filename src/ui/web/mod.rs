@@ -554,14 +554,21 @@ pub(crate) enum ForwardExit {
 pub(crate) async fn forward_state(
     state_rx: &mut mpsc::Receiver<AppState>,
     out: &OutboundTx,
+    sm: &StateManager,
     reader: &mut tokio::task::JoinHandle<()>,
     writer: &mut tokio::task::JoinHandle<()>,
 ) -> ForwardExit {
+    // One memo per connection (not per message): its resolve cache survives
+    // across snapshots, and each snapshot is already a clone.
+    let mut images = images::ImageLinks::default();
     loop {
         tokio::select! {
             maybe_state = state_rx.recv() => {
                 let Some(app_state) = maybe_state else { return ForwardExit::StateEnded };
                 let exit = app_state.exit_requested;
+                // Rewrite the already-cloned snapshot (not the shared state): /images/ links
+                // must never leak to disk, and stdio's separate publish path has no server.
+                let app_state = images.rewrite(app_state, &sm.session_cwd());
                 if out.publish_state(Arc::new(app_state)).is_err() {
                     return ForwardExit::WriterGone;
                 }
@@ -685,7 +692,14 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     // this loop and the socket would leak `attached > 0` in the registry,
     // blocking the idle-TTL reaper.
     let mut state_rx = registered.session.state_manager.subscribe();
-    let _exit = forward_state(&mut state_rx, &out_tx, &mut reader_task, &mut writer_task).await;
+    let _exit = forward_state(
+        &mut state_rx,
+        &out_tx,
+        &registered.session.state_manager,
+        &mut reader_task,
+        &mut writer_task,
+    )
+    .await;
 
     // Teardown: stop the reader, drain the writer exactly once (the
     // forwarder already observed WriterGone if the writer died first;
@@ -1527,9 +1541,10 @@ mod tests {
         let (out, _rx): (OutboundTx, OutboundRx) = outbound_channel();
         let _ = _rx;
 
+        let sm = StateManager::new();
         let exit = tokio::time::timeout(
             Duration::from_secs(1),
-            forward_state(&mut state_rx, &out, &mut reader, &mut writer),
+            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
         )
         .await
         .expect("forwarder must exit promptly when the writer task has already returned");
@@ -1557,9 +1572,10 @@ mod tests {
         let (out, _rx): (OutboundTx, OutboundRx) = outbound_channel();
         let _ = _rx;
 
+        let sm = StateManager::new();
         let exit = tokio::time::timeout(
             Duration::from_secs(1),
-            forward_state(&mut state_rx, &out, &mut reader, &mut writer),
+            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
         )
         .await
         .expect("forwarder must exit promptly when the reader task has already returned");
