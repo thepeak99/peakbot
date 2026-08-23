@@ -1586,6 +1586,122 @@ mod tests {
         );
     }
 
+    /// Invariant (runtime twin of `rewrite`'s by-value signature): the
+    /// rewrite is presentation-only — it must never reach shared state or
+    /// disk, because `sync_to_conversation` re-derives content from the
+    /// live AppState.
+    #[tokio::test]
+    async fn forward_state_rewrites_the_frame_without_touching_shared_or_persisted_state() {
+        use crate::storage::FileStorage;
+        use crate::ui::app_state::MessageRole;
+
+        let cwd = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(cwd.path().join("chart.png"), TINY_PNG).expect("write chart.png");
+
+        // Real on-disk persistence: a leak would land in this file.
+        let storage_dir = tempfile::TempDir::new().expect("tempdir");
+        let sm = StateManager::new_arc_with_storage(Arc::new(
+            FileStorage::new(storage_dir.path().to_path_buf()).expect("FileStorage"),
+        ));
+        sm.set_session_cwd(cwd.path().to_path_buf());
+        sm.create_conversation(
+            "red".into(),
+            "provider".into(),
+            "model".into(),
+            cwd.path().to_string_lossy().into_owned(),
+        );
+        sm.add_user_message("make a chart".into());
+        sm.add_assistant_message("see ![chart](chart.png)".into());
+
+        // The T13/T14 harness: the state channel carries the owned detached
+        // clone `subscribe()` would hand the forwarder; reader and writer
+        // never complete, so only the state arm may fire.
+        let (state_tx, mut state_rx) = mpsc::channel::<AppState>(1);
+        let mut reader: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let mut writer: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let (out, mut rx): (OutboundTx, OutboundRx) = outbound_channel();
+
+        // Ends the loop right after the first published frame.
+        let mut detached = sm.get_state();
+        detached.exit_requested = true;
+        state_tx.send(detached).await.expect("send detached clone");
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
+        )
+        .await
+        .expect("forwarder must exit after one published frame");
+        assert!(
+            matches!(exit, ForwardExit::StateEnded),
+            "forwarder must end via the exit flag after one frame; got {exit:?}"
+        );
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), rx.next())
+            .await
+            .expect("published frame must arrive")
+            .expect("published frame present");
+        let wire = match frame {
+            OutboundMessage::State { state } => state,
+            other => panic!("expected a State frame, got {other:?}"),
+        };
+        let wire_content = wire
+            .chat
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Agent)
+            .expect("agent row on the wire")
+            .content
+            .clone();
+
+        // (a) the rewrite happened on the wire.
+        assert!(
+            wire_content.contains("/images/"),
+            "wire frame must carry the rewritten link; got {wire_content:?}"
+        );
+
+        // (b) shared state still holds the raw path.
+        let shared = sm.get_state();
+        let shared_content = shared
+            .chat
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Agent)
+            .expect("agent row in shared state")
+            .content
+            .clone();
+        assert!(
+            shared_content.contains("chart.png"),
+            "shared state must keep the raw path; got {shared_content:?}"
+        );
+        assert!(
+            !shared
+                .chat
+                .messages
+                .iter()
+                .any(|m| m.content.contains("/images/")),
+            "rewritten links must never reach shared state"
+        );
+
+        // (c) persistence still holds the raw path (the real on-disk file).
+        sm.save_conversation();
+        let conv_id = sm
+            .get_current_conversation_id()
+            .expect("current conversation");
+        let on_disk = std::fs::read_to_string(storage_dir.path().join(format!("{conv_id}.json")))
+            .expect("conversation file on disk");
+        assert!(
+            on_disk.contains("chart.png"),
+            "persisted conversation must keep the raw path"
+        );
+        assert!(
+            !on_disk.contains("/images/"),
+            "rewritten links must never reach disk"
+        );
+    }
+
     /// T8 — a stalled `sink.send` cannot pin the writer forever: the
     /// `WRITE_TIMEOUT` reaper must close it (and the connection). The
     /// paused-time advance fires the timeout deterministically.
