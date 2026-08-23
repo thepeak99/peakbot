@@ -100,3 +100,185 @@ fn rewrite_markdown_images(
 ) -> std::borrow::Cow<'_, str> {
     unimplemented!("image-link-rewrite: rewrite markdown image targets")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_markdown_images;
+    use std::borrow::Cow;
+    use std::cell::RefCell;
+
+    /// Alt texts of every image node, in document order — reparse-based
+    /// assertions avoid pinning the implementation's escape spelling.
+    fn image_alts(src: &str) -> Vec<String> {
+        let mut alts = Vec::new();
+        let mut current = None;
+        for event in pulldown_cmark::Parser::new(src) {
+            match event {
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { .. }) => {
+                    current = Some(String::new())
+                }
+                pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Image) => {
+                    if let Some(alt) = current.take() {
+                        alts.push(alt);
+                    }
+                }
+                pulldown_cmark::Event::Text(text) => {
+                    if let Some(alt) = current.as_mut() {
+                        alt.push_str(&text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        alts
+    }
+
+    /// Destination URLs of every image node, in document order.
+    fn image_dests(src: &str) -> Vec<String> {
+        pulldown_cmark::Parser::new(src)
+            .filter_map(|event| match event {
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { dest_url, .. }) => {
+                    Some(dest_url.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn input_without_an_image_returns_borrowed() {
+        let src = "hello [link](https://example.com) world\n\nsecond line `code` and **bold**\n";
+        let out = rewrite_markdown_images(src, |_| Some("/images/x.png".to_string()));
+        // the no-op fast path the whole feature's performance rests on
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "no image nodes must borrow the input"
+        );
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn single_image_target_is_rewritten_to_the_resolved_id() {
+        let out = rewrite_markdown_images("![alt](a.png)", |_| Some("/images/abc.png".to_string()));
+        assert_eq!(out, "![alt](/images/abc.png)");
+    }
+
+    #[test]
+    fn every_image_is_rewritten_when_all_targets_resolve() {
+        let src = "![a](one.png) mid ![b](two.png) end ![c](three.png)";
+        let out = rewrite_markdown_images(src, |target| match target {
+            "one.png" => Some("/images/one.png".to_string()),
+            "two.png" => Some("/images/two.png".to_string()),
+            _ => Some("/images/three.png".to_string()),
+        });
+        assert_eq!(
+            out,
+            "![a](/images/one.png) mid ![b](/images/two.png) end ![c](/images/three.png)"
+        );
+    }
+
+    #[test]
+    fn unresolved_image_span_stays_byte_identical() {
+        // the span carries its title verbatim when `f` declines it
+        let src = "before ![a](x.png \"t\") after\n";
+        let out = rewrite_markdown_images(src, |_| None);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn only_the_resolved_image_is_rewritten_the_other_stays_byte_identical() {
+        let src = "![a](one.png) and ![b](two.png \"t\")";
+        let out = rewrite_markdown_images(src, |target| {
+            if target == "one.png" {
+                Some("/images/one.png".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(out, "![a](/images/one.png) and ![b](two.png \"t\")");
+    }
+
+    #[test]
+    fn image_in_fenced_code_block_is_left_alone() {
+        // pulldown-cmark emits code-block contents as Text, so we get this for free
+        let calls = RefCell::new(Vec::<String>::new());
+        let src = "before\n```\n![a](x.png)\n```\nafter\n";
+        let out = rewrite_markdown_images(src, |target| {
+            calls.borrow_mut().push(target.to_string());
+            Some("/images/x.png".to_string())
+        });
+        assert!(
+            calls.borrow().is_empty(),
+            "code-block contents are not image nodes"
+        );
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn image_in_inline_code_is_left_alone() {
+        let calls = RefCell::new(Vec::<String>::new());
+        let src = "see `![a](x.png)` here\n";
+        let out = rewrite_markdown_images(src, |target| {
+            calls.borrow_mut().push(target.to_string());
+            Some("/images/x.png".to_string())
+        });
+        assert!(
+            calls.borrow().is_empty(),
+            "inline code is not an image node"
+        );
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn alt_text_with_bracket_and_backslash_reparses_to_the_same_alt() {
+        let src = "![a\\]b\\\\c](x.png)";
+        // sanity: pin the input's own parse so a test-setup typo can't hide
+        assert_eq!(image_alts(src), vec!["a]b\\c"]);
+        let out = rewrite_markdown_images(src, |_| Some("/images/x.png".to_string()));
+        assert_eq!(
+            image_alts(&out),
+            image_alts(src),
+            "rewritten alt must reparse identically"
+        );
+    }
+
+    #[test]
+    fn empty_alt_stays_empty_when_resolved() {
+        let out = rewrite_markdown_images("![](x.png)", |_| Some("/images/x.png".to_string()));
+        assert_eq!(image_alts(&out), vec![""]);
+        assert_eq!(image_dests(&out), vec!["/images/x.png"]);
+    }
+
+    #[test]
+    fn f_is_called_once_per_image_with_the_raw_target_in_document_order() {
+        let calls = RefCell::new(Vec::<String>::new());
+        let src = "![a](one.png) mid ![b](two.png) end ![c](three.png)";
+        let out = rewrite_markdown_images(src, |target| {
+            calls.borrow_mut().push(target.to_string());
+            Some("/images/x.png".to_string())
+        });
+        assert_eq!(*calls.borrow(), vec!["one.png", "two.png", "three.png"]);
+        assert_eq!(
+            out,
+            "![a](/images/x.png) mid ![b](/images/x.png) end ![c](/images/x.png)"
+        );
+    }
+
+    #[test]
+    fn reference_style_image_is_rewritten_to_inline_form() {
+        // honest v1 behaviour: pulldown-cmark emits reference images as Image
+        // nodes too, so the span is spliced and the definition line dangles
+        let src = "![alt][ref]\n\n[ref]: path.png\n";
+        let out = rewrite_markdown_images(src, |_| Some("/images/abc.png".to_string()));
+        assert_eq!(out, "![alt](/images/abc.png)\n\n[ref]: path.png\n");
+    }
+
+    #[test]
+    fn titled_image_loses_its_title_on_rewrite() {
+        // the splice is `![{alt}]({new_target})`, so the title is dropped
+        let out = rewrite_markdown_images("![a](p.png \"title\")", |_| {
+            Some("/images/abc.png".to_string())
+        });
+        assert_eq!(out, "![a](/images/abc.png)");
+    }
+}
