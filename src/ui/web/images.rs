@@ -103,13 +103,13 @@ fn rewrite_markdown_images(
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_markdown_images;
-    use std::borrow::Cow;
-    use std::cell::RefCell;
     use super::ImageLinks;
+    use super::rewrite_markdown_images;
     use crate::image_cache::ImageRef;
     use crate::ui::app_state::{AppState, ChatMessage, MessageRole, MessageSource};
     use rig_core::completion::message::ImageMediaType;
+    use std::borrow::Cow;
+    use std::cell::RefCell;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
@@ -333,7 +333,10 @@ mod tests {
         let cwd = TempDir::new().expect("tempdir");
         std::fs::write(cwd.path().join("img.png"), unique_bytes("remote")).expect("write");
         let mut links = ImageLinks::default();
-        assert_eq!(links.resolve("https://example.com/img.png", cwd.path()), None);
+        assert_eq!(
+            links.resolve("https://example.com/img.png", cwd.path()),
+            None
+        );
     }
 
     #[test]
@@ -356,11 +359,13 @@ mod tests {
         // The id is real and its file exists in the cache: `/images/` is the
         // URL namespace, not a path, so this must be skipped without I/O.
         let bytes = unique_bytes("already-rewritten");
-        let ref_ = crate::image_cache::spill(&bytes, ImageMediaType::PNG, "x.png")
-            .expect("spill");
+        let ref_ = crate::image_cache::spill(&bytes, ImageMediaType::PNG, "x.png").expect("spill");
         let mut links = ImageLinks::default();
         let cwd = TempDir::new().expect("tempdir");
-        assert_eq!(links.resolve(&format!("/images/{}", ref_.id), cwd.path()), None);
+        assert_eq!(
+            links.resolve(&format!("/images/{}", ref_.id), cwd.path()),
+            None
+        );
         cleanup_spilled(&ref_.id);
     }
 
@@ -371,7 +376,9 @@ mod tests {
         std::fs::write(cwd.path().join("rel.png"), &bytes).expect("write");
 
         let mut links = ImageLinks::default();
-        let r = links.resolve("rel.png", cwd.path()).expect("relative target must resolve");
+        let r = links
+            .resolve("rel.png", cwd.path())
+            .expect("relative target must resolve");
 
         assert_eq!(r.id, format!("{}.png", sha256_hex(&bytes)));
         assert_eq!(r.display_name, "rel.png");
@@ -439,6 +446,7 @@ mod tests {
         let file = cwd.path().join("big.png");
         std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&file)
             .expect("create")
@@ -461,12 +469,14 @@ mod tests {
         std::fs::write(&file, &bytes).expect("write");
 
         let mut links = ImageLinks::default();
-        let first = links.resolve("cached.png", cwd.path()).expect("first resolve");
+        let first = links
+            .resolve("cached.png", cwd.path())
+            .expect("first resolve");
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0)).expect("chmod");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("chmod");
         }
         let second = links
             .resolve("cached.png", cwd.path())
@@ -494,7 +504,9 @@ mod tests {
 
         let bytes = unique_bytes("late");
         std::fs::write(cwd.path().join("late.png"), &bytes).expect("write");
-        let r = links.resolve("late.png", cwd.path()).expect("file now exists");
+        let r = links
+            .resolve("late.png", cwd.path())
+            .expect("file now exists");
         assert_eq!(r.id, format!("{}.png", sha256_hex(&bytes)));
         cleanup_spilled(&r.id);
     }
@@ -509,20 +521,24 @@ mod tests {
         std::fs::write(&file, &old).expect("write");
 
         let mut links = ImageLinks::default();
-        let first = links.resolve("chart.png", cwd.path()).expect("first resolve");
-
+        let first = links
+            .resolve("chart.png", cwd.path())
+            .expect("first resolve");
 
         // Distinct lengths plus an explicit future mtime force the (len,
         // mtime) stamp to change regardless of filesystem mtime granularity.
         let new = unique_bytes("stale-new-different-length");
         std::fs::write(&file, &new).expect("overwrite");
-        let times = std::fs::FileTimes::new()
-            .set_modified(SystemTime::now() + Duration::from_secs(3600));
-        std::fs::File::open(&file).expect("open").set_times(times).expect("set_times");
+        let times =
+            std::fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(3600));
+        std::fs::File::open(&file)
+            .expect("open")
+            .set_times(times)
+            .expect("set_times");
 
-
-
-        let second = links.resolve("chart.png", cwd.path()).expect("second resolve");
+        let second = links
+            .resolve("chart.png", cwd.path())
+            .expect("second resolve");
         assert_ne!(first.id, second.id, "changed content must mint a new id");
         assert_eq!(second.id, format!("{}.png", sha256_hex(&new)));
         cleanup_spilled(&first.id);
@@ -539,7 +555,10 @@ mod tests {
         let mut links = ImageLinks::default();
         let ra = links.resolve("a.png", cwd.path()).expect("a resolves");
         let rb = links.resolve("b.png", cwd.path()).expect("b resolves");
-        assert_eq!(ra.id, rb.id, "identical bytes must share one content address");
+        assert_eq!(
+            ra.id, rb.id,
+            "identical bytes must share one content address"
+        );
         assert_eq!(ra.display_name, "a.png");
         assert_eq!(rb.display_name, "b.png");
         cleanup_spilled(&ra.id);
@@ -554,7 +573,9 @@ mod tests {
         let mut links = ImageLinks::default();
         let first_bytes = unique_bytes("bound-first");
         std::fs::write(cwd.path().join("first.png"), &first_bytes).expect("write");
-        let first = links.resolve("first.png", cwd.path()).expect("first resolves");
+        let first = links
+            .resolve("first.png", cwd.path())
+            .expect("first resolves");
 
         let mut spilled = vec![first.id.clone()];
         for i in 0..1024 {
@@ -577,4 +598,232 @@ mod tests {
             cleanup_spilled(id);
         }
     }
+
+    // -- rewrite(): frame-level, takes AppState by value -----------------
+
+    fn state_with(messages: Vec<ChatMessage>) -> AppState {
+        let mut state = AppState::new();
+        state.chat.messages = messages;
+        state
+    }
+
+    /// A tool-result row with hand-set content/images — the
+    /// `ChatMessage::tool_result` constructor would recompute content from
+    /// the result string, which these tests need to control exactly.
+    fn tool_result_row(tool_name: &str, content: &str, images: Vec<ImageRef>) -> ChatMessage {
+        ChatMessage {
+            role: MessageRole::ToolResult,
+            content: content.to_string(),
+            attachments: Vec::new(),
+            images,
+            timestamp: chrono::Local::now(),
+            tool_name: Some(tool_name.to_string()),
+            tool_args: None,
+            tool_result: None,
+            call_id: None,
+            compacted: false,
+            source: MessageSource::Human,
+            thinking: Vec::new(),
+            response_id: None,
+        }
+    }
+
+    /// Field-wise comparison — ChatMessage does not derive PartialEq.
+    fn assert_messages_equal(a: &[ChatMessage], b: &[ChatMessage]) {
+        assert_eq!(a.len(), b.len(), "message count");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.role, y.role, "msg {i} role");
+            assert_eq!(x.content, y.content, "msg {i} content");
+            assert_eq!(x.images, y.images, "msg {i} images");
+            assert_eq!(x.attachments, y.attachments, "msg {i} attachments");
+            assert_eq!(x.tool_name, y.tool_name, "msg {i} tool_name");
+            assert_eq!(x.tool_args, y.tool_args, "msg {i} tool_args");
+            assert_eq!(x.tool_result, y.tool_result, "msg {i} tool_result");
+            assert_eq!(x.call_id, y.call_id, "msg {i} call_id");
+            assert_eq!(x.compacted, y.compacted, "msg {i} compacted");
+            assert_eq!(x.source, y.source, "msg {i} source");
+            assert_eq!(x.thinking, y.thinking, "msg {i} thinking");
+            assert_eq!(x.response_id, y.response_id, "msg {i} response_id");
+            assert_eq!(x.timestamp, y.timestamp, "msg {i} timestamp");
+        }
+    }
+
+    #[test]
+    fn rewrite_replaces_content_of_a_message_with_images_instead_of_appending() {
+        // The SPA re-shows the 🖼 text only as an image-load-error fallback,
+        // so the markdown link must replace it, not follow it.
+        let bytes = unique_bytes("replace");
+        let ref_ =
+            crate::image_cache::spill(&bytes, ImageMediaType::PNG, "shot.png").expect("spill");
+        let msg = ChatMessage::tool_result(
+            "view_image",
+            r#"{"path":"shot.png"}"#,
+            &format!(
+                r#"{{"image_ref":{{"id":"{}","display_name":"shot.png"}}}}"#,
+                ref_.id
+            ),
+            None,
+        );
+        assert_eq!(msg.content, "🖼 shot.png", "test-setup sanity");
+
+        let cwd = TempDir::new().expect("tempdir");
+        let mut links = ImageLinks::default();
+        let out = links.rewrite(state_with(vec![msg]), cwd.path());
+
+        let got = &out.chat.messages[0];
+        assert_eq!(got.content, format!("![shot.png](/images/{})", ref_.id));
+        assert!(
+            !got.content.contains("🖼"),
+            "original marker text must be gone"
+        );
+        cleanup_spilled(&ref_.id);
+    }
+
+    #[test]
+    fn rewrite_joins_multiple_image_refs_with_newlines() {
+        let b1 = unique_bytes("multi-1");
+        let b2 = unique_bytes("multi-2");
+        let r1 = crate::image_cache::spill(&b1, ImageMediaType::PNG, "one.png").expect("spill 1");
+        let r2 = crate::image_cache::spill(&b2, ImageMediaType::PNG, "two.png").expect("spill 2");
+
+        let msg = tool_result_row("view_image", "🖼 one.png", vec![r1.clone(), r2.clone()]);
+        let cwd = TempDir::new().expect("tempdir");
+        let mut links = ImageLinks::default();
+        let out = links.rewrite(state_with(vec![msg]), cwd.path());
+
+        let expected = format!(
+            "![one.png](/images/{})\n![two.png](/images/{})",
+            r1.id, r2.id
+        );
+        assert_eq!(out.chat.messages[0].content, expected);
+        cleanup_spilled(&r1.id);
+        cleanup_spilled(&r2.id);
+    }
+
+    #[test]
+    fn rewrite_needs_no_filesystem_for_already_spilled_refs() {
+        // The ref is already a content address of spilled bytes: cwd may
+        // point at a directory that does not exist at all.
+        let bytes = unique_bytes("no-fs");
+        let ref_ =
+            crate::image_cache::spill(&bytes, ImageMediaType::PNG, "shot.png").expect("spill");
+        let msg = tool_result_row("view_image", "🖼 shot.png", vec![ref_.clone()]);
+
+        let missing_cwd = PathBuf::from("/nonexistent-peakbot-red-suite-dir");
+        let mut links = ImageLinks::default();
+        let out = links.rewrite(state_with(vec![msg]), &missing_cwd);
+        assert_eq!(
+            out.chat.messages[0].content,
+            format!("![shot.png](/images/{})", ref_.id)
+        );
+        cleanup_spilled(&ref_.id);
+    }
+
+    #[test]
+    fn rewrite_escapes_a_display_name_containing_a_closing_bracket() {
+        // Re-parse to assert: the alt must survive the round trip; the escape
+        // spelling itself is the implementation's choice.
+        let bytes = unique_bytes("escape");
+        let ref_ =
+            crate::image_cache::spill(&bytes, ImageMediaType::PNG, "we]ird.png").expect("spill");
+        let msg = tool_result_row("view_image", "🖼 we]ird.png", vec![ref_.clone()]);
+
+        let cwd = TempDir::new().expect("tempdir");
+        let mut links = ImageLinks::default();
+        let out = links.rewrite(state_with(vec![msg]), cwd.path());
+
+        let content = &out.chat.messages[0].content;
+        assert_eq!(image_alts(content), vec!["we]ird.png".to_string()]);
+        assert_eq!(image_dests(content), vec![format!("/images/{}", ref_.id)]);
+        cleanup_spilled(&ref_.id);
+    }
+
+    #[test]
+    fn rewrite_rewrites_an_agent_row_image_link_to_the_spilled_id() {
+        let cwd = TempDir::new().expect("tempdir");
+        let bytes = unique_bytes("agent-link");
+        std::fs::write(cwd.path().join("chart.png"), &bytes).expect("write");
+
+        let msg = ChatMessage::agent("see ![chart](chart.png) below".to_string());
+        let mut links = ImageLinks::default();
+        let out = links.rewrite(state_with(vec![msg]), cwd.path());
+
+        let id = format!("{}.png", sha256_hex(&bytes));
+        assert_eq!(
+            out.chat.messages[0].content,
+            format!("see ![chart](/images/{id}) below")
+        );
+        cleanup_spilled(&id);
+    }
+
+    #[test]
+    fn rewrite_does_not_path_rewrite_a_tool_result_row() {
+        // A relative path inside tool output means "relative to that file",
+        // not the session cwd — resolving it would show the wrong image.
+        let cwd = TempDir::new().expect("tempdir");
+        std::fs::write(cwd.path().join("x.png"), unique_bytes("tool-scope")).expect("write");
+
+        let msg = tool_result_row("bash", "wrote ![x](./x.png) to disk", Vec::new());
+        let mut links = ImageLinks::default();
+        let out = links.rewrite(state_with(vec![msg]), cwd.path());
+        assert_eq!(out.chat.messages[0].content, "wrote ![x](./x.png) to disk");
+    }
+
+    #[test]
+    fn rewrite_does_not_path_rewrite_a_user_row() {
+        let cwd = TempDir::new().expect("tempdir");
+        std::fs::write(cwd.path().join("x.png"), unique_bytes("user-scope")).expect("write");
+
+        let msg = ChatMessage::user("look at ![x](./x.png)".to_string());
+        let mut links = ImageLinks::default();
+        let out = links.rewrite(state_with(vec![msg]), cwd.path());
+        assert_eq!(out.chat.messages[0].content, "look at ![x](./x.png)");
+    }
+
+    #[test]
+    fn rewrite_applies_replacement_not_path_rewrite_to_a_tool_result_with_images() {
+        // A row that is BOTH a tool result and carries images gets rule 1
+        // (replacement): the markdown link in its content is left alone.
+        let cwd = TempDir::new().expect("tempdir");
+        std::fs::write(cwd.path().join("x.png"), unique_bytes("both-link")).expect("write");
+        let img_bytes = unique_bytes("both-ref");
+        let ref_ =
+            crate::image_cache::spill(&img_bytes, ImageMediaType::PNG, "shot.png").expect("spill");
+
+        let msg = tool_result_row(
+            "view_image",
+            "![x](./x.png) and 🖼 shot.png",
+            vec![ref_.clone()],
+        );
+        let mut links = ImageLinks::default();
+        let out = links.rewrite(state_with(vec![msg]), cwd.path());
+        assert_eq!(
+            out.chat.messages[0].content,
+            format!("![shot.png](/images/{})", ref_.id)
+        );
+        cleanup_spilled(&ref_.id);
+    }
+
+    #[test]
+    fn rewrite_returns_the_state_unchanged_when_no_images_are_present() {
+        let messages = vec![
+            ChatMessage::user("hello".to_string()),
+            ChatMessage::agent("hi there".to_string()),
+            ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("c1".into())),
+            ChatMessage::tool_result(
+                "bash",
+                r#"{"command":"ls"}"#,
+                "Exit code: 0\nSTDOUT:\nfile.txt",
+                Some("c1".into()),
+            ),
+        ];
+        let before = state_with(messages.clone());
+        let after = ImageLinks::default().rewrite(state_with(messages), &PathBuf::from("/tmp"));
+        assert_messages_equal(&before.chat.messages, &after.chat.messages);
+    }
+
+    // Invariant (type-system-enforced, not runtime-testable): `rewrite` takes
+    // `AppState` BY VALUE, so it can never be applied to `StateManager`'s
+    // shared state and can never leak rewritten links to disk via
+    // `sync_to_conversation`. A runtime test here would be fake — none written.
 }
