@@ -82,6 +82,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
+mod images;
 mod registry;
 pub mod setup;
 pub mod tls;
@@ -232,6 +233,10 @@ impl Ui for WebUi {
         let mut app: Router = Router::new()
             .route("/ws", get(ws_handler))
             .route("/commands", get(commands_handler))
+            // Registered before `.fallback` (the SPA catch-all) and before
+            // the token layer below, so it is routed AND token-gated — the
+            // opposite of `/peakbot-ca.crt`, which merges after the layer.
+            .route("/images/{id}", get(images::image_handler))
             .with_state(self.ws_state.clone())
             .fallback(static_handler);
 
@@ -822,6 +827,9 @@ fn serve_stub() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Path;
+    use rig_core::completion::message::ImageMediaType;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn format_addr_in_use_contains_expected_parts() {
@@ -837,7 +845,9 @@ mod tests {
     /// roundtrip through `reqwest`. More honest than a tower-oneshot
     /// stub — exercises actual TCP, actual content-type headers, etc.
     async fn spawn_app() -> std::net::SocketAddr {
-        let app: Router = Router::new().fallback(static_handler);
+        let app: Router = Router::new()
+            .route("/images/{id}", get(images::image_handler))
+            .fallback(static_handler);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -936,6 +946,154 @@ mod tests {
         assert_eq!(cmds[0].name, "help");
     }
 
+    // --- /images/{id}: content-addressed image cache ---
+    //
+    // The handler can only see the process-wide `image_cache::dir()`, so
+    // tests stay collision-free under parallel execution by making every
+    // payload unique (content address ⇒ distinct id).
+
+    /// 1x1 transparent PNG — the smallest decodable PNG.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60,
+        0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0xa5, 0xf6, 0x45, 0x40, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// sha256-hex of `bytes` — mirrors the id minting in `image_cache`
+    /// without depending on its private `spill_in` seam.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Spill unique bytes into the process-wide cache; returns (id, bytes).
+    fn spill_unique(media_type: ImageMediaType, tag: &str) -> (String, Vec<u8>) {
+        let bytes = format!("{tag}-{}", Uuid::new_v4()).into_bytes();
+        let image_ref = crate::image_cache::spill(&bytes, media_type, "test.png")
+            .expect("spill into the global cache dir");
+        (image_ref.id, bytes)
+    }
+
+    #[tokio::test]
+    async fn images_route_serves_spilled_bytes_with_image_content_type() {
+        let image_ref = crate::image_cache::spill(TINY_PNG, ImageMediaType::PNG, "tiny.png")
+            .expect("spill the tiny png");
+        let addr = spawn_app().await;
+        let resp = reqwest::get(format!("http://{addr}/images/{}", image_ref.id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()[reqwest::header::CONTENT_TYPE], "image/png");
+        assert_eq!(resp.bytes().await.unwrap().to_vec(), TINY_PNG);
+    }
+
+    #[tokio::test]
+    async fn images_route_content_type_follows_the_id_extension() {
+        // `spill` only mints `jpg` for JPEG; the `jpeg` row is written
+        // directly so the second arm of the match is exercised too.
+        let rows: [(&str, ImageMediaType, Option<&str>, &str); 5] = [
+            ("png", ImageMediaType::PNG, None, "image/png"),
+            ("jpg", ImageMediaType::JPEG, None, "image/jpeg"),
+            ("jpeg", ImageMediaType::JPEG, Some("jpeg"), "image/jpeg"),
+            ("gif", ImageMediaType::GIF, None, "image/gif"),
+            ("webp", ImageMediaType::WEBP, None, "image/webp"),
+        ];
+        let addr = spawn_app().await;
+        for (ext, media_type, forced_ext, expected_ct) in rows {
+            let bytes = format!("web-image-{ext}-{}", Uuid::new_v4()).into_bytes();
+            let id = if let Some(ext) = forced_ext {
+                let id = format!("{}.{}", sha256_hex(&bytes), ext);
+                std::fs::write(crate::image_cache::dir().join(&id), &bytes).unwrap();
+                id
+            } else {
+                crate::image_cache::spill(&bytes, media_type, "t.png")
+                    .unwrap()
+                    .id
+            };
+            let resp = reqwest::get(format!("http://{addr}/images/{id}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "ext {ext}");
+            assert_eq!(resp.headers()[reqwest::header::CONTENT_TYPE], expected_ct);
+            assert_eq!(resp.bytes().await.unwrap().to_vec(), bytes, "ext {ext}");
+        }
+    }
+
+    #[tokio::test]
+    async fn images_route_sets_immutable_cache_control_and_nosniff() {
+        let (id, _bytes) = spill_unique(ImageMediaType::PNG, "web-image-cache-headers");
+        let addr = spawn_app().await;
+        let resp = reqwest::get(format!("http://{addr}/images/{id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()[reqwest::header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            resp.headers()[reqwest::header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn images_route_404s_on_unknown_hash() {
+        // Well-formed id for bytes we never spill — grammar passes, file
+        // is absent, and the response must not reveal which.
+        let id = format!(
+            "{}.png",
+            sha256_hex(format!("never-spilled-{}", Uuid::new_v4()).as_bytes())
+        );
+        let addr = spawn_app().await;
+        let resp = reqwest::get(format!("http://{addr}/images/{id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        assert_eq!(resp.text().await.unwrap(), "not found");
+    }
+
+    #[tokio::test]
+    async fn images_route_404s_on_malformed_id() {
+        let bad_ids = [
+            "not-hex.png".to_string(),
+            format!("{}c.png", "ab".repeat(31)), // 63 hex chars
+            format!("{}.png", "AB".repeat(32)),  // uppercase hex
+        ];
+        let addr = spawn_app().await;
+        for id in &bad_ids {
+            let resp = reqwest::get(format!("http://{addr}/images/{id}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "id {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn images_route_404s_on_traversal_id() {
+        let addr = spawn_app().await;
+        // reqwest keeps `%2F` encoded, so this form reaches the server raw;
+        // the extractor decodes it to `../../etc/passwd` before `path_for`
+        // rejects it.
+        let resp = reqwest::get(format!("http://{addr}/images/..%2f..%2fetc%2fpasswd"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // reqwest normalises literal `..` segments client-side, so the raw
+        // form is only reachable by a hand-crafted request — call the
+        // handler directly with the decoded segment (cf. `dotdot_path_returns_404`).
+        let resp = images::image_handler(Path("../../etc/passwd".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     // --- Phase 4: token auth ---
 
     /// Spawn `/commands` behind the token layer on a random loopback port.
@@ -943,6 +1101,9 @@ mod tests {
         let secret: Arc<str> = token.into();
         let app: Router = Router::new()
             .route("/commands", get(commands_handler))
+            // Route registered before the layer, as in the production
+            // router, so the images route inherits the token gate.
+            .route("/images/{id}", get(images::image_handler))
             .layer(from_fn_with_state(secret, require_token));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1012,6 +1173,28 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // Cookie-authed requests don't re-issue Set-Cookie.
         assert!(!resp.headers().contains_key(reqwest::header::SET_COOKIE));
+    }
+
+    #[tokio::test]
+    async fn images_route_requires_token_when_gated() {
+        // Pins the route placement: `/images/{id}` is registered before the
+        // token layer, so it inherits the gate (unlike `/peakbot-ca.crt`).
+        let (id, _bytes) = spill_unique(ImageMediaType::PNG, "web-image-gated");
+        let addr = spawn_gated("s3cret").await;
+
+        let resp = bare_client()
+            .get(format!("http://{addr}/images/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = bare_client()
+            .get(format!("http://{addr}/images/{id}?token=s3cret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
