@@ -2,7 +2,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
-import { memo } from "react";
+import { memo, useState, type ComponentProps } from "react";
 import type { ChatMessage, MessageRole } from "../types";
 
 // Per-role visual treatment. Mirrors the TUI's role glyphs/colours so the
@@ -100,6 +100,53 @@ function sameThinking(a: string[] | undefined, b: string[] | undefined): boolean
   return true;
 }
 
+// Only /images/, http(s)://, and data: become <img>: a bare local path the
+// backend left unresolved would hit the SPA catch-all route and render broken.
+function isRenderableImageSrc(src: string | undefined): boolean {
+  return (
+    src !== undefined &&
+    (src.startsWith("/images/") ||
+      src.startsWith("http://") ||
+      src.startsWith("https://") ||
+      src.startsWith("data:"))
+  );
+}
+
+// Markdown image renderer: a real <img> for renderable srcs, a muted text
+// stub when the src isn't renderable or the load fails (cache file swept).
+function CachedImage({ src, alt }: ComponentProps<"img"> & { node?: unknown }) {
+  const [error, setError] = useState(false);
+  const [lastSrc, setLastSrc] = useState(src);
+  if (src !== lastSrc) {
+    // Reset during render (not in an effect) so a new src never shows the
+    // stale fallback for a frame.
+    setLastSrc(src);
+    setError(false);
+  }
+  if (error || !isRenderableImageSrc(src)) {
+    return (
+      <span className="text-zinc-500" title={src ?? ""}>
+        🖼 {alt || "image"}
+      </span>
+    );
+  }
+  return (
+    <a href={src} target="_blank" rel="noreferrer">
+      <img
+        src={src}
+        alt={alt ?? ""}
+        loading="lazy"
+        onError={() => setError(true)}
+        className="max-h-96 rounded border border-zinc-800/60"
+      />
+    </a>
+  );
+}
+
+// Module scope: stable identity across renders — an inline literal would be
+// a fresh reference every render and defeat memoization.
+const MARKDOWN_COMPONENTS = { img: CachedImage } as const;
+
 // Unexported renderer. Wrapped by `memo` below so that, with the value comparator
 // (`sameMessage`), re-renders are skipped when the adapted message hasn't
 // actually changed. Identity comparison alone wouldn't help: every websocket
@@ -135,7 +182,11 @@ function MessageView({ message }: { message: ChatMessage }) {
       )}
       {isMarkdown(message.role) ? (
         <div className="markdown-body text-sm leading-relaxed text-zinc-200">
-          <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} rehypePlugins={[rehypeHighlight]}>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm, remarkBreaks]}
+            rehypePlugins={[rehypeHighlight]}
+            components={MARKDOWN_COMPONENTS}
+          >
             {message.content}
           </ReactMarkdown>
         </div>
