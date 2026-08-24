@@ -1,5 +1,7 @@
-import { describe, it, expect } from "vitest";
-import { sameMessage } from "./Message";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { Message, sameMessage } from "./Message";
 import type { ChatMessage } from "../types";
 
 // A canonical full message. Every test below mutates exactly one field off this
@@ -130,5 +132,122 @@ describe("sameMessage", () => {
     const a: ChatMessage = { role: "system", content: "ready", timestamp: "10:14" };
     const b: ChatMessage = { role: "system", content: "ready", timestamp: "10:14" };
     expect(sameMessage(a, b)).toBe(true);
+  });
+});
+
+// Render tests for markdown image links — same createRoot + act pattern as
+// Transcript.test.tsx; jsdom comes from the vitest environmentMatchGlobs.
+
+// React 19's `act` reads `globalThis.IS_REACT_ACT_ENVIRONMENT` and warns when
+// it's unset — set it once so the console stays clean.
+beforeAll(() => {
+  (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean })
+    .IS_REACT_ACT_ENVIRONMENT = true;
+});
+
+afterEach(() => {
+  document.body.innerHTML = "";
+});
+
+/** Render a message into a fresh container; returns the container and an
+ * async unmount for teardown. */
+async function renderMessage(message: ChatMessage): Promise<{
+  el: HTMLElement;
+  unmount: () => Promise<void>;
+}> {
+  const el = document.createElement("div");
+  document.body.appendChild(el);
+  const root = createRoot(el);
+  await act(async () => {
+    root.render(createElement(Message, { message }));
+  });
+  return {
+    el,
+    unmount: async () => {
+      await act(async () => {
+        root.unmount();
+      });
+    },
+  };
+}
+
+describe("markdown image rendering (CachedImage)", () => {
+  it("renders a resolved /images/ link as an <img> with that src", async () => {
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![x](/images/abc.png)",
+    });
+    try {
+      const img = el.querySelector("img");
+      expect(img).not.toBeNull();
+      expect(img!.getAttribute("src")).toBe("/images/abc.png");
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("wraps the <img> in an anchor to the same src and sets loading=lazy", async () => {
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![x](/images/abc.png)",
+    });
+    try {
+      const img = el.querySelector("img");
+      expect(img).not.toBeNull();
+      expect(img!.getAttribute("loading")).toBe("lazy");
+      const anchor = img!.closest("a");
+      expect(anchor).not.toBeNull();
+      expect(anchor!.getAttribute("href")).toBe("/images/abc.png");
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("renders remote http(s) images as an <img> (deliberately not blocked)", async () => {
+    // Pins the product decision NOT to block remote images for now.
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![x](https://example.com/x.png)",
+    });
+    try {
+      const img = el.querySelector("img");
+      expect(img).not.toBeNull();
+      expect(img!.getAttribute("src")).toBe("https://example.com/x.png");
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("renders a bare local path as the muted fallback, not an <img>", async () => {
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![chart](out/chart.png)",
+    });
+    try {
+      expect(el.querySelector("img")).toBeNull();
+      const span = el.querySelector("span[title='out/chart.png']");
+      expect(span).not.toBeNull();
+      expect(span!.textContent).toContain("🖼 chart");
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("falls back to the muted text when the image fails to load", async () => {
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![chart](/images/deadbeef.png)",
+    });
+    try {
+      const img = el.querySelector("img");
+      expect(img).not.toBeNull();
+      await act(async () => {
+        img!.dispatchEvent(new Event("error"));
+      });
+      expect(el.querySelector("img")).toBeNull();
+      expect(el.textContent).toContain("🖼 chart");
+    } finally {
+      await unmount();
+    }
   });
 });

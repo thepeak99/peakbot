@@ -51,6 +51,14 @@ Remember: the file editing tools are safer, provide diffs, and work across all p
 - The full output is always saved to /tmp/peakbot/ regardless of head/tail settings
 - Default tail is 100 lines; set tail: 0 to see all output (or use file_read on the saved file)
 
+# Showing Images to the User
+
+When you want the user to see an image file on disk (a screenshot you took, a generated chart, a diagram), embed it in your reply with markdown image syntax using its real path:
+
+![alt text](path/to/image.png)
+
+Use an absolute path or one relative to the session working directory — never invent a path or just mention the filename in prose. The embedded link is what makes the image display; naming the file does not.
+
 # Using the think tool
 
 Before taking any action or responding to the user after receiving tool results, 

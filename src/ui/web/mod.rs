@@ -82,6 +82,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
+mod images;
 mod registry;
 pub mod setup;
 pub mod tls;
@@ -232,6 +233,10 @@ impl Ui for WebUi {
         let mut app: Router = Router::new()
             .route("/ws", get(ws_handler))
             .route("/commands", get(commands_handler))
+            // Registered before `.fallback` (the SPA catch-all) and before
+            // the token layer below, so it is routed AND token-gated — the
+            // opposite of `/peakbot-ca.crt`, which merges after the layer.
+            .route("/images/{id}", get(images::image_handler))
             .with_state(self.ws_state.clone())
             .fallback(static_handler);
 
@@ -549,14 +554,21 @@ pub(crate) enum ForwardExit {
 pub(crate) async fn forward_state(
     state_rx: &mut mpsc::Receiver<AppState>,
     out: &OutboundTx,
+    sm: &StateManager,
     reader: &mut tokio::task::JoinHandle<()>,
     writer: &mut tokio::task::JoinHandle<()>,
 ) -> ForwardExit {
+    // One memo per connection (not per message): its resolve cache survives
+    // across snapshots, and each snapshot is already a clone.
+    let mut images = images::ImageLinks::default();
     loop {
         tokio::select! {
             maybe_state = state_rx.recv() => {
                 let Some(app_state) = maybe_state else { return ForwardExit::StateEnded };
                 let exit = app_state.exit_requested;
+                // Rewrite the already-cloned snapshot (not the shared state): /images/ links
+                // must never leak to disk, and stdio's separate publish path has no server.
+                let app_state = images.rewrite(app_state, &sm.session_cwd());
                 if out.publish_state(Arc::new(app_state)).is_err() {
                     return ForwardExit::WriterGone;
                 }
@@ -680,7 +692,14 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     // this loop and the socket would leak `attached > 0` in the registry,
     // blocking the idle-TTL reaper.
     let mut state_rx = registered.session.state_manager.subscribe();
-    let _exit = forward_state(&mut state_rx, &out_tx, &mut reader_task, &mut writer_task).await;
+    let _exit = forward_state(
+        &mut state_rx,
+        &out_tx,
+        &registered.session.state_manager,
+        &mut reader_task,
+        &mut writer_task,
+    )
+    .await;
 
     // Teardown: stop the reader, drain the writer exactly once (the
     // forwarder already observed WriterGone if the writer died first;
@@ -822,6 +841,9 @@ fn serve_stub() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Path;
+    use rig_core::completion::message::ImageMediaType;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn format_addr_in_use_contains_expected_parts() {
@@ -837,7 +859,9 @@ mod tests {
     /// roundtrip through `reqwest`. More honest than a tower-oneshot
     /// stub — exercises actual TCP, actual content-type headers, etc.
     async fn spawn_app() -> std::net::SocketAddr {
-        let app: Router = Router::new().fallback(static_handler);
+        let app: Router = Router::new()
+            .route("/images/{id}", get(images::image_handler))
+            .fallback(static_handler);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -936,6 +960,154 @@ mod tests {
         assert_eq!(cmds[0].name, "help");
     }
 
+    // --- /images/{id}: content-addressed image cache ---
+    //
+    // The handler can only see the process-wide `image_cache::dir()`, so
+    // tests stay collision-free under parallel execution by making every
+    // payload unique (content address ⇒ distinct id).
+
+    /// 1x1 transparent PNG — the smallest decodable PNG.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60,
+        0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0xa5, 0xf6, 0x45, 0x40, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// sha256-hex of `bytes` — mirrors the id minting in `image_cache`
+    /// without depending on its private `spill_in` seam.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Spill unique bytes into the process-wide cache; returns (id, bytes).
+    fn spill_unique(media_type: ImageMediaType, tag: &str) -> (String, Vec<u8>) {
+        let bytes = format!("{tag}-{}", Uuid::new_v4()).into_bytes();
+        let image_ref = crate::image_cache::spill(&bytes, media_type, "test.png")
+            .expect("spill into the global cache dir");
+        (image_ref.id, bytes)
+    }
+
+    #[tokio::test]
+    async fn images_route_serves_spilled_bytes_with_image_content_type() {
+        let image_ref = crate::image_cache::spill(TINY_PNG, ImageMediaType::PNG, "tiny.png")
+            .expect("spill the tiny png");
+        let addr = spawn_app().await;
+        let resp = reqwest::get(format!("http://{addr}/images/{}", image_ref.id))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()[reqwest::header::CONTENT_TYPE], "image/png");
+        assert_eq!(resp.bytes().await.unwrap().to_vec(), TINY_PNG);
+    }
+
+    #[tokio::test]
+    async fn images_route_content_type_follows_the_id_extension() {
+        // `spill` only mints `jpg` for JPEG; the `jpeg` row is written
+        // directly so the second arm of the match is exercised too.
+        let rows: [(&str, ImageMediaType, Option<&str>, &str); 5] = [
+            ("png", ImageMediaType::PNG, None, "image/png"),
+            ("jpg", ImageMediaType::JPEG, None, "image/jpeg"),
+            ("jpeg", ImageMediaType::JPEG, Some("jpeg"), "image/jpeg"),
+            ("gif", ImageMediaType::GIF, None, "image/gif"),
+            ("webp", ImageMediaType::WEBP, None, "image/webp"),
+        ];
+        let addr = spawn_app().await;
+        for (ext, media_type, forced_ext, expected_ct) in rows {
+            let bytes = format!("web-image-{ext}-{}", Uuid::new_v4()).into_bytes();
+            let id = if let Some(ext) = forced_ext {
+                let id = format!("{}.{}", sha256_hex(&bytes), ext);
+                std::fs::write(crate::image_cache::dir().join(&id), &bytes).unwrap();
+                id
+            } else {
+                crate::image_cache::spill(&bytes, media_type, "t.png")
+                    .unwrap()
+                    .id
+            };
+            let resp = reqwest::get(format!("http://{addr}/images/{id}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "ext {ext}");
+            assert_eq!(resp.headers()[reqwest::header::CONTENT_TYPE], expected_ct);
+            assert_eq!(resp.bytes().await.unwrap().to_vec(), bytes, "ext {ext}");
+        }
+    }
+
+    #[tokio::test]
+    async fn images_route_sets_immutable_cache_control_and_nosniff() {
+        let (id, _bytes) = spill_unique(ImageMediaType::PNG, "web-image-cache-headers");
+        let addr = spawn_app().await;
+        let resp = reqwest::get(format!("http://{addr}/images/{id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()[reqwest::header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            resp.headers()[reqwest::header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn images_route_404s_on_unknown_hash() {
+        // Well-formed id for bytes we never spill — grammar passes, file
+        // is absent, and the response must not reveal which.
+        let id = format!(
+            "{}.png",
+            sha256_hex(format!("never-spilled-{}", Uuid::new_v4()).as_bytes())
+        );
+        let addr = spawn_app().await;
+        let resp = reqwest::get(format!("http://{addr}/images/{id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        assert_eq!(resp.text().await.unwrap(), "not found");
+    }
+
+    #[tokio::test]
+    async fn images_route_404s_on_malformed_id() {
+        let bad_ids = [
+            "not-hex.png".to_string(),
+            format!("{}c.png", "ab".repeat(31)), // 63 hex chars
+            format!("{}.png", "AB".repeat(32)),  // uppercase hex
+        ];
+        let addr = spawn_app().await;
+        for id in &bad_ids {
+            let resp = reqwest::get(format!("http://{addr}/images/{id}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "id {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn images_route_404s_on_traversal_id() {
+        let addr = spawn_app().await;
+        // reqwest keeps `%2F` encoded, so this form reaches the server raw;
+        // the extractor decodes it to `../../etc/passwd` before `path_for`
+        // rejects it.
+        let resp = reqwest::get(format!("http://{addr}/images/..%2f..%2fetc%2fpasswd"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // reqwest normalises literal `..` segments client-side, so the raw
+        // form is only reachable by a hand-crafted request — call the
+        // handler directly with the decoded segment (cf. `dotdot_path_returns_404`).
+        let resp = images::image_handler(Path("../../etc/passwd".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     // --- Phase 4: token auth ---
 
     /// Spawn `/commands` behind the token layer on a random loopback port.
@@ -943,6 +1115,9 @@ mod tests {
         let secret: Arc<str> = token.into();
         let app: Router = Router::new()
             .route("/commands", get(commands_handler))
+            // Route registered before the layer, as in the production
+            // router, so the images route inherits the token gate.
+            .route("/images/{id}", get(images::image_handler))
             .layer(from_fn_with_state(secret, require_token));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1012,6 +1187,28 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // Cookie-authed requests don't re-issue Set-Cookie.
         assert!(!resp.headers().contains_key(reqwest::header::SET_COOKIE));
+    }
+
+    #[tokio::test]
+    async fn images_route_requires_token_when_gated() {
+        // Pins the route placement: `/images/{id}` is registered before the
+        // token layer, so it inherits the gate (unlike `/peakbot-ca.crt`).
+        let (id, _bytes) = spill_unique(ImageMediaType::PNG, "web-image-gated");
+        let addr = spawn_gated("s3cret").await;
+
+        let resp = bare_client()
+            .get(format!("http://{addr}/images/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = bare_client()
+            .get(format!("http://{addr}/images/{id}?token=s3cret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
@@ -1344,9 +1541,10 @@ mod tests {
         let (out, _rx): (OutboundTx, OutboundRx) = outbound_channel();
         let _ = _rx;
 
+        let sm = StateManager::new();
         let exit = tokio::time::timeout(
             Duration::from_secs(1),
-            forward_state(&mut state_rx, &out, &mut reader, &mut writer),
+            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
         )
         .await
         .expect("forwarder must exit promptly when the writer task has already returned");
@@ -1374,9 +1572,10 @@ mod tests {
         let (out, _rx): (OutboundTx, OutboundRx) = outbound_channel();
         let _ = _rx;
 
+        let sm = StateManager::new();
         let exit = tokio::time::timeout(
             Duration::from_secs(1),
-            forward_state(&mut state_rx, &out, &mut reader, &mut writer),
+            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
         )
         .await
         .expect("forwarder must exit promptly when the reader task has already returned");
@@ -1384,6 +1583,122 @@ mod tests {
         assert!(
             matches!(exit, ForwardExit::ReaderGone),
             "forwarder must return ReaderGone when the reader task completes first; got {exit:?}"
+        );
+    }
+
+    /// Invariant (runtime twin of `rewrite`'s by-value signature): the
+    /// rewrite is presentation-only — it must never reach shared state or
+    /// disk, because `sync_to_conversation` re-derives content from the
+    /// live AppState.
+    #[tokio::test]
+    async fn forward_state_rewrites_the_frame_without_touching_shared_or_persisted_state() {
+        use crate::storage::FileStorage;
+        use crate::ui::app_state::MessageRole;
+
+        let cwd = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(cwd.path().join("chart.png"), TINY_PNG).expect("write chart.png");
+
+        // Real on-disk persistence: a leak would land in this file.
+        let storage_dir = tempfile::TempDir::new().expect("tempdir");
+        let sm = StateManager::new_arc_with_storage(Arc::new(
+            FileStorage::new(storage_dir.path().to_path_buf()).expect("FileStorage"),
+        ));
+        sm.set_session_cwd(cwd.path().to_path_buf());
+        sm.create_conversation(
+            "red".into(),
+            "provider".into(),
+            "model".into(),
+            cwd.path().to_string_lossy().into_owned(),
+        );
+        sm.add_user_message("make a chart".into());
+        sm.add_assistant_message("see ![chart](chart.png)".into());
+
+        // The T13/T14 harness: the state channel carries the owned detached
+        // clone `subscribe()` would hand the forwarder; reader and writer
+        // never complete, so only the state arm may fire.
+        let (state_tx, mut state_rx) = mpsc::channel::<AppState>(1);
+        let mut reader: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let mut writer: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let (out, mut rx): (OutboundTx, OutboundRx) = outbound_channel();
+
+        // Ends the loop right after the first published frame.
+        let mut detached = sm.get_state();
+        detached.exit_requested = true;
+        state_tx.send(detached).await.expect("send detached clone");
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
+        )
+        .await
+        .expect("forwarder must exit after one published frame");
+        assert!(
+            matches!(exit, ForwardExit::StateEnded),
+            "forwarder must end via the exit flag after one frame; got {exit:?}"
+        );
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), rx.next())
+            .await
+            .expect("published frame must arrive")
+            .expect("published frame present");
+        let wire = match frame {
+            OutboundMessage::State { state } => state,
+            other => panic!("expected a State frame, got {other:?}"),
+        };
+        let wire_content = wire
+            .chat
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Agent)
+            .expect("agent row on the wire")
+            .content
+            .clone();
+
+        // (a) the rewrite happened on the wire.
+        assert!(
+            wire_content.contains("/images/"),
+            "wire frame must carry the rewritten link; got {wire_content:?}"
+        );
+
+        // (b) shared state still holds the raw path.
+        let shared = sm.get_state();
+        let shared_content = shared
+            .chat
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Agent)
+            .expect("agent row in shared state")
+            .content
+            .clone();
+        assert!(
+            shared_content.contains("chart.png"),
+            "shared state must keep the raw path; got {shared_content:?}"
+        );
+        assert!(
+            !shared
+                .chat
+                .messages
+                .iter()
+                .any(|m| m.content.contains("/images/")),
+            "rewritten links must never reach shared state"
+        );
+
+        // (c) persistence still holds the raw path (the real on-disk file).
+        sm.save_conversation();
+        let conv_id = sm
+            .get_current_conversation_id()
+            .expect("current conversation");
+        let on_disk = std::fs::read_to_string(storage_dir.path().join(format!("{conv_id}.json")))
+            .expect("conversation file on disk");
+        assert!(
+            on_disk.contains("chart.png"),
+            "persisted conversation must keep the raw path"
+        );
+        assert!(
+            !on_disk.contains("/images/"),
+            "rewritten links must never reach disk"
         );
     }
 
