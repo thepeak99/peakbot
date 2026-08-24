@@ -280,6 +280,7 @@ fn exact_ambiguous_with_fuzzy_superset_fixture() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::tool::Tool;
     use tempfile::tempdir;
 
     // ── resolve_against ─────────────────────────────────────────────────
@@ -772,6 +773,342 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             content,
             "file must be untouched"
+        );
+    }
+
+    // ── str_replace: required new_str contract (RED — pins the fix) ────
+    //
+    // Pins the user-approved contract for file_str_replace:
+    //   1. schema `required` = {path, old_str, new_str}, and new_str's
+    //      description states that an EMPTY STRING deletes old_str;
+    //   2. new_str ABSENT  -> Err carrying the exact self-correcting
+    //      guidance `new_str is required; pass "" to delete old_str`,
+    //      with NO file modification;
+    //   3. new_str null    -> same Err, no file modification;
+    //   4. new_str ""      -> Ok, wording says "Deleted" (never
+    //      "Replaced"), old_str gone from disk;
+    //   5. new_str non-empty -> Ok, wording still says "Replaced"
+    //      (unchanged behaviour — regression guard);
+    //   6. the match-level indicator ("whitespace_normalized") that
+    //      today rides along in the success message must survive in the
+    //      Deleted wording exactly as it does in the Replaced one.
+    //
+    // These drive the Rig `Tool` trait boundary (`definition` / `call`)
+    // with JSON args strings exactly as rig would deserialize and deliver
+    // them — NOT `str_replace::run` directly — because the contract lives
+    // at the boundary where model args arrive. `run`'s own
+    // `None`-means-delete behaviour stays pinned by
+    // `str_replace_normalized_match_deletion_removes_matched_range_only`,
+    // so the required-ness guard belongs in `call()`.
+    //
+    // RED expectation on current code: (1) required is only
+    // [path, old_str]; (2)/(3) a missing/null new_str silently DELETES
+    // old_str and returns Ok("... Replaced 1 occurrence ..."); (4)/(6)/(7)
+    // deletion is reported as "Replaced". (5) and (8) pass today:
+    // non-empty replacement is unchanged behaviour.
+
+    /// The exact guidance substring the model must see in the tool error
+    /// to self-correct (spec item 2/3 — verbatim).
+    const NEW_STR_REQUIRED_GUIDANCE: &str = "new_str is required; pass \"\" to delete old_str";
+
+    /// Deserialize rig-style args JSON the same way rig does before
+    /// invoking `Tool::call`.
+    fn parse_rig_args(json: &str) -> str_replace::FileStrReplaceArgs {
+        serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("test fixture must deserialize like rig's args: {e}"))
+    }
+
+    #[tokio::test]
+    async fn str_replace_schema_requires_new_str_and_documents_empty_string_deletion() {
+        // Spec item 1 — the schema is the first line of defence: a model
+        // that reads the schema must see new_str as required and learn
+        // that "" is the deletion path.
+        let tool = FileStrReplaceTool::new(PathBuf::from("/tmp"));
+        let def = tool.definition(String::new()).await;
+        let params = &def.parameters;
+
+        let required = params["required"]
+            .as_array()
+            .expect("schema must keep a `required` array");
+        let required_set: std::collections::BTreeSet<&str> = required
+            .iter()
+            .map(|v| v.as_str().expect("required entries are strings"))
+            .collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["path", "old_str", "new_str"].into_iter().collect();
+        assert_eq!(
+            required_set, expected,
+            "new_str must be required — a missing new_str today silently \
+             deletes old_str and reports a replacement"
+        );
+
+        let new_str_prop = &params["properties"]["new_str"];
+        assert_eq!(
+            new_str_prop["type"].as_str(),
+            Some("string"),
+            "new_str stays a string property"
+        );
+        let desc = new_str_prop["description"]
+            .as_str()
+            .expect("new_str must keep a description");
+        assert!(
+            desc.to_lowercase().contains("empty string"),
+            "new_str description must state that an empty string deletes \
+             old_str, got: {desc:?}"
+        );
+        assert!(
+            desc.to_lowercase().contains("delete"),
+            "new_str description must state that an empty string deletes \
+             old_str, got: {desc:?}"
+        );
+        assert!(
+            !desc.contains("Omit to delete"),
+            "the dishonest 'Omit to delete old_str' wording must be gone, \
+             got: {desc:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn str_replace_call_missing_new_str_errors_with_guidance_and_writes_nothing() {
+        // Spec item 2 — the exact shape of the production corruption: the
+        // model meant to replace, omitted new_str, and the tool deleted
+        // old_str while reporting "Replaced 1 occurrence".
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing_new_str.txt");
+        let original = "alpha beta gamma\n";
+        std::fs::write(&path, original).unwrap();
+
+        let args_json = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "old_str": "beta"
+        })
+        .to_string();
+        let args = parse_rig_args(&args_json);
+
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let result = tool.call(args).await;
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains(NEW_STR_REQUIRED_GUIDANCE),
+                    "error must carry the exact self-correcting guidance, got: {msg}"
+                );
+            }
+            Ok(out) => panic!(
+                "missing new_str must be rejected, not silently deleted — \
+                 got Ok: {out}"
+            ),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "rejected call must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn str_replace_call_null_new_str_errors_with_guidance_and_writes_nothing() {
+        // Spec item 3 — an explicit JSON null deserializes to the same
+        // `None` as an absent key and must be rejected identically.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("null_new_str.txt");
+        let original = "alpha beta gamma\n";
+        std::fs::write(&path, original).unwrap();
+
+        let args_json = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "old_str": "beta",
+            "new_str": null
+        })
+        .to_string();
+        let args = parse_rig_args(&args_json);
+
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let result = tool.call(args).await;
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains(NEW_STR_REQUIRED_GUIDANCE),
+                    "error must carry the exact self-correcting guidance, got: {msg}"
+                );
+            }
+            Ok(out) => panic!(
+                "null new_str must be rejected, not silently deleted — \
+                 got Ok: {out}"
+            ),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "rejected call must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn str_replace_call_empty_new_str_reports_deleted_not_replaced_and_removes_text() {
+        // Spec item 4 — the explicit empty string is the ONLY legal
+        // deletion path, and the success wording must say DELETED, never
+        // Replaced. (Today the deletion mechanics already work; only the
+        // wording is wrong — this test is RED on the wording assertions.)
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty_new_str.txt");
+        std::fs::write(&path, "alpha beta gamma\n").unwrap();
+
+        let args_json = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "old_str": "beta",
+            "new_str": ""
+        })
+        .to_string();
+        let args = parse_rig_args(&args_json);
+
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let out = tool
+            .call(args)
+            .await
+            .expect("explicit empty new_str is the legal deletion path");
+        assert!(
+            out.contains("Deleted"),
+            "deletion must be reported as a deletion, got: {out}"
+        );
+        assert!(
+            !out.contains("Replaced"),
+            "deletion must not be reported as a replacement, got: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha  gamma\n",
+            "old_str must be removed from disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn str_replace_call_nonempty_new_str_still_reports_replaced() {
+        // Spec item 5 — regression guard: a real replacement keeps the
+        // existing "Replaced" wording and behaviour. Expected GREEN today.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonempty_new_str.txt");
+        std::fs::write(&path, "alpha beta gamma\n").unwrap();
+
+        let args_json = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "old_str": "beta",
+            "new_str": "BETA"
+        })
+        .to_string();
+        let args = parse_rig_args(&args_json);
+
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let out = tool
+            .call(args)
+            .await
+            .expect("normal replacement must succeed");
+        assert!(out.contains("Replaced"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha BETA gamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn str_replace_call_end_to_end_json_args_with_thought_key_replaces() {
+        // Spec item (f) — full-path proof: the args arrive as ONE JSON
+        // string exactly as rig would deliver ThoughtGate's output,
+        // including the extra `thought` key, which the Args struct must
+        // ignore, not choke on. Expected GREEN today (non-empty
+        // replacement is unchanged behaviour).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("e2e_thought.txt");
+        std::fs::write(&path, "alpha beta gamma\n").unwrap();
+
+        let args_json = serde_json::json!({
+            "thought": "swap beta for BETA",
+            "path": path.to_string_lossy(),
+            "old_str": "beta",
+            "new_str": "BETA"
+        })
+        .to_string();
+        let args = parse_rig_args(&args_json);
+
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let out = tool
+            .call(args)
+            .await
+            .expect("end-to-end replacement must succeed");
+        assert!(out.contains("Replaced"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha BETA gamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn str_replace_call_empty_new_str_normalized_match_keeps_match_level_in_deleted_wording()
+    {
+        // Spec item 6 — the match-level indicator that today rides along
+        // in the success message ("Match required whitespace_normalized")
+        // must survive the wording change: Deleted messages keep the same
+        // format conventions as Replaced ones.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deleted_normalized.txt");
+        std::fs::write(&path, "alpha\nTARGET   \nbeta\n").unwrap();
+
+        let args_json = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "old_str": "TARGET\n",
+            "new_str": ""
+        })
+        .to_string();
+        let args = parse_rig_args(&args_json);
+
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let out = tool
+            .call(args)
+            .await
+            .expect("normalized-match deletion must succeed");
+        assert!(out.contains("Deleted"), "got: {out}");
+        assert!(!out.contains("Replaced"), "got: {out}");
+        assert!(
+            out.contains("whitespace_normalized"),
+            "match-level indicator must survive in the Deleted wording, got: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha\n   \nbeta\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn str_replace_call_empty_new_str_replace_all_reports_deleted_not_replaced() {
+        // Spec item 4, plural form — replace_all deletion must also be
+        // reported as a deletion. The exact plural wording is NOT pinned
+        // beyond "Deleted"/not-"Replaced" (the spec leaves it open).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deleted_all.txt");
+        std::fs::write(&path, "x x x\n").unwrap();
+
+        let args_json = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "old_str": "x",
+            "new_str": "",
+            "replace_all": true
+        })
+        .to_string();
+        let args = parse_rig_args(&args_json);
+
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let out = tool
+            .call(args)
+            .await
+            .expect("replace_all deletion must succeed");
+        assert!(out.contains("Deleted"), "got: {out}");
+        assert!(!out.contains("Replaced"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "  \n",
+            "every occurrence of old_str must be removed"
         );
     }
 

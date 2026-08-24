@@ -65,14 +65,14 @@ If editing fails, read the file first with `file_read` to get exact content, the
                     },
                     "new_str": {
                         "type": "string",
-                        "description": "Replacement string. Omit to delete old_str."
+                        "description": "Replacement text. Pass an empty string to delete old_str."
                     },
                     "replace_all": {
                         "type": "boolean",
                         "description": "If true, replace all occurrences. Default: false (single match only)."
                     }
                 },
-                "required": ["path", "old_str"]
+                "required": ["path", "old_str", "new_str"]
             }),
         }
     }
@@ -86,13 +86,24 @@ If editing fails, read the file first with `file_read` to get exact content, the
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(&self.session_cwd, &args.path);
-        let result = run(
-            &resolved.to_string_lossy(),
-            &args.old_str,
-            args.new_str.as_deref(),
-            args.replace_all.unwrap_or(false),
-        );
+        // Requiredness is enforced here, at the boundary where model args
+        // arrive: a missing or null new_str would otherwise silently
+        // DELETE old_str and report a replacement. `run` keeps its
+        // `Option`-taking signature (None = delete is pinned by a
+        // core-level test), so the guard lives in `call`, before any IO.
+        let result = if args.new_str.is_none() {
+            Err(FileEditError::Validation(
+                "new_str is required; pass \"\" to delete old_str".into(),
+            ))
+        } else {
+            let resolved = resolve_against(&self.session_cwd, &args.path);
+            run(
+                &resolved.to_string_lossy(),
+                &args.old_str,
+                args.new_str.as_deref(),
+                args.replace_all.unwrap_or(false),
+            )
+        };
 
         match &result {
             Ok(output) => tracing::info!(
@@ -159,6 +170,7 @@ pub(crate) fn run(
     }
 
     let new_str = new_str.unwrap_or("");
+    let is_deletion = new_str.is_empty();
     let content = read_file(path)?;
 
     let match_result = progressive_match(&content, old_str);
@@ -203,7 +215,16 @@ Tip: Read the file first with file_read to see exact formatting.",
     let new_content = splice(&content, &ranges, new_str);
     write_file(path, &new_content)?;
 
-    let replacement_msg = if count > 1 {
+    // An empty new_str is a deletion, not a replacement — report it as
+    // one. The rest of the message keeps the same format conventions
+    // (snippet, match-level info line, warnings) for both wordings.
+    let replacement_msg = if is_deletion {
+        if count > 1 {
+            format!("Deleted all {} occurrences", count)
+        } else {
+            "Deleted 1 occurrence".to_string()
+        }
+    } else if count > 1 {
         format!("Replaced all {} occurrences", count)
     } else {
         "Replaced 1 occurrence".to_string()
