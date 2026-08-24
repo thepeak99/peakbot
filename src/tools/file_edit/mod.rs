@@ -809,8 +809,7 @@ mod tests {
 
     /// The exact guidance substring the model must see in the tool error
     /// to self-correct (spec item 2/3 — verbatim).
-    const NEW_STR_REQUIRED_GUIDANCE: &str =
-        "new_str is required; pass \"\" to delete old_str";
+    const NEW_STR_REQUIRED_GUIDANCE: &str = "new_str is required; pass \"\" to delete old_str";
 
     /// Deserialize rig-style args JSON the same way rig does before
     /// invoking `Tool::call`.
@@ -1046,7 +1045,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn str_replace_call_empty_new_str_normalized_match_keeps_match_level_in_deleted_wording() {
+    async fn str_replace_call_empty_new_str_normalized_match_keeps_match_level_in_deleted_wording()
+    {
         // Spec item 6 — the match-level indicator that today rides along
         // in the success message ("Match required whitespace_normalized")
         // must survive the wording change: Deleted messages keep the same
