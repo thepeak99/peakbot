@@ -230,6 +230,17 @@ impl StateManager {
         *self.title_model.write().unwrap() = Some((*model).clone());
     }
 
+    /// Get the current title/compaction model (if available). Used by
+    /// `agent_loop` to fetch the live model after agent rebuilds (e.g. on
+    /// `/model` or `/pipeline` switch).
+    pub fn get_title_model(&self) -> Option<Arc<CompactionModel>> {
+        self.title_model
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|m| Arc::new(m.clone()))
+    }
+
     /// Generate a conversation title after the first assistant response.
     ///
     /// Fires only when `message_count == 1` (the just-completed turn) and

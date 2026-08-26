@@ -657,8 +657,10 @@ pub struct AgentRunner {
     /// construction. When `None`, `/model` is a no-op.
     rebuild_ctx: Option<RebuildContext>,
     /// Tool-free compaction model shared with ContextManager.
-    /// Cloned at construction so memory compaction can use it
-    /// without reaching through StateManager.
+    /// Kept for historical/API reasons; memory compaction now fetches
+    /// the live model from StateManager via get_title_model() so it sees
+    /// updates on `/model` and `/pipeline` switches.
+    #[allow(dead_code)]
     compaction_model: Option<Arc<CompactionModel>>,
 }
 
@@ -826,7 +828,6 @@ impl AgentRunner {
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
         let event_receiver = self.event_receiver.take();
-        let compaction_model = self.compaction_model.clone();
         // Shared cells for state that swaps on `/model` rebuild. The
         // event loop reads through these so `/stop` always cancels the
         // active prompt and the multimodal-vision gate always reflects
@@ -889,7 +890,6 @@ impl AgentRunner {
                     session_hook_cell,
                     provider_info_cell,
                     rebuild_ctx,
-                    compaction_model,
                 )
                 .await;
             }
@@ -1141,7 +1141,6 @@ impl AgentRunner {
         session_hook_cell: SharedSessionHook,
         provider_info_cell: SharedProviderInfo,
         mut rebuild_ctx: Option<RebuildContext>,
-        compaction_model: Option<Arc<CompactionModel>>,
     ) {
         use std::sync::atomic::Ordering;
 
@@ -1235,11 +1234,14 @@ impl AgentRunner {
 
                     // Lazy memory compaction: run once on the first user
                     // message so startup stays instant and the spinner gives
-                    // visual feedback while we work.
+                    // visual feedback while we work. The compaction_model is
+                    // queried live from StateManager, not from the initial
+                    // variable, so it sees updates from `/model` and `/pipeline`
+                    // rebuilds (see #XXX — memory.md compaction in pipeline mode).
                     if !memory_compaction_done && config.memory.enabled {
                         memory_compaction_done = true;
-                        if let (Some(sm), Some(model)) =
-                            (state_manager.as_ref(), compaction_model.as_ref())
+                        if let Some(sm) = state_manager.as_ref()
+                            && let Some(model) = sm.get_title_model()
                         {
                             let path = std::path::Path::new("memory.md");
                             if let Some(content) = crate::memory_compaction::read_if_oversized(
@@ -1248,7 +1250,7 @@ impl AgentRunner {
                             ) {
                                 sm.set_status(Some("Compacting memory.md...".to_string()));
                                 let size_before = content.len();
-                                match crate::memory_compaction::compact_memory(&content, model)
+                                match crate::memory_compaction::compact_memory(&content, &model)
                                     .await
                                 {
                                     Ok(compacted) => {
