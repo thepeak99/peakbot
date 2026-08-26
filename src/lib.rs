@@ -1240,44 +1240,44 @@ impl AgentRunner {
                     // rebuilds (see #XXX — memory.md compaction in pipeline mode).
                     if !memory_compaction_done && config.memory.enabled {
                         memory_compaction_done = true;
-                        if let Some(sm) = state_manager.as_ref() {
-                            if let Some(model) = sm.get_title_model() {
-                                let path = std::path::Path::new("memory.md");
-                                if let Some(content) = crate::memory_compaction::read_if_oversized(
-                                    path,
-                                    config.memory.threshold_bytes,
-                                ) {
-                                    sm.set_status(Some("Compacting memory.md...".to_string()));
-                                    let size_before = content.len();
-                                    match crate::memory_compaction::compact_memory(&content, &model)
-                                        .await
-                                    {
-                                        Ok(compacted) => {
-                                            if let Err(e) = std::fs::write(path, compacted) {
-                                                tracing::warn!(
-                                                    "Failed to write compacted memory.md: {}",
-                                                    e
-                                                );
-                                            } else {
-                                                sm.add_system_message(format!(
-                                                    "memory.md compacted (was {} bytes)",
-                                                    size_before
-                                                ));
-                                                tracing::info!(
-                                                    "memory.md compacted: {} -> {} bytes",
-                                                    size_before,
-                                                    std::fs::metadata(path)
-                                                        .map(|m| m.len() as usize)
-                                                        .unwrap_or(0)
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("Memory compaction failed: {}", e);
+                        if let Some(sm) = state_manager.as_ref()
+                            && let Some(model) = sm.get_title_model()
+                        {
+                            let path = std::path::Path::new("memory.md");
+                            if let Some(content) = crate::memory_compaction::read_if_oversized(
+                                path,
+                                config.memory.threshold_bytes,
+                            ) {
+                                sm.set_status(Some("Compacting memory.md...".to_string()));
+                                let size_before = content.len();
+                                match crate::memory_compaction::compact_memory(&content, &model)
+                                    .await
+                                {
+                                    Ok(compacted) => {
+                                        if let Err(e) = std::fs::write(path, compacted) {
+                                            tracing::warn!(
+                                                "Failed to write compacted memory.md: {}",
+                                                e
+                                            );
+                                        } else {
+                                            sm.add_system_message(format!(
+                                                "memory.md compacted (was {} bytes)",
+                                                size_before
+                                            ));
+                                            tracing::info!(
+                                                "memory.md compacted: {} -> {} bytes",
+                                                size_before,
+                                                std::fs::metadata(path)
+                                                    .map(|m| m.len() as usize)
+                                                    .unwrap_or(0)
+                                            );
                                         }
                                     }
-                                    sm.set_status(None);
+                                    Err(e) => {
+                                        tracing::warn!("Memory compaction failed: {}", e);
+                                    }
                                 }
+                                sm.set_status(None);
                             }
                         }
                     }
