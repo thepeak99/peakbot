@@ -1224,6 +1224,11 @@ impl AgentRunner {
                         } else {
                             sm.add_user_message_with_attachments(text.clone(), attachments);
                         }
+                        // Escape hatch: an interrupted conversation (provisional
+                        // or untitled) gets its definitive title now from
+                        // whatever transcript exists. The gate no-ops on a
+                        // fresh conversation's opening message; fire-and-forget.
+                        sm.maybe_generate_title();
                         sm.decrement_pending_input();
                         // A real human turn clears all bg cooldowns, so any
                         // buffered background output flushes on the next drain
@@ -2627,7 +2632,8 @@ impl AgentRunner {
                     if let Some(sm) = state_manager.as_ref() {
                         sm.add_assistant_message(response.clone());
                         sm.set_final_broadcast(true);
-                        // Fire-and-forget: generate title after first reply
+                        // Fire-and-forget: upgrade the provisional title
+                        // after the first reply
                         sm.maybe_generate_title();
                     }
 
