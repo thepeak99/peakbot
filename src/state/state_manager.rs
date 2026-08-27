@@ -6,7 +6,7 @@
 use crate::bg_processes::{BgError, BgRegistry, BgStatus, DrainedBlock, StartParams};
 use crate::context_manager::{CompactionResult, ContextManager};
 use crate::conversation::Conversation;
-use crate::conversation_title::generate_conversation_title;
+use crate::conversation_title::{generate_conversation_title, provisional_title};
 use crate::hooks::session_hook::SessionStats;
 use crate::providers::CompactionModel;
 use crate::storage::{ConversationStorage, ConversationSummary};
@@ -241,22 +241,24 @@ impl StateManager {
             .map(|m| Arc::new(m.clone()))
     }
 
-    /// Generate a conversation title after the first assistant response.
+    /// Upgrade the provisional title to the LLM's definitive one.
     ///
-    /// Fires only when `message_count == 1` (the just-completed turn) and
-    /// the conversation has no title yet. Uses the same fire-and-forget
-    /// pattern as compaction: errors are logged and silently ignored.
-    ///
-    /// Call this *after* `add_assistant_message` (which increments the
-    /// message count and persists the response).
+    /// Two-phase titling: the opening user message already carries a local
+    /// provisional title; this fires the one LLM upgrade once the transcript
+    /// has a reply or a second user message (the escape hatch for interrupted
+    /// turns). Fire-and-forget — a failure leaves the title provisional, so
+    /// the next call retries.
     pub fn maybe_generate_title(&self) {
-        // Short-circuit: only generate if the conversation doesn't have a title yet.
-        // This is the idempotency guard — once a title is set, never regenerate.
-        let has_title = {
-            let conv_guard = self.current_conversation.lock().unwrap();
-            conv_guard.as_ref().map(|c| c.has_title()).unwrap_or(false)
+        // Gate, cheapest first. The id is snapshotted at gate time; the
+        // write side re-checks it under the mutex (stale-slot race).
+        let (conv_id, needs_title) = {
+            let guard = self.current_conversation.lock().unwrap();
+            let Some(conv) = guard.as_ref() else {
+                return;
+            };
+            (conv.id, conv.needs_definitive_title())
         };
-        if has_title {
+        if !needs_title {
             return;
         }
 
@@ -266,8 +268,17 @@ impl StateManager {
             None => return,
         };
 
-        // Capture messages for the LLM call and verify we have at least
-        // one user and one assistant message to generate a meaningful title.
+        // A StateManager without a live self_ref can never apply the
+        // result — don't spend the call.
+        let weak = match self.self_ref.read().unwrap().clone() {
+            Some(w) => w,
+            None => return,
+        };
+
+        // Capture messages for the LLM call and verify the transcript can
+        // carry a meaningful title: at least one user row, and either a
+        // reply or a second user row (the opening message alone never
+        // triggers an LLM call).
         let messages: Vec<(String, String)> = {
             let state = self.state.read().unwrap();
             let msgs: Vec<(String, String)> = state
@@ -286,19 +297,18 @@ impl StateManager {
                 .filter(|(role, _)| role != "skip")
                 .collect();
 
-            let has_user = msgs.iter().any(|(r, _)| r == "user");
+            let user_count = msgs.iter().filter(|(r, _)| r == "user").count();
             let has_assistant = msgs.iter().any(|(r, _)| r == "assistant");
-            if !has_user || !has_assistant {
+            if user_count == 0 || !(has_assistant || user_count >= 2) {
                 return;
             }
             msgs
         };
 
-        // Spawn async task — fire and forget, errors logged.
-        // Capture only the Arcs needed for title-set + persist (avoids
-        // needing StateManager to be Clone).
-        let conv_for_title = self.current_conversation.clone();
-        let storage_for_title = self.storage.clone();
+        // Spawn async task — fire and forget, errors logged. Captures only
+        // the Weak + id + model: no conversation/storage Arcs, so the write
+        // side re-reads the slot fresh under the mutex (both the stale-slot
+        // race and the stale-clone-save window are closed).
         tokio::spawn(async move {
             let title = match generate_conversation_title(&messages, &model).await {
                 Ok(t) => t,
@@ -307,28 +317,43 @@ impl StateManager {
                     return;
                 }
             };
-
-            // Set title idempotently and persist
-            {
-                let mut guard = conv_for_title.lock().unwrap();
-                let Some(ref mut conv) = *guard else {
-                    return;
-                };
-                if conv.has_title() {
-                    return; // already set by a concurrent call
-                }
-                conv.set_title(title);
-                let conv_clone = conv.clone();
-                drop(guard);
-                if let Err(e) = storage_for_title
-                    .as_ref()
-                    .map(|s| s.save(&conv_clone))
-                    .unwrap_or(Ok(()))
-                {
-                    tracing::error!("Failed to persist conversation title: {e}");
-                }
+            if let Some(sm) = weak.upgrade() {
+                sm.apply_definitive_title(conv_id, title);
             }
         });
+    }
+
+    /// Land a generated title on the conversation it was generated for —
+    /// the spawned task's only write path.
+    ///
+    /// Re-checks under the conversation mutex: the slot may have moved on
+    /// (stale id — drop the title) or a definitive title may already have
+    /// landed (one-upgrade rule — drop). Persists via a fresh
+    /// `save_conversation` only after the guard is dropped (lock discipline
+    /// — see `save_conversation`).
+    fn apply_definitive_title(&self, conv_id: Uuid, title: String) {
+        let landed = {
+            let mut guard = self.current_conversation.lock().unwrap();
+            let Some(conv) = guard.as_mut() else {
+                return;
+            };
+            if conv.id != conv_id {
+                tracing::debug!(
+                    "Dropping generated title for stale conversation {conv_id}; slot is now {}",
+                    conv.id
+                );
+                return;
+            }
+            if !conv.needs_definitive_title() {
+                return; // a definitive title already landed
+            }
+            conv.set_definitive_title(title);
+            true
+        };
+        if landed {
+            self.save_conversation();
+            self.mirror_conversation_to_state();
+        }
     }
 
     /// Run compaction: produce a plan, apply it, return the result.
@@ -1479,16 +1504,16 @@ impl StateManager {
         {
             let mut guard = self.current_conversation.lock().unwrap();
             if let Some(ref mut conv) = *guard {
-                // Set the title field so the rename is visible immediately
-                // (title takes display precedence over name).
-                conv.title = Some(name);
-                conv.updated_at = chrono::Utc::now();
+                // /rename is terminal: a definitive title, so the LLM
+                // upgrade can never overwrite the user's name.
+                conv.set_definitive_title(name);
             } else {
                 return Err(anyhow::anyhow!("No current conversation"));
             }
             drop(guard);
         }
         self.save_conversation();
+        self.mirror_conversation_to_state();
         Ok(())
     }
 
@@ -1750,6 +1775,32 @@ impl StateManager {
         Ok(())
     }
 
+    /// Persist a user turn, stamping the provisional title when this turn is
+    /// the conversation's opening one (no title yet, no persisted transcript).
+    /// Mirrors into `AppState` only when a stamp landed, and only after
+    /// persist, so the broadcast carries the fresh message_count.
+    fn persist_user_turn(&self, mut provisional: Option<String>) {
+        let stamped = {
+            let mut guard = self.current_conversation.lock().unwrap();
+            let mut stamped = false;
+            if let Some(conv) = guard.as_mut()
+                && conv.title.is_none()
+                && conv.messages.is_empty()
+                && let Some(text) = provisional.take()
+            {
+                conv.set_provisional_title(text);
+                stamped = true;
+            }
+            stamped
+        };
+        if let Err(e) = self.persist_current() {
+            tracing::error!("Failed to persist user message: {}", e);
+        }
+        if stamped {
+            self.mirror_conversation_to_state();
+        }
+    }
+
     // ── Message Methods with Persistence ───────────────────────────────────────
 
     /// Add a user message to chat and persist.
@@ -1760,11 +1811,11 @@ impl StateManager {
     /// site doesn't need its own check. See `mid-compaction.md` § 3 Step 4.
     pub fn add_user_message(&self, content: String) {
         self.clear_response_thinking();
+        // Derive the provisional title before `content` moves into the row.
+        let provisional = provisional_title(&content);
         let msg = ChatMessage::user(content);
         self.update_chat(msg);
-        if let Err(e) = self.persist_current() {
-            tracing::error!("Failed to persist user message: {}", e);
-        }
+        self.persist_user_turn(provisional);
     }
 
     /// Add a synthetic user message produced by the `bash_bg` drain seam.
@@ -1790,11 +1841,11 @@ impl StateManager {
         attachments: Vec<crate::vision::ImageAttachment>,
     ) {
         self.clear_response_thinking();
+        // Image-only turns derive no title (blank text ⇒ None).
+        let provisional = provisional_title(&content);
         let msg = ChatMessage::user_with_attachments(content, attachments);
         self.update_chat(msg);
-        if let Err(e) = self.persist_current() {
-            tracing::error!("Failed to persist user message with attachments: {}", e);
-        }
+        self.persist_user_turn(provisional);
     }
 
     /// One place builds the assistant ChatMessage, so a new field can never be
@@ -6285,7 +6336,10 @@ mod tests {
         // Simulate an auto-generated title
         {
             let mut guard = sm.current_conversation.lock().unwrap();
-            guard.as_mut().unwrap().set_title("Auto Title".to_string());
+            guard
+                .as_mut()
+                .unwrap()
+                .set_definitive_title("Auto Title".to_string());
         }
         sm.save_conversation();
 
@@ -6340,12 +6394,17 @@ mod tests {
         );
         sm.add_assistant_message("Here are the files.".to_string());
 
-        // The conversation must not have a title yet
-        assert!(!sm.get_current_conversation().unwrap().has_title());
+        // The conversation must still owe a definitive title: the first user
+        // message only stamps the provisional (LLM-free) opening title.
+        assert!(
+            sm.get_current_conversation()
+                .unwrap()
+                .needs_definitive_title()
+        );
 
         // With the old `msg_count != 2` check this would return immediately.
         // With the fix, it should proceed (spawn an async task) because:
-        // - the conversation has no title
+        // - the conversation still needs a definitive title
         // - there's at least one user and one assistant message
         sm.maybe_generate_title();
 
@@ -6354,9 +6413,9 @@ mod tests {
     }
 
     /// `maybe_generate_title` must be a no-op when the conversation already
-    /// has a title, regardless of message count.
+    /// has a definitive title, regardless of message count.
     #[test]
-    fn maybe_generate_title_is_noop_when_title_exists() {
+    fn maybe_generate_title_is_noop_when_title_is_definitive() {
         let sm = StateManager::new_arc();
 
         sm.create_conversation(
@@ -6368,10 +6427,13 @@ mod tests {
         sm.add_user_message("hello".to_string());
         sm.add_assistant_message("hi".to_string());
 
-        // Pre-set a title
+        // Pre-set a definitive title
         {
             let mut guard = sm.current_conversation.lock().unwrap();
-            guard.as_mut().unwrap().set_title("Existing".to_string());
+            guard
+                .as_mut()
+                .unwrap()
+                .set_definitive_title("Existing".to_string());
         }
 
         // Should short-circuit immediately without spawning a task
@@ -6382,6 +6444,534 @@ mod tests {
             sm.get_current_conversation().unwrap().title.as_deref(),
             Some("Existing")
         );
+    }
+
+    // ── Two-phase conversation titling (provisional → definitive) ────────
+    //
+    // The opening user message stamps a local, LLM-free provisional title;
+    // `maybe_generate_title` upgrades it exactly once (end of the first turn,
+    // or the escape hatch on a later user message); `/rename` is terminal.
+    // `apply_definitive_title` is the single synchronous write point the
+    // spawned task funnels into.
+
+    /// The opening user message stamps a provisional title derived from the
+    /// text itself — no title model is registered, which proves the path is
+    /// LLM-free — and the stamp is persisted.
+    #[test]
+    fn first_user_message_sets_provisional_title_and_persists() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        // Deliberately NO `init_title_model` — the provisional path must
+        // not need one.
+        sm.create_conversation(
+            "Original Name".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("Fix the sudo bug in the bash tool".to_string());
+
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(
+            conv.title.as_deref(),
+            Some("Fix the sudo bug in the bash tool")
+        );
+        assert!(
+            conv.title_provisional,
+            "opening-message title must be provisional"
+        );
+
+        let id = sm.get_current_conversation_id().unwrap();
+        assert_eq!(
+            storage.load(id).unwrap().title.as_deref(),
+            Some("Fix the sudo bug in the bash tool"),
+            "provisional title must be persisted with the message"
+        );
+    }
+
+    /// Stamping the provisional title must refresh the live `AppState`
+    /// mirror so Views see the new name immediately.
+    #[test]
+    fn provisional_title_mirrors_into_app_state() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        sm.create_conversation(
+            "Original Name".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("Fix the sudo bug in the bash tool".to_string());
+
+        let state = sm.get_state();
+        assert_eq!(
+            state.conversation.as_ref().unwrap().name,
+            "Fix the sudo bug in the bash tool",
+            "AppState mirror must carry the provisional title"
+        );
+    }
+
+    /// An image-only opening message has no text to derive a title from:
+    /// the title stays `None` and the mirror keeps the creation name.
+    #[test]
+    fn image_only_first_message_keeps_title_none() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        sm.create_conversation(
+            "Original Name".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message_with_attachments(String::new(), vec![sample_attachment("cat.png")]);
+
+        assert!(
+            sm.get_current_conversation().unwrap().title.is_none(),
+            "image-only opening must not stamp a provisional title"
+        );
+        let state = sm.get_state();
+        assert_eq!(
+            state.conversation.as_ref().unwrap().name,
+            "Original Name",
+            "no stamp ⇒ no mirror refresh; creation name stays"
+        );
+    }
+
+    /// The provisional title belongs to the opening message: a second user
+    /// message must not replace it.
+    #[test]
+    fn second_user_message_does_not_replace_provisional_title() {
+        let sm = StateManager::new_arc();
+
+        sm.create_conversation(
+            "Test".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("A".to_string());
+        sm.add_user_message("B".to_string());
+
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(
+            conv.title.as_deref(),
+            Some("A"),
+            "opening title must survive later messages"
+        );
+        assert!(
+            conv.title_provisional,
+            "later user messages must not clear provisional-ness"
+        );
+    }
+
+    /// A conversation loaded from storage already has a transcript, so its
+    /// next user message is NOT its opening: no provisional title is
+    /// stamped — only the LLM path may title it.
+    #[test]
+    fn loaded_conversation_with_messages_gets_no_provisional_title() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let mut conv = Conversation::new(
+            "Old Chat".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        conv.messages.push(crate::conversation::Message::user(
+            "old question".to_string(),
+        ));
+        conv.messages.push(crate::conversation::Message::assistant(
+            "old reply".to_string(),
+        ));
+        storage.save(&conv).unwrap();
+
+        sm.load_conversation(conv.id).unwrap();
+        sm.add_user_message("something new".to_string());
+
+        assert!(
+            sm.get_current_conversation().unwrap().title.is_none(),
+            "a loaded transcript is not an opening message — title must stay None"
+        );
+    }
+
+    /// Gate G: the opening message alone (1 user row, 0 assistant rows) must
+    /// never trigger an LLM call — the provisional title stands until a
+    /// reply lands or a second user message arrives.
+    #[tokio::test]
+    async fn maybe_generate_title_skips_the_opening_message() {
+        use crate::providers::create_mock_compaction_model;
+
+        let sm = StateManager::new_arc();
+        let (model, mock) = create_mock_compaction_model();
+        sm.init_title_model(Arc::new(model));
+
+        sm.create_conversation(
+            "Test".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("hello".to_string());
+
+        sm.maybe_generate_title();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(conv.title.as_deref(), Some("hello"));
+        assert!(
+            conv.title_provisional,
+            "opening message must stay provisional"
+        );
+        assert_eq!(
+            mock.request_count(),
+            0,
+            "opening message must not trigger an LLM call"
+        );
+    }
+
+    /// Gate G (escape hatch): two user rows with no assistant reply yet are
+    /// enough to fire — the interrupted conversation gets its definitive
+    /// title from whatever exists.
+    #[tokio::test]
+    async fn maybe_generate_title_fires_on_second_user_message_without_assistant() {
+        use crate::providers::create_mock_compaction_model;
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        let (model, mock) = create_mock_compaction_model();
+        mock.add_response(crate::mock::MockResponse::text("Two Open Questions"));
+        sm.init_title_model(Arc::new(model));
+
+        sm.create_conversation(
+            "Test".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("First question".to_string());
+        sm.add_user_message("Second question".to_string());
+
+        sm.maybe_generate_title();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(conv.title.as_deref(), Some("Two Open Questions"));
+        assert!(
+            !conv.title_provisional,
+            "LLM upgrade must clear provisional-ness"
+        );
+        let id = sm.get_current_conversation_id().unwrap();
+        assert_eq!(
+            storage.load(id).unwrap().title.as_deref(),
+            Some("Two Open Questions"),
+            "upgraded title must be persisted"
+        );
+    }
+
+    /// The escape-hatch prompt is built from the transcript as it stands:
+    /// with no assistant reply yet it carries the user rows and nothing else.
+    #[tokio::test]
+    async fn escape_hatch_prompt_contains_only_user_rows() {
+        use crate::providers::create_mock_compaction_model;
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        let (model, mock) = create_mock_compaction_model();
+        mock.add_response(crate::mock::MockResponse::text("Two Open Questions"));
+        sm.init_title_model(Arc::new(model));
+
+        sm.create_conversation(
+            "Test".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("First question".to_string());
+        sm.add_user_message("Second question".to_string());
+
+        sm.maybe_generate_title();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let requests = mock.get_recorded_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "escape hatch must make exactly one LLM call"
+        );
+
+        // The prompt lands as a User message in the agent's chat_history.
+        // Concatenate every text part of every User message so we can assert
+        // on substring presence without depending on message-splitting.
+        let prompt_text: String = requests[0]
+            .chat_history
+            .iter()
+            .flat_map(|m| match m {
+                rig_core::completion::message::Message::User { content } => {
+                    let parts: Vec<String> = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            rig_core::completion::message::UserContent::Text(t) => {
+                                Some(t.text.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    parts
+                }
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            prompt_text.contains("user:"),
+            "transcript must carry the user rows; got:\n{prompt_text}"
+        );
+        assert!(
+            !prompt_text.contains("assistant:"),
+            "user-only transcript must not carry assistant rows; got:\n{prompt_text}"
+        );
+    }
+
+    /// End of the first successful turn: the provisional title is
+    /// overwritten by the LLM's, persisted, and mirrored into AppState.
+    #[tokio::test]
+    async fn end_of_turn_upgrade_overwrites_provisional_title() {
+        use crate::providers::create_mock_compaction_model;
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        let (model, mock) = create_mock_compaction_model();
+        mock.add_response(crate::mock::MockResponse::text("Sudo Bug Fix"));
+        sm.init_title_model(Arc::new(model));
+
+        sm.create_conversation(
+            "Test".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("Fix the sudo bug in the bash tool".to_string());
+        sm.add_assistant_message("Fixed it.".to_string());
+
+        sm.maybe_generate_title();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(conv.title.as_deref(), Some("Sudo Bug Fix"));
+        assert!(
+            !conv.title_provisional,
+            "end-of-turn upgrade must clear provisional-ness"
+        );
+        let id = sm.get_current_conversation_id().unwrap();
+        assert_eq!(
+            storage.load(id).unwrap().title.as_deref(),
+            Some("Sudo Bug Fix"),
+            "upgraded title must be persisted"
+        );
+        let state = sm.get_state();
+        assert_eq!(
+            state.conversation.as_ref().unwrap().name,
+            "Sudo Bug Fix",
+            "AppState mirror must carry the upgraded title"
+        );
+    }
+
+    /// Race fix: the id is captured at gate time; if the slot has moved on
+    /// to a different conversation by the time the title lands, the title
+    /// is dropped — it must not land on the new conversation or in storage.
+    #[test]
+    fn apply_definitive_title_ignores_a_stale_conversation_id() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        sm.create_conversation(
+            "A".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("first question".to_string());
+        let id_a = sm.get_current_conversation_id().unwrap();
+
+        // The slot moves on to a different conversation (e.g. `/new`).
+        sm.create_conversation(
+            "B".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+
+        // A title task that captured A's id at gate time lands late.
+        sm.apply_definitive_title(id_a, "Stale".to_string());
+
+        assert!(
+            sm.get_current_conversation().unwrap().title.is_none(),
+            "stale id must not title the conversation now in the slot"
+        );
+        assert_eq!(
+            storage.load(id_a).unwrap().title.as_deref(),
+            Some("first question"),
+            "stale id must not rewrite the old conversation"
+        );
+        for summary in sm.list_conversations().unwrap() {
+            assert_ne!(
+                summary.title.as_deref(),
+                Some("Stale"),
+                "'Stale' must not land anywhere in storage"
+            );
+        }
+    }
+
+    /// One-upgrade rule: the first definitive title wins; a second call
+    /// (e.g. a duplicate spawn) must not overwrite it.
+    #[test]
+    fn apply_definitive_title_only_lands_once() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        sm.create_conversation(
+            "Test".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("opening question".to_string());
+        let id = sm.get_current_conversation_id().unwrap();
+
+        sm.apply_definitive_title(id, "First Title".to_string());
+        sm.apply_definitive_title(id, "Second Title".to_string());
+
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(
+            conv.title.as_deref(),
+            Some("First Title"),
+            "first definitive title wins"
+        );
+        assert!(!conv.title_provisional);
+        assert_eq!(
+            storage.load(id).unwrap().title.as_deref(),
+            Some("First Title"),
+            "the loser must not be persisted"
+        );
+    }
+
+    /// A landed title must agree in all three places: the live
+    /// conversation, storage, and the AppState mirror.
+    #[test]
+    fn apply_definitive_title_persists_and_mirrors() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        sm.create_conversation(
+            "Original Name".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("opening question".to_string());
+        let id = sm.get_current_conversation_id().unwrap();
+
+        sm.apply_definitive_title(id, "Definitive Title".to_string());
+
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(conv.title.as_deref(), Some("Definitive Title"));
+        assert!(!conv.title_provisional);
+        assert_eq!(
+            storage.load(id).unwrap().title.as_deref(),
+            Some("Definitive Title")
+        );
+        let state = sm.get_state();
+        assert_eq!(
+            state.conversation.as_ref().unwrap().name,
+            "Definitive Title"
+        );
+    }
+
+    /// `/rename` is terminal: it clears provisional-ness, so a later hatch
+    /// call must not overwrite the user's name with an LLM title.
+    #[tokio::test]
+    async fn rename_clears_provisional_and_blocks_later_upgrade() {
+        use crate::providers::create_mock_compaction_model;
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        let (model, mock) = create_mock_compaction_model();
+        sm.init_title_model(Arc::new(model));
+
+        sm.create_conversation(
+            "Test".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("Fix the sudo bug".to_string());
+
+        sm.rename_conversation("My Name".to_string()).unwrap();
+
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(conv.title.as_deref(), Some("My Name"));
+        assert!(
+            !conv.title_provisional,
+            "rename must clear provisional-ness"
+        );
+
+        sm.maybe_generate_title();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(conv.title.as_deref(), Some("My Name"), "rename is terminal");
+        assert!(!conv.title_provisional);
+        assert_eq!(
+            mock.request_count(),
+            0,
+            "renamed conversation must not trigger an LLM call"
+        );
+    }
+
+    /// A rename must refresh the live `AppState` mirror so Views see the
+    /// new name immediately.
+    #[test]
+    fn rename_conversation_mirrors_into_app_state() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        sm.create_conversation(
+            "Original Name".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        sm.add_user_message("Fix the sudo bug".to_string());
+
+        sm.rename_conversation("My Name".to_string()).unwrap();
+
+        let state = sm.get_state();
+        assert_eq!(state.conversation.as_ref().unwrap().name, "My Name");
     }
 
     // ── Bash panel lifecycle (slice 2 of #11) ──────────────────────────
