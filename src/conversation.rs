@@ -278,6 +278,11 @@ pub struct Conversation {
     /// Displayed in /conversations listing. `None` until generated.
     #[serde(default)]
     pub title: Option<String>,
+    /// True while `title` is the local, LLM-free title derived from the
+    /// conversation's opening message. Means exactly: an LLM-generated title
+    /// is still owed. Cleared for good by the LLM upgrade and by /rename.
+    #[serde(default)]
+    pub title_provisional: bool,
     /// When the conversation was created
     pub created_at: DateTime<Utc>,
     /// When the conversation was last updated
@@ -334,6 +339,7 @@ impl Conversation {
             id: Uuid::new_v4(),
             name,
             title: None,
+            title_provisional: false,
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
@@ -407,23 +413,27 @@ impl Conversation {
         self.updated_at = Utc::now();
     }
 
-    /// Set the auto-generated title (truncated to 80 chars).
-    /// Silently ignores titles longer than 80 chars.
-    /// Idempotent: calling with a new title when one already exists is a no-op.
-    pub fn set_title(&mut self, title: String) {
+    /// Stamp the LLM-free opening-message title. No-op if a title already exists.
+    pub fn set_provisional_title(&mut self, title: String) {
         if self.title.is_some() {
-            // Title already generated — skip
             return;
         }
-        if title.len() <= 80 {
-            self.title = Some(title);
-            self.updated_at = Utc::now();
-        }
+        self.title = Some(title);
+        self.title_provisional = true;
+        self.updated_at = Utc::now();
     }
 
-    /// Whether the title has been generated (short-circuit check before LLM call).
-    pub fn has_title(&self) -> bool {
-        self.title.is_some()
+    /// Stamp the final title (LLM upgrade or /rename). Overwrites anything present
+    /// and clears provisional-ness. Caller owns length policy.
+    pub fn set_definitive_title(&mut self, title: String) {
+        self.title = Some(title);
+        self.title_provisional = false;
+        self.updated_at = Utc::now();
+    }
+
+    /// Is an LLM-generated title still owed? `title.is_none() || title_provisional`
+    pub fn needs_definitive_title(&self) -> bool {
+        self.title.is_none() || self.title_provisional
     }
 }
 
@@ -848,12 +858,28 @@ mod tests {
             String::new(),
         );
         assert!(conv.title.is_none());
-        assert!(!conv.has_title());
+        assert!(conv.needs_definitive_title());
     }
 
-    /// set_title stores the title and updates updated_at.
+    /// A fresh conversation owes a definitive title: no title yet and not
+    /// provisional.
     #[test]
-    fn set_title_stores_title() {
+    fn new_conversation_needs_definitive_title() {
+        let conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        assert!(conv.title.is_none());
+        assert!(!conv.title_provisional);
+        assert!(conv.needs_definitive_title());
+    }
+
+    /// set_provisional_title stamps the LLM-free opening-message title:
+    /// title set, flag true, still owes a definitive title, updated_at bumped.
+    #[test]
+    fn set_provisional_title_marks_provisional() {
         let mut conv = Conversation::new(
             "Conversation 2026-05-18".into(),
             "openrouter".into(),
@@ -861,37 +887,145 @@ mod tests {
             String::new(),
         );
         let before = conv.updated_at;
-        conv.set_title("Fix bug in auth".into());
-        assert_eq!(conv.title.as_deref(), Some("Fix bug in auth"));
-        assert!(conv.has_title());
+        conv.set_provisional_title("Fix the sudo bug".into());
+        assert_eq!(conv.title.as_deref(), Some("Fix the sudo bug"));
+        assert!(conv.title_provisional);
+        assert!(conv.needs_definitive_title());
         assert!(conv.updated_at >= before);
     }
 
-    /// set_title is idempotent — second call is a no-op.
+    /// A provisional call is a no-op once any title exists: after a
+    /// definitive title, a provisional call leaves title AND flag untouched.
     #[test]
-    fn set_title_is_idempotent() {
+    fn set_provisional_title_does_not_overwrite_existing_title() {
         let mut conv = Conversation::new(
             "Conversation 2026-05-18".into(),
             "openrouter".into(),
             "claude-3.7-sonnet".into(),
             String::new(),
         );
-        conv.set_title("First title".into());
-        conv.set_title("Second title".into());
-        assert_eq!(conv.title.as_deref(), Some("First title"));
+        conv.set_definitive_title("Definitive name".into());
+        assert_eq!(conv.title.as_deref(), Some("Definitive name"));
+        assert!(!conv.title_provisional);
+
+        conv.set_provisional_title("Should be ignored".into());
+        assert_eq!(conv.title.as_deref(), Some("Definitive name"));
+        assert!(!conv.title_provisional);
+        assert!(!conv.needs_definitive_title());
     }
 
-    /// set_title silently ignores titles longer than 80 chars.
+    /// set_definitive_title upgrades a provisional title: new text, flag
+    /// cleared, no longer owes a definitive title.
     #[test]
-    fn set_title_ignores_long_titles() {
+    fn set_definitive_title_clears_provisional() {
         let mut conv = Conversation::new(
             "Conversation 2026-05-18".into(),
             "openrouter".into(),
             "claude-3.7-sonnet".into(),
             String::new(),
         );
-        conv.set_title("A".repeat(200));
-        assert!(conv.title.is_none());
+        conv.set_provisional_title("Opening message text".into());
+        assert!(conv.title_provisional);
+
+        conv.set_definitive_title("Sudo Bug Fix".into());
+        assert_eq!(conv.title.as_deref(), Some("Sudo Bug Fix"));
+        assert!(!conv.title_provisional);
+        assert!(!conv.needs_definitive_title());
+    }
+
+    /// set_definitive_title overwrites an existing definitive title —
+    /// /rename-over-LLM-title semantics survive.
+    #[test]
+    fn set_definitive_title_overwrites_definitive() {
+        let mut conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        conv.set_definitive_title("LLM generated title".into());
+        assert_eq!(conv.title.as_deref(), Some("LLM generated title"));
+
+        conv.set_definitive_title("My Renamed Conversation".into());
+        assert_eq!(conv.title.as_deref(), Some("My Renamed Conversation"));
+        assert!(!conv.title_provisional);
+        assert!(!conv.needs_definitive_title());
+    }
+
+    /// The definitive setter has no length guard: a 200-char /rename is
+    /// stored verbatim (length policy lives at the boundary, not here).
+    #[test]
+    fn set_definitive_title_accepts_long_user_text() {
+        let mut conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        let long = "R".repeat(200);
+        conv.set_definitive_title(long.clone());
+        assert_eq!(conv.title.as_deref(), Some(long.as_str()));
+        assert!(!conv.title_provisional);
+    }
+
+    /// Legacy on-disk file: it carries `title` but no `title_provisional`
+    /// key. `#[serde(default)]` must default the flag to false, so a
+    /// legacy titled conversation is definitive and never regenerated.
+    #[test]
+    fn legacy_json_with_title_and_no_flag_is_definitive() {
+        let mut conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        conv.set_definitive_title("Old Title".into());
+        let mut value: serde_json::Value = serde_json::to_value(&conv).unwrap();
+        // Simulate a legacy file: drop the flag key, keep the title.
+        value.as_object_mut().unwrap().remove("title_provisional");
+        let legacy = value.to_string();
+        let loaded: Conversation = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(loaded.title.as_deref(), Some("Old Title"));
+        assert!(!loaded.title_provisional);
+        assert!(!loaded.needs_definitive_title());
+    }
+
+    /// Legacy on-disk file with no `title` key at all: the title stays
+    /// None, so a definitive title is still owed.
+    #[test]
+    fn legacy_json_without_title_needs_definitive() {
+        let conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        let mut value: serde_json::Value = serde_json::to_value(&conv).unwrap();
+        // Simulate a legacy file: drop the title (and flag) keys.
+        value.as_object_mut().unwrap().remove("title");
+        value.as_object_mut().unwrap().remove("title_provisional");
+        let legacy = value.to_string();
+        let loaded: Conversation = serde_json::from_str(&legacy).unwrap();
+        assert!(loaded.title.is_none());
+        assert!(loaded.needs_definitive_title());
+    }
+
+    /// The provisional flag survives a real serialize → deserialize round-trip.
+    #[test]
+    fn title_provisional_roundtrips_through_json() {
+        let mut conv = Conversation::new(
+            "Conversation 2026-05-18".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+            String::new(),
+        );
+        conv.set_provisional_title("Opening message text".into());
+        assert!(conv.title_provisional);
+        let json = serde_json::to_string(&conv).unwrap();
+        let loaded: Conversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.title.as_deref(), Some("Opening message text"));
+        assert!(loaded.title_provisional);
+        assert!(loaded.needs_definitive_title());
     }
 
     /// ConversationSummary.from uses title for name, falls back to conv.name.
@@ -903,7 +1037,7 @@ mod tests {
             "claude-3.7-sonnet".into(),
             String::new(),
         );
-        conv.set_title("Fix sudo bug".into());
+        conv.set_definitive_title("Fix sudo bug".into());
         let summary = ConversationSummary::from(&conv);
         assert_eq!(summary.name, "Fix sudo bug");
         assert_eq!(summary.title.as_deref(), Some("Fix sudo bug"));
@@ -932,7 +1066,7 @@ mod tests {
             "claude-3.7-sonnet".into(),
             String::new(),
         );
-        conv.set_title("Rust async patterns".into());
+        conv.set_definitive_title("Rust async patterns".into());
         let json = serde_json::to_string(&conv).unwrap();
         let loaded: Conversation = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.title.as_deref(), Some("Rust async patterns"));
