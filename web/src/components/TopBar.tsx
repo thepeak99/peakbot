@@ -20,6 +20,7 @@ export function TopBar({
   isRunning,
   connected,
   pendingInput,
+  statusMessage,
   models,
   activeAlias,
   hasTranscript,
@@ -38,6 +39,7 @@ export function TopBar({
   isRunning: boolean;
   connected: boolean;
   pendingInput: number;
+  statusMessage: string | null;
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
@@ -95,8 +97,13 @@ export function TopBar({
 
       {isRunning && (
         <span className="flex items-center gap-1.5 text-xs text-amber-400">
-          <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber-400 border-t-transparent" />
+          <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber-400 border-t-transparent shrink-0" />
           working…
+          {statusMessage && (
+            <span className="truncate max-w-[16rem]" title={statusMessage}>
+              · {statusMessage}
+            </span>
+          )}
         </span>
       )}
 

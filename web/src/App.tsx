@@ -221,6 +221,7 @@ export function App() {
         isRunning={isRunning}
         connected={connected}
         pendingInput={pendingInput}
+        statusMessage={state?.status_message ?? null}
         models={models}
         activeAlias={stats?.modelAlias || activeAlias}
         hasTranscript={hasTranscript}

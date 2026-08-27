@@ -148,6 +148,8 @@ export interface AppState {
    * per-message deletion needs a queue refactor still to come). */
   pending_input_count?: number;
   welcome: WireWelcome | null;
+  /** Transient agent phase label ("Compacting memory.md...", tool names, retries).
+   *  Set by the backend via set_status; only meaningful while is_running. Shared slot with tool-call names. */
   status_message?: string | null;
   exit_requested: boolean;
   bg: WireBg;
