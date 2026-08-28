@@ -10,7 +10,7 @@
 //!
 //! | class      | frames                                                                                  | order                          | loss                                                       | bound                              |
 //! |------------|-----------------------------------------------------------------------------------------|--------------------------------|------------------------------------------------------------|------------------------------------|
-//! | ordered    | `attached`, `ready`, `models_available`, `conversations_list`, `dir_listing`, `error`    | FIFO, exactly once             | never dropped — an overflow **kills the connection**       | ≤ `CTRL_CAPACITY` (32) small frames |
+//! | ordered    | `attached`, `ready`, `models_available`, `conversations_list`, `recent_dirs`, `dir_listing`, `error` | FIFO, exactly once             | never dropped — an overflow **kills the connection**       | ≤ `CTRL_CAPACITY` (32) small frames |
 //! | coalescing | `state`                                                                                 | published order preserved; gaps allowed | older unwritten snapshots are replaced by newer ones | exactly 1 slot                     |
 //!
 //! Cross-class: ordered frames win in `next()` (biased), so the handshake

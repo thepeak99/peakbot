@@ -58,6 +58,7 @@ use crate::ui::outbound::{OutboundRx, OutboundTx, outbound_channel};
 use crate::ui::ui_trait::builtin_commands;
 use crate::ui::wire::{
     InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot, build_dir_listing,
+    build_recent_dirs,
 };
 use crate::{StateManager, UiAction};
 use anyhow::Result;
@@ -759,6 +760,10 @@ fn dispatch_inbound(
             out_tx
                 .send(OutboundMessage::ConversationsList { items })
                 .is_ok()
+        }
+        Ok(InboundMessage::RequestRecentDirs) => {
+            let dirs = build_recent_dirs(state_manager);
+            out_tx.send(OutboundMessage::RecentDirs { dirs }).is_ok()
         }
         Ok(InboundMessage::KillSession { convo }) => {
             if let Ok(id) = Uuid::parse_str(&convo) {

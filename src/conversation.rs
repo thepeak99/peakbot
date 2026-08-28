@@ -461,6 +461,15 @@ pub struct ConversationSummary {
     pub provider_name: String,
     /// Wire id of the model used (e.g. `anthropic/claude-3.7-sonnet`).
     pub model: String,
+    /// Working directory the conversation was rooted in; `""` for files
+    /// written before `cwd` existed.
+    ///
+    /// Deliberately **not** `#[serde(default)]`, unlike `Conversation::cwd`.
+    /// A conversation file is the source of truth and must survive a schema
+    /// gap; `index.json` is a derived cache, so a pre-cwd index *should*
+    /// fail to parse — `read_index` folds that into `None` and `list()`
+    /// rebuilds. The absent default is the migration.
+    pub cwd: String,
 }
 
 impl From<&Conversation> for ConversationSummary {
@@ -475,6 +484,7 @@ impl From<&Conversation> for ConversationSummary {
             message_count: conv.metadata.message_count,
             provider_name: conv.provider_name.clone(),
             model: conv.model.clone(),
+            cwd: conv.cwd.clone(),
         }
     }
 }
@@ -1041,6 +1051,30 @@ mod tests {
         let summary = ConversationSummary::from(&conv);
         assert_eq!(summary.name, "Fix sudo bug");
         assert_eq!(summary.title.as_deref(), Some("Fix sudo bug"));
+    }
+
+    // ── recent_dirs: ConversationSummary carries cwd (feature under test) ──
+    //
+    // `ConversationSummary` does not have a `cwd` field yet — this is a
+    // REQUIRED field per the locked design (deliberately no
+    // `#[serde(default)]`, so a pre-cwd index.json fails to parse and
+    // `FileStorage::list()` rebuilds it). This test references
+    // `summary.cwd`, which does not exist on the struct today, so it must
+    // fail to COMPILE until the field is added.
+    /// `ConversationSummary::from` carries the conversation's `cwd` through
+    /// verbatim — the summary is used to drive the recent-dirs picker, so a
+    /// dropped cwd there would silently break the feature.
+    #[test]
+    fn summary_from_conversation_carries_cwd() {
+        let known_cwd = "/some/known/project/tree";
+        let conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "claude-3.7-sonnet".into(),
+            known_cwd.into(),
+        );
+        let summary = ConversationSummary::from(&conv);
+        assert_eq!(summary.cwd, known_cwd);
     }
 
     /// ConversationSummary.from falls back to conv.name when title is absent.

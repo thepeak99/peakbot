@@ -26,6 +26,7 @@ export function TopBar({
   hasTranscript,
   cwd,
   dirListing,
+  recentDirs,
   conversations,
   send,
   onSwitchModel,
@@ -45,6 +46,7 @@ export function TopBar({
   hasTranscript: boolean;
   cwd: string | null;
   dirListing: DirListing | null;
+  recentDirs: string[];
   conversations: ConversationSummary[];
   send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
@@ -90,6 +92,7 @@ export function TopBar({
             cwd={cwd}
             hasTranscript={hasTranscript}
             dirListing={dirListing}
+            recentDirs={recentDirs}
             send={send}
           />
         )}

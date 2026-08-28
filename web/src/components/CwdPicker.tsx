@@ -31,6 +31,7 @@ export function CwdPicker({
   cwd,
   hasTranscript,
   dirListing,
+  recentDirs,
   send,
   // Anchor the small-screen picker panel to the bottom of the viewport
   // (instead of the top) when the chip lives in the mobile bottom bar.
@@ -39,6 +40,9 @@ export function CwdPicker({
   cwd: string;
   hasTranscript: boolean;
   dirListing: DirListing | null;
+  /** Most-recently-used directories (newest-first, cwd excluded) shown as a
+   * "Recent" quick-jump section at the top of the picker. */
+  recentDirs: string[];
   send: (msg: InboundMessage) => void;
   dropUp?: boolean;
 }) {
@@ -59,13 +63,15 @@ export function CwdPicker({
     return () => document.removeEventListener("mousedown", onClick);
   }, [open]);
 
-  // On open, browse the current cwd. Reset the browsed anchor each time.
+  // On open, browse the current cwd and fetch the recent list. Reset the
+  // browsed anchor each time.
   const openPicker = () => {
     setOpen((o) => {
       const next = !o;
       if (next) {
         setBrowsed(null);
         send({ type: "list_dir", path: cwd });
+        send({ type: "request_recent_dirs" });
       }
       return next;
     });
@@ -122,6 +128,31 @@ export function CwdPicker({
               : "top-full mt-1 max-sm:top-[3.75rem]"
           }`}
         >
+          {/* Recent — quick-jump to the most recently used directories.
+              Rows reuse `commit`, so the confirm guard applies exactly as
+              for the browse list. Hidden entirely when empty. */}
+          {recentDirs.length > 0 && (
+            <div className="border-b border-zinc-800">
+              <div className="px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                Recent
+              </div>
+              {recentDirs.map((path) => (
+                <button
+                  key={path}
+                  onClick={() => commit(path)}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-800"
+                  title={path}
+                >
+                  <span className="shrink-0 text-zinc-500">📁</span>
+                  <span className="truncate font-medium">{basename(path)}</span>
+                  <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-zinc-500">
+                    {displayPath(path)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
           {/* Current browse path + up. */}
           <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2">
             <button
