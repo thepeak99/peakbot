@@ -202,7 +202,7 @@ cost_tracking: true              # OpenRouter only
 
 memory:                          # governs the whole memory.md feature
   enabled: true                  # false = no prompt section, no auto-compaction
-  threshold_bytes: 51200         # compact memory.md above this
+  threshold_bytes: 51200         # compact memory.md above this (resolved against the session cwd)
 
 tools:                           # built-in tool filter — pick ONE list
   disabled: [bash_bg, web_search]   # blocklist, XOR with:
