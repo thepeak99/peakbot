@@ -416,7 +416,7 @@ pub struct TimeoutsConfig {
     /// Budget for one tool call (default: 1800 = 30 min).
     #[serde(default = "default_tool_secs")]
     pub tool_secs: u64,
-    /// Budget for one delegation to a sub-agent (default: 3600 = 1 h). Longer
+    /// Budget for one delegation to a sub-agent (default: 7200 = 2 h). Longer
     /// than `tool_secs` because a delegate runs a full turn loop of its own.
     #[serde(default = "default_delegate_secs")]
     pub delegate_secs: u64,
@@ -454,7 +454,7 @@ fn default_tool_secs() -> u64 {
     1800
 }
 fn default_delegate_secs() -> u64 {
-    3600
+    7200
 }
 
 /// Web UI settings. Only the sticky-session reaper is configurable; all
@@ -3077,10 +3077,10 @@ agents:
     // surface the new block exposes.
 
     #[test]
-    fn timeouts_defaults_are_30min_tool_and_1h_delegate() {
+    fn timeouts_defaults_are_30min_tool_and_2h_delegate() {
         // Two boundary values, one observer: the defaults are the floor that
         // the boot configuration must produce, so absent any YAML the process
-        // starts with a 30-minute tool ceiling and a 1-hour delegation
+        // starts with a 30-minute tool ceiling and a 2-hour delegation
         // ceiling — anything tighter would surprise users who'd never seen
         // the postmortem.
         let t = TimeoutsConfig::default();
@@ -3089,8 +3089,8 @@ agents:
             "default tool_secs is 30 minutes (1800s); pin so a future tweak is deliberate"
         );
         assert_eq!(
-            t.delegate_secs, 3_600,
-            "default delegate_secs is 1 hour (3600s); pin so a future tweak is deliberate"
+            t.delegate_secs, 7_200,
+            "default delegate_secs is 2 hours (7200s); pin so a future tweak is deliberate"
         );
     }
 
@@ -3144,8 +3144,8 @@ agents:
             "explicitly set value must be retained"
         );
         assert_eq!(
-            cfg.timeouts.delegate_secs, 3_600,
-            "unset delegate_secs must default to 3600, not zero"
+            cfg.timeouts.delegate_secs, 7_200,
+            "unset delegate_secs must default to 7200, not zero"
         );
 
         let cfg: Config = serde_yaml::from_str("timeouts:\n  delegate_secs: 99\n")

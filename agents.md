@@ -211,7 +211,7 @@ tools:                           # built-in tool filter — pick ONE list
 
 timeouts:                        # wall-clock ceilings on agent work; see
   tool_secs: 1800                # `http:` for per-socket network timeouts
-  delegate_secs: 3600            # 1..=86400 each; 0 rejected at load
+  delegate_secs: 7200            # 1..=86400 each; 0 rejected at load
 
 http:                            # outbound timeouts for EVERY client (LLM,
   connect_timeout_secs: 30       # embeddings, MCP auth, web tools). 0 = disabled.
@@ -540,7 +540,7 @@ A sub-agent's preamble (`build_sub_agent_preamble`, rebuilt fresh per delegation
 
 Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). No sandbox in v1 — a sub-agent can write and run bash. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together. With #183 the abort is **mid-tool**, not just at the next LLM boundary: dropping the orchestrator's turn future unwinds the in-flight delegation and its sub-tool (`bash`/etc.) along with it, so the sub-agent's PTY child dies via `PtyHandle::drop` at the same instant. There is no resumption path.
 
-Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`), unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`. The whole delegation is bounded by `timeouts.delegate_secs` (default 1 h); on expiry the transcript takes that same path — summarised and returned as `INTERRUPTED`, not discarded.
+Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`), unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`. The whole delegation is bounded by `timeouts.delegate_secs` (default 2 h); on expiry the transcript takes that same path — summarised and returned as `INTERRUPTED`, not discarded.
 
 Where it lives: `src/pipeline/{delegate_tool,registry,set}.rs`, `build_sub_agent` in `src/providers/mod.rs`, `MessageSource` + lane filter in `src/ui/app_state.rs` / `src/state/state_manager.rs`.
 
