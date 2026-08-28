@@ -19,6 +19,7 @@
 //! {"type":"stop"}
 //! {"type":"switch_model","alias":"sonnet"}
 //! {"type":"request_conversations"}
+//! {"type":"request_recent_dirs"}
 //! {"type":"shutdown"}
 //! ```
 //!
@@ -34,6 +35,7 @@
 //! {"type":"models_available","active":"sonnet","models":[{"alias":"sonnet","provider_name":"openrouter","model_name":"anthropic/claude-sonnet-4.6","context_size":200000}]}
 //! {"type":"state","state":{...AppState...}}
 //! {"type":"conversations_list","items":[{"id":"<uuid>","name":"...","updated_at":"<iso8601>","message_count":42,"model":"..."}]}
+//! {"type":"recent_dirs","dirs":["/path/one","/path/two"]}
 //! {"type":"error","message":"..."}
 //! ```
 //!
@@ -57,6 +59,7 @@
 use crate::ui::outbound::{OutboundTx, outbound_channel};
 use crate::ui::wire::{
     InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot, build_dir_listing,
+    build_recent_dirs,
 };
 use crate::{StateManager, Ui, UiAction};
 use anyhow::Result;
@@ -222,6 +225,12 @@ async fn run_stdin_loop(
                     .send(OutboundMessage::ConversationsList { items })
                     .is_err()
                 {
+                    break;
+                }
+            }
+            Ok(InboundMessage::RequestRecentDirs) => {
+                let dirs = build_recent_dirs(&state_manager);
+                if out_tx.send(OutboundMessage::RecentDirs { dirs }).is_err() {
                     break;
                 }
             }

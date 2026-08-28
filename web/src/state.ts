@@ -228,6 +228,9 @@ export type OutboundMessage =
       entries: DirEntry[];
       error: string | null;
     }
+  /** Reply to `request_recent_dirs`: most-recently-used directories,
+   * newest-first, deduped, existing dirs only, current cwd excluded, max 8. */
+  | { type: "recent_dirs"; dirs: string[] }
   | { type: "error"; message: string };
 
 export type InboundMessage =
@@ -240,6 +243,7 @@ export type InboundMessage =
    * (single-agent mode). The backend enforces the pre-first-turn lock. */
   | { type: "select_pipeline"; name: string | null }
   | { type: "list_dir"; path: string }
+  | { type: "request_recent_dirs" }
   | { type: "request_conversations" }
   | { type: "kill_session"; convo: string }
   | { type: "shutdown" };

@@ -53,6 +53,7 @@ export function App() {
     conversations,
     commands,
     dirListing,
+    recentDirs,
     error,
     send,
     switchConvo,
@@ -227,6 +228,7 @@ export function App() {
         hasTranscript={hasTranscript}
         cwd={welcome?.cwd ?? null}
         dirListing={dirListing}
+        recentDirs={recentDirs}
         conversations={conversations}
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
@@ -306,6 +308,7 @@ export function App() {
         hasTranscript={hasTranscript}
         cwd={welcome?.cwd ?? null}
         dirListing={dirListing}
+        recentDirs={recentDirs}
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={(id) => switchConvo(id)}

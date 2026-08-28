@@ -16,6 +16,7 @@
 //! {"type":"switch_cwd","path":"~/proj"}    // maps to UiAction::ChangeCwd
 //! {"type":"list_dir","path":"~/proj"}      // browse for the cwd picker
 //! {"type":"request_conversations"}
+//! {"type":"request_recent_dirs"}
 //! {"type":"select_pipeline","name":"web-team"}  // null clears the binding
 //! {"type":"kill_session","convo":"aabbcc-…"}
 //! {"type":"shutdown"}
@@ -29,6 +30,7 @@
 //! {"type":"models_available","active":"sonnet","models":[...]}
 //! {"type":"state","state":{...AppState...}}
 //! {"type":"conversations_list","items":[...]}
+//! {"type":"recent_dirs","dirs":[...]}
 //! {"type":"dir_listing","path":"…","parent":"…","entries":[...],"error":null}
 //! {"type":"error","message":"..."}
 //! ```
@@ -72,6 +74,8 @@ pub(crate) enum InboundMessage {
         path: String,
     },
     RequestConversations,
+    /// One-shot request for the cwd picker's "Recent" section.
+    RequestRecentDirs,
     /// Bind the current conversation to a named pipeline (the Agents panel
     /// selector); `name: null` clears the binding. Maps to
     /// [`crate::ui::ui_trait::UiAction::SelectPipeline`]. The backend enforces
@@ -220,6 +224,8 @@ pub(crate) enum OutboundMessage {
     State { state: Arc<AppState> },
     /// Reply to `request_conversations`; empty when no storage is configured.
     ConversationsList { items: Vec<ConversationSummaryWire> },
+    /// Reply to `request_recent_dirs`; empty when no storage is configured.
+    RecentDirs { dirs: Vec<String> },
     /// One-shot answer to `list_dir` — a transient request/response for the
     /// cwd picker's directory browser. Deliberately **not** part of
     /// `AppState`: browsing is ephemeral UI state, not session state, so it
@@ -236,6 +242,15 @@ pub(crate) enum OutboundMessage {
     /// A non-fatal protocol or parse error.
     Error { message: String },
 }
+
+/// How many recent conversations define "recent". Bounds *relevance*, not
+/// cost — the summaries are already in memory. Without it, a single
+/// two-year-old conversation in /tmp would surface as a "recent" directory
+/// forever.
+const RECENT_DIRS_LOOKBACK: usize = 200;
+
+/// Rows in the picker's Recent section.
+const RECENT_DIRS_MAX: usize = 8;
 
 /// Wire-shaped snapshot of saved conversations. Empty when no storage is
 /// configured — the client treats that as "hide the picker". `active_ids`
@@ -258,6 +273,40 @@ pub(crate) fn build_conversations_snapshot(
             model: s.model,
         })
         .collect()
+}
+
+/// Distinct, existing working directories of the most recently updated
+/// conversations, newest first, excluding the session's current cwd.
+/// Empty when no storage is configured — the client hides the section.
+pub(crate) fn build_recent_dirs(sm: &StateManager) -> Vec<String> {
+    let session_cwd = sm.session_cwd().to_string_lossy().into_owned();
+    let mut seen = std::collections::HashSet::new();
+    let mut dirs = Vec::new();
+
+    for s in sm
+        .list_conversations()
+        .unwrap_or_default()
+        .into_iter()
+        .take(RECENT_DIRS_LOOKBACK)
+    {
+        if s.cwd.is_empty() || s.cwd == session_cwd {
+            continue;
+        }
+        // Insert every judged path (accepted or rejected) so a dead dir
+        // repeated many times across old conversations is stat'ed once.
+        if !seen.insert(s.cwd.clone()) {
+            continue;
+        }
+        if !std::path::Path::new(&s.cwd).is_dir() {
+            continue;
+        }
+        dirs.push(s.cwd);
+        if dirs.len() >= RECENT_DIRS_MAX {
+            break;
+        }
+    }
+
+    dirs
 }
 
 #[cfg(test)]
@@ -379,5 +428,256 @@ mod tests {
         // here means the frontend breaks.
         let state = &parsed["state"];
         assert!(state.get("chat").is_some(), "missing chat: {json}");
+    }
+
+    // ── recent_dirs (feature under test — RED until implemented) ─────────
+    //
+    // These tests are written against the locked design:
+    //   - `build_recent_dirs(sm)` walks `sm.list_conversations()` newest-first,
+    //     `.take(RECENT_DIRS_LOOKBACK)` (=200), and for each cwd IN ORDER:
+    //     skip empty; skip == session_cwd; skip if already in `seen` (seen
+    //     records EVERY judged path, accepted or rejected); insert into seen;
+    //     skip if !is_dir(); else push; break at RECENT_DIRS_MAX (=8).
+    //   - inbound `{"type":"request_recent_dirs"}` / outbound
+    //     `{"type":"recent_dirs","dirs":[...]}`.
+    //
+    // They reference `build_recent_dirs`, `RECENT_DIRS_MAX`,
+    // `RECENT_DIRS_LOOKBACK`, `InboundMessage::RequestRecentDirs` and
+    // `OutboundMessage::RecentDirs`, none of which exist yet — the crate's
+    // test build must fail to compile until the feature lands.
+
+    use crate::conversation::Conversation;
+    use crate::storage::{ConversationStorage, FileStorage};
+    use chrono::{DateTime, Utc};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// A StateManager backed by a fresh FileStorage in `storage_dir`, with
+    /// `session_cwd` pinned so the session-cwd skip is deterministic.
+    fn sm_and_store(
+        storage_dir: PathBuf,
+        session_cwd: PathBuf,
+    ) -> (Arc<StateManager>, Arc<FileStorage>) {
+        let store: Arc<FileStorage> = Arc::new(FileStorage::new(storage_dir).unwrap());
+        // `Arc::clone(&store)` would let inference pick `Self = Arc<dyn
+        // ConversationStorage>` from the annotation and then fail to unify
+        // `&store`'s concrete type; an explicit `as` coercion sidesteps that.
+        let storage = store.clone() as Arc<dyn ConversationStorage>;
+        let sm = StateManager::new_arc_with_storage(storage);
+        sm.set_session_cwd(session_cwd);
+        (sm, store)
+    }
+
+    /// Save a conversation with an explicit `updated_at` (so `list()`'s
+    /// newest-first sort is deterministic — never wall-clock dependent) and
+    /// the given `cwd`.
+    fn save_conv(store: &FileStorage, cwd: &str, updated_at: DateTime<Utc>) {
+        let mut conv = Conversation::new(
+            "convo".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            cwd.to_string(),
+        );
+        conv.updated_at = updated_at;
+        store.save(&conv).unwrap();
+    }
+
+    fn path_str(p: &std::path::Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    /// A path that does not exist on any sane machine — the dead-dir fixture.
+    const DEAD_DIR: &str = "/nonexistent/peakbot/recent/dirs/dead";
+
+    /// Newest-first: distinct live dirs come back in `list()` order (most
+    /// recently updated conversation first).
+    #[test]
+    fn build_recent_dirs_returns_distinct_dirs_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("alpha");
+        let b = tmp.path().join("beta");
+        let c = tmp.path().join("gamma");
+        for d in [&a, &b, &c] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), tmp.path().join("session"));
+
+        let now = Utc::now();
+        // Newest → oldest: alpha, beta, gamma.
+        save_conv(&store, &path_str(&a), now);
+        save_conv(&store, &path_str(&b), now - chrono::Duration::seconds(60));
+        save_conv(&store, &path_str(&c), now - chrono::Duration::seconds(120));
+
+        let dirs = build_recent_dirs(&sm);
+        assert_eq!(dirs, vec![path_str(&a), path_str(&b), path_str(&c)]);
+    }
+
+    /// Dedupe: a cwd repeated across conversations appears exactly once, at
+    /// its NEWEST occurrence's position (iteration is newest-first, so
+    /// first-seen wins).
+    #[test]
+    fn build_recent_dirs_dedupes_keeping_newest_occurrence() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("alpha");
+        let b = tmp.path().join("beta");
+        for d in [&a, &b] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), tmp.path().join("session"));
+
+        let now = Utc::now();
+        // alpha (newest), beta, alpha again (oldest) → [alpha, beta].
+        save_conv(&store, &path_str(&a), now);
+        save_conv(&store, &path_str(&b), now - chrono::Duration::seconds(60));
+        save_conv(&store, &path_str(&a), now - chrono::Duration::seconds(120));
+
+        let dirs = build_recent_dirs(&sm);
+        assert_eq!(dirs, vec![path_str(&a), path_str(&b)]);
+    }
+
+    /// Pre-cwd conversations persist an empty `cwd`; those summaries are
+    /// skipped, live dirs still surface.
+    #[test]
+    fn build_recent_dirs_skips_empty_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("alpha");
+        let b = tmp.path().join("beta");
+        for d in [&a, &b] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), tmp.path().join("session"));
+
+        let now = Utc::now();
+        // Newest conversation is a pre-cwd file (empty cwd) → skipped.
+        save_conv(&store, "", now);
+        save_conv(&store, &path_str(&a), now - chrono::Duration::seconds(60));
+        save_conv(&store, &path_str(&b), now - chrono::Duration::seconds(120));
+
+        let dirs = build_recent_dirs(&sm);
+        assert_eq!(dirs, vec![path_str(&a), path_str(&b)]);
+    }
+
+    /// A dir that no longer exists (deleted after the conversation was
+    /// saved) must not surface; live dirs still do.
+    #[test]
+    fn build_recent_dirs_skips_nonexistent_dir() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("alpha");
+        std::fs::create_dir(&a).unwrap();
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), tmp.path().join("session"));
+
+        let now = Utc::now();
+        save_conv(&store, DEAD_DIR, now);
+        save_conv(&store, &path_str(&a), now - chrono::Duration::seconds(60));
+
+        let dirs = build_recent_dirs(&sm);
+        assert_eq!(dirs, vec![path_str(&a)]);
+    }
+
+    /// The session's own cwd is never a "recent dir" — it is where we are.
+    #[test]
+    fn build_recent_dirs_skips_current_session_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("alpha");
+        let b = tmp.path().join("beta");
+        for d in [&a, &b] {
+            std::fs::create_dir(d).unwrap();
+        }
+        // session_cwd == a: a's conversations must be skipped.
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), a.clone());
+
+        let now = Utc::now();
+        save_conv(&store, &path_str(&a), now);
+        save_conv(&store, &path_str(&b), now - chrono::Duration::seconds(60));
+
+        let dirs = build_recent_dirs(&sm);
+        assert_eq!(dirs, vec![path_str(&b)]);
+    }
+
+    /// More distinct live dirs than RECENT_DIRS_MAX → exactly
+    /// RECENT_DIRS_MAX, the newest ones.
+    #[test]
+    fn build_recent_dirs_caps_at_recent_dirs_max() {
+        let tmp = TempDir::new().unwrap();
+        let dirs: Vec<std::path::PathBuf> =
+            (0..10).map(|i| tmp.path().join(format!("d{i}"))).collect();
+        for d in &dirs {
+            std::fs::create_dir(d).unwrap();
+        }
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), tmp.path().join("session"));
+
+        let now = Utc::now();
+        // d0 newest … d9 oldest.
+        for (i, d) in dirs.iter().enumerate() {
+            save_conv(
+                &store,
+                &path_str(d),
+                now - chrono::Duration::seconds(i as i64 * 60),
+            );
+        }
+
+        let out = build_recent_dirs(&sm);
+        assert_eq!(out.len(), RECENT_DIRS_MAX, "cap must hold: {out:?}");
+        let expected: Vec<String> = dirs
+            .iter()
+            .take(RECENT_DIRS_MAX)
+            .map(|d| path_str(d))
+            .collect();
+        assert_eq!(out, expected);
+    }
+
+    /// A live dir that only appears beyond the RECENT_DIRS_LOOKBACK window
+    /// is excluded: the (lookback+1)th-newest conversation's cwd is never
+    /// inspected. The newest `RECENT_DIRS_LOOKBACK` conversations all point
+    /// at a dead dir (skipped), the oldest points at a live one.
+    #[test]
+    fn build_recent_dirs_excludes_dirs_beyond_lookback_window() {
+        let tmp = TempDir::new().unwrap();
+        let beyond = tmp.path().join("beyond");
+        std::fs::create_dir(&beyond).unwrap();
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), tmp.path().join("session"));
+
+        let now = Utc::now();
+        // Newest RECENT_DIRS_LOOKBACK conversations: all dead-dir cwds.
+        for i in 0..RECENT_DIRS_LOOKBACK {
+            save_conv(
+                &store,
+                DEAD_DIR,
+                now - chrono::Duration::seconds(i as i64 * 60),
+            );
+        }
+        // The (lookback+1)th-newest: a live dir, outside the window.
+        save_conv(
+            &store,
+            &path_str(&beyond),
+            now - chrono::Duration::seconds(RECENT_DIRS_LOOKBACK as i64 * 60),
+        );
+
+        assert_eq!(build_recent_dirs(&sm), Vec::<String>::new());
+    }
+
+    /// No storage configured → `list_conversations()` is `None` → empty vec
+    /// (not an error, not a panic).
+    #[test]
+    fn build_recent_dirs_returns_empty_without_storage() {
+        let sm = StateManager::new();
+        assert_eq!(build_recent_dirs(&sm), Vec::<String>::new());
+    }
+
+    // ── recent_dirs wire protocol ─────────────────────────────────────────
+
+    #[test]
+    fn request_recent_dirs_parses() {
+        let m: InboundMessage = serde_json::from_str(r#"{"type":"request_recent_dirs"}"#).unwrap();
+        assert!(matches!(m, InboundMessage::RequestRecentDirs));
+    }
+
+    #[test]
+    fn recent_dirs_serializes_with_tag_and_dirs() {
+        let m = OutboundMessage::RecentDirs {
+            dirs: vec!["/a".to_string(), "/b".to_string()],
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#"{"type":"recent_dirs","dirs":["/a","/b"]}"#);
     }
 }

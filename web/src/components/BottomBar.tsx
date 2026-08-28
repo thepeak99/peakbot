@@ -20,6 +20,7 @@ export function BottomBar({
   hasTranscript,
   cwd,
   dirListing,
+  recentDirs,
   send,
   onSwitchModel,
   onLoadConversation,
@@ -31,6 +32,7 @@ export function BottomBar({
   hasTranscript: boolean;
   cwd: string | null;
   dirListing: DirListing | null;
+  recentDirs: string[];
   send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
   lockedReason?: string | null;
@@ -61,6 +63,7 @@ export function BottomBar({
           cwd={cwd}
           hasTranscript={hasTranscript}
           dirListing={dirListing}
+          recentDirs={recentDirs}
           send={send}
           dropUp
         />

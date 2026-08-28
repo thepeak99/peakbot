@@ -110,6 +110,11 @@ impl FileStorage {
 
     /// Read the summary index from disk. Returns `None` if it is absent or
     /// unreadable — the caller then rebuilds from a full scan.
+    ///
+    /// This also covers `ConversationSummary` schema changes: a field added
+    /// without `#[serde(default)]` (e.g. `cwd`) makes a stale index fail to
+    /// parse here, which folds into `None` and triggers the rebuild — no
+    /// separate migration code needed.
     fn read_index(&self) -> Option<HashMap<Uuid, ConversationSummary>> {
         let content = fs::read_to_string(self.index_path()).ok()?;
         serde_json::from_str(&content).ok()
@@ -391,6 +396,67 @@ mod tests {
         let ids: Vec<Uuid> = store.list().unwrap().iter().map(|s| s.id).collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&a.id) && ids.contains(&b.id));
+    }
+
+    // ── recent_dirs: stale (pre-cwd) index forces a rebuild ────────────────
+    //
+    // `ConversationSummary` gains a REQUIRED `cwd: String` field (no
+    // `#[serde(default)]` — deliberate). This test hand-writes an index.json
+    // shaped like the CURRENT (pre-feature) on-disk format — entries with no
+    // `cwd` key — next to a real saved conversation, then asserts `list()`
+    // detects the index no longer parses as `HashMap<Uuid,
+    // ConversationSummary>`, rebuilds from the conversation files, and
+    // persists a fresh index carrying `cwd`.
+    //
+    // Until `ConversationSummary::cwd` exists, `summary.cwd` below fails to
+    // COMPILE — the expected RED for this test today.
+    #[test]
+    fn list_rebuilds_when_index_predates_cwd() {
+        let dir = TempDir::new().unwrap();
+        let store = FileStorage::new(dir.path().to_path_buf()).unwrap();
+
+        let known_cwd = "/pre/cwd/index/rebuild/target";
+        let mut c = conv("has-a-cwd");
+        c.cwd = known_cwd.to_string();
+        store.save(&c).unwrap();
+
+        // Build a v1-shaped index entry: take the real current summary
+        // serialization and strip the `cwd` key, mirroring exactly what a
+        // pre-cwd on-disk `index.json` looked like.
+        let summary = ConversationSummary::from(&c);
+        let mut entry = serde_json::to_value(&summary).unwrap();
+        entry.as_object_mut().unwrap().remove("cwd");
+
+        let mut legacy_index = serde_json::Map::new();
+        legacy_index.insert(c.id.to_string(), entry);
+        let legacy_json = serde_json::Value::Object(legacy_index).to_string();
+        fs::write(store.index_path(), &legacy_json).unwrap();
+
+        // Sanity: the hand-written file really does lack `cwd` (guards
+        // against the fixture silently drifting and this test going green
+        // for the wrong reason).
+        assert!(
+            !legacy_json.contains("\"cwd\""),
+            "fixture must be pre-cwd shaped: {legacy_json}"
+        );
+
+        let summaries = store.list().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].cwd, known_cwd,
+            "a stale pre-cwd index must be rejected and rebuilt from the \
+             conversation files, restoring cwd"
+        );
+
+        // The rebuilt index persisted to disk must now carry the cwd key.
+        let on_disk = fs::read_to_string(store.index_path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        let rewritten_entry = &parsed[c.id.to_string()];
+        assert_eq!(
+            rewritten_entry.get("cwd").and_then(|v| v.as_str()),
+            Some(known_cwd),
+            "rebuilt index.json must persist cwd; got: {on_disk}"
+        );
     }
 
     #[test]

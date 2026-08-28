@@ -31,6 +31,10 @@ export interface AgentConnection {
    * socket, not part of AppState — browsing is ephemeral). `null` until the
    * first `list_dir` is answered. */
   dirListing: DirListing | null;
+  /** Most-recently-used directories for the cwd picker's "Recent" section
+   * (newest-first, deduped, existing dirs only, cwd excluded, max 8). Empty
+   * until the first `request_recent_dirs` is answered. */
+  recentDirs: string[];
   error: string | null;
   send: (msg: InboundMessage) => void;
   /** Switch this client to another conversation by re-attaching: bind the new
@@ -68,6 +72,7 @@ export function useAgent(): AgentConnection {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [dirListing, setDirListing] = useState<DirListing | null>(null);
+  const [recentDirs, setRecentDirs] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -158,6 +163,9 @@ export function useAgent(): AgentConnection {
               error: msg.error,
             });
             break;
+          case "recent_dirs":
+            setRecentDirs(msg.dirs);
+            break;
           case "error":
             setError(msg.message);
             break;
@@ -215,6 +223,7 @@ export function useAgent(): AgentConnection {
     conversations,
     commands,
     dirListing,
+    recentDirs,
     error,
     send,
     switchConvo,
