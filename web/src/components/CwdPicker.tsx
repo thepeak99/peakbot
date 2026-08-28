@@ -121,95 +121,105 @@ export function CwdPicker({
         // and anchors it on phones. Placing it in the base class would silently
         // no-op `dropUp` on tablets, where the host swaps but the breakpoint
         // prefix does not.
+        // max-h = viewport minus 8rem (3.75rem bottom bar + breathing room) so
+        // the commit bar stays visible on short windows.
         <div
-          className={`absolute left-0 z-20 w-80 rounded-md border border-zinc-800 bg-zinc-900 shadow-xl max-sm:fixed max-sm:inset-x-2 max-sm:mt-0 max-sm:mb-0 max-sm:w-auto ${
+          className={`absolute left-0 z-20 flex max-h-[calc(100dvh-8rem)] flex-col w-80 rounded-md border border-zinc-800 bg-zinc-900 shadow-xl max-sm:fixed max-sm:inset-x-2 max-sm:mt-0 max-sm:mb-0 max-sm:w-auto ${
             dropUp
               ? "bottom-full mb-1 max-sm:bottom-[3.75rem] max-sm:top-auto"
               : "top-full mt-1 max-sm:top-[3.75rem]"
           }`}
         >
-          {/* Recent — quick-jump to the most recently used directories.
-              Rows reuse `commit`, so the confirm guard applies exactly as
-              for the browse list. Hidden entirely when empty. */}
-          {recentDirs.length > 0 && (
-            <div className="border-b border-zinc-800">
-              <div className="px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-                Recent
-              </div>
-              {recentDirs.map((path) => (
-                <button
-                  key={path}
-                  onClick={() => commit(path)}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-800"
-                  title={path}
-                >
-                  <span className="shrink-0 text-zinc-500">📁</span>
-                  <span className="truncate font-medium">{basename(path)}</span>
-                  <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-zinc-500">
-                    {displayPath(path)}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-
-          {/* Current browse path + up. */}
-          <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2">
-            <button
-              onClick={() =>
-                dirListing?.parent && navigate(dirListing.parent)
-              }
-              disabled={!dirListing?.parent}
-              className="rounded px-1.5 py-0.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-30"
-              title="Up one level"
-            >
-              ⬆ ..
-            </button>
-            <span
-              className="min-w-0 flex-1 truncate font-mono text-[11px] text-zinc-400"
-              title={browsed ?? cwd}
-            >
-              {displayPath(browsed ?? cwd)}
-            </span>
-          </div>
-
-          {/* Error (folded into the dir_listing frame) renders inline. */}
-          {dirListing?.error && (
-            <div className="px-3 py-2 text-xs text-red-300">
-              {dirListing.error}
-            </div>
-          )}
-
-          {/* Directory list. */}
-          <div className="max-h-64 overflow-y-auto py-1">
-            {dirs.map((e) => (
-              <button
-                key={e.name}
-                onClick={() => navigate(`${browsed ?? cwd}/${e.name}`)}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-800"
-              >
-                <span className="text-zinc-500">📁</span>
-                <span className="truncate">{e.name}</span>
-              </button>
-            ))}
-            {files.map((e) => (
-              <div
-                key={e.name}
-                className="flex items-center gap-2 px-3 py-1.5 text-xs text-zinc-600"
-              >
-                <span>📄</span>
-                <span className="truncate">{e.name}</span>
-              </div>
-            ))}
-            {dirListing && !dirListing.error && dirs.length === 0 && (
-              <div className="px-3 py-2 text-xs text-zinc-500">
-                No sub-directories.
+          {/* One scroll container for the recent list, breadcrumb, and browse
+              list so they scroll together; the commit bar below stays pinned. */}
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {/* Recent — quick-jump to the most recently used directories.
+                Rows reuse `commit`, so the confirm guard applies exactly as
+                for the browse list. Hidden entirely when empty. */}
+            {recentDirs.length > 0 && (
+              <div className="border-b border-zinc-800">
+                <div className="px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                  Recent
+                </div>
+                {recentDirs.map((path) => (
+                  <button
+                    key={path}
+                    onClick={() => commit(path)}
+                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-800"
+                    title={path}
+                  >
+                    <span className="shrink-0 text-zinc-500">📁</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium">
+                        {basename(path)}
+                      </span>
+                      <span className="block truncate font-mono text-[10px] text-zinc-500">
+                        {displayPath(path)}
+                      </span>
+                    </span>
+                  </button>
+                ))}
               </div>
             )}
+
+            {/* Current browse path + up. */}
+            <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2">
+              <button
+                onClick={() =>
+                  dirListing?.parent && navigate(dirListing.parent)
+                }
+                disabled={!dirListing?.parent}
+                className="rounded px-1.5 py-0.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-30"
+                title="Up one level"
+              >
+                ⬆ ..
+              </button>
+              <span
+                className="min-w-0 flex-1 truncate font-mono text-[11px] text-zinc-400"
+                title={browsed ?? cwd}
+              >
+                {displayPath(browsed ?? cwd)}
+              </span>
+            </div>
+
+            {/* Error (folded into the dir_listing frame) renders inline. */}
+            {dirListing?.error && (
+              <div className="px-3 py-2 text-xs text-red-300">
+                {dirListing.error}
+              </div>
+            )}
+
+            {/* Directory list. */}
+            <div className="py-1">
+              {dirs.map((e) => (
+                <button
+                  key={e.name}
+                  onClick={() => navigate(`${browsed ?? cwd}/${e.name}`)}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-800"
+                >
+                  <span className="text-zinc-500">📁</span>
+                  <span className="truncate">{e.name}</span>
+                </button>
+              ))}
+              {files.map((e) => (
+                <div
+                  key={e.name}
+                  className="flex items-center gap-2 px-3 py-1.5 text-xs text-zinc-600"
+                >
+                  <span>📄</span>
+                  <span className="truncate">{e.name}</span>
+                </div>
+              ))}
+              {dirListing && !dirListing.error && dirs.length === 0 && (
+                <div className="px-3 py-2 text-xs text-zinc-500">
+                  No sub-directories.
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Commit. */}
-          <div className="border-t border-zinc-800 px-3 py-2">
+          <div className="shrink-0 border-t border-zinc-800 px-3 py-2">
             <button
               onClick={() => commit(browsed ?? cwd)}
               className="w-full rounded bg-emerald-700 px-2 py-1 text-xs font-medium text-emerald-50 hover:bg-emerald-600"
