@@ -1115,6 +1115,61 @@ impl AgentRunner {
         }
     }
 
+    /// Compact the session's `memory.md` if it exceeds `threshold_bytes`.
+    ///
+    /// Extracted from `agent_loop` so the path resolution is testable: the
+    /// path is joined onto `sm.session_cwd()`, **not** the process cwd. The
+    /// process cwd is frozen at startup (see
+    /// `tests/scenarios/no_set_current_dir.rs`); in web and pipeline mode the
+    /// session lives in a project directory that is not where the binary was
+    /// launched from. Resolving relatively silently compacted the wrong file
+    /// — i.e. never compacted at all.
+    ///
+    /// The compaction model is read live from `StateManager` so it reflects
+    /// `/model` and `/pipeline` rebuilds. Failures are logged, never fatal.
+    async fn maybe_compact_memory(sm: &StateManager, threshold_bytes: usize) {
+        let path = sm.session_cwd().join("memory.md");
+        let Some(content) = crate::memory_compaction::read_if_oversized(&path, threshold_bytes)
+        else {
+            return;
+        };
+        let Some(model) = sm.get_title_model() else {
+            tracing::warn!(
+                "memory.md is {} bytes (over the {} byte threshold) but no compaction \
+                 model is available — skipping compaction",
+                content.len(),
+                threshold_bytes
+            );
+            return;
+        };
+
+        sm.set_status(Some("Compacting memory.md...".to_string()));
+        let size_before = content.len();
+        match crate::memory_compaction::compact_memory(&content, &model).await {
+            Ok(compacted) => {
+                if let Err(e) = std::fs::write(&path, compacted) {
+                    tracing::warn!("Failed to write compacted memory.md: {}", e);
+                } else {
+                    sm.add_system_message(format!(
+                        "memory.md compacted (was {} bytes)",
+                        size_before
+                    ));
+                    tracing::info!(
+                        "memory.md compacted: {} -> {} bytes",
+                        size_before,
+                        std::fs::metadata(&path)
+                            .map(|m| m.len() as usize)
+                            .unwrap_or(0)
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Memory compaction failed: {}", e);
+            }
+        }
+        sm.set_status(None);
+    }
+
     /// Agent loop - processes messages from event loop, sends completions back.
     ///
     /// **Single-writer for user input.** This loop is the *only* place that
@@ -1237,53 +1292,15 @@ impl AgentRunner {
                         sm.set_running(true);
                     }
 
-                    // Lazy memory compaction: run once on the first user
-                    // message so startup stays instant and the spinner gives
-                    // visual feedback while we work. The compaction_model is
-                    // queried live from StateManager, not from the initial
-                    // variable, so it sees updates from `/model` and `/pipeline`
-                    // rebuilds (see #XXX — memory.md compaction in pipeline mode).
+                    // Lazy memory compaction: run once, on the first user
+                    // message, so startup stays instant and the spinner gives
+                    // visual feedback while we work. The compaction model is
+                    // read live from StateManager inside the helper, so it
+                    // sees `/model` and `/pipeline` rebuilds.
                     if !memory_compaction_done && config.memory.enabled {
                         memory_compaction_done = true;
-                        if let Some(sm) = state_manager.as_ref()
-                            && let Some(model) = sm.get_title_model()
-                        {
-                            let path = std::path::Path::new("memory.md");
-                            if let Some(content) = crate::memory_compaction::read_if_oversized(
-                                path,
-                                config.memory.threshold_bytes,
-                            ) {
-                                sm.set_status(Some("Compacting memory.md...".to_string()));
-                                let size_before = content.len();
-                                match crate::memory_compaction::compact_memory(&content, &model)
-                                    .await
-                                {
-                                    Ok(compacted) => {
-                                        if let Err(e) = std::fs::write(path, compacted) {
-                                            tracing::warn!(
-                                                "Failed to write compacted memory.md: {}",
-                                                e
-                                            );
-                                        } else {
-                                            sm.add_system_message(format!(
-                                                "memory.md compacted (was {} bytes)",
-                                                size_before
-                                            ));
-                                            tracing::info!(
-                                                "memory.md compacted: {} -> {} bytes",
-                                                size_before,
-                                                std::fs::metadata(path)
-                                                    .map(|m| m.len() as usize)
-                                                    .unwrap_or(0)
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Memory compaction failed: {}", e);
-                                    }
-                                }
-                                sm.set_status(None);
-                            }
+                        if let Some(sm) = state_manager.as_ref() {
+                            Self::maybe_compact_memory(sm, config.memory.threshold_bytes).await;
                         }
                     }
 
@@ -5061,6 +5078,85 @@ mod tests {
         assert!(
             !json.contains("SIG-ANTHROPIC"),
             "an Anthropic signature must never reach a foreign provider's wire; got: {json}",
+        );
+    }
+
+    /// Regression: `memory.md` must resolve against the *session* cwd, not
+    /// the process cwd. When PeakBot runs as a web server started from
+    /// $HOME with sessions in project dirs, the old relative
+    /// `Path::new("memory.md")` read the wrong file and the compaction
+    /// gate silently never fired.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn maybe_compact_memory_resolves_against_session_cwd() {
+        use crate::mock::MockResponse;
+        use std::io::Write;
+
+        // A session cwd holding an oversized memory.md.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_path = dir.path().join("memory.md");
+        let mut f = std::fs::File::create(&memory_path).unwrap();
+        writeln!(f, "MARKER_SESSION_MEMORY").unwrap();
+        writeln!(f, "{}", "x".repeat(200)).unwrap();
+
+        // A state manager whose session cwd is that tempdir.
+        let sm = StateManager::new_arc();
+        sm.set_session_cwd(dir.path().to_path_buf());
+
+        // A mock compaction model that rewrites the file.
+        let (model, mock) = crate::providers::create_mock_compaction_model();
+        mock.add_response(MockResponse::text("COMPACTED"));
+        sm.init_title_model(std::sync::Arc::new(model));
+
+        // Run the gate.
+        AgentRunner::maybe_compact_memory(&sm, 100).await;
+
+        // The session-cwd file must have been rewritten in place.
+        let rewritten = std::fs::read_to_string(&memory_path).unwrap();
+        assert_eq!(
+            rewritten, "COMPACTED",
+            "session-cwd memory.md must be rewritten in place"
+        );
+
+        // Exactly one model call, and the request must carry the session
+        // file's content — proof the SESSION file (not a process-cwd file)
+        // is what went to the model.
+        let requests = mock.get_recorded_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "compaction must make exactly one model call"
+        );
+        let last_msg = requests[0].chat_history.last().unwrap();
+        let msg_text = match last_msg {
+            rig_core::completion::message::Message::User { content } => content
+                .iter()
+                .map(|c| match c {
+                    rig_core::completion::message::UserContent::Text(t) => t.text.clone(),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => panic!("expected user message"),
+        };
+        assert!(
+            msg_text.contains("MARKER_SESSION_MEMORY"),
+            "model request must contain the session-cwd memory.md content"
+        );
+
+        // A system message must be surfaced on state.
+        let state = sm.get_state();
+        let system_msgs: Vec<_> = state
+            .chat
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, crate::ui::MessageRole::System))
+            .collect();
+        assert!(
+            system_msgs
+                .iter()
+                .any(|m| m.content.contains("memory.md compacted")),
+            "a 'memory.md compacted' system message must be surfaced on state"
         );
     }
 
