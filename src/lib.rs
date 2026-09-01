@@ -1947,7 +1947,7 @@ impl AgentRunner {
     ) -> Vec<String> {
         let mut warnings = Vec::new();
         // Boundary parse — keep previous config on any failure.
-        let fresh = match Config::reload_for(session_cwd) {
+        let fresh = match config.reload_for(session_cwd) {
             Ok(c) => c,
             Err(reason) => {
                 warnings.push(format!(
@@ -1968,16 +1968,10 @@ impl AgentRunner {
             }
         };
 
-        // Tool filter is a boundary parse — an invalid `tools:` block (both
-        // lists set, or an unknown tool name) keeps the previous config.
-        if let Err(e) = fresh.tools.validate() {
-            warnings.push(format!("⚠ config reload: {e} — keeping previous config."));
-            return warnings;
-        }
-
-        // Same boundary for the wall-clock budgets: a zero or absurd value
-        // would take effect on the very next tool call.
-        if let Err(e) = fresh.timeouts.validate() {
+        // Consolidated boundary parse (§1.6): tools filter + wall-clock
+        // budgets, over the effective (post-profile) config. Keeps the
+        // previous config on any failure.
+        if let Err(e) = fresh.validate() {
             warnings.push(format!("⚠ config reload: {e} — keeping previous config."));
             return warnings;
         }

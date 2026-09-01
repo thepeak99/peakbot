@@ -107,6 +107,13 @@ struct Cli {
     #[arg(long = "tls-name", value_name = "NAME", requires = "tls")]
     tls_name: Vec<String>,
 
+    /// Select a named overlay from the master config's `profiles:` block,
+    /// applied as the final step of config resolution (after per-repo, after
+    /// master) — see `docs/profiles-and-web-mode.md` §1. Generic: no clap
+    /// conflicts, applies to `--tui`, `--stdio`, and the web UI alike.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+
     /// Subcommand — `install` (copy binary) or `service …` (manage the login
     /// service). Absent ⇒ run the configured UI. Subcommands dispatch
     /// **before** `Config::load()` — `peakbot install` works on a machine
@@ -452,7 +459,7 @@ async fn main() -> Result<()> {
     // ── Shared setup ──────────────────────────────────────────────
 
     // Load configuration with metadata about what was found
-    let loaded = Config::load()?;
+    let loaded = Config::load(cli.profile.as_deref())?;
     let config_found = loaded.config_file_found;
     let mut needs_setup = false;
 

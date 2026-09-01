@@ -368,6 +368,34 @@ pub struct Config {
     /// a reload takes effect on the next tool.
     #[serde(default)]
     pub timeouts: TimeoutsConfig,
+
+    /// Named profiles. Read from the MASTER config only; a `profiles:` block in
+    /// a per-repo `.peakbot/config.yaml` is ignored (with a boot warning) — a
+    /// checked-out repo must not be able to redefine the deployment's
+    /// guarantees.
+    #[serde(default)]
+    pub profiles: HashMap<String, Profile>,
+
+    /// The profile applied to THIS config, if any. Never deserialized — set
+    /// only by `apply_profile`, so `Some(name)` always names a profile that
+    /// exists and has already been applied. Carried so `reload_for` can
+    /// re-apply it.
+    #[serde(skip)]
+    pub active_profile: Option<String>,
+}
+
+/// A named overlay over the effective config. Every field is optional:
+/// `None` = "leave the resolved value alone". Selected once, at boot, with
+/// `--profile <name>`; applied AFTER master+per-repo merge so it always wins.
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    /// Replaces `tools:` wholesale (blocklist XOR allowlist, validated as usual).
+    #[serde(default)]
+    pub tools: Option<ToolsConfig>,
+    /// Replaces `memory:` wholesale.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
 }
 
 /// Outbound HTTP timeouts, applied to every client PeakBot builds (LLM calls,
@@ -1676,6 +1704,11 @@ impl Config {
         if other.persona.is_some() {
             self.persona = other.persona;
         }
+
+        // profiles — deliberately NOT adopted: profiles are master-only. A
+        // checked-out repo must not be able to redefine the deployment's
+        // guarantees; `Config::load` warns when a per-repo config declares a
+        // `profiles:` block.
     }
 }
 
@@ -1710,6 +1743,8 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             http: HttpConfig::default(),
             timeouts: TimeoutsConfig::default(),
+            profiles: HashMap::new(),
+            active_profile: None,
         }
     }
 }
@@ -1817,9 +1852,10 @@ impl Config {
     /// 1. Defaults (lowest priority)
     /// 2. Master config (~/.config/peakbot/peakbot/config.yaml)
     /// 3. Per-repo config (.peakbot/config.yaml in cwd) - top-level key override
+    /// 4. `profile` overlay (from `--profile`, master config only — §1.4)
     ///
     /// Returns `LoadedConfig` with the loaded config and metadata about what was found.
-    pub fn load() -> anyhow::Result<LoadedConfig> {
+    pub fn load(profile: Option<&str>) -> anyhow::Result<LoadedConfig> {
         // A malformed master config is fatal — see `load_yaml_config`.
         let (master, config_file_path) = load_yaml_config()?;
         let config_file_found = master.is_some();
@@ -1828,10 +1864,11 @@ impl Config {
         let per_repo = std::env::current_dir()
             .ok()
             .and_then(|d| load_per_repo_config(&d));
-        let config = Self::merge_sources(master, per_repo);
+        warn_if_per_repo_declares_profiles(per_repo.as_ref());
+        let merged = Self::merge_sources(master, per_repo);
+        let config = apply_profile(merged, profile).map_err(anyhow::Error::msg)?;
 
-        config.tools.validate().map_err(anyhow::Error::msg)?;
-        config.timeouts.validate().map_err(anyhow::Error::msg)?;
+        config.validate().map_err(anyhow::Error::msg)?;
 
         Ok(LoadedConfig {
             config,
@@ -1840,16 +1877,24 @@ impl Config {
         })
     }
 
-    /// Re-read master + `<cwd>/.peakbot/config.yaml` for a live session.
-    /// Replaces `reload()` — `cwd` must be the directory the session WILL
-    /// be in after the calling verb completes (target for `/cd`, current
-    /// `session_cwd` for the other verbs). Same precedence as
-    /// [`Config::load`]; a malformed-master error maps to `Err(reason)`
-    /// so the caller can keep the previous config and warn instead of
-    /// crashing.
-    pub fn reload_for(cwd: &std::path::Path) -> Result<Config, String> {
+    /// Re-read master + `<cwd>/.peakbot/config.yaml` for a live session,
+    /// re-applying whatever profile is active on `self`. A method (not an
+    /// associated fn) so the live config's profile identity cannot be
+    /// forgotten by a caller — every reload verb re-derives the profile from
+    /// the config it already holds. Replaces `reload()` — `cwd` must be the
+    /// directory the session WILL be in after the calling verb completes
+    /// (target for `/cd`, current `session_cwd` for the other verbs). Same
+    /// precedence as [`Config::load`]; a malformed-master error or an
+    /// unknown profile maps to `Err(reason)` so the caller can keep the
+    /// previous config and warn instead of crashing.
+    pub fn reload_for(&self, cwd: &std::path::Path) -> Result<Config, String> {
         let master = load_yaml_config().map_err(|e| e.to_string())?.0;
-        Ok(Self::merge_sources(master, load_per_repo_config(cwd)))
+        let per_repo = load_per_repo_config(cwd);
+        warn_if_per_repo_declares_profiles(per_repo.as_ref());
+        apply_profile(
+            Self::merge_sources(master, per_repo),
+            self.active_profile.as_deref(),
+        )
     }
 
     /// Pure merge of the two config sources over defaults — the
@@ -1867,10 +1912,62 @@ impl Config {
     /// Adopt every field from `fresh` **except** `provider`, which is
     /// owned by the resolve step and must never be overwritten by a
     /// reload. This is the single point that enforces that invariant.
+    /// `active_profile` (and everything else) rides along unchanged, so the
+    /// next `reload_for` re-applies the same profile.
     pub fn adopt_reloaded(&mut self, fresh: Config) {
         let saved_provider = self.provider.clone();
         *self = fresh;
         self.provider = saved_provider;
+    }
+
+    /// Consolidated boundary parse over the effective (post-profile) config,
+    /// called once from [`Config::load`] and reused by the reload path
+    /// (`reload_session_config`) in place of the two separate calls it used
+    /// to make (§1.6).
+    pub fn validate(&self) -> Result<(), String> {
+        self.tools.validate()?;
+        self.timeouts.validate()?;
+        Ok(())
+    }
+}
+
+/// Apply the boot-selected profile overlay to an already-merged
+/// (master + per-repo) config — the ONE place a profile is applied (§1.4).
+/// `None` is a no-op (today's behaviour, byte-identical). An unknown name is
+/// a boot error naming it and listing the configured profiles (sorted, for a
+/// stable message).
+fn apply_profile(mut cfg: Config, name: Option<&str>) -> Result<Config, String> {
+    let Some(name) = name else { return Ok(cfg) };
+    let profile = cfg.profiles.get(name).cloned().ok_or_else(|| {
+        let mut known: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        format!(
+            "unknown profile '{name}'. Configured profiles: {}",
+            if known.is_empty() {
+                "(none)".to_string()
+            } else {
+                known.join(", ")
+            }
+        )
+    })?;
+    if let Some(t) = profile.tools {
+        cfg.tools = t;
+    }
+    if let Some(m) = profile.memory {
+        cfg.memory = m;
+    }
+    cfg.active_profile = Some(name.to_string());
+    Ok(cfg)
+}
+
+/// Master-only profiles (§1.5): a `profiles:` block in a per-repo config is
+/// never merged in (`merge_with` skips it), but silently dropping user config
+/// is astonishing — warn once whenever one is present.
+fn warn_if_per_repo_declares_profiles(per_repo: Option<&Config>) {
+    if per_repo.is_some_and(|c| !c.profiles.is_empty()) {
+        tracing::warn!(
+            "⚠ .peakbot/config.yaml declares `profiles:` — ignored (profiles are master-config only)."
+        );
     }
 }
 
@@ -4083,6 +4180,386 @@ max_image_bytes: 10485760
         assert!(
             super::load_per_repo_config(tmp.path()).is_none(),
             "no .peakbot/config.yaml in the dir must silently return None"
+        );
+    }
+
+    // =========================================================================
+    // PR 1 — Config profiles (RED).
+    //
+    // Written against the §1.2/§1.4 API the implementer will add: `Profile`,
+    // `Config::profiles`, `Config::active_profile`, `apply_profile`, and
+    // `Config::reload_for` as a `&self` method. None of those exist yet, so
+    // this section is compile-RED (E0432/E0599) until PR 1 lands. PR 1's
+    // `Profile` carries ONLY `tools` + `memory` (`system_prompt` is PR 2 and
+    // `allowed_models` is PR 1.5 — both out of scope here, per §7).
+    //
+    // Precedence tests build `Config`/`Profile` literals and drive the pure
+    // core (`merge_sources` + `apply_profile`) — the same pattern as the
+    // `merge_sources_*` tests above, so no filesystem is involved. Only the
+    // reload pin below touches a tempdir (master via XDG_CONFIG_HOME, per-repo
+    // via the `cwd` argument, mirroring the `load_per_repo_config` fixtures).
+    // =========================================================================
+
+    #[test]
+    fn profile_overlay_beats_per_repo_and_master_for_tools() {
+        // Master sets one tools filter, per-repo another, the profile a third —
+        // the effective config must carry the profile's (top of the precedence
+        // stack: profile > per-repo > master > defaults).
+        let master = Config {
+            tools: ToolsConfig {
+                disabled: vec!["bash".into()],
+                only: vec![],
+            },
+            profiles: HashMap::from([(
+                "locked".to_string(),
+                Profile {
+                    tools: Some(ToolsConfig {
+                        disabled: vec![],
+                        only: vec!["file_read".into()],
+                    }),
+                    memory: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            tools: ToolsConfig {
+                disabled: vec!["web_search".into()],
+                only: vec![],
+            },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        // Precondition: without the profile, per-repo wins over master.
+        assert_eq!(
+            merged.tools,
+            ToolsConfig {
+                disabled: vec!["web_search".into()],
+                only: vec![]
+            },
+            "per-repo must beat master before the profile is applied"
+        );
+        let effective = apply_profile(merged, Some("locked")).expect("profile exists");
+        assert_eq!(
+            effective.tools,
+            ToolsConfig {
+                disabled: vec![],
+                only: vec!["file_read".into()]
+            },
+            "the profile overlay must beat both per-repo and master for tools"
+        );
+    }
+
+    #[test]
+    fn profile_overlay_beats_per_repo_and_master_for_memory() {
+        // Profile memory.enabled: false must win over master/per-repo true.
+        let master = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 1000,
+            },
+            profiles: HashMap::from([(
+                "nomem".to_string(),
+                Profile {
+                    tools: None,
+                    memory: Some(MemoryConfig {
+                        enabled: false,
+                        threshold_bytes: 2000,
+                    }),
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 3000,
+            },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        // Precondition: per-repo memory wins over master (both non-default).
+        assert_eq!(
+            merged.memory,
+            MemoryConfig {
+                enabled: true,
+                threshold_bytes: 3000
+            },
+            "per-repo must beat master before the profile is applied"
+        );
+        let effective = apply_profile(merged, Some("nomem")).expect("profile exists");
+        assert_eq!(
+            effective.memory,
+            MemoryConfig {
+                enabled: false,
+                threshold_bytes: 2000
+            },
+            "the profile overlay must beat both per-repo and master for memory"
+        );
+        assert!(
+            !effective.memory.enabled,
+            "profile memory.enabled: false must win"
+        );
+    }
+
+    #[test]
+    fn unknown_profile_errors_naming_it_and_listing_configured() {
+        // `--profile gamma` with only alpha/beta configured ⇒ Err that names
+        // the unknown profile AND lists the configured ones.
+        let cfg = Config {
+            profiles: HashMap::from([
+                (
+                    "alpha".to_string(),
+                    Profile {
+                        tools: None,
+                        memory: None,
+                    },
+                ),
+                (
+                    "beta".to_string(),
+                    Profile {
+                        tools: None,
+                        memory: None,
+                    },
+                ),
+            ]),
+            ..Config::default()
+        };
+        let err = apply_profile(cfg, Some("gamma")).expect_err("unknown profile must error");
+        assert!(
+            err.contains("gamma"),
+            "error must name the unknown profile, got: {err}"
+        );
+        assert!(
+            err.contains("alpha"),
+            "error must list configured 'alpha', got: {err}"
+        );
+        assert!(
+            err.contains("beta"),
+            "error must list configured 'beta', got: {err}"
+        );
+    }
+
+    #[test]
+    fn per_repo_profiles_block_is_ignored_and_selecting_it_errors() {
+        // A `profiles:` block in a per-repo config is master-only: it must NOT
+        // be merged, and selecting such a profile errors as unknown.
+        let master = Config {
+            profiles: HashMap::from([(
+                "master_only".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            profiles: HashMap::from([(
+                "evil_repo".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        assert!(
+            !merged.profiles.contains_key("evil_repo"),
+            "a per-repo `profiles:` block must be ignored (not merged)"
+        );
+        assert!(
+            merged.profiles.contains_key("master_only"),
+            "master profiles must survive the merge"
+        );
+        let err = apply_profile(merged, Some("evil_repo"))
+            .expect_err("selecting an ignored per-repo profile must error");
+        assert!(
+            err.contains("evil_repo"),
+            "the error must name the unknown profile, got: {err}"
+        );
+    }
+
+    /// Serializes the env-var-mutating reload pin so it cannot race a future
+    /// test that also points the master config path at a tempdir.
+    static CONFIG_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    /// §1.7 security regression pin: a profile that disables `bash` must
+    /// survive a reload even when the per-repo config in the (new) cwd sets
+    /// `tools: {}` (allow everything). The profile is the operator's
+    /// deployment ceiling — a checked-out repo must not be able to void it.
+    ///
+    /// The master carries the blocklist ONLY via the profile (no top-level
+    /// `tools:`), so the merged config allows everything and the profile
+    /// re-application is what the pin actually exercises: if `reload_for`
+    /// forgot to re-apply the profile, `bash` would come back and this fails.
+    #[test]
+    fn profile_survives_reload_with_hostile_per_repo_config() {
+        let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+
+        // Point the master config at a tempdir. On Linux `ProjectDirs` honors
+        // XDG_CONFIG_HOME; save/restore so the test leaves no global state.
+        let original = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+        // Master config: the "locked" profile disables bash.
+        let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+        std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+        std::fs::write(
+            config_dir.join("config.yaml"),
+            "profiles:\n  locked:\n    tools:\n      disabled: [bash]\n",
+        )
+        .expect("write master config");
+
+        // Hostile per-repo config in the reload target dir: tools: {} (allow all).
+        let per_repo_dir = repo_tmp.path().join(".peakbot");
+        std::fs::create_dir_all(&per_repo_dir).expect("mkdir .peakbot");
+        std::fs::write(per_repo_dir.join("config.yaml"), "tools: {}\n").expect("write per-repo");
+
+        // The live config, as boot with `--profile locked` would have produced it.
+        let live = Config {
+            active_profile: Some("locked".to_string()),
+            profiles: HashMap::from([(
+                "locked".to_string(),
+                Profile {
+                    tools: Some(ToolsConfig {
+                        disabled: vec!["bash".into()],
+                        only: vec![],
+                    }),
+                    memory: None,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let reloaded = live
+            .reload_for(repo_tmp.path())
+            .expect("reload must succeed");
+
+        // Restore the env var BEFORE asserting (panic-safety).
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            !reloaded.tools.allows("bash"),
+            "bash must STILL be disabled after reload — the profile must survive a \
+             hostile per-repo `tools: {{}}` (got tools: {:?})",
+            reloaded.tools
+        );
+    }
+
+    #[test]
+    fn adopt_reloaded_preserves_active_profile() {
+        // After a reload, the config must still know which profile is active —
+        // `adopt_reloaded` copies every field from `fresh` (including the
+        // profile stamp), so the next reload re-applies the same profile.
+        let mut live = Config {
+            active_profile: None,
+            ..Config::default()
+        };
+        let fresh = Config {
+            active_profile: Some("locked".to_string()),
+            tools: ToolsConfig {
+                disabled: vec!["bash".into()],
+                only: vec![],
+            },
+            ..Config::default()
+        };
+        live.adopt_reloaded(fresh);
+        assert_eq!(
+            live.active_profile.as_deref(),
+            Some("locked"),
+            "adopt_reloaded must preserve the active_profile stamp"
+        );
+    }
+
+    #[test]
+    fn profile_leaves_unset_fields_untouched() {
+        // A profile that sets only `tools:` must not touch `memory` — the
+        // effective memory equals the master/per-repo-resolved value.
+        let master = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 1000,
+            },
+            profiles: HashMap::from([(
+                "tools_only".to_string(),
+                Profile {
+                    tools: Some(ToolsConfig {
+                        disabled: vec!["bash".into()],
+                        only: vec![],
+                    }),
+                    memory: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 3000,
+            },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        let resolved_memory = merged.memory.clone();
+        let effective = apply_profile(merged, Some("tools_only")).expect("profile exists");
+        assert_eq!(
+            effective.memory, resolved_memory,
+            "a field the profile does not set (memory) must be left untouched"
+        );
+        // And the field it DOES set is applied.
+        assert_eq!(
+            effective.tools,
+            ToolsConfig {
+                disabled: vec!["bash".into()],
+                only: vec![]
+            },
+            "the field the profile sets (tools) must be applied"
+        );
+    }
+
+    #[test]
+    fn no_profile_selected_keeps_active_profile_none_and_normal_merge() {
+        // No `--profile` ⇒ active_profile is None and the effective config
+        // equals the normal master+per-repo merge (today's behaviour,
+        // byte-identical).
+        let master = Config {
+            tools: ToolsConfig {
+                disabled: vec!["bash".into()],
+                only: vec![],
+            },
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 1000,
+            },
+            ..Config::default()
+        };
+        let repo = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 3000,
+            },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        let expected = merged.clone();
+        let effective = apply_profile(merged, None).expect("no profile must not error");
+        assert_eq!(
+            effective.active_profile, None,
+            "no profile selected ⇒ active_profile must be None"
+        );
+        assert_eq!(
+            effective, expected,
+            "no profile ⇒ effective config must equal the normal master+per-repo merge"
         );
     }
 }

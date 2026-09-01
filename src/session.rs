@@ -414,7 +414,7 @@ fn reload_pipelines_for_resume(
     if !path.join(".peakbot/config.yaml").is_file() {
         return None;
     }
-    let fresh = Config::reload_for(&path).ok()?;
+    let fresh = deps.config.reload_for(&path).ok()?;
     let registry = fresh.build_model_registry().ok()?;
     let set = PipelineSet::build(&fresh, &registry, Some(&deps.skills.names())).ok()?;
     Some(Arc::new(set))
