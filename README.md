@@ -95,9 +95,10 @@ every session-verb reload (`/cd`, `/new`, `/model`, `/load`), so it is a
 ceiling a checked-out repo cannot void. Profiles are master-config only; a
 `profiles:` block in a per-repo config is ignored with a boot warning.
 
-A profile can override three keys: `tools:`, `memory:`, and `pipelines:` —
-each using the shared filter documented in
-[Tool, Skill & Pipeline Filters](#tool-skill--pipeline-filters).
+A profile can override four keys: `tools:`, `memory:`, `pipelines:`, and
+`system_prompt:`. The first three each use the shared filter documented in
+[Tool, Skill & Pipeline Filters](#tool-skill--pipeline-filters); the fourth is
+its own thing, documented in [System Prompt](#system-prompt) below.
 
 ```yaml
 profiles:
@@ -120,6 +121,55 @@ profile is active, boot prints one line to stderr:
 
 ```
 ℹ profile 'web' active — overrides: tools, memory, pipelines.
+```
+
+### System Prompt
+
+The built-in system prompt has two parts: a short **persona** paragraph (voice
+and tone) followed by **core tool guidance** on how to use the built-in tools.
+Two keys — valid at the top level of a config file and inside a profile —
+replace one or the other:
+
+- `persona:` replaces only the persona; the built-in tool guidance still
+  follows it.
+- `system_prompt:` replaces the persona **and** the tool guidance — the
+  entire static head of the prompt. Everything dynamic still follows it: the
+  memory section (when enabled), skills, the environment block, `agents.md`,
+  and, for an orchestrator, `# Orchestrator Instructions` from the pipeline's
+  own prompt.
+
+Reach for `system_prompt:` when your deployment's toolset makes the built-in
+guidance wrong — roughly 69% of the built-in core prompt is coaching for
+`bash`, `think`, and `todo`, so a research-only or web-only profile that
+disables those tools shouldn't ship advice for using them. If you only want a
+different voice, use `persona:` instead — it keeps the built-in guidance
+current as PeakBot's tools evolve across releases.
+
+`persona:` and `system_prompt:` fill the **same slot** and are mutually
+exclusive: whichever key a source sets takes the slot and clears its sibling,
+so a per-repo `persona:` overrides a master `system_prompt:` and vice versa;
+a profile is applied last, so its choice is the ceiling. Setting both keys in
+the same file is a config error naming the file, as is a blank or
+whitespace-only `system_prompt:` — remove the key to get the built-in prompt.
+
+A `system_prompt:` also outranks a multi-agent pipeline's own orchestrator
+persona — the deployment's choice is a ceiling the team cannot override —
+while the pipeline's own `orchestrator.prompt` still appends afterward as
+`# Orchestrator Instructions`. Sub-agents are unaffected: a role's `prompt:`
+is already its entire preamble.
+
+```yaml
+profiles:
+  research:
+    system_prompt: |
+      You are a research assistant. You search the web and summarise findings
+      with citations. You do not write or execute code.
+    tools:
+      only: [think, todo, web_search, fetch_page, fetch_url]
+    memory:
+      enabled: false
+    pipelines:
+      enabled: false
 ```
 
 ### Tool, Skill & Pipeline Filters

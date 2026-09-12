@@ -27,7 +27,7 @@ use crate::tools::ShellKind;
 use crate::ui::app_state::WelcomeState;
 use crate::{
     AgentRunner, McpServerHandle, PEAKBOT_VERSION, RebuildContext, SkillRegistry, StateManager,
-    TodoTool, UiAction, build_system_prompt, create_provider,
+    TodoTool, UiAction, build_system_prompt, create_provider, resolve_prompt_head,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -219,9 +219,17 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // Build the per-session system prompt from `session_cwd` — the only
     // place the cwd flows into the prompt. Skills + shell_kind are part
     // of the env block too. With a pipeline selected this drops the
-    // crusader persona and appends the pipeline's orchestrator prompt. A
-    // pipeline's own `persona:` replaces the global one for its orchestrator
-    // (amendment 1); otherwise the global `persona:` applies unchanged.
+    // crusader persona and appends the pipeline's orchestrator prompt. The
+    // head (config `system_prompt:`/`persona:` vs the pipeline's own
+    // `orchestrator.persona`) is resolved by the shared helper the rebuild
+    // seam also uses. `config_head` outlives this call: `RebuildContext`
+    // below stores the *unresolved* config head, because a later rebuild
+    // re-resolves it against whatever pipeline is selected then.
+    let config_head = deps.config.prompt_head();
+    let session_head = resolve_prompt_head(
+        config_head.as_ref(),
+        active.and_then(|p| p.orchestrator_persona.as_deref()),
+    );
     let session_prompt = build_system_prompt(
         &deps.skills,
         deps.shell_kind.as_ref(),
@@ -229,9 +237,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         deps.config.memory.enabled,
         active.is_some(),
         active.and_then(|p| p.orchestrator_prompt.as_deref()),
-        active
-            .and_then(|p| p.orchestrator_persona.as_deref())
-            .or_else(|| deps.config.persona()),
+        session_head.as_ref(),
     );
 
     // The `delegate` tool (and thus sub-agents) is registered iff a pipeline is
@@ -341,7 +347,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         vector_store: deps.vector_store.clone(),
         memory_enabled: deps.config.memory.enabled,
         tools_filter: deps.config.tools.clone(),
-        persona: deps.config.persona().map(str::to_string),
+        prompt_head: config_head,
     };
 
     let mut runner = AgentRunner::new(

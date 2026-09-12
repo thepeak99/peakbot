@@ -302,11 +302,18 @@ pub struct Config {
 
     /// Replaces the built-in persona (`src/system_prompt_persona.txt`) at the
     /// head of the agentless system prompt. Absent or whitespace-only =
-    /// built-in. Not used in orchestrator mode (see
-    /// `pipeline.orchestrator_prompt`) and never applied to sub-agents (a
-    /// role's `prompt:` is its whole persona).
+    /// built-in. In orchestrator mode it still leads the orchestrator's
+    /// recipe unless the pipeline sets its own `orchestrator.persona:`;
+    /// never applied to sub-agents (a role's `prompt:` is its whole persona).
     #[serde(default)]
     pub persona: Option<String>,
+
+    /// The ENTIRE static system prompt: replaces both the persona piece and the
+    /// built-in core tool guidance. For deployments whose toolset makes the
+    /// built-in coaching wrong (research-only, web-only). Mutually exclusive
+    /// with `persona:` — they fill the same slot. Absent = built-in prompt.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 
     /// DEPRECATED: Use provider.config.model instead
     /// Maximum tool turns per message
@@ -400,6 +407,10 @@ pub struct Profile {
     /// `None` = every declared pipeline, i.e. today's behaviour.
     #[serde(default)]
     pub pipelines: Option<NameFilter>,
+    /// Takes the static-prompt slot for this profile: sets `system_prompt` and
+    /// clears any `persona` the master/per-repo merge resolved to.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 impl Profile {
@@ -415,6 +426,9 @@ impl Profile {
         }
         if self.pipelines.is_some() {
             out.push("pipelines");
+        }
+        if self.system_prompt.is_some() {
+            out.push("system_prompt");
         }
         out
     }
@@ -834,6 +848,31 @@ impl Config {
             .filter(|s| !s.is_empty())
     }
 
+    /// The static-prompt slot: `system_prompt` wins over `persona`, blank is
+    /// treated as absent. `None` = the built-in head.
+    ///
+    /// Returns an *owned* head so it can be stored in `RebuildContext`
+    /// without a lifetime — that is what keeps "exactly one head" a type
+    /// invariant all the way to prompt assembly, instead of decaying into two
+    /// parallel `Option<String>` fields. Prompt assembly only happens on agent
+    /// rebuild, so the clone is irrelevant.
+    pub fn prompt_head(&self) -> Option<PromptHead> {
+        let full = self
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(s) = full {
+            return Some(PromptHead::Full(s.to_string()));
+        }
+        let persona = self
+            .persona
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        persona.map(|s| PromptHead::Persona(s.to_string()))
+    }
+
     /// Build a [`ModelRegistry`] from the loaded config.
     ///
     /// Two paths:
@@ -920,6 +959,16 @@ impl Config {
         self.provider = resolved.clone();
         resolved
     }
+}
+
+/// What fills the static head of the system prompt. Exactly one variant can
+/// apply, which is why this is an enum and not two `Option`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptHead {
+    /// Replaces the built-in persona; the core tool guidance still follows.
+    Persona(String),
+    /// Replaces the persona AND the core guidance.
+    Full(String),
 }
 
 /// Describe the legacy `provider:` block in a tuple shape that the
@@ -1677,11 +1726,17 @@ impl Config {
             self.default_model = other.default_model;
         }
 
-        // persona - override if set (per-repo can replace the master persona).
-        // Whitespace-only values are kept here; `Config::persona()` collapses
-        // them to None at read time so "absent" stays a single representation.
-        if other.persona.is_some() {
+        // The static-prompt slot: whichever key the per-repo file sets takes the
+        // slot and clears its sibling, so the effective config never holds both.
+        // Whitespace-only values are kept here; `Config::persona()` /
+        // `Config::prompt_head()` collapse them to None at read time so
+        // "absent" stays a single representation.
+        if other.system_prompt.is_some() {
+            self.system_prompt = other.system_prompt;
+            self.persona = None;
+        } else if other.persona.is_some() {
             self.persona = other.persona;
+            self.system_prompt = None;
         }
 
         // profiles — deliberately NOT adopted: profiles are master-only. A
@@ -1698,6 +1753,7 @@ impl Default for Config {
             providers: Vec::new(),
             default_model: None,
             persona: None,
+            system_prompt: None,
             agent_max_turns: default_max_turns(),
             mcp_servers: None,
             searxng: None,
@@ -1844,12 +1900,26 @@ impl Config {
         // overlay — before `merge_sources`.
         if let Some(master) = &master {
             validate_active_profile_filters(master, profile).map_err(anyhow::Error::msg)?;
+            // The static-prompt slot: a single file cannot claim both halves.
+            // Runs per source file, before `merge_sources` — after the merge the
+            // slot rule has cleared the sibling, so the conflict is invisible.
+            let master_label = config_file_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "master config".to_string());
+            validate_prompt_slot(master, &master_label).map_err(anyhow::Error::msg)?;
         }
         // The ONE legitimate process-cwd read: at boot it really is the
         // session cwd. Every post-boot path passes the dir explicitly.
-        let per_repo = std::env::current_dir()
-            .ok()
-            .and_then(|d| load_per_repo_config(&d));
+        let per_repo_dir = std::env::current_dir().ok();
+        let per_repo = per_repo_dir.as_ref().and_then(|d| load_per_repo_config(d));
+        if let Some(per_repo) = &per_repo {
+            let per_repo_label = per_repo_dir
+                .as_ref()
+                .map(|d| d.join(".peakbot/config.yaml").display().to_string())
+                .unwrap_or_else(|| ".peakbot/config.yaml".to_string());
+            validate_prompt_slot(per_repo, &per_repo_label).map_err(anyhow::Error::msg)?;
+        }
         warn_if_per_repo_declares_profiles(per_repo.as_ref());
         let merged = Self::merge_sources(master, per_repo);
         let config = apply_profile(merged, profile).map_err(anyhow::Error::msg)?;
@@ -1892,13 +1962,24 @@ impl Config {
     /// unknown profile maps to `Err(reason)` so the caller can keep the
     /// previous config and warn instead of crashing.
     pub fn reload_for(&self, cwd: &std::path::Path) -> Result<Config, String> {
-        let master = load_yaml_config().map_err(|e| e.to_string())?.0;
+        let (master, master_path) = load_yaml_config().map_err(|e| e.to_string())?;
         // Same master-universe gate as `Config::load`: the active profile's
         // `pipelines:` filter may only name pipelines master declares.
         if let Some(master) = &master {
             validate_active_profile_filters(master, self.active_profile.as_deref())?;
+            // The static-prompt slot: a single file cannot claim both halves.
+            // Runs per source file, before `merge_sources`.
+            let master_label = master_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "master config".to_string());
+            validate_prompt_slot(master, &master_label)?;
         }
         let per_repo = load_per_repo_config(cwd);
+        if let Some(per_repo) = &per_repo {
+            let per_repo_label = cwd.join(".peakbot/config.yaml").display().to_string();
+            validate_prompt_slot(per_repo, &per_repo_label)?;
+        }
         warn_if_per_repo_declares_profiles(per_repo.as_ref());
         apply_profile(
             Self::merge_sources(master, per_repo),
@@ -1938,6 +2019,19 @@ impl Config {
         self.tools
             .validate_names("tools", "tool", BUILTIN_TOOL_NAMES)?;
         self.timeouts.validate()?;
+        // A blank `system_prompt` is a config error: unlike `persona`, there is
+        // no sensible "empty full prompt" — the built-in head is the only
+        // fallback. Trim only to test emptiness; never mutate the stored string.
+        if self
+            .system_prompt
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            return Err(
+                "system_prompt: must not be blank — remove the key to use the built-in prompt."
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -1971,6 +2065,14 @@ fn apply_profile(mut cfg: Config, name: Option<&str>) -> Result<Config, String> 
     // `retain` keeps declaration order; `enabled: false` clears everything.
     if let Some(filter) = profile.pipelines {
         cfg.pipelines.retain(|p| filter.allows(&p.name));
+    }
+    // The static-prompt slot: the profile is the ceiling — its `system_prompt`
+    // takes the slot and clears any `persona` the master/per-repo merge
+    // resolved to, so a checked-out repo cannot swap the deployment's full
+    // prompt for its own persona.
+    if let Some(s) = profile.system_prompt {
+        cfg.system_prompt = Some(s);
+        cfg.persona = None;
     }
     cfg.active_profile = Some(name.to_string());
     Ok(cfg)
@@ -2011,6 +2113,21 @@ fn validate_active_profile_filters(master: &Config, profile: Option<&str>) -> Re
         return Ok(());
     }
     filter.validate_names(&label, "pipeline", &known)
+}
+
+/// Reject a config file that claims both halves of the static-prompt slot:
+/// `persona:` and `system_prompt:` fill ONE slot, so a single file cannot set
+/// both. Runs per source file, BEFORE [`Config::merge_sources`] — after the
+/// merge the slot rule has already cleared the sibling, so the conflict is no
+/// longer visible in the merged config. One helper shared by [`Config::load`]
+/// and [`Config::reload_for`] so the two paths cannot drift.
+fn validate_prompt_slot(cfg: &Config, source: &str) -> Result<(), String> {
+    if cfg.persona.is_some() && cfg.system_prompt.is_some() {
+        return Err(format!(
+            "{source}: `persona:` and `system_prompt:` fill the same slot — set one, not both."
+        ));
+    }
+    Ok(())
 }
 
 /// Master-only profiles (§1.5): a `profiles:` block in a per-repo config is
@@ -4300,6 +4417,7 @@ max_image_bytes: 10485760
                     }),
                     memory: None,
                     pipelines: None,
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4352,6 +4470,7 @@ max_image_bytes: 10485760
                         threshold_bytes: 2000,
                     }),
                     pipelines: None,
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4400,6 +4519,7 @@ max_image_bytes: 10485760
                         tools: None,
                         memory: None,
                         pipelines: None,
+                        system_prompt: None,
                     },
                 ),
                 (
@@ -4408,6 +4528,7 @@ max_image_bytes: 10485760
                         tools: None,
                         memory: None,
                         pipelines: None,
+                        system_prompt: None,
                     },
                 ),
             ]),
@@ -4439,6 +4560,7 @@ max_image_bytes: 10485760
                     tools: None,
                     memory: None,
                     pipelines: None,
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4450,6 +4572,7 @@ max_image_bytes: 10485760
                     tools: None,
                     memory: None,
                     pipelines: None,
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4523,6 +4646,7 @@ max_image_bytes: 10485760
                     }),
                     memory: None,
                     pipelines: None,
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4593,6 +4717,7 @@ max_image_bytes: 10485760
                     }),
                     memory: None,
                     pipelines: None,
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4726,6 +4851,7 @@ max_image_bytes: 10485760
                         only: vec![],
                         ..Default::default()
                     }),
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4760,6 +4886,7 @@ max_image_bytes: 10485760
                     }),
                     memory: None,
                     pipelines: None,
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4798,6 +4925,7 @@ max_image_bytes: 10485760
             tools: None,
             memory: None,
             pipelines: None,
+            system_prompt: None,
         };
         assert_eq!(
             none.overridden_fields(),
@@ -4809,6 +4937,7 @@ max_image_bytes: 10485760
             tools: Some(NameFilter::default()),
             memory: Some(MemoryConfig::default()),
             pipelines: Some(NameFilter::default()),
+            system_prompt: None,
         };
         assert_eq!(
             all.overridden_fields(),
@@ -4820,11 +4949,36 @@ max_image_bytes: 10485760
             tools: None,
             memory: None,
             pipelines: Some(NameFilter::default()),
+            system_prompt: None,
         };
         assert_eq!(
             pipes.overridden_fields(),
             vec!["pipelines"],
             "only `pipelines` set ⇒ just that key"
+        );
+        // (d) all four set ⇒ the full declaration order, `system_prompt` last.
+        let all_four = Profile {
+            tools: Some(NameFilter::default()),
+            memory: Some(MemoryConfig::default()),
+            pipelines: Some(NameFilter::default()),
+            system_prompt: Some("FULL".to_string()),
+        };
+        assert_eq!(
+            all_four.overridden_fields(),
+            vec!["tools", "memory", "pipelines", "system_prompt"],
+            "all four set ⇒ declaration order, `system_prompt` last"
+        );
+        // (e) only system_prompt ⇒ just ["system_prompt"].
+        let prompt_only = Profile {
+            tools: None,
+            memory: None,
+            pipelines: None,
+            system_prompt: Some("FULL".to_string()),
+        };
+        assert_eq!(
+            prompt_only.overridden_fields(),
+            vec!["system_prompt"],
+            "only `system_prompt` set ⇒ just that key"
         );
     }
 
@@ -4850,6 +5004,7 @@ max_image_bytes: 10485760
                         only: vec!["a".into()],
                         ..Default::default()
                     }),
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4869,6 +5024,408 @@ max_image_bytes: 10485760
             vec!["a", "b"],
             "no profile ⇒ the declared top-level pipelines are untouched"
         );
+    }
+
+    // =========================================================================
+    // PR 2 — the static-prompt slot (RED).
+    //
+    // `persona:` and `system_prompt:` fill ONE slot: whichever key a source
+    // sets takes the slot and CLEARS its sibling, so the more specific
+    // source owns the whole slot (per-repo `persona` beats master
+    // `system_prompt`, and vice versa). A profile is applied LAST, so its
+    // `system_prompt` is the ceiling over everything a per-repo config set.
+    // Both keys in the SAME file, or a blank `system_prompt`, are config
+    // errors.
+    //
+    // RED until `merge_with` learns the slot rule, `apply_profile` applies
+    // `Profile.system_prompt` (clearing `persona`), and `Config::validate`
+    // rejects blank/both-set. The last two tests are GREEN: they pin the
+    // already-implemented `prompt_head` accessor and the
+    // `overridden_fields` order.
+    // =========================================================================
+
+    /// Master sets `system_prompt`, per-repo sets `persona`: the per-repo
+    /// source owns the whole slot — the effective config carries the
+    /// persona and the master's full prompt is cleared. (RED — `merge_with`
+    /// still merges `persona` only and never touches `system_prompt`, so
+    /// the master's full prompt survives the merge.)
+    #[test]
+    fn master_system_prompt_yields_slot_to_per_repo_persona() {
+        let master = Config {
+            system_prompt: Some("FULL-MASTER".to_string()),
+            ..Config::default()
+        };
+        let repo = Config {
+            persona: Some("REPO-PERSONA".to_string()),
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        assert_eq!(
+            merged.persona.as_deref(),
+            Some("REPO-PERSONA"),
+            "per-repo `persona` must win the slot over the master `system_prompt`"
+        );
+        assert_eq!(
+            merged.system_prompt, None,
+            "the per-repo `persona` must CLEAR the master `system_prompt` (one slot)"
+        );
+    }
+
+    /// Mirror image: master sets `persona`, per-repo sets `system_prompt` —
+    /// the per-repo full prompt takes the slot and clears the master
+    /// persona. (RED — `merge_with` never reads `other.system_prompt`, so
+    /// the per-repo override is dropped and the master persona survives.)
+    #[test]
+    fn per_repo_system_prompt_takes_slot_from_master_persona() {
+        let master = Config {
+            persona: Some("MASTER-PERSONA".to_string()),
+            ..Config::default()
+        };
+        let repo = Config {
+            system_prompt: Some("FULL-REPO".to_string()),
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        assert_eq!(
+            merged.system_prompt.as_deref(),
+            Some("FULL-REPO"),
+            "per-repo `system_prompt` must win the slot over the master `persona`"
+        );
+        assert_eq!(
+            merged.persona, None,
+            "the per-repo `system_prompt` must CLEAR the master `persona` (one slot)"
+        );
+    }
+
+    /// The profile is the ceiling: a profile's `system_prompt` beats a
+    /// per-repo `persona` and clears it — profiles are applied AFTER the
+    /// master+per-repo merge, so they win over every file-level source.
+    /// (RED — `apply_profile` does not yet apply `Profile.system_prompt`,
+    /// so the per-repo persona survives.)
+    #[test]
+    fn profile_system_prompt_is_a_ceiling_over_per_repo_persona() {
+        let master = Config {
+            profiles: HashMap::from([(
+                "locked".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: None,
+                    system_prompt: Some("FULL-PROFILE".to_string()),
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            persona: Some("REPO-PERSONA".to_string()),
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        // Precondition: without the profile, the per-repo persona is in the slot.
+        assert_eq!(
+            merged.persona.as_deref(),
+            Some("REPO-PERSONA"),
+            "per-repo `persona` must be in the slot before the profile is applied"
+        );
+        let effective = apply_profile(merged, Some("locked")).expect("profile exists");
+        assert_eq!(
+            effective.system_prompt.as_deref(),
+            Some("FULL-PROFILE"),
+            "the profile `system_prompt` must take the slot (the ceiling)"
+        );
+        assert_eq!(
+            effective.persona, None,
+            "the profile `system_prompt` must CLEAR the per-repo `persona`"
+        );
+    }
+
+    /// §1.7 security pin, prompt-slot edition: a profile that sets
+    /// `system_prompt` must survive a reload even when the per-repo config
+    /// in the (new) cwd sets `persona`. The profile is the operator's
+    /// deployment ceiling — a checked-out repo must not be able to swap the
+    /// deployment's full prompt for its own persona.
+    ///
+    /// The master carries the prompt ONLY via the profile (no top-level
+    /// `system_prompt:`), so the merged config carries the per-repo persona
+    /// and the profile re-application is what the pin actually exercises:
+    /// if `reload_for` forgot to re-apply the profile, the persona would
+    /// come back and this fails. (RED — `apply_profile` does not yet apply
+    /// `Profile.system_prompt`.)
+    #[test]
+    fn profile_system_prompt_survives_hostile_reload() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the (currently RED) assertions so a panic here can
+        // never poison `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let reloaded = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            // Point the master config at a tempdir. On Linux `ProjectDirs`
+            // honors XDG_CONFIG_HOME; save/restore so the test leaves no
+            // global state.
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            // Master config: the "locked" profile owns the prompt slot.
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "profiles:\n  locked:\n    system_prompt: FULL-PROFILE\n",
+            )
+            .expect("write master config");
+
+            // Hostile per-repo config in the reload target dir: its own persona.
+            let per_repo_dir = repo_tmp.path().join(".peakbot");
+            std::fs::create_dir_all(&per_repo_dir).expect("mkdir .peakbot");
+            std::fs::write(per_repo_dir.join("config.yaml"), "persona: REPO-PERSONA\n")
+                .expect("write per-repo");
+
+            // The live config, as boot with `--profile locked` would have produced it.
+            let live = Config {
+                active_profile: Some("locked".to_string()),
+                profiles: HashMap::from([(
+                    "locked".to_string(),
+                    Profile {
+                        tools: None,
+                        memory: None,
+                        pipelines: None,
+                        system_prompt: Some("FULL-PROFILE".to_string()),
+                    },
+                )]),
+                ..Config::default()
+            };
+
+            let reloaded = live
+                .reload_for(repo_tmp.path())
+                .expect("reload must succeed");
+
+            // Restore the env var BEFORE dropping the guard (panic-safety).
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            reloaded
+        };
+
+        assert_eq!(
+            reloaded.system_prompt.as_deref(),
+            Some("FULL-PROFILE"),
+            "the profile `system_prompt` must STILL own the slot after a hostile reload"
+        );
+        assert_eq!(
+            reloaded.persona, None,
+            "the hostile per-repo `persona` must be cleared by the profile after reload"
+        );
+    }
+
+    /// A blank (empty or whitespace-only) `system_prompt` is a config error
+    /// naming the key — unlike `persona`, there is no sensible "empty full
+    /// prompt": the built-in head is the only fallback. Driven through
+    /// `Config::validate`, the consolidated boundary parse `Config::load`
+    /// runs. (RED — `validate` does not yet check `system_prompt`.)
+    #[test]
+    fn blank_system_prompt_is_a_config_error() {
+        for blank in ["", "   ", "\t\n \n"] {
+            let cfg = Config {
+                system_prompt: Some(blank.to_string()),
+                ..Config::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err("blank system_prompt must be rejected");
+            assert!(
+                err.contains("system_prompt"),
+                "error must name the offending key, got: {err}"
+            );
+        }
+        // Whitespace PADDING around real content is legal — trim, don't reject.
+        let cfg = Config {
+            system_prompt: Some("  real prompt  ".to_string()),
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "a whitespace-padded real prompt must pass validation"
+        );
+    }
+
+    /// Both `persona:` and `system_prompt:` in the MASTER file ⇒ boot error
+    /// naming both keys — they fill one slot, so a single file cannot claim
+    /// both. Driven end-to-end through `Config::load`, the real boot seam.
+    /// (RED — `Config::validate` does not yet reject the pair.)
+    #[test]
+    fn persona_and_system_prompt_in_one_file_is_a_config_error() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the (currently RED) assertions so a panic here can
+        // never poison `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let result = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "persona: MASTER-PERSONA\nsystem_prompt: FULL-MASTER\n",
+            )
+            .expect("write master config");
+
+            let result = Config::load(None);
+
+            // Restore the env var BEFORE dropping the guard (panic-safety).
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            result
+        };
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("both keys in the master file must be a config error"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("persona"),
+            "the error must name `persona`, got: {msg}"
+        );
+        assert!(
+            msg.contains("system_prompt"),
+            "the error must name `system_prompt`, got: {msg}"
+        );
+    }
+
+    /// Same rule for the PER-REPO file: both keys in
+    /// `.peakbot/config.yaml` ⇒ config error naming both — they fill one
+    /// slot, so a single file cannot claim both. The post-merge config can
+    /// never show this: `merge_with` resolves the slot DURING the merge
+    /// (per-repo `system_prompt` wins and clears `persona`), so the rule is
+    /// enforced per source file, BEFORE `merge_sources`, by
+    /// `validate_prompt_slot`. Driven end-to-end through
+    /// `Config::reload_for(cwd)` — the live-session seam — which runs that
+    /// check on the per-repo file before merging; `cwd` is an explicit
+    /// argument, so the fixture needs no process-cwd mutation.
+    /// (GREEN — `validate_prompt_slot` and its `reload_for` call site are
+    /// implemented; this pins the wiring, not missing code.)
+    #[test]
+    fn persona_and_system_prompt_in_per_repo_file_is_a_config_error() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+        let per_repo_path = repo_tmp.path().join(".peakbot/config.yaml");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the assertions so a panic here can never poison
+        // `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let result = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            // Point the master config at an EMPTY tempdir (no master file)
+            // so the per-repo file is the only source in play and the test
+            // is independent of whatever config the host actually has.
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            // The offending per-repo config: both halves of the slot.
+            std::fs::create_dir_all(per_repo_path.parent().expect("parent dir"))
+                .expect("mkdir .peakbot");
+            std::fs::write(
+                &per_repo_path,
+                "persona: REPO-PERSONA\nsystem_prompt: FULL-REPO\n",
+            )
+            .expect("write per-repo");
+
+            // No active profile: the slot error must fire on the per-repo
+            // file regardless of profile state.
+            let live = Config::default();
+            let result = live.reload_for(repo_tmp.path());
+
+            // Restore the env var BEFORE dropping the guard (panic-safety).
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            result
+        };
+
+        let msg = match result {
+            Err(e) => e,
+            Ok(_) => panic!("both keys in the per-repo file must be a config error"),
+        };
+        assert!(
+            msg.contains("persona"),
+            "the error must name `persona`, got: {msg}"
+        );
+        assert!(
+            msg.contains("system_prompt"),
+            "the error must name `system_prompt`, got: {msg}"
+        );
+        // The label must be the PER-REPO file's full path — that is what
+        // proves the right source was blamed, not the master config.
+        assert!(
+            msg.contains(per_repo_path.to_str().expect("utf-8 path")),
+            "the error must point at the per-repo file, got: {msg}"
+        );
+        assert!(
+            !msg.contains(master_tmp.path().to_str().expect("utf-8 path")),
+            "the error must NOT point at the master config dir, got: {msg}"
+        );
+    }
+
+    /// The slot accessor: `system_prompt` wins over `persona`, blank is
+    /// treated as absent, `None` = the built-in head. (GREEN —
+    /// `prompt_head` is already implemented; this pins the accessor, not
+    /// missing code.)
+    #[test]
+    fn prompt_head_prefers_full_over_persona_and_treats_blank_as_absent() {
+        let rows: [(Option<&str>, Option<&str>, Option<PromptHead>); 6] = [
+            (
+                Some("Persona here"),
+                None,
+                Some(PromptHead::Persona("Persona here".to_string())),
+            ),
+            (
+                None,
+                Some("Full prompt"),
+                Some(PromptHead::Full("Full prompt".to_string())),
+            ),
+            (
+                Some("Persona here"),
+                Some("Full prompt"),
+                Some(PromptHead::Full("Full prompt".to_string())),
+            ),
+            (Some("   "), None, None),
+            (
+                Some("Persona here"),
+                Some(" \t\n "),
+                Some(PromptHead::Persona("Persona here".to_string())),
+            ),
+            (None, None, None),
+        ];
+        for (persona, system_prompt, expected) in rows {
+            let cfg = Config {
+                persona: persona.map(str::to_string),
+                system_prompt: system_prompt.map(str::to_string),
+                ..Config::default()
+            };
+            assert_eq!(
+                cfg.prompt_head(),
+                expected,
+                "persona={persona:?} system_prompt={system_prompt:?}"
+            );
+        }
     }
 
     // =========================================================================
@@ -4905,6 +5462,7 @@ max_image_bytes: 10485760
                         enabled: false,
                         ..Default::default()
                     }),
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4939,6 +5497,7 @@ max_image_bytes: 10485760
                         disabled: vec![],
                         only: vec![],
                     }),
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -4973,6 +5532,7 @@ max_image_bytes: 10485760
                         only: vec![],
                         ..Default::default()
                     }),
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -5036,6 +5596,7 @@ max_image_bytes: 10485760
                         only: vec!["a".into()],
                         ..Default::default()
                     }),
+                    system_prompt: None,
                 },
             )]),
             ..Config::default()
@@ -5132,6 +5693,7 @@ max_image_bytes: 10485760
                             enabled: false,
                             ..Default::default()
                         }),
+                        system_prompt: None,
                     },
                 )]),
                 ..Config::default()
@@ -5417,6 +5979,7 @@ profiles:
                         tools: None,
                         memory: None,
                         pipelines: Some(filter.clone()),
+                        system_prompt: None,
                     },
                 )]),
                 ..Config::default()
