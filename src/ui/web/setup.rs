@@ -18,7 +18,7 @@
 //! the token layer, so every `/api/setup/*` route is gated by the same
 //! `require_token` as `/ws` and `/commands`.
 
-use crate::config::{Config, save_config_at};
+use crate::config::{BUILTIN_TOOL_NAMES, Config, save_config_at};
 use crate::pipeline::PipelineSet;
 use axum::{
     Router,
@@ -732,7 +732,10 @@ async fn post_config(State(state): State<Arc<SetupState>>, req: Request<Body>) -
 
     // Step 2 — tools filter XOR (blocklist vs allowlist) and the
     // known-tool-name check.
-    if let Err(e) = cfg.tools.validate() {
+    if let Err(e) = cfg.tools.validate_shape("tools").and_then(|()| {
+        cfg.tools
+            .validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
+    }) {
         problems.push(e);
     }
 

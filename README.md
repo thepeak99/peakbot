@@ -86,6 +86,59 @@ Or set the provider via environment variable:
 export PROVIDER='{"type":"openrouter","api_key":"sk-or-v1-xxx","model":"anthropic/claude-3.7-sonnet"}'
 ```
 
+### Profiles
+
+A **profile** is a named config overlay declared in the master config's
+`profiles:` map and selected at boot with `--profile <name>`. It is applied
+**last** — after the per-repo `.peakbot/config.yaml` merge — and re-applied on
+every session-verb reload (`/cd`, `/new`, `/model`, `/load`), so it is a
+ceiling a checked-out repo cannot void. Profiles are master-config only; a
+`profiles:` block in a per-repo config is ignored with a boot warning.
+
+A profile can override three keys: `tools:`, `memory:`, and `pipelines:` —
+each using the shared filter documented in
+[Tool, Skill & Pipeline Filters](#tool-skill--pipeline-filters).
+
+```yaml
+profiles:
+  locked:
+    tools:
+      disabled: [bash]
+    pipelines:
+      enabled: false
+```
+
+The `pipelines:` gate names pipelines from the **master config's** `pipelines:`
+list — a gate can only name teams the master declares, and an unknown name is a
+boot error listing the known ones. The gate caps the *effective* list, so a
+per-repo config's own pipelines are still capped, and `enabled: false` blocks
+every team regardless of where it was declared. If the gate leaves you with no
+pipelines, PeakBot runs single-agent; a conversation whose selected pipeline
+was gated away continues without one. Invalid filters are fatal at boot (on a
+session-verb reload PeakBot warns and keeps the previous config). When a
+profile is active, boot prints one line to stderr:
+
+```
+ℹ profile 'web' active — overrides: tools, memory, pipelines.
+```
+
+### Tool, Skill & Pipeline Filters
+
+`tools:` in the config, a role's `skills:`, and a profile's `pipelines:` all
+share one filter with one meaning:
+
+- `only:` — allowlist. Only the named entries survive.
+- `disabled:` — blocklist. The named entries are removed.
+- Setting both `only:` and `disabled:` is a config error.
+- An empty list, or no filter at all, means **no filtering** — everything is
+  allowed. An empty `only:` never means "none"; use `enabled: false` for that.
+- `enabled: false` means **nothing is allowed** — the way to say "no built-in
+  tools" or "single-agent only, no pipelines".
+
+`tools:` newly accepts `enabled:` (it previously had no way to say "no tools"
+short of listing every tool in `disabled:`). Existing `tools:` and `skills:`
+configs behave exactly as before.
+
 ### Run
 
 ```bash

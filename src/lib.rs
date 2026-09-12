@@ -615,7 +615,7 @@ pub struct RebuildContext {
     pub memory_enabled: bool,
     /// Built-in tool filter (blocklist/allowlist). Refreshed on config reload;
     /// consumed by `add_builtin_tools` when the agent is rebuilt.
-    pub tools_filter: crate::config::ToolsConfig,
+    pub tools_filter: crate::config::NameFilter,
     /// The configured persona (from `persona:`). Replaces the built-in persona
     /// at the head of the agentless recipe. A selected pipeline's
     /// `orchestrator.persona` overrides it for that team (amendment 1).
@@ -4955,7 +4955,7 @@ mod tests {
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
+            tools_filter: crate::config::NameFilter::default(),
             persona: None,
         }
     }
@@ -7033,7 +7033,7 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
+            tools_filter: crate::config::NameFilter::default(),
             persona: None,
         };
 
@@ -7093,7 +7093,7 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
+            tools_filter: crate::config::NameFilter::default(),
             persona: None,
         };
 
@@ -7137,7 +7137,7 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
+            tools_filter: crate::config::NameFilter::default(),
             persona: None,
         };
 
@@ -7294,7 +7294,7 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
+            tools_filter: crate::config::NameFilter::default(),
             persona: None,
         };
 

@@ -231,7 +231,7 @@ pub fn create_provider(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tools_filter: &crate::config::ToolsConfig,
+    tools_filter: &crate::config::NameFilter,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
@@ -482,7 +482,7 @@ fn add_builtin_tools<M, P>(
     searxng_config: Option<&SearXngConfig>,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tools_filter: &crate::config::ToolsConfig,
+    tools_filter: &crate::config::NameFilter,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Option<Arc<StateManager>>,
     shell_kind: Option<&ShellKind>,
@@ -718,7 +718,7 @@ fn create_openrouter_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tools_filter: &crate::config::ToolsConfig,
+    tools_filter: &crate::config::NameFilter,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
@@ -839,7 +839,7 @@ fn create_anthropic_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tools_filter: &crate::config::ToolsConfig,
+    tools_filter: &crate::config::NameFilter,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
@@ -958,7 +958,7 @@ fn create_ollama_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tools_filter: &crate::config::ToolsConfig,
+    tools_filter: &crate::config::NameFilter,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
@@ -1055,7 +1055,7 @@ fn create_openai_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tools_filter: &crate::config::ToolsConfig,
+    tools_filter: &crate::config::NameFilter,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
@@ -1160,7 +1160,7 @@ fn create_llamacpp_agent(
     max_turns: usize,
     todo_tool: Option<TodoTool>,
     bash_config: &BashConfig,
-    tools_filter: &crate::config::ToolsConfig,
+    tools_filter: &crate::config::NameFilter,
     pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
@@ -1365,7 +1365,7 @@ pub(crate) fn build_sub_agent(
     searxng_config: Option<&SearXngConfig>,
     max_turns: usize,
     bash_config: &BashConfig,
-    tools_filter: &crate::config::ToolsConfig,
+    tools_filter: &crate::config::NameFilter,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
     vector_store: Option<&crate::vector::VectorStore>,
@@ -2047,5 +2047,98 @@ mod tests {
 
         // Provider overrules on → true.
         assert!(resolve_display_reasoning(Some(false), Some(true)));
+    }
+
+    // ── the consistency pin, tools surface ─────────────────────────────────
+    //
+    // Companion to `config::tests::name_filter_semantics_are_identical_for_
+    // tools_skills_and_pipelines`. The tools surface consumes `NameFilter`
+    // through `add_builtin_tools`'s single filter seam:
+    // `tools.retain(|t| tools_filter.allows(&t.name()))`. That function is
+    // private to this module, so the pin's per-seam proof lives here: the
+    // REAL `add_builtin_tools` is driven with the mock model (no network)
+    // and the surviving tool set is read back through rig's
+    // `ToolServerHandle::get_tool_defs`. The full 8-row table is pinned on
+    // the shared predicate in the config module; here we prove the
+    // master-switch short-circuit, the allowlist, and the blocklist each
+    // reach the real seam.
+
+    /// Drive the real `add_builtin_tools` filter seam with `filter` and
+    /// return the wire names of the tools that survive, in registration
+    /// order. No shell (`shell_kind: None`), no optional extras — the
+    /// built-in core set only.
+    #[cfg(feature = "mock")]
+    async fn builtin_tool_names_under(filter: &crate::config::NameFilter) -> Vec<String> {
+        let model = MockCompletionModel::new();
+        let agent = add_builtin_tools(
+            AgentBuilder::new(model),
+            None, // searxng
+            None, // todo
+            &BashConfig::default(),
+            filter,
+            None,  // pipeline registry
+            None,  // state manager
+            None,  // shell kind
+            None,  // vector store
+            None,  // view_image
+            false, // wire bash panel
+            None,  // sub-agent wiring
+            &TimeoutsConfig::default(),
+        )
+        .build();
+        let defs = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("tool defs");
+        defs.into_iter().map(|d| d.name).collect()
+    }
+
+    /// The tools seam honours the locked `NameFilter` semantics:
+    /// `enabled: false` drops EVERY built-in tool (the master-switch
+    /// short-circuit reaches the real seam); `only` is an allowlist;
+    /// `disabled` is a blocklist.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn tools_seam_honours_name_filter_enabled_only_and_disabled() {
+        // Master switch: `enabled: false` ⇒ NOTHING survives.
+        let off = crate::config::NameFilter {
+            enabled: false,
+            ..Default::default()
+        };
+        let names = builtin_tool_names_under(&off).await;
+        assert!(
+            names.is_empty(),
+            "enabled: false must drop every built-in tool; got {names:?}"
+        );
+
+        // Allowlist: exactly the named tool survives.
+        let only_think = crate::config::NameFilter {
+            disabled: vec![],
+            only: vec!["think".into()],
+            ..Default::default()
+        };
+        let names = builtin_tool_names_under(&only_think).await;
+        assert_eq!(
+            names,
+            vec!["think".to_string()],
+            "only: [think] must leave exactly think"
+        );
+
+        // Blocklist: everything but the named tool survives.
+        let no_think = crate::config::NameFilter {
+            disabled: vec!["think".into()],
+            only: vec![],
+            ..Default::default()
+        };
+        let names = builtin_tool_names_under(&no_think).await;
+        assert!(
+            !names.contains(&"think".to_string()),
+            "disabled: [think] must drop think; got {names:?}"
+        );
+        assert!(
+            names.contains(&"file_read".to_string()) && names.contains(&"bash_bg".to_string()),
+            "disabled: [think] must keep the rest of the built-ins; got {names:?}"
+        );
     }
 }
