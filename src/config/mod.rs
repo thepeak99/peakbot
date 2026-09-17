@@ -302,11 +302,18 @@ pub struct Config {
 
     /// Replaces the built-in persona (`src/system_prompt_persona.txt`) at the
     /// head of the agentless system prompt. Absent or whitespace-only =
-    /// built-in. Not used in orchestrator mode (see
-    /// `pipeline.orchestrator_prompt`) and never applied to sub-agents (a
-    /// role's `prompt:` is its whole persona).
+    /// built-in. In orchestrator mode it still leads the orchestrator's
+    /// recipe unless the pipeline sets its own `orchestrator.persona:`;
+    /// never applied to sub-agents (a role's `prompt:` is its whole persona).
     #[serde(default)]
     pub persona: Option<String>,
+
+    /// The ENTIRE static system prompt: replaces both the persona piece and the
+    /// built-in core tool guidance. For deployments whose toolset makes the
+    /// built-in coaching wrong (research-only, web-only). Mutually exclusive
+    /// with `persona:` — they fill the same slot. Absent = built-in prompt.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 
     /// DEPRECATED: Use provider.config.model instead
     /// Maximum tool turns per message
@@ -358,7 +365,7 @@ pub struct Config {
     /// Built-in tool filter (blocklist `disabled:` XOR allowlist `only:`).
     /// Absent block = every tool available.
     #[serde(default)]
-    pub tools: ToolsConfig,
+    pub tools: NameFilter,
 
     /// Outbound HTTP timeouts. Boot-only — read once when the process starts.
     #[serde(default)]
@@ -368,6 +375,63 @@ pub struct Config {
     /// a reload takes effect on the next tool.
     #[serde(default)]
     pub timeouts: TimeoutsConfig,
+
+    /// Named profiles. Read from the MASTER config only; a `profiles:` block in
+    /// a per-repo `.peakbot/config.yaml` is ignored (with a boot warning) — a
+    /// checked-out repo must not be able to redefine the deployment's
+    /// guarantees.
+    #[serde(default)]
+    pub profiles: HashMap<String, Profile>,
+
+    /// The profile applied to THIS config, if any. Never deserialized — set
+    /// only by `apply_profile`, so `Some(name)` always names a profile that
+    /// exists and has already been applied. Carried so `reload_for` can
+    /// re-apply it.
+    #[serde(skip)]
+    pub active_profile: Option<String>,
+}
+
+/// A named overlay over the effective config. Every field is optional:
+/// `None` = "leave the resolved value alone". Selected once, at boot, with
+/// `--profile <name>`; applied AFTER master+per-repo merge so it always wins.
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    /// Replaces `tools:` wholesale (blocklist XOR allowlist, validated as usual).
+    #[serde(default)]
+    pub tools: Option<NameFilter>,
+    /// Replaces `memory:` wholesale.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
+    /// Narrows the effective `pipelines:` list (blocklist XOR allowlist).
+    /// `None` = every declared pipeline, i.e. today's behaviour.
+    #[serde(default)]
+    pub pipelines: Option<NameFilter>,
+    /// Takes the static-prompt slot for this profile: sets `system_prompt` and
+    /// clears any `persona` the master/per-repo merge resolved to.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+}
+
+impl Profile {
+    /// The config keys this profile overrides, in declaration order. One source of
+    /// truth for the boot banner that tells the operator what a profile changed.
+    pub fn overridden_fields(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.tools.is_some() {
+            out.push("tools");
+        }
+        if self.memory.is_some() {
+            out.push("memory");
+        }
+        if self.pipelines.is_some() {
+            out.push("pipelines");
+        }
+        if self.system_prompt.is_some() {
+            out.push("system_prompt");
+        }
+        out
+    }
 }
 
 /// Outbound HTTP timeouts, applied to every client PeakBot builds (LLM calls,
@@ -542,7 +606,7 @@ pub struct AgentDefinition {
 
     /// Which skills this role's sub-agent sees in its prompt. Default: all.
     #[serde(default)]
-    pub skills: SkillFilter,
+    pub skills: NameFilter,
 
     /// Inject the repo's `agents.md` into this role's preamble. Default: off
     /// (sub-agents get a lean, task-scoped preamble unless a role opts in).
@@ -784,6 +848,31 @@ impl Config {
             .filter(|s| !s.is_empty())
     }
 
+    /// The static-prompt slot: `system_prompt` wins over `persona`, blank is
+    /// treated as absent. `None` = the built-in head.
+    ///
+    /// Returns an *owned* head so it can be stored in `RebuildContext`
+    /// without a lifetime — that is what keeps "exactly one head" a type
+    /// invariant all the way to prompt assembly, instead of decaying into two
+    /// parallel `Option<String>` fields. Prompt assembly only happens on agent
+    /// rebuild, so the clone is irrelevant.
+    pub fn prompt_head(&self) -> Option<PromptHead> {
+        let full = self
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(s) = full {
+            return Some(PromptHead::Full(s.to_string()));
+        }
+        let persona = self
+            .persona
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        persona.map(|s| PromptHead::Persona(s.to_string()))
+    }
+
     /// Build a [`ModelRegistry`] from the loaded config.
     ///
     /// Two paths:
@@ -870,6 +959,16 @@ impl Config {
         self.provider = resolved.clone();
         resolved
     }
+}
+
+/// What fills the static head of the system prompt. Exactly one variant can
+/// apply, which is why this is an enum and not two `Option`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptHead {
+    /// Replaces the built-in persona; the core tool guidance still follows.
+    Persona(String),
+    /// Replaces the persona AND the core guidance.
+    Full(String),
 }
 
 /// Describe the legacy `provider:` block in a tuple shape that the
@@ -1395,75 +1494,26 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "web_search",
 ];
 
-/// Built-in tool filter. `disabled` is a blocklist (those are removed, the
-/// rest stay); `only` is an allowlist (only those stay). The two are mutually
-/// exclusive — setting both is a config error. Both empty = every tool stays.
-#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ToolsConfig {
-    /// Blocklist: these tools are removed; every other tool stays.
-    #[serde(default)]
-    pub disabled: Vec<String>,
-    /// Allowlist: only these tools stay; every other tool is removed.
-    #[serde(default)]
-    pub only: Vec<String>,
-}
-
-impl ToolsConfig {
-    /// Boundary parse: reject the illegal `disabled`+`only` combination and
-    /// any name that isn't a real tool (typo catch). Returns a user-facing
-    /// message on failure.
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.disabled.is_empty() && !self.only.is_empty() {
-            return Err(
-                "tools: set either `disabled` (blocklist) or `only` (allowlist), not both."
-                    .to_string(),
-            );
-        }
-        for name in self.disabled.iter().chain(self.only.iter()) {
-            if !BUILTIN_TOOL_NAMES.contains(&name.as_str()) {
-                return Err(format!(
-                    "tools: unknown tool '{name}'. Known tools: {}.",
-                    BUILTIN_TOOL_NAMES.join(", ")
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether a built-in tool of this name should be registered. Allowlist
-    /// wins when present, then blocklist; empty filter allows everything.
-    pub fn allows(&self, name: &str) -> bool {
-        if !self.only.is_empty() {
-            self.only.iter().any(|n| n == name)
-        } else {
-            !self.disabled.iter().any(|n| n == name)
-        }
-    }
-}
-
-/// Per-role skill filter (which skills a sub-agent sees in its prompt).
-///
-/// Mirrors [`ToolsConfig`] — `only` (allowlist) XOR `disabled` (blocklist),
-/// both empty means "all skills" — plus an `enabled` short-circuit so a
-/// focused role can be given no skills at all. Skill names are validated
-/// against the discovered skill set in a second boundary pass (after skill
-/// discovery), not here, since the names aren't known at config-parse time.
+/// One name filter for all three call sites (`tools:`, a role's `skills:`, a
+/// profile's `pipelines:`). `enabled: false` allows nothing; a non-empty
+/// `only` is an allowlist; otherwise `disabled` is a blocklist; both lists
+/// empty (or absent) allows everything. Setting both lists is a config error.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct SkillFilter {
-    /// Master switch: `false` gives this role no skills, ignoring the lists.
+pub struct NameFilter {
+    /// Master switch: `false` allows nothing, ignoring the lists.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Blocklist: these skills are hidden; every other skill stays.
+    /// Blocklist: these names are removed; every other name stays.
     #[serde(default)]
     pub disabled: Vec<String>,
-    /// Allowlist: only these skills stay; every other skill is hidden.
+    /// Allowlist: only these names stay; every other name is removed.
     #[serde(default)]
     pub only: Vec<String>,
 }
 
-impl Default for SkillFilter {
+// Hand-rolled, NOT derived: a derived `Default` would yield `enabled: false` ("allow nothing"), silently disabling every tool/skill/pipeline in any `..Default::default()` struct-update literal.
+impl Default for NameFilter {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -1473,20 +1523,24 @@ impl Default for SkillFilter {
     }
 }
 
-impl SkillFilter {
-    /// Boundary parse: reject the illegal `disabled`+`only` combination and
-    /// any name not in `known` (typo catch). Called after skill discovery.
-    pub fn validate(&self, role: &str, known: &[String]) -> Result<(), String> {
+impl NameFilter {
+    /// Boundary parse: setting both lists is illegal.
+    pub fn validate_shape(&self, label: &str) -> Result<(), String> {
         if !self.disabled.is_empty() && !self.only.is_empty() {
             return Err(format!(
-                "pipeline.agents.{role}.skills: set either `disabled` (blocklist) or \
-                 `only` (allowlist), not both."
+                "{label}: set either `disabled` (blocklist) or `only` (allowlist), not both."
             ));
         }
+        Ok(())
+    }
+
+    /// Boundary parse: every name in `disabled`/`only` must be in `known`
+    /// (typo catch).
+    pub fn validate_names(&self, label: &str, noun: &str, known: &[&str]) -> Result<(), String> {
         for name in self.disabled.iter().chain(self.only.iter()) {
-            if !known.iter().any(|k| k == name) {
+            if !known.contains(&name.as_str()) {
                 return Err(format!(
-                    "pipeline.agents.{role}.skills: unknown skill '{name}'. Known skills: {}.",
+                    "{label}: unknown {noun} '{name}'. Known {noun}s: {}.",
                     known.join(", ")
                 ));
             }
@@ -1494,16 +1548,18 @@ impl SkillFilter {
         Ok(())
     }
 
-    /// Whether a skill of this name is shown to the role. `enabled: false`
-    /// short-circuits to none; then allowlist wins, then blocklist.
-    pub fn shows(&self, name: &str) -> bool {
+    /// Whether a name of this value survives the filter. `enabled: false`
+    /// short-circuits to none; then allowlist wins, then blocklist. Both
+    /// sides are trimmed to match `PipelineSet::build`'s name normalization.
+    pub fn allows(&self, name: &str) -> bool {
         if !self.enabled {
             return false;
         }
+        let name = name.trim();
         if !self.only.is_empty() {
-            self.only.iter().any(|n| n == name)
+            self.only.iter().any(|n| n.trim() == name)
         } else {
-            !self.disabled.iter().any(|n| n == name)
+            !self.disabled.iter().any(|n| n.trim() == name)
         }
     }
 }
@@ -1654,7 +1710,7 @@ impl Config {
         }
 
         // tools - override if other has a non-default filter
-        if other.tools != ToolsConfig::default() {
+        if other.tools != NameFilter::default() {
             self.tools = other.tools;
         }
 
@@ -1670,12 +1726,23 @@ impl Config {
             self.default_model = other.default_model;
         }
 
-        // persona - override if set (per-repo can replace the master persona).
-        // Whitespace-only values are kept here; `Config::persona()` collapses
-        // them to None at read time so "absent" stays a single representation.
-        if other.persona.is_some() {
+        // The static-prompt slot: whichever key the per-repo file sets takes the
+        // slot and clears its sibling, so the effective config never holds both.
+        // Whitespace-only values are kept here; `Config::persona()` /
+        // `Config::prompt_head()` collapse them to None at read time so
+        // "absent" stays a single representation.
+        if other.system_prompt.is_some() {
+            self.system_prompt = other.system_prompt;
+            self.persona = None;
+        } else if other.persona.is_some() {
             self.persona = other.persona;
+            self.system_prompt = None;
         }
+
+        // profiles — deliberately NOT adopted: profiles are master-only. A
+        // checked-out repo must not be able to redefine the deployment's
+        // guarantees; `Config::load` warns when a per-repo config declares a
+        // `profiles:` block.
     }
 }
 
@@ -1686,6 +1753,7 @@ impl Default for Config {
             providers: Vec::new(),
             default_model: None,
             persona: None,
+            system_prompt: None,
             agent_max_turns: default_max_turns(),
             mcp_servers: None,
             searxng: None,
@@ -1707,9 +1775,11 @@ impl Default for Config {
             pipelines: Vec::new(),
             vector_db: None,
             web: WebConfig::default(),
-            tools: ToolsConfig::default(),
+            tools: NameFilter::default(),
             http: HttpConfig::default(),
             timeouts: TimeoutsConfig::default(),
+            profiles: HashMap::new(),
+            active_profile: None,
         }
     }
 }
@@ -1817,21 +1887,62 @@ impl Config {
     /// 1. Defaults (lowest priority)
     /// 2. Master config (~/.config/peakbot/peakbot/config.yaml)
     /// 3. Per-repo config (.peakbot/config.yaml in cwd) - top-level key override
+    /// 4. `profile` overlay (from `--profile`, master config only — §1.4)
     ///
     /// Returns `LoadedConfig` with the loaded config and metadata about what was found.
-    pub fn load() -> anyhow::Result<LoadedConfig> {
+    pub fn load(profile: Option<&str>) -> anyhow::Result<LoadedConfig> {
         // A malformed master config is fatal — see `load_yaml_config`.
         let (master, config_file_path) = load_yaml_config()?;
         let config_file_found = master.is_some();
+        // Master-universe gate: the active profile's `pipelines:` filter may
+        // only name pipelines master itself declares. Runs at the
+        // master-load step, while master is still separate from the per-repo
+        // overlay — before `merge_sources`.
+        if let Some(master) = &master {
+            validate_active_profile_filters(master, profile).map_err(anyhow::Error::msg)?;
+            // The static-prompt slot: a single file cannot claim both halves.
+            // Runs per source file, before `merge_sources` — after the merge the
+            // slot rule has cleared the sibling, so the conflict is invisible.
+            let master_label = config_file_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "master config".to_string());
+            validate_prompt_slot(master, &master_label).map_err(anyhow::Error::msg)?;
+        }
         // The ONE legitimate process-cwd read: at boot it really is the
         // session cwd. Every post-boot path passes the dir explicitly.
-        let per_repo = std::env::current_dir()
-            .ok()
-            .and_then(|d| load_per_repo_config(&d));
-        let config = Self::merge_sources(master, per_repo);
+        let per_repo_dir = std::env::current_dir().ok();
+        let per_repo = per_repo_dir.as_ref().and_then(|d| load_per_repo_config(d));
+        if let Some(per_repo) = &per_repo {
+            let per_repo_label = per_repo_dir
+                .as_ref()
+                .map(|d| d.join(".peakbot/config.yaml").display().to_string())
+                .unwrap_or_else(|| ".peakbot/config.yaml".to_string());
+            validate_prompt_slot(per_repo, &per_repo_label).map_err(anyhow::Error::msg)?;
+        }
+        warn_if_per_repo_declares_profiles(per_repo.as_ref());
+        let merged = Self::merge_sources(master, per_repo);
+        let config = apply_profile(merged, profile).map_err(anyhow::Error::msg)?;
 
-        config.tools.validate().map_err(anyhow::Error::msg)?;
-        config.timeouts.validate().map_err(anyhow::Error::msg)?;
+        config.validate().map_err(anyhow::Error::msg)?;
+
+        // Boot banner: one stderr line, only when a profile is actually
+        // active, only after load+validate succeeded. `eprintln!` (not
+        // `tracing::info!`) so it is visible without `RUST_LOG`. Deliberately
+        // NOT in `apply_profile` — that runs on every reload.
+        if let Some(name) = &config.active_profile {
+            let fields = config
+                .profiles
+                .get(name)
+                .map(|p| p.overridden_fields())
+                .unwrap_or_default();
+            let fields = if fields.is_empty() {
+                "(nothing)".to_string()
+            } else {
+                fields.join(", ")
+            };
+            eprintln!("ℹ profile '{name}' active — overrides: {fields}.");
+        }
 
         Ok(LoadedConfig {
             config,
@@ -1840,16 +1951,40 @@ impl Config {
         })
     }
 
-    /// Re-read master + `<cwd>/.peakbot/config.yaml` for a live session.
-    /// Replaces `reload()` — `cwd` must be the directory the session WILL
-    /// be in after the calling verb completes (target for `/cd`, current
-    /// `session_cwd` for the other verbs). Same precedence as
-    /// [`Config::load`]; a malformed-master error maps to `Err(reason)`
-    /// so the caller can keep the previous config and warn instead of
-    /// crashing.
-    pub fn reload_for(cwd: &std::path::Path) -> Result<Config, String> {
-        let master = load_yaml_config().map_err(|e| e.to_string())?.0;
-        Ok(Self::merge_sources(master, load_per_repo_config(cwd)))
+    /// Re-read master + `<cwd>/.peakbot/config.yaml` for a live session,
+    /// re-applying whatever profile is active on `self`. A method (not an
+    /// associated fn) so the live config's profile identity cannot be
+    /// forgotten by a caller — every reload verb re-derives the profile from
+    /// the config it already holds. Replaces `reload()` — `cwd` must be the
+    /// directory the session WILL be in after the calling verb completes
+    /// (target for `/cd`, current `session_cwd` for the other verbs). Same
+    /// precedence as [`Config::load`]; a malformed-master error or an
+    /// unknown profile maps to `Err(reason)` so the caller can keep the
+    /// previous config and warn instead of crashing.
+    pub fn reload_for(&self, cwd: &std::path::Path) -> Result<Config, String> {
+        let (master, master_path) = load_yaml_config().map_err(|e| e.to_string())?;
+        // Same master-universe gate as `Config::load`: the active profile's
+        // `pipelines:` filter may only name pipelines master declares.
+        if let Some(master) = &master {
+            validate_active_profile_filters(master, self.active_profile.as_deref())?;
+            // The static-prompt slot: a single file cannot claim both halves.
+            // Runs per source file, before `merge_sources`.
+            let master_label = master_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "master config".to_string());
+            validate_prompt_slot(master, &master_label)?;
+        }
+        let per_repo = load_per_repo_config(cwd);
+        if let Some(per_repo) = &per_repo {
+            let per_repo_label = cwd.join(".peakbot/config.yaml").display().to_string();
+            validate_prompt_slot(per_repo, &per_repo_label)?;
+        }
+        warn_if_per_repo_declares_profiles(per_repo.as_ref());
+        apply_profile(
+            Self::merge_sources(master, per_repo),
+            self.active_profile.as_deref(),
+        )
     }
 
     /// Pure merge of the two config sources over defaults — the
@@ -1867,10 +2002,142 @@ impl Config {
     /// Adopt every field from `fresh` **except** `provider`, which is
     /// owned by the resolve step and must never be overwritten by a
     /// reload. This is the single point that enforces that invariant.
+    /// `active_profile` (and everything else) rides along unchanged, so the
+    /// next `reload_for` re-applies the same profile.
     pub fn adopt_reloaded(&mut self, fresh: Config) {
         let saved_provider = self.provider.clone();
         *self = fresh;
         self.provider = saved_provider;
+    }
+
+    /// Consolidated boundary parse over the effective (post-profile) config,
+    /// called once from [`Config::load`] and reused by the reload path
+    /// (`reload_session_config`) in place of the two separate calls it used
+    /// to make (§1.6).
+    pub fn validate(&self) -> Result<(), String> {
+        self.tools.validate_shape("tools")?;
+        self.tools
+            .validate_names("tools", "tool", BUILTIN_TOOL_NAMES)?;
+        self.timeouts.validate()?;
+        // A blank `system_prompt` is a config error: unlike `persona`, there is
+        // no sensible "empty full prompt" — the built-in head is the only
+        // fallback. Trim only to test emptiness; never mutate the stored string.
+        if self
+            .system_prompt
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            return Err(
+                "system_prompt: must not be blank — remove the key to use the built-in prompt."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Apply the boot-selected profile overlay to an already-merged
+/// (master + per-repo) config — the ONE place a profile is applied (§1.4).
+/// `None` is a no-op (today's behaviour, byte-identical). An unknown name is
+/// a boot error naming it and listing the configured profiles (sorted, for a
+/// stable message).
+fn apply_profile(mut cfg: Config, name: Option<&str>) -> Result<Config, String> {
+    let Some(name) = name else { return Ok(cfg) };
+    let profile = cfg.profiles.get(name).cloned().ok_or_else(|| {
+        let mut known: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        format!(
+            "unknown profile '{name}'. Configured profiles: {}",
+            if known.is_empty() {
+                "(none)".to_string()
+            } else {
+                known.join(", ")
+            }
+        )
+    })?;
+    if let Some(t) = profile.tools {
+        cfg.tools = t;
+    }
+    if let Some(m) = profile.memory {
+        cfg.memory = m;
+    }
+    // The pipelines gate: a ceiling over the effective (merged) list.
+    // `retain` keeps declaration order; `enabled: false` clears everything.
+    if let Some(filter) = profile.pipelines {
+        cfg.pipelines.retain(|p| filter.allows(&p.name));
+    }
+    // The static-prompt slot: the profile is the ceiling — its `system_prompt`
+    // takes the slot and clears any `persona` the master/per-repo merge
+    // resolved to, so a checked-out repo cannot swap the deployment's full
+    // prompt for its own persona.
+    if let Some(s) = profile.system_prompt {
+        cfg.system_prompt = Some(s);
+        cfg.persona = None;
+    }
+    cfg.active_profile = Some(name.to_string());
+    Ok(cfg)
+}
+
+/// Validate the ACTIVE profile's `pipelines:` gate against MASTER's own
+/// `pipelines:` names — the one check that must run while master is still
+/// separate from the per-repo overlay, i.e. at the master-load step, before
+/// [`Config::merge_sources`]. Called from both [`Config::load`] and
+/// [`Config::reload_for`] (one helper, so the two paths cannot drift).
+///
+/// The name universe is master's list, not the merged one: profiles are a
+/// master-config-only concept (`merge_with` refuses per-repo `profiles:`),
+/// so a gate can only name teams the master config declares. An absent
+/// profile name is `Ok(())` here — the unknown-profile error is owned by
+/// [`apply_profile`]. Only the active profile is validated, exactly like
+/// `tools:`: an unselected profile's bad filter is inert.
+fn validate_active_profile_filters(master: &Config, profile: Option<&str>) -> Result<(), String> {
+    let Some(name) = profile else { return Ok(()) };
+    let Some(profile) = master.profiles.get(name) else {
+        return Ok(());
+    };
+    let Some(filter) = &profile.pipelines else {
+        return Ok(());
+    };
+    let label = format!("profiles.{name}.pipelines");
+    filter.validate_shape(&label)?;
+    let known: Vec<&str> = master.pipelines.iter().map(|p| p.name.as_str()).collect();
+    if known.is_empty() {
+        // `validate_names` would print `Known pipelines: .` — a poor message
+        // when master declares no pipelines at all. Name the first offending
+        // pipeline instead; a gate with no names stays valid.
+        if let Some(n) = filter.disabled.iter().chain(filter.only.iter()).next() {
+            return Err(format!(
+                "{label}: names pipeline '{n}', but the master config declares no pipelines."
+            ));
+        }
+        return Ok(());
+    }
+    filter.validate_names(&label, "pipeline", &known)
+}
+
+/// Reject a config file that claims both halves of the static-prompt slot:
+/// `persona:` and `system_prompt:` fill ONE slot, so a single file cannot set
+/// both. Runs per source file, BEFORE [`Config::merge_sources`] — after the
+/// merge the slot rule has already cleared the sibling, so the conflict is no
+/// longer visible in the merged config. One helper shared by [`Config::load`]
+/// and [`Config::reload_for`] so the two paths cannot drift.
+fn validate_prompt_slot(cfg: &Config, source: &str) -> Result<(), String> {
+    if cfg.persona.is_some() && cfg.system_prompt.is_some() {
+        return Err(format!(
+            "{source}: `persona:` and `system_prompt:` fill the same slot — set one, not both."
+        ));
+    }
+    Ok(())
+}
+
+/// Master-only profiles (§1.5): a `profiles:` block in a per-repo config is
+/// never merged in (`merge_with` skips it), but silently dropping user config
+/// is astonishing — warn once whenever one is present.
+fn warn_if_per_repo_declares_profiles(per_repo: Option<&Config>) {
+    if per_repo.is_some_and(|c| !c.profiles.is_empty()) {
+        tracing::warn!(
+            "⚠ .peakbot/config.yaml declares `profiles:` — ignored (profiles are master-config only)."
+        );
     }
 }
 
@@ -1994,82 +2261,98 @@ mod tests {
 
     #[test]
     fn tools_filter_default_allows_everything() {
-        let t = ToolsConfig::default();
+        let t = NameFilter::default();
         assert!(t.allows("bash"));
         assert!(t.allows("web_search"));
-        assert!(t.validate().is_ok());
+        assert!(t.validate_shape("tools").is_ok());
+        assert!(
+            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
+                .is_ok()
+        );
     }
 
     #[test]
     fn skill_filter_default_shows_everything() {
-        let f = SkillFilter::default();
-        assert!(f.shows("github"));
-        assert!(f.shows("anything"));
-        assert!(f.validate("role", &["github".into()]).is_ok());
+        let f = NameFilter::default();
+        assert!(f.allows("github"));
+        assert!(f.allows("anything"));
+        assert!(f.validate_shape("pipeline.agents.role.skills").is_ok());
+        assert!(
+            f.validate_names("pipeline.agents.role.skills", "skill", &["github"])
+                .is_ok()
+        );
     }
 
     #[test]
     fn skill_filter_disabled_master_switch_hides_all() {
-        let f = SkillFilter {
+        let f = NameFilter {
             enabled: false,
             ..Default::default()
         };
-        assert!(!f.shows("github"), "enabled=false hides every skill");
+        assert!(!f.allows("github"), "enabled=false hides every skill");
     }
 
     #[test]
     fn skill_filter_only_is_allowlist() {
-        let f = SkillFilter {
+        let f = NameFilter {
             enabled: true,
             disabled: vec![],
             only: vec!["github".into()],
         };
-        assert!(f.shows("github"));
-        assert!(!f.shows("helius-solana"));
+        assert!(f.allows("github"));
+        assert!(!f.allows("helius-solana"));
     }
 
     #[test]
     fn skill_filter_disabled_is_blocklist() {
-        let f = SkillFilter {
+        let f = NameFilter {
             enabled: true,
             disabled: vec!["helius-solana".into()],
             only: vec![],
         };
-        assert!(!f.shows("helius-solana"));
-        assert!(f.shows("github"));
+        assert!(!f.allows("helius-solana"));
+        assert!(f.allows("github"));
     }
 
     #[test]
     fn skill_filter_rejects_both_lists() {
-        let f = SkillFilter {
+        let f = NameFilter {
             enabled: true,
             disabled: vec!["a".into()],
             only: vec!["b".into()],
         };
-        let known = vec!["a".into(), "b".into()];
-        assert!(f.validate("role", &known).is_err(), "both lists is illegal");
+        assert!(
+            f.validate_shape("pipeline.agents.role.skills").is_err(),
+            "both lists is illegal"
+        );
     }
 
     #[test]
     fn skill_filter_rejects_unknown_skill_name() {
-        let f = SkillFilter {
+        let f = NameFilter {
             enabled: true,
             disabled: vec![],
             only: vec!["ghost".into()],
         };
         assert!(
-            f.validate("role", &["github".into()]).is_err(),
+            f.validate_names("pipeline.agents.role.skills", "skill", &["github"])
+                .is_err(),
             "an unknown skill name is a typo-catch error"
         );
     }
 
     #[test]
     fn tools_filter_blocklist_removes_named_keeps_rest() {
-        let t = ToolsConfig {
+        let t = NameFilter {
             disabled: vec!["bash_bg".into(), "web_search".into()],
             only: vec![],
+            ..Default::default()
         };
-        assert!(t.validate().is_ok());
+        assert!(t.validate_shape("tools").is_ok());
+        assert!(
+            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
+                .is_ok()
+        );
         assert!(!t.allows("bash_bg"));
         assert!(!t.allows("web_search"));
         assert!(t.allows("file_read"));
@@ -2077,11 +2360,16 @@ mod tests {
 
     #[test]
     fn tools_filter_allowlist_keeps_only_named() {
-        let t = ToolsConfig {
+        let t = NameFilter {
             disabled: vec![],
             only: vec!["file_read".into(), "bash".into()],
+            ..Default::default()
         };
-        assert!(t.validate().is_ok());
+        assert!(t.validate_shape("tools").is_ok());
+        assert!(
+            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
+                .is_ok()
+        );
         assert!(t.allows("file_read"));
         assert!(t.allows("bash"));
         assert!(!t.allows("web_search"));
@@ -2090,20 +2378,25 @@ mod tests {
 
     #[test]
     fn tools_filter_both_lists_is_error() {
-        let t = ToolsConfig {
+        let t = NameFilter {
             disabled: vec!["bash".into()],
             only: vec!["file_read".into()],
+            ..Default::default()
         };
-        assert!(t.validate().is_err());
+        assert!(t.validate_shape("tools").is_err());
     }
 
     #[test]
     fn tools_filter_unknown_tool_is_error() {
-        let t = ToolsConfig {
+        let t = NameFilter {
             disabled: vec!["definitely_not_a_tool".into()],
             only: vec![],
+            ..Default::default()
         };
-        assert!(t.validate().is_err());
+        assert!(
+            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
+                .is_err()
+        );
     }
 
     #[test]
@@ -4084,5 +4377,1630 @@ max_image_bytes: 10485760
             super::load_per_repo_config(tmp.path()).is_none(),
             "no .peakbot/config.yaml in the dir must silently return None"
         );
+    }
+
+    // =========================================================================
+    // PR 1 — Config profiles (RED).
+    //
+    // Written against the §1.2/§1.4 API the implementer will add: `Profile`,
+    // `Config::profiles`, `Config::active_profile`, `apply_profile`, and
+    // `Config::reload_for` as a `&self` method. None of those exist yet, so
+    // this section is compile-RED (E0432/E0599) until PR 1 lands. PR 1's
+    // `Profile` carries ONLY `tools` + `memory` (`system_prompt` is PR 2 and
+    // `allowed_models` is PR 1.5 — both out of scope here, per §7).
+    //
+    // Precedence tests build `Config`/`Profile` literals and drive the pure
+    // core (`merge_sources` + `apply_profile`) — the same pattern as the
+    // `merge_sources_*` tests above, so no filesystem is involved. Only the
+    // reload pin below touches a tempdir (master via XDG_CONFIG_HOME, per-repo
+    // via the `cwd` argument, mirroring the `load_per_repo_config` fixtures).
+    // =========================================================================
+
+    #[test]
+    fn profile_overlay_beats_per_repo_and_master_for_tools() {
+        // Master sets one tools filter, per-repo another, the profile a third —
+        // the effective config must carry the profile's (top of the precedence
+        // stack: profile > per-repo > master > defaults).
+        let master = Config {
+            tools: NameFilter {
+                disabled: vec!["bash".into()],
+                only: vec![],
+                ..Default::default()
+            },
+            profiles: HashMap::from([(
+                "locked".to_string(),
+                Profile {
+                    tools: Some(NameFilter {
+                        disabled: vec![],
+                        only: vec!["file_read".into()],
+                        ..Default::default()
+                    }),
+                    memory: None,
+                    pipelines: None,
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            tools: NameFilter {
+                disabled: vec!["web_search".into()],
+                only: vec![],
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        // Precondition: without the profile, per-repo wins over master.
+        assert_eq!(
+            merged.tools,
+            NameFilter {
+                disabled: vec!["web_search".into()],
+                only: vec![],
+                ..Default::default()
+            },
+            "per-repo must beat master before the profile is applied"
+        );
+        let effective = apply_profile(merged, Some("locked")).expect("profile exists");
+        assert_eq!(
+            effective.tools,
+            NameFilter {
+                disabled: vec![],
+                only: vec!["file_read".into()],
+                ..Default::default()
+            },
+            "the profile overlay must beat both per-repo and master for tools"
+        );
+    }
+
+    #[test]
+    fn profile_overlay_beats_per_repo_and_master_for_memory() {
+        // Profile memory.enabled: false must win over master/per-repo true.
+        let master = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 1000,
+            },
+            profiles: HashMap::from([(
+                "nomem".to_string(),
+                Profile {
+                    tools: None,
+                    memory: Some(MemoryConfig {
+                        enabled: false,
+                        threshold_bytes: 2000,
+                    }),
+                    pipelines: None,
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 3000,
+            },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        // Precondition: per-repo memory wins over master (both non-default).
+        assert_eq!(
+            merged.memory,
+            MemoryConfig {
+                enabled: true,
+                threshold_bytes: 3000
+            },
+            "per-repo must beat master before the profile is applied"
+        );
+        let effective = apply_profile(merged, Some("nomem")).expect("profile exists");
+        assert_eq!(
+            effective.memory,
+            MemoryConfig {
+                enabled: false,
+                threshold_bytes: 2000
+            },
+            "the profile overlay must beat both per-repo and master for memory"
+        );
+        assert!(
+            !effective.memory.enabled,
+            "profile memory.enabled: false must win"
+        );
+    }
+
+    #[test]
+    fn unknown_profile_errors_naming_it_and_listing_configured() {
+        // `--profile gamma` with only alpha/beta configured ⇒ Err that names
+        // the unknown profile AND lists the configured ones.
+        let cfg = Config {
+            profiles: HashMap::from([
+                (
+                    "alpha".to_string(),
+                    Profile {
+                        tools: None,
+                        memory: None,
+                        pipelines: None,
+                        system_prompt: None,
+                    },
+                ),
+                (
+                    "beta".to_string(),
+                    Profile {
+                        tools: None,
+                        memory: None,
+                        pipelines: None,
+                        system_prompt: None,
+                    },
+                ),
+            ]),
+            ..Config::default()
+        };
+        let err = apply_profile(cfg, Some("gamma")).expect_err("unknown profile must error");
+        assert!(
+            err.contains("gamma"),
+            "error must name the unknown profile, got: {err}"
+        );
+        assert!(
+            err.contains("alpha"),
+            "error must list configured 'alpha', got: {err}"
+        );
+        assert!(
+            err.contains("beta"),
+            "error must list configured 'beta', got: {err}"
+        );
+    }
+
+    #[test]
+    fn per_repo_profiles_block_is_ignored_and_selecting_it_errors() {
+        // A `profiles:` block in a per-repo config is master-only: it must NOT
+        // be merged, and selecting such a profile errors as unknown.
+        let master = Config {
+            profiles: HashMap::from([(
+                "master_only".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: None,
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            profiles: HashMap::from([(
+                "evil_repo".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: None,
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        assert!(
+            !merged.profiles.contains_key("evil_repo"),
+            "a per-repo `profiles:` block must be ignored (not merged)"
+        );
+        assert!(
+            merged.profiles.contains_key("master_only"),
+            "master profiles must survive the merge"
+        );
+        let err = apply_profile(merged, Some("evil_repo"))
+            .expect_err("selecting an ignored per-repo profile must error");
+        assert!(
+            err.contains("evil_repo"),
+            "the error must name the unknown profile, got: {err}"
+        );
+    }
+
+    /// Serializes the env-var-mutating reload pin so it cannot race a future
+    /// test that also points the master config path at a tempdir.
+    static CONFIG_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    /// §1.7 security regression pin: a profile that disables `bash` must
+    /// survive a reload even when the per-repo config in the (new) cwd sets
+    /// `tools: {}` (allow everything). The profile is the operator's
+    /// deployment ceiling — a checked-out repo must not be able to void it.
+    ///
+    /// The master carries the blocklist ONLY via the profile (no top-level
+    /// `tools:`), so the merged config allows everything and the profile
+    /// re-application is what the pin actually exercises: if `reload_for`
+    /// forgot to re-apply the profile, `bash` would come back and this fails.
+    #[test]
+    fn profile_survives_reload_with_hostile_per_repo_config() {
+        let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+
+        // Point the master config at a tempdir. On Linux `ProjectDirs` honors
+        // XDG_CONFIG_HOME; save/restore so the test leaves no global state.
+        let original = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+        // Master config: the "locked" profile disables bash.
+        let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+        std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+        std::fs::write(
+            config_dir.join("config.yaml"),
+            "profiles:\n  locked:\n    tools:\n      disabled: [bash]\n",
+        )
+        .expect("write master config");
+
+        // Hostile per-repo config in the reload target dir: tools: {} (allow all).
+        let per_repo_dir = repo_tmp.path().join(".peakbot");
+        std::fs::create_dir_all(&per_repo_dir).expect("mkdir .peakbot");
+        std::fs::write(per_repo_dir.join("config.yaml"), "tools: {}\n").expect("write per-repo");
+
+        // The live config, as boot with `--profile locked` would have produced it.
+        let live = Config {
+            active_profile: Some("locked".to_string()),
+            profiles: HashMap::from([(
+                "locked".to_string(),
+                Profile {
+                    tools: Some(NameFilter {
+                        disabled: vec!["bash".into()],
+                        only: vec![],
+                        ..Default::default()
+                    }),
+                    memory: None,
+                    pipelines: None,
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let reloaded = live
+            .reload_for(repo_tmp.path())
+            .expect("reload must succeed");
+
+        // Restore the env var BEFORE asserting (panic-safety).
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            !reloaded.tools.allows("bash"),
+            "bash must STILL be disabled after reload — the profile must survive a \
+             hostile per-repo `tools: {{}}` (got tools: {:?})",
+            reloaded.tools
+        );
+    }
+
+    #[test]
+    fn adopt_reloaded_preserves_active_profile() {
+        // After a reload, the config must still know which profile is active —
+        // `adopt_reloaded` copies every field from `fresh` (including the
+        // profile stamp), so the next reload re-applies the same profile.
+        let mut live = Config {
+            active_profile: None,
+            ..Config::default()
+        };
+        let fresh = Config {
+            active_profile: Some("locked".to_string()),
+            tools: NameFilter {
+                disabled: vec!["bash".into()],
+                only: vec![],
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        live.adopt_reloaded(fresh);
+        assert_eq!(
+            live.active_profile.as_deref(),
+            Some("locked"),
+            "adopt_reloaded must preserve the active_profile stamp"
+        );
+    }
+
+    #[test]
+    fn profile_leaves_unset_fields_untouched() {
+        // A profile that sets only `tools:` must not touch `memory` — the
+        // effective memory equals the master/per-repo-resolved value.
+        let master = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 1000,
+            },
+            profiles: HashMap::from([(
+                "tools_only".to_string(),
+                Profile {
+                    tools: Some(NameFilter {
+                        disabled: vec!["bash".into()],
+                        only: vec![],
+                        ..Default::default()
+                    }),
+                    memory: None,
+                    pipelines: None,
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 3000,
+            },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        let resolved_memory = merged.memory.clone();
+        let effective = apply_profile(merged, Some("tools_only")).expect("profile exists");
+        assert_eq!(
+            effective.memory, resolved_memory,
+            "a field the profile does not set (memory) must be left untouched"
+        );
+        // And the field it DOES set is applied.
+        assert_eq!(
+            effective.tools,
+            NameFilter {
+                disabled: vec!["bash".into()],
+                only: vec![],
+                ..Default::default()
+            },
+            "the field the profile sets (tools) must be applied"
+        );
+    }
+
+    #[test]
+    fn no_profile_selected_keeps_active_profile_none_and_normal_merge() {
+        // No `--profile` ⇒ active_profile is None and the effective config
+        // equals the normal master+per-repo merge (today's behaviour,
+        // byte-identical).
+        let master = Config {
+            tools: NameFilter {
+                disabled: vec!["bash".into()],
+                only: vec![],
+                ..Default::default()
+            },
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 1000,
+            },
+            ..Config::default()
+        };
+        let repo = Config {
+            memory: MemoryConfig {
+                enabled: true,
+                threshold_bytes: 3000,
+            },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        let expected = merged.clone();
+        let effective = apply_profile(merged, None).expect("no profile must not error");
+        assert_eq!(
+            effective.active_profile, None,
+            "no profile selected ⇒ active_profile must be None"
+        );
+        assert_eq!(
+            effective, expected,
+            "no profile ⇒ effective config must equal the normal master+per-repo merge"
+        );
+    }
+
+    // =========================================================================
+    // PR 1.5 — profile `pipelines:` filter.
+    //
+    // `apply_profile` is the ONE place a profile is applied (§1.4); today it
+    // overrides `tools` and `memory` but does NOT touch `cfg.pipelines`, so
+    // these tests pin the shape/no-op/precedence semantics that must hold
+    // before AND after the `pipelines` arm lands. They build `Config`/`Profile`
+    // literals and drive the pure core directly — the same pattern as the
+    // PR 1 profile tests above. (The narrowing tests were written against
+    // the rejected `only: Option<Vec>` shape and are re-added against
+    // `NameFilter` in the follow-up.)
+    // =========================================================================
+
+    /// Minimal `PipelineDef` for the filter tests: only `name` matters to
+    /// `apply_profile` (it never inspects `orchestrator`/`agents`), so both
+    /// are left at their defaults. `apply_profile` does not call
+    /// `PipelineSet::build`, so the "agents non-empty" rule is not in play.
+    fn pipeline(name: &str) -> PipelineDef {
+        PipelineDef {
+            name: name.to_string(),
+            orchestrator: OrchestratorDef::default(),
+            agents: Members::default(),
+        }
+    }
+
+    /// T1: setting BOTH the blocklist and the allowlist is illegal (the same
+    /// rule as `tools:`). The error must name both keys. (GREEN —
+    /// `validate_shape` already exists.)
+    #[test]
+    fn name_filter_rejects_disabled_and_only_together() {
+        let f = NameFilter {
+            disabled: vec!["a".into()],
+            only: vec!["b".into()],
+            ..Default::default()
+        };
+        let err = f
+            .validate_shape("pipelines")
+            .expect_err("both lists must be rejected");
+        assert!(
+            err.contains("disabled"),
+            "error must name the `disabled` blocklist, got: {err}"
+        );
+        assert!(
+            err.contains("only"),
+            "error must name the `only` allowlist, got: {err}"
+        );
+    }
+
+    /// T3: `disabled: []` with `only: None` = "allow everything". Every
+    /// declared pipeline must survive, in order. (GREEN today — the no-op
+    /// path — and must stay GREEN after the change: it pins the empty
+    /// blocklist.)
+    #[test]
+    fn profile_pipelines_disabled_empty_keeps_all_pipelines() {
+        let master = Config {
+            pipelines: vec![pipeline("a"), pipeline("b")],
+            profiles: HashMap::from([(
+                "noop".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: Some(NameFilter {
+                        disabled: vec![],
+                        only: vec![],
+                        ..Default::default()
+                    }),
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(master, Some("noop")).expect("profile exists");
+        let names: Vec<&str> = effective
+            .pipelines
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "`disabled: []` must keep every pipeline, in order"
+        );
+    }
+
+    /// T4: a profile that sets `tools:` but NOT `pipelines:` must leave the
+    /// pipeline list untouched AND still apply `tools`. (GREEN — pins the
+    /// no-filter path.)
+    #[test]
+    fn profile_without_pipelines_key_leaves_pipelines_and_applies_other_fields() {
+        let master = Config {
+            pipelines: vec![pipeline("a"), pipeline("b")],
+            profiles: HashMap::from([(
+                "tools_only".to_string(),
+                Profile {
+                    tools: Some(NameFilter {
+                        disabled: vec!["bash".into()],
+                        only: vec![],
+                        ..Default::default()
+                    }),
+                    memory: None,
+                    pipelines: None,
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(master, Some("tools_only")).expect("profile exists");
+        // Pipelines untouched.
+        let names: Vec<&str> = effective
+            .pipelines
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "a profile with no `pipelines:` key must leave the list untouched"
+        );
+        // And the field it DOES set is applied.
+        assert_eq!(
+            effective.tools,
+            NameFilter {
+                disabled: vec!["bash".into()],
+                only: vec![],
+                ..Default::default()
+            },
+            "the `tools:` field the profile sets must still be applied"
+        );
+    }
+
+    /// T8: `overridden_fields()` returns the config keys the profile actually
+    /// sets, in declaration order. (GREEN — `overridden_fields` already
+    /// exists.)
+    #[test]
+    fn profile_overridden_fields_reports_set_keys_in_declaration_order() {
+        // (a) all-None ⇒ empty.
+        let none = Profile {
+            tools: None,
+            memory: None,
+            pipelines: None,
+            system_prompt: None,
+        };
+        assert_eq!(
+            none.overridden_fields(),
+            Vec::<&'static str>::new(),
+            "an all-None profile overrides nothing"
+        );
+        // (b) tools + memory + pipelines ⇒ that exact declaration order.
+        let all = Profile {
+            tools: Some(NameFilter::default()),
+            memory: Some(MemoryConfig::default()),
+            pipelines: Some(NameFilter::default()),
+            system_prompt: None,
+        };
+        assert_eq!(
+            all.overridden_fields(),
+            vec!["tools", "memory", "pipelines"],
+            "all three set ⇒ declaration order"
+        );
+        // (c) only pipelines ⇒ just ["pipelines"].
+        let pipes = Profile {
+            tools: None,
+            memory: None,
+            pipelines: Some(NameFilter::default()),
+            system_prompt: None,
+        };
+        assert_eq!(
+            pipes.overridden_fields(),
+            vec!["pipelines"],
+            "only `pipelines` set ⇒ just that key"
+        );
+        // (d) all four set ⇒ the full declaration order, `system_prompt` last.
+        let all_four = Profile {
+            tools: Some(NameFilter::default()),
+            memory: Some(MemoryConfig::default()),
+            pipelines: Some(NameFilter::default()),
+            system_prompt: Some("FULL".to_string()),
+        };
+        assert_eq!(
+            all_four.overridden_fields(),
+            vec!["tools", "memory", "pipelines", "system_prompt"],
+            "all four set ⇒ declaration order, `system_prompt` last"
+        );
+        // (e) only system_prompt ⇒ just ["system_prompt"].
+        let prompt_only = Profile {
+            tools: None,
+            memory: None,
+            pipelines: None,
+            system_prompt: Some("FULL".to_string()),
+        };
+        assert_eq!(
+            prompt_only.overridden_fields(),
+            vec!["system_prompt"],
+            "only `system_prompt` set ⇒ just that key"
+        );
+    }
+
+    /// T10 — no-profile no-op: a master config that declares BOTH a
+    /// `profiles:` block (with a `pipelines:` filter) AND a top-level
+    /// `pipelines:` list must boot (with no `--profile`) to the untouched
+    /// top-level list and `active_profile == None`. The profiles block is
+    /// inert until selected. Driven through `apply_profile(…, None)` — the
+    /// exact seam `Config::load(None)` calls when no profile is passed — so
+    /// the test stays deterministic (no dependence on the test process cwd).
+    /// (GREEN — pins that the no-flag path is not regressed.)
+    #[test]
+    fn no_profile_selected_leaves_master_pipelines_and_profile_stamp_none() {
+        let master = Config {
+            pipelines: vec![pipeline("a"), pipeline("b")],
+            profiles: HashMap::from([(
+                "locked".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: Some(NameFilter {
+                        disabled: vec![],
+                        only: vec!["a".into()],
+                        ..Default::default()
+                    }),
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(master, None).expect("no profile must not error");
+        assert_eq!(
+            effective.active_profile, None,
+            "no profile selected ⇒ active_profile must be None"
+        );
+        let names: Vec<&str> = effective
+            .pipelines
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "no profile ⇒ the declared top-level pipelines are untouched"
+        );
+    }
+
+    // =========================================================================
+    // PR 2 — the static-prompt slot (RED).
+    //
+    // `persona:` and `system_prompt:` fill ONE slot: whichever key a source
+    // sets takes the slot and CLEARS its sibling, so the more specific
+    // source owns the whole slot (per-repo `persona` beats master
+    // `system_prompt`, and vice versa). A profile is applied LAST, so its
+    // `system_prompt` is the ceiling over everything a per-repo config set.
+    // Both keys in the SAME file, or a blank `system_prompt`, are config
+    // errors.
+    //
+    // RED until `merge_with` learns the slot rule, `apply_profile` applies
+    // `Profile.system_prompt` (clearing `persona`), and `Config::validate`
+    // rejects blank/both-set. The last two tests are GREEN: they pin the
+    // already-implemented `prompt_head` accessor and the
+    // `overridden_fields` order.
+    // =========================================================================
+
+    /// Master sets `system_prompt`, per-repo sets `persona`: the per-repo
+    /// source owns the whole slot — the effective config carries the
+    /// persona and the master's full prompt is cleared. (RED — `merge_with`
+    /// still merges `persona` only and never touches `system_prompt`, so
+    /// the master's full prompt survives the merge.)
+    #[test]
+    fn master_system_prompt_yields_slot_to_per_repo_persona() {
+        let master = Config {
+            system_prompt: Some("FULL-MASTER".to_string()),
+            ..Config::default()
+        };
+        let repo = Config {
+            persona: Some("REPO-PERSONA".to_string()),
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        assert_eq!(
+            merged.persona.as_deref(),
+            Some("REPO-PERSONA"),
+            "per-repo `persona` must win the slot over the master `system_prompt`"
+        );
+        assert_eq!(
+            merged.system_prompt, None,
+            "the per-repo `persona` must CLEAR the master `system_prompt` (one slot)"
+        );
+    }
+
+    /// Mirror image: master sets `persona`, per-repo sets `system_prompt` —
+    /// the per-repo full prompt takes the slot and clears the master
+    /// persona. (RED — `merge_with` never reads `other.system_prompt`, so
+    /// the per-repo override is dropped and the master persona survives.)
+    #[test]
+    fn per_repo_system_prompt_takes_slot_from_master_persona() {
+        let master = Config {
+            persona: Some("MASTER-PERSONA".to_string()),
+            ..Config::default()
+        };
+        let repo = Config {
+            system_prompt: Some("FULL-REPO".to_string()),
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        assert_eq!(
+            merged.system_prompt.as_deref(),
+            Some("FULL-REPO"),
+            "per-repo `system_prompt` must win the slot over the master `persona`"
+        );
+        assert_eq!(
+            merged.persona, None,
+            "the per-repo `system_prompt` must CLEAR the master `persona` (one slot)"
+        );
+    }
+
+    /// The profile is the ceiling: a profile's `system_prompt` beats a
+    /// per-repo `persona` and clears it — profiles are applied AFTER the
+    /// master+per-repo merge, so they win over every file-level source.
+    /// (RED — `apply_profile` does not yet apply `Profile.system_prompt`,
+    /// so the per-repo persona survives.)
+    #[test]
+    fn profile_system_prompt_is_a_ceiling_over_per_repo_persona() {
+        let master = Config {
+            profiles: HashMap::from([(
+                "locked".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: None,
+                    system_prompt: Some("FULL-PROFILE".to_string()),
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            persona: Some("REPO-PERSONA".to_string()),
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        // Precondition: without the profile, the per-repo persona is in the slot.
+        assert_eq!(
+            merged.persona.as_deref(),
+            Some("REPO-PERSONA"),
+            "per-repo `persona` must be in the slot before the profile is applied"
+        );
+        let effective = apply_profile(merged, Some("locked")).expect("profile exists");
+        assert_eq!(
+            effective.system_prompt.as_deref(),
+            Some("FULL-PROFILE"),
+            "the profile `system_prompt` must take the slot (the ceiling)"
+        );
+        assert_eq!(
+            effective.persona, None,
+            "the profile `system_prompt` must CLEAR the per-repo `persona`"
+        );
+    }
+
+    /// §1.7 security pin, prompt-slot edition: a profile that sets
+    /// `system_prompt` must survive a reload even when the per-repo config
+    /// in the (new) cwd sets `persona`. The profile is the operator's
+    /// deployment ceiling — a checked-out repo must not be able to swap the
+    /// deployment's full prompt for its own persona.
+    ///
+    /// The master carries the prompt ONLY via the profile (no top-level
+    /// `system_prompt:`), so the merged config carries the per-repo persona
+    /// and the profile re-application is what the pin actually exercises:
+    /// if `reload_for` forgot to re-apply the profile, the persona would
+    /// come back and this fails. (RED — `apply_profile` does not yet apply
+    /// `Profile.system_prompt`.)
+    #[test]
+    fn profile_system_prompt_survives_hostile_reload() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the (currently RED) assertions so a panic here can
+        // never poison `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let reloaded = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            // Point the master config at a tempdir. On Linux `ProjectDirs`
+            // honors XDG_CONFIG_HOME; save/restore so the test leaves no
+            // global state.
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            // Master config: the "locked" profile owns the prompt slot.
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "profiles:\n  locked:\n    system_prompt: FULL-PROFILE\n",
+            )
+            .expect("write master config");
+
+            // Hostile per-repo config in the reload target dir: its own persona.
+            let per_repo_dir = repo_tmp.path().join(".peakbot");
+            std::fs::create_dir_all(&per_repo_dir).expect("mkdir .peakbot");
+            std::fs::write(per_repo_dir.join("config.yaml"), "persona: REPO-PERSONA\n")
+                .expect("write per-repo");
+
+            // The live config, as boot with `--profile locked` would have produced it.
+            let live = Config {
+                active_profile: Some("locked".to_string()),
+                profiles: HashMap::from([(
+                    "locked".to_string(),
+                    Profile {
+                        tools: None,
+                        memory: None,
+                        pipelines: None,
+                        system_prompt: Some("FULL-PROFILE".to_string()),
+                    },
+                )]),
+                ..Config::default()
+            };
+
+            let reloaded = live
+                .reload_for(repo_tmp.path())
+                .expect("reload must succeed");
+
+            // Restore the env var BEFORE dropping the guard (panic-safety).
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            reloaded
+        };
+
+        assert_eq!(
+            reloaded.system_prompt.as_deref(),
+            Some("FULL-PROFILE"),
+            "the profile `system_prompt` must STILL own the slot after a hostile reload"
+        );
+        assert_eq!(
+            reloaded.persona, None,
+            "the hostile per-repo `persona` must be cleared by the profile after reload"
+        );
+    }
+
+    /// A blank (empty or whitespace-only) `system_prompt` is a config error
+    /// naming the key — unlike `persona`, there is no sensible "empty full
+    /// prompt": the built-in head is the only fallback. Driven through
+    /// `Config::validate`, the consolidated boundary parse `Config::load`
+    /// runs. (RED — `validate` does not yet check `system_prompt`.)
+    #[test]
+    fn blank_system_prompt_is_a_config_error() {
+        for blank in ["", "   ", "\t\n \n"] {
+            let cfg = Config {
+                system_prompt: Some(blank.to_string()),
+                ..Config::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err("blank system_prompt must be rejected");
+            assert!(
+                err.contains("system_prompt"),
+                "error must name the offending key, got: {err}"
+            );
+        }
+        // Whitespace PADDING around real content is legal — trim, don't reject.
+        let cfg = Config {
+            system_prompt: Some("  real prompt  ".to_string()),
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "a whitespace-padded real prompt must pass validation"
+        );
+    }
+
+    /// Both `persona:` and `system_prompt:` in the MASTER file ⇒ boot error
+    /// naming both keys — they fill one slot, so a single file cannot claim
+    /// both. Driven end-to-end through `Config::load`, the real boot seam.
+    /// (RED — `Config::validate` does not yet reject the pair.)
+    #[test]
+    fn persona_and_system_prompt_in_one_file_is_a_config_error() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the (currently RED) assertions so a panic here can
+        // never poison `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let result = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "persona: MASTER-PERSONA\nsystem_prompt: FULL-MASTER\n",
+            )
+            .expect("write master config");
+
+            let result = Config::load(None);
+
+            // Restore the env var BEFORE dropping the guard (panic-safety).
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            result
+        };
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("both keys in the master file must be a config error"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("persona"),
+            "the error must name `persona`, got: {msg}"
+        );
+        assert!(
+            msg.contains("system_prompt"),
+            "the error must name `system_prompt`, got: {msg}"
+        );
+    }
+
+    /// Same rule for the PER-REPO file: both keys in
+    /// `.peakbot/config.yaml` ⇒ config error naming both — they fill one
+    /// slot, so a single file cannot claim both. The post-merge config can
+    /// never show this: `merge_with` resolves the slot DURING the merge
+    /// (per-repo `system_prompt` wins and clears `persona`), so the rule is
+    /// enforced per source file, BEFORE `merge_sources`, by
+    /// `validate_prompt_slot`. Driven end-to-end through
+    /// `Config::reload_for(cwd)` — the live-session seam — which runs that
+    /// check on the per-repo file before merging; `cwd` is an explicit
+    /// argument, so the fixture needs no process-cwd mutation.
+    /// (GREEN — `validate_prompt_slot` and its `reload_for` call site are
+    /// implemented; this pins the wiring, not missing code.)
+    #[test]
+    fn persona_and_system_prompt_in_per_repo_file_is_a_config_error() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+        let per_repo_path = repo_tmp.path().join(".peakbot/config.yaml");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the assertions so a panic here can never poison
+        // `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let result = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            // Point the master config at an EMPTY tempdir (no master file)
+            // so the per-repo file is the only source in play and the test
+            // is independent of whatever config the host actually has.
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            // The offending per-repo config: both halves of the slot.
+            std::fs::create_dir_all(per_repo_path.parent().expect("parent dir"))
+                .expect("mkdir .peakbot");
+            std::fs::write(
+                &per_repo_path,
+                "persona: REPO-PERSONA\nsystem_prompt: FULL-REPO\n",
+            )
+            .expect("write per-repo");
+
+            // No active profile: the slot error must fire on the per-repo
+            // file regardless of profile state.
+            let live = Config::default();
+            let result = live.reload_for(repo_tmp.path());
+
+            // Restore the env var BEFORE dropping the guard (panic-safety).
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            result
+        };
+
+        let msg = match result {
+            Err(e) => e,
+            Ok(_) => panic!("both keys in the per-repo file must be a config error"),
+        };
+        assert!(
+            msg.contains("persona"),
+            "the error must name `persona`, got: {msg}"
+        );
+        assert!(
+            msg.contains("system_prompt"),
+            "the error must name `system_prompt`, got: {msg}"
+        );
+        // The label must be the PER-REPO file's full path — that is what
+        // proves the right source was blamed, not the master config.
+        assert!(
+            msg.contains(per_repo_path.to_str().expect("utf-8 path")),
+            "the error must point at the per-repo file, got: {msg}"
+        );
+        assert!(
+            !msg.contains(master_tmp.path().to_str().expect("utf-8 path")),
+            "the error must NOT point at the master config dir, got: {msg}"
+        );
+    }
+
+    /// The slot accessor: `system_prompt` wins over `persona`, blank is
+    /// treated as absent, `None` = the built-in head. (GREEN —
+    /// `prompt_head` is already implemented; this pins the accessor, not
+    /// missing code.)
+    #[test]
+    fn prompt_head_prefers_full_over_persona_and_treats_blank_as_absent() {
+        let rows: [(Option<&str>, Option<&str>, Option<PromptHead>); 6] = [
+            (
+                Some("Persona here"),
+                None,
+                Some(PromptHead::Persona("Persona here".to_string())),
+            ),
+            (
+                None,
+                Some("Full prompt"),
+                Some(PromptHead::Full("Full prompt".to_string())),
+            ),
+            (
+                Some("Persona here"),
+                Some("Full prompt"),
+                Some(PromptHead::Full("Full prompt".to_string())),
+            ),
+            (Some("   "), None, None),
+            (
+                Some("Persona here"),
+                Some(" \t\n "),
+                Some(PromptHead::Persona("Persona here".to_string())),
+            ),
+            (None, None, None),
+        ];
+        for (persona, system_prompt, expected) in rows {
+            let cfg = Config {
+                persona: persona.map(str::to_string),
+                system_prompt: system_prompt.map(str::to_string),
+                ..Config::default()
+            };
+            assert_eq!(
+                cfg.prompt_head(),
+                expected,
+                "persona={persona:?} system_prompt={system_prompt:?}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Profile pipelines gate — the pending `apply_profile` retain.
+    //
+    // These tests pin the locked semantics of `Profile.pipelines` (a
+    // `NameFilter` over the effective `pipelines:` list):
+    //   * `enabled: false`            ⇒ nothing allowed ("single-agent only")
+    //   * `only: []` / `disabled: []` ⇒ no filtering (an empty list is NEVER
+    //                                   "none")
+    //   * `disabled: [n]`             ⇒ blocklist, declaration order kept
+    //   * `only: [n]`                 ⇒ allowlist, a ceiling over the merged
+    //                                   (master + per-repo) list
+    //   * unknown name                ⇒ boot error (universe = MASTER's list)
+    //
+    // RED until `apply_profile` learns `cfg.pipelines.retain(|p|
+    // filter.allows(&p.name))`; the no-op rows are GREEN today and must stay
+    // GREEN.
+    // =========================================================================
+
+    /// `enabled: false` is the profile's "single-agent only, no pipelines"
+    /// switch: every declared pipeline is dropped. (RED — `apply_profile`
+    /// does not yet touch `cfg.pipelines`.)
+    #[test]
+    fn profile_pipelines_enabled_false_clears_all_pipelines() {
+        let master = Config {
+            pipelines: vec![pipeline("a"), pipeline("b")],
+            profiles: HashMap::from([(
+                "solo".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: Some(NameFilter {
+                        enabled: false,
+                        ..Default::default()
+                    }),
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(master, Some("solo")).expect("profile exists");
+        assert!(
+            effective.pipelines.is_empty(),
+            "enabled: false must clear every pipeline; got {:?}",
+            effective
+                .pipelines
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Anti-astonishment pin: `only: []` (an explicit empty allowlist) is a
+    /// NO-OP — it must never mean "none". "Allow nothing" is
+    /// `enabled: false`'s job and only its job. (GREEN today — the no-op
+    /// path — and must stay GREEN after the change.)
+    #[test]
+    fn profile_pipelines_only_empty_is_a_no_op() {
+        let master = Config {
+            pipelines: vec![pipeline("a"), pipeline("b")],
+            profiles: HashMap::from([(
+                "noop".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: Some(NameFilter {
+                        enabled: true,
+                        disabled: vec![],
+                        only: vec![],
+                    }),
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(master, Some("noop")).expect("profile exists");
+        let names: Vec<&str> = effective
+            .pipelines
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "`only: []` must keep every pipeline, in order"
+        );
+    }
+
+    /// `disabled: [b]` removes exactly `b` and preserves the declaration
+    /// order of the survivors — the gate is a `retain`, not a set. (RED —
+    /// `apply_profile` does not yet touch `cfg.pipelines`.)
+    #[test]
+    fn profile_pipelines_disabled_removes_named_in_order() {
+        let master = Config {
+            pipelines: vec![pipeline("a"), pipeline("b"), pipeline("c")],
+            profiles: HashMap::from([(
+                "gate".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: Some(NameFilter {
+                        disabled: vec!["b".into()],
+                        only: vec![],
+                        ..Default::default()
+                    }),
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(master, Some("gate")).expect("profile exists");
+        let names: Vec<&str> = effective
+            .pipelines
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "c"],
+            "`disabled: [b]` must leave exactly [a, c] in declaration order"
+        );
+    }
+
+    /// The gate is a CEILING over the effective (merged) list: master
+    /// declares [a, b]; the per-repo `.peakbot/config.yaml` replaces it
+    /// wholesale with [a, b, c] (the stage-1.1 merge rule); the active
+    /// profile's `only: [a]` narrows the effective list to exactly [a].
+    /// Filesystem fixture on the per-repo side so the real
+    /// `load_per_repo_config` seam is exercised. (RED — `apply_profile`
+    /// does not yet touch `cfg.pipelines`.)
+    #[test]
+    fn profile_pipelines_only_is_a_ceiling_over_per_repo_list() {
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+        let per_repo_dir = repo_tmp.path().join(".peakbot");
+        std::fs::create_dir_all(&per_repo_dir).expect("mkdir .peakbot");
+        std::fs::write(
+            per_repo_dir.join("config.yaml"),
+            "pipelines:
+  - name: a
+    orchestrator: {}
+    agents:
+      r:
+        prompt: p
+  - name: b
+    orchestrator: {}
+    agents:
+      r:
+        prompt: p
+  - name: c
+    orchestrator: {}
+    agents:
+      r:
+        prompt: p
+",
+        )
+        .expect("write per-repo");
+
+        let master = Config {
+            pipelines: vec![pipeline("a"), pipeline("b")],
+            profiles: HashMap::from([(
+                "gate".to_string(),
+                Profile {
+                    tools: None,
+                    memory: None,
+                    pipelines: Some(NameFilter {
+                        disabled: vec![],
+                        only: vec!["a".into()],
+                        ..Default::default()
+                    }),
+                    system_prompt: None,
+                },
+            )]),
+            ..Config::default()
+        };
+        let per_repo = load_per_repo_config(repo_tmp.path()).expect("per-repo config parses");
+        let merged = Config::merge_sources(Some(master), Some(per_repo));
+        // Precondition: per-repo replaces the master list wholesale.
+        let merged_names: Vec<&str> = merged.pipelines.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            merged_names,
+            vec!["a", "b", "c"],
+            "per-repo must replace the master pipelines list wholesale before the profile is applied"
+        );
+
+        let effective = apply_profile(merged, Some("gate")).expect("profile exists");
+        let names: Vec<&str> = effective
+            .pipelines
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a"],
+            "the profile `only: [a]` gate must cap the merged list at exactly [a]"
+        );
+    }
+
+    /// §1.7 security pin, pipelines edition: a profile whose gate is
+    /// `enabled: false` must survive a reload even when the per-repo config
+    /// in the (new) cwd declares pipelines. The profile is the operator's
+    /// deployment ceiling — a checked-out repo must not be able to void it.
+    ///
+    /// The master carries the gate ONLY via the profile (no top-level
+    /// `pipelines:`), so the merged config carries the per-repo list and the
+    /// profile re-application is what the pin actually exercises: if
+    /// `reload_for` forgot to re-apply the profile, the pipelines would come
+    /// back and this fails. (RED — `apply_profile` does not yet touch
+    /// `cfg.pipelines`.)
+    #[test]
+    fn profile_pipelines_enabled_false_survives_hostile_reload() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the (currently RED) assertions so a panic here can
+        // never poison `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let reloaded = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            // Point the master config at a tempdir. On Linux `ProjectDirs`
+            // honors XDG_CONFIG_HOME; save/restore so the test leaves no
+            // global state.
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            // Master config: the "locked" profile kills every pipeline.
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "profiles:\n  locked:\n    pipelines:\n      enabled: false\n",
+            )
+            .expect("write master config");
+
+            // Hostile per-repo config in the reload target dir: two pipelines.
+            let per_repo_dir = repo_tmp.path().join(".peakbot");
+            std::fs::create_dir_all(&per_repo_dir).expect("mkdir .peakbot");
+            std::fs::write(
+                per_repo_dir.join("config.yaml"),
+                "pipelines:
+  - name: alpha
+    orchestrator: {}
+    agents:
+      r:
+        prompt: p
+  - name: beta
+    orchestrator: {}
+    agents:
+      r:
+        prompt: p
+",
+            )
+            .expect("write per-repo");
+
+            // The live config, as boot with `--profile locked` would have produced it.
+            let live = Config {
+                active_profile: Some("locked".to_string()),
+                profiles: HashMap::from([(
+                    "locked".to_string(),
+                    Profile {
+                        tools: None,
+                        memory: None,
+                        pipelines: Some(NameFilter {
+                            enabled: false,
+                            ..Default::default()
+                        }),
+                        system_prompt: None,
+                    },
+                )]),
+                ..Config::default()
+            };
+
+            let reloaded = live
+                .reload_for(repo_tmp.path())
+                .expect("reload must succeed");
+
+            // Restore the env var BEFORE dropping the guard (panic-safety).
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            reloaded
+        };
+
+        assert!(
+            reloaded.pipelines.is_empty(),
+            "a profile with `pipelines.enabled: false` must survive a hostile reload; got {:?}",
+            reloaded
+                .pipelines
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Boot error: a profile's `pipelines:` gate naming a pipeline master
+    /// never declared must fail the load, naming the unknown name and
+    /// listing the known ones. The universe is MASTER's own `pipelines:`
+    /// list (profiles are master-config-only) — NOT the per-repo merged
+    /// list. Driven end-to-end through `Config::load` — the real boot seam.
+    /// (RED — the master-config load path does not yet validate the
+    /// profile filters.)
+    #[test]
+    fn profile_pipelines_unknown_name_is_a_boot_error() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the (currently RED) assertions so a panic here can
+        // never poison `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let result = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "pipelines:
+  - name: a
+    orchestrator: {}
+    agents:
+      r:
+        prompt: p
+profiles:
+  web:
+    pipelines:
+      only: [ghost]
+",
+            )
+            .expect("write master config");
+
+            let result = Config::load(Some("web"));
+
+            // Restore the env var BEFORE dropping the guard (panic-safety).
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            result
+        };
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a gate naming an unknown pipeline must be a boot error"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ghost"),
+            "the error must name the unknown pipeline, got: {msg}"
+        );
+        assert!(
+            msg.contains("Known pipelines: a"),
+            "the error must list the known (master) pipeline names, got: {msg}"
+        );
+    }
+
+    /// Unit half of the unknown-name pin: `validate_names` against the
+    /// MASTER pipeline list is the boundary parse the load path must run for
+    /// each profile's gate. The end-to-end half is
+    /// `profile_pipelines_unknown_name_is_a_boot_error`. (GREEN —
+    /// `validate_names` already exists; it is not yet wired into the load
+    /// path.)
+    #[test]
+    fn name_filter_validate_names_flags_unknown_pipeline_against_master_list() {
+        let gate = NameFilter {
+            disabled: vec![],
+            only: vec!["ghost".into()],
+            ..Default::default()
+        };
+        let err = gate
+            .validate_names("profiles.web.pipelines", "pipeline", &["a"])
+            .expect_err("an unknown pipeline name must be rejected");
+        assert!(
+            err.contains("ghost"),
+            "the error must name the unknown pipeline, got: {err}"
+        );
+        assert!(
+            err.contains("Known pipelines: a"),
+            "the error must list the known pipeline names, got: {err}"
+        );
+    }
+
+    // =========================================================================
+    // THE consistency pin.
+    //
+    // Project rule: "the same three keys (`enabled`, `disabled`, `only`)
+    // mean the same thing for tools, skills and pipelines". This table is
+    // the enforcement mechanism for that rule.
+    // =========================================================================
+
+    /// THE consistency pin: one table of `NameFilter` cases, run against
+    /// every surface a filter reaches, asserting identical outcomes.
+    ///
+    /// What is REALLY exercised here:
+    /// 1. **The shared predicate** — `NameFilter::allows`, the exact method
+    ///    all three call sites consume.
+    /// 2. **The skills seam (real)** — `SkillRegistry::to_system_prompt_section_filtered`,
+    ///    the production consumer of a role's `skills:` filter, over a
+    ///    registry holding exactly the skills `x` and `y`.
+    /// 3. **The pipelines seam (real)** — `apply_profile` over a config
+    ///    declaring pipelines `x` and `y`, the production consumer of a
+    ///    profile's `pipelines:` gate. RED until `apply_profile` learns the
+    ///    pending `cfg.pipelines.retain(|p| filter.allows(&p.name))`.
+    ///
+    /// What is NOT exercised here: **the tools seam** —
+    /// `add_builtin_tools`'s `tools.retain(|t| tools_filter.allows(&t.name()))`
+    /// is private to `src/providers/mod.rs` and needs a rig agent builder,
+    /// so it is pinned by the companion test
+    /// `tools_seam_honours_name_filter_enabled_only_and_disabled` there,
+    /// which drives the real `add_builtin_tools` with the mock model for
+    /// the `enabled: false` / `only` / `disabled` shapes.
+    #[test]
+    fn name_filter_semantics_are_identical_for_tools_skills_and_pipelines() {
+        use crate::skills::SkillRegistry;
+
+        struct Row {
+            enabled: bool,
+            disabled: &'static [&'static str],
+            only: &'static [&'static str],
+            expected_x: bool,
+            expected_y: bool,
+        }
+
+        let rows = [
+            Row {
+                enabled: true,
+                disabled: &[],
+                only: &[],
+                expected_x: true,
+                expected_y: true,
+            },
+            Row {
+                enabled: true,
+                disabled: &["x"],
+                only: &[],
+                expected_x: false,
+                expected_y: true,
+            },
+            Row {
+                enabled: true,
+                disabled: &["y"],
+                only: &[],
+                expected_x: true,
+                expected_y: false,
+            },
+            Row {
+                enabled: true,
+                disabled: &[],
+                only: &["x"],
+                expected_x: true,
+                expected_y: false,
+            },
+            Row {
+                enabled: true,
+                disabled: &[],
+                only: &["y"],
+                expected_x: false,
+                expected_y: true,
+            },
+            // The anti-astonishment row: an EMPTY allowlist is a no-op,
+            // never "none".
+            Row {
+                enabled: true,
+                disabled: &[],
+                only: &[],
+                expected_x: true,
+                expected_y: true,
+            },
+            Row {
+                enabled: false,
+                disabled: &[],
+                only: &[],
+                expected_x: false,
+                expected_y: false,
+            },
+            Row {
+                enabled: false,
+                disabled: &[],
+                only: &["x"],
+                expected_x: false,
+                expected_y: false,
+            },
+        ];
+
+        // Skills fixture: a registry holding exactly the skills `x` and `y`
+        // (the real `load_from_directory` seam, same shape as the
+        // discovery.rs fixtures).
+        let tmp = tempfile::tempdir().expect("skills tmpdir");
+        for (name, desc) in [("x", "X"), ("y", "Y")] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("mkdir skill dir");
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {desc}\n---\n# Body\n"),
+            )
+            .expect("write SKILL.md");
+        }
+        let mut registry = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        registry.load_from_directory(tmp.path(), &mut warnings);
+        assert_eq!(registry.len(), 2, "fixture: both skills must load");
+
+        for (i, row) in rows.iter().enumerate() {
+            let filter = NameFilter {
+                enabled: row.enabled,
+                disabled: row.disabled.iter().map(|s| s.to_string()).collect(),
+                only: row.only.iter().map(|s| s.to_string()).collect(),
+            };
+            let ctx = format!(
+                "row {i} (enabled={} disabled={:?} only={:?})",
+                row.enabled, row.disabled, row.only
+            );
+
+            // Surface 1: the shared predicate every call site consumes.
+            assert_eq!(filter.allows("x"), row.expected_x, "{ctx}: `x`");
+            assert_eq!(filter.allows("y"), row.expected_y, "{ctx}: `y`");
+
+            // Surface 2: the real skills seam — a role's `skills:` filter.
+            let section = registry.to_system_prompt_section_filtered(&filter);
+            assert_eq!(
+                section.contains("- x: "),
+                row.expected_x,
+                "{ctx}: skills seam must show `x` iff the predicate allows it"
+            );
+            assert_eq!(
+                section.contains("- y: "),
+                row.expected_y,
+                "{ctx}: skills seam must show `y` iff the predicate allows it"
+            );
+            if !row.enabled {
+                assert!(
+                    section.is_empty(),
+                    "{ctx}: enabled=false must yield no skills section at all"
+                );
+            }
+
+            // Surface 3: the real pipelines seam — a profile's `pipelines:`
+            // gate over a config declaring pipelines `x` and `y`.
+            let master = Config {
+                pipelines: vec![pipeline("x"), pipeline("y")],
+                profiles: HashMap::from([(
+                    "gate".to_string(),
+                    Profile {
+                        tools: None,
+                        memory: None,
+                        pipelines: Some(filter.clone()),
+                        system_prompt: None,
+                    },
+                )]),
+                ..Config::default()
+            };
+            let effective = apply_profile(master, Some("gate")).expect("profile exists");
+            let names: Vec<&str> = effective
+                .pipelines
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect();
+            let mut expected: Vec<&str> = Vec::new();
+            if row.expected_x {
+                expected.push("x");
+            }
+            if row.expected_y {
+                expected.push("y");
+            }
+            assert_eq!(
+                names, expected,
+                "{ctx}: pipelines seam must keep exactly the allowed names, in declaration order"
+            );
+        }
     }
 }

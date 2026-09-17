@@ -138,8 +138,8 @@ impl SkillRegistry {
     /// Like [`Self::to_system_prompt_section`], but only lists skills the
     /// filter shows — the per-role sub-agent view. Empty when the filter
     /// hides every skill (or none are registered).
-    pub fn to_system_prompt_section_filtered(&self, filter: &crate::config::SkillFilter) -> String {
-        self.section_where(|s| filter.shows(&s.name))
+    pub fn to_system_prompt_section_filtered(&self, filter: &crate::config::NameFilter) -> String {
+        self.section_where(|s| filter.allows(&s.name))
     }
 
     /// Shared body: render the skills section over the skills passing `keep`.
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn filtered_section_respects_skill_filter() {
-        use crate::config::SkillFilter;
+        use crate::config::NameFilter;
         let tmp = TempDir::new().unwrap();
         write_skill(
             tmp.path(),
@@ -260,7 +260,7 @@ mod tests {
         registry.load_from_directory(tmp.path(), &mut warnings);
 
         // Allowlist: only `alpha` is shown.
-        let only_alpha = SkillFilter {
+        let only_alpha = NameFilter {
             enabled: true,
             disabled: vec![],
             only: vec!["alpha".into()],
@@ -270,7 +270,7 @@ mod tests {
         assert!(!section.contains("beta"), "beta must be filtered out");
 
         // Master switch off: empty section, no header.
-        let none = SkillFilter {
+        let none = NameFilter {
             enabled: false,
             ..Default::default()
         };

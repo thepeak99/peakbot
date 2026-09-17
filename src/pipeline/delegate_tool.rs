@@ -39,7 +39,7 @@ pub struct SubAgentDeps {
     pub registry: Arc<SubAgentRegistry>,
     pub searxng: Option<SearXngConfig>,
     pub bash_config: BashConfig,
-    pub tools_filter: crate::config::ToolsConfig,
+    pub tools_filter: crate::config::NameFilter,
     pub state_manager: Arc<StateManager>,
     pub shell_kind: Option<ShellKind>,
     pub vector_store: Option<crate::vector::VectorStore>,
@@ -68,7 +68,7 @@ fn build_sub_agent_preamble(
     shell_kind: Option<&ShellKind>,
     cwd: &std::path::Path,
     skills: &crate::skills::SkillRegistry,
-    filter: &crate::config::SkillFilter,
+    filter: &crate::config::NameFilter,
     bg: &[BgListEntry],
     agents_md: bool,
 ) -> String {
@@ -563,7 +563,7 @@ mod tests {
             registry: Arc::new(registry),
             searxng: None,
             bash_config: BashConfig::default(),
-            tools_filter: crate::config::ToolsConfig::default(),
+            tools_filter: crate::config::NameFilter::default(),
             state_manager: StateManager::new_arc(),
             shell_kind: None,
             vector_store: None,
@@ -801,7 +801,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("agents.md"), "SENTINEL-SUBAGENT-CONTEXT").unwrap();
         let skills = crate::skills::SkillRegistry::default();
-        let filter = crate::config::SkillFilter::default();
+        let filter = crate::config::NameFilter::default();
 
         let opted_in =
             build_sub_agent_preamble("role prompt", None, dir.path(), &skills, &filter, &[], true);
@@ -832,7 +832,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("agents.md"), "SENTINEL-SUBAGENT-CONTEXT").unwrap();
         let skills = crate::skills::SkillRegistry::default();
-        let filter = crate::config::SkillFilter::default();
+        let filter = crate::config::NameFilter::default();
         let bg = vec![running(4, "npm run dev", Some("dev-server"))];
 
         let preamble =
@@ -855,7 +855,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("agents.md"), "SENTINEL-SUBAGENT-CONTEXT").unwrap();
         let skills = crate::skills::SkillRegistry::default();
-        let filter = crate::config::SkillFilter::default();
+        let filter = crate::config::NameFilter::default();
         // Exited entries render as "" too, so they must cost nothing either.
         let bg = vec![exited(1, "old-thing", None)];
 
@@ -888,7 +888,7 @@ mod tests {
     fn p2_sub_agent_preamble_does_not_include_built_in_crusader_persona() {
         let dir = tempfile::tempdir().unwrap();
         let skills = crate::skills::SkillRegistry::default();
-        let filter = crate::config::SkillFilter::default();
+        let filter = crate::config::NameFilter::default();
 
         let preamble = build_sub_agent_preamble(
             "ROLE-PROMPT-SENTINEL",
@@ -922,7 +922,7 @@ mod tests {
     fn p2_sub_agent_preamble_only_carries_the_role_own_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let skills = crate::skills::SkillRegistry::default();
-        let filter = crate::config::SkillFilter::default();
+        let filter = crate::config::NameFilter::default();
 
         // A role prompt that itself looks like a persona. The preamble
         // must start with this text and contain no other persona-shaped
@@ -955,7 +955,7 @@ mod tests {
             Option<&crate::ShellKind>,
             &std::path::Path,
             &crate::skills::SkillRegistry,
-            &crate::config::SkillFilter,
+            &crate::config::NameFilter,
             &[BgListEntry],
             bool,
         ) -> String;

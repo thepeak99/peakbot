@@ -314,7 +314,7 @@ fn delegate_tool_for_registry(registry: std::sync::Arc<SubAgentRegistry>) -> Del
         registry,
         searxng: None,
         bash_config: peakbot::config::BashConfig::default(),
-        tools_filter: peakbot::config::ToolsConfig::default(),
+        tools_filter: peakbot::config::NameFilter::default(),
         state_manager: StateManager::new_arc(),
         shell_kind: None,
         vector_store: None,

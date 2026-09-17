@@ -86,6 +86,109 @@ Or set the provider via environment variable:
 export PROVIDER='{"type":"openrouter","api_key":"sk-or-v1-xxx","model":"anthropic/claude-3.7-sonnet"}'
 ```
 
+### Profiles
+
+A **profile** is a named config overlay declared in the master config's
+`profiles:` map and selected at boot with `--profile <name>`. It is applied
+**last** — after the per-repo `.peakbot/config.yaml` merge — and re-applied on
+every session-verb reload (`/cd`, `/new`, `/model`, `/load`), so it is a
+ceiling a checked-out repo cannot void. Profiles are master-config only; a
+`profiles:` block in a per-repo config is ignored with a boot warning.
+
+A profile can override four keys: `tools:`, `memory:`, `pipelines:`, and
+`system_prompt:`. The first three each use the shared filter documented in
+[Tool, Skill & Pipeline Filters](#tool-skill--pipeline-filters); the fourth is
+its own thing, documented in [System Prompt](#system-prompt) below.
+
+```yaml
+profiles:
+  locked:
+    tools:
+      disabled: [bash]
+    pipelines:
+      enabled: false
+```
+
+The `pipelines:` gate names pipelines from the **master config's** `pipelines:`
+list — a gate can only name teams the master declares, and an unknown name is a
+boot error listing the known ones. The gate caps the *effective* list, so a
+per-repo config's own pipelines are still capped, and `enabled: false` blocks
+every team regardless of where it was declared. If the gate leaves you with no
+pipelines, PeakBot runs single-agent; a conversation whose selected pipeline
+was gated away continues without one. Invalid filters are fatal at boot (on a
+session-verb reload PeakBot warns and keeps the previous config). When a
+profile is active, boot prints one line to stderr:
+
+```
+ℹ profile 'web' active — overrides: tools, memory, pipelines.
+```
+
+### System Prompt
+
+The built-in system prompt has two parts: a short **persona** paragraph (voice
+and tone) followed by **core tool guidance** on how to use the built-in tools.
+Two keys — valid at the top level of a config file and inside a profile —
+replace one or the other:
+
+- `persona:` replaces only the persona; the built-in tool guidance still
+  follows it.
+- `system_prompt:` replaces the persona **and** the tool guidance — the
+  entire static head of the prompt. Everything dynamic still follows it: the
+  memory section (when enabled), skills, the environment block, `agents.md`,
+  and, for an orchestrator, `# Orchestrator Instructions` from the pipeline's
+  own prompt.
+
+Reach for `system_prompt:` when your deployment's toolset makes the built-in
+guidance wrong — roughly 69% of the built-in core prompt is coaching for
+`bash`, `think`, and `todo`, so a research-only or web-only profile that
+disables those tools shouldn't ship advice for using them. If you only want a
+different voice, use `persona:` instead — it keeps the built-in guidance
+current as PeakBot's tools evolve across releases.
+
+`persona:` and `system_prompt:` fill the **same slot** and are mutually
+exclusive: whichever key a source sets takes the slot and clears its sibling,
+so a per-repo `persona:` overrides a master `system_prompt:` and vice versa;
+a profile is applied last, so its choice is the ceiling. Setting both keys in
+the same file is a config error naming the file, as is a blank or
+whitespace-only `system_prompt:` — remove the key to get the built-in prompt.
+
+A `system_prompt:` also outranks a multi-agent pipeline's own orchestrator
+persona — the deployment's choice is a ceiling the team cannot override —
+while the pipeline's own `orchestrator.prompt` still appends afterward as
+`# Orchestrator Instructions`. Sub-agents are unaffected: a role's `prompt:`
+is already its entire preamble.
+
+```yaml
+profiles:
+  research:
+    system_prompt: |
+      You are a research assistant. You search the web and summarise findings
+      with citations. You do not write or execute code.
+    tools:
+      only: [think, todo, web_search, fetch_page, fetch_url]
+    memory:
+      enabled: false
+    pipelines:
+      enabled: false
+```
+
+### Tool, Skill & Pipeline Filters
+
+`tools:` in the config, a role's `skills:`, and a profile's `pipelines:` all
+share one filter with one meaning:
+
+- `only:` — allowlist. Only the named entries survive.
+- `disabled:` — blocklist. The named entries are removed.
+- Setting both `only:` and `disabled:` is a config error.
+- An empty list, or no filter at all, means **no filtering** — everything is
+  allowed. An empty `only:` never means "none"; use `enabled: false` for that.
+- `enabled: false` means **nothing is allowed** — the way to say "no built-in
+  tools" or "single-agent only, no pipelines".
+
+`tools:` newly accepts `enabled:` (it previously had no way to say "no tools"
+short of listing every tool in `disabled:`). Existing `tools:` and `skills:`
+configs behave exactly as before.
+
 ### Run
 
 ```bash

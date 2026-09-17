@@ -42,8 +42,8 @@ pub mod vision;
 pub use config::{
     AgentDefinition, AnthropicConfig, BashConfig, Config, ContextConfig, ConversationConfig,
     LoadedConfig, McpServerConfig, McpTransportType, ModelEntry, ModelRegistry, OllamaConfig,
-    OpenRouterConfig, PipelineConfig, ProviderConfig, ProviderEntry, ProviderType, RegistryError,
-    ResolvedModel, RetryConfig, SearXngConfig, VectorDbConfig, get_config_file_path,
+    OpenRouterConfig, PipelineConfig, PromptHead, ProviderConfig, ProviderEntry, ProviderType,
+    RegistryError, ResolvedModel, RetryConfig, SearXngConfig, VectorDbConfig, get_config_file_path,
 };
 use context_manager::ContextManager;
 pub use context_manager::{CompactionResult, auto_detect_context_size};
@@ -439,16 +439,24 @@ pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
 /// section is omitted so the model is never told to read/update memory.md.
 ///
 /// `subagents_active` selects the recipe: when true (orchestrator)
-/// `orchestrator_prompt` (if set) is appended as extra framing. The core tool
-/// guidance, memory, skills, env block, and agents.md are shared by both.
+/// `orchestrator_prompt` (if set) is appended as extra framing. Memory,
+/// skills, env block and agents.md are shared by both recipes, as is the core
+/// tool guidance unless `head` replaces it (see below).
 ///
-/// `persona`, when set, leads **either** recipe (multi-pipeline amendment 1: a
-/// pipeline's `orchestrator.persona` replaces the global one; omitted, the
-/// global `persona:` applies to the orchestrator unchanged). `None` /
-/// whitespace-only counts as absent, and only then does `subagents_active`
-/// matter: the agentless recipe falls back to the built-in crusader persona,
-/// while the orchestrator leads with the core guidance — the crusader would
-/// confuse an agent whose job is to coordinate a team.
+/// `head` fills the static head of the prompt and leads **either** recipe:
+///
+/// - [`PromptHead::Persona`] replaces the built-in persona, the core tool
+///   guidance still follows (multi-pipeline amendment 1: a pipeline's
+///   `orchestrator.persona` replaces the global one; omitted, the global
+///   `persona:` applies to the orchestrator unchanged).
+/// - [`PromptHead::Full`] (config `system_prompt:`) replaces the persona AND
+///   the core guidance — a deployment that disables `bash`/`think`/`todo`
+///   would otherwise ship built-in coaching for tools the model cannot call.
+///
+/// `None` / whitespace-only counts as absent, and only then does
+/// `subagents_active` matter: the agentless recipe falls back to the built-in
+/// crusader persona, while the orchestrator leads with the core guidance — the
+/// crusader would confuse an agent whose job is to coordinate a team.
 pub fn build_system_prompt(
     skills: &SkillRegistry,
     shell_kind: Option<&ShellKind>,
@@ -456,25 +464,38 @@ pub fn build_system_prompt(
     memory_enabled: bool,
     subagents_active: bool,
     orchestrator_prompt: Option<&str>,
-    persona: Option<&str>,
+    head: Option<&PromptHead>,
 ) -> String {
     let mut prompt = String::new();
 
-    match persona.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(p) => {
-            prompt.push_str(p);
-            // Mirrors the built-in persona's trailing single `\n` so either
+    // The trim-and-filter guards repeat `Config::prompt_head`'s discipline
+    // because a pipeline's `orchestrator.persona` reaches this parameter
+    // unvalidated: whitespace-only is absent, at the accessor AND here.
+    match head {
+        // A full head owns everything down to the dynamic sections: no
+        // built-in persona, and deliberately no `SYSTEM_PROMPT_CORE`.
+        Some(PromptHead::Full(s)) if !s.trim().is_empty() => {
+            prompt.push_str(s.trim());
+            prompt.push('\n');
+        }
+        Some(PromptHead::Persona(s)) if !s.trim().is_empty() => {
+            prompt.push_str(s.trim());
+            // Mirrors the built-in persona's trailing single `\n` so every
             // branch produces the same byte boundary before
             // `SYSTEM_PROMPT_CORE`.
             prompt.push('\n');
+            prompt.push_str(SYSTEM_PROMPT_CORE);
         }
         // The built-in crusader is the *agentless* default only. An
-        // orchestrator with no configured persona leads with the core
+        // orchestrator with no configured head leads with the core
         // guidance, exactly as it did before pipelines gained a `persona:`.
-        None if !subagents_active => prompt.push_str(SYSTEM_PROMPT_PERSONA),
-        None => {}
+        _ => {
+            if !subagents_active {
+                prompt.push_str(SYSTEM_PROMPT_PERSONA);
+            }
+            prompt.push_str(SYSTEM_PROMPT_CORE);
+        }
     }
-    prompt.push_str(SYSTEM_PROMPT_CORE);
 
     if memory_enabled {
         prompt.push_str(MEMORY_PROMPT_SECTION);
@@ -493,6 +514,37 @@ pub fn build_system_prompt(
     debug!("System prompt:\n {}", prompt);
 
     prompt
+}
+
+/// Resolve the static prompt head from the two sources that can supply one:
+/// the config (`system_prompt:` / `persona:`, already collapsed into a single
+/// slot by [`Config::prompt_head`]) and the selected pipeline's
+/// `orchestrator.persona`.
+///
+/// Precedence:
+///
+/// 1. A config [`PromptHead::Full`] outranks a pipeline persona — a full
+///    `system_prompt:` is a deployment ceiling, and a profile that sets it has
+///    already been announced by the boot banner.
+/// 2. Otherwise the selected pipeline's `orchestrator.persona` replaces the
+///    global one (multi-pipeline amendment 1).
+/// 3. Otherwise the config's own head, or `None` for the built-in.
+///
+/// Lives here, next to [`build_system_prompt`], because it is prompt-
+/// composition policy over a pipeline value the config layer knows nothing
+/// about — and because both production call sites (session boot and the
+/// `/model` rebuild seam) must derive it identically or they drift.
+pub fn resolve_prompt_head(
+    config_head: Option<&PromptHead>,
+    pipeline_persona: Option<&str>,
+) -> Option<PromptHead> {
+    match config_head {
+        Some(full @ PromptHead::Full(_)) => Some(full.clone()),
+        _ => match pipeline_persona {
+            Some(p) => Some(PromptHead::Persona(p.to_string())),
+            None => config_head.cloned(),
+        },
+    }
 }
 
 /// The `**Shell**:` env-block line, derived from the detected shell.
@@ -615,14 +667,15 @@ pub struct RebuildContext {
     pub memory_enabled: bool,
     /// Built-in tool filter (blocklist/allowlist). Refreshed on config reload;
     /// consumed by `add_builtin_tools` when the agent is rebuilt.
-    pub tools_filter: crate::config::ToolsConfig,
-    /// The configured persona (from `persona:`). Replaces the built-in persona
-    /// at the head of the agentless recipe. A selected pipeline's
-    /// `orchestrator.persona` overrides it for that team (amendment 1).
-    /// Live-reloadable via `/new`, `/model`, `/cd`, `/load` — the rebuild seam
-    /// recomputes the prompt with this value, and `persona` has no live handles
-    /// behind it (just a string).
-    pub persona: Option<String>,
+    pub tools_filter: crate::config::NameFilter,
+    /// The configured static prompt head (`system_prompt:` or `persona:`,
+    /// collapsed to one slot by `Config::prompt_head`). A selected pipeline's
+    /// `orchestrator.persona` overrides a `Persona` head for that team
+    /// (amendment 1); a `Full` head outranks even that. Live-reloadable via
+    /// `/new`, `/model`, `/cd`, `/load` — the rebuild seam recomputes the
+    /// prompt with this value, and a head has no live handles behind it (just
+    /// a string).
+    pub prompt_head: Option<crate::config::PromptHead>,
 }
 
 /// Shared cell holding the *currently active* SessionHook. Replaced
@@ -1947,7 +2000,7 @@ impl AgentRunner {
     ) -> Vec<String> {
         let mut warnings = Vec::new();
         // Boundary parse — keep previous config on any failure.
-        let fresh = match Config::reload_for(session_cwd) {
+        let fresh = match config.reload_for(session_cwd) {
             Ok(c) => c,
             Err(reason) => {
                 warnings.push(format!(
@@ -1968,16 +2021,10 @@ impl AgentRunner {
             }
         };
 
-        // Tool filter is a boundary parse — an invalid `tools:` block (both
-        // lists set, or an unknown tool name) keeps the previous config.
-        if let Err(e) = fresh.tools.validate() {
-            warnings.push(format!("⚠ config reload: {e} — keeping previous config."));
-            return warnings;
-        }
-
-        // Same boundary for the wall-clock budgets: a zero or absurd value
-        // would take effect on the very next tool call.
-        if let Err(e) = fresh.timeouts.validate() {
+        // Consolidated boundary parse (§1.6): tools filter + wall-clock
+        // budgets, over the effective (post-profile) config. Keeps the
+        // previous config on any failure.
+        if let Err(e) = fresh.validate() {
             warnings.push(format!("⚠ config reload: {e} — keeping previous config."));
             return warnings;
         }
@@ -2042,9 +2089,10 @@ impl AgentRunner {
         ctx.searxng_config = config.searxng.clone();
         ctx.max_turns = config.agent_max_turns;
         ctx.bash_config = config.bash.clone();
-        // `persona` is live-reloadable (no handles behind it). Mirroring it
-        // here is what makes `/new` after a config edit pick up the new text.
-        ctx.persona = config.persona.clone();
+        // The prompt head is live-reloadable (no handles behind it). Mirroring
+        // it here is what makes `/new` after a config edit pick up new
+        // `persona:` / `system_prompt:` text.
+        ctx.prompt_head = config.prompt_head();
 
         // Pipelines + catalogue — stamped together (I-4). The catalogue is
         // always refreshed on a successful build, even when the names are
@@ -2158,7 +2206,13 @@ impl AgentRunner {
         // Recompute the prompt here — the single seam — so the orchestrator
         // framing always tracks the current selection and cwd. A team's own
         // `orchestrator.persona` replaces the global persona for it
-        // (amendment 1).
+        // (amendment 1), unless the config pins a full `system_prompt:`.
+        let head = resolve_prompt_head(
+            ctx.prompt_head.as_ref(),
+            active
+                .as_ref()
+                .and_then(|p| p.orchestrator_persona.as_deref()),
+        );
         ctx.system_prompt = build_system_prompt(
             &ctx.skills,
             ctx.shell_kind.as_ref(),
@@ -2168,10 +2222,7 @@ impl AgentRunner {
             active
                 .as_ref()
                 .and_then(|p| p.orchestrator_prompt.as_deref()),
-            active
-                .as_ref()
-                .and_then(|p| p.orchestrator_persona.as_deref())
-                .or(ctx.persona.as_deref()),
+            head.as_ref(),
         );
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
@@ -4961,8 +5012,8 @@ mod tests {
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
-            persona: None,
+            tools_filter: crate::config::NameFilter::default(),
+            prompt_head: None,
         }
     }
 
@@ -7039,8 +7090,8 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
-            persona: None,
+            tools_filter: crate::config::NameFilter::default(),
+            prompt_head: None,
         };
 
         let warning = super::reconcile_pipeline_selection(&ctx, &sm)
@@ -7099,8 +7150,8 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
-            persona: None,
+            tools_filter: crate::config::NameFilter::default(),
+            prompt_head: None,
         };
 
         let chat_len_before = sm.get_state().chat.messages.len();
@@ -7143,8 +7194,8 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
-            persona: None,
+            tools_filter: crate::config::NameFilter::default(),
+            prompt_head: None,
         };
 
         let chat_len_before = sm.get_state().chat.messages.len();
@@ -7300,8 +7351,8 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
-            tools_filter: crate::config::ToolsConfig::default(),
-            persona: None,
+            tools_filter: crate::config::NameFilter::default(),
+            prompt_head: None,
         };
 
         // This is the seam pin: the EXACT lookup the rebuild seam does

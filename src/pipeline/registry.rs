@@ -6,7 +6,7 @@
 //! [`crate::pipeline::SubAgentDeps`], which owns the orchestrator's build
 //! context (tools, env, event sink) — the registry itself stays lean.
 
-use crate::config::{Members, ModelRegistry, PipelineConfig, ResolvedModel, SkillFilter};
+use crate::config::{Members, ModelRegistry, NameFilter, PipelineConfig, ResolvedModel};
 use std::collections::HashMap;
 
 /// A role resolved against the model registry, ready to build.
@@ -19,7 +19,7 @@ pub(crate) struct ResolvedRole {
     pub(crate) model: ResolvedModel,
     pub(crate) prompt: String,
     pub(crate) env: Option<HashMap<String, String>>,
-    pub(crate) skills: SkillFilter,
+    pub(crate) skills: NameFilter,
     pub(crate) agents_md: bool,
 }
 
@@ -69,6 +69,7 @@ impl SubAgentRegistry {
         known_skills: &[String],
     ) -> Result<Self, SubAgentError> {
         let mut roles = HashMap::with_capacity(members.len());
+        let known: Vec<&str> = known_skills.iter().map(String::as_str).collect();
 
         for (name, def) in members.iter() {
             if name.is_empty() {
@@ -77,9 +78,11 @@ impl SubAgentRegistry {
             if def.prompt.is_empty() {
                 return Err(SubAgentError::EmptyPrompt(name.clone()));
             }
+            let skills_label = format!("pipeline.agents.{name}.skills");
             def.skills
-                .validate(name, known_skills)
-                .map_err(SubAgentError::BadSkillFilter)?;
+                .validate_shape(&skills_label)
+                .and_then(|()| def.skills.validate_names(&skills_label, "skill", &known))
+                .map_err(SubAgentError::BadNameFilter)?;
 
             // Omitted `model:` → the registry default.
             let alias = def
@@ -153,7 +156,7 @@ pub enum SubAgentError {
     },
 
     #[error("{0}")]
-    BadSkillFilter(String),
+    BadNameFilter(String),
 }
 
 #[cfg(test)]
@@ -208,7 +211,7 @@ mod tests {
             model: model.map(str::to_string),
             prompt: prompt.to_string(),
             env: None,
-            skills: crate::config::SkillFilter::default(),
+            skills: crate::config::NameFilter::default(),
             agents_md: false,
         }
     }
@@ -291,7 +294,7 @@ mod tests {
     #[test]
     fn unknown_skill_name_is_rejected() {
         let mut def = role(Some("flash"), "research");
-        def.skills = crate::config::SkillFilter {
+        def.skills = crate::config::NameFilter {
             enabled: true,
             disabled: vec![],
             only: vec!["ghost-skill".into()],
@@ -299,14 +302,14 @@ mod tests {
         let cfg = pipeline_with(vec![("researcher", def)]);
         let err = SubAgentRegistry::new(&cfg, &registry(), &["github".into()])
             .expect_err("unknown skill must fail construction");
-        assert!(matches!(err, SubAgentError::BadSkillFilter(_)));
+        assert!(matches!(err, SubAgentError::BadNameFilter(_)));
     }
 
     /// A valid `skills:` filter is stored through construction.
     #[test]
     fn role_skill_filter_is_stored() {
         let mut def = role(Some("flash"), "research");
-        def.skills = crate::config::SkillFilter {
+        def.skills = crate::config::NameFilter {
             enabled: true,
             disabled: vec![],
             only: vec!["github".into()],

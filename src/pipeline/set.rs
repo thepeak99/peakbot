@@ -1012,7 +1012,7 @@ pipelines:
 
     /// A role whose `skills:` filter names a skill that isn't in the
     /// caller's `known_skills` list MUST be rejected with
-    /// `PipelineSetError::SubAgent(SubAgentError::BadSkillFilter)`.
+    /// `PipelineSetError::SubAgent(SubAgentError::BadNameFilter)`.
     /// The same YAML + `Some(&["foo"])` must build cleanly. Together
     /// they pin the load-bearing rule: rebuild after the skill re-scan,
     /// because a role whose skill was just introduced in the target
@@ -1020,7 +1020,7 @@ pipelines:
     /// (the pre-reload snapshot).
     #[test]
     fn build_rejects_role_skill_filter_absent_from_known_skills() {
-        use crate::config::{AgentDefinition, Members, OrchestratorDef, PipelineDef, SkillFilter};
+        use crate::config::{AgentDefinition, Members, NameFilter, OrchestratorDef, PipelineDef};
         use crate::pipeline::PipelineSetError;
         use std::collections::HashMap;
 
@@ -1031,7 +1031,7 @@ pipelines:
                 model: None,
                 prompt: "writes docs".to_string(),
                 env: None,
-                skills: SkillFilter {
+                skills: NameFilter {
                     enabled: true,
                     disabled: vec![],
                     only: vec!["foo".into()],
@@ -1048,7 +1048,7 @@ pipelines:
             ..Config::default()
         };
 
-        // The known-skills list is EMPTY — `foo` is unknown → BadSkillFilter.
+        // The known-skills list is EMPTY — `foo` is unknown → BadNameFilter.
         // The error must be the SubAgent variant (the §3.4 validation table
         // names "Role problems | existing `SubAgentError` messages wrapped
         // with `pipeline '{name}':`"), NOT e.g. an `UnknownModel` or a
@@ -1059,11 +1059,11 @@ pipelines:
             PipelineSetError::SubAgent { ref source, .. } => {
                 use crate::pipeline::registry::SubAgentError;
                 assert!(
-                    matches!(source, SubAgentError::BadSkillFilter(_)),
-                    "the wrapped error must be BadSkillFilter; got: {source:?}"
+                    matches!(source, SubAgentError::BadNameFilter(_)),
+                    "the wrapped error must be BadNameFilter; got: {source:?}"
                 );
             }
-            other => panic!("expected SubAgent(BadSkillFilter), got: {other:?}"),
+            other => panic!("expected SubAgent(BadNameFilter), got: {other:?}"),
         }
 
         // Same call with the skill now in `known_skills` — must build.
@@ -1132,6 +1132,51 @@ pipelines:
             vec!["beta".to_string()],
             "the resolved set must contain exactly the per-repo pipeline (alpha was \
              overridden wholesale by the merge rule); got: {names:?}"
+        );
+    }
+
+    /// T9 — consumer pin (web Agents-panel catalogue): `PipelineSet::build`
+    /// over a `Config` whose `pipelines:` has ALREADY been narrowed (e.g. by
+    /// a profile's `apply_profile`) must surface exactly those entries, and
+    /// `infos()` must carry exactly those names. This is the read-side
+    /// contract the profile filter feeds: `build` iterates `cfg.pipelines`
+    /// verbatim, so a narrowed list cannot be re-expanded here.
+    ///
+    /// NOTE: GREEN today — it does NOT depend on the `apply_profile`
+    /// `pipelines` arm (it hands `build` an already-narrowed `Config`). It
+    /// pins the downstream consumer so a future `build` refactor that
+    /// re-derives the roster from somewhere other than `cfg.pipelines`
+    /// cannot silently un-narrow a profile-gated deployment.
+    #[test]
+    fn build_surfaces_exactly_the_narrowed_pipelines() {
+        // A config whose `pipelines:` was narrowed to just `beta` (as a
+        // profile `only: [beta]` would leave it).
+        let yaml = format!(
+            "{PROVIDERS}\
+pipelines:
+  - name: beta
+    orchestrator: {{}}
+    agents:
+      r:
+        prompt: p
+"
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).expect("narrowed config parses");
+
+        let set = PipelineSet::build(&cfg, &two_model_registry(), Some(&[]))
+            .expect("a narrowed config must build");
+
+        let names: Vec<String> = set.infos().into_iter().map(|i| i.name).collect();
+        assert_eq!(
+            names,
+            vec!["beta".to_string()],
+            "build must surface exactly the narrowed pipeline list (got {names:?})"
+        );
+        // And the set agrees with infos() on the roster.
+        assert_eq!(
+            set.names_joined(),
+            "beta",
+            "names_joined must match the narrowed roster"
         );
     }
 }
