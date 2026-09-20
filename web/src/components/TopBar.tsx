@@ -1,4 +1,3 @@
-import type { SessionStats } from "../types";
 import type {
   ConversationSummary,
   DirListing,
@@ -14,9 +13,8 @@ import type { NotifyPermission } from "../useTaskNotifications";
 
 // Top status bar. Sessions trio (conversations + model + cwd) live here on
 // lg+ and migrate to the BottomBar on smaller screens. Right side carries the
-// working spinner, tokens/cost readout, and connection indicator.
+// working spinner and connection indicator.
 export function TopBar({
-  stats,
   isRunning,
   connected,
   pendingInput,
@@ -36,7 +34,6 @@ export function TopBar({
   onToggleNotify,
   lockedReason = null,
 }: {
-  stats: SessionStats | null;
   isRunning: boolean;
   connected: boolean;
   pendingInput: number;
@@ -120,12 +117,6 @@ export function TopBar({
       )}
 
       <div className="ml-auto flex items-center gap-4 font-mono text-[11px] tabular-nums text-zinc-500">
-        {stats && (
-          <>
-            <span>{(stats.inputTokens + stats.outputTokens).toLocaleString()} tok</span>
-            <span>${stats.costUsd.toFixed(4)}</span>
-          </>
-        )}
         <ThemeToggle />
         <NotifyToggle
           enabled={notifyEnabled}

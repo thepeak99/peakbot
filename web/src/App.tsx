@@ -218,7 +218,6 @@ export function App() {
   return (
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-zinc-950 text-zinc-100">
     <TopBar
-        stats={stats}
         isRunning={isRunning}
         connected={connected}
         pendingInput={pendingInput}
