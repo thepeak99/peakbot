@@ -44,7 +44,6 @@ import type {
   InboundMessage,
   ModelInfo,
 } from "../state";
-import type { SessionStats } from "../types";
 import type { NotifyPermission } from "../useTaskNotifications";
 
 // React 19's `flushSync` checks `IS_REACT_ACT_ENVIRONMENT`; set once so the
@@ -62,7 +61,6 @@ beforeAll(() => {
 // post-implementation call site will, while still compiling loosely
 // enough for vitest's transform to run the file.
 interface TopBarPropsWithStatus {
-  stats: SessionStats | null;
   isRunning: boolean;
   statusMessage: string | null;
   connected: boolean;
@@ -84,7 +82,6 @@ interface TopBarPropsWithStatus {
 
 const baseProps: TopBarPropsWithStatus = {
   connected: true,
-  stats: null,
   models: [],
   activeAlias: "gpt",
   hasTranscript: false,
