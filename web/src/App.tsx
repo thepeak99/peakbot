@@ -296,6 +296,7 @@ export function App() {
             onStop={() => send({ type: "stop" })}
             watchingRole={scopeLabel}
             onClearWatch={() => setView("global")}
+            pendingInput={pendingInput}
           />
         </main>
       </div>

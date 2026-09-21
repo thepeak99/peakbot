@@ -8,7 +8,9 @@
 // mis-press away from sending a half-typed message, so the only path to send
 // is the button. Desktop (fine pointer) keeps Enter-to-send. The check is on
 // the *primary* input device, not the viewport width, so a Surface in laptop
-// mode with a keyboard attached still gets Enter-to-send.
+// mode with a keyboard attached still gets Enter-to-send. While the agent
+// runs, Stop and the dispatch button (labeled "Queue") sit side by side so
+// touch users can still queue mid-turn.
 //
 // A slash palette (fed by `GET /commands`, the single source of truth) opens
 // while the input is a bare `/name` prefix. It's a flat filtered list — pick
@@ -60,6 +62,7 @@ export function Composer({
   onStop,
   watchingRole,
   onClearWatch,
+  pendingInput,
 }: {
   isRunning: boolean;
   connected: boolean;
@@ -72,6 +75,9 @@ export function Composer({
   watchingRole?: string | null;
   /** Drop back to the global view (the notice's "Clear" link). */
   onClearWatch?: () => void;
+  /** Server-side queue depth (`AppState.pending_input_count`). While running,
+   * >0 means stopping would drop queued sends, so Stop warns about it. */
+  pendingInput: number;
 }) {
   const [text, setText] = useState("");
   const [selected, setSelected] = useState(0);
@@ -237,6 +243,15 @@ export function Composer({
 
   const canSend = connected && (!!text.trim() || images.length > 0);
 
+  // One label for the always-mounted dispatch button: mid-turn sends are
+  // queued server-side, so while running it reads "Queue".
+  const actionLabel = isRunning ? "Queue" : "Send";
+  // Stopping discards the queued sends, so the button says so when any exist.
+  const stopLabel =
+    pendingInput > 0
+      ? `Stop and discard ${pendingInput} queued message${pendingInput === 1 ? "" : "s"}`
+      : "Stop";
+
   return (
     <div className="border-t border-zinc-800 bg-zinc-950 p-3">
       <div className="mx-auto max-w-3xl">
@@ -365,26 +380,36 @@ export function Composer({
                 style={{ minHeight: MIN_H, maxHeight: MAX_H }}
                 className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed"
               />
-              {isRunning ? (
+              {isRunning && (
                 <button
                   onClick={onStop}
+                  title={stopLabel}
+                  aria-label={stopLabel}
                   className="flex items-center gap-1.5 rounded-lg bg-red-950/70 px-3 py-1.5 text-sm font-medium text-red-300 hover:bg-red-900/70"
                 >
                   <span className="h-2 w-2 rounded-sm bg-red-400" />
-                  Stop
-                </button>
-              ) : (
-                <button
-                  onClick={submit}
-                  disabled={!canSend}
-                  className="rounded-lg bg-emerald-700 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
-                >
-                  Send
+                  {/* Collapses to icon-only below sm so the row fits 360px;
+                      the aria-label above carries the name when it does. */}
+                  <span className="hidden sm:inline">Stop</span>
                 </button>
               )}
+              <button
+                onClick={submit}
+                disabled={!canSend}
+                className="rounded-lg bg-emerald-700 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
+              >
+                {actionLabel}
+              </button>
             </div>
           </div>
         </div>
+        {/* Always visible (unlike the lg hint row below): on touch there is no
+            hover/focus, so the discard warning can't ride Stop's aria-label. */}
+        {isRunning && pendingInput > 0 && (
+          <div className="mt-1.5 px-1 text-[11px] text-zinc-600">
+            ⏳ {pendingInput} queued · sent when this turn ends · Stop discards them
+          </div>
+        )}
         {attachError && (
           <div className="mt-1.5 px-1 text-[11px] text-red-400">{attachError}</div>
         )}
@@ -393,11 +418,11 @@ export function Composer({
         <div className="mt-1.5 hidden flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-zinc-600 lg:flex">
           {touchInput ? (
             <span>
-              <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Send</kbd> to dispatch
+              <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">{actionLabel}</kbd> to dispatch
             </span>
           ) : (
             <span>
-              <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Enter</kbd> to send
+              <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Enter</kbd> to {actionLabel.toLowerCase()}
             </span>
           )}
           <span>
