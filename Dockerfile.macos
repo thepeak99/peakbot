@@ -34,7 +34,7 @@ RUN npm run build
 # Stage `builder`: owns the entire cargo build, including the final binary
 # that the scratch stage exports. This stage MUST be referenced by the final
 # `COPY --from=`, otherwise BuildKit will prune it along with the binary.
-FROM ghcr.io/rust-cross/cargo-zigbuild:latest AS builder
+FROM ghcr.io/rust-cross/cargo-zigbuild:0.23.3 AS builder
 
 # Default to a universal2 fat binary; override with --build-arg TARGET=...
 ARG TARGET=universal2-apple-darwin
