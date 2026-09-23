@@ -3,6 +3,12 @@
 // commands ride send_message — the backend classifies them. Disabled until
 // the WebSocket connects.
 //
+// While a sub-agent is running and pausable (`subAgent.pausable`), a
+// Pause/Resume button sits next to Stop: it sends the explicit `{"type":
+// "pause"}` / `{"type":"resume"}` frames (never a toggle) and relabels by the
+// wire `pause` state — "⏸ Pause" while running, "▶ Resume" while pausing or
+// paused. Stop stays as is and aborts everything, paused sub-agent included.
+//
 // **Mobile / touch:** on a coarse-pointer device (phone, tablet, or laptop in
 // tablet mode) Enter inserts a newline — the on-screen return key is one
 // mis-press away from sending a half-typed message, so the only path to send
@@ -31,6 +37,7 @@
 
 import { useRef, useState, useLayoutEffect } from "react";
 import type { SlashCommand } from "../state";
+import type { SubAgentRun } from "../types";
 import { useMediaQuery } from "../useMediaQuery";
 
 // Mirror of vision.rs MAX_IMAGE_BYTES — fail fast before shipping a doomed frame.
@@ -58,6 +65,9 @@ export function Composer({
   commands,
   onSend,
   onStop,
+  subAgent = null,
+  onPause,
+  onResume,
   watchingRole,
   onClearWatch,
 }: {
@@ -66,6 +76,14 @@ export function Composer({
   commands: SlashCommand[];
   onSend: (text: string) => void;
   onStop: () => void;
+  /** The currently-running sub-agent (view type), or null when the turn is
+   * orchestrator-only / between sub-agent invocations. Drives the
+   * Pause/Resume button. */
+  subAgent?: SubAgentRun | null;
+  /** Send `{"type":"pause"}` — explicit command, not a toggle. */
+  onPause: () => void;
+  /** Send `{"type":"resume"}`. */
+  onResume: () => void;
   /** Label of the sub-agent view currently being watched, or null in the
    * global view. Purely a transcript filter — input always goes to the
    * orchestrator — so its only job here is to say so. */
@@ -366,13 +384,35 @@ export function Composer({
                 className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed"
               />
               {isRunning ? (
-                <button
-                  onClick={onStop}
-                  className="flex items-center gap-1.5 rounded-lg bg-red-950/70 px-3 py-1.5 text-sm font-medium text-red-300 hover:bg-red-900/70"
-                >
-                  <span className="h-2 w-2 rounded-sm bg-red-400" />
-                  Stop
-                </button>
+                <>
+                  {/* Pause/Resume: only while a pausable sub-agent is
+                      running. Explicit frames (pause / resume), never a
+                      toggle — the label tracks the wire pause state. Amber
+                      keeps it distinct from Stop's red (abort everything). */}
+                  {subAgent?.pausable && (
+                    <button
+                      onClick={subAgent.pause === "running" ? onPause : onResume}
+                      title={
+                        subAgent.pause === "running"
+                          ? "Pause sub-agent after its current step"
+                          : "Resume sub-agent"
+                      }
+                      className="flex items-center gap-1.5 rounded-lg bg-amber-950/70 px-3 py-1.5 text-sm font-medium text-amber-300 hover:bg-amber-900/70"
+                    >
+                      <span className="text-xs leading-none">
+                        {subAgent.pause === "running" ? "⏸" : "▶"}
+                      </span>
+                      {subAgent.pause === "running" ? "Pause" : "Resume"}
+                    </button>
+                  )}
+                  <button
+                    onClick={onStop}
+                    className="flex items-center gap-1.5 rounded-lg bg-red-950/70 px-3 py-1.5 text-sm font-medium text-red-300 hover:bg-red-900/70"
+                  >
+                    <span className="h-2 w-2 rounded-sm bg-red-400" />
+                    Stop
+                  </button>
+                </>
               ) : (
                 <button
                   onClick={submit}

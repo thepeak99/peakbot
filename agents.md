@@ -258,6 +258,8 @@ OAuth notes: first connect opens the browser; tokens cached under `~/.cache/peak
 | `/context` | Context usage |
 | `/compact` | Force context compaction |
 | `/bg` | List background processes |
+| `/pause` | Pause the running sub-agent at its next step (Ctrl+P in TUI) |
+| `/resume` | Resume a paused sub-agent (Ctrl+P in TUI) |
 | `/model [alias]` | List / switch models |
 | `/pipeline [name\|none]` | List / select / clear pipeline |
 | `/cd [path]` | Show / change session cwd |
@@ -539,6 +541,8 @@ A sub-agent's preamble (`build_sub_agent_preamble`, rebuilt fresh per delegation
 ### Tools, isolation, stop
 
 Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). No sandbox in v1 — a sub-agent can write and run bash. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together. With #183 the abort is **mid-tool**, not just at the next LLM boundary: dropping the orchestrator's turn future unwinds the in-flight delegation and its sub-tool (`bash`/etc.) along with it, so the sub-agent's PTY child dies via `PtyHandle::drop` at the same instant. There is no resumption path.
+
+Pause (`/pause`, `Ctrl+P` in the TUI) is a **cooperative** gate and sub-agents only: the sub-agent finishes the step it is on, then parks before its next LLM call or tool dispatch until `/resume` (or `Ctrl+P` again). Paused time never counts against `timeouts.delegate_secs`, and Ollama sub-agents (hookless) are not pausable. Stop is unchanged: it aborts everything **including a paused sub-agent** — the parked wait is part of the turn future, so it drops with it.
 
 Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`), unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`. The whole delegation is bounded by `timeouts.delegate_secs` (default 2 h); on expiry the transcript takes that same path — summarised and returned as `INTERRUPTED`, not discarded.
 

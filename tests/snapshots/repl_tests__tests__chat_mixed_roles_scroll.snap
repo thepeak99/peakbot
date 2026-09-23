@@ -1,6 +1,5 @@
 ---
 source: tests/repl_tests.rs
-assertion_line: 540
 expression: "lines.join(\"\\n\")"
 ---
 ┌ Chat Messages ────────────────────────────────────────────────────┐▲
@@ -13,4 +12,4 @@ expression: "lines.join(\"\\n\")"
 │                                                                   │║
 │                                                                   │║
 │                                                                   │║
-└trl+C exit · Ctrl+T tasks · Ctrl+B bash · F4 select · Ctrl+G multi ┘▼
+└rl+T tasks · Ctrl+B bash · F4 select · Ctrl+G multi · Ctrl+P pause ┘▼

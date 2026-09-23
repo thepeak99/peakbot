@@ -31,6 +31,7 @@ import {
   adaptBg,
   adaptContext,
   adaptStats,
+  adaptSubAgent,
   adaptWelcome,
   deriveSubAgentRoster,
   filesFromMessages,
@@ -138,6 +139,9 @@ export function App() {
       : flatTree(todosFromMessages(visibleMessages));
   const bg = state ? adaptBg(state) : [];
   const context = state ? adaptContext(state) : null;
+  // The running sub-agent (pause feature): null for orchestrator-only turns.
+  // Drives the TopBar chip and the Composer's Pause/Resume button.
+  const subAgent = state ? adaptSubAgent(state) : null;
   const files = filesFromMessages(visibleMessages);
   // API calls per lane, so the Agents panel can show them next to its message
   // counts — two different units that otherwise look like disagreement.
@@ -222,6 +226,7 @@ export function App() {
         connected={connected}
         pendingInput={pendingInput}
         statusMessage={state?.status_message ?? null}
+        subAgent={subAgent}
         models={models}
         activeAlias={stats?.modelAlias || activeAlias}
         hasTranscript={hasTranscript}
@@ -294,6 +299,9 @@ export function App() {
               transcriptRef.current?.jumpToLatest();
             }}
             onStop={() => send({ type: "stop" })}
+            subAgent={subAgent}
+            onPause={() => send({ type: "pause" })}
+            onResume={() => send({ type: "resume" })}
             watchingRole={scopeLabel}
             onClearWatch={() => setView("global")}
           />

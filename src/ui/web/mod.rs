@@ -745,6 +745,10 @@ fn dispatch_inbound(
             action_sender.send(UiAction::SendMessage(text)).is_ok()
         }
         Ok(InboundMessage::Stop) => action_sender.send(UiAction::RequestStop).is_ok(),
+        // Pause/resume the running sub-agent — same immediate path as Stop
+        // (the controller handles them without queueing behind the turn).
+        Ok(InboundMessage::Pause) => action_sender.send(UiAction::PauseSubAgent).is_ok(),
+        Ok(InboundMessage::Resume) => action_sender.send(UiAction::ResumeSubAgent).is_ok(),
         Ok(InboundMessage::SwitchModel { alias }) => {
             action_sender.send(UiAction::SwitchModel(alias)).is_ok()
         }
@@ -858,6 +862,81 @@ mod tests {
         assert!(msg.contains("already in use"));
         assert!(msg.contains("peakbot service status"));
         assert!(msg.contains("--bind"));
+    }
+
+    // --- Inbound dispatch: pause/resume → UiAction ---
+    //
+    // Contract for the pause/resume wire frames: `{"type":"pause"}` /
+    // `{"type":"resume"}` must surface as `UiAction::PauseSubAgent` /
+    // `ResumeSubAgent` on the controller's action channel — the same
+    // immediate path `{"type":"stop"}` takes for `RequestStop` (handled
+    // without queueing behind the running turn).
+
+    fn dispatch_fixture() -> (
+        tokio::sync::mpsc::UnboundedSender<UiAction>,
+        tokio::sync::mpsc::UnboundedReceiver<UiAction>,
+        OutboundTx,
+        Arc<StateManager>,
+        SessionRegistry,
+    ) {
+        let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = outbound_channel();
+        let sm = StateManager::new_arc();
+        let config = crate::config::Config::default();
+        let model_registry = Arc::new(
+            config
+                .build_model_registry()
+                .expect("legacy registry builds"),
+        );
+        let deps = SessionDeps {
+            config,
+            model_registry,
+            skills: crate::skills::SkillRegistry::new(),
+            skill_warnings: Vec::new(),
+            mcp_handles: Arc::new(Vec::new()),
+            searxng_config: None,
+            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
+            vector_store: None,
+            shell_kind: None,
+            storage: None,
+            mcp_tools_count: 0,
+            skills_count: 0,
+        };
+        let registry = SessionRegistry::new(Arc::new(deps));
+        (action_tx, action_rx, out_tx, sm, registry)
+    }
+
+    #[test]
+    fn inbound_pause_maps_to_pause_sub_agent_action() {
+        let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
+        let kept = dispatch_inbound(r#"{"type":"pause"}"#, &tx, &out_tx, &sm, &registry);
+        assert!(kept, "pause frame must keep the socket loop alive");
+        assert!(
+            matches!(rx.try_recv().unwrap(), UiAction::PauseSubAgent),
+            "pause frame must surface as UiAction::PauseSubAgent"
+        );
+    }
+
+    #[test]
+    fn inbound_resume_maps_to_resume_sub_agent_action() {
+        let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
+        let kept = dispatch_inbound(r#"{"type":"resume"}"#, &tx, &out_tx, &sm, &registry);
+        assert!(kept, "resume frame must keep the socket loop alive");
+        assert!(
+            matches!(rx.try_recv().unwrap(), UiAction::ResumeSubAgent),
+            "resume frame must surface as UiAction::ResumeSubAgent"
+        );
+    }
+
+    #[test]
+    fn inbound_stop_still_maps_to_request_stop() {
+        // Regression guard for the arm next door: the pause/resume arms
+        // landed between SendMessage and SwitchModel; Stop must not have
+        // drifted.
+        let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
+        let kept = dispatch_inbound(r#"{"type":"stop"}"#, &tx, &out_tx, &sm, &registry);
+        assert!(kept);
+        assert!(matches!(rx.try_recv().unwrap(), UiAction::RequestStop));
     }
 
     /// Spawn the real axum router on a random loopback port, then

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   adaptStats,
+  adaptSubAgent,
   assignDelegationCalls,
   deriveSubAgentRoster,
   filterMessagesByView,
@@ -672,5 +673,54 @@ describe("adaptStats reconciles session totals with the lane breakdown", () => {
     const stats = adaptStats(stateWithLanes([]));
     expect(stats.inputTokens).toBe(425);
     expect(stats.outputTokens).toBe(12);
+  });
+});
+
+// adaptSubAgent: the wire `sub_agent` is `#[serde(default)]` on the Rust
+// side, so pre-pause-subagents snapshots omit the field entirely. The
+// adapter must normalise absent (and explicit null) to null so callers see
+// one shape.
+describe("adaptSubAgent", () => {
+  function stateWithSubAgent(subAgent: unknown): AppState {
+    return {
+      chat: { messages: [] },
+      todo: { visible: false, items: [] },
+      stats: {
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_api_calls: 0,
+        total_cost: 0,
+        model: "m",
+        provider_name: "p",
+        model_alias: "a",
+      },
+      context: {
+        current_usage: 0,
+        window_size: 1000,
+        compaction_enabled: true,
+        compaction_threshold: 0.8,
+      },
+      conversation: null,
+      is_running: true,
+      is_loading: false,
+      welcome: null,
+      exit_requested: false,
+      bg: { recent_summaries: [] },
+      bash_panel: { kind: "idle" },
+      ...(subAgent === undefined ? {} : { sub_agent: subAgent }),
+    } as unknown as AppState;
+  }
+
+  it("passes a present sub_agent through", () => {
+    const run = { role: "researcher", pausable: true, pause: "paused" as const };
+    expect(adaptSubAgent(stateWithSubAgent(run))).toEqual(run);
+  });
+
+  it("normalises an absent sub_agent (old snapshot) to null", () => {
+    expect(adaptSubAgent(stateWithSubAgent(undefined))).toBeNull();
+  });
+
+  it("normalises an explicit null sub_agent to null", () => {
+    expect(adaptSubAgent(stateWithSubAgent(null))).toBeNull();
   });
 });

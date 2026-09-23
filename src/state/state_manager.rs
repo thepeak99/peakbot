@@ -44,6 +44,40 @@ pub struct StopTally {
     pub shell: bool,
 }
 
+/// RAII guard for a running sub-agent, returned by
+/// [`StateManager::begin_sub_agent`].
+///
+/// Holds a `Weak` handle to the `StateManager` so the guard can clear
+/// `AppState.sub_agent` back to `None` (and reset the pause gate) when the
+/// sub-agent run ends. A `Weak` (not `Arc`) so the guard can never keep a
+/// manager alive past its owner.
+///
+/// Dropping the guard aborts the parked-state watcher (if one was spawned)
+/// and calls [`StateManager::end_sub_agent`], so a finished, errored, or
+/// stopped sub-agent never leaves a stale slot, a stale pause request, or a
+/// live watcher behind.
+pub struct SubAgentRunGuard {
+    state_manager: Option<Weak<StateManager>>,
+    /// Mirrors gate park/unpark onto `AppState.sub_agent.pause` (Pausing →
+    /// Paused → Running). `None` when no tokio runtime was available at
+    /// `begin_sub_agent` (sync unit tests) — there the pause state only moves
+    /// via the explicit `request_pause`/`resume` calls.
+    pause_watcher: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SubAgentRunGuard {
+    fn drop(&mut self) {
+        // Abort the watcher first so it can't race `end_sub_agent`'s state
+        // write (a late upgrade would land after the slot is cleared).
+        if let Some(watcher) = self.pause_watcher.take() {
+            watcher.abort();
+        }
+        if let Some(sm) = self.state_manager.take().and_then(|w| w.upgrade()) {
+            sm.end_sub_agent();
+        }
+    }
+}
+
 /// Manages AppState and distributes updates to subscribed Views.
 /// Owns ContextManager internally; compaction triggers automatically.
 pub struct StateManager {
@@ -113,6 +147,14 @@ pub struct StateManager {
     /// so a Stop pressed while idle can never poison the next turn.
     /// Lock discipline: taken only synchronously, never across `.await`.
     turn_cancel: RwLock<CancellationToken>,
+
+    // ── Sub-agent pause gate (pause-subagents) ────────────────────────────────
+    /// Cooperative pause gate for the currently-running sub-agent. The gate
+    /// is shared (Arc) so parked checkpoints, the `StateManager` request
+    /// path, and the hook integration all observe the same request flag.
+    /// Reset when a sub-agent run ends (guard drop) so a fresh run starts
+    /// with no stale pause request.
+    pause_gate: Arc<crate::state::pause::PauseGate>,
 
     // ── Rendering Coalescence ─────────────────────────────────────────────────
     /// Monotonic counter for render coalescence — see `slow-messages.md` §4.4.
@@ -185,6 +227,7 @@ impl StateManager {
             // re-mints on every turn start (D-D / invariant I1), so the
             // construction-time value is only read until the first turn.
             turn_cancel: RwLock::new(CancellationToken::new()),
+            pause_gate: Arc::new(crate::state::pause::PauseGate::new()),
             revision: AtomicU64::new(0),
             // Default `true` — matches `resolve_preserve_reasoning`'s default
             // (design §2.1: "Unset anywhere → `true`: on Anthropic, replaying
@@ -930,6 +973,147 @@ impl StateManager {
     /// pressed while idle cannot poison the next turn.
     pub fn turn_cancel_token(&self) -> CancellationToken {
         self.turn_cancel.read().unwrap().clone()
+    }
+
+    // ── Sub-agent pause (pause-subagents) ─────────────────────────────────────
+
+    /// The cooperative pause gate for the currently-running sub-agent.
+    ///
+    /// Shared (`Arc`) so the hook integration's checkpoints and the
+    /// `request_pause`/`resume` paths observe the same request flag.
+    /// Tests and the agent loop use this to inspect `is_pause_requested`.
+    pub fn pause_gate(&self) -> Arc<crate::state::pause::PauseGate> {
+        self.pause_gate.clone()
+    }
+
+    /// Mark a sub-agent as running and return a guard that clears the slot
+    /// (and resets the gate) when the run ends.
+    ///
+    /// Sets `AppState.sub_agent` to `Some { role, pausable, pause: Running }`
+    /// and notifies subscribers. The returned guard is the *sole* owner of
+    /// the slot's lifetime: dropping it (sub-agent finished, errored, or was
+    /// stopped) clears `sub_agent` to `None` and resets the pause gate so a
+    /// fresh run starts clean.
+    pub fn begin_sub_agent(&self, role: &str, pausable: bool) -> SubAgentRunGuard {
+        // A fresh run starts with no stale pause request or parked clock.
+        self.pause_gate.reset();
+        {
+            let mut state = self.state.write().unwrap();
+            state.sub_agent = Some(crate::ui::app_state::SubAgentRun {
+                role: role.to_string(),
+                pausable,
+                pause: crate::ui::app_state::PauseState::Running,
+            });
+            self.notify_update(&state);
+        }
+        // The guard holds a `Weak` so it can clear the slot on drop without
+        // keeping the manager alive. A bare `StateManager::new()` (no
+        // `self_ref`) yields a guard whose drop is a no-op — fine for the
+        // state-only paths; production always uses `new_arc`.
+        let weak = self.self_ref.read().unwrap().clone();
+        // Mirror actual park/unpark onto the UI (Pausing → Paused → Running)
+        // so the status can show `Paused`, not just `Pausing`. Spawned only
+        // when a runtime exists — sync unit tests have none, and there the
+        // pause state moves via `request_pause`/`resume` directly.
+        let pause_watcher = match (tokio::runtime::Handle::try_current(), weak.clone()) {
+            (Ok(handle), Some(sm_weak)) => {
+                let gate = self.pause_gate.clone();
+                Some(handle.spawn(async move {
+                    let mut rx = gate.subscribe_parked();
+                    while rx.changed().await.is_ok() {
+                        let parked = *rx.borrow_and_update();
+                        if let Some(sm) = sm_weak.upgrade() {
+                            sm.set_sub_agent_pause(parked);
+                        }
+                    }
+                }))
+            }
+            _ => None,
+        };
+        SubAgentRunGuard {
+            state_manager: weak,
+            pause_watcher,
+        }
+    }
+
+    /// Request the currently-running sub-agent pause at its next checkpoint.
+    ///
+    /// No-op if no sub-agent is running or it is not pausable. Otherwise
+    /// sets `AppState.sub_agent.pause` to `Pausing` and calls
+    /// [`PauseGate::request_pause`]. Idempotent.
+    pub fn request_pause(&self) {
+        let mut state = self.state.write().unwrap();
+        let Some(run) = state.sub_agent.as_mut() else {
+            return; // no sub-agent running
+        };
+        if !run.pausable {
+            return; // not pausable — ignore
+        }
+        if run.pause != crate::ui::app_state::PauseState::Running {
+            return; // already pausing or paused — idempotent
+        }
+        run.pause = crate::ui::app_state::PauseState::Pausing;
+        let snapshot = state.clone();
+        drop(state);
+        self.pause_gate.request_pause();
+        self.notify_update(&snapshot);
+    }
+
+    /// Resume a paused (or pausing) sub-agent.
+    ///
+    /// No-op if no sub-agent is running. Otherwise calls
+    /// [`PauseGate::resume`] and sets `AppState.sub_agent.pause` to
+    /// `Running`. Idempotent.
+    pub fn resume(&self) {
+        let mut state = self.state.write().unwrap();
+        let Some(run) = state.sub_agent.as_mut() else {
+            return; // no sub-agent running
+        };
+        if run.pause == crate::ui::app_state::PauseState::Running {
+            return; // already running — idempotent
+        }
+        run.pause = crate::ui::app_state::PauseState::Running;
+        let snapshot = state.clone();
+        drop(state);
+        self.pause_gate.resume();
+        self.notify_update(&snapshot);
+    }
+
+    /// Clear the sub-agent slot and reset the pause gate. Called by
+    /// [`SubAgentRunGuard::drop`]. Idempotent.
+    fn end_sub_agent(&self) {
+        let mut state = self.state.write().unwrap();
+        state.sub_agent = None;
+        let snapshot = state.clone();
+        drop(state);
+        self.pause_gate.reset();
+        self.notify_update(&snapshot);
+    }
+
+    /// Move the running sub-agent's pause state on an actual gate park/unpark:
+    /// park takes `Pausing` → `Paused`, unpark takes `Paused` → `Running`.
+    /// Called by the parked watcher spawned in [`Self::begin_sub_agent`];
+    /// no-op (no broadcast) when the slot is empty or the transition doesn't
+    /// apply.
+    fn set_sub_agent_pause(&self, parked: bool) {
+        let mut state = self.state.write().unwrap();
+        let Some(run) = state.sub_agent.as_mut() else {
+            return;
+        };
+        let changed = match (parked, run.pause) {
+            (true, crate::ui::app_state::PauseState::Pausing) => {
+                run.pause = crate::ui::app_state::PauseState::Paused;
+                true
+            }
+            (false, crate::ui::app_state::PauseState::Paused) => {
+                run.pause = crate::ui::app_state::PauseState::Running;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.notify_update(&state);
+        }
     }
 
     /// Signal the UI to quit on its next tick (the `/exit` command path).
@@ -8655,5 +8839,291 @@ mod tests {
             "a two-response run with replayable blocks MUST differ from the legacy rebuild — \
              that difference is the fix",
         );
+    }
+
+    // ── pause-subagents: StateManager sub-agent pause API ────────────────────
+    //
+    // These assert the contract the StateManager + gate must satisfy: the
+    // pause/resume lifecycle, idempotency, and the guard's RAII cleanup
+    // (clear slot + reset gate on drop).
+
+    use crate::ui::app_state::{PauseState, SubAgentRun};
+
+    /// request_pause with no sub-agent running is a no-op: the slot stays
+    /// `None` and the gate is never asked to pause.
+    #[test]
+    fn request_pause_with_no_sub_agent_is_a_noop() {
+        let sm = StateManager::new();
+        sm.request_pause();
+
+        assert_eq!(
+            sm.get_state().sub_agent,
+            None,
+            "no sub-agent running → sub_agent must stay None"
+        );
+        assert!(
+            !sm.pause_gate().is_pause_requested(),
+            "no sub-agent running → gate must not have a pause requested"
+        );
+    }
+
+    /// A non-pausable sub-agent ignores pause requests: state stays
+    /// `Running` and the gate is never asked.
+    #[test]
+    fn request_pause_on_non_pausable_sub_agent_is_a_noop() {
+        let sm = StateManager::new();
+        let guard = sm.begin_sub_agent("researcher", false);
+        sm.request_pause();
+
+        let state = sm.get_state();
+        assert_eq!(
+            state.sub_agent,
+            Some(SubAgentRun {
+                role: "researcher".to_string(),
+                pausable: false,
+                pause: PauseState::Running,
+            }),
+            "non-pausable sub-agent must stay Running after request_pause"
+        );
+        assert!(
+            !sm.pause_gate().is_pause_requested(),
+            "non-pausable sub-agent → gate must not have a pause requested"
+        );
+        drop(guard);
+    }
+
+    /// The full pause/resume lifecycle for a pausable sub-agent:
+    /// begin → Running; request_pause → Pausing + gate requested;
+    /// resume → Running + gate not requested. request_pause twice and
+    /// resume twice must be idempotent.
+    #[test]
+    fn pause_resume_lifecycle_is_idempotent() {
+        let sm = StateManager::new();
+        let guard = sm.begin_sub_agent("researcher", true);
+
+        // begin_sub_agent stamps the slot as Running.
+        assert_eq!(
+            sm.get_state().sub_agent,
+            Some(SubAgentRun {
+                role: "researcher".to_string(),
+                pausable: true,
+                pause: PauseState::Running,
+            })
+        );
+
+        // request_pause → Pausing + gate requested.
+        sm.request_pause();
+        assert_eq!(
+            sm.get_state().sub_agent.as_ref().unwrap().pause,
+            PauseState::Pausing,
+            "request_pause must move the sub-agent to Pausing"
+        );
+        assert!(
+            sm.pause_gate().is_pause_requested(),
+            "request_pause must set the gate's pause request"
+        );
+
+        // request_pause twice → idempotent (still Pausing, gate still set).
+        sm.request_pause();
+        assert_eq!(
+            sm.get_state().sub_agent.as_ref().unwrap().pause,
+            PauseState::Pausing,
+            "a second request_pause must be idempotent"
+        );
+
+        // resume → Running + gate not requested.
+        sm.resume();
+        assert_eq!(
+            sm.get_state().sub_agent.as_ref().unwrap().pause,
+            PauseState::Running,
+            "resume must move the sub-agent back to Running"
+        );
+        assert!(
+            !sm.pause_gate().is_pause_requested(),
+            "resume must clear the gate's pause request"
+        );
+
+        // resume twice → idempotent (still Running, gate still clear).
+        sm.resume();
+        assert_eq!(
+            sm.get_state().sub_agent.as_ref().unwrap().pause,
+            PauseState::Running,
+            "a second resume must be idempotent"
+        );
+        drop(guard);
+    }
+
+    /// Dropping the guard clears the sub-agent slot and resets the gate.
+    /// A fresh begin_sub_agent afterwards starts in Running with the gate
+    /// not requested (no stale pause request carried over).
+    #[test]
+    fn guard_drop_clears_sub_agent_and_resets_gate() {
+        // `new_arc` sets `self_ref` so the guard's `Weak` can upgrade and
+        // clear the slot on drop.
+        let sm = StateManager::new_arc();
+        {
+            let guard = sm.begin_sub_agent("researcher", true);
+            sm.request_pause();
+            assert_eq!(
+                sm.get_state().sub_agent.as_ref().unwrap().pause,
+                PauseState::Pausing,
+                "sanity: pause was requested before the guard drops"
+            );
+            drop(guard);
+        }
+
+        assert_eq!(
+            sm.get_state().sub_agent,
+            None,
+            "dropping the guard must clear sub_agent to None"
+        );
+        assert!(
+            !sm.pause_gate().is_pause_requested(),
+            "dropping the guard must reset the gate (no stale pause request)"
+        );
+
+        // A fresh run starts clean: Running, gate not requested.
+        let guard2 = sm.begin_sub_agent("reviewer", true);
+        assert_eq!(
+            sm.get_state().sub_agent,
+            Some(SubAgentRun {
+                role: "reviewer".to_string(),
+                pausable: true,
+                pause: PauseState::Running,
+            }),
+            "a fresh begin_sub_agent must start in Running"
+        );
+        assert!(
+            !sm.pause_gate().is_pause_requested(),
+            "a fresh begin_sub_agent must not inherit a stale pause request"
+        );
+        drop(guard2);
+    }
+
+    /// **Stop while paused** — the critical behavior: a sub-agent parked at
+    /// the pause gate must be aborted promptly when the turn is cancelled
+    /// (the Stop path: `request_stop_and_drain` cancels the per-turn token,
+    /// and `process_message_internal`'s `select!` drops the turn's future),
+    /// and the unwind must leave the session clean — `sub_agent` is `None`
+    /// and the gate is neither parked nor requested — so the next delegation
+    /// starts clean.
+    ///
+    /// Seam: the future the real turn drops owns both the
+    /// [`SubAgentRunGuard`] (held by `DelegateTool::call` for the whole
+    /// delegation) and the parked `checkpoint()` (the sub-agent's hook awaits
+    /// the gate at the top of `on_completion_call`). We reproduce that
+    /// future, park it, then cancel it through a `CancellationToken`
+    /// `select!` exactly like the real turn does.
+    #[tokio::test]
+    async fn stop_while_parked_aborts_delegation_and_resets_state() {
+        use std::time::{Duration, Instant};
+
+        let sm = StateManager::new_arc();
+        let gate = sm.pause_gate();
+
+        // The turn's future: owns the guard, checkpoints like the sub-agent's
+        // hook, and does work (the LLM call) between checkpoints. The work
+        // ends when the test signals it — that signal is sent only after the
+        // pause has been requested, so the second checkpoint is guaranteed to
+        // see the request and park.
+        let (work_done_tx, work_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut work_done_tx = Some(work_done_tx);
+        let mut turn = Box::pin(async {
+            let guard = sm.begin_sub_agent("researcher", true);
+            gate.checkpoint().await; // first checkpoint — no pause yet
+            let _ = work_done_rx.await; // sub-agent work (the LLM call)
+            gate.checkpoint().await; // second checkpoint — parks (paused)
+            drop(guard);
+        });
+
+        // Drive until in-flight, request a pause (what /pause does), end the
+        // work, then drive until genuinely parked.
+        loop {
+            if gate.is_parked() {
+                break;
+            }
+            if sm.get_state().sub_agent.is_some() && !gate.is_pause_requested() {
+                sm.request_pause();
+                if let Some(tx) = work_done_tx.take() {
+                    tx.send(()).ok(); // the LLM call "returns"
+                }
+            }
+            if tokio::time::timeout(Duration::from_millis(20), &mut turn)
+                .await
+                .is_ok()
+            {
+                panic!("the turn must not complete while parking");
+            }
+        }
+        assert!(
+            gate.is_parked(),
+            "sanity: the checkpoint is genuinely parked"
+        );
+
+        // The park watcher mirrors the park onto the UI (Pausing → Paused).
+        let mut waited = Duration::from_millis(0);
+        while sm.get_state().sub_agent.as_ref().map(|run| run.pause) != Some(PauseState::Paused) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            waited += Duration::from_millis(1);
+            assert!(
+                waited < Duration::from_secs(2),
+                "the park watcher must mirror the park as Paused"
+            );
+        }
+
+        // STOP — exactly what the real turn does: `select! { biased; _ =
+        // cancel.cancelled() => Stopped, r = prompt }`. Cancelling the token
+        // makes the cancel arm win and drops the turn's future — which owns
+        // the parked checkpoint and the guard.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let started = Instant::now();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {}
+            _ = turn => panic!("a parked turn must not complete on Stop"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "Stop must drop a parked turn promptly, took {:?}",
+            started.elapsed()
+        );
+
+        // The unwind must leave the session clean for the next delegation.
+        assert_eq!(
+            sm.get_state().sub_agent,
+            None,
+            "Stop must clear the sub-agent slot"
+        );
+        assert!(
+            !gate.is_pause_requested(),
+            "Stop must reset the gate's pause request (not left 'requested')"
+        );
+        assert!(
+            !gate.is_parked(),
+            "Stop must clear the parked clock (not left 'parked')"
+        );
+        assert_eq!(
+            gate.paused_total(),
+            Duration::ZERO,
+            "parked time must not leak into the next run's budget"
+        );
+
+        // The next delegation starts clean: Running, no stale request.
+        let guard = sm.begin_sub_agent("reviewer", true);
+        assert_eq!(
+            sm.get_state().sub_agent,
+            Some(SubAgentRun {
+                role: "reviewer".to_string(),
+                pausable: true,
+                pause: PauseState::Running,
+            }),
+            "a fresh begin_sub_agent after Stop must start in Running"
+        );
+        assert!(
+            !gate.is_pause_requested(),
+            "a fresh begin_sub_agent after Stop must not inherit a stale request"
+        );
+        drop(guard);
     }
 }

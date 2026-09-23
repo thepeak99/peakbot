@@ -1057,6 +1057,275 @@ mod tests {
              exactly one call_id, or sanitize_tool_pairs will silently drop the pair"
         );
     }
+
+    // ── Pause gate (pause sub-agents) ───────────────────────────────────────
+    //
+    // A hook built with `with_pause` must park at `gate.checkpoint()` at the
+    // very TOP of `on_completion_call` and `on_tool_call` — before any event
+    // emission — so a paused sub-agent halts at the next LLM-call or
+    // tool-dispatch boundary, never mid-tool. These tests drive the
+    // PromptHook methods directly (same seam as the sub-agent-gate tests
+    // above, pinned to `MockCompletionModel` via turbofish) and use
+    // `start_paused = true` virtual time: a parked checkpoint must not
+    // complete no matter how much virtual time passes. The "not paused" /
+    // "no gate" tests are regression guards: a hook without a pause gate
+    // must behave exactly as today.
+
+    /// Drive `on_completion_call` in a spawned task so the test can observe
+    /// the gate while the call is in flight.
+    async fn spawn_completion_call(
+        hook: &SessionHook,
+        prompt: &Message,
+    ) -> tokio::task::JoinHandle<HookAction> {
+        let hook = hook.clone();
+        let prompt = prompt.clone();
+        tokio::spawn(async move {
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &prompt,
+                &[],
+            )
+            .await
+        })
+    }
+
+    /// Yield until the gate reports a parked checkpoint, so the assertions
+    /// below run against a genuinely parked call, not a not-yet-polled one.
+    async fn wait_until_parked(gate: &crate::state::PauseGate) {
+        while !gate.is_parked() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Gate paused: `on_completion_call` parks at the checkpoint — it does
+    /// not complete within 1 virtual second, `is_parked()` is true, and a
+    /// single `resume()` releases it so the call completes normally. The
+    /// checkpoint must sit at the very TOP: no event may be emitted while
+    /// the call is parked, and the request event arrives only after release.
+    #[tokio::test(start_paused = true)]
+    async fn pause_gate_parks_on_completion_call_and_releases_on_resume() {
+        let gate = Arc::new(crate::state::PauseGate::new());
+        let (hook, mut rx) = SessionHook::with_channel();
+        let hook = hook.with_pause(gate.clone());
+        gate.request_pause();
+
+        let mut h = spawn_completion_call(&hook, &user_msg("next")).await;
+        wait_until_parked(&gate).await;
+
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), &mut h).await;
+        assert!(
+            r.is_err(),
+            "on_completion_call must not complete while the gate is paused"
+        );
+        assert!(
+            gate.is_parked(),
+            "the parked checkpoint must be visible on the gate"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no event may be emitted before the checkpoint (park, then emit — never the reverse)"
+        );
+
+        gate.resume();
+        let action = tokio::time::timeout(std::time::Duration::from_secs(1), h)
+            .await
+            .expect("the call must complete promptly after resume")
+            .expect("the hook task must not panic");
+        assert!(
+            matches!(action, HookAction::Continue),
+            "a released checkpoint must fall through to normal hook behaviour"
+        );
+        assert!(
+            !gate.is_parked(),
+            "the gate must not stay parked after release"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the request event must be emitted once the checkpoint is released"
+        );
+    }
+
+    /// Gate paused: `on_tool_call` parks at the checkpoint too — the
+    /// sub-agent halts at the tool-dispatch boundary, never mid-tool.
+    #[tokio::test(start_paused = true)]
+    async fn pause_gate_parks_on_tool_call_and_releases_on_resume() {
+        let gate = Arc::new(crate::state::PauseGate::new());
+        let hook = SessionHook::new(None).with_pause(gate.clone());
+        gate.request_pause();
+
+        let mut h = tokio::spawn({
+            let hook = hook.clone();
+            async move {
+                rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_call(
+                    &hook,
+                    "file_read",
+                    None,
+                    "internal-1",
+                    r#"{"path":"a.txt"}"#,
+                )
+                .await
+            }
+        });
+        wait_until_parked(&gate).await;
+
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), &mut h).await;
+        assert!(
+            r.is_err(),
+            "on_tool_call must not complete while the gate is paused"
+        );
+        assert!(
+            gate.is_parked(),
+            "the parked checkpoint must be visible on the gate"
+        );
+
+        gate.resume();
+        tokio::time::timeout(std::time::Duration::from_secs(1), h)
+            .await
+            .expect("the call must complete promptly after resume")
+            .expect("the hook task must not panic");
+        assert!(
+            !gate.is_parked(),
+            "the gate must not stay parked after release"
+        );
+    }
+
+    /// Gate paused and the call parked, then the in-flight future is dropped
+    /// (Stop cancels the turn): the drop must unwind the gate — afterwards
+    /// `is_parked()` is false. A gate that believed it was still parked would
+    /// wedge `pause_aware_timeout` and any parked-based decision after Stop.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_parked_hook_future_unwinds_the_gate() {
+        let gate = Arc::new(crate::state::PauseGate::new());
+        let hook = SessionHook::new(None).with_pause(gate.clone());
+        gate.request_pause();
+
+        let h = spawn_completion_call(&hook, &user_msg("next")).await;
+        wait_until_parked(&gate).await;
+
+        // Cancel the in-flight call the way Stop cancels a turn. `abort` is
+        // asynchronous: tokio marks the task cancelled and schedules it, and
+        // the future (with its `ParkGuard`) is dropped only when the runtime
+        // next polls it. Await the handle so the drop — and the gate unwind it
+        // triggers — has completed before asserting.
+        h.abort();
+        let err = h
+            .await
+            .expect_err("an aborted task must not complete normally");
+        assert!(err.is_cancelled(), "the abort must cancel the task");
+
+        assert!(
+            !gate.is_parked(),
+            "dropping a parked checkpoint must clear the parked state \
+             (Stop-while-paused unwinds cleanly)"
+        );
+    }
+
+    /// Gate attached but NOT paused: both calls complete immediately — the
+    /// checkpoint must be a no-op pass-through when no pause is requested.
+    #[tokio::test(start_paused = true)]
+    async fn hook_with_unpaused_gate_completes_immediately() {
+        let gate = Arc::new(crate::state::PauseGate::new());
+        let hook = SessionHook::new(None).with_pause(gate);
+        let prompt = user_msg("next");
+
+        let action = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &prompt,
+                &[],
+            ),
+        )
+        .await
+        .expect("on_completion_call must complete when the gate is not paused");
+        assert!(matches!(action, HookAction::Continue));
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_call(
+                &hook,
+                "file_read",
+                None,
+                "internal-1",
+                r#"{"path":"a.txt"}"#,
+            ),
+        )
+        .await
+        .expect("on_tool_call must complete when the gate is not paused");
+    }
+
+    /// No gate at all (the orchestrator's hook): both calls complete
+    /// immediately — regression guard that `with_pause` is opt-in and a
+    /// gateless hook behaves exactly as today.
+    #[tokio::test(start_paused = true)]
+    async fn hook_without_pause_gate_completes_immediately() {
+        let hook = SessionHook::new(None);
+        let prompt = user_msg("next");
+
+        let action = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &prompt,
+                &[],
+            ),
+        )
+        .await
+        .expect("on_completion_call must complete without a pause gate");
+        assert!(matches!(action, HookAction::Continue));
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_call(
+                &hook,
+                "file_read",
+                None,
+                "internal-1",
+                r#"{"path":"a.txt"}"#,
+            ),
+        )
+        .await
+        .expect("on_tool_call must complete without a pause gate");
+    }
+
+    /// The orchestrator's hook — built by
+    /// `providers::build_anthropic_session_hook`, which never calls
+    /// `with_pause` — must not park even when the session's gate carries a
+    /// pending pause request (a sub-agent is paused). Pause is sub-agents
+    /// only; the orchestrator keeps running.
+    #[tokio::test(start_paused = true)]
+    async fn orchestrator_hook_has_no_pause_gate_even_when_sub_agent_is_paused() {
+        let sm = crate::state::StateManager::new_arc();
+        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook =
+            crate::providers::build_anthropic_session_hook(sender, sm.stats_arc(), &sm, false);
+
+        // A pausable sub-agent is running and paused: the session's gate
+        // carries a pending pause request.
+        let _guard = sm.begin_sub_agent("researcher", true);
+        sm.request_pause();
+        assert!(
+            sm.pause_gate().is_pause_requested(),
+            "sanity: the gate has a pending pause request"
+        );
+
+        // The orchestrator's hook must pass straight through — no park.
+        let prompt = user_msg("next");
+        let action = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &prompt,
+                &[],
+            ),
+        )
+        .await
+        .expect("the orchestrator's hook must never park at the pause gate");
+        assert!(
+            matches!(action, HookAction::Continue),
+            "the orchestrator's on_completion_call must continue"
+        );
+    }
 }
 
 /// Sub-agent-only hook state. `SessionHook: Clone` shallow-copies Arc handles,
@@ -1095,6 +1364,12 @@ pub struct SessionHook {
     /// budget gate plus the per-request history snapshot the delegate tool
     /// reads to summarise an interrupted delegation.
     sub_agent: Option<SubAgentGate>,
+    /// Cooperative pause gate for pausable sub-agents, set via
+    /// [`SessionHook::with_pause`]. When present, `on_completion_call` and
+    /// `on_tool_call` must park at [`crate::state::PauseGate::checkpoint`]
+    /// before doing anything else, so a paused sub-agent halts at the next
+    /// LLM-call or tool-dispatch boundary — never mid-tool.
+    pause_gate: Option<Arc<crate::state::PauseGate>>,
     /// Resolved-at-construction copy of the provider's
     /// `preserve_reasoning` knob. When `false`, the capture seam drops
     /// every thinking block before it can reach `AgentEvent` — single
@@ -1121,6 +1396,7 @@ impl SessionHook {
             stats: Arc::new(Mutex::new(SessionStats::new())),
             state_manager: None,
             sub_agent: None,
+            pause_gate: None,
             preserve_reasoning: false,
             sniff_id: Arc::new(AtomicU64::new(0)),
             wire: None,
@@ -1138,6 +1414,7 @@ impl SessionHook {
             stats,
             state_manager: None,
             sub_agent: None,
+            pause_gate: None,
             preserve_reasoning: false,
             sniff_id: Arc::new(AtomicU64::new(0)),
             wire: None,
@@ -1175,6 +1452,20 @@ impl SessionHook {
         self
     }
 
+    /// Attach the cooperative pause gate of a pausable sub-agent. Builder-
+    /// style; returns `self` for chaining. Called from `build_sub_agent` for
+    /// every sub-agent — the Ollama lane never attaches this hook to its
+    /// agent (hookless by type), so its gate is never awaited and it is not
+    /// pausable. With a gate, `on_completion_call` and `on_tool_call`
+    /// park at [`crate::state::PauseGate::checkpoint`] at the very top —
+    /// before any event emission — so a paused sub-agent halts at the next
+    /// LLM-call or tool-dispatch boundary, never mid-tool. A hook without a
+    /// gate behaves exactly as before.
+    pub fn with_pause(mut self, gate: Arc<crate::state::PauseGate>) -> Self {
+        self.pause_gate = Some(gate);
+        self
+    }
+
     /// The history as of the last `on_completion_call`. Empty for an
     /// orchestrator hook, for a hookless (Ollama) sub-agent, and before the
     /// first request.
@@ -1205,6 +1496,7 @@ impl SessionHook {
                 stats: Arc::new(Mutex::new(SessionStats::new())),
                 state_manager: None,
                 sub_agent: None,
+                pause_gate: None,
                 preserve_reasoning: false,
                 sniff_id: Arc::new(AtomicU64::new(0)),
                 wire: None,
@@ -1376,6 +1668,11 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
     /// `last_input_tokens`), not here. See `mid-compaction.md` for the full
     /// design.
     async fn on_completion_call(&self, prompt: &Message, history: &[Message]) -> HookAction {
+        // Park before anything else: a paused sub-agent halts at this
+        // boundary without emitting the request event (park, then emit).
+        if let Some(g) = &self.pause_gate {
+            g.checkpoint().await;
+        }
         // Sniff first: the `req` line must be on disk before the call leaves,
         // so a hung or killed request still leaves its input behind.
         if crate::sniff::enabled() {
@@ -1570,6 +1867,11 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         internal_call_id: &str,
         args: &str,
     ) -> ToolCallHookAction {
+        // Park before dispatching: a paused sub-agent halts at the tool
+        // boundary, never mid-tool.
+        if let Some(g) = &self.pause_gate {
+            g.checkpoint().await;
+        }
         if let Some(ref sender) = self.event_sender {
             // Stamp the call with the response that requested it. The
             // transcript row is appended later by the event-processing task,

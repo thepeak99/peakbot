@@ -37,7 +37,7 @@ use crate::PEAKBOT_VERSION;
 use crate::model_locked_message;
 use crate::state::StateManager;
 use crate::ui::ChatMessage;
-use crate::ui::app_state::{AppState, ChatState};
+use crate::ui::app_state::{AppState, ChatState, PauseState, SubAgentRun};
 use crate::ui::repl::bash_panel::{
     effective_panel_height as bash_effective_panel_height, render_bash_panel,
 };
@@ -614,7 +614,9 @@ impl ReplUi {
     /// `Ctrl+C exit` → universal escape, always first;
     /// `Ctrl+T tasks` / `Ctrl+B bash` → panel toggles, grouped;
     /// `F4 select` → mode switch, less frequent;
-    /// `Ctrl+G multi` → input mode, least frequent.
+    /// `Ctrl+G multi` → input mode, least frequent;
+    /// `Ctrl+P pause` → sub-agent pause toggle, only meaningful while a
+    /// delegation runs (the working title repeats it there when active).
     ///
     /// When `select_mode` is `true`, the block returns *naked* — no
     /// borders, no titles, no hint. The point is that with the
@@ -630,8 +632,10 @@ impl ReplUi {
         Block::default()
             .title(" Chat Messages ")
             .title_bottom(
-                Line::from(" Ctrl+C exit · Ctrl+T tasks · Ctrl+B bash · F4 select · Ctrl+G multi ")
-                    .right_aligned(),
+                Line::from(
+                    " Ctrl+C exit · Ctrl+T tasks · Ctrl+B bash · F4 select · Ctrl+G multi · Ctrl+P pause ",
+                )
+                .right_aligned(),
             )
             .borders(Borders::ALL)
     }
@@ -735,6 +739,26 @@ impl ReplUi {
         f.render_widget(scrolled, chunks[0]);
     }
 
+    /// The sub-agent segment of the working title. Empty when no
+    /// sub-agent is running. Pausable: `🧩 <role> · Ctrl+P pause` while
+    /// running, `⏸ Pausing <role>…` while the step finishes, `⏸ <role>
+    /// paused · Ctrl+P resume` once parked. Not pausable (Ollama): the
+    /// role only — there is no pause to offer.
+    fn sub_agent_title_segment(run: Option<&SubAgentRun>) -> String {
+        let Some(run) = run else {
+            return String::new();
+        };
+        let seg = match (run.pausable, &run.pause) {
+            (true, PauseState::Running) => format!("🧩 {} · Ctrl+P pause", run.role),
+            (true, PauseState::Pausing) => format!("⏸ Pausing {}…", run.role),
+            (true, PauseState::Paused) => format!("⏸ {} paused · Ctrl+P resume", run.role),
+            // Non-pausable runs can never leave Running — the gate is
+            // never armed for them — but keep the match exhaustive.
+            (false, _) => run.role.clone(),
+        };
+        format!(" · {seg}")
+    }
+
     /// Build the input paragraph with an animated "working" title when the
     /// agent is running.
     ///
@@ -758,6 +782,7 @@ impl ReplUi {
         pending_input: usize,
         bg_running: usize,
         multiline: bool,
+        sub_agent: Option<&SubAgentRun>,
     ) -> Paragraph<'a> {
         let (prompt_text, prompt_color) = if input.is_empty() {
             ("💬 Message...", Color::DarkGray)
@@ -849,12 +874,16 @@ impl ReplUi {
                 } else {
                     String::new()
                 };
+                // Sub-agent segment (pause state + Ctrl+P hint) — see
+                // `sub_agent_title_segment`.
+                let sub_agent_seg = Self::sub_agent_title_segment(sub_agent);
                 format!(
-                    " {} Working · {} · {}{}{} · esc to stop ",
+                    " {} Working · {} · {}{}{}{} · esc to stop ",
                     spinner::frame_for(t),
                     spinner::fmt_elapsed(t),
                     phase,
                     queued,
+                    sub_agent_seg,
                     bg_segment,
                 )
             }
@@ -1081,6 +1110,7 @@ impl ReplUi {
                     state.pending_input_count,
                     state.bg.running_count,
                     self.multiline_mode,
+                    state.sub_agent.as_ref(),
                 );
 
                 // Check if todo panel should be shown (based on terminal size and visibility state)
@@ -1498,6 +1528,22 @@ impl ReplUi {
         self.try_intercept_model_command(msg) || self.try_intercept_cd_command(msg)
     }
 
+    /// Which `UiAction` a Ctrl+P tap should send for the given state:
+    /// `Running` → `PauseSubAgent`, `Pausing`/`Paused` → `ResumeSubAgent`.
+    /// `None` (ignore the keystroke) when no sub-agent is running or it is
+    /// not pausable (Ollama). Pure so the key arm stays a one-liner and the
+    /// decision is unit-testable without a terminal.
+    fn sub_agent_toggle_action(state: &AppState) -> Option<UiAction> {
+        let run = state.sub_agent.as_ref()?;
+        if !run.pausable {
+            return None;
+        }
+        Some(match run.pause {
+            PauseState::Running => UiAction::PauseSubAgent,
+            PauseState::Pausing | PauseState::Paused => UiAction::ResumeSubAgent,
+        })
+    }
+
     fn handle_keyboard_input(&mut self, key: KeyEvent) {
         match key.code {
             // Toggle todo panel with Ctrl+T
@@ -1571,6 +1617,23 @@ impl ReplUi {
                 } else {
                     // First tap → enter mode. Buffer untouched.
                     self.multiline_mode = true;
+                }
+            }
+            // Ctrl+P — pause/resume toggle for the running sub-agent.
+            // Pause is cooperative: the sub-agent finishes its current
+            // step, then parks at the next checkpoint; the state machine
+            // decides which direction this tap goes (see
+            // `sub_agent_toggle_action`). No sub-agent (or a non-pausable
+            // one) → ignored. Gated off while a confirm dialog or command
+            // popup is open, like Ctrl+G.
+            KeyCode::Char('p' | 'P')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.confirm_dialog.is_none()
+                    && self.command_popup.is_none() =>
+            {
+                if let Some(action) = Self::sub_agent_toggle_action(&self.state_manager.get_state())
+                {
+                    let _ = self.action_sender.send(action);
                 }
             }
             // Scroll todo panel with Ctrl+Up/Down when panel is visible
@@ -2563,15 +2626,17 @@ mod multiline_input_tests {
     /// changes upstream, this test catches it.
     #[test]
     fn real_paragraph_line_count_includes_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false);
+        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false, None);
         // 1 content line (placeholder) + 2 border rows = 3.
         assert_eq!(empty.line_count(120), 3);
 
-        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false);
+        let one_newline =
+            ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false, None);
         // 2 content lines + 2 border rows = 4.
         assert_eq!(one_newline.line_count(120), 4);
 
-        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false);
+        let two_newlines =
+            ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false, None);
         // 3 content lines + 2 border rows = 5.
         assert_eq!(two_newlines.line_count(120), 5);
     }
@@ -2583,13 +2648,15 @@ mod multiline_input_tests {
     /// `Constraint::Length(input_height)` math in `ReplUi::render`.
     #[test]
     fn paragraph_content_rows_strips_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false);
+        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false, None);
         assert_eq!(ReplUi::paragraph_content_rows(&empty, 120), 1);
 
-        let one_newline = ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false);
+        let one_newline =
+            ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false, None);
         assert_eq!(ReplUi::paragraph_content_rows(&one_newline, 120), 2);
 
-        let two_newlines = ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false);
+        let two_newlines =
+            ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false, None);
         assert_eq!(ReplUi::paragraph_content_rows(&two_newlines, 120), 3);
     }
 
@@ -2661,6 +2728,7 @@ mod multiline_input_tests {
             3,
             0,
             false,
+            None,
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
         terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
@@ -2698,6 +2766,7 @@ mod multiline_input_tests {
             0,
             0,
             false,
+            None,
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
         terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
@@ -2712,6 +2781,95 @@ mod multiline_input_tests {
         assert!(
             !rendered.contains("queued"),
             "working title must not show queued hint when count == 0; rendered:\n{rendered}",
+        );
+    }
+
+    // ─── Sub-agent title segment + Ctrl+P toggle decision ────────────────
+
+    fn run(pausable: bool, pause: PauseState) -> SubAgentRun {
+        SubAgentRun {
+            role: "researcher".to_string(),
+            pausable,
+            pause,
+        }
+    }
+
+    #[test]
+    fn sub_agent_title_segment_is_empty_without_sub_agent() {
+        assert_eq!(ReplUi::sub_agent_title_segment(None), "");
+    }
+
+    #[test]
+    fn sub_agent_title_segment_running_shows_pause_hint() {
+        let r = run(true, PauseState::Running);
+        assert_eq!(
+            ReplUi::sub_agent_title_segment(Some(&r)),
+            " · 🧩 researcher · Ctrl+P pause"
+        );
+    }
+
+    #[test]
+    fn sub_agent_title_segment_pausing_shows_pausing() {
+        let r = run(true, PauseState::Pausing);
+        assert_eq!(
+            ReplUi::sub_agent_title_segment(Some(&r)),
+            " · ⏸ Pausing researcher…"
+        );
+    }
+
+    #[test]
+    fn sub_agent_title_segment_paused_shows_resume_hint() {
+        let r = run(true, PauseState::Paused);
+        assert_eq!(
+            ReplUi::sub_agent_title_segment(Some(&r)),
+            " · ⏸ researcher paused · Ctrl+P resume"
+        );
+    }
+
+    #[test]
+    fn sub_agent_title_segment_non_pausable_shows_role_only() {
+        // Ollama sub-agents: no pause to offer, no Ctrl+P hint.
+        let r = run(false, PauseState::Running);
+        assert_eq!(ReplUi::sub_agent_title_segment(Some(&r)), " · researcher");
+    }
+
+    #[test]
+    fn ctrl_p_toggle_decision_matrix() {
+        // Running → pause; Pausing/Paused → resume; no sub-agent or
+        // non-pausable → ignore (None).
+        let state_with = |sub_agent: Option<SubAgentRun>| AppState {
+            sub_agent,
+            ..Default::default()
+        };
+
+        let state = state_with(Some(run(true, PauseState::Running)));
+        assert!(matches!(
+            ReplUi::sub_agent_toggle_action(&state),
+            Some(UiAction::PauseSubAgent)
+        ));
+
+        let state = state_with(Some(run(true, PauseState::Pausing)));
+        assert!(matches!(
+            ReplUi::sub_agent_toggle_action(&state),
+            Some(UiAction::ResumeSubAgent)
+        ));
+
+        let state = state_with(Some(run(true, PauseState::Paused)));
+        assert!(matches!(
+            ReplUi::sub_agent_toggle_action(&state),
+            Some(UiAction::ResumeSubAgent)
+        ));
+
+        let state = state_with(Some(run(false, PauseState::Running)));
+        assert!(
+            ReplUi::sub_agent_toggle_action(&state).is_none(),
+            "non-pausable sub-agent: Ctrl+P is ignored"
+        );
+
+        let state = state_with(None);
+        assert!(
+            ReplUi::sub_agent_toggle_action(&state).is_none(),
+            "no sub-agent: Ctrl+P is ignored"
         );
     }
 }
@@ -3825,8 +3983,8 @@ mod multiline_mode_tests {
     fn build_input_paragraph_accepts_multiline_flag() {
         // Just a compile-time pin: the signature must accept the new
         // bool. The visual diff is owned by snapshot tests.
-        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, true);
-        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, false);
+        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, true, None);
+        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, false, None);
     }
 }
 
@@ -4542,6 +4700,63 @@ mod model_popup_tests {
             matches!(&popup.mode, PopupMode::Argument { command } if command == "model"),
             "after second space: popup should still be in Argument mode, got {:?}",
             popup.mode
+        );
+    }
+
+    // ─── Ctrl+P: sub-agent pause/resume toggle ───────────────────────────
+    //
+    // The decision matrix lives in `ctrl_p_toggle_decision_matrix`
+    // (multiline_input_tests); these pin the key wiring: the keystroke
+    // reaches the controller as the right `UiAction`, and is dropped
+    // entirely when there is nothing to pause.
+
+    fn ctrl_p() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_p_sends_pause_when_sub_agent_running() {
+        let (mut ui, mut rx) = harness_no_registry();
+        // Hold the guard: dropping it clears `sub_agent` (RAII contract).
+        let _guard = ui.state_manager.begin_sub_agent("researcher", true);
+        ui.handle_keyboard_input(ctrl_p());
+        assert!(
+            matches!(rx.try_recv().unwrap(), UiAction::PauseSubAgent),
+            "Running pausable sub-agent: Ctrl+P must send PauseSubAgent"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_sends_resume_when_sub_agent_pausing() {
+        let (mut ui, mut rx) = harness_no_registry();
+        let _guard = ui.state_manager.begin_sub_agent("researcher", true);
+        ui.state_manager.request_pause(); // Running → Pausing
+        ui.handle_keyboard_input(ctrl_p());
+        assert!(
+            matches!(rx.try_recv().unwrap(), UiAction::ResumeSubAgent),
+            "Pausing sub-agent: Ctrl+P must send ResumeSubAgent"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_is_ignored_without_sub_agent() {
+        let (mut ui, mut rx) = harness_no_registry();
+        ui.handle_keyboard_input(ctrl_p());
+        assert!(
+            rx.try_recv().is_err(),
+            "no sub-agent: Ctrl+P must send nothing"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_is_ignored_for_non_pausable_sub_agent() {
+        let (mut ui, mut rx) = harness_no_registry();
+        // Ollama sub-agents are hookless — nothing to park.
+        let _guard = ui.state_manager.begin_sub_agent("researcher", false);
+        ui.handle_keyboard_input(ctrl_p());
+        assert!(
+            rx.try_recv().is_err(),
+            "non-pausable sub-agent: Ctrl+P must send nothing"
         );
     }
 }

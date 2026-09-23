@@ -71,6 +71,15 @@ pub enum UiAction {
     /// records it, persists it, and rebuilds the agent on that team's
     /// orchestrator so model, prompt and `delegate` roster all match.
     SelectPipeline(Option<String>),
+
+    /// Request the currently-running (pausable) sub-agent pause at its
+    /// next checkpoint. No-op if no sub-agent is running or it is not
+    /// pausable. See `StateManager::request_pause` / `PauseGate`.
+    PauseSubAgent,
+
+    /// Resume a paused (or pausing) sub-agent. No-op if no sub-agent is
+    /// running. See `StateManager::resume` / `PauseGate`.
+    ResumeSubAgent,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TodoItemAction {
@@ -142,6 +151,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         ),
         SlashCommand::new("bg", "List background processes (bash_bg)", false),
         SlashCommand::new("stop", "Stop the agent (interrupt current task)", false),
+        SlashCommand::new(
+            "pause",
+            "Pause the running sub-agent at its next step (Ctrl+P in TUI)",
+            false,
+        ),
+        SlashCommand::new("resume", "Resume a paused sub-agent (Ctrl+P in TUI)", false),
         SlashCommand::new("exit", "Quit PeakBot (no confirmation)", false),
     ]
 }
@@ -347,6 +362,8 @@ mod tests {
                 "cd",
                 "bg",
                 "stop",
+                "pause",
+                "resume",
                 "exit",
             ],
         );

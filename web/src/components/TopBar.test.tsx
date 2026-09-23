@@ -44,6 +44,7 @@ import type {
   InboundMessage,
   ModelInfo,
 } from "../state";
+import type { SubAgentRun } from "../types";
 import type { NotifyPermission } from "../useTaskNotifications";
 
 // React 19's `flushSync` checks `IS_REACT_ACT_ENVIRONMENT`; set once so the
@@ -63,6 +64,7 @@ beforeAll(() => {
 interface TopBarPropsWithStatus {
   isRunning: boolean;
   statusMessage: string | null;
+  subAgent: SubAgentRun | null;
   connected: boolean;
   pendingInput: number;
   models: ModelInfo[];
@@ -92,6 +94,7 @@ const baseProps: TopBarPropsWithStatus = {
   notifyPermission: "unsupported",
   isRunning: false,
   statusMessage: null,
+  subAgent: null,
   send: () => {},
   onSwitchModel: () => {},
   onLoadConversation: () => {},
@@ -180,5 +183,71 @@ describe("TopBar — status_message wire parity in the working… chip", () => {
     const titled = el.querySelector('[title="bash"]');
     expect(titled).not.toBeNull();
     expect(titled!.textContent).toBe("· bash");
+  });
+});
+
+// ── Sub-agent chip (pause-subagents feature) ─────────────────────────────
+// The chip sits next to "working…" and tracks the wire `sub_agent.pause`
+// state: 🧩 <role> while running, the pausing sentence while pausing, and
+// the parked sentence while paused. Gated on isRunning like the status
+// message, and absent when no sub-agent runs (orchestrator-only turns).
+
+describe("TopBar — sub-agent chip", () => {
+  it("renders '🧩 researcher' while the sub-agent is running", async () => {
+    const el = await mount({
+      ...baseProps,
+      isRunning: true,
+      subAgent: { role: "researcher", pausable: true, pause: "running" },
+    });
+
+    expect(el.textContent).toContain("🧩 researcher");
+    expect(el.textContent).toContain("working…");
+    expect(el.textContent).not.toContain("paused");
+  });
+
+  it("renders the pausing sentence while pause === 'pausing'", async () => {
+    const el = await mount({
+      ...baseProps,
+      isRunning: true,
+      subAgent: { role: "researcher", pausable: true, pause: "pausing" },
+    });
+
+    expect(el.textContent).toContain(
+      "⏸ Pausing researcher after current step…",
+    );
+  });
+
+  it("renders the parked sentence while pause === 'paused'", async () => {
+    const el = await mount({
+      ...baseProps,
+      isRunning: true,
+      subAgent: { role: "researcher", pausable: true, pause: "paused" },
+    });
+
+    expect(el.textContent).toContain("⏸ researcher paused");
+  });
+
+  it("hides the chip when isRunning is false (stale sub_agent must not leak)", async () => {
+    const el = await mount({
+      ...baseProps,
+      isRunning: false,
+      subAgent: { role: "researcher", pausable: true, pause: "paused" },
+    });
+
+    expect(el.textContent).not.toContain("researcher");
+    expect(el.textContent).not.toContain("🧩");
+    expect(el.textContent).not.toContain("⏸");
+  });
+
+  it("renders no chip when no sub-agent runs (orchestrator-only turn)", async () => {
+    const el = await mount({
+      ...baseProps,
+      isRunning: true,
+      subAgent: null,
+    });
+
+    expect(el.textContent).toContain("working…");
+    expect(el.textContent).not.toContain("🧩");
+    expect(el.textContent).not.toContain("⏸");
   });
 });

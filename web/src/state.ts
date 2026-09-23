@@ -124,6 +124,22 @@ export interface WireBg {
   recent_summaries: WireBgSummary[];
 }
 
+/** Pause lifecycle of a running sub-agent, as observed by UIs
+ * (src/ui/app_state.rs `PauseState`, lowercase serde). */
+export type WirePauseState = "running" | "pausing" | "paused";
+
+/** The currently-running sub-agent invocation (src/ui/app_state.rs
+ * `SubAgentRun`), carried on `AppState.sub_agent`. */
+export interface WireSubAgentRun {
+  /** The sub-agent's role name (e.g. "researcher"). */
+  role: string;
+  /** Whether this sub-agent honors pause requests. Non-pausable sub-agents
+   * (e.g. mid-tool-call with no safe checkpoint) hide the Pause button. */
+  pausable: boolean;
+  /** Current pause lifecycle state. */
+  pause: WirePauseState;
+}
+
 // BashPanelState is an internally-tagged enum (`kind`).
 export type WireBashPanel =
   | { kind: "idle" }
@@ -162,6 +178,10 @@ export interface AppState {
    * mode. Mutable only before the first turn; everything downstream
    * (orchestrator model, delegate roster, `/model` lock) derives from it. */
   selected_pipeline?: string | null;
+  /** The currently-running sub-agent, if any, and its pause status. Absent
+   * (`#[serde(default)]` on the Rust side) in pre-pause-subagents snapshots —
+   * the adapter normalises absent to null (adapt.ts `adaptSubAgent`). */
+  sub_agent?: WireSubAgentRun | null;
 }
 
 /** One configured pipeline — the wire projection of `PipelineInfo`
@@ -237,6 +257,11 @@ export type InboundMessage =
   | { type: "attach"; convo: string | null }
   | { type: "send_message"; text: string }
   | { type: "stop" }
+  /** Request the running (pausable) sub-agent pause at its next checkpoint.
+   * Idempotent — the backend ignores it when nothing is running. */
+  | { type: "pause" }
+  /** Resume a paused (or pausing) sub-agent. Idempotent. */
+  | { type: "resume" }
   | { type: "switch_model"; alias: string }
   | { type: "switch_cwd"; path: string }
   /** Bind this conversation to a named pipeline; `null` clears the binding

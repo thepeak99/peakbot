@@ -16,9 +16,11 @@
 //! See `docs/tool-time-budget-design.md`.
 
 use crate::config::TimeoutsConfig;
+use crate::state::PauseGate;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::{ToolDyn, ToolError};
 use rig_core::wasm_compat::WasmBoxedFuture;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Floor (not an override) for the shell tools: they clamp their own
@@ -73,6 +75,10 @@ pub struct TimeBudget {
     budget: Duration,
     /// Cached so the timeout path does not re-enter the inner tool.
     name: String,
+    /// Set only for `delegate`: its sub-agent can park mid-call, so the
+    /// deadline is pause-aware (parked time never counts). Every other tool
+    /// parks only outside its budget, so a plain timeout suffices.
+    pause_gate: Option<Arc<PauseGate>>,
 }
 
 impl TimeBudget {
@@ -90,7 +96,17 @@ impl TimeBudget {
             name: inner.name(),
             inner,
             budget,
+            pause_gate: None,
         }
+    }
+
+    /// Make the deadline pause-aware: time the sub-agent spends parked in
+    /// `gate` does not count against the budget, so a paused delegation can
+    /// wait indefinitely without tripping this backstop. Only `delegate`
+    /// gets this — it is the only tool that can park mid-call.
+    pub fn with_pause_gate(mut self, gate: Arc<PauseGate>) -> Self {
+        self.pause_gate = Some(gate);
+        self
     }
 
     /// Test-only: the resolved budget is otherwise an implementation detail,
@@ -112,11 +128,27 @@ impl ToolDyn for TimeBudget {
 
     fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, ToolError>> {
         Box::pin(async move {
-            match tokio::time::timeout(self.budget, self.inner.call(args)).await {
-                Ok(result) => result,
-                // `error!`, not `warn!`: a fired budget always means something
-                // is broken — a pathological upstream or a wrong constant.
-                Err(_elapsed) => {
+            // `delegate` can park mid-call (its sub-agent's hook awaits the
+            // gate), so its deadline is pause-aware: parked time never counts
+            // and a paused delegation can wait forever. Every other tool runs
+            // on a plain timeout — its checkpoints sit outside its budget.
+            let outcome: Option<Result<String, ToolError>> = match &self.pause_gate {
+                Some(gate) => crate::state::pause::pause_aware_timeout(
+                    gate,
+                    self.budget,
+                    self.inner.call(args),
+                )
+                .await
+                .ok(),
+                None => tokio::time::timeout(self.budget, self.inner.call(args))
+                    .await
+                    .ok(),
+            };
+            match outcome {
+                Some(result) => result,
+                None => {
+                    // `error!`, not `warn!`: a fired budget always means something
+                    // is broken — a pathological upstream or a wrong constant.
                     tracing::error!(
                         target: "peakbot",
                         tool = %self.name,
@@ -225,6 +257,55 @@ mod tests {
     }
     impl std::error::Error for InnerErr {}
 
+    /// A `delegate`-named inner tool that parks at the gate's checkpoint,
+    /// then does 100 ms of work. Stands in for a paused delegation.
+    fn parking(gate: Arc<PauseGate>) -> Named {
+        Named {
+            name: "delegate",
+            build: Box::new(move || {
+                let gate = gate.clone();
+                Box::pin(async move {
+                    gate.checkpoint().await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok("done".to_string())
+                })
+            }),
+        }
+    }
+
+    /// Same, but with 500 ms of work before the park and 700 ms after —
+    /// 1.2 s of work against a 1 s budget.
+    fn parking_with_work(gate: Arc<PauseGate>) -> Named {
+        Named {
+            name: "delegate",
+            build: Box::new(move || {
+                let gate = gate.clone();
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    gate.checkpoint().await;
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    Ok("done".to_string())
+                })
+            }),
+        }
+    }
+
+    /// Park the gate for one virtual hour, then resume. Blocks on the
+    /// `parked` watch (never a yield-spin — that would suppress the virtual
+    /// clock advance, see `pause.rs`'s tests for the full explanation).
+    fn hour_park_then_resume(gate: Arc<PauseGate>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut rx = gate.subscribe_parked();
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    return; // gate dropped
+                }
+            }
+            tokio::time::advance(Duration::from_secs(3600)).await;
+            gate.resume();
+        })
+    }
+
     /// Paused-time decorator contract: an inner future that never completes
     /// gets cut at the budget, and the model receives an `Ok` timeout message
     /// — NOT an `Err`. The exact wording is pinned (the marker, the tool
@@ -259,6 +340,53 @@ mod tests {
         // `budget.as_secs()` is what the design pins (`timeout_message`
         // formats the bound as `{N}s`). 1500 ms rounds down to 1.
         assert!(s.contains("1s"), "budget seconds missing from: {s}");
+    }
+
+    /// A paused delegation must never trip the delegate budget: with a 1 s
+    /// budget, an inner future parked in the gate for 1 virtual hour must
+    /// still return its output. Parked time does not count.
+    #[tokio::test(start_paused = true)]
+    async fn delegate_budget_with_parked_gate_never_expires() {
+        let gate = Arc::new(PauseGate::new());
+        gate.request_pause();
+
+        let wrapped =
+            TimeBudget::with_budget(Box::new(parking(gate.clone())), Duration::from_secs(1))
+                .with_pause_gate(gate.clone());
+        let waiter = hour_park_then_resume(gate.clone());
+
+        let result = wrapped.call("{}".to_string()).await;
+
+        assert_eq!(
+            result.expect("a parked delegation must not trip its budget"),
+            "done",
+            "time parked in the gate must not count against the delegate budget"
+        );
+        waiter.await.expect("waiter task must not panic");
+    }
+
+    /// The gate makes the deadline pause-aware, not absent: work still counts.
+    /// 500 ms of work, a 1-hour park, then 700 ms of work against a 1 s budget
+    /// must time out with the canonical message (the model self-corrects from
+    /// it — it must stay an `Ok`, not an `Err`).
+    #[tokio::test(start_paused = true)]
+    async fn delegate_budget_with_gate_still_expires_when_work_exceeds_budget() {
+        let gate = Arc::new(PauseGate::new());
+        gate.request_pause();
+
+        let wrapped = TimeBudget::with_budget(
+            Box::new(parking_with_work(gate.clone())),
+            Duration::from_secs(1),
+        )
+        .with_pause_gate(gate.clone());
+        let waiter = hour_park_then_resume(gate.clone());
+
+        let result = wrapped.call("{}".to_string()).await;
+
+        let s = result.expect("timeout must be Ok(String), not Err(ToolError)");
+        assert!(s.contains("⏱ TIMEOUT"), "timeout marker missing from: {s}");
+        assert!(s.contains("delegate"), "tool name missing from: {s}");
+        waiter.await.expect("waiter task must not panic");
     }
 
     /// The happy path: an inner tool's output is returned **byte-identical**
