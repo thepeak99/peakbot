@@ -158,6 +158,14 @@ enum QueueMessage {
 enum SubmitKind {
     /// `/stop` — interrupts the running agent instead of queueing.
     StopCommand,
+    /// `/pause` — asks the running sub-agent to park at its next
+    /// checkpoint. Immediate like `/stop` (works mid-turn); no-op with a
+    /// short system note when no sub-agent is running.
+    PauseCommand,
+    /// `/resume` — wakes a paused (or pausing) sub-agent. Immediate like
+    /// `/stop` (works mid-turn); no-op with a short system note when no
+    /// sub-agent is running.
+    ResumeCommand,
     /// Any other `/xxx` — routed to `process_command_internal`.
     Command(String),
     /// Plain chat content — sent to the LLM.
@@ -190,6 +198,15 @@ fn classify_submission(msg: &str) -> SubmitKind {
     let trimmed = msg.trim();
     if trimmed == "/stop" {
         return SubmitKind::StopCommand;
+    }
+    // `/pause` / `/resume` — sub-agent pause controls. Like `/stop` they
+    // are handled immediately in the event loop (not queued behind the
+    // running turn), so they work mid-delegation.
+    if trimmed == "/pause" {
+        return SubmitKind::PauseCommand;
+    }
+    if trimmed == "/resume" {
+        return SubmitKind::ResumeCommand;
     }
     // `/pipeline [name|none|off]` — a per-conversation binding, not an LLM
     // turn. The whitespace filter keeps `/pipelines` (and any other longer
@@ -1048,6 +1065,31 @@ impl AgentRunner {
                         SubmitKind::StopCommand => {
                             request_stop_and_drain(&state_manager, &msg_tx, &drain_requested).await;
                         }
+                        // `/pause` / `/resume` — immediate, like `/stop`: they
+                        // must work mid-turn (that's the whole point of
+                        // pausing a running sub-agent), so they are NOT
+                        // queued behind the in-flight turn. Both are
+                        // idempotent no-ops in StateManager; the only extra
+                        // here is a short note when there is no sub-agent to
+                        // act on, so the command never fails silently.
+                        SubmitKind::PauseCommand => {
+                            if let Some(ref sm) = state_manager {
+                                if sm.get_state().sub_agent.is_none() {
+                                    sm.add_system_message("No sub-agent running.".to_string());
+                                } else {
+                                    sm.request_pause();
+                                }
+                            }
+                        }
+                        SubmitKind::ResumeCommand => {
+                            if let Some(ref sm) = state_manager {
+                                if sm.get_state().sub_agent.is_none() {
+                                    sm.add_system_message("No sub-agent running.".to_string());
+                                } else {
+                                    sm.resume();
+                                }
+                            }
+                        }
                         SubmitKind::Command(cmd) => {
                             // Dispatched by agent_loop via process_command_internal.
                             msg_tx.send(QueueMessage::Command(cmd)).await.ok();
@@ -1163,6 +1205,25 @@ impl AgentRunner {
                         sm.increment_pending_input();
                     }
                     msg_tx.send(QueueMessage::SelectPipeline(name)).await.ok();
+                }
+
+                UiAction::PauseSubAgent => {
+                    // Immediate, like RequestStop — not queued behind the
+                    // running turn. All it does is arm the pause gate; the
+                    // sub-agent parks itself at its next checkpoint.
+                    // No-op (idempotent) when no pausable sub-agent runs.
+                    if let Some(ref sm) = state_manager {
+                        sm.request_pause();
+                    }
+                }
+
+                UiAction::ResumeSubAgent => {
+                    // Immediate, like RequestStop — clears the gate so the
+                    // parked sub-agent wakes at its next checkpoint.
+                    // No-op (idempotent) when no sub-agent is paused.
+                    if let Some(ref sm) = state_manager {
+                        sm.resume();
+                    }
                 }
             }
         }
@@ -5406,6 +5467,40 @@ mod tests {
         assert!(matches!(
             classify_submission("/stop"),
             SubmitKind::StopCommand
+        ));
+    }
+
+    #[test]
+    fn classify_slash_pause_and_resume_are_immediate_commands() {
+        // /pause and /resume are special like /stop: handled immediately in
+        // the event loop (they must work while a turn is running), never
+        // queued and never sent to the LLM.
+        assert!(matches!(
+            classify_submission("/pause"),
+            SubmitKind::PauseCommand
+        ));
+        assert!(matches!(
+            classify_submission("/resume"),
+            SubmitKind::ResumeCommand
+        ));
+        // Whitespace-tolerant, like /stop.
+        assert!(matches!(
+            classify_submission("  /pause  "),
+            SubmitKind::PauseCommand
+        ));
+        assert!(matches!(
+            classify_submission("/resume\n"),
+            SubmitKind::ResumeCommand
+        ));
+        // Longer words are NOT pause/resume — they fall through to the
+        // generic command arm (e.g. a future /pauser or /resumed).
+        assert!(matches!(
+            classify_submission("/pauser"),
+            SubmitKind::Command(_)
+        ));
+        assert!(matches!(
+            classify_submission("/resumed"),
+            SubmitKind::Command(_)
         ));
     }
 

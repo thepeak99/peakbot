@@ -302,6 +302,19 @@ impl Tool for DelegateTool {
         let snapshot = deps.state_manager.get_todo_list();
         validate_parent(&snapshot, args.parent_task_id)?;
 
+        // Ollama is hookless by type — its sub-agent never reaches a
+        // checkpoint, so it is not pausable (the UI hides the button).
+        let provider_config = &role.model.provider_config;
+        let pausable = !matches!(provider_config, crate::config::ProviderConfig::Ollama(_));
+
+        // The guard owns the sub-agent slot for the whole call — success,
+        // error, timeout, and the Stop unwind all drop it at the end of this
+        // function, so a pause can never leak into the next delegation.
+        let _sub_agent_guard = deps.state_manager.begin_sub_agent(&args.role, pausable);
+        // The session's single pause gate: the sub-agent's hook, this loop's
+        // deadline, and the delegate TimeBudget all await the same gate.
+        let gate = deps.state_manager.pause_gate();
+
         // One inbound read, two renderings: this snapshot both tells the
         // sub-agent what is already running and anchors the outbound delta.
         let bg_before = deps.state_manager.list_bg();
@@ -333,7 +346,7 @@ impl Tool for DelegateTool {
             .map(|fraction| (fraction * role.model.context_size as f64) as usize);
 
         let (agent, hook) = crate::providers::build_sub_agent(
-            &role.model.provider_config,
+            provider_config,
             &preamble,
             deps.event_sink.clone(),
             &args.role,
@@ -356,12 +369,14 @@ impl Tool for DelegateTool {
         let mut history = Vec::new();
         let mut attempt = 0;
         // The whole loop sits inside the deadline, so the wire-retry budget is
-        // part of it rather than additive to it. On expiry the delegation is
-        // cancelled and its transcript is still salvaged through the normal
-        // handoff path — the outer `budget_for("delegate")` sits a salvage
-        // margin above this bound, leaving room for that summarisation.
+        // part of it rather than additive to it. Parked (paused) time is
+        // excluded — a paused delegation can wait indefinitely without
+        // expiring. On expiry the delegation is cancelled and its transcript
+        // is still salvaged through the normal handoff path — the outer
+        // `budget_for("delegate")` sits a salvage margin above this bound,
+        // leaving room for that summarisation.
         let budget = crate::tools::time_budget::delegate_loop_budget(&deps.timeouts);
-        let bounded = tokio::time::timeout(budget, async {
+        let bounded = crate::state::pause::pause_aware_timeout(&gate, budget, async {
             loop {
                 match agent
                     .prompt_with_history(args.task.as_str(), &mut history)
@@ -765,6 +780,339 @@ mod tests {
                 role: "reviewer".to_string()
             }
         );
+    }
+
+    /// A `DelegateTool` with one role named `researcher` on the given
+    /// provider. The offline way to drive the real `call()` path: an
+    /// OpenRouter provider without an API key fails in `build_sub_agent`
+    /// before any wire call; an OpenAI provider pointed at a dead loopback
+    /// endpoint fails on the first prompt.
+    fn delegate_tool_with_role(
+        sm: Arc<StateManager>,
+        provider: crate::config::ProviderEntry,
+        retry: crate::config::RetryConfig,
+    ) -> DelegateTool {
+        use crate::config::{
+            AgentDefinition, ModelEntry, ModelRegistry, PipelineConfig, ProviderType,
+        };
+
+        let provider = match provider.kind {
+            // Both test providers declare the same single model.
+            ProviderType::OpenRouter | ProviderType::OpenAI => provider,
+            other => panic!("test provider must be openrouter or openai, got {other:?}"),
+        };
+        let mut provider = provider;
+        provider.models = vec![ModelEntry {
+            name: "anthropic/claude-3.7-sonnet".into(),
+            alias: Some("sonnet".into()),
+            max_tokens: None,
+            temperature: None,
+            extra_params: None,
+            prompt_caching: None,
+            vision: None,
+            context_size: None,
+            preserve_reasoning: true,
+            display_reasoning: false,
+        }];
+        let model_registry =
+            ModelRegistry::build(&[provider], Some("sonnet")).expect("test model registry builds");
+        let pipeline_config = PipelineConfig {
+            enabled: true,
+            orchestrator_prompt: None,
+            agents: crate::config::Members(std::collections::HashMap::from([(
+                "researcher".to_string(),
+                AgentDefinition {
+                    model: Some("sonnet".into()),
+                    prompt: "research".into(),
+                    env: None,
+                    skills: crate::config::NameFilter::default(),
+                    agents_md: false,
+                },
+            )])),
+        };
+        let registry = SubAgentRegistry::new(&pipeline_config, &model_registry, &[])
+            .expect("role registry builds");
+
+        let deps = SubAgentDeps {
+            registry: Arc::new(registry),
+            searxng: None,
+            bash_config: BashConfig::default(),
+            tools_filter: crate::config::NameFilter::default(),
+            state_manager: sm,
+            shell_kind: None,
+            vector_store: None,
+            max_turns: 0,
+            skills: crate::skills::SkillRegistry::default(),
+            event_sink: None,
+            retry,
+            timeouts: crate::config::TimeoutsConfig::default(),
+        };
+        DelegateTool::new(Arc::new(deps))
+    }
+
+    /// The guard must be released when the delegation errors: a role whose
+    /// provider build fails (no API key) drives the real `call()` path —
+    /// `begin_sub_agent` → build error → guard drop — with no network. The
+    /// sub-agent slot and the pause gate must both be clean afterwards.
+    #[tokio::test]
+    async fn delegate_call_releases_sub_agent_slot_when_build_fails() {
+        let sm = StateManager::new_arc();
+        sm.add_todo("parent task".to_string());
+        let provider = crate::config::ProviderEntry {
+            name: "openrouter".into(),
+            kind: crate::config::ProviderType::OpenRouter,
+            api_key: None, // build_sub_agent must fail on this, before any wire call
+            base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
+            models: vec![],
+        };
+        let tool =
+            delegate_tool_with_role(sm.clone(), provider, crate::config::RetryConfig::default());
+
+        let err = tool
+            .call(DelegateArgs {
+                role: "researcher".into(),
+                task: "do it".into(),
+                parent_task_id: 1,
+            })
+            .await
+            .expect_err("a role with no API key must fail the sub-agent build");
+
+        assert!(
+            matches!(err, DelegateError::Build { .. }),
+            "expected a Build error, got: {err}"
+        );
+        assert_eq!(
+            sm.get_state().sub_agent,
+            None,
+            "the guard must clear the sub-agent slot when the call errors"
+        );
+        assert!(
+            !sm.pause_gate().is_pause_requested(),
+            "the guard must reset the pause gate when the call errors"
+        );
+    }
+
+    /// The guard must be held for the whole delegation and released after it
+    /// ends: a role whose endpoint accepts connections but never answers
+    /// keeps the prompt in flight, so the sub-agent slot is observable while
+    /// the call runs. A pause requested in that window must not leak past
+    /// the handoff — the guard's drop resets the gate.
+    #[tokio::test]
+    async fn delegate_call_holds_sub_agent_slot_while_in_flight_and_releases_after_handoff() {
+        use crate::ui::app_state::{PauseState, SubAgentRun};
+
+        // Accept connections and hold them; aborting this task drops the held
+        // sockets, which is what fails the in-flight prompt (stream ends →
+        // transport error → no retries → handoff).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener binds");
+        let port = listener
+            .local_addr()
+            .expect("listener has an address")
+            .port();
+        let acceptor = tokio::spawn(async move {
+            let mut held: Vec<tokio::net::TcpStream> = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+            drop(held);
+        });
+
+        let sm = StateManager::new_arc();
+        sm.add_todo("parent task".to_string());
+        let provider = crate::config::ProviderEntry {
+            name: "openai".into(),
+            kind: crate::config::ProviderType::OpenAI,
+            api_key: Some("sk-test".into()),
+            base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+            preserve_reasoning: None,
+            display_reasoning: None,
+            models: vec![],
+        };
+        // No retries: the first transport failure goes straight to the handoff.
+        let retry = crate::config::RetryConfig {
+            max_retries: 0,
+            ..crate::config::RetryConfig::default()
+        };
+        let tool = delegate_tool_with_role(sm.clone(), provider, retry);
+
+        let args = DelegateArgs {
+            role: "researcher".into(),
+            task: "do it".into(),
+            parent_task_id: 1,
+        };
+        let handle = tokio::spawn(async move { tool.call(args).await });
+
+        // Wait for the delegation to be in flight: the slot is set.
+        let mut in_flight = None;
+        for _ in 0..1000 {
+            if let Some(run) = sm.get_state().sub_agent.clone() {
+                in_flight = Some(run);
+                break;
+            }
+            if handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let run =
+            in_flight.expect("the sub-agent slot must be set while the delegation is in flight");
+        assert_eq!(
+            run,
+            SubAgentRun {
+                role: "researcher".to_string(),
+                pausable: true,
+                pause: PauseState::Running,
+            },
+            "a hooked sub-agent must be pausable and start in Running"
+        );
+
+        // Request a pause in the window — it must not survive the delegation.
+        sm.request_pause();
+        assert_eq!(
+            sm.get_state().sub_agent.as_ref().unwrap().pause,
+            PauseState::Pausing,
+            "request_pause must move the in-flight sub-agent to Pausing"
+        );
+
+        // Fail the in-flight prompt by dropping the held connection.
+        acceptor.abort();
+        let out = handle
+            .await
+            .expect("call task must not panic")
+            .expect("a dead sub-agent comes back as a handoff, not an error");
+        assert!(
+            out.contains("INTERRUPTED"),
+            "a dead sub-agent must come back as a summarised handoff; got: {out}"
+        );
+
+        assert_eq!(
+            sm.get_state().sub_agent,
+            None,
+            "the guard must clear the sub-agent slot when the call ends"
+        );
+        assert!(
+            !sm.pause_gate().is_pause_requested(),
+            "a pause requested before the end must not leak into the next delegation"
+        );
+    }
+
+    /// The guard must be released when the delegation succeeds: a role whose
+    /// endpoint answers with a plain completion (no tool calls) drives the
+    /// full `call()` path — `begin_sub_agent` → prompt → normalize → guard
+    /// drop. The sub-agent slot and the pause gate must both be clean
+    /// afterwards.
+    #[tokio::test]
+    async fn delegate_call_releases_sub_agent_slot_when_delegation_succeeds() {
+        // A minimal OpenAI-compatible responder (Responses API): one
+        // connection, one completion, then close.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener binds");
+        let port = listener
+            .local_addr()
+            .expect("listener has an address")
+            .port();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.expect("client connects");
+            // Drain the request (headers + declared body) before answering.
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while request_complete(&buf).is_none() && buf.len() < 1_048_576 {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            let body = serde_json::json!({
+                "id": "resp_123",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "anthropic/claude-3.7-sonnet",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_123",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "annotations": [],
+                        "text": "done"
+                    }]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.ok();
+        });
+
+        let sm = StateManager::new_arc();
+        sm.add_todo("parent task".to_string());
+        let provider = crate::config::ProviderEntry {
+            name: "openai".into(),
+            kind: crate::config::ProviderType::OpenAI,
+            api_key: Some("sk-test".into()),
+            base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+            preserve_reasoning: None,
+            display_reasoning: None,
+            models: vec![],
+        };
+        let tool =
+            delegate_tool_with_role(sm.clone(), provider, crate::config::RetryConfig::default());
+
+        let out = tool
+            .call(DelegateArgs {
+                role: "researcher".into(),
+                task: "do it".into(),
+                parent_task_id: 1,
+            })
+            .await
+            .expect("a completed delegation returns its result");
+
+        assert!(
+            out.contains("done"),
+            "the sub-agent's final text must reach the orchestrator; got: {out}"
+        );
+        assert!(
+            !out.contains("INTERRUPTED"),
+            "a clean completion must not be reported as a handoff; got: {out}"
+        );
+        assert_eq!(
+            sm.get_state().sub_agent,
+            None,
+            "the guard must clear the sub-agent slot when the call succeeds"
+        );
+        assert!(
+            !sm.pause_gate().is_pause_requested(),
+            "the gate must be clean after a successful delegation"
+        );
+        server.abort();
+    }
+
+    /// Index just past the end of an HTTP request (headers + declared body),
+    /// or `None` while the request is still arriving. Test-only helper for
+    /// the fake OpenAI responder above.
+    fn request_complete(buf: &[u8]) -> Option<usize> {
+        let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let headers = std::str::from_utf8(&buf[..header_end]).ok()?;
+        let mut body_len = 0usize;
+        for line in headers.split("\r\n") {
+            if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                body_len = rest.trim().parse().ok()?;
+            }
+        }
+        let total = header_end + body_len;
+        (buf.len() >= total).then_some(total)
     }
 
     /// A sub-agent that returns empty or whitespace-only text must never reach

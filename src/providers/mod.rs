@@ -503,6 +503,12 @@ where
     // is moved into `bash_bg` below.
     let sm_for_delegate = state_manager.clone();
 
+    // The delegate tool's outer TimeBudget must not expire while the
+    // sub-agent is parked — it awaits the same session gate as the hook and
+    // the inner loop. `None` here (no state manager) means no delegate tool
+    // is registered at all, so nothing can park.
+    let delegate_pause = sm_for_delegate.as_ref().map(|sm| sm.pause_gate());
+
     // Path + shell tools resolve/spawn against the session cwd, owned by the
     // state manager (single source of truth). Without one (tests), fall back to
     // the process cwd — unchanged behaviour.
@@ -631,7 +637,7 @@ where
     // inner tool), so blocklist/allowlist address tools by their wire name.
     tools.retain(|t| tools_filter.allows(&t.name()));
 
-    builder.tools(budget_all(tools, timeouts))
+    builder.tools(budget_all(tools, timeouts, delegate_pause))
 }
 
 /// Attach the live bash panel iff this agent owns one. The orchestrator wires
@@ -679,10 +685,28 @@ fn gate(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
 /// Wrap every tool in a wall-clock budget. Called at the two — and only two —
 /// places tools enter the rig builder, so "every tool the model can call is
 /// time-bounded" holds by construction. See docs/tool-time-budget-design.md.
-fn budget_all(tools: Vec<Box<dyn ToolDyn>>, cfg: &TimeoutsConfig) -> Vec<Box<dyn ToolDyn>> {
+///
+/// Only `delegate` gets the session's pause gate: it is the only tool that
+/// can park mid-call (its sub-agent's hook awaits the gate), so it is the
+/// only one whose deadline must exclude parked time. MCP tools never park
+/// mid-call — pass `None`.
+fn budget_all(
+    tools: Vec<Box<dyn ToolDyn>>,
+    cfg: &TimeoutsConfig,
+    delegate_pause: Option<Arc<crate::state::PauseGate>>,
+) -> Vec<Box<dyn ToolDyn>> {
     tools
         .into_iter()
-        .map(|t| Box::new(crate::tools::TimeBudget::wrap(t, cfg)) as Box<dyn ToolDyn>)
+        .map(|t| {
+            let budgeted = crate::tools::TimeBudget::wrap(t, cfg);
+            let budgeted = match &delegate_pause {
+                Some(gate) if budgeted.name() == "delegate" => {
+                    budgeted.with_pause_gate(gate.clone())
+                }
+                _ => budgeted,
+            };
+            Box::new(budgeted) as Box<dyn ToolDyn>
+        })
         .collect()
 }
 
@@ -706,7 +730,8 @@ pub(crate) fn prepare_mcp_tools(
     tools: Vec<Box<dyn ToolDyn>>,
     cfg: &TimeoutsConfig,
 ) -> Vec<Box<dyn ToolDyn>> {
-    budget_all(tools.into_iter().map(gate).collect(), cfg)
+    // MCP tools never park mid-call — no pause gate.
+    budget_all(tools.into_iter().map(gate).collect(), cfg, None)
 }
 
 /// Create OpenRouter agent and info
@@ -1373,14 +1398,19 @@ pub(crate) fn build_sub_agent(
     timeouts: &TimeoutsConfig,
 ) -> Result<(DynAgent, Arc<SessionHook>)> {
     // Events-only lane-tagged hook. No compaction gate (fresh context) — the
-    // sub-agent gate terminates instead of compacting.
+    // sub-agent gate terminates instead of compacting. The pause gate is the
+    // session's single one (owned by the StateManager): the hook's
+    // checkpoints, the delegate loop's deadline, and the delegate TimeBudget
+    // all await the same gate. Ollama never attaches this hook to its agent
+    // (hookless by type), so its gate is never awaited — it is not pausable.
     let (wire_provider, wire_model) = wire_label_of(config);
     let hook = SessionHook::new(sink)
         .with_source(crate::ui::app_state::MessageSource::SubAgent {
             role: role.to_string(),
         })
         .with_wire_label(wire_provider, wire_model)
-        .with_sub_agent_gate(context_budget);
+        .with_sub_agent_gate(context_budget)
+        .with_pause(state_manager.pause_gate());
 
     // A sub-agent never sees `delegate` (no nested delegation). It reaches the
     // `todo` tool via `add_builtin_tools`'s `todo_tool.unwrap_or_default()`,
@@ -1857,7 +1887,7 @@ mod tests {
     #[tokio::test]
     async fn budget_all_preserves_name_and_definition() {
         let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(InnerEcho)];
-        let budgeted = budget_all(tools, &TimeoutsConfig::default());
+        let budgeted = budget_all(tools, &TimeoutsConfig::default(), None);
 
         assert_eq!(budgeted.len(), 1, "budget_all must preserve count");
         assert_eq!(budgeted[0].name(), "echo", "name must pass through");
@@ -1872,6 +1902,116 @@ mod tests {
             "TimeBudget must NOT inject `thought` — that's ThoughtGate's job; got schema: {}",
             def.parameters
         );
+    }
+
+    /// Per-instance-named inner tool that parks at the given gate's
+    /// checkpoint when called. `Tool::NAME` is a const, so a per-instance
+    /// name needs a hand-rolled `ToolDyn` impl.
+    struct ParkingTool {
+        name: &'static str,
+        gate: Arc<crate::state::PauseGate>,
+    }
+
+    impl ToolDyn for ParkingTool {
+        fn name(&self) -> String {
+            self.name.to_string()
+        }
+
+        fn definition(
+            &self,
+            _prompt: String,
+        ) -> rig_core::wasm_compat::WasmBoxedFuture<'_, ToolDefinition> {
+            Box::pin(async {
+                ToolDefinition {
+                    name: self.name.to_string(),
+                    description: "named".to_string(),
+                    parameters: json!({ "type": "object", "properties": {} }),
+                }
+            })
+        }
+
+        fn call(
+            &self,
+            _args: String,
+        ) -> rig_core::wasm_compat::WasmBoxedFuture<'_, Result<String, rig_core::tool::ToolError>>
+        {
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                gate.checkpoint().await;
+                // Post-park work: under virtual time the resume and a plain
+                // timeout's deadline land in the same clock jump, so without
+                // this the timeout and the inner's completion would race.
+                // With it, the deadline (t+1s) is always behind the inner's
+                // completion (t+park+100ms) when the park is long.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok("done".to_string())
+            })
+        }
+    }
+
+    /// Park the gate for one virtual hour, then resume. Blocks on the
+    /// `parked` watch (never a yield-spin — that would suppress the virtual
+    /// clock advance, see `pause.rs`'s tests for the full explanation).
+    fn hour_park_then_resume(gate: Arc<crate::state::PauseGate>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut rx = gate.subscribe_parked();
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    return; // gate dropped
+                }
+            }
+            tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+            gate.resume();
+        })
+    }
+
+    /// `budget_all` must make the deadline pause-aware for `delegate` ONLY —
+    /// it is the only tool that can park mid-call. Behavioural pin: with a
+    /// 1 s budget, an inner future parked in the gate for 1 virtual hour must
+    /// survive for `delegate` and must time out for every other tool.
+    #[tokio::test(start_paused = true)]
+    async fn budget_all_makes_only_delegate_pause_aware() {
+        let gate = Arc::new(crate::state::PauseGate::new());
+        let cfg = TimeoutsConfig {
+            tool_secs: 1,
+            delegate_secs: 3_600,
+        };
+
+        let tools: Vec<Box<dyn ToolDyn>> = vec![
+            Box::new(ParkingTool {
+                name: "delegate",
+                gate: gate.clone(),
+            }),
+            // `fetch_page` — a generic-row tool that gets `tool_secs` (1 s)
+            // verbatim. (Not `bash`: the shell floor would outlast the park.)
+            Box::new(ParkingTool {
+                name: "fetch_page",
+                gate: gate.clone(),
+            }),
+        ];
+        let budgeted = budget_all(tools, &cfg, Some(gate.clone()));
+
+        // delegate: parked time does not count — the 1-hour park survives.
+        gate.request_pause();
+        let waiter = hour_park_then_resume(gate.clone());
+        let out = budgeted[0].call("{}".to_string()).await;
+        assert_eq!(
+            out.expect("delegate's budget must not fire while parked"),
+            "done",
+            "delegate's TimeBudget must exclude parked time"
+        );
+        waiter.await.expect("waiter task must not panic");
+
+        // fetch_page: plain timeout — the same 1-hour park trips its 1 s budget.
+        gate.request_pause();
+        let waiter = hour_park_then_resume(gate.clone());
+        let out = budgeted[1].call("{}".to_string()).await;
+        let s = out.expect("timeout must be Ok(String), not Err(ToolError)");
+        assert!(
+            s.contains("⏱ TIMEOUT"),
+            "non-delegate tools must keep a plain timeout — only delegate can park mid-call; got: {s}"
+        );
+        waiter.await.expect("waiter task must not panic");
     }
 
     /// The MCP seam (`prepare_mcp_tools`) must produce tools with BOTH the
@@ -1940,7 +2080,7 @@ mod tests {
         };
 
         let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(AlwaysPending)];
-        let budgeted = budget_all(tools, &cfg);
+        let budgeted = budget_all(tools, &cfg, None);
         assert_eq!(budgeted.len(), 1, "budget_all must preserve count");
         assert_eq!(
             budgeted[0].name(),

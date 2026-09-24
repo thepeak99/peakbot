@@ -17,6 +17,8 @@
 //! ```json
 //! {"type":"send_message","text":"hello"}
 //! {"type":"stop"}
+//! {"type":"pause"}
+//! {"type":"resume"}
 //! {"type":"switch_model","alias":"sonnet"}
 //! {"type":"request_conversations"}
 //! {"type":"request_recent_dirs"}
@@ -186,74 +188,69 @@ async fn run_stdin_loop(
         if trimmed.is_empty() {
             continue;
         }
-        match serde_json::from_str::<InboundMessage>(trimmed) {
-            Ok(InboundMessage::SendMessage { text }) => {
-                if action_sender.send(UiAction::SendMessage(text)).is_err() {
-                    break;
-                }
-            }
-            Ok(InboundMessage::Stop) => {
-                if action_sender.send(UiAction::RequestStop).is_err() {
-                    break;
-                }
-            }
-            Ok(InboundMessage::SwitchModel { alias }) => {
-                if action_sender.send(UiAction::SwitchModel(alias)).is_err() {
-                    break;
-                }
-            }
-            Ok(InboundMessage::SwitchCwd { path }) => {
-                if action_sender.send(UiAction::ChangeCwd(path)).is_err() {
-                    break;
-                }
-            }
-            Ok(InboundMessage::SelectPipeline { name }) => {
-                if action_sender.send(UiAction::SelectPipeline(name)).is_err() {
-                    break;
-                }
-            }
-            Ok(InboundMessage::ListDir { path }) => {
-                if out_tx.send(build_dir_listing(&path)).is_err() {
-                    break;
-                }
-            }
-            Ok(InboundMessage::RequestConversations) => {
-                // stdio is single-session with no registry — no conversation
-                // is "active" in the sticky-session sense.
-                let items = build_conversations_snapshot(&state_manager, &Default::default());
-                if out_tx
-                    .send(OutboundMessage::ConversationsList { items })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Ok(InboundMessage::RequestRecentDirs) => {
-                let dirs = build_recent_dirs(&state_manager);
-                if out_tx.send(OutboundMessage::RecentDirs { dirs }).is_err() {
-                    break;
-                }
-            }
-            // Sticky-session frames are web-only (no registry over stdio) —
-            // accept and ignore so the shared enum stays exhaustive.
-            Ok(InboundMessage::Attach { .. }) | Ok(InboundMessage::KillSession { .. }) => {}
-            Ok(InboundMessage::Shutdown) => {
-                // `/exit` sets `exit_requested`, which unwinds the state loop
-                // and lets `main` tear down cleanly.
-                let _ = action_sender.send(UiAction::SendMessage("/exit".to_string()));
-                break;
-            }
-            Err(e) => {
-                let envelope = OutboundMessage::Error {
-                    message: format!("invalid inbound JSON: {e}"),
-                };
-                if out_tx.send(envelope).is_err() {
-                    break;
-                }
-            }
+        if !dispatch_stdin_line(trimmed, &action_sender, &out_tx, &state_manager) {
+            break;
         }
     }
     Ok(())
+}
+
+/// Dispatch one inbound line. Returns `false` when the loop should stop
+/// (channel closed or `shutdown` received). Split out of
+/// [`run_stdin_loop`] so the InboundMessage→UiAction mapping is testable
+/// without a real stdin.
+fn dispatch_stdin_line(
+    trimmed: &str,
+    action_sender: &UnboundedSender<UiAction>,
+    out_tx: &OutboundTx,
+    state_manager: &StateManager,
+) -> bool {
+    match serde_json::from_str::<InboundMessage>(trimmed) {
+        Ok(InboundMessage::SendMessage { text }) => {
+            action_sender.send(UiAction::SendMessage(text)).is_ok()
+        }
+        Ok(InboundMessage::Stop) => action_sender.send(UiAction::RequestStop).is_ok(),
+        // Pause/resume the running sub-agent — same immediate path as Stop
+        // (the controller handles them without queueing behind the turn).
+        Ok(InboundMessage::Pause) => action_sender.send(UiAction::PauseSubAgent).is_ok(),
+        Ok(InboundMessage::Resume) => action_sender.send(UiAction::ResumeSubAgent).is_ok(),
+        Ok(InboundMessage::SwitchModel { alias }) => {
+            action_sender.send(UiAction::SwitchModel(alias)).is_ok()
+        }
+        Ok(InboundMessage::SwitchCwd { path }) => {
+            action_sender.send(UiAction::ChangeCwd(path)).is_ok()
+        }
+        Ok(InboundMessage::SelectPipeline { name }) => {
+            action_sender.send(UiAction::SelectPipeline(name)).is_ok()
+        }
+        Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
+        Ok(InboundMessage::RequestConversations) => {
+            // stdio is single-session with no registry — no conversation
+            // is "active" in the sticky-session sense.
+            let items = build_conversations_snapshot(state_manager, &Default::default());
+            out_tx
+                .send(OutboundMessage::ConversationsList { items })
+                .is_ok()
+        }
+        Ok(InboundMessage::RequestRecentDirs) => {
+            let dirs = build_recent_dirs(state_manager);
+            out_tx.send(OutboundMessage::RecentDirs { dirs }).is_ok()
+        }
+        // Sticky-session frames are web-only (no registry over stdio) —
+        // accept and ignore so the shared enum stays exhaustive.
+        Ok(InboundMessage::Attach { .. }) | Ok(InboundMessage::KillSession { .. }) => true,
+        Ok(InboundMessage::Shutdown) => {
+            // `/exit` sets `exit_requested`, which unwinds the state loop
+            // and lets `main` tear down cleanly.
+            let _ = action_sender.send(UiAction::SendMessage("/exit".to_string()));
+            false
+        }
+        Err(e) => out_tx
+            .send(OutboundMessage::Error {
+                message: format!("invalid inbound JSON: {e}"),
+            })
+            .is_ok(),
+    }
 }
 
 /// Write one NDJSON line (+ newline + flush). Writer-task only, to keep
@@ -264,4 +261,73 @@ async fn write_line(line: &str) -> Result<()> {
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inbound dispatch tests: `InboundMessage` → `UiAction` mapping.
+    //! Mirrors the web `dispatch_inbound` pause/resume tests — the stdio
+    //! surface must produce the same controller actions.
+
+    use super::*;
+
+    fn fixture() -> (
+        UnboundedSender<UiAction>,
+        tokio::sync::mpsc::UnboundedReceiver<UiAction>,
+        OutboundTx,
+        Arc<StateManager>,
+    ) {
+        let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = outbound_channel();
+        let sm = StateManager::new_arc();
+        (action_tx, action_rx, out_tx, sm)
+    }
+
+    #[test]
+    fn stdin_pause_maps_to_pause_sub_agent_action() {
+        let (tx, mut rx, out_tx, sm) = fixture();
+        let kept = dispatch_stdin_line(r#"{"type":"pause"}"#, &tx, &out_tx, &sm);
+        assert!(kept, "pause line must keep the stdin loop alive");
+        assert!(
+            matches!(rx.try_recv().unwrap(), UiAction::PauseSubAgent),
+            "pause line must surface as UiAction::PauseSubAgent"
+        );
+    }
+
+    #[test]
+    fn stdin_resume_maps_to_resume_sub_agent_action() {
+        let (tx, mut rx, out_tx, sm) = fixture();
+        let kept = dispatch_stdin_line(r#"{"type":"resume"}"#, &tx, &out_tx, &sm);
+        assert!(kept, "resume line must keep the stdin loop alive");
+        assert!(
+            matches!(rx.try_recv().unwrap(), UiAction::ResumeSubAgent),
+            "resume line must surface as UiAction::ResumeSubAgent"
+        );
+    }
+
+    #[test]
+    fn stdin_stop_still_maps_to_request_stop() {
+        // Regression guard for the arm next door.
+        let (tx, mut rx, out_tx, sm) = fixture();
+        let kept = dispatch_stdin_line(r#"{"type":"stop"}"#, &tx, &out_tx, &sm);
+        assert!(kept);
+        assert!(matches!(rx.try_recv().unwrap(), UiAction::RequestStop));
+    }
+
+    #[tokio::test]
+    async fn stdin_invalid_json_reports_error_and_keeps_loop() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sm = StateManager::new_arc();
+        let kept = dispatch_stdin_line("not json", &tx, &out_tx, &sm);
+        assert!(kept, "a bad line must not tear down the loop");
+        // The error envelope goes out the outbound channel, not to the
+        // controller.
+        let msg = out_rx.next().await.expect("error envelope emitted");
+        assert!(
+            matches!(msg, OutboundMessage::Error { .. }),
+            "bad line must surface as an Error envelope, got {msg:?}"
+        );
+        assert!(!tx.is_closed(), "action channel must stay open");
+    }
 }
