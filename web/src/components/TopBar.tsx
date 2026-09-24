@@ -4,6 +4,7 @@ import type {
   InboundMessage,
   ModelInfo,
 } from "../state";
+import type { SubAgentRun } from "../types";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
@@ -19,6 +20,7 @@ export function TopBar({
   connected,
   pendingInput,
   statusMessage,
+  subAgent = null,
   models,
   activeAlias,
   hasTranscript,
@@ -38,6 +40,9 @@ export function TopBar({
   connected: boolean;
   pendingInput: number;
   statusMessage: string | null;
+  /** The currently-running sub-agent, or null for orchestrator-only turns.
+   * Renders the 🧩/⏸ chip next to "working…" while non-null. */
+  subAgent?: SubAgentRun | null;
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
@@ -103,6 +108,28 @@ export function TopBar({
             <span className="truncate max-w-[16rem]" title={statusMessage}>
               · {statusMessage}
             </span>
+          )}
+        </span>
+      )}
+
+      {/* Sub-agent chip: which delegated agent is driving the turn and its
+          pause lifecycle. Gated on isRunning like the status message — a
+          stale sub_agent must not leak once the run has ended. Sky ties it to
+          the sub-agent lane color used by the watching banner. */}
+      {isRunning && subAgent && (
+        <span className="flex items-center gap-1.5 text-xs text-sky-400">
+          {subAgent.pause === "running" && (
+            <>
+              🧩 <span className="font-medium">{subAgent.role}</span>
+            </>
+          )}
+          {subAgent.pause === "pausing" && (
+            <>⏸ Pausing {subAgent.role} after current step…</>
+          )}
+          {subAgent.pause === "paused" && (
+            <>
+              ⏸ <span className="font-medium">{subAgent.role}</span> paused
+            </>
           )}
         </span>
       )}

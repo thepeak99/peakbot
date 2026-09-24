@@ -20,6 +20,8 @@
 //! {"type":"select_pipeline","name":"web-team"}  // null clears the binding
 //! {"type":"kill_session","convo":"aabbcc-…"}
 //! {"type":"shutdown"}
+//! {"type":"pause"}
+//! {"type":"resume"}
 //! ```
 //!
 //! ## Outbound (agent → client)
@@ -57,6 +59,12 @@ pub(crate) enum InboundMessage {
         text: String,
     },
     Stop,
+    /// Request the currently-running (pausable) sub-agent pause at its
+    /// next checkpoint. Maps to [`crate::ui::ui_trait::UiAction::PauseSubAgent`].
+    Pause,
+    /// Resume a paused (or pausing) sub-agent. Maps to
+    /// [`crate::ui::ui_trait::UiAction::ResumeSubAgent`].
+    Resume,
     SwitchModel {
         alias: String,
     },
@@ -679,5 +687,19 @@ mod tests {
         };
         let json = serde_json::to_string(&m).unwrap();
         assert_eq!(json, r#"{"type":"recent_dirs","dirs":["/a","/b"]}"#);
+    }
+
+    // ── pause/resume wire protocol ───────────────────────────────────────
+
+    #[test]
+    fn pause_parses() {
+        let m: InboundMessage = serde_json::from_str(r#"{"type":"pause"}"#).unwrap();
+        assert!(matches!(m, InboundMessage::Pause));
+    }
+
+    #[test]
+    fn resume_parses() {
+        let m: InboundMessage = serde_json::from_str(r#"{"type":"resume"}"#).unwrap();
+        assert!(matches!(m, InboundMessage::Resume));
     }
 }

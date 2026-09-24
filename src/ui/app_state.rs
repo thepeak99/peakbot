@@ -147,6 +147,14 @@ pub struct AppState {
     /// prompt recipe, orchestrator model, `/model` lock — derives from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_pipeline: Option<String>,
+
+    /// The currently-running sub-agent, if any, and its pause status.
+    /// `None` when no sub-agent is running (orchestrator-only turn, or
+    /// between sub-agent invocations). `#[serde(default)]` keeps older
+    /// wire snapshots (pre-pause-subagents) parsing cleanly — they read
+    /// back as `None`.
+    #[serde(default)]
+    pub sub_agent: Option<SubAgentRun>,
 }
 
 impl AppState {
@@ -154,6 +162,33 @@ impl AppState {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// Pause lifecycle of a running sub-agent, as observed by UIs.
+///
+/// `Running` — no pause requested. `Pausing` — a pause has been
+/// requested but the sub-agent hasn't parked yet (still mid-step).
+/// `Paused` — the sub-agent is parked at a checkpoint. The `Paused`
+/// transition is driven by the hook integration (not covered here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PauseState {
+    Running,
+    Pausing,
+    Paused,
+}
+
+/// A running sub-agent invocation, as surfaced to UIs via `AppState`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubAgentRun {
+    /// The sub-agent's role name (e.g. "researcher").
+    pub role: String,
+    /// Whether this sub-agent honors pause requests. Some sub-agents
+    /// (e.g. those mid-tool-call with no safe checkpoint) may be
+    /// non-pausable.
+    pub pausable: bool,
+    /// Current pause lifecycle state.
+    pub pause: PauseState,
 }
 
 /// Chat message state
@@ -2415,5 +2450,114 @@ mod tests {
         let parsed: ChatMessage =
             serde_json::from_str(&baseline).expect("old JSON must still parse");
         assert!(parsed.images.is_empty());
+    }
+
+    // ── pause-subagents: PauseState / SubAgentRun / AppState.sub_agent ──
+
+    #[test]
+    fn pause_state_serializes_as_lowercase_variant_names() {
+        assert_eq!(
+            serde_json::to_string(&PauseState::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PauseState::Pausing).unwrap(),
+            "\"pausing\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PauseState::Paused).unwrap(),
+            "\"paused\""
+        );
+    }
+
+    #[test]
+    fn pause_state_deserializes_from_lowercase_variant_names() {
+        assert_eq!(
+            serde_json::from_str::<PauseState>("\"running\"").unwrap(),
+            PauseState::Running
+        );
+        assert_eq!(
+            serde_json::from_str::<PauseState>("\"pausing\"").unwrap(),
+            PauseState::Pausing
+        );
+        assert_eq!(
+            serde_json::from_str::<PauseState>("\"paused\"").unwrap(),
+            PauseState::Paused
+        );
+    }
+
+    #[test]
+    fn sub_agent_run_round_trips_through_serde() {
+        let run = SubAgentRun {
+            role: "researcher".to_string(),
+            pausable: true,
+            pause: PauseState::Pausing,
+        };
+        let json = serde_json::to_string(&run).expect("serializes");
+        let back: SubAgentRun = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, run);
+    }
+
+    /// A fresh `AppState` has no sub-agent running.
+    #[test]
+    fn new_app_state_has_no_sub_agent_by_default() {
+        let state = AppState::new();
+        assert_eq!(state.sub_agent, None);
+    }
+
+    /// `sub_agent: Some(..)` round-trips 1:1 through serde.
+    #[test]
+    fn app_state_sub_agent_round_trips_when_present() {
+        let mut state = AppState::new();
+        state.sub_agent = Some(SubAgentRun {
+            role: "researcher".to_string(),
+            pausable: true,
+            pause: PauseState::Paused,
+        });
+
+        let json = serde_json::to_string(&state).expect("serializes");
+        assert!(
+            json.contains("\"sub_agent\""),
+            "sub_agent must serialize as a top-level field; got: {json}"
+        );
+
+        let parsed: AppState = serde_json::from_str(&json).expect("round-trips back");
+        assert_eq!(parsed.sub_agent, state.sub_agent);
+    }
+
+    /// Forward compat: an OLD `AppState` JSON snapshot with no `sub_agent`
+    /// key at all (exactly what pre-pause-subagents code persisted) must
+    /// still deserialize, yielding `sub_agent == None` via
+    /// `#[serde(default)]`. We take a real serialized `AppState` and strip
+    /// the `sub_agent` key to build the fixture, so this stays honest to
+    /// what an actual old snapshot looks like.
+    #[test]
+    fn deserializing_old_app_state_json_without_sub_agent_key_yields_none() {
+        let mut state = AppState::new();
+        state.sub_agent = Some(SubAgentRun {
+            role: "researcher".to_string(),
+            pausable: false,
+            pause: PauseState::Running,
+        });
+        let json = serde_json::to_string(&state).expect("serializes");
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON object");
+        let removed = value
+            .as_object_mut()
+            .expect("AppState serializes as an object")
+            .remove("sub_agent");
+        assert!(
+            removed.is_some(),
+            "sanity: sub_agent key must have been present before stripping"
+        );
+        let old_snapshot = serde_json::to_string(&value).expect("re-serializes without key");
+        assert!(!old_snapshot.contains("sub_agent"));
+
+        let parsed: AppState =
+            serde_json::from_str(&old_snapshot).expect("old snapshot must parse on new code");
+        assert_eq!(
+            parsed.sub_agent, None,
+            "missing sub_agent key must default to None"
+        );
     }
 }

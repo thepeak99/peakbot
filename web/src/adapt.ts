@@ -18,6 +18,7 @@ import type {
   LaneStat,
   MessageRole,
   SessionStats,
+  SubAgentRun,
   TodoItem,
   TodoNode,
   TodoStatus,
@@ -143,6 +144,13 @@ export function adaptBg(s: AppState): BgProcess[] {
     status: b.status === "running" ? "running" : "exited",
     exitCode: b.exit_code ?? undefined,
   }));
+}
+
+/** The currently-running sub-agent, or null when none is running. Normalises
+ * the wire field's absent state (pre-pause-subagents snapshots omit it —
+ * `#[serde(default)]`) to null so callers get one shape. */
+export function adaptSubAgent(s: AppState): SubAgentRun | null {
+  return s.sub_agent ?? null;
 }
 
 // File tools whose `path` arg we surface in the Files tab. Writes (create /
