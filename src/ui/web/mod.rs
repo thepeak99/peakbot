@@ -547,6 +547,16 @@ pub(crate) enum ForwardExit {
     StateEnded,
 }
 
+/// The SPA renders `content`, never `tool_result`; the raw
+/// payload (base64 images, long output) is most of the frame,
+/// so it stays server-side.
+fn strip_tool_results(mut state: AppState) -> AppState {
+    for m in &mut state.chat.messages {
+        m.tool_result = None;
+    }
+    state
+}
+
 /// Pump `StateManager` snapshots into the connection's coalescing slot
 /// until any leg of the connection dies. The `writer` arm is what turns
 /// "the writer noticed the peer is dead" into "the socket detaches from
@@ -569,7 +579,7 @@ pub(crate) async fn forward_state(
                 let exit = app_state.exit_requested;
                 // Rewrite the already-cloned snapshot (not the shared state): /images/ links
                 // must never leak to disk, and stdio's separate publish path has no server.
-                let app_state = images.rewrite(app_state, &sm.session_cwd());
+                let app_state = strip_tool_results(images.rewrite(app_state, &sm.session_cwd()));
                 if out.publish_state(Arc::new(app_state)).is_err() {
                     return ForwardExit::WriterGone;
                 }
@@ -1999,5 +2009,180 @@ mod tests {
                 .expect("recording-sink mutex poisoned") += 1;
             Poll::Ready(Ok(()))
         }
+    }
+
+    // ── web wire reduction: `tool_result` never reaches the browser ────────
+    //
+    // The SPA declares `tool_result` (web/src/state.ts:27) but never reads it:
+    // `adaptMessage` passes `content` through verbatim and `Message.tsx`
+    // renders `content`. The raw payload (view_image's inline base64, long
+    // bash output) is 60–86% of frame bytes, so the per-socket web frame must
+    // drop it. The StateManager keeps the full payload — persistence, the
+    // model's wire history, and stdio's separate publish path are untouched.
+    //
+    // RED: `forward_state` does not apply this reduction yet, so the published
+    // frame still carries the payload and the assertions below fail. The
+    // implementer applies it to the detached clone in `forward_state`, right
+    // beside `images.rewrite` (same by-value discipline as `ImageLinks::rewrite`).
+
+    /// 1 MiB of base64-ish payload starting with the PNG magic — the
+    /// `view_image` shape that bloats every frame.
+    fn megabyte_base64_payload() -> String {
+        format!("iVBOR{}", "A".repeat(1024 * 1024 - "iVBOR".len()))
+    }
+
+    /// A `view_image` tool-result row: display line in `content`, the full
+    /// base64 payload in `tool_result`. Built via the real constructor so the
+    /// row is shaped exactly as production mints it.
+    fn view_image_row_with_payload(payload: &str) -> ChatMessage {
+        ChatMessage::tool_result(
+            "view_image",
+            r#"{"path":"shot.png"}"#,
+            &format!(
+                r#"{{"type":"image","data":"{payload}","mimeType":"image/png","image_ref":{{"id":"{}.png","display_name":"shot.png"}}}}"#,
+                "ab".repeat(32)
+            ),
+            None,
+        )
+    }
+
+    /// The delegate handoff banner — the display text the transcript shows for
+    /// an interrupted sub-agent. It lives in `content` (via
+    /// `format_tool_result` → `truncate_to_lines`), so it must survive the
+    /// `tool_result` strip.
+    const INTERRUPTED_BANNER: &str =
+        "[delegate:reviewer] INTERRUPTED — the subagent context exceeded its max threshold.";
+
+    /// The web frame for a state whose transcript holds a 1 MiB `tool_result`
+    /// must:
+    /// (a) carry no payload and stay small — the payload is 60–86% of frame
+    ///     bytes today;
+    /// (b) still carry each row's display text (`content`) — the SPA renders
+    ///     `content`, never `tool_result`;
+    /// (c) leave the StateManager's shared state holding the full payload —
+    ///     the reduction applies to the wire copy only.
+    #[tokio::test]
+    async fn web_state_frame_drops_tool_result_but_keeps_content() {
+        use crate::ui::app_state::{ChatState, MessageSource};
+
+        let cwd = tempfile::TempDir::new().expect("tempdir");
+        let sm = StateManager::new();
+        sm.set_session_cwd(cwd.path().to_path_buf());
+
+        let payload = megabyte_base64_payload();
+        let interrupted = ChatMessage::tool_result(
+            "delegate",
+            r#"{"role":"reviewer","task":"review"}"#,
+            INTERRUPTED_BANNER,
+            None,
+        )
+        .with_source(MessageSource::SubAgent {
+            role: "reviewer".to_string(),
+        });
+        let mut chat = ChatState::new();
+        chat.add_message(view_image_row_with_payload(&payload));
+        chat.add_message(interrupted);
+        sm.update_chat_state(chat);
+
+        // Test-setup sanity: the shared state really does hold the payload
+        // before anything is forwarded.
+        let shared_before = sm.get_state();
+        let row = shared_before
+            .chat
+            .messages
+            .iter()
+            .find(|m| m.tool_name.as_deref() == Some("view_image"))
+            .expect("view_image row in shared state");
+        assert!(
+            row.tool_result
+                .as_deref()
+                .is_some_and(|r| r.contains(&payload)),
+            "fixture must carry the 1 MiB payload before the forward"
+        );
+
+        // The T13/T14 harness: the state channel carries the owned detached
+        // clone `subscribe()` would hand the forwarder; reader and writer
+        // never complete, so only the state arm may fire.
+        let (state_tx, mut state_rx) = mpsc::channel::<AppState>(1);
+        let mut reader: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let mut writer: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let (out, mut rx): (OutboundTx, OutboundRx) = outbound_channel();
+
+        let mut detached = sm.get_state();
+        detached.exit_requested = true;
+        state_tx.send(detached).await.expect("send detached clone");
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
+        )
+        .await
+        .expect("forwarder must exit after one published frame");
+        assert!(
+            matches!(exit, ForwardExit::StateEnded),
+            "forwarder must end via the exit flag after one frame; got {exit:?}"
+        );
+
+        // The exact bytes the writer would put on the socket.
+        let frame = tokio::time::timeout(Duration::from_secs(1), rx.next())
+            .await
+            .expect("published frame must arrive")
+            .expect("published frame present");
+        let wire = match frame {
+            OutboundMessage::State { state } => state,
+            other => panic!("expected a State frame, got {other:?}"),
+        };
+        let json = serde_json::to_string(&OutboundMessage::State {
+            state: wire.clone(),
+        })
+        .expect("serialise the state frame");
+
+        // (a) the payload is gone and the frame is small.
+        assert!(
+            !json.contains("iVBOR"),
+            "web frame must not carry the base64 payload; frame was {} bytes",
+            json.len()
+        );
+        assert!(
+            json.len() < 64 * 1024,
+            "web frame must stay under 64 KiB; was {} bytes",
+            json.len()
+        );
+
+        // (b) the display text survives — the SPA renders `content`.
+        assert!(
+            json.contains("shot.png"),
+            "the view_image row's display text must survive the reduction"
+        );
+        assert!(
+            json.contains("INTERRUPTED"),
+            "the delegate row's INTERRUPTED banner (in `content`) must survive"
+        );
+
+        // (c) the reduction is wire-copy only: shared state keeps the payload.
+        let shared_after = sm.get_state();
+        let row_after = shared_after
+            .chat
+            .messages
+            .iter()
+            .find(|m| m.tool_name.as_deref() == Some("view_image"))
+            .expect("view_image row in shared state");
+        assert!(
+            row_after
+                .tool_result
+                .as_deref()
+                .is_some_and(|r| r.contains(&payload)),
+            "shared state must keep the full payload"
+        );
+        assert!(
+            shared_after
+                .chat
+                .messages
+                .iter()
+                .any(|m| m.content.contains("INTERRUPTED")),
+            "shared state must keep the INTERRUPTED banner"
+        );
     }
 }

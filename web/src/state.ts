@@ -24,7 +24,7 @@ export interface WireChatMessage {
   timestamp: string; // ISO 8601
   tool_name?: string;
   tool_args?: string;
-  tool_result?: string;
+  // Server-side only (stripped per frame by strip_tool_results); SPA renders content.
   call_id?: string;
   compacted?: boolean;
   source?: WireMessageSource;
