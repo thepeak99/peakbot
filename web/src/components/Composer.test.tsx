@@ -1,37 +1,19 @@
-// RED tests for the mobile queue-button bug in `Composer.tsx`.
+// Regression tests for the Composer's action row: the mobile queue button
+// and the sub-agent Pause/Resume button.
 //
-// Bug: on a touch device you cannot queue a message while the agent is
-// running. Enter-to-send is deliberately disabled on coarse pointers
-// (Composer.tsx:221-226 — that stays), and the action slot is a single
-// `isRunning ? <Stop> : <Send>` (Composer.tsx:368-384), so while running
-// the Send button is unmounted and there is no way to queue. The backend
-// already accepts mid-turn sends and queues them — this is UI-only.
+// Mobile queue (issue #123): on a touch device Enter inserts a newline by
+// design, so the only path to send is the button. The dispatch button is
+// ALWAYS mounted and ALWAYS the last button in DOM order; while `isRunning`
+// it reads "Queue" (mid-turn sends are queued server-side) and Stop sits
+// before it. Stop's accessible name warns about discarding queued sends
+// when `pendingInput > 0`, and an inline hint line shows the queue depth.
 //
-// Agreed design these tests lock in (written BEFORE the implementation;
-// tests 1, 2, 3, 5, 7 are expected RED today; 4 and 6 describe existing
-// behaviour and are expected GREEN):
-//
-//   - While `isRunning`, the composer renders BOTH a Stop control and a
-//     dispatch button. The dispatch button is ALWAYS mounted and ALWAYS
-//     the last button in DOM order; Stop, when present, comes immediately
-//     before it.
-//   - Dispatch button text: `Send` when idle, `Queue` when `isRunning`.
-//     Same emerald styling in both states.
-//   - Clicking dispatch goes through the existing `onSend(text)` path
-//     (same as today's `submit()`), clears the textarea, and does NOT
-//     call `onStop`.
-//   - Dispatch is disabled when there is nothing to send (the existing
-//     `canSend` logic: non-empty trimmed text or ≥1 attached image, and
-//     `connected`).
-//   - Stop's accessible name/title: plain `Stop` when `pendingInput ===
-//     0`; when `pendingInput > 0` it warns about discarding, containing
-//     both the count and the word `discard`.
-//   - NEW PROP `pendingInput: number` (sourced in App.tsx from
-//     `state.pending_input_count`). While `isRunning && pendingInput > 0`
-//     an inline hint line — NOT breakpoint-gated — contains the count and
-//     the word `discard`; absent when `pendingInput === 0`.
-//   - On touch, Enter (no shift) still does NOT send — it inserts a
-//     newline. Must stay true even while running (locks commit 63f526e).
+// Pause/Resume (pause-subagents): while a pausable sub-agent runs, an amber
+// Pause/Resume button sits before Stop. It sends the explicit
+// `{"type":"pause"}` / `{"type":"resume"}` frames (never a toggle) and
+// relabels by the wire pause state — "⏸ Pause" while running, "▶ Resume"
+// while pausing or paused. Stop stays as is and aborts everything, paused
+// sub-agent included.
 //
 // Harness modeled on `TopBar.test.tsx` / `Transcript.test.tsx`: plain
 // `createRoot` + `act` (jsdom is auto-enabled for `src/components/**` by
@@ -42,19 +24,13 @@
 // and restored in `afterEach`. `matches` is driven by the `touchMatches`
 // flag set per test; only `(pointer: coarse)` is targeted, any other query
 // is tolerated and reports `false`.
-//
-// `pendingInput` is not on Composer's declared props today, so the fixture
-// is typed as the real interface plus the new field and passed through an
-// `as unknown as Parameters<typeof Composer>[0]` cast (the established
-// pattern in this repo, see TopBar.test.tsx) so the file still
-// type-checks and vitest runs it against today's component. Post-
-// implementation the cast becomes a no-op identity.
 
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Composer } from "./Composer";
-import type { SlashCommand } from "../state";
+import type { InboundMessage, SlashCommand } from "../state";
+import type { SubAgentRun } from "../types";
 
 // React 19's `flushSync` checks `IS_REACT_ACT_ENVIRONMENT`; set once so the
 // console stays clean, matching the other component tests' setup.
@@ -95,21 +71,17 @@ beforeEach(() => {
 
 // ─── fixture ──────────────────────────────────────────────────────────────
 
-// Composer's declared props today (Composer.tsx:55-75) have no `pendingInput`
-// field. Type the fixture as the real interface PLUS the not-yet-existing
-// field, so the fixture reads the way the post-implementation call site will,
-// while the cast in `mount` keeps the file compiling against today's
-// component.
 interface ComposerProps {
   isRunning: boolean;
   connected: boolean;
   commands: SlashCommand[];
   onSend: (text: string) => void;
   onStop: () => void;
+  subAgent: SubAgentRun | null;
+  onPause: () => void;
+  onResume: () => void;
   watchingRole?: string | null;
   onClearWatch?: () => void;
-  /** NEW — not on Composer's props type yet. Sourced in App.tsx from
-   *  `state.pending_input_count`. */
   pendingInput: number;
 }
 
@@ -119,11 +91,19 @@ const makeProps = (overrides: Partial<ComposerProps> = {}): ComposerProps => ({
   commands: [],
   onSend: vi.fn(),
   onStop: vi.fn(),
+  subAgent: null,
+  onPause: vi.fn(),
+  onResume: vi.fn(),
   watchingRole: null,
   onClearWatch: () => {},
   pendingInput: 0,
   ...overrides,
 });
+
+// A pausable sub-agent in the given pause state.
+function subAgent(pause: SubAgentRun["pause"]): SubAgentRun {
+  return { role: "researcher", pausable: true, pause };
+}
 
 // ─── mount helper ─────────────────────────────────────────────────────────
 
@@ -145,13 +125,7 @@ async function mount(props: ComposerProps): Promise<HTMLDivElement> {
   document.body.appendChild(container);
   await act(async () => {
     root = createRoot(container!);
-    // `pendingInput` is not part of Composer's declared props today, so we
-    // cast through `unknown` to pass it anyway — the point of these tests
-    // is to prove the prop is currently ignored/absent, not to fight the
-    // type system. Post-implementation this cast becomes a no-op identity.
-    root.render(
-      <Composer {...(props as unknown as Parameters<typeof Composer>[0])} />,
-    );
+    root.render(<Composer {...props} />);
   });
   return container;
 }
@@ -200,6 +174,24 @@ const hasDiscardCount = (el: HTMLElement, count: number): boolean =>
     return text.includes(String(count)) && text.toLowerCase().includes("discard");
   });
 
+/** Find a rendered button by its text content. */
+function findButton(el: HTMLDivElement, text: string): HTMLButtonElement {
+  const btn = Array.from(el.querySelectorAll("button")).find((b) =>
+    b.textContent?.includes(text),
+  );
+  if (!btn) {
+    throw new Error(`no button containing "${text}" in:\n${el.innerHTML}`);
+  }
+  return btn;
+}
+
+/** True when any rendered button contains the text. */
+function hasButton(el: HTMLDivElement, text: string): boolean {
+  return Array.from(el.querySelectorAll("button")).some((b) =>
+    b.textContent?.includes(text),
+  );
+}
+
 // Set a textarea's value the way a user typing would, so React's onChange
 // (backed by the native `input` event) fires. Direct `el.value = ...` would
 // bypass React's controlled state.
@@ -233,8 +225,6 @@ const pressEnter = async (el: HTMLTextAreaElement): Promise<void> => {
 
 describe("Composer — mobile queue button while running", () => {
   // T1 — THE bug: on touch while running, both controls must be present.
-  // RED today: the action slot is `isRunning ? <Stop> : <Send>`, so no
-  // "Queue" button exists while running.
   it("touch + running: renders BOTH a 'Queue' dispatch button and a Stop control", async () => {
     touchMatches = true;
     const el = await mount(makeProps({ isRunning: true }));
@@ -242,7 +232,7 @@ describe("Composer — mobile queue button while running", () => {
     const queue = buttonWithText(el, "Queue");
     expect(
       queue,
-      "expected a button with text 'Queue' while running (the Send button is unmounted today)",
+      "expected a button with text 'Queue' while running",
     ).not.toBeNull();
     const stop = stopControl(el);
     expect(
@@ -252,7 +242,6 @@ describe("Composer — mobile queue button while running", () => {
   });
 
   // T2 — dispatch rides the existing onSend path, never onStop.
-  // RED today: no "Queue" button exists while running.
   it("touch + running: clicking 'Queue' calls onSend once with the text, does not call onStop, and clears the textarea", async () => {
     touchMatches = true;
     const props = makeProps({ isRunning: true });
@@ -273,8 +262,7 @@ describe("Composer — mobile queue button while running", () => {
     expect(textarea!.value).toBe("");
   });
 
-  // T3 — DOM order: Stop immediately before dispatch; dispatch last.
-  // RED today: no "Queue" button exists while running.
+  // T3 — DOM order: Stop before dispatch; dispatch last.
   it("running: the Stop control appears before the dispatch button, which is the last button in DOM order", async () => {
     const el = await mount(makeProps({ isRunning: true }));
 
@@ -294,8 +282,7 @@ describe("Composer — mobile queue button while running", () => {
     ).toBe(queue);
   });
 
-  // T4 — idle behaviour unchanged: dispatch reads "Send", no Stop.
-  // Expected GREEN today (existing behaviour).
+  // T4 — idle behaviour: dispatch reads "Send", no Stop.
   it("idle: the dispatch button reads 'Send' and no Stop control exists", async () => {
     const el = await mount(makeProps({ isRunning: false }));
 
@@ -306,8 +293,7 @@ describe("Composer — mobile queue button while running", () => {
     expect(stopControl(el), "expected no Stop control while idle").toBeNull();
   });
 
-  // T5 — nothing to send → disabled (existing `canSend`), click is a no-op.
-  // RED today: no "Queue" button exists while running.
+  // T5 — nothing to send → disabled (`canSend`), click is a no-op.
   it("running + empty input: the 'Queue' button is disabled and clicking it does not call onSend", async () => {
     const props = makeProps({ isRunning: true });
     const el = await mount(props);
@@ -324,7 +310,6 @@ describe("Composer — mobile queue button while running", () => {
   });
 
   // T6 — touch Enter never sends, even while running (locks commit 63f526e).
-  // Expected GREEN today (existing behaviour).
   it("touch + running: Enter without shift does not call onSend (newline behaviour preserved)", async () => {
     touchMatches = true;
     const props = makeProps({ isRunning: true });
@@ -342,7 +327,6 @@ describe("Composer — mobile queue button while running", () => {
 
   // T7 — the pendingInput hint line: present with the count + "discard"
   // while running and queued, absent when nothing is queued.
-  // RED today: `pendingInput` is not a Composer prop and no such line exists.
   it("running + pendingInput=2: an element contains both '2' and 'discard'; with pendingInput=0 no such element exists", async () => {
     const elWith = await mount(makeProps({ isRunning: true, pendingInput: 2 }));
     expect(
@@ -355,5 +339,142 @@ describe("Composer — mobile queue button while running", () => {
       hasDiscardCount(elWithout, 0),
       "expected no element containing both '0' and 'discard' when nothing is queued",
     ).toBe(false);
+  });
+});
+
+// ─── Pause/Resume visibility ─────────────────────────────────────────────
+
+describe("Composer — Pause/Resume visibility", () => {
+  it("hides the Pause button when idle", async () => {
+    const el = await mount(makeProps({
+      isRunning: false,
+      subAgent: subAgent("running"),
+    }));
+
+    expect(hasButton(el, "Pause")).toBe(false);
+    expect(hasButton(el, "Resume")).toBe(false);
+  });
+
+  it("hides the Pause button when only the orchestrator runs (subAgent null)", async () => {
+    const el = await mount(makeProps({
+      isRunning: true,
+      subAgent: null,
+    }));
+
+    expect(hasButton(el, "Pause")).toBe(false);
+    expect(hasButton(el, "Resume")).toBe(false);
+    // Stop still shows while running.
+    expect(hasButton(el, "Stop")).toBe(true);
+  });
+
+  it("hides the Pause button when the sub-agent is not pausable", async () => {
+    const el = await mount(makeProps({
+      isRunning: true,
+      subAgent: { role: "researcher", pausable: false, pause: "running" },
+    }));
+
+    expect(hasButton(el, "Pause")).toBe(false);
+    expect(hasButton(el, "Resume")).toBe(false);
+    expect(hasButton(el, "Stop")).toBe(true);
+  });
+});
+
+// ─── Pause/Resume label + frames ─────────────────────────────────────────
+
+describe("Composer — Pause/Resume label and wire frames", () => {
+  it("shows '⏸ Pause' with the pause tooltip while pause === 'running'", async () => {
+    const el = await mount(makeProps({
+      isRunning: true,
+      subAgent: subAgent("running"),
+    }));
+
+    const btn = findButton(el, "Pause");
+    expect(btn.textContent).toContain("⏸");
+    expect(btn.title).toBe("Pause sub-agent after its current step");
+    expect(hasButton(el, "Resume")).toBe(false);
+  });
+
+  it("clicking Pause sends the explicit {type:'pause'} frame", async () => {
+    const sent: InboundMessage[] = [];
+    const el = await mount(makeProps({
+      isRunning: true,
+      subAgent: subAgent("running"),
+      onPause: () => sent.push({ type: "pause" }),
+    }));
+
+    const btn = findButton(el, "Pause");
+    await act(async () => {
+      btn.click();
+    });
+
+    expect(sent).toEqual([{ type: "pause" }]);
+  });
+
+  it("shows '▶ Resume' with the resume tooltip while pause === 'pausing'", async () => {
+    const el = await mount(makeProps({
+      isRunning: true,
+      subAgent: subAgent("pausing"),
+    }));
+
+    const btn = findButton(el, "Resume");
+    expect(btn.textContent).toContain("▶");
+    expect(btn.title).toBe("Resume sub-agent");
+    expect(hasButton(el, "Pause")).toBe(false);
+  });
+
+  it("clicking Resume (pausing) sends the explicit {type:'resume'} frame", async () => {
+    const sent: InboundMessage[] = [];
+    const el = await mount(makeProps({
+      isRunning: true,
+      subAgent: subAgent("pausing"),
+      onResume: () => sent.push({ type: "resume" }),
+    }));
+
+    const btn = findButton(el, "Resume");
+    await act(async () => {
+      btn.click();
+    });
+
+    expect(sent).toEqual([{ type: "resume" }]);
+  });
+
+  it("shows '▶ Resume' and sends {type:'resume'} while pause === 'paused'", async () => {
+    const sent: InboundMessage[] = [];
+    const el = await mount(makeProps({
+      isRunning: true,
+      subAgent: subAgent("paused"),
+      onResume: () => sent.push({ type: "resume" }),
+    }));
+
+    const btn = findButton(el, "Resume");
+    expect(btn.textContent).toContain("▶");
+    expect(btn.title).toBe("Resume sub-agent");
+    await act(async () => {
+      btn.click();
+    });
+
+    expect(sent).toEqual([{ type: "resume" }]);
+  });
+});
+
+// ─── Stop unchanged ─────────────────────────────────────────────────────
+
+describe("Composer — Stop stays as is", () => {
+  it("renders Stop next to Pause while a pausable sub-agent runs, and Stop still sends {type:'stop'}", async () => {
+    const sent: InboundMessage[] = [];
+    const el = await mount(makeProps({
+      isRunning: true,
+      subAgent: subAgent("running"),
+      onStop: () => sent.push({ type: "stop" }),
+      onPause: () => sent.push({ type: "pause" }),
+    }));
+
+    expect(hasButton(el, "Pause")).toBe(true);
+    const stop = findButton(el, "Stop");
+    await act(async () => {
+      stop.click();
+    });
+
+    expect(sent).toEqual([{ type: "stop" }]);
   });
 });

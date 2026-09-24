@@ -3,8 +3,11 @@
 //! Contains application state management. StateManager is the single source of truth
 //! for all application state (stats, todo, chat, etc.).
 
+pub mod pause;
 pub mod state_manager;
 
+// Re-export the pause gate types for convenience.
+pub use pause::{PauseAwareElapsed, PauseGate};
 // Re-export StateManager for convenience.
 // #183: `StopTally` is the snapshot type `stop_turn_processes` returns; it
 // needs to be reachable from `lib.rs::stop_message` (which is module-private

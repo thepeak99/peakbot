@@ -91,6 +91,20 @@ export interface BgProcess {
   exitCode?: number;
 }
 
+/** Pause lifecycle of a running sub-agent (view mirror of the wire
+ * `WirePauseState`; the field names are already camelCase). */
+export type PauseState = "running" | "pausing" | "paused";
+
+/** The currently-running sub-agent, as surfaced by the backend. `null` (or
+ * absent) when no sub-agent is running — orchestrator-only turns and the
+ * gaps between sub-agent invocations. */
+export interface SubAgentRun {
+  role: string;
+  /** Whether this sub-agent honors pause requests — gates the Pause button. */
+  pausable: boolean;
+  pause: PauseState;
+}
+
 // A file the agent touched this session, derived from file-edit tool calls
 // in the transcript (#126). `edits` counts how many times it was written.
 export interface FileEdit {

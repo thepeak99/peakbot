@@ -22,7 +22,7 @@ mod tests {
 
     #[test]
     fn input_area_empty() {
-        let paragraph = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false);
+        let paragraph = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false, None);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_empty", lines.join("\n"));
@@ -30,7 +30,8 @@ mod tests {
 
     #[test]
     fn input_area_cursor_start() {
-        let paragraph = ReplUi::build_input_paragraph("Hello", 0, false, None, None, 0, 0, false);
+        let paragraph =
+            ReplUi::build_input_paragraph("Hello", 0, false, None, None, 0, 0, false, None);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_cursor_start", lines.join("\n"));
@@ -38,7 +39,8 @@ mod tests {
 
     #[test]
     fn input_area_cursor_middle() {
-        let paragraph = ReplUi::build_input_paragraph("Hello", 2, false, None, None, 0, 0, false);
+        let paragraph =
+            ReplUi::build_input_paragraph("Hello", 2, false, None, None, 0, 0, false, None);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_cursor_middle", lines.join("\n"));
@@ -46,7 +48,8 @@ mod tests {
 
     #[test]
     fn input_area_cursor_end() {
-        let paragraph = ReplUi::build_input_paragraph("Hello", 5, false, None, None, 0, 0, false);
+        let paragraph =
+            ReplUi::build_input_paragraph("Hello", 5, false, None, None, 0, 0, false, None);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!("input_area_cursor_end", lines.join("\n"));
@@ -63,6 +66,7 @@ mod tests {
             0,
             0,
             false,
+            None,
         );
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
@@ -79,7 +83,7 @@ mod tests {
     #[test]
     fn input_area_multiline_cursor_on_second_line() {
         let paragraph =
-            ReplUi::build_input_paragraph("abc\ndef", 5, false, None, None, 0, 0, false);
+            ReplUi::build_input_paragraph("abc\ndef", 5, false, None, None, 0, 0, false, None);
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!(
@@ -93,7 +97,7 @@ mod tests {
     #[test]
     fn input_area_multiline_cursor_on_first_line() {
         let paragraph =
-            ReplUi::build_input_paragraph("abc\ndef", 1, false, None, None, 0, 0, false);
+            ReplUi::build_input_paragraph("abc\ndef", 1, false, None, None, 0, 0, false, None);
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!(
@@ -107,7 +111,7 @@ mod tests {
     #[test]
     fn input_area_multiline_cursor_at_end_of_first_line() {
         let paragraph =
-            ReplUi::build_input_paragraph("abc\ndef", 3, false, None, None, 0, 0, false);
+            ReplUi::build_input_paragraph("abc\ndef", 3, false, None, None, 0, 0, false, None);
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!(
@@ -121,7 +125,8 @@ mod tests {
     /// Expected: "> abc" on line 0, "█" on line 1.
     #[test]
     fn input_area_multiline_cursor_on_empty_trailing_line() {
-        let paragraph = ReplUi::build_input_paragraph("abc\n", 4, false, None, None, 0, 0, false);
+        let paragraph =
+            ReplUi::build_input_paragraph("abc\n", 4, false, None, None, 0, 0, false, None);
         let terminal = render_widget(paragraph, 60, 5);
         let lines = buffer_to_lines(terminal.backend());
         assert_snapshot!(
@@ -142,6 +147,7 @@ mod tests {
             0,
             0,
             false,
+            None,
         );
         let terminal = render_widget(paragraph, 60, 6);
         let lines = buffer_to_lines(terminal.backend());
@@ -1327,7 +1333,7 @@ mod tests {
         // Simulate user typing/pasting "⚠️ help me" (warn emoji + VS16).
         let input = "\u{26A0}\u{FE0F} help me";
         let paragraph =
-            ReplUi::build_input_paragraph(input, input.len(), false, None, None, 0, 0, false);
+            ReplUi::build_input_paragraph(input, input.len(), false, None, None, 0, 0, false, None);
         let terminal = render_widget(paragraph, 60, 3);
         let lines = buffer_to_lines(terminal.backend());
         let joined = lines.join("\n");
