@@ -1658,9 +1658,9 @@ fn single_response_with_text_and_tool_call_still_coalesces() {
         r#"{"path":"a.txt"}"#.to_string(),
         Some("c1".to_string()),
     );
-    // The result closes the pair: `sanitize_tool_pairs` drops an orphan
-    // ToolCall at the wire boundary, so a call with no result never reaches
-    // the rebuild helper this test is about.
+    // The result closes the pair: without it, `sanitize_tool_pairs` would
+    // answer the call as INTERRUPTED at the wire boundary, and the rebuild
+    // helper this test is about would see a synthetic result instead.
     sm.add_tool_result(
         MessageSource::Human,
         "file_read".to_string(),
@@ -1752,9 +1752,9 @@ fn rows_without_response_id_never_replay_reasoning() {
         r#"{"command":"ls"}"#.to_string(),
         Some("c1".to_string()),
     );
-    // The result closes the pair: `sanitize_tool_pairs` drops an orphan
-    // ToolCall at the wire boundary, so a call with no result would never
-    // reach the rebuild helper at all.
+    // The result closes the pair: without it, `sanitize_tool_pairs` would
+    // answer the call as INTERRUPTED at the wire boundary, and the rebuild
+    // helper would see a synthetic result instead of the real one.
     sm.add_tool_result(
         MessageSource::Human,
         "bash".to_string(),

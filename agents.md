@@ -125,7 +125,9 @@ Two exceptions, registered ungated: `think` (its `thought` *is* the payload) and
 
 ## Configuration
 
-Loaded from `config.yaml` in the platform config dir, merged with a per-repo `.peakbot/config.yaml`; environment variables take precedence. Key env vars: `PROVIDER` (JSON provider config), `AGENT_MAX_TURNS`, `MCP_SERVERS` (JSON), `SEARXNG_BASE_URL`, `PEAKBOT_WEB_TOKEN`.
+Loaded from `config.yaml` in the platform config dir, merged with a per-repo `.peakbot/config.yaml`; environment variables take precedence. Key env vars: `PROVIDER` (JSON provider config), `AGENT_MAX_TURNS`, `MCP_SERVERS` (JSON), `SEARXNG_BASE_URL`, `PEAKBOT_WEB_TOKEN`, `RUST_LOG`.
+
+`RUST_LOG` controls `tracing`-style log verbosity: unset, errors only. For a service install consider `RUST_LOG=peakbot=info` (systemd: `systemctl --user edit peakbot` → `[Service]` / `Environment=RUST_LOG=peakbot=info`).
 
 ### Live reload on session verbs (`/new`, `/model`, `/cd`, `/load`)
 
@@ -540,7 +542,7 @@ A sub-agent's preamble (`build_sub_agent_preamble`, rebuilt fresh per delegation
 
 ### Tools, isolation, stop
 
-Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). No sandbox in v1 — a sub-agent can write and run bash. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together. With #183 the abort is **mid-tool**, not just at the next LLM boundary: dropping the orchestrator's turn future unwinds the in-flight delegation and its sub-tool (`bash`/etc.) along with it, so the sub-agent's PTY child dies via `PtyHandle::drop` at the same instant. There is no resumption path.
+Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). No sandbox in v1 — a sub-agent can write and run bash. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together. With #183 the abort is **mid-tool**, not just at the next LLM boundary: dropping the orchestrator's turn future unwinds the in-flight delegation and its sub-tool (`bash`/etc.) along with it, so the sub-agent's PTY child dies via `PtyHandle::drop` at the same instant. Stop or session teardown during a delegation persists an `INTERRUPTED` result for the in-flight `delegate` call, quoting the sub-agent's last message. Any tool call with no recorded result (crash, old transcripts) reaches the model as `INTERRUPTED` at the wire boundary (`sanitize_tool_pairs`) and is never silently dropped.
 
 Pause (`/pause`, `Ctrl+P` in the TUI) is a **cooperative** gate and sub-agents only: the sub-agent finishes the step it is on, then parks before its next LLM call or tool dispatch until `/resume` (or `Ctrl+P` again). Paused time never counts against `timeouts.delegate_secs`, and Ollama sub-agents (hookless) are not pausable. Stop is unchanged: it aborts everything **including a paused sub-agent** — the parked wait is part of the turn future, so it drops with it.
 

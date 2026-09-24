@@ -968,8 +968,13 @@ impl AgentRunner {
         // Wait for event loop to exit (View closed)
         event_handle.await.ok();
         agent_handle.abort();
+        // The abort drops the in-flight turn's future exactly as Stop does;
+        // await so the drop has landed before the seam below reads state.
+        agent_handle.await.ok();
         // Drop the bg notify sender so the bridge wakes and exits.
         if let Some(sm) = self.state_manager.as_ref() {
+            // Answer the in-flight tool call, if any, before teardown.
+            sm.close_interrupted_tool_call();
             sm.detach_bg_notify();
             // Kill any still-running bg processes before tearing down.
             sm.clear_bg();
@@ -2748,10 +2753,16 @@ impl AgentRunner {
             // sub-agent, the PTY child that dies through `PtyHandle::drop`.
             // There is deliberately no cancel arm inside the tools — adding
             // one would shadow this one (outer-observes-inner race) and
-            // would still be unreachable code in production.
+            // would still be unreachable code in production. The cancel arm
+            // below answers the in-flight tool call, if any, as INTERRUPTED.
             let result = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return CompletionResult::Stopped,
+                _ = cancel.cancelled() => {
+                    if let Some(sm) = state_manager {
+                        sm.close_interrupted_tool_call();
+                    }
+                    return CompletionResult::Stopped;
+                }
                 r = agent.as_ref().prompt_with_history(current_turn.clone(), &mut history) => r,
             };
 
@@ -7515,6 +7526,259 @@ pipelines:
             sm.get_current_conversation().unwrap().pipeline.as_deref(),
             Some("web-team"),
             "…and persisted truth agrees with the mirror (I-3)"
+        );
+    }
+
+    // ─── interrupted tool results (interrupted-tool-results design §5 b3/c) ───
+
+    /// b3 — Stop mid-tool: the cancel arm must answer the in-flight
+    /// orchestrator-lane ToolCall with a persisted INTERRUPTED result that
+    /// quotes the sub-agent's last message. Modelled on
+    /// `retry_arm_resumes_from_the_tail_after_a_tool_roundtrip`: a real
+    /// hanging `bash sleep 30` is the in-flight tool, and the sub-agent's
+    /// persisted work is emulated with a sourced assistant row.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_mid_tool_persists_interrupted_result() {
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+        use crate::ui::app_state::MessageRole;
+        use std::sync::Arc;
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+        sm.add_user_message("go".to_string());
+
+        let (agent, _info, mut events, _hook, model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        // A real in-flight tool: the bash PTY child hangs for 30s, far past
+        // this test's own ≤10s budget.
+        model.add_response(crate::mock::MockResponse::tool_call(
+            "bash",
+            serde_json::json!({ "command": "sleep 30" }),
+        ));
+
+        // Event pump: tool rows land through the async event-processor path.
+        let sm_opt_pump = Some(sm.clone());
+        let pump = tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                AgentRunner::process_event_for_ui(&sm_opt_pump, ev);
+            }
+        });
+
+        // Mint the per-turn token exactly as production does (the agent_loop
+        // UserMessage arm) so the turn binds the token Stop will cancel.
+        sm.set_running(true);
+
+        let current_turn = sm
+            .build_current_turn_message()
+            .expect("the user turn was dispatched");
+        let agent = Arc::new(agent);
+        let config = Config::default();
+        let sm_opt = Some(sm.clone());
+        let turn = tokio::spawn(async move {
+            AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await
+        });
+
+        // Wait (≤5s) until the ToolCall row has landed and the tool is in flight.
+        let call_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let msgs = sm.get_state().chat.messages;
+                if let Some(tail) = msgs.last()
+                    && tail.role == MessageRole::ToolCall
+                    && tail.tool_name.as_deref() == Some("bash")
+                {
+                    return tail.call_id.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the bash ToolCall row must land within 5s");
+
+        // Emulate the sub-agent's persisted work (the forensics quote source).
+        sm.add_assistant_message_sourced(
+            MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            "halfway done".to_string(),
+        );
+
+        // Stop: cancels the per-turn token; the turn's future is dropped.
+        sm.stop_turn_processes();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+            .await
+            .expect("the cancelled turn must finish within 5s")
+            .expect("the turn task must not panic");
+        assert!(
+            matches!(result, CompletionResult::Stopped),
+            "a cancelled turn must report Stopped"
+        );
+
+        // The orchestrator lane's last row is the synthesized answer.
+        let msgs = sm.get_state().chat.messages;
+        let last_orch = msgs
+            .iter()
+            .rev()
+            .find(|m| m.source.is_orchestrator_lane())
+            .expect("the orchestrator lane is non-empty");
+        assert_eq!(
+            last_orch.role,
+            MessageRole::ToolResult,
+            "the in-flight call must be answered, not left dangling; transcript={msgs:?}"
+        );
+        assert_eq!(
+            last_orch.call_id, call_id,
+            "the answer must carry the bash call's id"
+        );
+        assert_eq!(last_orch.tool_name.as_deref(), Some("bash"));
+        let text = last_orch.tool_result.as_deref().unwrap_or_default();
+        assert!(
+            text.starts_with("INTERRUPTED: the turn was stopped before `bash` returned."),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("halfway done"),
+            "the sub-agent's last message must be quoted; got: {text}"
+        );
+
+        // Persisted — the notice survives reload.
+        let id = sm
+            .get_current_conversation_id()
+            .expect("boot conversation exists");
+        let conv = storage.load(id).expect("conversation persists");
+        assert!(
+            conv.messages.iter().any(|m| {
+                matches!(
+                    m,
+                    crate::conversation::Message::ToolResult { call_id: cid, .. }
+                        if cid == &call_id
+                )
+            }),
+            "the INTERRUPTED result must be on disk"
+        );
+
+        pump.abort();
+    }
+
+    /// c — teardown mid-tool: when the action channel closes with a turn in
+    /// flight, `run_loop` must abort the agent task and answer the in-flight
+    /// orchestrator-lane ToolCall with a persisted INTERRUPTED result. Not
+    /// covered by b3: teardown never reaches the cancel arm — it takes the
+    /// abort branch, a different hook.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_mid_tool_persists_interrupted_result() {
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+        use crate::ui::app_state::MessageRole;
+        use std::sync::Arc;
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+
+        let (agent, info, events, hook, model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        model.add_response(crate::mock::MockResponse::tool_call(
+            "bash",
+            serde_json::json!({ "command": "sleep 30" }),
+        ));
+
+        // Compaction off: AgentRunner::new must not need a compaction provider.
+        let config = Config {
+            context: ContextConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let mut runner = AgentRunner::new(
+            agent,
+            config,
+            info,
+            SkillRegistry::default(),
+            Some(events),
+            Some(sm.clone()),
+            hook,
+            100_000,
+        )
+        .expect("runner builds");
+
+        let (tx, rx) = mpsc::unbounded_channel::<UiAction>();
+        let h = tokio::spawn(async move { runner.run_loop(rx).await });
+
+        tx.send(UiAction::SendMessage("go".into()))
+            .expect("the action channel is open");
+
+        // Wait (≤10s) until the ToolCall row has landed and the tool is in
+        // flight, then close the action channel (session teardown).
+        let call_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let msgs = sm.get_state().chat.messages;
+                if let Some(tail) = msgs.last()
+                    && tail.role == MessageRole::ToolCall
+                    && tail.tool_name.as_deref() == Some("bash")
+                {
+                    return tail.call_id.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the bash ToolCall row must land within 10s");
+
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
+
+        // The same INTERRUPTED row as b3 — without the sub-agent quote —
+        // persisted.
+        let msgs = sm.get_state().chat.messages;
+        let last_orch = msgs
+            .iter()
+            .rev()
+            .find(|m| m.source.is_orchestrator_lane())
+            .expect("the orchestrator lane is non-empty");
+        assert_eq!(
+            last_orch.role,
+            MessageRole::ToolResult,
+            "the in-flight call must be answered at teardown; transcript={msgs:?}"
+        );
+        assert_eq!(
+            last_orch.call_id, call_id,
+            "the answer must carry the bash call's id"
+        );
+        assert_eq!(last_orch.tool_name.as_deref(), Some("bash"));
+        let text = last_orch.tool_result.as_deref().unwrap_or_default();
+        assert!(
+            text.starts_with("INTERRUPTED: the turn was stopped before `bash` returned."),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains("Last message from sub-agent"),
+            "no sub-agent rows exist — the quote must not appear; got: {text}"
+        );
+
+        let id = sm
+            .get_current_conversation_id()
+            .expect("boot conversation exists");
+        let conv = storage.load(id).expect("conversation persists");
+        assert!(
+            conv.messages.iter().any(|m| {
+                matches!(
+                    m,
+                    crate::conversation::Message::ToolResult { call_id: cid, .. }
+                        if cid == &call_id
+                )
+            }),
+            "the INTERRUPTED result must be on disk"
         );
     }
 }
