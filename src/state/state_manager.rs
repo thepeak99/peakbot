@@ -2054,6 +2054,79 @@ impl StateManager {
         }
     }
 
+    /// Answer the orchestrator lane's in-flight call after its turn was
+    /// dropped (Stop or session teardown). The dropped turn's future killed
+    /// the in-flight tool, but the transcript still holds the unanswered
+    /// `ToolCall` — left bare, the wire 400s and the model is lied to.
+    ///
+    /// No-op unless the orchestrator lane's **tail** is a `ToolCall` (rig
+    /// tool concurrency is 1, so only the tail can be unanswered). After
+    /// the answer lands the tail is a `ToolResult`, so a second call — Stop
+    /// followed by teardown — is a no-op. For a `delegate` call, the
+    /// sub-agent's last non-blank assistant message is quoted from the
+    /// transcript (its rows are already persisted; no snapshot file).
+    pub fn close_interrupted_tool_call(&self) {
+        use crate::ui::app_state::MessageRole;
+
+        // One write-lock section: find, build, append and notify under the
+        // same guard so the event-processor task can't interleave a late
+        // row between the check and the append.
+        let appended = {
+            let mut state = self.state.write().unwrap();
+            let Some(i) = state
+                .chat
+                .messages
+                .iter()
+                .rposition(|m| m.source.is_orchestrator_lane())
+            else {
+                return;
+            };
+            let Some(call) = state.chat.messages.get(i) else {
+                return;
+            };
+            if call.role != MessageRole::ToolCall {
+                return;
+            }
+            // Every row after the lane tail is a sub-agent row by
+            // construction; quote the last one that said anything, so the
+            // orchestrator can tell "finished" from "mid-step".
+            let quote = state
+                .chat
+                .messages
+                .iter()
+                .skip(i + 1)
+                .rev()
+                .find(|m| {
+                    m.role == MessageRole::Agent
+                        && matches!(m.source, MessageSource::SubAgent { .. })
+                        && !m.content.trim().is_empty()
+                })
+                .map(|m| {
+                    let MessageSource::SubAgent { role } = &m.source else {
+                        unreachable!("every row after the lane tail is sub-agent")
+                    };
+                    (role.clone(), m.content.clone())
+                });
+            let tool = call.tool_name.clone().unwrap_or_default();
+            let mut text = format!(
+                "INTERRUPTED: the turn was stopped before `{tool}` returned. \
+                 Its side effects may have happened; check before redoing."
+            );
+            if let Some((role, content)) = quote {
+                text.push_str(&format!(
+                    "\n\nLast message from sub-agent `{role}` before the stop:\n{content}"
+                ));
+            }
+            let row = crate::tool_use_validator::interrupted_result(call, &text);
+            state.chat.add_message(row);
+            self.notify_update(&state);
+            true
+        };
+        if appended && let Err(e) = self.persist_current() {
+            tracing::error!("Failed to persist interrupted tool result: {}", e);
+        }
+    }
+
     // ── History Conversion for Agent ───────────────────────────────────────────
 
     /// Convert chat messages to rig_core::Message for agent history.
@@ -2073,7 +2146,8 @@ impl StateManager {
     ///
     /// Messages are run through [`sanitize_tool_pairs`] first: this is the wire
     /// boundary, and an unpaired `ToolCall` here is a hard provider error, not
-    /// a display glitch.
+    /// a display glitch. The validator answers such a call with an
+    /// `INTERRUPTED` result rather than dropping it.
     ///
     /// [`sanitize_tool_pairs`]: crate::tool_use_validator::sanitize_tool_pairs
     pub fn get_agent_history(&self) -> Vec<rig_core::completion::message::Message> {
@@ -2120,12 +2194,8 @@ impl StateManager {
         // Last stop before the wire: concurrent appends (the bg drain seam vs.
         // the event-processor task) can split a ToolCall/ToolResult pair, and
         // every provider 400s on that — permanently, for the rest of the
-        // conversation. Dropping the broken pair here self-heals instead.
-        let sanitized: Vec<crate::ui::app_state::ChatMessage> =
-            crate::tool_use_validator::sanitize_tool_pairs(live)
-                .into_iter()
-                .cloned()
-                .collect();
+        // conversation. Answering the orphan here self-heals instead.
+        let sanitized = crate::tool_use_validator::sanitize_tool_pairs(live);
 
         // Read the cross-provider wire gate (design §3.4). When off, no
         // ThinkingBlock survives the rebuild — even a Claude-transcript
@@ -2566,10 +2636,9 @@ impl StateManager {
     ///
     /// Sanitized with [`sanitize_tool_pairs`] over the **full live sequence,
     /// including the tail, before splitting** — never over the head slice
-    /// alone. Sanitizing the head alone orphans the ToolCall whose ToolResult
-    /// is the tail; `sanitize_tool_pairs` deletes orphan calls, so the prompt
-    /// would become a ToolResult with no matching `tool_use` — a guaranteed
-    /// hard 400 on the single most common shape here.
+    /// alone. Sanitizing the head alone would answer the tail's call with a
+    /// synthetic result and then duplicate it with the real one — a
+    /// guaranteed hard 400 on the single most common shape here.
     ///
     /// Returns `None` when there is no resumption needed — empty conversation
     /// or fresh turn. In that case the caller falls back to the normal
@@ -2603,10 +2672,8 @@ impl StateManager {
         // `get_agent_history` so a post-compaction resume replays survivors'
         // thinking blocks in the same thinking-first wire order — the
         // one place where forgetting the change produces a live 400.
-        let history_msgs: Vec<crate::ui::app_state::ChatMessage> =
-            head.iter().map(|m| (*m).clone()).collect();
         let wire_reasoning = *self.wire_reasoning.read().unwrap();
-        let history = Self::convert_history_to_rig(&history_msgs, wire_reasoning);
+        let history = Self::convert_history_to_rig(head, wire_reasoning);
 
         // ── Build prompt: the last message converted to a rig Message ───────
         // Mirror the pre-change shape — for a single message at the tail of
@@ -4059,7 +4126,8 @@ mod tests {
     }
 
     /// Test that get_agent_history() produces proper rig ToolCall messages (not text approximations).
-    /// The result is added too because an orphan call is dropped at the wire boundary.
+    /// The result is added too because an orphan call would be answered as
+    /// INTERRUPTED at the wire boundary.
     #[test]
     fn test_get_agent_history_tool_call_is_structured() {
         use rig_core::completion::message::{AssistantContent, Message as RigMessage};
@@ -4103,7 +4171,8 @@ mod tests {
     }
 
     /// Test that get_agent_history() produces proper rig ToolResult messages.
-    /// The call is added too because an orphan result is dropped at the wire boundary.
+    /// The call is added too because a stray result without its call is
+    /// dropped at the wire boundary.
     #[test]
     fn test_get_agent_history_tool_result_is_structured() {
         use rig_core::completion::message::{
@@ -4542,16 +4611,20 @@ mod tests {
     }
 
     /// An orphan ToolCall persisted by a crash mid-tool must survive the load
-    /// into the display transcript (load no longer mutates) but never reach the
-    /// provider — repair happens at the wire boundary in `get_agent_history`,
-    /// not on the saved rows. Closes the gap left when
+    /// into the display transcript (load no longer mutates) and reach the
+    /// provider ANSWERED — the wire boundary in `get_agent_history` emits the
+    /// call followed by a synthesized `INTERRUPTED` result, never a silent
+    /// drop. Closes the gap left when
     /// `sync_from_conversation_sanitizes_orphan_call` was deleted in #271.
+    /// This is the on-disk orphan (#262) contract.
     #[test]
     fn load_conversation_with_orphan_tool_call_yields_valid_wire_on_next_prompt() {
         use crate::conversation::{Conversation, Message};
         use crate::storage::{ConversationStorage, InMemoryStorage};
         use crate::ui::app_state::{MessageRole, MessageSource};
-        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, ToolResultContent, UserContent,
+        };
         use std::sync::Arc;
 
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::default());
@@ -4687,20 +4760,50 @@ mod tests {
             }
         }
 
-        // The orphan id must not appear in wire history at all.
-        for msg in &history {
-            let RigMessage::Assistant { content, .. } = msg else {
-                continue;
-            };
-            for c in content.iter() {
-                if let AssistantContent::ToolCall(tc) = c {
-                    assert_ne!(
-                        tc.id, "call-9",
-                        "orphan ToolCall leaked to the wire (history: {history:?})"
-                    );
-                }
-            }
-        }
+        // The orphan call must appear on the wire — answered by a
+        // synthesized INTERRUPTED result, never silently dropped.
+        let call_idx = history
+            .iter()
+            .position(|msg| {
+                matches!(msg, RigMessage::Assistant { content, .. }
+                if content.iter().any(|c| matches!(
+                    c,
+                    AssistantContent::ToolCall(tc) if tc.id == "call-9"
+                )))
+            })
+            .expect("orphan ToolCall call-9 must appear on the wire (history: {history:?})");
+        let next = history
+            .get(call_idx + 1)
+            .expect("call-9 must be immediately followed by its answer (history: {history:?})");
+        let result = match next {
+            RigMessage::User { content } => content
+                .iter()
+                .find_map(|c| match c {
+                    UserContent::ToolResult(tr) if tr.id == "call-9" => Some(tr),
+                    _ => None,
+                })
+                .expect("call-9 must be answered by a ToolResult with the same id (history: {history:?})"),
+            other => panic!("expected the User ToolResult after call-9, got {other:?}"),
+        };
+        let text = result
+            .content
+            .iter()
+            .find_map(|part| match part {
+                ToolResultContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            text.starts_with("INTERRUPTED: no result was recorded"),
+            "the orphan must be answered with UNRECORDED_RESULT, got: {text}"
+        );
+
+        // Read-time repair is pure (I4): the transcript is untouched.
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            3,
+            "get_agent_history must not write synthesized rows back to the transcript"
+        );
     }
 
     // ─── todo persistence roundtrip ──────────────────────────────────────
@@ -5831,15 +5934,10 @@ mod tests {
 
     /// The straddle case B3.3 exists to catch. A naive fix would sanitize
     /// `messages[..last_idx]` alone, which orphans the ToolCall whose
-    /// ToolResult is the tail — `sanitize_tool_pairs` then deletes the
-    /// orphan and the prompt becomes a ToolResult with no matching
-    /// `tool_use`, a guaranteed hard 400. Sanitizing the full live sequence
-    /// (including the tail) before splitting keeps the pair intact.
-    ///
-    /// **RED today**: `build_resumption_from_tail` does not sanitize
-    /// at all yet, so this currently passes only by accident of ordering —
-    /// pinned so the eventual sanitize-then-split implementation is proven
-    /// against the straddle shape specifically.
+    /// ToolResult is the tail — `sanitize_tool_pairs` would then answer the
+    /// call with a synthetic result and the real one would duplicate it, a
+    /// guaranteed hard 400. Sanitizing the full live sequence (including the
+    /// tail) before splitting keeps the pair intact.
     #[test]
     fn resumption_keeps_a_toolcall_result_pair_across_the_split() {
         use rig_core::completion::message::{AssistantContent, Message as RigMessage};
@@ -5890,15 +5988,18 @@ mod tests {
         );
     }
 
-    /// No orphan ToolCall (one with no matching ToolResult in the live
-    /// sequence) may survive into the resumption history — it is a
-    /// guaranteed hard 400 on the wire.
-    ///
-    /// **RED today**: `build_resumption_from_tail` performs no
-    /// sanitization, so the orphan ToolCall passes straight through.
+    /// An orphan ToolCall (no matching ToolResult in the live sequence) is a
+    /// guaranteed hard 400 on the wire, so it must be answered — not dropped.
+    /// The resumption history carries the call immediately followed by the
+    /// synthesized INTERRUPTED result (UNRECORDED_RESULT); silent deletion
+    /// would lie to the model about a call whose side effects may have
+    /// happened.
     #[test]
-    fn resumption_drops_an_orphan_toolcall() {
-        use rig_core::completion::message::{AssistantContent, Message as RigMessage};
+    fn resumption_closes_an_orphan_toolcall_with_interrupted_result() {
+        use crate::tool_use_validator::UNRECORDED_RESULT;
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, ToolResultContent, UserContent,
+        };
 
         let sm = StateManager::new();
         sm.add_user_message("read the file".to_string());
@@ -5918,13 +6019,44 @@ mod tests {
             .build_resumption_from_tail()
             .expect("non-empty conversation must produce resumption");
 
-        let has_orphan_tool_call = history.iter().any(|m| {
-            matches!(m, RigMessage::Assistant { content, .. }
-                if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_))))
-        });
+        let call_idx = history
+            .iter()
+            .position(|m| {
+                matches!(m, RigMessage::Assistant { content, .. }
+                if content.iter().any(|c| matches!(
+                    c,
+                    AssistantContent::ToolCall(tc) if tc.id == "c1"
+                )))
+            })
+            .expect(
+                "the orphan ToolCall c1 must survive into resumption history; history={history:?}",
+            );
+
+        let result = match history.get(call_idx + 1) {
+            Some(RigMessage::User { content }) => content
+                .iter()
+                .find_map(|c| match c {
+                    UserContent::ToolResult(tr) if tr.id == "c1" => Some(tr),
+                    _ => None,
+                })
+                .expect(
+                    "the orphan call must be immediately answered by a ToolResult with the same id; history={history:?}",
+                ),
+            other => panic!(
+                "expected the User ToolResult after the orphan call, got {other:?}"
+            ),
+        };
+        let text = result
+            .content
+            .iter()
+            .find_map(|part| match part {
+                ToolResultContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
         assert!(
-            !has_orphan_tool_call,
-            "an orphan ToolCall must not survive into resumption history; history={history:?}"
+            text.contains(UNRECORDED_RESULT),
+            "the synthetic answer must be UNRECORDED_RESULT, got: {text}"
         );
     }
 
@@ -8654,6 +8786,258 @@ mod tests {
             wire_json(&legacy_convert_history_to_rig(&t, true)),
             "a two-response run with replayable blocks MUST differ from the legacy rebuild — \
              that difference is the fix",
+        );
+    }
+
+    // ─── close_interrupted_tool_call (interrupted-tool-results design §5) ───
+
+    /// b1 — the forensics shape: an orchestrator `delegate` call left in
+    /// flight by a Stop, with the sub-agent's persisted work behind it. The
+    /// helper must answer the orchestrator-lane tail with an INTERRUPTED
+    /// result that quotes the sub-agent's LAST message only, persist it,
+    /// keep the wire valid, and be idempotent (Stop then teardown).
+    #[test]
+    fn close_interrupted_tool_call_answers_orphan_delegate_in_orchestrator_lane() {
+        use crate::storage::InMemoryStorage;
+        use crate::ui::app_state::MessageRole;
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage};
+        use std::sync::Arc;
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+
+        // The forensics shape: the orchestrator's delegate call is in flight;
+        // the sub-agent's rows are already persisted behind it.
+        sm.add_user_message("Fix it".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "delegate".to_string(),
+            r#"{"role":"junior"}"#.to_string(),
+            Some("d1".to_string()),
+        );
+        sm.add_tool_call(
+            MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            None,
+            "bash".to_string(),
+            r#"{"command":"telegram send"}"#.to_string(),
+            Some("s1".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            "bash".to_string(),
+            r#"{"command":"telegram send"}"#.to_string(),
+            "sent".to_string(),
+            Some("s1".to_string()),
+        );
+        sm.add_assistant_message_sourced(
+            MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            "Telegram sent.".to_string(),
+        );
+        sm.add_assistant_message_sourced(
+            MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            "All steps complete. Finalizing todos:".to_string(),
+        );
+        // The sub-agent's own in-flight call — sub-agent lane, never
+        // answered by the helper (orchestrator lane only).
+        sm.add_tool_call(
+            MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            None,
+            "todo".to_string(),
+            r#"{"action":"add"}"#.to_string(),
+            Some("s2".to_string()),
+        );
+
+        let before = sm.get_state().chat.messages.len();
+        sm.close_interrupted_tool_call();
+
+        // Exactly one new row, at the end.
+        let msgs = sm.get_state().chat.messages;
+        assert_eq!(msgs.len(), before + 1, "exactly one synthesized row");
+        let row = msgs.last().expect("the transcript is non-empty");
+        assert_eq!(row.role, MessageRole::ToolResult);
+        assert_eq!(row.call_id.as_deref(), Some("d1"));
+        assert_eq!(row.tool_name.as_deref(), Some("delegate"));
+        assert_eq!(
+            row.source,
+            MessageSource::Human,
+            "the answer sits on the orchestrator lane (I2)"
+        );
+        let text = row.tool_result.as_deref().unwrap_or_default();
+        assert!(
+            text.starts_with("INTERRUPTED: the turn was stopped before `delegate` returned."),
+            "got: {text}"
+        );
+        assert!(text.contains("sub-agent `junior`"), "got: {text}");
+        assert!(
+            text.contains("All steps complete. Finalizing todos:"),
+            "the sub-agent's LAST message must be quoted; got: {text}"
+        );
+        assert!(
+            !text.contains("Telegram sent."),
+            "only the last sub-agent message is quoted; got: {text}"
+        );
+
+        // Persisted — the notice survives reload.
+        let id = sm
+            .get_current_conversation_id()
+            .expect("boot conversation exists");
+        let conv = storage.load(id).expect("conversation persists");
+        assert!(
+            conv.messages.iter().any(|m| {
+                matches!(m, crate::conversation::Message::ToolResult { call_id, .. }
+                    if call_id.as_deref() == Some("d1"))
+            }),
+            "the INTERRUPTED delegate result must be on disk"
+        );
+
+        // Wire: the delegate call is followed by its answer; no other
+        // sub-agent text leaks onto the orchestrator wire.
+        sm.add_user_message("continue".to_string());
+        let history = sm.get_agent_history();
+        assert_eq!(
+            history.len(),
+            3,
+            "User + answered delegate pair; history={history:?}"
+        );
+        let tc_id = match &history[1] {
+            RigMessage::Assistant { content, .. } => content
+                .iter()
+                .find_map(|c| match c {
+                    AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    _ => None,
+                })
+                .expect("the delegate ToolCall must be on the wire; history={history:?}"),
+            other => panic!("expected the delegate ToolCall, got {other:?}"),
+        };
+        assert_eq!(tc_id, "d1");
+        let wire = wire_json(&history);
+        assert!(
+            wire.contains("All steps complete"),
+            "the answer must quote the sub-agent's last message; wire={wire}"
+        );
+        assert!(
+            !wire.contains("Telegram sent."),
+            "no other sub-agent text may reach the wire; wire={wire}"
+        );
+
+        // Idempotent: a second call (Stop then teardown) is a no-op.
+        let count = sm.get_state().chat.messages.len();
+        sm.close_interrupted_tool_call();
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            count,
+            "the lane tail is now a ToolResult — the helper must not double-answer"
+        );
+    }
+
+    /// b2 — the helper acts only when the orchestrator lane's TAIL is a
+    /// ToolCall. Every other tail shape is a no-op, including a
+    /// sub-agent-lane tail (sub-agent calls are never answered here).
+    #[test]
+    fn close_interrupted_tool_call_is_noop_unless_lane_tail_is_a_call() {
+        // tail [User]
+        let sm = StateManager::new_arc();
+        sm.add_user_message("hi".to_string());
+        let n = sm.get_state().chat.messages.len();
+        sm.close_interrupted_tool_call();
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            n,
+            "tail [User] must be a no-op"
+        );
+
+        // tail [User, Agent]
+        let sm = StateManager::new_arc();
+        sm.add_user_message("hi".to_string());
+        sm.add_assistant_message("hello".to_string());
+        let n = sm.get_state().chat.messages.len();
+        sm.close_interrupted_tool_call();
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            n,
+            "tail [User, Agent] must be a no-op"
+        );
+
+        // tail [User, TC c, TR c] — the pair is complete
+        let sm = StateManager::new_arc();
+        sm.add_user_message("hi".to_string());
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("c".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "bash".to_string(),
+            "{}".to_string(),
+            "ok".to_string(),
+            Some("c".to_string()),
+        );
+        let n = sm.get_state().chat.messages.len();
+        sm.close_interrupted_tool_call();
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            n,
+            "a complete pair must be a no-op"
+        );
+
+        // tail [] — empty transcript
+        let sm = StateManager::new_arc();
+        let n = sm.get_state().chat.messages.len();
+        sm.close_interrupted_tool_call();
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            n,
+            "an empty transcript must be a no-op"
+        );
+
+        // tail [TC(Human) c, TR(Human) c, TC(SubAgent) s] — the lane tail is
+        // the completed pair; the sub-agent's in-flight call is never
+        // answered by this helper.
+        let sm = StateManager::new_arc();
+        sm.add_tool_call(
+            MessageSource::Human,
+            None,
+            "bash".to_string(),
+            "{}".to_string(),
+            Some("c".to_string()),
+        );
+        sm.add_tool_result(
+            MessageSource::Human,
+            "bash".to_string(),
+            "{}".to_string(),
+            "ok".to_string(),
+            Some("c".to_string()),
+        );
+        sm.add_tool_call(
+            MessageSource::SubAgent {
+                role: "junior".into(),
+            },
+            None,
+            "todo".to_string(),
+            "{}".to_string(),
+            Some("s".to_string()),
+        );
+        let n = sm.get_state().chat.messages.len();
+        sm.close_interrupted_tool_call();
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            n,
+            "a sub-agent-lane tail must be a no-op (orchestrator lane only)"
         );
     }
 }

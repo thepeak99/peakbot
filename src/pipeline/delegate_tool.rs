@@ -436,10 +436,9 @@ impl Tool for DelegateTool {
 
         // Every successful path through this tool — including timed-out and
         // dead-sub-agent handoffs — saves the sub-agent's own earlier messages
-        // to a temp file and appends a one-line pointer. INTERRUPTED/timeout
-        // delegations still get a file: their history snapshot is populated.
-        // Only the user-cancel `Abort` above short-circuits the note (via the
-        // `return Err`).
+        // to a temp file and appends a one-line pointer. A user Stop drops
+        // this future, so no note is written here; the turn's cancel seam
+        // answers the call instead.
         Ok(super::sub_agent_messages::attach_note(
             result,
             &args.role,

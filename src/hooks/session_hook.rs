@@ -1008,11 +1008,11 @@ mod tests {
     /// nanoid (`hooks.rs:116-136`, `prompt_request/mod.rs:972`). So the
     /// `call_id` persisted here is PeakBot's own correlation handle, not
     /// the provider's. What actually matters — and what
-    /// `sanitize_tool_pairs` (`tool_use_validator.rs:41-44`) depends on,
-    /// since it pairs call/result rows on `call_id` equality — is that the
-    /// call row and its result row agree. This pins that property so a
-    /// future id change can't silently break pairing and delete history at
-    /// the wire boundary.
+    /// `sanitize_tool_pairs` (`tool_use_validator.rs`) depends on, since it
+    /// pairs call/result rows on `call_id` equality — is that the call row
+    /// and its result row agree. This pins that property so a future id
+    /// change can't silently break pairing and lose the real result at the
+    /// wire boundary.
     #[tokio::test]
     async fn tool_call_and_tool_result_rows_share_one_call_id() {
         let (hook, mut rx) = SessionHook::with_channel();
@@ -1054,7 +1054,7 @@ mod tests {
         assert_eq!(
             call_id, result_id,
             "the ToolCall and ToolResult rows for one round-trip must share \
-             exactly one call_id, or sanitize_tool_pairs will silently drop the pair"
+             exactly one call_id, or sanitize_tool_pairs will answer the call as INTERRUPTED"
         );
     }
 }
