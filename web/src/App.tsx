@@ -304,6 +304,7 @@ export function App() {
             onResume={() => send({ type: "resume" })}
             watchingRole={scopeLabel}
             onClearWatch={() => setView("global")}
+            pendingInput={pendingInput}
           />
         </main>
       </div>
