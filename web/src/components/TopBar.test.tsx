@@ -66,7 +66,6 @@ interface TopBarPropsWithStatus {
   statusMessage: string | null;
   subAgent: SubAgentRun | null;
   connected: boolean;
-  pendingInput: number;
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
@@ -90,7 +89,6 @@ const baseProps: TopBarPropsWithStatus = {
   cwd: null,
   dirListing: null,
   conversations: [],
-  pendingInput: 0,
   notifyPermission: "unsupported",
   isRunning: false,
   statusMessage: null,

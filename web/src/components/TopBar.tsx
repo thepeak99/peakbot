@@ -18,7 +18,6 @@ import type { NotifyPermission } from "../useTaskNotifications";
 export function TopBar({
   isRunning,
   connected,
-  pendingInput,
   statusMessage,
   subAgent = null,
   models,
@@ -38,7 +37,6 @@ export function TopBar({
 }: {
   isRunning: boolean;
   connected: boolean;
-  pendingInput: number;
   statusMessage: string | null;
   /** The currently-running sub-agent, or null for orchestrator-only turns.
    * Renders the 🧩/⏸ chip next to "working…" while non-null. */
@@ -134,15 +132,6 @@ export function TopBar({
         </span>
       )}
 
-      {pendingInput > 0 && (
-        <span
-          className="flex items-center gap-1 rounded bg-zinc-800/80 px-1.5 py-0.5 text-xs text-zinc-400"
-          title={`${pendingInput} message${pendingInput === 1 ? "" : "s"} queued while the agent is busy`}
-        >
-          ⏳ {pendingInput} queued
-        </span>
-      )}
-
       <div className="ml-auto flex items-center gap-4 font-mono text-[11px] tabular-nums text-zinc-500">
         <ThemeToggle />
         <NotifyToggle
@@ -154,13 +143,21 @@ export function TopBar({
           className={`flex items-center gap-1.5 rounded px-1.5 py-0.5 ${
             connected ? "text-emerald-400" : "text-zinc-500"
           }`}
+          aria-label={connected ? "connected" : "offline"}
         >
           <span
             className={`h-1.5 w-1.5 rounded-full ${
               connected ? "bg-emerald-400" : "bg-zinc-600"
             }`}
           />
-          {connected ? "connected" : "offline"}
+          {connected ? (
+            // Mobile (below lg): dot only — the label is redundant on a
+            // phone's narrow top bar. The outer span's aria-label keeps the
+            // status exposed to screen readers.
+            <span className="hidden lg:inline">connected</span>
+          ) : (
+            "offline"
+          )}
         </span>
       </div>
     </header>

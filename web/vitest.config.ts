@@ -17,5 +17,6 @@ export default defineConfig({
   plugins: [react()],
   test: {
     environmentMatchGlobs: [["src/components/**", "jsdom"]],
+    setupFiles: ["./vitest.setup.ts"],
   },
 });
