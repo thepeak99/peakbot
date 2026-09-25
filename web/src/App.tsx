@@ -224,7 +224,6 @@ export function App() {
     <TopBar
         isRunning={isRunning}
         connected={connected}
-        pendingInput={pendingInput}
         statusMessage={state?.status_message ?? null}
         subAgent={subAgent}
         models={models}
