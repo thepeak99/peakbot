@@ -15,8 +15,9 @@
 // is the button. Desktop (fine pointer) keeps Enter-to-send. The check is on
 // the *primary* input device, not the viewport width, so a Surface in laptop
 // mode with a keyboard attached still gets Enter-to-send. While the agent
-// runs, Stop and the dispatch button (labeled "Queue") sit side by side so
-// touch users can still queue mid-turn.
+// runs with an empty box, the row shows icon-only Pause/Stop (labels would
+// squeeze the textarea on phones); the moment there's content to send, the
+// labelled "Queue" button takes over.
 //
 // A slash palette (fed by `GET /commands`, the single source of truth) opens
 // while the input is a bare `/name` prefix. It's a flat filtered list — pick
@@ -259,7 +260,11 @@ export function Composer({
       ? "Message the orchestrator…"
       : "Type a message…";
 
-  const canSend = connected && (!!text.trim() || images.length > 0);
+  // Content half of `canSend`, split out because it also picks which running
+  // controls are mounted: empty box → icon-only Pause/Stop, content → the
+  // labelled Queue button alone.
+  const hasContent = !!text.trim() || images.length > 0;
+  const canSend = connected && hasContent;
 
   // One label for the always-mounted dispatch button: mid-turn sends are
   // queued server-side, so while running it reads "Queue".
@@ -398,11 +403,14 @@ export function Composer({
                 style={{ minHeight: MIN_H, maxHeight: MAX_H }}
                 className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed"
               />
-              {isRunning && (
+              {isRunning && !hasContent ? (
+                // Empty box mid-turn: icon-only controls — labels would leave
+                // ~56px for the textarea on a 360px phone. Queue (below)
+                // replaces them the moment there's content to send.
                 <>
                   {/* Pause/Resume: only while a pausable sub-agent is
                       running. Explicit frames (pause / resume), never a
-                      toggle — the label tracks the wire pause state. Amber
+                      toggle — the glyph tracks the wire pause state. Amber
                       keeps it distinct from Stop's red (abort everything). */}
                   {subAgent?.pausable && (
                     <button
@@ -412,34 +420,32 @@ export function Composer({
                           ? "Pause sub-agent after its current step"
                           : "Resume sub-agent"
                       }
-                      className="flex items-center gap-1.5 rounded-lg bg-amber-950/70 px-3 py-1.5 text-sm font-medium text-amber-300 hover:bg-amber-900/70"
+                      aria-label={subAgent.pause === "running" ? "Pause" : "Resume"}
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-950/70 text-amber-300 hover:bg-amber-900/70"
                     >
                       <span className="text-xs leading-none">
                         {subAgent.pause === "running" ? "⏸" : "▶"}
                       </span>
-                      {subAgent.pause === "running" ? "Pause" : "Resume"}
                     </button>
                   )}
                   <button
                     onClick={onStop}
                     title={stopLabel}
                     aria-label={stopLabel}
-                    className="flex items-center gap-1.5 rounded-lg bg-red-950/70 px-3 py-1.5 text-sm font-medium text-red-300 hover:bg-red-900/70"
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-950/70 hover:bg-red-900/70"
                   >
-                    <span className="h-2 w-2 rounded-sm bg-red-400" />
-                    {/* Collapses to icon-only below sm so the row fits 360px;
-                        the aria-label above carries the name when it does. */}
-                    <span className="hidden sm:inline">Stop</span>
+                    <span className="h-2.5 w-2.5 rounded-[2px] bg-red-400" />
                   </button>
                 </>
+              ) : (
+                <button
+                  onClick={submit}
+                  disabled={!canSend}
+                  className="rounded-lg bg-emerald-700 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
+                >
+                  {actionLabel}
+                </button>
               )}
-              <button
-                onClick={submit}
-                disabled={!canSend}
-                className="rounded-lg bg-emerald-700 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
-              >
-                {actionLabel}
-              </button>
             </div>
           </div>
         </div>
