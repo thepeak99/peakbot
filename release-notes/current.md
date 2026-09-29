@@ -3,3 +3,5 @@
 This file is the working draft for the next release. When a version is tagged, this file is renamed to `<version>.md` and a new empty `current.md` is created.
 
 ## Changes
+
+- **`/profile` — per-conversation profiles.** Pick a config profile for a conversation with `/profile <name>` (`/profile` lists them, `/profile none` for the base config). Locked after the first turn, carried over by `/new`, restored by `/load` (a vanished profile is dropped with a warning). The web UI gains a **Profile** tab (a radio list: "None (base config)" + one row per configured profile) that sends the same choice back. Profiles can now also override `ui.tabs` to gate which web tabs show — e.g. `ui: { tabs: { disabled: [files, tasks] } }` — using the usual `only:`/`disabled:`/`enabled: false` filter, with tab names drawn from `session`, `todo`, `files`, `tasks`, `bash`, `agents`, `profile`. Boot `--profile <name>` **pins** the profile for the whole process, empties the picker, hides the Profile tab, and refuses runtime switching; a runtime selection is a preset, **not** a security boundary — lock a web deployment down with `--profile <name>`.

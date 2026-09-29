@@ -223,6 +223,9 @@ fn dispatch_stdin_line(
         Ok(InboundMessage::SelectPipeline { name }) => {
             action_sender.send(UiAction::SelectPipeline(name)).is_ok()
         }
+        Ok(InboundMessage::SelectProfile { name }) => {
+            action_sender.send(UiAction::SelectProfile(name)).is_ok()
+        }
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
             // stdio is single-session with no registry — no conversation

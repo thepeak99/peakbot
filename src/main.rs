@@ -107,10 +107,11 @@ struct Cli {
     #[arg(long = "tls-name", value_name = "NAME", requires = "tls")]
     tls_name: Vec<String>,
 
-    /// Select a named overlay from the master config's `profiles:` block,
+    /// Pin a named overlay from the master config's `profiles:` block,
     /// applied as the final step of config resolution (after per-repo, after
-    /// master) — see `docs/profiles-and-web-mode.md` §1. Generic: no clap
-    /// conflicts, applies to `--tui`, `--stdio`, and the web UI alike.
+    /// master) — see `docs/profiles-and-web-mode.md` §1. Pinned means every
+    /// conversation runs under it and `/profile <name>` is refused. Applies
+    /// to `--tui`, `--stdio`, and the web UI alike.
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
 
@@ -623,6 +624,7 @@ async fn main() -> Result<()> {
         storage,
         mcp_tools_count,
         skills_count,
+        profile_pin: cli.profile.clone(),
     });
 
     use peakbot::ui::{ReplUi, StdioUi, WebUi, build_models_snapshot};

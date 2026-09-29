@@ -91,6 +91,13 @@ pub(crate) enum InboundMessage {
     SelectPipeline {
         name: Option<String>,
     },
+    /// Bind the current conversation to a config profile (the Profile tab
+    /// picker); `name: null` — or an omitted `name` — clears the binding.
+    /// Maps to [`crate::ui::ui_trait::UiAction::SelectProfile`]. The backend
+    /// enforces the lock and the boot `--profile` pin.
+    SelectProfile {
+        name: Option<String>,
+    },
     /// End an active session for *everyone* attached to it (dropdown "kill").
     KillSession {
         convo: String,
@@ -701,5 +708,48 @@ mod tests {
     fn resume_parses() {
         let m: InboundMessage = serde_json::from_str(r#"{"type":"resume"}"#).unwrap();
         assert!(matches!(m, InboundMessage::Resume));
+    }
+
+    // ── select_profile wire protocol (Layer D, RED) ─────────────────────────
+    //
+    // D4: `InboundMessage::SelectProfile { name: Option<String> }` — the
+    // profile-axis twin of `SelectPipeline`. Wire shape:
+    //   {"type":"select_profile","name":"research"}  // bind
+    //   {"type":"select_profile","name":null}         // clear
+    //   {"type":"select_profile"}                     // name omitted → None
+    //
+    // Compile-RED until the variant exists (E0599 on `InboundMessage::SelectProfile`).
+
+    #[test]
+    fn select_profile_with_name_parses() {
+        let m: InboundMessage =
+            serde_json::from_str(r#"{"type":"select_profile","name":"research"}"#).unwrap();
+        assert!(
+            matches!(m, InboundMessage::SelectProfile { name: Some(n) } if n == "research"),
+            "a named select_profile frame must carry the name through"
+        );
+    }
+
+    #[test]
+    fn select_profile_with_null_name_clears() {
+        let m: InboundMessage =
+            serde_json::from_str(r#"{"type":"select_profile","name":null}"#).unwrap();
+        assert!(
+            matches!(m, InboundMessage::SelectProfile { name: None }),
+            "an explicit null must clear the binding, same as select_pipeline"
+        );
+    }
+
+    /// `name` omitted entirely must also parse to `None` — a client that
+    /// only ever sends `null` on clear and never the bare key must not be
+    /// the only supported shape; both must work.
+    #[test]
+    fn select_profile_with_name_omitted_defaults_to_none() {
+        let m: InboundMessage = serde_json::from_str(r#"{"type":"select_profile"}"#)
+            .expect("an omitted `name` key must still parse");
+        assert!(
+            matches!(m, InboundMessage::SelectProfile { name: None }),
+            "an omitted name field must default to None"
+        );
     }
 }

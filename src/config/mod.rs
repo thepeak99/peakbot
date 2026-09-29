@@ -411,6 +411,9 @@ pub struct Profile {
     /// clears any `persona` the master/per-repo merge resolved to.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Web-UI tab visibility for this profile, filtered by [`TAB_NAMES`].
+    #[serde(default)]
+    pub ui: Option<ProfileUi>,
 }
 
 impl Profile {
@@ -430,8 +433,73 @@ impl Profile {
         if self.system_prompt.is_some() {
             out.push("system_prompt");
         }
+        if self.ui.is_some() {
+            out.push("ui");
+        }
         out
     }
+}
+
+/// Per-profile Web-UI block: which of the seven Web tabs a profile
+/// shows. Absent (default) = all tabs.
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileUi {
+    /// The Web tabs this profile makes visible — reuses the shared
+    /// [`NameFilter`] `enabled` / `disabled` / `only` semantics.
+    #[serde(default)]
+    pub tabs: Option<NameFilter>,
+}
+
+/// The seven Web tabs, in canonical order — the closed universe a profile's
+/// `ui.tabs` filter may name.
+pub const TAB_NAMES: [&str; 7] = [
+    "session", "todo", "files", "tasks", "bash", "agents", "profile",
+];
+
+/// Web tabs visible under a profile's `ui.tabs` filter, in canonical order.
+/// Reuses [`NameFilter`] as-is: `None` = all tabs, `enabled: false` = none,
+/// then `only` allowlist, then `disabled` blocklist.
+pub fn visible_tabs(filter: Option<&NameFilter>) -> Vec<&'static str> {
+    TAB_NAMES
+        .iter()
+        .filter(|&tab| filter.is_none_or(|f| f.allows(tab)))
+        .copied()
+        .collect()
+}
+
+/// Profile names the web client may pick, sorted — the same order
+/// [`Config::profile_names`] uses, so listings and the picker agree. Empty
+/// when no profiles are defined OR a boot `--profile` pin is active: a pin
+/// is not a choice, and an empty picker is what hides the profile tab.
+pub fn selectable_profiles(cfg: &Config, pin: Option<&str>) -> Vec<String> {
+    if pin.is_some() {
+        return Vec::new();
+    }
+    cfg.profile_names()
+}
+
+/// Tabs the client should render for this session, computed SERVER-side
+/// (the client must not re-derive config rules). Starts from the active
+/// profile's `ui.tabs` filter — a missing/stale profile, an absent `ui`, or
+/// an absent `tabs` all mean "no filter" (all seven, canonical order) — then
+/// removes "profile" when `selectable` is empty: a picker with nothing to
+/// pick is a dead tab.
+pub fn session_visible_tabs(cfg: &Config, selectable: &[String]) -> Vec<String> {
+    let filter = cfg
+        .active_profile
+        .as_deref()
+        .and_then(|name| cfg.profiles.get(name))
+        .and_then(|profile| profile.ui.as_ref())
+        .and_then(|ui| ui.tabs.as_ref());
+    let mut tabs: Vec<String> = visible_tabs(filter)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if selectable.is_empty() {
+        tabs.retain(|tab| tab != "profile");
+    }
+    tabs
 }
 
 /// Outbound HTTP timeouts, applied to every client PeakBot builds (LLM calls,
@@ -1951,22 +2019,25 @@ impl Config {
         })
     }
 
-    /// Re-read master + `<cwd>/.peakbot/config.yaml` for a live session,
-    /// re-applying whatever profile is active on `self`. A method (not an
-    /// associated fn) so the live config's profile identity cannot be
-    /// forgotten by a caller — every reload verb re-derives the profile from
-    /// the config it already holds. Replaces `reload()` — `cwd` must be the
-    /// directory the session WILL be in after the calling verb completes
-    /// (target for `/cd`, current `session_cwd` for the other verbs). Same
-    /// precedence as [`Config::load`]; a malformed-master error or an
-    /// unknown profile maps to `Err(reason)` so the caller can keep the
-    /// previous config and warn instead of crashing.
-    pub fn reload_for(&self, cwd: &std::path::Path) -> Result<Config, String> {
+    /// Re-read master + `<cwd>/.peakbot/config.yaml` for a live session and
+    /// apply `profile` (`None` = base config). The profile is the caller's
+    /// [`effective_profile`], never `self.active_profile`: selection is
+    /// per-conversation, so a stale stamp on the live config must not leak
+    /// into the next one. `cwd` must be the directory the session WILL be in
+    /// after the calling verb completes (target for `/cd`, current
+    /// `session_cwd` for the other verbs). Same precedence as
+    /// [`Config::load`]; a malformed-master error or an unknown profile maps
+    /// to `Err(reason)` so the caller can keep the previous config and warn.
+    pub fn reload_for(
+        &self,
+        cwd: &std::path::Path,
+        profile: Option<&str>,
+    ) -> Result<Config, String> {
         let (master, master_path) = load_yaml_config().map_err(|e| e.to_string())?;
         // Same master-universe gate as `Config::load`: the active profile's
         // `pipelines:` filter may only name pipelines master declares.
         if let Some(master) = &master {
-            validate_active_profile_filters(master, self.active_profile.as_deref())?;
+            validate_active_profile_filters(master, profile)?;
             // The static-prompt slot: a single file cannot claim both halves.
             // Runs per source file, before `merge_sources`.
             let master_label = master_path
@@ -1981,10 +2052,35 @@ impl Config {
             validate_prompt_slot(per_repo, &per_repo_label)?;
         }
         warn_if_per_repo_declares_profiles(per_repo.as_ref());
-        apply_profile(
-            Self::merge_sources(master, per_repo),
-            self.active_profile.as_deref(),
-        )
+        apply_profile(Self::merge_sources(master, per_repo), profile)
+    }
+
+    /// Resolve a conversation's saved profile against the configured ones —
+    /// the profile twin of `PipelineSet::resolve_saved`, one rule for resume
+    /// and `/load`. A name that is no longer configured resolves to `None`
+    /// plus the warning to surface; the caller drops the selection.
+    pub fn resolve_saved_profile(&self, saved: Option<&str>) -> (Option<&str>, Option<String>) {
+        let Some(name) = saved else {
+            return (None, None);
+        };
+        match self.profiles.get_key_value(name) {
+            Some((key, _)) => (Some(key.as_str()), None),
+            None => (
+                None,
+                Some(format!(
+                    "⚠ Profile '{name}' from this conversation is no longer configured; \
+                     loaded without a profile."
+                )),
+            ),
+        }
+    }
+
+    /// Configured profile names, sorted — the order every listing and
+    /// refusal message uses, so they read the same everywhere.
+    pub fn profile_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.profiles.keys().cloned().collect();
+        names.sort_unstable();
+        names
     }
 
     /// Pure merge of the two config sources over defaults — the
@@ -2002,8 +2098,8 @@ impl Config {
     /// Adopt every field from `fresh` **except** `provider`, which is
     /// owned by the resolve step and must never be overwritten by a
     /// reload. This is the single point that enforces that invariant.
-    /// `active_profile` (and everything else) rides along unchanged, so the
-    /// next `reload_for` re-applies the same profile.
+    /// `active_profile` rides along, so the live config always records the
+    /// profile that was actually applied.
     pub fn adopt_reloaded(&mut self, fresh: Config) {
         let saved_provider = self.provider.clone();
         *self = fresh;
@@ -2032,15 +2128,30 @@ impl Config {
                     .to_string(),
             );
         }
+        // Profile `ui.tabs` filters are NameFilters over the fixed web-tab
+        // universe, checked like `tools:` (over `BUILTIN_TOOL_NAMES`) and a
+        // profile `pipelines:` gate (over master's declared pipelines).
+        for (name, profile) in &self.profiles {
+            if let Some(tabs) = profile.ui.as_ref().and_then(|ui| ui.tabs.as_ref()) {
+                let label = format!("profiles.{name}.ui.tabs");
+                tabs.validate_shape(&label)?;
+                tabs.validate_names(&label, "tab", &TAB_NAMES)?;
+            }
+        }
         Ok(())
     }
 }
 
-/// Apply the boot-selected profile overlay to an already-merged
-/// (master + per-repo) config — the ONE place a profile is applied (§1.4).
-/// `None` is a no-op (today's behaviour, byte-identical). An unknown name is
-/// a boot error naming it and listing the configured profiles (sorted, for a
-/// stable message).
+/// Effective profile for a session: the boot `--profile` pin beats the
+/// conversation's own selection. Always derived, never stored.
+pub fn effective_profile<'a>(pin: Option<&'a str>, selected: Option<&'a str>) -> Option<&'a str> {
+    pin.or(selected)
+}
+
+/// Apply a profile overlay to an already-merged (master + per-repo) config —
+/// the ONE place a profile is applied (§1.4). `None` is a no-op. An unknown
+/// name is an error naming it and listing the configured profiles (sorted,
+/// for a stable message).
 fn apply_profile(mut cfg: Config, name: Option<&str>) -> Result<Config, String> {
     let Some(name) = name else { return Ok(cfg) };
     let profile = cfg.profiles.get(name).cloned().ok_or_else(|| {
@@ -2254,6 +2365,15 @@ pub fn save_master_config(yaml: &str) -> anyhow::Result<SaveOutcome> {
     })?;
     save_config_at(parent, yaml)
 }
+
+/// One lock for EVERY test that swaps `XDG_CONFIG_HOME` to point the master
+/// config at a tempdir. It is crate-level (not private to `mod tests`)
+/// because the lib.rs `handle_select_profile` tests drive `reload_for`
+/// through the same env knob and run in the same test process — two
+/// private locks would not protect the suites from each other.
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 #[cfg(test)]
 mod tests {
@@ -4418,6 +4538,7 @@ max_image_bytes: 10485760
                     memory: None,
                     pipelines: None,
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -4471,6 +4592,7 @@ max_image_bytes: 10485760
                     }),
                     pipelines: None,
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -4520,6 +4642,7 @@ max_image_bytes: 10485760
                         memory: None,
                         pipelines: None,
                         system_prompt: None,
+                        ui: None,
                     },
                 ),
                 (
@@ -4529,6 +4652,7 @@ max_image_bytes: 10485760
                         memory: None,
                         pipelines: None,
                         system_prompt: None,
+                        ui: None,
                     },
                 ),
             ]),
@@ -4561,6 +4685,7 @@ max_image_bytes: 10485760
                     memory: None,
                     pipelines: None,
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -4573,6 +4698,7 @@ max_image_bytes: 10485760
                     memory: None,
                     pipelines: None,
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -4593,11 +4719,6 @@ max_image_bytes: 10485760
             "the error must name the unknown profile, got: {err}"
         );
     }
-
-    /// Serializes the env-var-mutating reload pin so it cannot race a future
-    /// test that also points the master config path at a tempdir.
-    static CONFIG_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     /// §1.7 security regression pin: a profile that disables `bash` must
     /// survive a reload even when the per-repo config in the (new) cwd sets
@@ -4647,13 +4768,14 @@ max_image_bytes: 10485760
                     memory: None,
                     pipelines: None,
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
         };
 
         let reloaded = live
-            .reload_for(repo_tmp.path())
+            .reload_for(repo_tmp.path(), Some("locked"))
             .expect("reload must succeed");
 
         // Restore the env var BEFORE asserting (panic-safety).
@@ -4718,6 +4840,7 @@ max_image_bytes: 10485760
                     memory: None,
                     pipelines: None,
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -4852,6 +4975,7 @@ max_image_bytes: 10485760
                         ..Default::default()
                     }),
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -4887,6 +5011,7 @@ max_image_bytes: 10485760
                     memory: None,
                     pipelines: None,
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -4926,6 +5051,7 @@ max_image_bytes: 10485760
             memory: None,
             pipelines: None,
             system_prompt: None,
+            ui: None,
         };
         assert_eq!(
             none.overridden_fields(),
@@ -4938,6 +5064,7 @@ max_image_bytes: 10485760
             memory: Some(MemoryConfig::default()),
             pipelines: Some(NameFilter::default()),
             system_prompt: None,
+            ui: None,
         };
         assert_eq!(
             all.overridden_fields(),
@@ -4950,6 +5077,7 @@ max_image_bytes: 10485760
             memory: None,
             pipelines: Some(NameFilter::default()),
             system_prompt: None,
+            ui: None,
         };
         assert_eq!(
             pipes.overridden_fields(),
@@ -4962,6 +5090,7 @@ max_image_bytes: 10485760
             memory: Some(MemoryConfig::default()),
             pipelines: Some(NameFilter::default()),
             system_prompt: Some("FULL".to_string()),
+            ui: None,
         };
         assert_eq!(
             all_four.overridden_fields(),
@@ -4974,6 +5103,7 @@ max_image_bytes: 10485760
             memory: None,
             pipelines: None,
             system_prompt: Some("FULL".to_string()),
+            ui: None,
         };
         assert_eq!(
             prompt_only.overridden_fields(),
@@ -5005,6 +5135,7 @@ max_image_bytes: 10485760
                         ..Default::default()
                     }),
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -5112,6 +5243,7 @@ max_image_bytes: 10485760
                     memory: None,
                     pipelines: None,
                     system_prompt: Some("FULL-PROFILE".to_string()),
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -5193,13 +5325,14 @@ max_image_bytes: 10485760
                         memory: None,
                         pipelines: None,
                         system_prompt: Some("FULL-PROFILE".to_string()),
+                        ui: None,
                     },
                 )]),
                 ..Config::default()
             };
 
             let reloaded = live
-                .reload_for(repo_tmp.path())
+                .reload_for(repo_tmp.path(), Some("locked"))
                 .expect("reload must succeed");
 
             // Restore the env var BEFORE dropping the guard (panic-safety).
@@ -5348,7 +5481,7 @@ max_image_bytes: 10485760
             // No active profile: the slot error must fire on the per-repo
             // file regardless of profile state.
             let live = Config::default();
-            let result = live.reload_for(repo_tmp.path());
+            let result = live.reload_for(repo_tmp.path(), None);
 
             // Restore the env var BEFORE dropping the guard (panic-safety).
             unsafe {
@@ -5463,6 +5596,7 @@ max_image_bytes: 10485760
                         ..Default::default()
                     }),
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -5498,6 +5632,7 @@ max_image_bytes: 10485760
                         only: vec![],
                     }),
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -5533,6 +5668,7 @@ max_image_bytes: 10485760
                         ..Default::default()
                     }),
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -5597,6 +5733,7 @@ max_image_bytes: 10485760
                         ..Default::default()
                     }),
                     system_prompt: None,
+                    ui: None,
                 },
             )]),
             ..Config::default()
@@ -5694,13 +5831,14 @@ max_image_bytes: 10485760
                             ..Default::default()
                         }),
                         system_prompt: None,
+                        ui: None,
                     },
                 )]),
                 ..Config::default()
             };
 
             let reloaded = live
-                .reload_for(repo_tmp.path())
+                .reload_for(repo_tmp.path(), Some("locked"))
                 .expect("reload must succeed");
 
             // Restore the env var BEFORE dropping the guard (panic-safety).
@@ -5980,6 +6118,7 @@ profiles:
                         memory: None,
                         pipelines: Some(filter.clone()),
                         system_prompt: None,
+                        ui: None,
                     },
                 )]),
                 ..Config::default()
@@ -6002,5 +6141,1034 @@ profiles:
                 "{ctx}: pipelines seam must keep exactly the allowed names, in declaration order"
             );
         }
+    }
+
+    // =========================================================================
+    // Profile `ui.tabs` (Layer A) — per-profile web-UI tab visibility.
+    //
+    // `Profile` gains `ui: Option<ProfileUi>`; `ProfileUi { tabs:
+    // Option<NameFilter> }` reuses the shared `NameFilter` (the same
+    // `enabled` / `disabled` / `only` semantics as `tools:` and the
+    // pipelines gate). `TAB_NAMES` is the canonical tab universe;
+    // `visible_tabs` is the pure helper the web layer will consume.
+    // Validation runs at the load/reload boundary (`Config::validate`):
+    // unknown tab names and `only`+`disabled` together are config errors.
+    //
+    // (RED — `TAB_NAMES`, `ProfileUi`, `Profile.ui` and `visible_tabs` do
+    // not exist yet, and `Config::validate` does not yet check profile tab
+    // filters.)
+    // =========================================================================
+
+    /// The canonical tab universe: exactly these seven names, in this order.
+    /// `visible_tabs` and the web layer both rely on this order.
+    #[test]
+    fn tab_names_is_the_seven_canonical_tabs_in_order() {
+        assert_eq!(
+            TAB_NAMES,
+            [
+                "session", "todo", "files", "tasks", "bash", "agents", "profile"
+            ],
+            "TAB_NAMES must list the seven web tabs in canonical order"
+        );
+        // A duplicated name would make `visible_tabs` emit the same tab twice.
+        let mut seen = std::collections::HashSet::new();
+        for name in TAB_NAMES {
+            assert!(seen.insert(name), "TAB_NAMES lists '{name}' twice");
+        }
+    }
+
+    /// `visible_tabs(None)` = no filter = every tab, in canonical order.
+    #[test]
+    fn visible_tabs_none_returns_all_seven_in_canonical_order() {
+        assert_eq!(
+            visible_tabs(None),
+            vec![
+                "session", "todo", "files", "tasks", "bash", "agents", "profile"
+            ]
+        );
+    }
+
+    /// A default `NameFilter` (both lists empty) also means "all tabs" — the
+    /// same "empty lists = allow all" rule as `tools:`.
+    #[test]
+    fn visible_tabs_default_filter_returns_all_seven() {
+        assert_eq!(
+            visible_tabs(Some(&NameFilter::default())),
+            vec![
+                "session", "todo", "files", "tasks", "bash", "agents", "profile"
+            ]
+        );
+    }
+
+    /// `enabled: false` hides every tab — the `kiosk` shape.
+    #[test]
+    fn visible_tabs_enabled_false_returns_empty() {
+        let f = NameFilter {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(
+            visible_tabs(Some(&f)).is_empty(),
+            "enabled: false must hide every tab"
+        );
+    }
+
+    /// `only` is an allowlist, and the result comes back in CANONICAL order,
+    /// not the order the user wrote the list.
+    #[test]
+    fn visible_tabs_only_returns_canonical_order_not_input_order() {
+        let f = NameFilter {
+            only: vec!["bash".into(), "session".into()],
+            ..Default::default()
+        };
+        assert_eq!(visible_tabs(Some(&f)), vec!["session", "bash"]);
+    }
+
+    /// `disabled` is a blocklist: named tabs drop out, the rest keep their
+    /// canonical order. (The `research` shape from the design.)
+    #[test]
+    fn visible_tabs_disabled_removes_named_keeps_rest_in_order() {
+        let f = NameFilter {
+            disabled: vec!["bash".into(), "files".into(), "profile".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            visible_tabs(Some(&f)),
+            vec!["session", "todo", "tasks", "agents"]
+        );
+    }
+
+    /// `only: []` NEVER means "no tabs" — the same trap rule as `tools:`: an
+    /// empty list allows everything.
+    #[test]
+    fn visible_tabs_empty_only_list_still_returns_all_seven() {
+        let f = NameFilter {
+            only: vec![],
+            ..Default::default()
+        };
+        assert_eq!(
+            visible_tabs(Some(&f)),
+            vec![
+                "session", "todo", "files", "tasks", "bash", "agents", "profile"
+            ]
+        );
+    }
+
+    /// Parse: the `research` shape — `ui.tabs.disabled` blocklist.
+    #[test]
+    fn profile_ui_tabs_disabled_parses() {
+        let cfg: Config = serde_yaml::from_str(
+            "profiles:
+  research:
+    ui:
+      tabs:
+        disabled: [bash, files, profile]
+",
+        )
+        .expect("ui.tabs.disabled must parse");
+        assert_eq!(
+            cfg.profiles.get("research").expect("profile parsed").ui,
+            Some(ProfileUi {
+                tabs: Some(NameFilter {
+                    enabled: true,
+                    disabled: vec!["bash".into(), "files".into(), "profile".into()],
+                    only: vec![],
+                }),
+            }),
+        );
+    }
+
+    /// Parse: the `kiosk` shape — `ui.tabs.enabled: false` hides everything.
+    #[test]
+    fn profile_ui_tabs_enabled_false_parses() {
+        let cfg: Config = serde_yaml::from_str(
+            "profiles:
+  kiosk:
+    ui:
+      tabs:
+        enabled: false
+",
+        )
+        .expect("ui.tabs.enabled: false must parse");
+        assert_eq!(
+            cfg.profiles.get("kiosk").expect("profile parsed").ui,
+            Some(ProfileUi {
+                tabs: Some(NameFilter {
+                    enabled: false,
+                    disabled: vec![],
+                    only: vec![],
+                }),
+            }),
+        );
+    }
+
+    /// Back-compat: a profile with NO `ui` key (including a fully empty
+    /// profile) still parses, with `ui == None`.
+    #[test]
+    fn profile_without_ui_key_still_parses() {
+        let cfg: Config = serde_yaml::from_str(
+            "profiles:
+  dev: {}
+  tools_only:
+    tools:
+      disabled: [bash]
+",
+        )
+        .expect("profiles without ui must parse");
+        assert_eq!(
+            cfg.profiles.get("dev").expect("dev parsed").ui,
+            None,
+            "an empty profile has no ui block"
+        );
+        assert_eq!(
+            cfg.profiles
+                .get("tools_only")
+                .expect("tools_only parsed")
+                .ui,
+            None,
+            "a profile that sets only tools has no ui block"
+        );
+    }
+
+    /// Edge: `ui: {}` parses to `Some(ProfileUi { tabs: None })` — a present
+    /// but empty `ui` block is distinct from an absent one.
+    #[test]
+    fn profile_ui_empty_block_parses_with_tabs_none() {
+        let cfg: Config = serde_yaml::from_str(
+            "profiles:
+  kiosk:
+    ui: {}
+",
+        )
+        .expect("an empty ui block must parse");
+        assert_eq!(
+            cfg.profiles.get("kiosk").expect("profile parsed").ui,
+            Some(ProfileUi { tabs: None }),
+        );
+    }
+
+    /// `ProfileUi` is `deny_unknown_fields`: a typo under `ui:` is a parse
+    /// error naming the bad key, not a silently-ignored field.
+    #[test]
+    fn profile_ui_unknown_key_is_rejected() {
+        let err = serde_yaml::from_str::<Config>(
+            "profiles:
+  kiosk:
+    ui:
+      tabs:
+        enabled: false
+      panels: []
+",
+        )
+        .expect_err("unknown key under ui: must be rejected");
+        assert!(
+            err.to_string().contains("panels"),
+            "the error must name the unknown key, got: {err}"
+        );
+    }
+
+    /// `tabs` reuses `NameFilter`, which is itself `deny_unknown_fields`:
+    /// a typo inside `ui.tabs:` is a parse error too.
+    #[test]
+    fn profile_ui_tabs_unknown_key_is_rejected() {
+        let err = serde_yaml::from_str::<Config>(
+            "profiles:
+  research:
+    ui:
+      tabs:
+        only: [bash]
+        extra: 1
+",
+        )
+        .expect_err("unknown key under ui.tabs: must be rejected");
+        assert!(
+            err.to_string().contains("extra"),
+            "the error must name the unknown key, got: {err}"
+        );
+    }
+
+    /// Boundary parse: an unknown tab in `ui.tabs.only` is a
+    /// `Config::validate` error that names the bad name and lists the valid
+    /// tabs.
+    #[test]
+    fn config_validate_rejects_unknown_tab_in_profile_ui_tabs_only() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "research".to_string(),
+                Profile {
+                    ui: Some(ProfileUi {
+                        tabs: Some(NameFilter {
+                            only: vec!["ghost".into()],
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            active_profile: Some("research".to_string()),
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("an unknown tab name must be rejected");
+        assert!(
+            err.contains("ghost"),
+            "the error must name the unknown tab, got: {err}"
+        );
+        for tab in TAB_NAMES {
+            assert!(
+                err.contains(tab),
+                "the error must list the valid tabs (missing '{tab}'), got: {err}"
+            );
+        }
+    }
+
+    /// Same pin for the `disabled` list — both lists are name-checked.
+    #[test]
+    fn config_validate_rejects_unknown_tab_in_profile_ui_tabs_disabled() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "research".to_string(),
+                Profile {
+                    ui: Some(ProfileUi {
+                        tabs: Some(NameFilter {
+                            disabled: vec!["ghost".into()],
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            active_profile: Some("research".to_string()),
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("an unknown tab name must be rejected");
+        assert!(
+            err.contains("ghost"),
+            "the error must name the unknown tab, got: {err}"
+        );
+        for tab in TAB_NAMES {
+            assert!(
+                err.contains(tab),
+                "the error must list the valid tabs (missing '{tab}'), got: {err}"
+            );
+        }
+    }
+
+    /// Boundary parse: `only` + `disabled` together in `ui.tabs` is a config
+    /// error — the `NameFilter` XOR, enforced for tabs exactly like for
+    /// tools.
+    #[test]
+    fn config_validate_rejects_profile_ui_tabs_with_both_only_and_disabled() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "kiosk".to_string(),
+                Profile {
+                    ui: Some(ProfileUi {
+                        tabs: Some(NameFilter {
+                            only: vec!["bash".into()],
+                            disabled: vec!["files".into()],
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            active_profile: Some("kiosk".to_string()),
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("only + disabled together must be rejected");
+        assert!(
+            err.contains("only") && err.contains("disabled"),
+            "the error must name both conflicting lists, got: {err}"
+        );
+    }
+
+    /// Positive control: known tab names validate cleanly. The blocklist
+    /// includes `profile` and `session` — names that are NOT in
+    /// `BUILTIN_TOOL_NAMES` — so this also pins that tabs are validated
+    /// against the tab universe, not the tool universe.
+    #[test]
+    fn config_validate_accepts_profile_ui_tabs_with_known_tab_names() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "research".to_string(),
+                Profile {
+                    ui: Some(ProfileUi {
+                        tabs: Some(NameFilter {
+                            disabled: vec!["bash".into(), "files".into(), "profile".into()],
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            active_profile: Some("research".to_string()),
+            ..Config::default()
+        };
+        let result = cfg.validate();
+        assert!(
+            result.is_ok(),
+            "known tab names must validate, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// End-to-end: a profile whose `ui.tabs` names a ghost tab must fail at
+    /// the boot seam (`Config::load`), with a message that names the bad tab
+    /// and lists the valid ones. Driven through the real load path — the
+    /// XDG_CONFIG_HOME trick from the profile-pipelines boot-error pin.
+    /// (RED — the load path does not yet validate profile tab filters.)
+    #[test]
+    fn profile_ui_tabs_unknown_tab_is_a_boot_error() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the (currently RED) assertions so a panic here can
+        // never poison `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let result = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "profiles:
+  research:
+    ui:
+      tabs:
+        only: [ghost]
+",
+            )
+            .expect("write master config");
+
+            let result = Config::load(Some("research"));
+
+            // Restore the env var BEFORE dropping the guard (panic-safety).
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            result
+        };
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a profile naming an unknown tab must be a boot error"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ghost"),
+            "the error must name the unknown tab, got: {msg}"
+        );
+        for tab in TAB_NAMES {
+            assert!(
+                msg.contains(tab),
+                "the error must list the valid tabs (missing '{tab}'), got: {msg}"
+            );
+        }
+    }
+
+    /// `overridden_fields` (the boot-banner source) must report `ui` when the
+    /// profile sets it, in declaration order — `ui` last, after
+    /// `system_prompt`.
+    #[test]
+    fn profile_overridden_fields_includes_ui_when_set() {
+        // (a) only ui set ⇒ just ["ui"].
+        let ui_only = Profile {
+            ui: Some(ProfileUi {
+                tabs: Some(NameFilter::default()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            ui_only.overridden_fields(),
+            vec!["ui"],
+            "only `ui` set ⇒ just that key"
+        );
+        // (b) all five set ⇒ the full declaration order, `ui` last.
+        let all_five = Profile {
+            tools: Some(NameFilter::default()),
+            memory: Some(MemoryConfig::default()),
+            pipelines: Some(NameFilter::default()),
+            system_prompt: Some("FULL".to_string()),
+            ui: Some(ProfileUi {
+                tabs: Some(NameFilter::default()),
+            }),
+        };
+        assert_eq!(
+            all_five.overridden_fields(),
+            vec!["tools", "memory", "pipelines", "system_prompt", "ui"],
+            "all five set ⇒ declaration order, `ui` last"
+        );
+    }
+
+    // =========================================================================
+    // Layer B — `reload_for` takes the profile as an explicit parameter (RED).
+    //
+    // B1: `reload_for(&self, cwd: &Path, profile: Option<&str>)`. The profile
+    // to apply is the CALLER's decision (the session verb computes
+    // `effective_profile(pin, selected)`), not a re-read of
+    // `self.active_profile`:
+    //   * `Some(name)` → apply `name`; the reloaded config is stamped
+    //     `active_profile = Some(name)` and the profile's filters are in
+    //     effect.
+    //   * `None`       → base config, no profile; `active_profile` comes
+    //     back `None` — even when `self` still carries a stale stamp.
+    //   * unknown name → `Err` naming the unknown profile (the caller keeps
+    //     the previous config and warns).
+    //
+    // Compile-RED until the signature gains the `profile` parameter: every
+    // call below passes two arguments to today's one-argument method.
+    // =========================================================================
+
+    /// B1: `Some("locked")` applies the profile — the stamp lands on the
+    /// reloaded config and the profile's `tools:` filter is in effect. The
+    /// live config carries NO stamp of its own: the explicit parameter, not
+    /// `self.active_profile`, drives the application.
+    #[test]
+    fn reload_for_explicit_profile_applies_it_and_stamps_active_profile() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+
+        // The env-mutating part runs under the shared lock; the guard is
+        // dropped BEFORE the assertions so a panic here can never poison
+        // `CONFIG_ENV_LOCK` for the other env-mutating tests.
+        let reloaded = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "profiles:\n  locked:\n    tools:\n      disabled: [bash]\n",
+            )
+            .expect("write master config");
+
+            // No stamp on the live config — the explicit parameter decides.
+            let live = Config::default();
+            let reloaded = live
+                .reload_for(repo_tmp.path(), Some("locked"))
+                .expect("reload must succeed");
+
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            reloaded
+        };
+
+        assert_eq!(
+            reloaded.active_profile.as_deref(),
+            Some("locked"),
+            "the applied profile must be stamped on the reloaded config"
+        );
+        assert!(
+            !reloaded.tools.allows("bash"),
+            "the profile's `tools:` filter must be in effect after reload (got {:?})",
+            reloaded.tools
+        );
+    }
+
+    /// B1: `None` means "base config, no profile" — and it wins over a STALE
+    /// stamp on `self`: the parameter, not `self.active_profile`, decides.
+    /// `active_profile` comes back `None` and the profile's filter is absent.
+    #[test]
+    fn reload_for_none_applies_base_config_even_with_stale_stamp() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+
+        let reloaded = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "profiles:\n  locked:\n    tools:\n      disabled: [bash]\n",
+            )
+            .expect("write master config");
+
+            // A stale stamp that the explicit `None` must override.
+            let live = Config {
+                active_profile: Some("locked".to_string()),
+                ..Config::default()
+            };
+            let reloaded = live
+                .reload_for(repo_tmp.path(), None)
+                .expect("reload must succeed");
+
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            reloaded
+        };
+
+        assert!(
+            reloaded.active_profile.is_none(),
+            "`None` must come back unprofiled, stamp and all (got {:?})",
+            reloaded.active_profile
+        );
+        assert!(
+            reloaded.tools.allows("bash"),
+            "no profile ⇒ the base config's tool filter is in effect (got {:?})",
+            reloaded.tools
+        );
+    }
+
+    /// B1: an unknown profile name is `Err` — the caller keeps the previous
+    /// config and warns. The error names the unknown profile (and, per the
+    /// `apply_profile` contract, lists the configured ones).
+    #[test]
+    fn reload_for_unknown_profile_is_an_error_naming_the_profile() {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+
+        let result = {
+            let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+            let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+            std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                "profiles:\n  locked:\n    tools:\n      disabled: [bash]\n",
+            )
+            .expect("write master config");
+
+            let live = Config::default();
+            let result = live.reload_for(repo_tmp.path(), Some("ghost"));
+
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            result
+        };
+
+        let msg = match result {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown profile must be a reload error"),
+        };
+        assert!(
+            msg.contains("ghost"),
+            "the error must name the unknown profile, got: {msg}"
+        );
+        assert!(
+            msg.contains("locked"),
+            "the error must list the configured profile, got: {msg}"
+        );
+    }
+
+    // =========================================================================
+    // Layer B — `effective_profile`: boot pin beats conversation selection (RED).
+    //
+    // B2: the effective profile for a session is `pin.or(selected)`, where
+    // `pin` is the boot `--profile <name>` and `selected` is the
+    // conversation's `Conversation.profile`. Pure, module-level helper in
+    // `crate::config` (next to `Config`), so the session verbs and the tests
+    // share one implementation:
+    //
+    // ```ignore
+    // pub fn effective_profile<'a>(
+    //     pin: Option<&'a str>,
+    //     selected: Option<&'a str>,
+    // ) -> Option<&'a str>
+    // ```
+    //
+    // Compile-RED until the helper exists (E0425).
+    // =========================================================================
+
+    #[test]
+    fn effective_profile_pin_wins_over_selection() {
+        assert_eq!(
+            effective_profile(Some("web"), Some("admin")),
+            Some("web"),
+            "the boot pin must beat the conversation's selection"
+        );
+    }
+
+    #[test]
+    fn effective_profile_falls_back_to_selection_without_pin() {
+        assert_eq!(
+            effective_profile(None, Some("admin")),
+            Some("admin"),
+            "no pin ⇒ the conversation's selection applies"
+        );
+    }
+
+    #[test]
+    fn effective_profile_pin_only() {
+        assert_eq!(
+            effective_profile(Some("web"), None),
+            Some("web"),
+            "no selection ⇒ the pin applies"
+        );
+    }
+
+    #[test]
+    fn effective_profile_none_when_neither_pin_nor_selection() {
+        assert_eq!(
+            effective_profile(None, None),
+            None,
+            "no pin and no selection ⇒ base config, no profile"
+        );
+    }
+
+    // =========================================================================
+    // Layer C — `resolve_saved_profile`: a vanished profile on /load (RED).
+    //
+    // C5: mirrors `PipelineSet::resolve_saved` (src/pipeline/set.rs) for the
+    // profile axis — one rule for resume + /load, on `Config` (which owns
+    // the `profiles:` map):
+    //   * `Some(name)` present in `self.profiles` → `(Some(name), None)`
+    //   * `Some(name)` missing                    → `(None, Some(warning))`
+    //     — the caller drops the selection and surfaces the warning
+    //   * `None`                                  → `(None, None)` — silent
+    //
+    // ```ignore
+    // impl Config {
+    //     pub fn resolve_saved_profile(
+    //         &self,
+    //         saved: Option<&str>,
+    //     ) -> (Option<&str>, Option<String>);
+    // }
+    // ```
+    //
+    // Compile-RED until the method exists (E0599).
+    // =========================================================================
+
+    #[test]
+    fn resolve_saved_profile_existing_name_resolves_silently() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "web".to_string(),
+                Profile {
+                    tools: Some(NameFilter {
+                        disabled: vec!["bash".into()],
+                        only: vec![],
+                        ..Default::default()
+                    }),
+                    memory: None,
+                    pipelines: None,
+                    system_prompt: None,
+                    ui: None,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let (resolved, warning) = cfg.resolve_saved_profile(Some("web"));
+        assert_eq!(resolved, Some("web"), "existing name must resolve");
+        assert!(
+            warning.is_none(),
+            "successful resolve must NOT emit a warning; got: {warning:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_saved_profile_missing_name_returns_none_and_warning() {
+        let cfg = Config {
+            profiles: HashMap::from([("web".to_string(), Profile::default())]),
+            ..Config::default()
+        };
+
+        let (resolved, warning) = cfg.resolve_saved_profile(Some("ghost"));
+        assert!(
+            resolved.is_none(),
+            "missing name must resolve to None (caller drops the selection)"
+        );
+        let w = warning.expect("missing name must emit a warning");
+        assert!(
+            w.contains("ghost"),
+            "warning must name the missing profile; got: {w}"
+        );
+    }
+
+    #[test]
+    fn resolve_saved_profile_none_input_is_silent() {
+        let cfg = Config {
+            profiles: HashMap::from([("web".to_string(), Profile::default())]),
+            ..Config::default()
+        };
+
+        let (resolved, warning) = cfg.resolve_saved_profile(None);
+        assert!(resolved.is_none(), "no selection → no profile");
+        assert!(
+            warning.is_none(),
+            "no selection → no warning (fresh session baseline); got: {warning:?}"
+        );
+    }
+
+    // =========================================================================
+    // Layer D — the server-computed profile view (RED).
+    //
+    // D1: `selectable_profiles(cfg, pin)` — the profile names the web
+    // client may pick, sorted. EMPTY when no profiles are defined OR when
+    // a boot `--profile` pin is active: the client never needs to know
+    // about pinning (there is nothing to pick — the pin is the only
+    // profile, and it is not a choice).
+    //
+    // D2: `session_visible_tabs(cfg, selectable)` — the tabs the client
+    // should render, computed SERVER-side (the client must not re-derive
+    // config rules). Rule: start from the active profile's `ui.tabs`
+    // filter (`visible_tabs` — no active profile / no `ui` / no `tabs` =
+    // all seven in canonical order), then remove "profile" when
+    // `selectable` is empty — a profile picker with nothing to pick is a
+    // dead tab.
+    //
+    // ```ignore
+    // pub fn selectable_profiles(cfg: &Config, pin: Option<&str>) -> Vec<String>
+    // pub fn session_visible_tabs(cfg: &Config, selectable: &[String]) -> Vec<String>
+    // ```
+    //
+    // Compile-RED until both helpers exist (E0425).
+    // =========================================================================
+
+    /// A config with the named profiles, each carrying the given `ui`
+    /// block, and the given `active_profile` stamp.
+    fn config_for_view(names: &[&str], ui: Option<ProfileUi>, active: Option<&str>) -> Config {
+        let mut cfg = Config {
+            active_profile: active.map(str::to_string),
+            ..Config::default()
+        };
+        for name in names {
+            cfg.profiles.insert(
+                name.to_string(),
+                Profile {
+                    ui: ui.clone(),
+                    ..Default::default()
+                },
+            );
+        }
+        cfg
+    }
+
+    // ----- D1: selectable_profiles ----------------------------------------
+
+    /// No profiles defined → nothing selectable (the profile tab must go
+    /// away — see `session_visible_tabs`).
+    #[test]
+    fn selectable_profiles_empty_when_no_profiles_defined() {
+        let cfg = config_for_view(&[], None, None);
+        assert_eq!(
+            selectable_profiles(&cfg, None),
+            Vec::<String>::new(),
+            "no profiles ⇒ nothing to select"
+        );
+    }
+
+    /// Profiles defined, no pin → every name, SORTED (the same order
+    /// `profile_names()` uses, so listings and the picker agree).
+    #[test]
+    fn selectable_profiles_sorted_when_unpinned() {
+        let cfg = config_for_view(&["web", "admin", "research"], None, None);
+        assert_eq!(
+            selectable_profiles(&cfg, None),
+            vec![
+                "admin".to_string(),
+                "research".to_string(),
+                "web".to_string()
+            ],
+            "names must come back sorted"
+        );
+    }
+
+    /// A boot pin is active → EMPTY, even though profiles exist. The
+    /// client never sees the pin: an empty picker means "no profile tab",
+    /// which is exactly the pinned UX.
+    #[test]
+    fn selectable_profiles_empty_when_pin_active() {
+        let cfg = config_for_view(&["web", "admin"], None, Some("web"));
+        assert_eq!(
+            selectable_profiles(&cfg, Some("web")),
+            Vec::<String>::new(),
+            "a pin removes the choice — the client must get an empty list"
+        );
+    }
+
+    /// Pin active with no profiles at all (a misconfigured pin) → still
+    /// empty; the pin never invents a profile.
+    #[test]
+    fn selectable_profiles_empty_when_pin_active_and_no_profiles() {
+        let cfg = config_for_view(&[], None, None);
+        assert_eq!(
+            selectable_profiles(&cfg, Some("web")),
+            Vec::<String>::new(),
+            "a pin with no profiles still yields an empty picker"
+        );
+    }
+
+    // ----- D2: session_visible_tabs ----------------------------------------
+
+    /// No active profile + profiles selectable → all seven tabs in
+    /// canonical order (the baseline).
+    #[test]
+    fn session_visible_tabs_all_seven_when_no_active_profile_and_selectable() {
+        let cfg = config_for_view(&["web"], None, None);
+        assert_eq!(
+            session_visible_tabs(&cfg, &["web".to_string()]),
+            vec![
+                "session", "todo", "files", "tasks", "bash", "agents", "profile",
+            ],
+            "no active profile ⇒ every tab, canonical order"
+        );
+    }
+
+    /// No active profile + NOTHING selectable (no profiles defined or a
+    /// pin) → the six tabs WITHOUT "profile": the picker has nothing to
+    /// pick, so the tab is dead weight.
+    #[test]
+    fn session_visible_tabs_drops_profile_tab_when_nothing_selectable() {
+        let cfg = config_for_view(&[], None, None);
+        assert_eq!(
+            session_visible_tabs(&cfg, &[]),
+            vec!["session", "todo", "files", "tasks", "bash", "agents"],
+            "empty selectable list ⇒ the profile tab is removed"
+        );
+    }
+
+    /// Active profile with a `ui.tabs` blocklist: the filter applies, and
+    /// "profile" survives because something is still selectable.
+    #[test]
+    fn session_visible_tabs_applies_active_profile_blocklist() {
+        let cfg = config_for_view(
+            &["research"],
+            Some(ProfileUi {
+                tabs: Some(NameFilter {
+                    enabled: true,
+                    disabled: vec!["bash".into(), "profile".into()],
+                    only: vec![],
+                }),
+            }),
+            Some("research"),
+        );
+        assert_eq!(
+            session_visible_tabs(&cfg, &["research".to_string()]),
+            vec!["session", "todo", "files", "tasks", "agents"],
+            "the profile's disabled tabs are removed; the rest keep canonical order"
+        );
+    }
+
+    /// Active profile with `ui.tabs.enabled: false` → NO tabs at all,
+    /// even when profiles are selectable (the profile is a kiosk).
+    #[test]
+    fn session_visible_tabs_enabled_false_returns_empty() {
+        let cfg = config_for_view(
+            &["research"],
+            Some(ProfileUi {
+                tabs: Some(NameFilter {
+                    enabled: false,
+                    disabled: vec![],
+                    only: vec![],
+                }),
+            }),
+            Some("research"),
+        );
+        assert_eq!(
+            session_visible_tabs(&cfg, &["research".to_string()]),
+            Vec::<String>::new(),
+            "enabled: false hides everything, profile tab included"
+        );
+    }
+
+    /// Active profile with an `only` allowlist: the tabs come back in
+    /// CANONICAL order (the filter never reorders), "profile" included
+    /// because something is selectable.
+    #[test]
+    fn session_visible_tabs_only_allowlist_keeps_canonical_order() {
+        let cfg = config_for_view(
+            &["research"],
+            Some(ProfileUi {
+                tabs: Some(NameFilter {
+                    enabled: true,
+                    disabled: vec![],
+                    only: vec!["profile".into(), "session".into()],
+                }),
+            }),
+            Some("research"),
+        );
+        assert_eq!(
+            session_visible_tabs(&cfg, &["research".to_string()]),
+            vec!["session", "profile"],
+            "allowlist output is canonical order, not input order"
+        );
+    }
+
+    /// The two rules compose: an allowlist that includes "profile" still
+    /// loses it when nothing is selectable (pin or no profiles).
+    #[test]
+    fn session_visible_tabs_only_allowlist_still_drops_profile_when_unselectable() {
+        let cfg = config_for_view(
+            &["research"],
+            Some(ProfileUi {
+                tabs: Some(NameFilter {
+                    enabled: true,
+                    disabled: vec![],
+                    only: vec!["profile".into(), "session".into()],
+                }),
+            }),
+            Some("research"),
+        );
+        assert_eq!(
+            session_visible_tabs(&cfg, &[]),
+            vec!["session"],
+            "an empty selectable list removes 'profile' even from an allowlist"
+        );
+    }
+
+    /// A stale `active_profile` stamp (the profile vanished from config)
+    /// behaves like no active profile: the base tab set, and the
+    /// selectable-list rule still applies.
+    #[test]
+    fn session_visible_tabs_stale_active_profile_treated_as_base() {
+        let cfg = config_for_view(&["web"], None, Some("ghost"));
+        assert_eq!(
+            session_visible_tabs(&cfg, &[]),
+            vec!["session", "todo", "files", "tasks", "bash", "agents"],
+            "an unknown active profile must not crash or hide the base tabs"
+        );
+    }
+
+    /// `ui: {}` (present but no `tabs` filter) = all tabs — a present
+    /// empty block is distinct from `enabled: false`.
+    #[test]
+    fn session_visible_tabs_ui_without_tabs_filter_shows_all() {
+        let cfg = config_for_view(
+            &["research"],
+            Some(ProfileUi { tabs: None }),
+            Some("research"),
+        );
+        assert_eq!(
+            session_visible_tabs(&cfg, &["research".to_string()]),
+            vec![
+                "session", "todo", "files", "tasks", "bash", "agents", "profile",
+            ],
+            "an empty ui block ('ui: {{}}') is 'no filter', not 'no tabs'"
+        );
     }
 }

@@ -21,7 +21,9 @@
 //! `Drop` impl or `AbortHandle` is needed — the channel-close cascade is
 //! the teardown (verified `lib.rs` run_loop end).
 
-use crate::config::{Config, ModelRegistry, SearXngConfig};
+use crate::config::{
+    Config, ModelRegistry, SearXngConfig, selectable_profiles, session_visible_tabs,
+};
 use crate::pipeline::PipelineSet;
 use crate::tools::ShellKind;
 use crate::ui::app_state::WelcomeState;
@@ -67,6 +69,9 @@ pub struct SessionDeps {
     pub storage: Option<Arc<dyn crate::ConversationStorage>>,
     pub mcp_tools_count: usize,
     pub skills_count: usize,
+    /// The boot `--profile` pin. `config` was loaded under it; every session
+    /// runs under it and refuses runtime profile selection.
+    pub profile_pin: Option<String>,
 }
 
 /// One running, independent agent: its `StateManager` (Model), the write
@@ -123,14 +128,51 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         state_manager.set_shell(sk.executable().to_string());
     }
 
-    // On resume, prefer a set rebuilt from the conversation's per-repo
-    // config so a team in `.peakbot/config.yaml` survives; any rebuild
-    // failure falls back to `deps.pipelines`. Cwd is the saved value.
-    let pipelines: Arc<PipelineSet> = match resume {
-        Some(id) => reload_pipelines_for_resume(&state_manager, deps, id)
-            .unwrap_or_else(|| deps.pipelines.clone()),
-        None => deps.pipelines.clone(),
-    };
+    // ── Per-session cwd ──────────────────────────────────────────────────────
+    // Resume adopts the saved cwd iff it's non-empty and still points at a
+    // directory. Anything else (no resume, no storage, missing/empty
+    // cwd, gone directory) falls through to the boot cwd. A gone cwd is
+    // best-effort: the user can `/cd` to a valid tree at runtime.
+    let boot_cwd = std::env::current_dir().unwrap_or_default();
+    let saved_cwd: Option<PathBuf> = resume
+        .and_then(|id| state_manager.peek_conversation_cwd(id).ok())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir());
+    let session_cwd = saved_cwd.clone().unwrap_or(boot_cwd);
+
+    // The conversation's profile: a fresh session runs under the pin (or the
+    // base config); a resumed one re-applies its saved profile.
+    let saved_profile = resume
+        .and_then(|id| state_manager.peek_conversation_profile(id).ok())
+        .flatten();
+    let (mut profile, mut profile_warnings) = crate::resolve_conversation_profile(
+        &deps.config,
+        saved_profile.as_deref(),
+        deps.profile_pin.as_deref(),
+    );
+
+    // A resumed session rebuilds from its own tree and profile, so a team in
+    // its `.peakbot/config.yaml` survives and its profile applies. A profile
+    // that can't be applied falls back to the boot config, and says so.
+    let (config, pipelines) =
+        match reload_for_resume(deps, &session_cwd, profile.as_deref(), saved_cwd.is_some()) {
+            Ok(resumed) => (
+                resumed.config.unwrap_or_else(|| deps.config.clone()),
+                resumed
+                    .pipelines
+                    .map(Arc::new)
+                    .unwrap_or_else(|| deps.pipelines.clone()),
+            ),
+            Err(reason) => {
+                profile_warnings.push(format!(
+                    "⚠ Couldn't apply profile '{}' ({reason}); loaded without it.",
+                    profile.as_deref().unwrap_or_default()
+                ));
+                profile = deps.profile_pin.clone();
+                (deps.config.clone(), deps.pipelines.clone())
+            }
+        };
     state_manager.set_pipelines(pipelines.infos());
 
     // The conversation's pipeline selection. A fresh session has none; a
@@ -192,25 +234,6 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         Some(all)
     };
 
-    // ── Per-session cwd ──────────────────────────────────────────────────────
-    // Resume adopts the saved cwd iff it's non-empty and still points at a
-    // directory. Anything else (no resume, no storage, missing/empty
-    // cwd, gone directory) falls through to the boot cwd. A gone cwd is
-    // best-effort: the user can `/cd` to a valid tree at runtime.
-    let boot_cwd = std::env::current_dir().unwrap_or_default();
-    let session_cwd: PathBuf = match resume {
-        Some(id) => state_manager
-            .peek_conversation_cwd(id)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .and_then(|s| {
-                let p = PathBuf::from(&s);
-                if p.is_dir() { Some(p) } else { None }
-            })
-            .unwrap_or(boot_cwd),
-        None => boot_cwd,
-    };
-
     // Stamp the SM *before* create_provider so the tools snapshot the
     // per-session value at agent-build time. A `set_session_cwd` after
     // build would not reach the already-built tools.
@@ -225,7 +248,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // seam also uses. `config_head` outlives this call: `RebuildContext`
     // below stores the *unresolved* config head, because a later rebuild
     // re-resolves it against whatever pipeline is selected then.
-    let config_head = deps.config.prompt_head();
+    let config_head = config.prompt_head();
     let session_head = resolve_prompt_head(
         config_head.as_ref(),
         active.and_then(|p| p.orchestrator_persona.as_deref()),
@@ -234,7 +257,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         &deps.skills,
         deps.shell_kind.as_ref(),
         &session_cwd,
-        deps.config.memory.enabled,
+        config.memory.enabled,
         active.is_some(),
         active.and_then(|p| p.orchestrator_prompt.as_deref()),
         session_head.as_ref(),
@@ -252,17 +275,17 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         mcp_tools,
         &session_prompt,
         deps.searxng_config.as_ref(),
-        deps.config.agent_max_turns,
+        config.agent_max_turns,
         Some(todo_tool.clone()),
-        &deps.config.bash,
-        &deps.config.tools,
+        &config.bash,
+        &config.tools,
         boot_registry,
         state_manager.clone(),
         deps.shell_kind.as_ref(),
         deps.vector_store.as_ref(),
         &deps.skills,
-        &deps.config.retry,
-        &deps.config.timeouts,
+        &config.retry,
+        &config.timeouts,
     )?;
 
     // Thread the resolved reasoning gates into the shared StateManager.
@@ -300,11 +323,22 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // session actually booted on so an unconfigured name is dropped from the
     // conversation too (and not re-persisted).
     state_manager.set_selected_pipeline(active.map(|p| p.name.clone()));
+    state_manager.set_selected_profile(profile);
 
-    // A resumed conversation whose saved pipeline is gone from config boots
-    // without one — say so rather than silently downgrade. Emitted after the
-    // load, which replaces the chat with the saved transcript.
-    if let Some(warning) = pipeline_warning {
+    // Stamp the server-computed profile view (picker + tabs) from the
+    // per-session config — the client must not re-derive config rules.
+    // Under a pin the picker is empty, which is what hides the tab.
+    let selectable = selectable_profiles(&config, deps.profile_pin.as_deref());
+    state_manager.set_profile_view(
+        selectable.clone(),
+        session_visible_tabs(&config, &selectable),
+    );
+
+    // A resumed conversation whose saved pipeline or profile is gone from
+    // config boots without it — say so rather than silently downgrade.
+    // Emitted after the load, which replaces the chat with the saved
+    // transcript.
+    for warning in pipeline_warning.into_iter().chain(profile_warnings) {
         state_manager.add_system_message(warning);
     }
 
@@ -338,21 +372,22 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         system_prompt: session_prompt,
         mcp_handles: deps.mcp_handles.clone(),
         searxng_config: deps.searxng_config.clone(),
-        max_turns: deps.config.agent_max_turns,
+        max_turns: config.agent_max_turns,
         todo_tool: Some(todo_tool),
-        bash_config: deps.config.bash.clone(),
+        bash_config: config.bash.clone(),
         pipelines: deps.pipelines.clone(),
         shell_kind: deps.shell_kind.clone(),
         skills: deps.skills.clone(),
         vector_store: deps.vector_store.clone(),
-        memory_enabled: deps.config.memory.enabled,
-        tools_filter: deps.config.tools.clone(),
+        memory_enabled: config.memory.enabled,
+        tools_filter: config.tools.clone(),
         prompt_head: config_head,
+        profile_pin: deps.profile_pin.clone(),
     };
 
     let mut runner = AgentRunner::new(
         agent,
-        deps.config.clone(),
+        config.clone(),
         provider_info.clone(),
         deps.skills.clone(),
         event_receiver,
@@ -368,19 +403,19 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     state_manager.set_welcome(WelcomeState {
         provider_name: provider_info.name.clone(),
         model: provider_info.model.clone(),
-        max_tokens: deps.config.max_tokens() as usize,
+        max_tokens: config.max_tokens() as usize,
         // file_create, file_str_replace, file_insert, file_read, bash,
         // list_directory, fetch_url, fetch_page, think, todo, search
         builtin_tools_count: 11,
         mcp_tools_count: deps.mcp_tools_count,
         skills_count: deps.skills_count,
-        searxng_enabled: deps.config.searxng_enabled(),
-        searxng_url: deps.config.searxng.as_ref().map(|s| s.base_url.clone()),
-        cost_tracking_enabled: deps.config.supports_pricing() && deps.config.cost_tracking,
-        compaction_enabled: deps.config.context.enabled,
-        compaction_threshold: deps.config.context.threshold,
-        compaction_keep_recent: deps.config.context.keep_recent,
-        conversation_persistence_enabled: deps.config.conversation_enabled(),
+        searxng_enabled: config.searxng_enabled(),
+        searxng_url: config.searxng.as_ref().map(|s| s.base_url.clone()),
+        cost_tracking_enabled: config.supports_pricing() && config.cost_tracking,
+        compaction_enabled: config.context.enabled,
+        compaction_threshold: config.context.threshold,
+        compaction_keep_recent: config.context.keep_recent,
+        conversation_persistence_enabled: config.conversation_enabled(),
         cwd: session_cwd,
         peakbot_version: PEAKBOT_VERSION.to_string(),
     });
@@ -398,32 +433,62 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     })
 }
 
-/// Rebuild the pipeline set from the conversation's per-repo config on
-/// resume. Returns `None` for every failure mode (no saved cwd, gone
-/// dir, no `.peakbot/config.yaml`, bad YAML, registry/set build error)
-/// so the caller can fall back to `deps.pipelines` unchanged.
-fn reload_pipelines_for_resume(
-    state_manager: &StateManager,
+/// What [`reload_for_resume`] rebuilt; `None` fields keep the boot value.
+struct Resumed {
+    /// Only when the profile differs from the boot one — a per-repo file
+    /// alone rebuilds just the pipeline set, as it always has.
+    config: Option<Config>,
+    pipelines: Option<PipelineSet>,
+}
+
+/// Rebuild config and pipeline set for a session that isn't running under
+/// the boot config: a resumed conversation whose tree has its own
+/// `.peakbot/config.yaml` (`check_per_repo`), or whose profile differs from
+/// the boot one. Without either, the boot values are authoritative — an empty
+/// set from `reload_for` would silently drop boot-declared teams.
+///
+/// A per-repo-only failure falls back silently, as before profiles; `Err` is
+/// reserved for a profile that couldn't be applied, which the caller reports.
+fn reload_for_resume(
     deps: &SessionDeps,
-    id: Uuid,
-) -> Option<Arc<PipelineSet>> {
-    let cwd = state_manager
-        .peek_conversation_cwd(id)
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let path = PathBuf::from(&cwd);
-    if !path.is_dir() {
-        return None;
+    cwd: &std::path::Path,
+    profile: Option<&str>,
+    check_per_repo: bool,
+) -> std::result::Result<Resumed, String> {
+    let profile_differs = profile != deps.config.active_profile.as_deref();
+    let per_repo = check_per_repo && cwd.join(".peakbot/config.yaml").is_file();
+    let keep_boot = Resumed {
+        config: None,
+        pipelines: None,
+    };
+    if !profile_differs && !per_repo {
+        return Ok(keep_boot);
     }
-    // Without a per-repo file the boot set is authoritative — an empty
-    // set from `reload_for` would silently drop boot-declared teams.
-    if !path.join(".peakbot/config.yaml").is_file() {
-        return None;
+    match rebuild_config_and_pipelines(deps, cwd, profile) {
+        Ok((fresh, set)) => Ok(Resumed {
+            config: profile_differs.then(|| {
+                let mut config = deps.config.clone();
+                config.adopt_reloaded(fresh);
+                config
+            }),
+            pipelines: Some(set),
+        }),
+        Err(reason) if profile_differs => Err(reason),
+        Err(_) => Ok(keep_boot),
     }
-    let fresh = deps.config.reload_for(&path).ok()?;
-    let registry = fresh.build_model_registry().ok()?;
-    let set = PipelineSet::build(&fresh, &registry, Some(&deps.skills.names())).ok()?;
-    Some(Arc::new(set))
+}
+
+fn rebuild_config_and_pipelines(
+    deps: &SessionDeps,
+    cwd: &std::path::Path,
+    profile: Option<&str>,
+) -> std::result::Result<(Config, PipelineSet), String> {
+    let fresh = deps.config.reload_for(cwd, profile)?;
+    fresh.validate()?;
+    let registry = fresh.build_model_registry().map_err(|e| e.to_string())?;
+    let set = PipelineSet::build(&fresh, &registry, Some(&deps.skills.names()))
+        .map_err(|e| e.to_string())?;
+    Ok((fresh, set))
 }
 
 #[cfg(test)]
@@ -501,6 +566,7 @@ mod tests {
             storage: Some(storage),
             mcp_tools_count: 0,
             skills_count: 0,
+            profile_pin: None,
         }
     }
 
@@ -650,6 +716,7 @@ mod tests {
             storage: Some(storage),
             mcp_tools_count: 0,
             skills_count: 0,
+            profile_pin: None,
         }
     }
 

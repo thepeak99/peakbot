@@ -8,7 +8,7 @@
 // body is a 288px rail, below sm it spans 94vw. Replaces the old static aside
 // + separate mobile hamburger drawer.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Transcript, type TranscriptHandle } from "./components/Transcript";
 import { EmptyTranscript } from "./components/EmptyTranscript";
 import { BashPanel } from "./components/BashPanel";
@@ -21,11 +21,14 @@ import { TodoPanel } from "./components/TodoPanel";
 import { BgPanel } from "./components/BgPanel";
 import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
+import { ProfilePanel } from "./components/ProfilePanel";
 import { useAgent } from "./useAgent";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
+import { filterTabs, resolveActiveTab } from "./tabs";
 import type { ViewFilter } from "./types";
+import { selectProfile } from "./state";
 import {
   adaptBashPanel,
   adaptBg,
@@ -82,6 +85,13 @@ export function App() {
   // and stats to one lane via the message `source`.
   const pipelines = state?.pipelines ?? [];
   const selectedPipeline = state?.selected_pipeline ?? null;
+  // Profiles. `profiles` is the selectable catalogue (sorted); `activeProfile`
+  // is what THIS conversation is bound to (null = base config). An empty
+  // catalogue means no profiles are defined OR a `--profile` pin is active —
+  // either way there is nothing to pick, so the Profile tab is hidden (below).
+  const profiles = state?.profiles ?? [];
+  const activeProfile = state?.active_profile ?? null;
+  const hasProfiles = profiles.length > 0;
  // When a pipeline is selected, the model selector is locked to the
   // orchestrator's model — the chip stays visible but is disabled.
   const modelLockedReason = selectedPipeline
@@ -217,7 +227,46 @@ export function App() {
       ),
       badge: selectedPipeline ? roster.length : undefined,
     },
+    // The Profile tab only exists when there is something to pick. An empty
+    // catalogue (no profiles, or a `--profile` pin) hides it entirely — the
+    // server omits it from `visible_tabs` too, but this guards the legacy
+    // `visible_tabs === undefined` case so it never flashes for profile-less
+    // users.
+    ...(hasProfiles
+      ? [
+          {
+            id: "profile",
+            label: "Profile",
+            icon: "👤",
+            content: (
+              <ProfilePanel
+                profiles={profiles}
+                active={activeProfile}
+                locked={conversationStarted}
+                onSelect={(name) => send(selectProfile(name))}
+              />
+            ),
+          },
+        ]
+      : []),
   ];
+
+  // Narrow the canonical tab list to the server's `visible_tabs` (config/
+  // profile rule, computed server-side — never re-derived here). An absent
+  // field (older server) means "no rule yet" → every tab shows.
+  const visibleTabs = filterTabs(tabs, state?.visible_tabs);
+  const visibleTabIds = visibleTabs.map((t) => t.id);
+
+  // Keep an open drawer pointed at a tab the server still shows. When the
+  // visible set changes (a profile pin can drop the "profile" tab out from
+  // under an open drawer), relocate the active tab to the first still-visible
+  // one. A closed drawer (null) stays closed — resolveActiveTab never reopens
+  // it.
+  useEffect(() => {
+    if (drawerTab !== null && !visibleTabIds.includes(drawerTab)) {
+      setDrawerTab(resolveActiveTab(drawerTab, visibleTabIds));
+    }
+  }, [drawerTab, visibleTabIds]);
 
   return (
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-zinc-950 text-zinc-100">
@@ -324,7 +373,7 @@ export function App() {
    
 
       <TabbedDrawer
-        tabs={tabs}
+        tabs={visibleTabs}
         active={drawerTab}
         onActiveChange={setDrawerTab}
       />

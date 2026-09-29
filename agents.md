@@ -141,6 +141,7 @@ Editing `config.yaml` or skills does not require a restart: each session verb re
 | `cost_tracking`, `context.*`, `retry.*`, `memory.*`, `timeouts.*` | `provider` (legacy block) |
 | `tools.*` (built-in filter) | `http.*` (published once into the client factory) |
 | `pipelines:` (rebuilt from per-repo config; see note) | legacy `pipeline:` (hard boot error — `PipelineSet::build` rejects it) |
+| `profiles:` (re-applied on every reload; a profile's `ui.tabs` gates the web tabs it shows) | — |
 
 `pipelines:` is now hot-reloadable on `/cd`, `/new`, `/model`, `/load`. The rebuild runs **after** the skill re-scan (so a role's `skills:` filter is validated against fresh names) and **before** `adopt_reloaded` (so it still has `&fresh_config`). A bad `pipelines:` block warns and keeps the previous set; the rest of the config is still adopted. The per-conversation selection on a non-empty conversation is **locked** (the existing "locked after first turn" rule is unchanged) — picking a team mid-conversation would risk mid-flight tool-list drift, so the reconciler only acts on a freshly minted conversation. Nothing is auto-selected: a local `.peakbot/config.yaml` declaring `pipelines:` makes teams *available*, never *active*. Legacy `pipeline:` is still a hard build error at boot — no silent adaptation, no silent zero-pipeline boot.
 
@@ -264,13 +265,18 @@ OAuth notes: first connect opens the browser; tokens cached under `~/.cache/peak
 | `/resume` | Resume a paused sub-agent (Ctrl+P in TUI) |
 | `/model [alias]` | List / switch models |
 | `/pipeline [name\|none]` | List / select / clear pipeline |
+| `/profile [name\|none]` | List / select / clear per-conversation profile (web: Profile tab) |
 | `/cd [path]` | Show / change session cwd |
 | `/new`, `/load`, `/conversations` | Conversation management |
 | `exit` | Quit |
 
 ### Web UI (`peakbot`, the default)
 
-Serves the embedded SPA + live chat over WebSocket. Use `peakbot --tui` for the terminal UI.
+Serves the embedded SPA + live chat over WebSocket. Use `peakbot --tui` for the
+terminal UI. A web **Profile** tab (radio list: "None (base config)" plus one row
+per configured profile) picks the per-conversation profile; it only appears when
+profiles are selectable — some configured and no `--profile` pin — and is hidden
+otherwise (a pin is a lockdown, so the picker is empty then).
 
 | Flag | Default | Description |
 |------|---------|-------------|

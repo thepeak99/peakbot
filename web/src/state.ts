@@ -182,6 +182,19 @@ export interface AppState {
    * (`#[serde(default)]` on the Rust side) in pre-pause-subagents snapshots —
    * the adapter normalises absent to null (adapt.ts `adaptSubAgent`). */
   sub_agent?: WireSubAgentRun | null;
+  /** Profile names the client may pick (the Profile tab's picker), sorted.
+   * Absent/empty means no profiles are defined OR a `--profile` pin is
+   * active — the tab has nothing to offer either way. Optional so old wire
+   * snapshots parse; the safe default is `[]`. */
+  profiles?: string[];
+  /** The config profile this conversation is bound to, or `null` for the
+   * base config. Optional so old wire snapshots parse; the safe default is
+   * `null`. */
+  active_profile?: string | null;
+  /** Server-computed subset of the canonical drawer-tab order the client
+   * should render. Optional so old wire snapshots parse; an absent field
+   * means "no rule yet" — show every tab (see `tabs.ts` filterTabs). */
+  visible_tabs?: string[];
 }
 
 /** One configured pipeline — the wire projection of `PipelineInfo`
@@ -267,8 +280,20 @@ export type InboundMessage =
   /** Bind this conversation to a named pipeline; `null` clears the binding
    * (single-agent mode). The backend enforces the pre-first-turn lock. */
   | { type: "select_pipeline"; name: string | null }
+  /** Bind this conversation to a named config profile; `null` clears the
+   * binding (base config). The backend enforces the pre-first-turn lock,
+   * same as `select_pipeline`. */
+  | { type: "select_profile"; name: string | null }
   | { type: "list_dir"; path: string }
   | { type: "request_recent_dirs" }
   | { type: "request_conversations" }
   | { type: "kill_session"; convo: string }
   | { type: "shutdown" };
+
+/** Build a `select_profile` inbound frame — mirrors how App.tsx builds
+ * `select_pipeline` inline (`send({ type: "select_pipeline", name })`).
+ * Exists as a named export so ProfilePanel's `onSelect` call site is unit
+ * testable without mounting the socket. */
+export function selectProfile(name: string | null): InboundMessage {
+  return { type: "select_profile", name };
+}
