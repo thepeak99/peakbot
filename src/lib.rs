@@ -134,6 +134,14 @@ enum QueueMessage {
     /// (locked), else recorded, persisted, and the agent rebuilt on that team's
     /// orchestrator so the model, prompt and `delegate` roster all match.
     SelectPipeline(Option<String>),
+    /// Run the current conversation under a config profile (`Some(name)`) or
+    /// the base config (`None`). Dequeued between turns and handled by
+    /// `handle_select_profile`: same lock rule as `SelectPipeline`, plus the
+    /// boot `--profile` pin.
+    SelectProfile(Option<String>),
+    /// Bare `/profile`: list the configured profiles. Answered by the agent
+    /// loop because it owns the live config and the pin.
+    ListProfiles,
     /// One or more `bash_bg` processes have output ready. Payload is
     /// empty — the agent loop drains every bg buffer in one pass.
     /// Multiple notifications coalesce naturally (the drain returns
@@ -183,6 +191,9 @@ enum SubmitKind {
     /// `/pipeline [name|none|off]` — bind this conversation to a named team,
     /// not an LLM turn.
     PipelineCommand(PipelineSubmission),
+    /// `/profile [name|none|off]` — run this conversation under a config
+    /// profile, not an LLM turn.
+    ProfileCommand(ProfileSubmission),
 }
 
 /// What a `/pipeline` invocation asked for. Bare = show the catalogue;
@@ -192,6 +203,33 @@ enum SubmitKind {
 enum PipelineSubmission {
     List,
     Set(Option<String>),
+}
+
+/// What a `/profile` invocation asked for — same grammar as
+/// [`PipelineSubmission`].
+#[derive(Debug)]
+enum ProfileSubmission {
+    List,
+    Set(Option<String>),
+}
+
+/// The argument of a `/<verb> [arg]` selection command, trimmed (empty for
+/// the bare verb), or `None` when `trimmed` is not that verb. The whitespace
+/// filter keeps longer words (`/pipelines`, `/profilex`) out.
+fn selection_command_arg<'a>(trimmed: &'a str, verb: &str) -> Option<&'a str> {
+    trimmed
+        .strip_prefix(verb)
+        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+        .map(str::trim)
+}
+
+/// A selection target: `none`/`off` (any case) clear it, anything else is a
+/// name taken verbatim.
+fn selection_target(arg: &str) -> Option<String> {
+    match arg.to_ascii_lowercase().as_str() {
+        "none" | "off" => None,
+        _ => Some(arg.to_string()),
+    }
 }
 
 fn classify_submission(msg: &str) -> SubmitKind {
@@ -208,20 +246,20 @@ fn classify_submission(msg: &str) -> SubmitKind {
     if trimmed == "/resume" {
         return SubmitKind::ResumeCommand;
     }
-    // `/pipeline [name|none|off]` — a per-conversation binding, not an LLM
-    // turn. The whitespace filter keeps `/pipelines` (and any other longer
-    // word) out of this arm.
-    if let Some(rest) = trimmed
-        .strip_prefix("/pipeline")
-        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
-    {
-        let arg = rest.trim();
+    // `/pipeline` and `/profile` are per-conversation selections, not LLM
+    // turns.
+    if let Some(arg) = selection_command_arg(trimmed, "/pipeline") {
         return SubmitKind::PipelineCommand(if arg.is_empty() {
             PipelineSubmission::List
-        } else if matches!(arg.to_ascii_lowercase().as_str(), "none" | "off") {
-            PipelineSubmission::Set(None)
         } else {
-            PipelineSubmission::Set(Some(arg.to_string()))
+            PipelineSubmission::Set(selection_target(arg))
+        });
+    }
+    if let Some(arg) = selection_command_arg(trimmed, "/profile") {
+        return SubmitKind::ProfileCommand(if arg.is_empty() {
+            ProfileSubmission::List
+        } else {
+            ProfileSubmission::Set(selection_target(arg))
         });
     }
     // Preserve whitespace on commands — leading whitespace in "/ quit"
@@ -316,6 +354,113 @@ fn resolve_pipeline_choice(
         ));
     }
     PipelineChoice::Apply(target.map(str::to_string))
+}
+
+/// What a `/profile <target>` request resolves to — the read-only half of the
+/// command, kept separate from `handle_select_profile` so the rules are
+/// testable without an agent.
+enum ProfileChoice {
+    /// Already running under this target — silent no-op, no reload.
+    Unchanged,
+    /// Refused, with the message to show the user.
+    Refused(String),
+    /// Apply this selection (needs a config reload and an agent rebuild).
+    Apply(Option<String>),
+}
+
+/// Resolve a `/profile` target against the conversation's effective profile.
+/// "Unchanged" compares against the effective profile, so re-selecting the
+/// pin is a no-op while clearing it is refused.
+fn resolve_profile_choice(
+    sm: &StateManager,
+    target: Option<&str>,
+    pinned: Option<&str>,
+    available: &[String],
+) -> ProfileChoice {
+    let selected = sm.selected_profile();
+    if crate::config::effective_profile(pinned, selected.as_deref()) == target {
+        return ProfileChoice::Unchanged;
+    }
+    // Same lock as the pipeline: the tool list and prompt are fixed once the
+    // model has seen them.
+    if sm.conversation_has_turns() {
+        return ProfileChoice::Refused(
+            "the profile is locked once the conversation has started — /new for a fresh one."
+                .to_string(),
+        );
+    }
+    if let Some(pin) = pinned {
+        return ProfileChoice::Refused(format!(
+            "the profile is pinned by --profile {pin} — restart without --profile to switch."
+        ));
+    }
+    if let Some(name) = target
+        && !available.iter().any(|a| a == name)
+    {
+        let listed = if available.is_empty() {
+            "(none configured — add a `profiles:` block to the master config.yaml)".to_string()
+        } else {
+            available.join(", ")
+        };
+        return ProfileChoice::Refused(format!(
+            "unknown profile '{name}'. Available profiles: {listed}"
+        ));
+    }
+    ProfileChoice::Apply(target.map(str::to_string))
+}
+
+/// Resolve a conversation's saved profile on resume and `/load`: a profile no
+/// longer configured is dropped, and a boot pin overrides the saved one.
+/// Returns the selection to record (the pin, when pinned, so the conversation
+/// records what it actually runs under) plus the warnings to surface.
+pub(crate) fn resolve_conversation_profile(
+    config: &Config,
+    saved: Option<&str>,
+    pin: Option<&str>,
+) -> (Option<String>, Vec<String>) {
+    let (resolved, warning) = config.resolve_saved_profile(saved);
+    let mut warnings: Vec<String> = warning.into_iter().collect();
+    if let (Some(pin), Some(resolved)) = (pin, resolved)
+        && resolved != pin
+    {
+        warnings.push(format!(
+            "⚠ This conversation used profile '{resolved}', but --profile {pin} is pinned; \
+             continuing under '{pin}'."
+        ));
+    }
+    let selection = crate::config::effective_profile(pin, resolved).map(str::to_string);
+    (selection, warnings)
+}
+
+/// Render the bare `/profile` listing. `None` (the base config) is listed
+/// first so it can carry the `→` marker like any profile.
+fn render_profile_list(names: &[String], current: Option<&str>, pinned: Option<&str>) -> String {
+    if names.is_empty() {
+        return "👤 No profiles configured. Add a `profiles:` block to the master config.yaml."
+            .to_string();
+    }
+    let arrow = |on: bool| if on { "→ " } else { "  " };
+    let mut msg = String::from("Available profiles:\n");
+    msg.push_str(&format!(
+        "{}None  (base config)\n",
+        arrow(current.is_none())
+    ));
+    for name in names {
+        msg.push_str(&format!(
+            "{}{name}\n",
+            arrow(current == Some(name.as_str()))
+        ));
+    }
+    match pinned {
+        Some(pin) => msg.push_str(&format!(
+            "\nPinned by --profile {pin} — restart without --profile to switch."
+        )),
+        None => msg.push_str(
+            "\nUse /profile <name> to select one, /profile none for the base config \
+             (only before the first turn).",
+        ),
+    }
+    msg
 }
 
 /// Render the `/pipeline` listing from `AppState` — the catalogue stamped at
@@ -455,10 +600,14 @@ pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
 /// `memory_enabled` gates the `memory.md` instructions: when false the
 /// section is omitted so the model is never told to read/update memory.md.
 ///
+/// `agents_md_enabled` gates the repo's `agents.md` section: when false the
+/// section is omitted (the profile's `agents_md: false` ceiling).
+///
 /// `subagents_active` selects the recipe: when true (orchestrator)
 /// `orchestrator_prompt` (if set) is appended as extra framing. Memory,
-/// skills, env block and agents.md are shared by both recipes, as is the core
-/// tool guidance unless `head` replaces it (see below).
+/// skills, env block and (when enabled) agents.md are shared by both
+/// recipes, as is the core tool guidance unless `head` replaces it (see
+/// below).
 ///
 /// `head` fills the static head of the prompt and leads **either** recipe:
 ///
@@ -474,11 +623,13 @@ pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
 /// `subagents_active` matter: the agentless recipe falls back to the built-in
 /// crusader persona, while the orchestrator leads with the core guidance — the
 /// crusader would confuse an agent whose job is to coordinate a team.
+#[allow(clippy::too_many_arguments)] // agents_md_enabled is the new profile ceiling; callers pass the resolved value
 pub fn build_system_prompt(
     skills: &SkillRegistry,
     shell_kind: Option<&ShellKind>,
     cwd: &std::path::Path,
     memory_enabled: bool,
+    agents_md_enabled: bool,
     subagents_active: bool,
     orchestrator_prompt: Option<&str>,
     head: Option<&PromptHead>,
@@ -520,7 +671,9 @@ pub fn build_system_prompt(
 
     prompt.push_str(&skills.to_system_prompt_section());
     prompt.push_str(&env_block(shell_kind, cwd));
-    prompt.push_str(&agents_md_section(cwd));
+    if agents_md_enabled {
+        prompt.push_str(&agents_md_section(cwd));
+    }
 
     if subagents_active
         && let Some(extra) = orchestrator_prompt.map(str::trim).filter(|s| !s.is_empty())
@@ -682,6 +835,10 @@ pub struct RebuildContext {
     /// (and, at the compaction call site, the auto-compaction). Refreshed on
     /// config reload like `skills`.
     pub memory_enabled: bool,
+    /// Whether the repo's `agents.md` is injected into the system prompt —
+    /// the profile's `agents_md:` ceiling, applied at the last reload.
+    /// Refreshed on config reload like `memory_enabled`.
+    pub agents_md_enabled: bool,
     /// Built-in tool filter (blocklist/allowlist). Refreshed on config reload;
     /// consumed by `add_builtin_tools` when the agent is rebuilt.
     pub tools_filter: crate::config::NameFilter,
@@ -693,6 +850,20 @@ pub struct RebuildContext {
     /// prompt with this value, and a head has no live handles behind it (just
     /// a string).
     pub prompt_head: Option<crate::config::PromptHead>,
+    /// The boot `--profile` pin, if any. Set once at session build; while it
+    /// is set, runtime profile selection is refused and every reload applies
+    /// it.
+    pub profile_pin: Option<String>,
+}
+
+impl RebuildContext {
+    /// The profile every reload for this session must apply — derived from
+    /// the pin and the conversation's selection, never cached.
+    fn effective_profile(&self, sm: &StateManager) -> Option<String> {
+        let selected = sm.selected_profile();
+        crate::config::effective_profile(self.profile_pin.as_deref(), selected.as_deref())
+            .map(str::to_string)
+    }
 }
 
 /// Shared cell holding the *currently active* SessionHook. Replaced
@@ -1169,6 +1340,19 @@ impl AgentRunner {
                                 msg_tx.send(QueueMessage::SelectPipeline(name)).await.ok();
                             }
                         },
+                        SubmitKind::ProfileCommand(choice) => match choice {
+                            ProfileSubmission::List => {
+                                msg_tx.send(QueueMessage::ListProfiles).await.ok();
+                            }
+                            ProfileSubmission::Set(name) => {
+                                // Same shape as `/pipeline <name>`: the agent
+                                // loop owns the config and the agent handle.
+                                if let Some(ref sm) = state_manager {
+                                    sm.increment_pending_input();
+                                }
+                                msg_tx.send(QueueMessage::SelectProfile(name)).await.ok();
+                            }
+                        },
                     }
                 }
 
@@ -1210,6 +1394,16 @@ impl AgentRunner {
                         sm.increment_pending_input();
                     }
                     msg_tx.send(QueueMessage::SelectPipeline(name)).await.ok();
+                }
+
+                UiAction::SelectProfile(name) => {
+                    // Same shape as SelectPipeline — the agent loop owns the
+                    // config and the agent handle, and the profile selection
+                    // reloads + rebuilds them.
+                    if let Some(ref sm) = state_manager {
+                        sm.increment_pending_input();
+                    }
+                    msg_tx.send(QueueMessage::SelectProfile(name)).await.ok();
                 }
 
                 UiAction::PauseSubAgent => {
@@ -1368,6 +1562,8 @@ impl AgentRunner {
                     | Some(QueueMessage::SwitchModel(_))
                     | Some(QueueMessage::ChangeCwd(_))
                     | Some(QueueMessage::SelectPipeline(_))
+                    | Some(QueueMessage::SelectProfile(_))
+                    | Some(QueueMessage::ListProfiles)
                     | Some(QueueMessage::BackgroundOutputReady) => {
                         // Discarded — pending counter was already zeroed by
                         // the event loop's drain trigger. (SwitchModel is
@@ -1647,6 +1843,45 @@ impl AgentRunner {
                     completion_tx.send(CompletionResult::CommandDone).ok();
                 }
 
+                Some(QueueMessage::SelectProfile(name)) => {
+                    if let Some(ref sm) = state_manager {
+                        sm.set_running(true);
+                    }
+                    let outcome = Self::handle_select_profile(
+                        name,
+                        &mut agent,
+                        &mut config,
+                        &state_manager,
+                        &session_hook_cell,
+                        &provider_info_cell,
+                        &mut event_processor,
+                        rebuild_ctx.as_mut(),
+                    )
+                    .await;
+                    if let Some(ref sm) = state_manager {
+                        sm.decrement_pending_input();
+                        sm.set_running(false);
+                    }
+                    if let Err(msg) = outcome
+                        && let Some(ref sm) = state_manager
+                    {
+                        sm.add_system_message(format!("❌ /profile: {msg}"));
+                    }
+                    completion_tx.send(CompletionResult::CommandDone).ok();
+                }
+
+                Some(QueueMessage::ListProfiles) => {
+                    if let Some(ref sm) = state_manager {
+                        let pin = rebuild_ctx.as_ref().and_then(|c| c.profile_pin.as_deref());
+                        sm.add_system_message(render_profile_list(
+                            &config.profile_names(),
+                            config.active_profile.as_deref(),
+                            pin,
+                        ));
+                    }
+                    completion_tx.send(CompletionResult::CommandDone).ok();
+                }
+
                 None => {
                     // Channel closed, exit
                     if let Some(handle) = event_processor.take() {
@@ -1701,11 +1936,13 @@ impl AgentRunner {
         // a new system prompt / registry is in play before we switch.
         // Warnings are surfaced *after* the conversation reset below so
         // `reset_conversation_state()` can't wipe them from the chat.
+        let profile = ctx.effective_profile(&sm_for_provider);
         let reload_warnings = Self::reload_session_config(
             config,
             ctx,
             &sm_for_provider,
             &sm_for_provider.session_cwd(),
+            profile.as_deref(),
         );
 
         let Some(resolved) = ctx.registry.resolve(alias) else {
@@ -1876,6 +2113,158 @@ impl AgentRunner {
         Ok(())
     }
 
+    /// Run the current conversation under a config profile, or the base
+    /// config. Same lock rule as `/pipeline`; refused outright under a boot
+    /// `--profile` pin.
+    ///
+    /// The profile reshapes the config itself (tools, memory, prompt head,
+    /// pipelines gate), so this is a reload + rebuild on the current model.
+    /// No conversation reset, for the same reason as `/pipeline`: it is empty
+    /// by construction and the web UI's `?convo=` binding must survive.
+    /// Any failure restores the previous selection and config.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_select_profile(
+        name: Option<String>,
+        agent_slot: &mut Arc<DynAgent>,
+        config: &mut Config,
+        state_manager: &Option<Arc<StateManager>>,
+        session_hook_cell: &SharedSessionHook,
+        provider_info_cell: &SharedProviderInfo,
+        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
+        rebuild_ctx: Option<&mut RebuildContext>,
+    ) -> Result<(), String> {
+        let Some(ctx) = rebuild_ctx else {
+            return Err("model registry not configured — restart with a `providers:` block".into());
+        };
+        let sm = state_manager
+            .clone()
+            .ok_or_else(|| "state manager required".to_string())?;
+
+        let target = match resolve_profile_choice(
+            &sm,
+            name.as_deref(),
+            ctx.profile_pin.as_deref(),
+            &config.profile_names(),
+        ) {
+            ProfileChoice::Unchanged => return Ok(()),
+            ProfileChoice::Refused(msg) => return Err(msg),
+            ProfileChoice::Apply(target) => target,
+        };
+
+        let previous_profile = sm.selected_profile();
+        let previous_pipeline = sm.selected_pipeline();
+        sm.set_selected_profile(target.clone());
+
+        let applied = Self::apply_selected_profile(
+            agent_slot,
+            config,
+            &sm,
+            session_hook_cell,
+            provider_info_cell,
+            event_processor,
+            state_manager,
+            ctx,
+        )
+        .await;
+        let warnings = match applied {
+            Ok(warnings) => warnings,
+            Err(e) => {
+                // The agent was never swapped, so put the selection back and
+                // re-derive config + ctx for it; otherwise they would describe
+                // a profile the running agent doesn't have.
+                sm.set_selected_profile(previous_profile);
+                sm.set_selected_pipeline(previous_pipeline);
+                let profile = ctx.effective_profile(&sm);
+                for warning in Self::reload_session_config(
+                    config,
+                    ctx,
+                    &sm,
+                    &sm.session_cwd(),
+                    profile.as_deref(),
+                ) {
+                    sm.add_system_message(warning);
+                }
+                return Err(e);
+            }
+        };
+
+        sm.add_system_message(match &target {
+            Some(name) => format!("👤 Profile '{name}' selected."),
+            None => "👤 Profile cleared — base config.".to_string(),
+        });
+        for warning in warnings {
+            sm.add_system_message(warning);
+        }
+        Ok(())
+    }
+
+    /// Reload for the conversation's (already recorded) profile and rebuild
+    /// the agent on the current model. Returns the warnings to surface; `Err`
+    /// means the running agent is untouched and the caller must roll back.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_selected_profile(
+        agent_slot: &mut Arc<DynAgent>,
+        config: &mut Config,
+        sm: &Arc<StateManager>,
+        session_hook_cell: &SharedSessionHook,
+        provider_info_cell: &SharedProviderInfo,
+        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
+        state_manager: &Option<Arc<StateManager>>,
+        ctx: &mut RebuildContext,
+    ) -> Result<Vec<String>, String> {
+        let profile = ctx.effective_profile(sm);
+        let mut warnings =
+            Self::reload_session_config(config, ctx, sm, &sm.session_cwd(), profile.as_deref());
+        if config.active_profile != profile {
+            // The reload kept the previous config — its warnings say why.
+            return Err(warnings.join(" "));
+        }
+        // The profile's pipelines gate may have removed the selected team.
+        // Zero turns (the lock), so the write targets this conversation.
+        if let Some(warning) = reconcile_pipeline_selection(ctx, sm) {
+            warnings.push(warning);
+        }
+
+        // Current model, like `/cd`; the rebuild seam still hands a selected
+        // team's orchestrator its own model.
+        let resolved = ctx
+            .registry
+            .resolve(&sm.get_model_alias())
+            .or_else(|| {
+                ctx.registry
+                    .find_by_wire_id(&sm.get_provider_name(), &sm.get_model())
+            })
+            .ok_or_else(|| "current model not found in registry".to_string())?
+            .clone();
+        Self::rebuild_agent_for_resolved(
+            &resolved,
+            agent_slot,
+            config,
+            sm,
+            session_hook_cell,
+            provider_info_cell,
+            event_processor,
+            state_manager,
+            ctx,
+        )
+        .await?;
+
+        // A dropped team hands the orchestrator back to `resolved`; keep the
+        // display and the persisted re-activation key truthful either way.
+        let running = match sm
+            .selected_pipeline()
+            .and_then(|n| ctx.pipelines.get(&n).cloned())
+        {
+            Some(pipeline) => pipeline.orchestrator,
+            None => resolved,
+        };
+        sm.set_model(running.model_name.clone());
+        sm.set_provider_name(running.provider_name.clone());
+        sm.set_model_alias(running.alias.clone());
+        sm.set_conversation_wire_id(running.provider_name, running.model_name);
+        Ok(warnings)
+    }
+
     /// Change the working directory and rebuild on a fresh conversation.
     /// The cwd sibling of [`Self::handle_switch_model`] — same reset +
     /// rebuild seam, different axis.
@@ -1934,7 +2323,9 @@ impl AgentRunner {
         // because process cwd never moves (no `set_current_dir`), so the
         // per-repo config and the skill re-scan must read the NEW tree.
         // Warnings are surfaced after the conversation reset below.
-        let mut reload_warnings = Self::reload_session_config(config, ctx, &sm, target);
+        let profile = ctx.effective_profile(&sm);
+        let mut reload_warnings =
+            Self::reload_session_config(config, ctx, &sm, target, profile.as_deref());
 
         let resolved = ctx
             .registry
@@ -2030,6 +2421,11 @@ impl AgentRunner {
     /// still the old dir when this runs); the other verbs pass the
     /// current `session_cwd`. (Invariant I-5.)
     ///
+    /// `profile` is the session's effective profile
+    /// ([`RebuildContext::effective_profile`]). On success
+    /// `config.active_profile` equals it; a failed reload leaves the previous
+    /// stamp, which is how `/profile` detects that its choice didn't land.
+    ///
     /// Fallible edges are handled at the boundary: a malformed YAML or a
     /// bad `default_model` (registry build error) warns and **keeps the
     /// previous config** — the session survives. Both fallible steps run
@@ -2063,10 +2459,11 @@ impl AgentRunner {
         ctx: &mut RebuildContext,
         sm: &Arc<StateManager>,
         session_cwd: &std::path::Path,
+        profile: Option<&str>,
     ) -> Vec<String> {
         let mut warnings = Vec::new();
         // Boundary parse — keep previous config on any failure.
-        let fresh = match config.reload_for(session_cwd) {
+        let fresh = match config.reload_for(session_cwd, profile) {
             Ok(c) => c,
             Err(reason) => {
                 warnings.push(format!(
@@ -2148,6 +2545,9 @@ impl AgentRunner {
 
         ctx.registry = Arc::new(new_registry);
         ctx.memory_enabled = config.memory.enabled;
+        // The profile's `agents_md:` ceiling rides the reloaded config —
+        // the rebuild seam that follows reads it for the fresh prompt.
+        ctx.agents_md_enabled = config.agents_md;
         ctx.tools_filter = config.tools.clone();
         // `ctx.system_prompt` is recomputed by the rebuild seam that follows
         // every reload (it derives persona/orchestrator framing from the live
@@ -2171,6 +2571,17 @@ impl AgentRunner {
             sm.set_pipelines(set.infos());
             ctx.pipelines = Arc::new(set);
         }
+
+        // Stamp the server-computed profile view (picker + tabs) from the
+        // reloaded config. Every session verb funnels through this seam, so
+        // the client's view can never drift from the effective profile —
+        // including `handle_select_profile` (via `apply_selected_profile`)
+        // and its rollback, which re-stamps the restored profile.
+        let selectable = crate::config::selectable_profiles(config, ctx.profile_pin.as_deref());
+        sm.set_profile_view(
+            selectable.clone(),
+            crate::config::session_visible_tabs(config, &selectable),
+        );
 
         warnings
     }
@@ -2250,17 +2661,31 @@ impl AgentRunner {
         // Rebuild MCP tool list from the long-lived handles. McpTool
         // implements Clone (rig 0.33), so we get a fresh Vec without
         // restarting any subprocess. See agents.md / multi-model.md.
+        // Grouped per server so the active profile's `mcp_servers:` gate
+        // can filter by server name — a runtime `/profile` switch changes
+        // the rebuilt agent's MCP toolset (boot does the same).
         let mcp_tools: Option<Vec<Box<dyn rig_core::tool::ToolDyn>>> = if ctx.mcp_handles.is_empty()
         {
             None
         } else {
-            let mut all = Vec::new();
-            for h in ctx.mcp_handles.iter() {
-                for t in h.tools().iter().cloned() {
-                    all.push(Box::new(t) as Box<dyn rig_core::tool::ToolDyn>);
-                }
-            }
-            Some(all)
+            let groups: Vec<(String, Vec<Box<dyn rig_core::tool::ToolDyn>>)> = ctx
+                .mcp_handles
+                .iter()
+                .map(|h| {
+                    (
+                        h.name().to_string(),
+                        h.tools()
+                            .iter()
+                            .cloned()
+                            .map(|t| Box::new(t) as Box<dyn rig_core::tool::ToolDyn>)
+                            .collect(),
+                    )
+                })
+                .collect();
+            Some(mcp_tools_for_profile(
+                groups,
+                config.active_mcp_server_filter(),
+            ))
         };
 
         // `delegate` is registered iff a pipeline is selected, and it exposes
@@ -2284,6 +2709,7 @@ impl AgentRunner {
             ctx.shell_kind.as_ref(),
             &sm_for_provider.session_cwd(),
             ctx.memory_enabled,
+            ctx.agents_md_enabled,
             active.is_some(),
             active
                 .as_ref()
@@ -2307,6 +2733,7 @@ impl AgentRunner {
             &ctx.skills,
             config.retry(),
             config.timeouts(),
+            ctx.agents_md_enabled,
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 
@@ -2439,10 +2866,30 @@ impl AgentRunner {
         // prompt may be rebuilt again below if the saved cwd differs).
         // The conversation was already loaded by the /load handler, so
         // warnings are safe to surface immediately.
-        let sm_arc = sm.clone();
-        for warning in Self::reload_session_config(config, ctx, &sm_arc, &reload_cwd) {
+        // The loaded conversation's profile decides what the reload applies:
+        // a vanished one is dropped, and a boot pin overrides it (stamped, so
+        // the conversation records what it actually runs under).
+        let (selection, profile_warnings) = resolve_conversation_profile(
+            config,
+            sm.selected_profile().as_deref(),
+            ctx.profile_pin.as_deref(),
+        );
+        for warning in profile_warnings {
             sm.add_system_message(warning);
         }
+        sm.set_selected_profile(selection);
+        let profile = ctx.effective_profile(sm);
+        let profile_before = config.active_profile.clone();
+
+        let sm_arc = sm.clone();
+        for warning in
+            Self::reload_session_config(config, ctx, &sm_arc, &reload_cwd, profile.as_deref())
+        {
+            sm.add_system_message(warning);
+        }
+        // A different profile means a different tool list and prompt — a
+        // rebuild axis of its own. Compared on what the reload applied.
+        let profile_changed = config.active_profile != profile_before;
 
         let saved_provider = conv.provider_name.clone();
         let saved_model = conv.model.clone();
@@ -2501,7 +2948,7 @@ impl AgentRunner {
         // for that conversation.
 
         // Nothing to rebuild if no axis moved.
-        if !wire_id_changed && !cwd_changed && !selection_changed {
+        if !wire_id_changed && !cwd_changed && !selection_changed && !profile_changed {
             return;
         }
         // The selected team owns the orchestrator; without one, the loaded
@@ -2567,10 +3014,15 @@ impl AgentRunner {
         // is zero-turn, so the `set_selected_pipeline(None)` write targets
         // it (invariant I-3) — and the rebuild then sees the cleared
         // selection.
-        let mut reload_warnings = Vec::new();
-        for warning in Self::reload_session_config(config, ctx, &sm_arc, &sm.session_cwd()) {
-            reload_warnings.push(warning);
-        }
+        // `create_conversation` carried the profile over, like the pipeline.
+        let profile = ctx.effective_profile(sm);
+        let mut reload_warnings = Self::reload_session_config(
+            config,
+            ctx,
+            &sm_arc,
+            &sm.session_cwd(),
+            profile.as_deref(),
+        );
         if let Some(warning) = reconcile_pipeline_selection(ctx, sm) {
             reload_warnings.push(warning);
         }
@@ -3747,7 +4199,6 @@ fn refresh_attempt_from_transcript(
 /// properly closed on drop to avoid the "RunningService dropped without
 /// explicit close()" warning.
 pub struct McpServerHandle {
-    #[allow(unused)]
     name: String,
     tools: Vec<McpTool>,
     /// The running service connection. Must be closed on drop for clean shutdown.
@@ -3792,6 +4243,12 @@ impl Drop for McpServerHandle {
 }
 
 impl McpServerHandle {
+    /// The server's configured name — the key a profile's `mcp_servers:`
+    /// gate addresses.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn tools(&self) -> &[McpTool] {
         &self.tools
     }
@@ -3831,6 +4288,29 @@ impl McpServerHandle {
 
         self.into_tools()
     }
+}
+
+/// Flatten per-server MCP tool groups into the flat tool list an agent
+/// receives, honouring a profile's `mcp_servers:` gate. Servers keep their
+/// input order, tools keep their per-server order; `None` = no gate
+/// (every server's tools — today's behaviour), `enabled: false` = none.
+/// The servers themselves keep running either way — this only decides
+/// which servers' tools reach the agent.
+///
+/// Takes the groups BY VALUE (not by reference): `Box<dyn ToolDyn>` cannot
+/// be cloned (`ToolDyn` carries no `Clone` bound — most tools, including
+/// the plain `Tool` blanket impl, have no way to duplicate themselves), so
+/// this is a pure ownership filter/flatten rather than a copy. Callers that
+/// need the groups again build them twice (cheap: `McpTool: Clone`).
+pub fn mcp_tools_for_profile(
+    servers: Vec<(String, Vec<Box<dyn ToolDyn>>)>,
+    filter: Option<&crate::config::NameFilter>,
+) -> Vec<Box<dyn ToolDyn>> {
+    servers
+        .into_iter()
+        .filter(|(name, _)| filter.is_none_or(|f| f.allows(name)))
+        .flat_map(|(_, tools)| tools.into_iter())
+        .collect()
 }
 
 pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpServerHandle> {
@@ -4136,6 +4616,7 @@ mod tests {
             Some(&ps),
             &std::env::current_dir().unwrap(),
             true,
+            true,
             false,
             None,
             None,
@@ -4164,6 +4645,7 @@ mod tests {
             &skills,
             Some(&bash),
             &std::env::current_dir().unwrap(),
+            true,
             true,
             false,
             None,
@@ -4194,7 +4676,7 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-CONTENT").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, None, None);
+        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
 
         assert!(
             prompt.contains(&dir.to_string_lossy().to_string()),
@@ -4222,7 +4704,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, None, None);
+        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
         assert!(
             prompt.contains("# Memory.md"),
             "memory section must be present when memory is enabled"
@@ -4242,7 +4724,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, false, false, None, None);
+        let prompt = build_system_prompt(&skills, None, &dir, false, true, false, None, None);
         assert!(
             !prompt.contains("# Memory.md"),
             "memory section must be omitted when memory is disabled"
@@ -4259,13 +4741,13 @@ mod tests {
         let skills = SkillRegistry::new();
         let cwd = std::env::current_dir().unwrap();
 
-        let agentless = build_system_prompt(&skills, None, &cwd, false, false, None, None);
+        let agentless = build_system_prompt(&skills, None, &cwd, false, true, false, None, None);
         assert!(
             agentless.contains("CODE CRUSADER"),
             "agentless prompt must carry the persona"
         );
 
-        let orchestrator = build_system_prompt(&skills, None, &cwd, false, true, None, None);
+        let orchestrator = build_system_prompt(&skills, None, &cwd, false, true, true, None, None);
         assert!(
             !orchestrator.contains("CODE CRUSADER"),
             "orchestrator prompt must drop the persona"
@@ -4284,24 +4766,118 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let extra = Some("Lead the SENTINEL-TEAM well.");
 
-        let on = build_system_prompt(&skills, None, &cwd, false, true, extra, None);
+        let on = build_system_prompt(&skills, None, &cwd, false, true, true, extra, None);
         assert!(
             on.contains("SENTINEL-TEAM"),
             "orchestrator prompt must be appended when sub-agents are active"
         );
 
-        let off = build_system_prompt(&skills, None, &cwd, false, false, extra, None);
+        let off = build_system_prompt(&skills, None, &cwd, false, true, false, extra, None);
         assert!(
             !off.contains("SENTINEL-TEAM"),
             "orchestrator prompt must be ignored in agentless mode"
         );
 
         // A blank orchestrator prompt adds no section.
-        let blank = build_system_prompt(&skills, None, &cwd, false, true, Some("   "), None);
+        let blank = build_system_prompt(&skills, None, &cwd, false, true, true, Some("   "), None);
         assert!(
             !blank.contains("# Orchestrator Instructions"),
             "a blank orchestrator prompt must not emit a section header"
         );
+    }
+
+    // =========================================================================
+    // CONTRACT B — `Profile.agents_md` at the prompt seam (RED).
+    //
+    // The flag reaches the builder as `agents_md_enabled: bool`, inserted
+    // after `memory_enabled` (the two dynamic-section gates sit together):
+    //
+    //     build_system_prompt(
+    //         skills, shell_kind, cwd,
+    //         memory_enabled,
+    //         agents_md_enabled,   // NEW — false ⇒ no agents.md section
+    //         subagents_active, orchestrator_prompt, head,
+    //     )
+    //
+    // Compile-RED until the parameter lands: every call below passes eight
+    // arguments to today's seven-argument function.
+    // =========================================================================
+
+    /// `agents_md_enabled: false` omits the agents.md content from the
+    /// main agent's system prompt (the profile's `agents_md: false`
+    /// ceiling). (RED — the parameter does not exist yet.)
+    #[test]
+    fn system_prompt_omits_agents_md_when_disabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "peakbot-agents-md-off-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-OFF").unwrap();
+
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, &dir, true, false, false, None, None);
+        assert!(
+            !prompt.contains("SENTINEL-AGENTS-OFF"),
+            "agents_md_enabled: false must omit the agents.md content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `agents_md_enabled: true` keeps today's behaviour: the agents.md
+    /// content is injected. (RED — the parameter does not exist yet.)
+    #[test]
+    fn system_prompt_includes_agents_md_when_enabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "peakbot-agents-md-on-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-ON").unwrap();
+
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
+        assert!(
+            prompt.contains("SENTINEL-AGENTS-ON"),
+            "agents_md_enabled: true must inject the agents.md content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The gate applies to the orchestrator recipe too, not just the
+    /// agentless one — one ceiling for the whole session's main agent.
+    /// (RED — the parameter does not exist yet.)
+    #[test]
+    fn system_prompt_omits_agents_md_for_orchestrator_recipe_too() {
+        let dir = std::env::temp_dir().join(format!(
+            "peakbot-agents-md-orch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-ORCH").unwrap();
+
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, &dir, true, false, true, None, None);
+        assert!(
+            !prompt.contains("SENTINEL-AGENTS-ORCH"),
+            "the agents_md gate must hold for the orchestrator recipe as well"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -5084,8 +5660,10 @@ mod tests {
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
+            profile_pin: None,
         }
     }
 
@@ -5625,6 +6203,226 @@ mod tests {
             classify_submission(input),
             SubmitKind::InvalidAttachment(_)
         ));
+    }
+
+    // =========================================================================
+    // CONTRACT A — `Profile.mcp_servers` at the tool seam (RED).
+    //
+    // MCP tools ARE tracked per server today (`McpServerHandle` owns a
+    // `name` + its `tools`), but both flattening sites (`create_session` in
+    // `src/session.rs`, `rebuild_agent_for_resolved` here) collapse the
+    // handles into one flat `Vec<Box<dyn ToolDyn>>` before the profile can
+    // see them. The locked seam is a pure filter over the per-server
+    // collection, so the gate is testable without a live MCP subprocess:
+    //
+    //     pub fn mcp_tools_for_profile(
+    //         servers: &[(String, Vec<Box<dyn ToolDyn>>)],
+    //         filter: Option<&NameFilter>,
+    //     ) -> Vec<Box<dyn ToolDyn>>
+    //
+    // Servers in input order, tools in per-server order; `None` = no gate
+    // (every server's tools — today's behaviour); `enabled: false` = none.
+    // Both flattening sites build the groups from `mcp_handles` (the new
+    // `McpServerHandle::name()` accessor) and pass
+    // `config.active_mcp_server_filter()` — boot AND rebuild, so a runtime
+    // `/profile` switch changes the rebuilt agent's MCP toolset.
+    //
+    // Compile-RED until the function lands.
+    // =========================================================================
+
+    /// Two throwaway rig tools standing in for MCP tools — `Tool::NAME` is
+    /// per-type, hence two unit structs (the same trick as `InnerEcho` in
+    /// `src/providers/mod.rs::tests`).
+    struct AlphaTool;
+    impl rig_core::tool::Tool for AlphaTool {
+        const NAME: &'static str = "alpha_tool";
+        type Error = std::convert::Infallible;
+        type Args = serde_json::Value;
+        type Output = String;
+        async fn definition(&self, _p: String) -> rig_core::completion::ToolDefinition {
+            rig_core::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "alpha".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn call(&self, _args: serde_json::Value) -> Result<String, Self::Error> {
+            Ok("alpha".to_string())
+        }
+    }
+
+    struct BetaTool;
+    impl rig_core::tool::Tool for BetaTool {
+        const NAME: &'static str = "beta_tool";
+        type Error = std::convert::Infallible;
+        type Args = serde_json::Value;
+        type Output = String;
+        async fn definition(&self, _p: String) -> rig_core::completion::ToolDefinition {
+            rig_core::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "beta".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn call(&self, _args: serde_json::Value) -> Result<String, Self::Error> {
+            Ok("beta".to_string())
+        }
+    }
+
+    /// The fixture collection: server `alpha` with one tool, server `beta`
+    /// with one tool — the shape both flattening sites produce.
+    fn mcp_fixture_servers() -> Vec<(String, Vec<Box<dyn rig_core::tool::ToolDyn>>)> {
+        use rig_core::tool::ToolDyn;
+        vec![
+            (
+                "alpha".to_string(),
+                vec![Box::new(AlphaTool) as Box<dyn ToolDyn>],
+            ),
+            (
+                "beta".to_string(),
+                vec![Box::new(BetaTool) as Box<dyn ToolDyn>],
+            ),
+        ]
+    }
+
+    fn tool_names(tools: &[Box<dyn rig_core::tool::ToolDyn>]) -> Vec<String> {
+        tools.iter().map(|t| t.name()).collect()
+    }
+
+    /// `None` = no gate: every server's tools, in server order.
+    /// (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_none_keeps_every_server_in_order() {
+        let servers = mcp_fixture_servers();
+        let tools = mcp_tools_for_profile(servers, None);
+        assert_eq!(
+            tool_names(&tools),
+            vec!["alpha_tool", "beta_tool"],
+            "no gate ⇒ every server's tools, in server order"
+        );
+    }
+
+    /// `only: [alpha]` ⇒ only alpha's tools reach the agent.
+    /// (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_only_keeps_named_servers() {
+        let servers = mcp_fixture_servers();
+        let gate = crate::config::NameFilter {
+            only: vec!["alpha".into()],
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert_eq!(
+            tool_names(&tools),
+            vec!["alpha_tool"],
+            "only: [alpha] ⇒ only alpha's tools"
+        );
+    }
+
+    /// `disabled: [alpha]` ⇒ everything but alpha's tools.
+    /// (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_disabled_drops_named_servers() {
+        let servers = mcp_fixture_servers();
+        let gate = crate::config::NameFilter {
+            disabled: vec!["alpha".into()],
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert_eq!(
+            tool_names(&tools),
+            vec!["beta_tool"],
+            "disabled: [alpha] ⇒ all servers but alpha"
+        );
+    }
+
+    /// `enabled: false` ⇒ no MCP tools at all (the servers keep running).
+    /// (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_enabled_false_keeps_nothing() {
+        let servers = mcp_fixture_servers();
+        let gate = crate::config::NameFilter {
+            enabled: false,
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert!(
+            tools.is_empty(),
+            "enabled: false ⇒ no MCP tools, got: {:?}",
+            tool_names(&tools)
+        );
+    }
+
+    /// Anti-astonishment (the `NameFilter` rule): EMPTY lists are a no-op —
+    /// `only: []` never means "none". (RED — the function does not exist
+    /// yet.)
+    #[test]
+    fn mcp_tools_for_profile_empty_lists_allow_all() {
+        for gate in [
+            crate::config::NameFilter {
+                only: vec![],
+                ..Default::default()
+            },
+            crate::config::NameFilter {
+                disabled: vec![],
+                ..Default::default()
+            },
+        ] {
+            // Fresh fixture per iteration: `mcp_tools_for_profile` now
+            // consumes the groups by value (tools aren't `Clone`), so the
+            // same `servers` binding cannot be reused across loop passes.
+            let servers = mcp_fixture_servers();
+            let tools = mcp_tools_for_profile(servers, Some(&gate));
+            assert_eq!(
+                tool_names(&tools),
+                vec!["alpha_tool", "beta_tool"],
+                "an empty list must be a no-op, got: {:?}",
+                tool_names(&tools)
+            );
+        }
+    }
+
+    /// A name the config layer would have rejected still filters to
+    /// nothing at the pure seam (validation is upstream; the filter must
+    /// not panic or leak tools on an unknown name). (RED — the function
+    /// does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_only_unknown_name_keeps_nothing() {
+        let servers = mcp_fixture_servers();
+        let gate = crate::config::NameFilter {
+            only: vec!["ghost".into()],
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert!(
+            tools.is_empty(),
+            "only: [ghost] matches no server ⇒ no tools, got: {:?}",
+            tool_names(&tools)
+        );
+    }
+
+    /// Edge: a server with ZERO tools contributes nothing and must not
+    /// break the filter. (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_skips_server_with_no_tools() {
+        use rig_core::tool::ToolDyn;
+        let servers = vec![
+            ("alpha".to_string(), Vec::<Box<dyn ToolDyn>>::new()),
+            (
+                "beta".to_string(),
+                vec![Box::new(BetaTool) as Box<dyn ToolDyn>],
+            ),
+        ];
+        let gate = crate::config::NameFilter {
+            only: vec!["alpha".into()],
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert!(
+            tools.is_empty(),
+            "an allowed server with no tools yields no tools, got: {:?}",
+            tool_names(&tools)
+        );
     }
 
     // --- MCP tests (pre-existing) -------------------------------------------
@@ -7196,8 +7994,10 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
+            profile_pin: None,
         };
 
         let warning = super::reconcile_pipeline_selection(&ctx, &sm)
@@ -7256,8 +8056,10 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
+            profile_pin: None,
         };
 
         let chat_len_before = sm.get_state().chat.messages.len();
@@ -7300,8 +8102,10 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
+            profile_pin: None,
         };
 
         let chat_len_before = sm.get_state().chat.messages.len();
@@ -7457,8 +8261,10 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
+            profile_pin: None,
         };
 
         // This is the seam pin: the EXACT lookup the rebuild seam does
@@ -7779,6 +8585,1175 @@ pipelines:
                 )
             }),
             "the INTERRUPTED result must be on disk"
+        );
+    }
+
+    // ── Layer B+C: /profile command + profile choice resolution (RED) ───────
+    //
+    // Mirrors the Stage 1.2 /pipeline tests one axis over:
+    // 1. `/profile [name|none|off]` routing (`SubmitKind::ProfileCommand`).
+    // 2. `resolve_profile_choice` — the read-only half of the command:
+    //    unchanged → locked-after-first-turn → pinned → unknown-name →
+    //    apply, in that order.
+    //
+    // Compile-RED until `ProfileSubmission`, `SubmitKind::ProfileCommand`,
+    // `ProfileChoice` and `resolve_profile_choice` exist.
+    // =========================================================================
+
+    /// `/profile` (bare, no arg) classifies as the List variant — the
+    /// controller will then emit a listing of the configured profiles.
+    /// `/profile <name>` classifies as `Set(Some(name))` (rest of the line,
+    /// spaces allowed, case-sensitive). `/profile none` and `/profile off`
+    /// both classify as `Set(None)`. Word-boundary discipline identical to
+    /// `/pipeline`.
+    #[test]
+    fn classify_profile_command_variants() {
+        // Bare — List. Printed by the controller from the config.
+        assert!(matches!(
+            classify_submission("/profile"),
+            SubmitKind::ProfileCommand(ProfileSubmission::List)
+        ));
+        assert!(matches!(
+            classify_submission("  /profile  "),
+            SubmitKind::ProfileCommand(ProfileSubmission::List)
+        ));
+
+        // Name — Set(Some(name)). The exact name string survives, no
+        // case-folding (profile names are user-typed).
+        assert!(matches!(
+            classify_submission("/profile web"),
+            SubmitKind::ProfileCommand(ProfileSubmission::Set(ref s)) if s.as_deref() == Some("web")
+        ));
+        assert!(matches!(
+            classify_submission("/profile admin"),
+            SubmitKind::ProfileCommand(ProfileSubmission::Set(ref s)) if s.as_deref() == Some("admin")
+        ));
+        // Names may contain spaces; parsing takes everything after "/profile ".
+        assert!(matches!(
+            classify_submission("/profile Generic Dev Team"),
+            SubmitKind::ProfileCommand(ProfileSubmission::Set(ref s)) if s.as_deref() == Some("Generic Dev Team")
+        ));
+
+        // `none` and `off` — both clear the selection.
+        for clear in [
+            "/profile none",
+            "/profile off",
+            "/profile OFF",
+            "/profile None",
+        ] {
+            assert!(
+                matches!(
+                    classify_submission(clear),
+                    SubmitKind::ProfileCommand(ProfileSubmission::Set(None))
+                ),
+                "{clear:?} must clear the selection"
+            );
+        }
+
+        // Word-boundary guard: `/profiles` (with an s) is NOT the profile
+        // command; `/profilex` isn't either.
+        assert!(matches!(
+            classify_submission("/profiles"),
+            SubmitKind::Command(_)
+        ));
+        assert!(matches!(
+            classify_submission("/profilex"),
+            SubmitKind::Command(_)
+        ));
+        // Mid-sentence slash stays chat content.
+        assert!(matches!(
+            classify_submission("TODO: /profile foo"),
+            SubmitKind::UserMessage(_)
+        ));
+    }
+
+    // `resolve_profile_choice` mirrors `resolve_pipeline_choice`'s outcome
+    // type and rule order, plus the boot-pin rule. Signature under test
+    // (the implementer conforms to it):
+    //
+    // ```ignore
+    // enum ProfileChoice {
+    //     Unchanged,
+    //     Refused(String),
+    //     Apply(Option<String>),
+    // }
+    //
+    // fn resolve_profile_choice(
+    //     sm: &StateManager,
+    //     target: Option<&str>,
+    //     pinned: Option<&str>,
+    //     available: &[String],
+    // ) -> ProfileChoice
+    // ```
+    //
+    // Rule order: unchanged → locked-after-first-turn → pinned →
+    // unknown-name → apply. `target: None` is what the parse delivers for
+    // `none`/`off`.
+
+    /// Selecting the profile the conversation already has is a silent
+    /// no-op — no rebuild storm (mirrors `PipelineChoice::Unchanged`).
+    #[test]
+    fn resolve_profile_choice_same_target_is_unchanged() {
+        let sm = StateManager::new();
+        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
+        sm.set_selected_profile(Some("web".into()));
+
+        let available = vec!["web".to_string(), "admin".to_string()];
+        assert!(
+            matches!(
+                resolve_profile_choice(&sm, Some("web"), None, &available),
+                ProfileChoice::Unchanged
+            ),
+            "same target must be Unchanged"
+        );
+    }
+
+    /// Locked after the first real turn — the refusal reuses the pipeline's
+    /// wording pattern ("…locked once the conversation has started — /new
+    /// for a fresh one.").
+    #[test]
+    fn resolve_profile_choice_locked_after_first_turn() {
+        let sm = StateManager::new();
+        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
+        sm.add_user_message("hi".to_string());
+
+        let available = vec!["web".to_string()];
+        match resolve_profile_choice(&sm, Some("web"), None, &available) {
+            ProfileChoice::Refused(msg) => assert!(
+                msg.contains("locked once the conversation has started — /new for a fresh one"),
+                "the refusal must reuse the pipeline's lock wording; got: {msg}"
+            ),
+            _ => panic!("expected Refused after the first turn"),
+        }
+    }
+
+    /// Pinned at boot with `--profile web`: any change is refused, naming
+    /// the pin. A different name and clearing are both refused — the pin
+    /// keeps winning (`effective_profile = pin.or(selected)`).
+    #[test]
+    fn resolve_profile_choice_pinned_refuses_naming_the_pin() {
+        let sm = StateManager::new();
+        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
+
+        let available = vec!["web".to_string(), "admin".to_string()];
+
+        // A different name…
+        match resolve_profile_choice(&sm, Some("admin"), Some("web"), &available) {
+            ProfileChoice::Refused(msg) => assert!(
+                msg.contains("pinned by --profile web"),
+                "the refusal must name the pin; got: {msg}"
+            ),
+            _ => panic!("expected Refused for a different name under a pin"),
+        }
+        // …and clearing is refused too.
+        match resolve_profile_choice(&sm, None, Some("web"), &available) {
+            ProfileChoice::Refused(msg) => assert!(
+                msg.contains("pinned by --profile web"),
+                "clearing must be refused under a pin; got: {msg}"
+            ),
+            _ => panic!("expected Refused for clearing under a pin"),
+        }
+    }
+
+    /// The unchanged rule outranks the pin: selecting the pinned profile
+    /// that is already the current selection is a silent no-op.
+    #[test]
+    fn resolve_profile_choice_pinned_same_target_is_unchanged() {
+        let sm = StateManager::new();
+        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
+        sm.set_selected_profile(Some("web".into()));
+
+        let available = vec!["web".to_string()];
+        assert!(
+            matches!(
+                resolve_profile_choice(&sm, Some("web"), Some("web"), &available),
+                ProfileChoice::Unchanged
+            ),
+            "selecting the pinned profile that is already current must be a no-op"
+        );
+    }
+
+    /// Unknown name: refused, naming the unknown profile and listing the
+    /// available ones (mirrors the pipeline refusal shape).
+    #[test]
+    fn resolve_profile_choice_unknown_name_refused_lists_available() {
+        let sm = StateManager::new();
+        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
+
+        let available = vec!["web".to_string(), "admin".to_string()];
+        match resolve_profile_choice(&sm, Some("ghost"), None, &available) {
+            ProfileChoice::Refused(msg) => {
+                assert!(
+                    msg.contains("ghost"),
+                    "must name the unknown profile; got: {msg}"
+                );
+                assert!(msg.contains("web"), "must list available 'web'; got: {msg}");
+                assert!(
+                    msg.contains("admin"),
+                    "must list available 'admin'; got: {msg}"
+                );
+            }
+            _ => panic!("expected Refused for an unknown name"),
+        }
+    }
+
+    /// Unknown name with NO profiles configured: the refusal still names the
+    /// unknown profile and says none are configured (mirrors the pipeline's
+    /// empty-list message).
+    #[test]
+    fn resolve_profile_choice_unknown_name_with_no_profiles_says_none_configured() {
+        let sm = StateManager::new();
+        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
+
+        match resolve_profile_choice(&sm, Some("ghost"), None, &[]) {
+            ProfileChoice::Refused(msg) => {
+                assert!(
+                    msg.contains("ghost"),
+                    "must name the unknown profile; got: {msg}"
+                );
+                assert!(
+                    msg.contains("none configured"),
+                    "must say no profiles are configured; got: {msg}"
+                );
+            }
+            _ => panic!("expected Refused for an unknown name"),
+        }
+    }
+
+    /// `none`/`off` arrive here as `target: None` (the parse owns the
+    /// spellings) — a current selection is cleared.
+    #[test]
+    fn resolve_profile_choice_none_clears_selection() {
+        let sm = StateManager::new();
+        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
+        sm.set_selected_profile(Some("web".into()));
+
+        let available = vec!["web".to_string()];
+        assert!(
+            matches!(
+                resolve_profile_choice(&sm, None, None, &available),
+                ProfileChoice::Apply(None)
+            ),
+            "target None must clear the selection"
+        );
+    }
+
+    /// A valid, available name is applied.
+    #[test]
+    fn resolve_profile_choice_valid_name_applies() {
+        let sm = StateManager::new();
+        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
+
+        let available = vec!["web".to_string(), "admin".to_string()];
+        assert!(
+            matches!(
+                resolve_profile_choice(&sm, Some("web"), None, &available),
+                ProfileChoice::Apply(Some(target)) if target == "web"
+            ),
+            "a valid name must be applied"
+        );
+    }
+
+    // =========================================================================
+    // Layer C — `resolve_conversation_profile`: the shared /load + resume
+    // rule (GREEN — implemented, was untested).
+    //
+    // One rule for both entry points (session boot and `/load`): a saved
+    // profile that is no longer configured is dropped with a warning, and
+    // a boot `--profile` pin overrides the saved one. The returned
+    // selection is what the caller RECORDS (the pin, when pinned — the
+    // conversation must record what it actually runs under), plus the
+    // warnings to surface.
+    // =========================================================================
+
+    fn config_with_profiles(names: &[&str]) -> Config {
+        let mut cfg = Config::default();
+        for name in names {
+            cfg.profiles
+                .insert(name.to_string(), crate::config::Profile::default());
+        }
+        cfg
+    }
+
+    /// Pin + a different saved profile: the pin wins AND the user is told
+    /// which saved profile got overridden (both names must appear).
+    #[test]
+    fn resolve_conversation_profile_pin_beats_saved_with_warning() {
+        let cfg = config_with_profiles(&["web", "admin"]);
+        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("admin"), Some("web"));
+        assert_eq!(
+            selection.as_deref(),
+            Some("web"),
+            "the boot pin must beat the saved profile"
+        );
+        assert_eq!(warnings.len(), 1, "exactly one warning; got: {warnings:?}");
+        assert!(
+            warnings[0].contains("admin") && warnings[0].contains("web"),
+            "the warning must name BOTH the saved and the pinned profile; got: {}",
+            warnings[0]
+        );
+    }
+
+    /// Pin + the SAME saved profile: the pin still wins (trivially) but
+    /// there is nothing to warn about — a redundant "overridden by the
+    /// pin" line would be noise.
+    #[test]
+    fn resolve_conversation_profile_pin_equal_to_saved_is_silent() {
+        let cfg = config_with_profiles(&["web"]);
+        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("web"), Some("web"));
+        assert_eq!(selection.as_deref(), Some("web"));
+        assert!(
+            warnings.is_empty(),
+            "pin == saved ⇒ no warning; got: {warnings:?}"
+        );
+    }
+
+    /// Pin + no saved profile: the pin applies, silently. A fresh session
+    /// under a pin must not announce the pin on every boot.
+    #[test]
+    fn resolve_conversation_profile_pin_without_saved_applies_silently() {
+        let cfg = config_with_profiles(&["web"]);
+        let (selection, warnings) = resolve_conversation_profile(&cfg, None, Some("web"));
+        assert_eq!(selection.as_deref(), Some("web"));
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    /// No pin + a saved profile that still exists: it applies, silently —
+    /// the normal resume case.
+    #[test]
+    fn resolve_conversation_profile_saved_profile_without_pin_applies() {
+        let cfg = config_with_profiles(&["web", "admin"]);
+        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("admin"), None);
+        assert_eq!(selection.as_deref(), Some("admin"));
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    /// No pin + a saved profile that vanished from config: dropped to
+    /// `None` (base config) with a warning naming the vanished profile.
+    #[test]
+    fn resolve_conversation_profile_vanished_saved_profile_dropped_with_warning() {
+        let cfg = config_with_profiles(&["web"]);
+        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("ghost"), None);
+        assert_eq!(
+            selection, None,
+            "a vanished profile must resolve to the base config"
+        );
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(
+            warnings[0].contains("ghost"),
+            "the warning must name the vanished profile; got: {}",
+            warnings[0]
+        );
+    }
+
+    /// Pin + a vanished saved profile: the pin still applies (there is
+    /// nothing to override), and the vanished-profile warning is the only
+    /// one — no pin-override warning on top.
+    #[test]
+    fn resolve_conversation_profile_vanished_saved_with_pin_keeps_pin() {
+        let cfg = config_with_profiles(&["web"]);
+        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("ghost"), Some("web"));
+        assert_eq!(
+            selection.as_deref(),
+            Some("web"),
+            "the pin survives a vanished saved profile"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the vanished-profile warning; got: {warnings:?}"
+        );
+        assert!(warnings[0].contains("ghost"));
+    }
+
+    /// Nothing anywhere: base config, no warnings — the fresh-session
+    /// baseline.
+    #[test]
+    fn resolve_conversation_profile_nothing_anywhere_is_silent_base() {
+        let cfg = config_with_profiles(&["web"]);
+        let (selection, warnings) = resolve_conversation_profile(&cfg, None, None);
+        assert_eq!(selection, None);
+        assert!(warnings.is_empty());
+    }
+
+    // =========================================================================
+    // Layer C — `handle_select_profile`: apply / refuse / roll back (GREEN —
+    // implemented, was untested).
+    //
+    // The `/profile` verb's write half, driven end-to-end through the real
+    // handler with the RebuildContext pattern (the same harness shape as
+    // the `reconcile_pipeline_selection` tests): a live `Config`, a
+    // `RebuildContext` whose registry matches the master config on disk,
+    // and a mock agent in the slot. `reload_for` reads the master config
+    // from `XDG_CONFIG_HOME`, so each test points it at a tempdir under
+    // the shared `CONFIG_ENV_LOCK` (one test process, one env knob).
+    //
+    // Contract (mirrors `handle_select_pipeline` one axis over):
+    //   * happy path: the profile is applied — `Conversation.profile`,
+    //     `AppState.active_profile` and `Config.active_profile` all agree,
+    //     and the agent is rebuilt under it;
+    //   * refusals (locked / pinned / unknown name) leave every surface
+    //     untouched — no selection write, no config swap, no rebuild;
+    //   * a failed reload (the profile vanished from the master config
+    //     between selection and apply) rolls the profile AND the pipeline
+    //     selection back to the previous pair;
+    //   * a profile whose `pipelines:` gate filters out the selected team
+    //     drops the pipeline selection with the canonical warning.
+    // =========================================================================
+
+    /// Master config for the happy/refusal tests: one Ollama alias
+    /// (`local` — no credentials, no network at agent-build time, so the
+    /// rebuild seam runs to completion offline) and two profiles.
+    const PROFILE_HANDLER_MASTER: &str = "\
+providers:
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: llama3
+        alias: local
+default_model: local
+profiles:
+  research:
+    tools:
+      disabled: [bash]
+  web:
+    tools:
+      disabled: [view_image]
+";
+
+    /// The rollback test's master: `research` is GONE from disk — the
+    /// live config still lists it, which is exactly the "profile removed
+    /// between selection and apply" race the rollback must survive.
+    const PROFILE_HANDLER_MASTER_NO_RESEARCH: &str = "\
+providers:
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: llama3
+        alias: local
+default_model: local
+profiles:
+  web:
+    tools:
+      disabled: [view_image]
+";
+
+    /// The pipeline-gate test's master: two teams, and a profile whose
+    /// `pipelines:` allowlist keeps only `research-crew`.
+    const PROFILE_HANDLER_MASTER_GATED: &str = "\
+providers:
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: llama3
+        alias: local
+default_model: local
+pipelines:
+  - name: web-team
+    orchestrator: {}
+    agents:
+      r:
+        prompt: p
+  - name: research-crew
+    orchestrator: {}
+    agents:
+      r:
+        prompt: p
+profiles:
+  research:
+    pipelines:
+      only: [research-crew]
+";
+
+    /// The view-stamp test's master: a profile whose `ui.tabs` disables
+    /// `bash` — selecting it must remove "bash" from the client's
+    /// `AppState.visible_tabs`.
+    const PROFILE_HANDLER_MASTER_TABS: &str = "\
+providers:
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: llama3
+        alias: local
+default_model: local
+profiles:
+  research:
+    ui:
+      tabs:
+        disabled: [bash]
+";
+
+    /// The handler-test harness: a StateManager rooted at `repo_tmp`
+    /// (an empty tree — no per-repo config, no skills), a live `Config`
+    /// parsed from `live_yaml`, a `RebuildContext` whose registry matches
+    /// the master config on disk, and a mock agent in the slot.
+    #[cfg(feature = "mock")]
+    fn profile_handler_fixture(
+        repo_tmp: &std::path::Path,
+        live_yaml: &str,
+        profile_pin: Option<&str>,
+    ) -> (
+        Arc<StateManager>,
+        Config,
+        RebuildContext,
+        Arc<DynAgent>,
+        SharedSessionHook,
+        SharedProviderInfo,
+    ) {
+        let sm = StateManager::new_arc();
+        sm.set_session_cwd(repo_tmp.to_path_buf());
+        sm.set_model_alias("local".to_string());
+        let config: Config = serde_yaml::from_str(live_yaml).expect("live config parses");
+        let registry = config.build_model_registry().expect("registry builds");
+        let pipelines = crate::pipeline::PipelineSet::build(&config, &registry, Some(&[]))
+            .expect("pipelines build");
+        let (mock_agent, mock_info, _rx, mock_hook, _mock_model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        let ctx = RebuildContext {
+            registry: Arc::new(registry),
+            system_prompt: "test prompt".into(),
+            mcp_handles: Arc::new(Vec::new()),
+            searxng_config: None,
+            max_turns: 4,
+            todo_tool: None,
+            bash_config: crate::config::BashConfig::default(),
+            pipelines: Arc::new(pipelines),
+            shell_kind: None,
+            skills: crate::skills::SkillRegistry::default(),
+            vector_store: None,
+            memory_enabled: false,
+            agents_md_enabled: true,
+            tools_filter: crate::config::NameFilter::default(),
+            prompt_head: None,
+            profile_pin: profile_pin.map(str::to_string),
+        };
+        (
+            sm,
+            config,
+            ctx,
+            Arc::new(mock_agent),
+            Arc::new(std::sync::RwLock::new(mock_hook)),
+            Arc::new(std::sync::RwLock::new(Arc::new(mock_info))),
+        )
+    }
+
+    /// Point the master config at a tempdir holding `master_yaml` for the
+    /// duration of `body`, under the shared env lock, with an empty repo
+    /// tree as the session cwd. `body` returns everything the assertions
+    /// need so they run OUTSIDE the lock — a panic while holding it would
+    /// poison the lock for the whole test process (memory.md). The repo
+    /// path is OWNED (not a borrow of the tempdir) so the async body can
+    /// outlive the closure's parameter lifetime.
+    // The env lock is held across `body`'s await on purpose: the handler
+    // re-reads the master config from disk mid-await, so `XDG_CONFIG_HOME`
+    // must stay pointed at the tempdir for the whole body.
+    #[allow(clippy::await_holding_lock)]
+    async fn with_master_config<F, T>(
+        master_yaml: &str,
+        body: impl FnOnce(std::path::PathBuf) -> F,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+        let _env_guard = crate::config::CONFIG_ENV_LOCK.lock().unwrap();
+        let original = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+        let config_dir = crate::config::get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+        std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+        std::fs::write(config_dir.join("config.yaml"), master_yaml).expect("write master config");
+        let result = body(repo_tmp.path().to_path_buf()).await;
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        result
+    }
+
+    /// Any system message containing `needle` (order-independent — the
+    /// handler may emit warnings before or after the announcement).
+    fn any_system_message(sm: &Arc<StateManager>, needle: &str) -> bool {
+        sm.get_state().chat.messages.iter().any(|m| {
+            matches!(m.role, crate::ui::app_state::MessageRole::System)
+                && m.content.contains(needle)
+        })
+    }
+
+    /// Happy path: the profile is applied end to end — the selection is
+    /// recorded on the conversation and the live mirror, the config is
+    /// reloaded under the profile (its `tools:` filter in effect, its
+    /// `active_profile` stamped), and the agent is rebuilt (a new Arc in
+    /// the slot).
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_applies_profile_and_rebuilds_agent() {
+        let (outcome, sm, config, agent_before, agent_after) =
+            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
+                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
+                let agent_before = Arc::as_ptr(&agent_slot);
+                let mut config = config;
+                let mut ctx = ctx;
+                let mut agent_slot = agent_slot;
+                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+                let outcome = AgentRunner::handle_select_profile(
+                    Some("research".into()),
+                    &mut agent_slot,
+                    &mut config,
+                    &Some(sm.clone()),
+                    &hook_cell,
+                    &info_cell,
+                    &mut event_processor,
+                    Some(&mut ctx),
+                )
+                .await;
+                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
+            })
+            .await;
+
+        assert!(outcome.is_ok(), "happy path must succeed: {outcome:?}");
+        assert_eq!(
+            sm.selected_profile().as_deref(),
+            Some("research"),
+            "the selection must be recorded on the conversation"
+        );
+        assert_eq!(
+            sm.get_state().active_profile,
+            Some("research".into()),
+            "AppState.active_profile must mirror the selection"
+        );
+        assert_eq!(
+            config.active_profile.as_deref(),
+            Some("research"),
+            "the reloaded config must carry the active_profile stamp"
+        );
+        assert!(
+            !config.tools.allows("bash"),
+            "the profile's `tools:` filter must be in effect after the reload"
+        );
+        assert!(
+            config.tools.allows("view_image"),
+            "only the selected profile's filter applies — `web`'s must not leak in"
+        );
+        assert_ne!(
+            agent_before, agent_after,
+            "the agent must be rebuilt — a new Arc in the slot"
+        );
+        assert!(
+            any_system_message(&sm, "Profile 'research' selected"),
+            "the selection must be announced"
+        );
+    }
+
+    /// Refusal: once the conversation has a turn, the profile is locked —
+    /// the error names the lock, and NO surface moves: no selection
+    /// write, no config swap, no rebuild.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_refused_when_locked_leaves_state_untouched() {
+        let (outcome, sm, config, agent_before, agent_after) =
+            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
+                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
+                // Seed a real turn — the conversation is now locked.
+                sm.add_user_message("hi".into());
+                assert!(sm.conversation_has_turns(), "fixture: locked");
+                let agent_before = Arc::as_ptr(&agent_slot);
+                let mut config = config;
+                let mut ctx = ctx;
+                let mut agent_slot = agent_slot;
+                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+                let outcome = AgentRunner::handle_select_profile(
+                    Some("research".into()),
+                    &mut agent_slot,
+                    &mut config,
+                    &Some(sm.clone()),
+                    &hook_cell,
+                    &info_cell,
+                    &mut event_processor,
+                    Some(&mut ctx),
+                )
+                .await;
+                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
+            })
+            .await;
+
+        let msg = outcome.expect_err("a locked conversation must refuse");
+        assert!(
+            msg.to_lowercase().contains("lock"),
+            "the refusal must name the lock; got: {msg}"
+        );
+        assert_eq!(
+            sm.selected_profile(),
+            None,
+            "a refused selection must NOT be recorded"
+        );
+        assert_eq!(
+            config.active_profile, None,
+            "a refused selection must NOT swap the config"
+        );
+        assert!(
+            config.tools.allows("bash"),
+            "a refused selection must NOT apply the profile's filter"
+        );
+        assert_eq!(
+            agent_before, agent_after,
+            "a refused selection must NOT rebuild the agent"
+        );
+        assert!(
+            !any_system_message(&sm, "Profile 'research' selected"),
+            "a refused selection must NOT announce success"
+        );
+    }
+
+    /// Refusal: under a boot `--profile` pin, naming a DIFFERENT profile
+    /// is refused (the pin is a restart-level decision); re-naming the pin
+    /// itself is a silent no-op.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_pinned_refuses_other_names() {
+        let (outcome, sm, config, agent_before, agent_after) =
+            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
+                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, Some("web"));
+                let agent_before = Arc::as_ptr(&agent_slot);
+                let mut config = config;
+                let mut ctx = ctx;
+                let mut agent_slot = agent_slot;
+                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+                let outcome = AgentRunner::handle_select_profile(
+                    Some("research".into()),
+                    &mut agent_slot,
+                    &mut config,
+                    &Some(sm.clone()),
+                    &hook_cell,
+                    &info_cell,
+                    &mut event_processor,
+                    Some(&mut ctx),
+                )
+                .await;
+                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
+            })
+            .await;
+
+        let msg = outcome.expect_err("a pinned session must refuse other profiles");
+        assert!(
+            msg.contains("pinned") && msg.contains("web"),
+            "the refusal must name the pin; got: {msg}"
+        );
+        assert_eq!(sm.selected_profile(), None, "the pin is not a selection");
+        assert_eq!(config.active_profile, None, "no reload may have run");
+        assert_eq!(agent_before, agent_after, "no rebuild may have run");
+
+        // Re-naming the pin itself: Unchanged — Ok, silent, no rebuild.
+        let (outcome, sm, _config, agent_before, agent_after) =
+            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
+                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, Some("web"));
+                let agent_before = Arc::as_ptr(&agent_slot);
+                let mut config = config;
+                let mut ctx = ctx;
+                let mut agent_slot = agent_slot;
+                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+                let outcome = AgentRunner::handle_select_profile(
+                    Some("web".into()),
+                    &mut agent_slot,
+                    &mut config,
+                    &Some(sm.clone()),
+                    &hook_cell,
+                    &info_cell,
+                    &mut event_processor,
+                    Some(&mut ctx),
+                )
+                .await;
+                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
+            })
+            .await;
+        assert!(
+            outcome.is_ok(),
+            "re-selecting the pin is a no-op, not an error: {outcome:?}"
+        );
+        assert_eq!(agent_before, agent_after, "the no-op must NOT rebuild");
+        assert!(
+            !any_system_message(&sm, "selected"),
+            "the no-op must be silent"
+        );
+    }
+
+    /// Refusal: an unknown name is refused with the available profiles
+    /// listed (sorted), and no surface moves.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_unknown_name_refused_lists_available() {
+        let (outcome, sm, config, agent_before, agent_after) =
+            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
+                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
+                let agent_before = Arc::as_ptr(&agent_slot);
+                let mut config = config;
+                let mut ctx = ctx;
+                let mut agent_slot = agent_slot;
+                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+                let outcome = AgentRunner::handle_select_profile(
+                    Some("ghost".into()),
+                    &mut agent_slot,
+                    &mut config,
+                    &Some(sm.clone()),
+                    &hook_cell,
+                    &info_cell,
+                    &mut event_processor,
+                    Some(&mut ctx),
+                )
+                .await;
+                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
+            })
+            .await;
+
+        let msg = outcome.expect_err("an unknown profile must be refused");
+        assert!(
+            msg.contains("ghost"),
+            "the refusal must name the bad name; got: {msg}"
+        );
+        assert!(
+            msg.contains("research") && msg.contains("web"),
+            "the refusal must list the available profiles (sorted); got: {msg}"
+        );
+        assert_eq!(sm.selected_profile(), None);
+        assert_eq!(config.active_profile, None);
+        assert_eq!(agent_before, agent_after, "no rebuild may have run");
+    }
+
+    /// Rollback: the profile vanished from the master config between
+    /// selection and apply (the live config still lists it, the disk
+    /// read no longer does). The reload fails, so the handler must put
+    /// BOTH the profile and the pipeline selection back to the previous
+    /// pair and re-derive the config for them — the running agent was
+    /// never swapped, so state must describe the profile it still has.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_rollback_when_reload_fails_restores_previous_pair() {
+        // Live config: both profiles (the user picked `research`).
+        // Disk master: only `web` (the profile was just removed).
+        let (outcome, sm, config, agent_before, agent_after) =
+            with_master_config(PROFILE_HANDLER_MASTER_NO_RESEARCH, |repo| async move {
+                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
+                // Pre-stage the previous pair the rollback must restore.
+                sm.set_selected_profile(Some("web".into()));
+                sm.set_selected_pipeline(Some("web-team".into()));
+                let agent_before = Arc::as_ptr(&agent_slot);
+                let mut config = config;
+                let mut ctx = ctx;
+                let mut agent_slot = agent_slot;
+                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+                let outcome = AgentRunner::handle_select_profile(
+                    Some("research".into()),
+                    &mut agent_slot,
+                    &mut config,
+                    &Some(sm.clone()),
+                    &hook_cell,
+                    &info_cell,
+                    &mut event_processor,
+                    Some(&mut ctx),
+                )
+                .await;
+                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
+            })
+            .await;
+
+        let msg = outcome.expect_err("a failed reload must surface as an error");
+        assert!(
+            msg.contains("research"),
+            "the error must name the profile that failed to apply; got: {msg}"
+        );
+        assert_eq!(
+            sm.selected_profile().as_deref(),
+            Some("web"),
+            "the previous profile selection must be restored"
+        );
+        assert_eq!(
+            sm.selected_pipeline().as_deref(),
+            Some("web-team"),
+            "the previous pipeline selection must be restored too"
+        );
+        assert_eq!(
+            config.active_profile.as_deref(),
+            Some("web"),
+            "the rollback must re-derive the config for the previous profile"
+        );
+        assert_eq!(
+            agent_before, agent_after,
+            "the agent was never swapped — the slot must be untouched"
+        );
+        assert!(
+            !any_system_message(&sm, "Profile 'research' selected"),
+            "a rolled-back selection must NOT announce success"
+        );
+    }
+
+    /// Pipeline reconciliation: selecting a profile whose `pipelines:`
+    /// gate filters out the currently selected team drops the pipeline
+    /// selection with the canonical warning — the same reconciler every
+    /// reload path runs, reached here through the profile axis.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_pipeline_gate_drops_filtered_selection_with_warning() {
+        let (outcome, sm, config, ctx_pipelines, agent_before, agent_after) =
+            with_master_config(PROFILE_HANDLER_MASTER_GATED, |repo| async move {
+                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER_GATED, None);
+                // The user is currently on `web-team` — the profile's gate
+                // keeps only `research-crew`.
+                sm.set_selected_pipeline(Some("web-team".into()));
+                let agent_before = Arc::as_ptr(&agent_slot);
+                let mut config = config;
+                let mut ctx = ctx;
+                let mut agent_slot = agent_slot;
+                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+                let outcome = AgentRunner::handle_select_profile(
+                    Some("research".into()),
+                    &mut agent_slot,
+                    &mut config,
+                    &Some(sm.clone()),
+                    &hook_cell,
+                    &info_cell,
+                    &mut event_processor,
+                    Some(&mut ctx),
+                )
+                .await;
+                (
+                    outcome,
+                    sm,
+                    config,
+                    ctx.pipelines
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect::<Vec<_>>(),
+                    agent_before,
+                    Arc::as_ptr(&agent_slot),
+                )
+            })
+            .await;
+
+        assert!(
+            outcome.is_ok(),
+            "the selection itself must succeed: {outcome:?}"
+        );
+        assert_eq!(
+            sm.selected_profile().as_deref(),
+            Some("research"),
+            "the profile must be applied"
+        );
+        assert_eq!(
+            config.active_profile.as_deref(),
+            Some("research"),
+            "the config must be reloaded under the profile"
+        );
+        assert_eq!(
+            ctx_pipelines,
+            vec!["research-crew".to_string()],
+            "the profile's pipelines gate must narrow the live set"
+        );
+        assert_eq!(
+            sm.selected_pipeline(),
+            None,
+            "the filtered-out team must be dropped from the selection"
+        );
+        assert!(
+            any_system_message(&sm, "Pipeline 'web-team'"),
+            "the drop must be announced by name"
+        );
+        assert!(
+            any_system_message(&sm, "not configured"),
+            "the canonical 'not configured / continuing without a pipeline' \
+             wording must be used"
+        );
+        assert_ne!(
+            agent_before, agent_after,
+            "a successful apply must rebuild the agent"
+        );
+    }
+
+    /// View stamp: selecting a profile whose `ui.tabs` disables a tab must
+    /// remove it from `AppState.visible_tabs` — the server-computed view the
+    /// client renders from — and the picker must keep the configured names.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_updates_visible_tabs() {
+        let (outcome, profiles_view, tabs_view) =
+            with_master_config(PROFILE_HANDLER_MASTER_TABS, |repo| async move {
+                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER_TABS, None);
+                let mut config = config;
+                let mut ctx = ctx;
+                let mut agent_slot = agent_slot;
+                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+                let outcome = AgentRunner::handle_select_profile(
+                    Some("research".into()),
+                    &mut agent_slot,
+                    &mut config,
+                    &Some(sm.clone()),
+                    &hook_cell,
+                    &info_cell,
+                    &mut event_processor,
+                    Some(&mut ctx),
+                )
+                .await;
+                let state = sm.get_state();
+                (outcome, state.profiles, state.visible_tabs)
+            })
+            .await;
+
+        assert!(outcome.is_ok(), "happy path must succeed: {outcome:?}");
+        assert_eq!(
+            profiles_view,
+            vec!["research".to_string()],
+            "the picker must list the configured profile"
+        );
+        assert_eq!(
+            tabs_view,
+            vec![
+                "session".to_string(),
+                "todo".to_string(),
+                "files".to_string(),
+                "tasks".to_string(),
+                "agents".to_string(),
+                "profile".to_string(),
+            ],
+            "the profile's disabled tab must be gone from the client view"
+        );
+    }
+
+    // =========================================================================
+    // CONTRACT B — `Profile.agents_md` at the `handle_select_profile`
+    // harness (RED / guard).
+    //
+    // The repo tree carries a sentinel `agents.md`; the rebuild seam
+    // recomputes `ctx.system_prompt` from the session cwd, so the rebuilt
+    // prompt is observable without touching the agent. Selecting a profile
+    // with `agents_md: false` must rebuild on a prompt WITHOUT the
+    // sentinel; a profile without the key keeps today's behaviour (WITH it).
+    //
+    // The first test is RED today for the right reason: `agents_md:` is an
+    // unknown profile key, so the reload fails and the selection is refused
+    // (`outcome` is `Err` before any prompt assertion runs).
+    // =========================================================================
+
+    /// Selecting a profile with `agents_md: false` rebuilds the agent on a
+    /// system prompt WITHOUT the repo's agents.md content.
+    /// (RED — the profile key does not exist yet.)
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_agents_md_false_omits_agents_md_from_rebuilt_prompt() {
+        const MASTER: &str = "\
+providers:
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: llama3
+        alias: local
+default_model: local
+profiles:
+  web:
+    agents_md: false
+";
+        let (outcome, sm, ctx) = with_master_config(MASTER, |repo| async move {
+            std::fs::write(repo.join("agents.md"), "SENTINEL-HARNESS-AGENTS")
+                .expect("write sentinel agents.md");
+            let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                profile_handler_fixture(&repo, MASTER, None);
+            let mut config = config;
+            let mut ctx = ctx;
+            let mut agent_slot = agent_slot;
+            let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+            let outcome = AgentRunner::handle_select_profile(
+                Some("web".into()),
+                &mut agent_slot,
+                &mut config,
+                &Some(sm.clone()),
+                &hook_cell,
+                &info_cell,
+                &mut event_processor,
+                Some(&mut ctx),
+            )
+            .await;
+            (outcome, sm, ctx)
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "selecting the agents_md profile must succeed: {outcome:?}"
+        );
+        assert!(
+            any_system_message(&sm, "Profile 'web' selected"),
+            "the selection must be announced"
+        );
+        assert!(
+            !ctx.system_prompt.contains("SENTINEL-HARNESS-AGENTS"),
+            "agents_md: false must keep agents.md out of the rebuilt prompt; prompt: {}",
+            ctx.system_prompt
+        );
+    }
+
+    /// Guard: a profile WITHOUT `agents_md:` keeps today's behaviour — the
+    /// rebuilt prompt still carries the repo's agents.md. (GREEN today;
+    /// must stay green: absent = unchanged.)
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_without_agents_md_keeps_agents_md_in_rebuilt_prompt() {
+        const MASTER: &str = "\
+providers:
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: llama3
+        alias: local
+default_model: local
+profiles:
+  web:
+    tools:
+      disabled: [bash]
+";
+        let (outcome, _sm, ctx) = with_master_config(MASTER, |repo| async move {
+            std::fs::write(repo.join("agents.md"), "SENTINEL-HARNESS-AGENTS")
+                .expect("write sentinel agents.md");
+            let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                profile_handler_fixture(&repo, MASTER, None);
+            let mut config = config;
+            let mut ctx = ctx;
+            let mut agent_slot = agent_slot;
+            let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+            let outcome = AgentRunner::handle_select_profile(
+                Some("web".into()),
+                &mut agent_slot,
+                &mut config,
+                &Some(sm.clone()),
+                &hook_cell,
+                &info_cell,
+                &mut event_processor,
+                Some(&mut ctx),
+            )
+            .await;
+            (outcome, sm, ctx)
+        })
+        .await;
+
+        assert!(outcome.is_ok(), "happy path must succeed: {outcome:?}");
+        assert!(
+            ctx.system_prompt.contains("SENTINEL-HARNESS-AGENTS"),
+            "absent agents_md: must keep the repo's agents.md in the rebuilt prompt; prompt: {}",
+            ctx.system_prompt
         );
     }
 }

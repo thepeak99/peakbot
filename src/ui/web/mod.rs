@@ -768,6 +768,9 @@ fn dispatch_inbound(
         Ok(InboundMessage::SelectPipeline { name }) => {
             action_sender.send(UiAction::SelectPipeline(name)).is_ok()
         }
+        Ok(InboundMessage::SelectProfile { name }) => {
+            action_sender.send(UiAction::SelectProfile(name)).is_ok()
+        }
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
             let items = build_conversations_snapshot(state_manager, &registry.active_ids());
@@ -911,6 +914,7 @@ mod tests {
             storage: None,
             mcp_tools_count: 0,
             skills_count: 0,
+            profile_pin: None,
         };
         let registry = SessionRegistry::new(Arc::new(deps));
         (action_tx, action_rx, out_tx, sm, registry)
@@ -947,6 +951,51 @@ mod tests {
         let kept = dispatch_inbound(r#"{"type":"stop"}"#, &tx, &out_tx, &sm, &registry);
         assert!(kept);
         assert!(matches!(rx.try_recv().unwrap(), UiAction::RequestStop));
+    }
+
+    // ── select_profile inbound → UiAction (Layer D, RED) ────────────────────
+    //
+    // D4: `{"type":"select_profile","name":...}` must surface as
+    // `UiAction::SelectProfile(name)` on the controller's action channel —
+    // the same dispatch shape `SelectPipeline` already has. Compile-RED
+    // until `InboundMessage::SelectProfile` and `UiAction::SelectProfile`
+    // both exist.
+
+    #[test]
+    fn inbound_select_profile_with_name_maps_to_select_profile_action() {
+        let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
+        let kept = dispatch_inbound(
+            r#"{"type":"select_profile","name":"research"}"#,
+            &tx,
+            &out_tx,
+            &sm,
+            &registry,
+        );
+        assert!(kept, "select_profile frame must keep the socket loop alive");
+        assert!(
+            matches!(
+                rx.try_recv().unwrap(),
+                UiAction::SelectProfile(Some(n)) if n == "research"
+            ),
+            "a named select_profile frame must surface as UiAction::SelectProfile(Some(name))"
+        );
+    }
+
+    #[test]
+    fn inbound_select_profile_with_null_maps_to_clear_action() {
+        let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
+        let kept = dispatch_inbound(
+            r#"{"type":"select_profile","name":null}"#,
+            &tx,
+            &out_tx,
+            &sm,
+            &registry,
+        );
+        assert!(kept);
+        assert!(
+            matches!(rx.try_recv().unwrap(), UiAction::SelectProfile(None)),
+            "a null-name select_profile frame must clear the binding"
+        );
     }
 
     /// Spawn the real axum router on a random loopback port, then

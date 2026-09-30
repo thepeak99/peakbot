@@ -1341,9 +1341,16 @@ impl StateManager {
         // persisted conversation still names (and `/load` resurrects it).
         // Dropping a selection the fresh config no longer defines is the
         // reconciler's job at the verb call sites, not the mint's.
-        let selected = self.state.read().unwrap().selected_pipeline.clone();
+        let (selected, profile) = {
+            let state = self.state.read().unwrap();
+            (
+                state.selected_pipeline.clone(),
+                state.active_profile.clone(),
+            )
+        };
         let mut conv = Conversation::new(name, provider_name, model, cwd);
         conv.pipeline = selected;
+        conv.profile = profile;
         *self.current_conversation.lock().unwrap() = Some(conv);
         self.mirror_conversation_to_state();
     }
@@ -1394,6 +1401,36 @@ impl StateManager {
         }
         let mut state = self.state.write().unwrap();
         state.selected_pipeline = name;
+        self.notify_update(&state);
+    }
+
+    /// The config profile this conversation runs under. Reads the live
+    /// `AppState` mirror that [`Self::set_selected_profile`] writes.
+    pub fn selected_profile(&self) -> Option<String> {
+        self.state.read().unwrap().active_profile.clone()
+    }
+
+    /// Record the profile selection onto the current conversation and into
+    /// the live `AppState`. Records only — the caller owns the lock rule and
+    /// the config reload. Same guard order as [`Self::set_selected_pipeline`].
+    pub fn set_selected_profile(&self, name: Option<String>) {
+        if let Some(conv) = self.current_conversation.lock().unwrap().as_mut() {
+            conv.profile = name.clone();
+        }
+        let mut state = self.state.write().unwrap();
+        state.active_profile = name;
+        self.notify_update(&state);
+    }
+
+    /// Stamp the server-computed profile view — the picker's names and the
+    /// tabs the client should render — into the live `AppState`. Called at
+    /// session build and after every successful config reload / profile
+    /// apply; a call REPLACES the previous view wholesale (no merge), so a
+    /// re-stamp never leaves a stale profile's tab set behind.
+    pub fn set_profile_view(&self, profiles: Vec<String>, visible_tabs: Vec<String>) {
+        let mut state = self.state.write().unwrap();
+        state.profiles = profiles;
+        state.visible_tabs = visible_tabs;
         self.notify_update(&state);
     }
 
@@ -1479,15 +1516,19 @@ impl StateManager {
             // rebuilds on its team's orchestrator and the Agents panel shows
             // the right row. A name that is no longer configured is dropped by
             // the caller (`PipelineSet::resolve_saved`), not here.
-            let restored = self
+            // The profile is restored the same way; `resolve_saved_profile`
+            // drops a vanished one at the caller.
+            let (restored, profile) = self
                 .current_conversation
                 .lock()
                 .unwrap()
                 .as_ref()
-                .and_then(|c| c.pipeline.clone());
+                .map(|c| (c.pipeline.clone(), c.profile.clone()))
+                .unwrap_or_default();
             {
                 let mut state = self.state.write().unwrap();
                 state.selected_pipeline = restored;
+                state.active_profile = profile;
             }
             // Background processes are scoped to the conversation they
             // were spawned in. Loading a different conversation severs
@@ -1536,6 +1577,17 @@ impl StateManager {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
         Ok(storage.load(id)?.pipeline)
+    }
+
+    /// Peek at a saved conversation's persisted profile without loading it —
+    /// the resume path must build the session config under it before the
+    /// conversation is loaded.
+    pub fn peek_conversation_profile(&self, id: Uuid) -> anyhow::Result<Option<String>> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
+        Ok(storage.load(id)?.profile)
     }
 
     /// Peek at a saved conversation's persisted `cwd` without loading
@@ -9509,5 +9561,163 @@ mod tests {
             "a fresh begin_sub_agent after Stop must not inherit a stale request"
         );
         drop(guard);
+    }
+
+    // ── Layer C: per-conversation profile selection state (RED) ─────────────
+    //
+    // Mirrors the Stage 1.2 pipeline-selection tests one axis over: the
+    // per-conversation profile lives on `Conversation.profile` (persisted
+    // truth) and is mirrored into `AppState.active_profile` (live). The
+    // setter writes both surfaces; the getter reads the mirror.
+    //
+    // Compile-RED until `StateManager::set_selected_profile`,
+    // `StateManager::selected_profile`, `AppState.active_profile` and
+    // `Conversation.profile` exist.
+
+    /// `set_selected_profile(Some(name))` mirrors the choice into the
+    /// current conversation's `profile` field AND into
+    /// `AppState.active_profile`. One nullable fact, two surfaces — the
+    /// same invariant as `set_selected_pipeline` (I-3).
+    #[test]
+    fn set_selected_profile_writes_conversation_and_app_state() {
+        let sm = StateManager::new();
+        // Seed a current conversation — the persisted mirror requires it.
+        sm.create_conversation(
+            "profile-select".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
+
+        // Default = no profile.
+        assert_eq!(sm.get_state().active_profile, None);
+
+        // Set some — both surfaces must reflect.
+        sm.set_selected_profile(Some("web".into()));
+        assert_eq!(sm.get_state().active_profile, Some("web".into()));
+        assert_eq!(
+            sm.get_current_conversation()
+                .expect("current conversation")
+                .profile
+                .as_deref(),
+            Some("web"),
+            "the conversation's persisted `profile` field must mirror the choice"
+        );
+
+        // Set None — both surfaces cleared.
+        sm.set_selected_profile(None);
+        assert_eq!(sm.get_state().active_profile, None);
+        assert_eq!(
+            sm.get_current_conversation()
+                .expect("current conversation")
+                .profile,
+            None,
+            "the conversation's persisted `profile` field must be cleared too"
+        );
+    }
+
+    /// `selected_profile()` reads through `AppState.active_profile` — the
+    /// getter half of the seam `set_selected_profile` writes. Pinning it as
+    /// a separate test catches an implementer who wires the setter to one
+    /// source and the getter to another.
+    #[test]
+    fn selected_profile_getter_reads_app_state() {
+        let sm = StateManager::new();
+        assert_eq!(sm.selected_profile().as_deref(), None);
+        sm.set_selected_profile(Some("web".into()));
+        assert_eq!(sm.selected_profile().as_deref(), Some("web"));
+        sm.set_selected_profile(None);
+        assert_eq!(sm.selected_profile().as_deref(), None);
+    }
+
+    // ── Layer D: `set_profile_view` keeps `AppState.profiles` and
+    // `AppState.visible_tabs` current (RED) ─────────────────────────────
+    //
+    // D3: a single setter, `StateManager::set_profile_view(profiles:
+    // Vec<String>, visible_tabs: Vec<String>)`, writes BOTH `AppState`
+    // fields in one lock acquisition — same shape as `set_selected_pipeline`
+    // (one nullable fact, one write path) and `set_pipelines` (a
+    // server-computed projection, not user input). The implementer calls
+    // it at session build and after every profile apply/reload; the tests
+    // here pin the setter/getter contract alone, independent of when it's
+    // called.
+    //
+    // ```ignore
+    // impl StateManager {
+    //     pub fn set_profile_view(&self, profiles: Vec<String>, visible_tabs: Vec<String>);
+    // }
+    // ```
+    //
+    // Compile-RED until the method exists (E0599) — `AppState.profiles` /
+    // `AppState.visible_tabs` are also new fields the method needs to write.
+
+    /// A fresh `StateManager` starts with both fields empty — the
+    /// pre-session-build baseline, mirroring `set_pipelines`'s "empty is
+    /// the no-pipelines-configured baseline" convention.
+    #[test]
+    fn fresh_state_manager_has_empty_profile_view() {
+        let sm = StateManager::new();
+        assert_eq!(sm.get_state().profiles, Vec::<String>::new());
+        assert_eq!(sm.get_state().visible_tabs, Vec::<String>::new());
+    }
+
+    /// `set_profile_view` writes BOTH fields in one call — the getter half
+    /// is `sm.get_state()`, mirroring how `set_pipelines`/`AppState.pipelines`
+    /// are read.
+    #[test]
+    fn set_profile_view_writes_both_app_state_fields() {
+        let sm = StateManager::new();
+        sm.set_profile_view(
+            vec!["admin".to_string(), "web".to_string()],
+            vec!["session".to_string(), "todo".to_string()],
+        );
+        let state = sm.get_state();
+        assert_eq!(
+            state.profiles,
+            vec!["admin".to_string(), "web".to_string()],
+            "profiles must land in AppState.profiles verbatim (the caller sorts)"
+        );
+        assert_eq!(
+            state.visible_tabs,
+            vec!["session".to_string(), "todo".to_string()],
+            "visible_tabs must land in AppState.visible_tabs verbatim"
+        );
+    }
+
+    /// A later call REPLACES the previous view wholesale — no
+    /// accumulation, no merge. Exercises the case that matters most in
+    /// production: re-calling after a profile apply must not leave stale
+    /// names from the previous profile's tab set lying around.
+    #[test]
+    fn set_profile_view_replaces_previous_view_wholesale() {
+        let sm = StateManager::new();
+        sm.set_profile_view(
+            vec!["web".to_string()],
+            vec!["session".to_string(), "bash".to_string()],
+        );
+        sm.set_profile_view(Vec::new(), vec!["session".to_string()]);
+        let state = sm.get_state();
+        assert_eq!(
+            state.profiles,
+            Vec::<String>::new(),
+            "the second call must replace, not merge with, the first"
+        );
+        assert_eq!(
+            state.visible_tabs,
+            vec!["session".to_string()],
+            "same replace-not-merge rule for visible_tabs"
+        );
+    }
+
+    /// `set_profile_view` must publish through the same `AppState` read
+    /// path as every other view (`set_pipelines`, `set_selected_pipeline`)
+    /// — a call is visible via `get_state()` immediately, with no separate
+    /// "commit" step.
+    #[test]
+    fn set_profile_view_is_visible_through_get_state_immediately() {
+        let sm = StateManager::new();
+        assert_eq!(sm.get_state().profiles, Vec::<String>::new());
+        sm.set_profile_view(vec!["only-one".to_string()], vec!["session".to_string()]);
+        assert_eq!(sm.get_state().profiles, vec!["only-one".to_string()]);
     }
 }

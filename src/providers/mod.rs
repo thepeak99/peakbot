@@ -239,6 +239,7 @@ pub fn create_provider(
     skills: &crate::skills::SkillRegistry,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
+    agents_md: bool,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
@@ -263,6 +264,7 @@ pub fn create_provider(
                 skills,
                 retry,
                 timeouts,
+                agents_md,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -288,6 +290,7 @@ pub fn create_provider(
                 skills,
                 retry,
                 timeouts,
+                agents_md,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -313,6 +316,7 @@ pub fn create_provider(
                 skills,
                 retry,
                 timeouts,
+                agents_md,
             )?;
             Ok((
                 DynAgent::Anthropic(agent),
@@ -338,6 +342,7 @@ pub fn create_provider(
                 skills,
                 retry,
                 timeouts,
+                agents_md,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -363,6 +368,7 @@ pub fn create_provider(
                 skills,
                 retry,
                 timeouts,
+                agents_md,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -491,6 +497,7 @@ fn add_builtin_tools<M, P>(
     wire_bash_panel: bool,
     sub_agent_wiring: Option<SubAgentWiring>,
     timeouts: &TimeoutsConfig,
+    agents_md: bool,
 ) -> rig_core::agent::AgentBuilder<M, P, rig_core::agent::WithBuilderTools>
 where
     M: rig_core::completion::CompletionModel,
@@ -627,6 +634,10 @@ where
             event_sink: wiring.event_sink,
             retry: wiring.retry,
             timeouts: timeouts.clone(),
+            // The profile's `agents_md:` ceiling — the caller passes the
+            // per-session (profile-applied) value, so a runtime `/profile`
+            // switch changes the next delegation's preamble.
+            agents_md_ceiling: agents_md,
         };
         let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(deps));
         tools.push(gate(Box::new(delegate_tool)));
@@ -751,6 +762,7 @@ fn create_openrouter_agent(
     skills: &crate::skills::SkillRegistry,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
+    agents_md: bool,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -814,6 +826,7 @@ fn create_openrouter_agent(
             skills: skills.clone(),
         }),
         timeouts,
+        agents_md,
     );
 
     // Add MCP tools and build
@@ -872,6 +885,7 @@ fn create_anthropic_agent(
     skills: &crate::skills::SkillRegistry,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
+    agents_md: bool,
 ) -> Result<(
     Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -948,6 +962,7 @@ fn create_anthropic_agent(
             skills: skills.clone(),
         }),
         timeouts,
+        agents_md,
     );
 
     let agent = if let Some(tools) = mcp_tools {
@@ -991,6 +1006,7 @@ fn create_ollama_agent(
     skills: &crate::skills::SkillRegistry,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
+    agents_md: bool,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -1044,6 +1060,7 @@ fn create_ollama_agent(
             skills: skills.clone(),
         }),
         timeouts,
+        agents_md,
     );
 
     // Add MCP tools and build
@@ -1088,6 +1105,7 @@ fn create_openai_agent(
     skills: &crate::skills::SkillRegistry,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
+    agents_md: bool,
 ) -> Result<(
     Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -1153,6 +1171,7 @@ fn create_openai_agent(
             skills: skills.clone(),
         }),
         timeouts,
+        agents_md,
     );
 
     // Add MCP tools and build
@@ -1193,6 +1212,7 @@ fn create_llamacpp_agent(
     skills: &crate::skills::SkillRegistry,
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
+    agents_md: bool,
 ) -> Result<(
     Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -1261,6 +1281,7 @@ fn create_llamacpp_agent(
             skills: skills.clone(),
         }),
         timeouts,
+        agents_md,
     );
 
     // Add MCP tools and build
@@ -1450,6 +1471,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 None,
                 timeouts,
+                true, // no `delegate` here; ceiling applied in DelegateTool::call
             );
             Ok((DynAgent::OpenRouter(builder.build()), Arc::new(hook)))
         }
@@ -1484,6 +1506,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 None,
                 timeouts,
+                true, // no `delegate` here; ceiling applied in DelegateTool::call
             );
             Ok((DynAgent::OpenAI(builder.build()), Arc::new(hook)))
         }
@@ -1522,6 +1545,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 None,
                 timeouts,
+                true, // no `delegate` here; ceiling applied in DelegateTool::call
             );
             Ok((DynAgent::Anthropic(builder.build()), Arc::new(hook)))
         }
@@ -1557,6 +1581,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 None,
                 timeouts,
+                true, // no `delegate` here; ceiling applied in DelegateTool::call
             );
             Ok((DynAgent::LlamaCpp(builder.build()), Arc::new(hook)))
         }
@@ -1591,6 +1616,7 @@ pub(crate) fn build_sub_agent(
                 false,
                 None,
                 timeouts,
+                true, // no `delegate` here; ceiling applied in DelegateTool::call
             );
             Ok((DynAgent::Ollama(builder.build()), Arc::new(hook)))
         }
@@ -2224,6 +2250,7 @@ mod tests {
             false, // wire bash panel
             None,  // sub-agent wiring
             &TimeoutsConfig::default(),
+            true, // agents_md ceiling (no `delegate` registered here)
         )
         .build();
         let defs = agent

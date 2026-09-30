@@ -89,16 +89,48 @@ export PROVIDER='{"type":"openrouter","api_key":"sk-or-v1-xxx","model":"anthropi
 ### Profiles
 
 A **profile** is a named config overlay declared in the master config's
-`profiles:` map and selected at boot with `--profile <name>`. It is applied
-**last** — after the per-repo `.peakbot/config.yaml` merge — and re-applied on
-every session-verb reload (`/cd`, `/new`, `/model`, `/load`), so it is a
-ceiling a checked-out repo cannot void. Profiles are master-config only; a
-`profiles:` block in a per-repo config is ignored with a boot warning.
+`profiles:` map. It is applied **last** — after the per-repo
+`.peakbot/config.yaml` merge — and re-applied on every session-verb reload
+(`/cd`, `/new`, `/model`, `/load`), so it is a ceiling a checked-out repo
+cannot void. Profiles are master-config only; a `profiles:` block in a
+per-repo config is ignored with a boot warning.
 
-A profile can override four keys: `tools:`, `memory:`, `pipelines:`, and
-`system_prompt:`. The first three each use the shared filter documented in
-[Tool, Skill & Pipeline Filters](#tool-skill--pipeline-filters); the fourth is
-its own thing, documented in [System Prompt](#system-prompt) below.
+A profile is chosen per conversation with `/profile <name>` (`/profile` lists
+them, `/profile none` returns to the base config). Like `/pipeline`, the
+choice is locked once the conversation has started, carried over by `/new`,
+and restored by `/load` (a profile that is no longer configured is dropped
+with a warning). Booting with `--profile <name>` **pins** it instead: every
+conversation runs under that profile and `/profile <name>` is refused. That
+pin is the only lockdown that holds: the web UI lists profiles as a radio list
+the user can pick from, so a runtime `/profile` choice is a convenience
+**preset, not a security boundary** — to lock a web deployment to one profile,
+always boot with `--profile <name>` (the picker then empties and the Profile
+tab hides).
+
+A profile can override seven keys: `tools:`, `memory:`, `pipelines:`,
+`mcp_servers:`, `agents_md:`, `system_prompt:`, and `ui:`. The first three
+each use the shared filter documented in
+[Tool, Skill & Pipeline Filters](#tool-skill--pipeline-filters);
+`system_prompt:` is documented in [System Prompt](#system-prompt) below; `ui:`
+covers the web tabs in the paragraph after this.
+
+`mcp_servers:` is that same name filter applied to the master config's
+`mcp_servers:` list: only the surviving servers' tools reach the agent
+(`only:` allowlist, `disabled:` blocklist, `enabled: false` for none), and a
+name the master never declares is a boot error. `agents_md:` is a plain bool
+— `false` omits the repo's `agents.md` section from the system prompt and
+caps every sub-agent to the same ceiling.
+
+`ui:` controls which web tabs a profile shows, using the same filter semantics
+as the other keys: a `tabs:` block with `only:` / `disabled:` (XOR, as in
+`tools:`/`skills:`/`pipelines:`) or `enabled: false` for none. Tab names come
+from a closed set — `session`, `todo`, `files`, `tasks`, `bash`, `agents`,
+`profile` — and an unknown name is a boot error. With no `ui:` (or no `tabs:`)
+every tab shows. The web UI renders a **Profile** tab (a radio list: "None
+(base config)" plus one row per configured profile) exactly when profiles are
+selectable — some configured and no `--profile` pin active — and hides it
+otherwise; hiding is cosmetic, `/profile <name>` keeps working from the
+terminal.
 
 ```yaml
 profiles:
@@ -107,6 +139,9 @@ profiles:
       disabled: [bash]
     pipelines:
       enabled: false
+    ui:
+      tabs:
+        disabled: [files, tasks, bash, agents]
 ```
 
 The `pipelines:` gate names pipelines from the **master config's** `pipelines:`

@@ -55,6 +55,18 @@ pub struct SubAgentDeps {
     /// Wall-clock budgets — the delegation's prompt loop reads `delegate_secs`
     /// from here, so the operator's config drives it rather than a constant.
     pub timeouts: crate::config::TimeoutsConfig,
+    /// The profile's `agents_md:` ceiling (config-level, defaults `true`):
+    /// ANDed with a role's own `agents_md` opt-in before building the
+    /// preamble, so `agents_md: false` strips even an opted-in role's
+    /// agents.md section.
+    pub agents_md_ceiling: bool,
+}
+
+/// The effective agents.md flag for a delegation: the role's own opt-in
+/// AND the profile's `agents_md:` ceiling — a profile with `agents_md:
+/// false` strips the section even from a role that opted in.
+fn agents_md_effective(role_agents_md: bool, profile_ceiling: bool) -> bool {
+    role_agents_md && profile_ceiling
 }
 
 /// Build a sub-agent's preamble: `role_prompt` + the live env block + this
@@ -324,9 +336,10 @@ impl Tool for DelegateTool {
         // Enrich the role prompt with a lean shared context: the live env
         // block (cwd/time/shell) + this role's filtered skills + what is
         // running in the shared bg registry, plus the repo's
-        // agents.md only when the role opts in (`agents_md: true`). No persona,
-        // no core tool guidance, no memory — a sub-agent's `prompt` is its whole
-        // persona; everything else it needs goes in the task. Derived here (not
+        // agents.md only when the role opts in (`agents_md: true`) AND the
+        // profile's `agents_md:` ceiling allows it. No persona, no core tool
+        // guidance, no memory — a sub-agent's `prompt` is its whole persona;
+        // everything else it needs goes in the task. Derived here (not
         // cached) so cwd/time are always current.
         let preamble = build_sub_agent_preamble(
             &role.prompt,
@@ -335,7 +348,7 @@ impl Tool for DelegateTool {
             &deps.skills,
             &role.skills,
             &bg_before,
-            role.agents_md,
+            agents_md_effective(role.agents_md, deps.agents_md_ceiling),
         );
 
         // Size the gate against THIS role's model, not the orchestrator's:
@@ -586,6 +599,7 @@ mod tests {
             event_sink: None,
             retry: crate::config::RetryConfig::default(),
             timeouts: crate::config::TimeoutsConfig::default(),
+            agents_md_ceiling: true,
         };
         DelegateTool::new(Arc::new(deps))
     }
@@ -845,6 +859,7 @@ mod tests {
             event_sink: None,
             retry,
             timeouts: crate::config::TimeoutsConfig::default(),
+            agents_md_ceiling: true,
         };
         DelegateTool::new(Arc::new(deps))
     }
@@ -1170,6 +1185,40 @@ mod tests {
             !opted_out.contains("SENTINEL-SUBAGENT-CONTEXT"),
             "default (agents_md: false) must keep the preamble lean"
         );
+    }
+
+    // =========================================================================
+    // CONTRACT B — the profile's `agents_md:` gate is a CEILING over the
+    // role's opt-in (RED).
+    //
+    // Sub-agent roles keep their own per-role `agents_md` opt-in (pinned
+    // above), but a profile with `agents_md: false` must strip it: a role
+    // with `agents_md: true` still gets none. The locked seam is the pure
+    // combine the delegation call site applies before calling
+    // `build_sub_agent_preamble` (whose last parameter stays the FINAL
+    // bool, so the pins above keep their shape):
+    //
+    //     fn agents_md_effective(role_agents_md: bool, profile_ceiling: bool) -> bool
+    //
+    // Compile-RED until the helper lands.
+    // =========================================================================
+
+    /// The ceiling rule: effective = role opt-in AND profile gate.
+    /// (RED — the helper does not exist yet.)
+    #[test]
+    fn agents_md_ceiling_is_role_opt_in_and_profile_gate() {
+        for (role, ceiling, expected) in [
+            (true, true, true),   // opted in, profile silent ⇒ injected
+            (true, false, false), // the ceiling: opted-in role still gets none
+            (false, true, false), // opt-out stays opt-out
+            (false, false, false),
+        ] {
+            assert_eq!(
+                agents_md_effective(role, ceiling),
+                expected,
+                "role agents_md={role} under profile ceiling={ceiling} must be {expected}"
+            );
+        }
     }
 
     /// A running bg process is surfaced to the sub-agent, positioned after the

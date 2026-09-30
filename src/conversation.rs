@@ -317,6 +317,11 @@ pub struct Conversation {
     /// such files carry is ignored on load (no auto-mapping — amendment 5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
+    /// The config profile this conversation runs under, or `None` for the
+    /// base config. Same lifecycle as `pipeline`: chosen before the first
+    /// turn, carried over by `/new`, re-applied by `/load`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 impl Conversation {
@@ -349,6 +354,7 @@ impl Conversation {
             metadata: ConversationMetadata::default(),
             todos: crate::tools::todo::TodoList::new(),
             pipeline: None,
+            profile: None,
         }
     }
 
@@ -1390,5 +1396,73 @@ mod tests {
         );
         // And the field is also None directly, since no `pipeline` key.
         assert_eq!(conv.pipeline, None);
+    }
+
+    // ── per-conversation profile (Layer C, RED) ─────────────────────────────
+    //
+    // C1: `Conversation.profile: Option<String>` with `#[serde(default)]` —
+    // the persisted truth for the runtime per-conversation profile
+    // selection, mirroring `Conversation.pipeline` (the one nullable fact
+    // the session verbs derive the effective config from). Old conversation
+    // files without the field must load as `None`.
+    //
+    // Compile-RED until the field exists (E0599).
+
+    /// A fresh conversation has no profile — `None` is the baseline, exactly
+    /// like `pipeline`.
+    #[test]
+    fn new_conversation_has_no_profile() {
+        let conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "claude-3".into(),
+            String::new(),
+        );
+        assert!(conv.profile.is_none());
+    }
+
+    /// The profile round-trips through serde without loss.
+    #[test]
+    fn profile_roundtrips_through_json() {
+        let mut conv = Conversation::new(
+            "Test".into(),
+            "openrouter".into(),
+            "claude-3".into(),
+            String::new(),
+        );
+        conv.profile = Some("web".to_string());
+
+        let json = serde_json::to_string(&conv).unwrap();
+        let parsed: Conversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.profile.as_deref(),
+            Some("web"),
+            "the profile must survive a serialize → deserialize round-trip"
+        );
+    }
+
+    /// A conversation file written before the field existed (no `profile`
+    /// key) loads as `None` — `#[serde(default)]` is the migration.
+    /// Neighbouring fields stay intact.
+    #[test]
+    fn old_conversation_json_without_profile_field_loads_as_none() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "old",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "messages": [],
+            "provider_name": "openrouter",
+            "model": "anthropic/claude-3.7-sonnet",
+            "metadata": {}
+        }"#;
+        let parsed: Conversation =
+            serde_json::from_str(json).expect("a pre-profile conversation file must load");
+        assert!(
+            parsed.profile.is_none(),
+            "absent `profile` key must default to None"
+        );
+        assert_eq!(parsed.name, "old");
+        assert_eq!(parsed.model, "anthropic/claude-3.7-sonnet");
     }
 }

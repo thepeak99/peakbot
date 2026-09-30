@@ -148,6 +148,26 @@ pub struct AppState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_pipeline: Option<String>,
 
+    /// The config profile in effect for this conversation, or `None` for the
+    /// base config. Mirror of `Conversation.profile`; under a boot
+    /// `--profile` pin it is the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_profile: Option<String>,
+
+    /// Profile names the client may pick (the Profile tab's picker),
+    /// sorted. Server-computed and stamped at session build and after every
+    /// profile apply/reload — `is_empty()` hides the profile tab, never a
+    /// separate flag. `#[serde(default)]` keeps pre-Layer-D snapshots
+    /// parsing cleanly.
+    #[serde(default)]
+    pub profiles: Vec<String>,
+
+    /// The web tabs the client should render under this session's active
+    /// profile — computed server-side (the client must not re-derive config
+    /// rules). Same stamping points as `profiles`.
+    #[serde(default)]
+    pub visible_tabs: Vec<String>,
+
     /// The currently-running sub-agent, if any, and its pause status.
     /// `None` when no sub-agent is running (orchestrator-only turn, or
     /// between sub-agent invocations). `#[serde(default)]` keeps older
@@ -2559,5 +2579,81 @@ mod tests {
             parsed.sub_agent, None,
             "missing sub_agent key must default to None"
         );
+    }
+
+    // ── Layer D: `profiles` / `visible_tabs` fields on AppState (RED) ──────
+    //
+    // D4: the outbound state snapshot must carry `profiles: Vec<String>`
+    // and `visible_tabs: Vec<String>` (`active_profile` already exists,
+    // pinned separately below) — snake_case, consistent with every other
+    // wire field (`selected_pipeline`, `active_profile`). Compile-RED
+    // until both fields exist on `AppState` (E0609 on `.profiles` /
+    // `.visible_tabs`, or "no field" on the struct literal below).
+
+    /// The new fields round-trip 1:1 and use the SAME snake_case naming
+    /// style the existing `selected_pipeline`/`active_profile` fields do
+    /// — no camelCase drift, no `#[serde(rename)]` needed anywhere else.
+    #[test]
+    fn profile_view_fields_serialize_snake_case_and_round_trip() {
+        let mut state = AppState::new();
+        state.profiles = vec!["admin".to_string(), "web".to_string()];
+        state.active_profile = Some("web".to_string());
+        state.visible_tabs = vec!["session".to_string(), "bash".to_string()];
+
+        let json = serde_json::to_string(&state).expect("serializes");
+        assert!(
+            json.contains("\"profiles\":[\"admin\",\"web\"]"),
+            "profiles must serialize snake_case as a top-level array; got: {json}"
+        );
+        assert!(
+            json.contains("\"active_profile\":\"web\""),
+            "active_profile must serialize snake_case, matching the existing field; got: {json}"
+        );
+        assert!(
+            json.contains("\"visible_tabs\":[\"session\",\"bash\"]"),
+            "visible_tabs must serialize snake_case as a top-level array; got: {json}"
+        );
+
+        let parsed: AppState = serde_json::from_str(&json).expect("round-trips back");
+        assert_eq!(
+            parsed.profiles,
+            vec!["admin".to_string(), "web".to_string()]
+        );
+        assert_eq!(parsed.active_profile.as_deref(), Some("web"));
+        assert_eq!(
+            parsed.visible_tabs,
+            vec!["session".to_string(), "bash".to_string()]
+        );
+    }
+
+    /// An old snapshot (pre-Layer-D) with no `profiles`/`visible_tabs`
+    /// keys must still parse — both fields need `#[serde(default)]` so a
+    /// mid-rollout client/server pair doesn't hard-fail on missing keys.
+    #[test]
+    fn old_snapshot_without_profile_view_fields_parses_with_empty_defaults() {
+        let old_snapshot = r#"{
+            "chat": {"messages": [], "auto_scroll": true, "scroll_offset": 0},
+            "todo": {"items": [], "visible": false},
+            "input": {"buffer": "", "cursor": 0, "history": []},
+            "stats": {"model": "", "model_alias": "", "provider_name": "", "total_input_tokens": 0, "total_output_tokens": 0, "total_api_calls": 0, "total_cost": 0.0, "lanes": []},
+            "context": {"current_usage": 0, "window_size": 0, "compaction_enabled": false, "compaction_threshold": 0.0, "last_input_tokens": 0, "compaction_keep_recent": 0},
+            "conversation": null,
+            "preferences": {"theme": "auto", "tool_render_mode": "collapsed"},
+            "is_running": false,
+            "is_loading": false,
+            "is_final": false,
+            "status_message": null,
+            "exit_requested": false,
+            "pending_input_count": 0,
+            "bg": {"running_count": 0, "recent_summaries": []},
+            "bash_panel": {"kind": "idle"},
+            "bash_panel_visibility": "Auto"
+        }"#;
+
+        let parsed: AppState =
+            serde_json::from_str(old_snapshot).expect("old snapshot must parse on new code");
+        assert_eq!(parsed.profiles, Vec::<String>::new());
+        assert_eq!(parsed.visible_tabs, Vec::<String>::new());
+        assert_eq!(parsed.active_profile, None);
     }
 }
