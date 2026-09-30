@@ -600,10 +600,14 @@ pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
 /// `memory_enabled` gates the `memory.md` instructions: when false the
 /// section is omitted so the model is never told to read/update memory.md.
 ///
+/// `agents_md_enabled` gates the repo's `agents.md` section: when false the
+/// section is omitted (the profile's `agents_md: false` ceiling).
+///
 /// `subagents_active` selects the recipe: when true (orchestrator)
 /// `orchestrator_prompt` (if set) is appended as extra framing. Memory,
-/// skills, env block and agents.md are shared by both recipes, as is the core
-/// tool guidance unless `head` replaces it (see below).
+/// skills, env block and (when enabled) agents.md are shared by both
+/// recipes, as is the core tool guidance unless `head` replaces it (see
+/// below).
 ///
 /// `head` fills the static head of the prompt and leads **either** recipe:
 ///
@@ -619,11 +623,13 @@ pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
 /// `subagents_active` matter: the agentless recipe falls back to the built-in
 /// crusader persona, while the orchestrator leads with the core guidance — the
 /// crusader would confuse an agent whose job is to coordinate a team.
+#[allow(clippy::too_many_arguments)] // agents_md_enabled is the new profile ceiling; callers pass the resolved value
 pub fn build_system_prompt(
     skills: &SkillRegistry,
     shell_kind: Option<&ShellKind>,
     cwd: &std::path::Path,
     memory_enabled: bool,
+    agents_md_enabled: bool,
     subagents_active: bool,
     orchestrator_prompt: Option<&str>,
     head: Option<&PromptHead>,
@@ -665,7 +671,9 @@ pub fn build_system_prompt(
 
     prompt.push_str(&skills.to_system_prompt_section());
     prompt.push_str(&env_block(shell_kind, cwd));
-    prompt.push_str(&agents_md_section(cwd));
+    if agents_md_enabled {
+        prompt.push_str(&agents_md_section(cwd));
+    }
 
     if subagents_active
         && let Some(extra) = orchestrator_prompt.map(str::trim).filter(|s| !s.is_empty())
@@ -827,6 +835,10 @@ pub struct RebuildContext {
     /// (and, at the compaction call site, the auto-compaction). Refreshed on
     /// config reload like `skills`.
     pub memory_enabled: bool,
+    /// Whether the repo's `agents.md` is injected into the system prompt —
+    /// the profile's `agents_md:` ceiling, applied at the last reload.
+    /// Refreshed on config reload like `memory_enabled`.
+    pub agents_md_enabled: bool,
     /// Built-in tool filter (blocklist/allowlist). Refreshed on config reload;
     /// consumed by `add_builtin_tools` when the agent is rebuilt.
     pub tools_filter: crate::config::NameFilter,
@@ -2533,6 +2545,9 @@ impl AgentRunner {
 
         ctx.registry = Arc::new(new_registry);
         ctx.memory_enabled = config.memory.enabled;
+        // The profile's `agents_md:` ceiling rides the reloaded config —
+        // the rebuild seam that follows reads it for the fresh prompt.
+        ctx.agents_md_enabled = config.agents_md;
         ctx.tools_filter = config.tools.clone();
         // `ctx.system_prompt` is recomputed by the rebuild seam that follows
         // every reload (it derives persona/orchestrator framing from the live
@@ -2646,17 +2661,31 @@ impl AgentRunner {
         // Rebuild MCP tool list from the long-lived handles. McpTool
         // implements Clone (rig 0.33), so we get a fresh Vec without
         // restarting any subprocess. See agents.md / multi-model.md.
+        // Grouped per server so the active profile's `mcp_servers:` gate
+        // can filter by server name — a runtime `/profile` switch changes
+        // the rebuilt agent's MCP toolset (boot does the same).
         let mcp_tools: Option<Vec<Box<dyn rig_core::tool::ToolDyn>>> = if ctx.mcp_handles.is_empty()
         {
             None
         } else {
-            let mut all = Vec::new();
-            for h in ctx.mcp_handles.iter() {
-                for t in h.tools().iter().cloned() {
-                    all.push(Box::new(t) as Box<dyn rig_core::tool::ToolDyn>);
-                }
-            }
-            Some(all)
+            let groups: Vec<(String, Vec<Box<dyn rig_core::tool::ToolDyn>>)> = ctx
+                .mcp_handles
+                .iter()
+                .map(|h| {
+                    (
+                        h.name().to_string(),
+                        h.tools()
+                            .iter()
+                            .cloned()
+                            .map(|t| Box::new(t) as Box<dyn rig_core::tool::ToolDyn>)
+                            .collect(),
+                    )
+                })
+                .collect();
+            Some(mcp_tools_for_profile(
+                groups,
+                config.active_mcp_server_filter(),
+            ))
         };
 
         // `delegate` is registered iff a pipeline is selected, and it exposes
@@ -2680,6 +2709,7 @@ impl AgentRunner {
             ctx.shell_kind.as_ref(),
             &sm_for_provider.session_cwd(),
             ctx.memory_enabled,
+            ctx.agents_md_enabled,
             active.is_some(),
             active
                 .as_ref()
@@ -2703,6 +2733,7 @@ impl AgentRunner {
             &ctx.skills,
             config.retry(),
             config.timeouts(),
+            ctx.agents_md_enabled,
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 
@@ -4168,7 +4199,6 @@ fn refresh_attempt_from_transcript(
 /// properly closed on drop to avoid the "RunningService dropped without
 /// explicit close()" warning.
 pub struct McpServerHandle {
-    #[allow(unused)]
     name: String,
     tools: Vec<McpTool>,
     /// The running service connection. Must be closed on drop for clean shutdown.
@@ -4213,6 +4243,12 @@ impl Drop for McpServerHandle {
 }
 
 impl McpServerHandle {
+    /// The server's configured name — the key a profile's `mcp_servers:`
+    /// gate addresses.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn tools(&self) -> &[McpTool] {
         &self.tools
     }
@@ -4252,6 +4288,29 @@ impl McpServerHandle {
 
         self.into_tools()
     }
+}
+
+/// Flatten per-server MCP tool groups into the flat tool list an agent
+/// receives, honouring a profile's `mcp_servers:` gate. Servers keep their
+/// input order, tools keep their per-server order; `None` = no gate
+/// (every server's tools — today's behaviour), `enabled: false` = none.
+/// The servers themselves keep running either way — this only decides
+/// which servers' tools reach the agent.
+///
+/// Takes the groups BY VALUE (not by reference): `Box<dyn ToolDyn>` cannot
+/// be cloned (`ToolDyn` carries no `Clone` bound — most tools, including
+/// the plain `Tool` blanket impl, have no way to duplicate themselves), so
+/// this is a pure ownership filter/flatten rather than a copy. Callers that
+/// need the groups again build them twice (cheap: `McpTool: Clone`).
+pub fn mcp_tools_for_profile(
+    servers: Vec<(String, Vec<Box<dyn ToolDyn>>)>,
+    filter: Option<&crate::config::NameFilter>,
+) -> Vec<Box<dyn ToolDyn>> {
+    servers
+        .into_iter()
+        .filter(|(name, _)| filter.is_none_or(|f| f.allows(name)))
+        .flat_map(|(_, tools)| tools.into_iter())
+        .collect()
 }
 
 pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpServerHandle> {
@@ -4557,6 +4616,7 @@ mod tests {
             Some(&ps),
             &std::env::current_dir().unwrap(),
             true,
+            true,
             false,
             None,
             None,
@@ -4585,6 +4645,7 @@ mod tests {
             &skills,
             Some(&bash),
             &std::env::current_dir().unwrap(),
+            true,
             true,
             false,
             None,
@@ -4615,7 +4676,7 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-CONTENT").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, None, None);
+        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
 
         assert!(
             prompt.contains(&dir.to_string_lossy().to_string()),
@@ -4643,7 +4704,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, None, None);
+        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
         assert!(
             prompt.contains("# Memory.md"),
             "memory section must be present when memory is enabled"
@@ -4663,7 +4724,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, false, false, None, None);
+        let prompt = build_system_prompt(&skills, None, &dir, false, true, false, None, None);
         assert!(
             !prompt.contains("# Memory.md"),
             "memory section must be omitted when memory is disabled"
@@ -4680,13 +4741,13 @@ mod tests {
         let skills = SkillRegistry::new();
         let cwd = std::env::current_dir().unwrap();
 
-        let agentless = build_system_prompt(&skills, None, &cwd, false, false, None, None);
+        let agentless = build_system_prompt(&skills, None, &cwd, false, true, false, None, None);
         assert!(
             agentless.contains("CODE CRUSADER"),
             "agentless prompt must carry the persona"
         );
 
-        let orchestrator = build_system_prompt(&skills, None, &cwd, false, true, None, None);
+        let orchestrator = build_system_prompt(&skills, None, &cwd, false, true, true, None, None);
         assert!(
             !orchestrator.contains("CODE CRUSADER"),
             "orchestrator prompt must drop the persona"
@@ -4705,24 +4766,118 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let extra = Some("Lead the SENTINEL-TEAM well.");
 
-        let on = build_system_prompt(&skills, None, &cwd, false, true, extra, None);
+        let on = build_system_prompt(&skills, None, &cwd, false, true, true, extra, None);
         assert!(
             on.contains("SENTINEL-TEAM"),
             "orchestrator prompt must be appended when sub-agents are active"
         );
 
-        let off = build_system_prompt(&skills, None, &cwd, false, false, extra, None);
+        let off = build_system_prompt(&skills, None, &cwd, false, true, false, extra, None);
         assert!(
             !off.contains("SENTINEL-TEAM"),
             "orchestrator prompt must be ignored in agentless mode"
         );
 
         // A blank orchestrator prompt adds no section.
-        let blank = build_system_prompt(&skills, None, &cwd, false, true, Some("   "), None);
+        let blank = build_system_prompt(&skills, None, &cwd, false, true, true, Some("   "), None);
         assert!(
             !blank.contains("# Orchestrator Instructions"),
             "a blank orchestrator prompt must not emit a section header"
         );
+    }
+
+    // =========================================================================
+    // CONTRACT B — `Profile.agents_md` at the prompt seam (RED).
+    //
+    // The flag reaches the builder as `agents_md_enabled: bool`, inserted
+    // after `memory_enabled` (the two dynamic-section gates sit together):
+    //
+    //     build_system_prompt(
+    //         skills, shell_kind, cwd,
+    //         memory_enabled,
+    //         agents_md_enabled,   // NEW — false ⇒ no agents.md section
+    //         subagents_active, orchestrator_prompt, head,
+    //     )
+    //
+    // Compile-RED until the parameter lands: every call below passes eight
+    // arguments to today's seven-argument function.
+    // =========================================================================
+
+    /// `agents_md_enabled: false` omits the agents.md content from the
+    /// main agent's system prompt (the profile's `agents_md: false`
+    /// ceiling). (RED — the parameter does not exist yet.)
+    #[test]
+    fn system_prompt_omits_agents_md_when_disabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "peakbot-agents-md-off-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-OFF").unwrap();
+
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, &dir, true, false, false, None, None);
+        assert!(
+            !prompt.contains("SENTINEL-AGENTS-OFF"),
+            "agents_md_enabled: false must omit the agents.md content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `agents_md_enabled: true` keeps today's behaviour: the agents.md
+    /// content is injected. (RED — the parameter does not exist yet.)
+    #[test]
+    fn system_prompt_includes_agents_md_when_enabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "peakbot-agents-md-on-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-ON").unwrap();
+
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
+        assert!(
+            prompt.contains("SENTINEL-AGENTS-ON"),
+            "agents_md_enabled: true must inject the agents.md content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The gate applies to the orchestrator recipe too, not just the
+    /// agentless one — one ceiling for the whole session's main agent.
+    /// (RED — the parameter does not exist yet.)
+    #[test]
+    fn system_prompt_omits_agents_md_for_orchestrator_recipe_too() {
+        let dir = std::env::temp_dir().join(format!(
+            "peakbot-agents-md-orch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-ORCH").unwrap();
+
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, &dir, true, false, true, None, None);
+        assert!(
+            !prompt.contains("SENTINEL-AGENTS-ORCH"),
+            "the agents_md gate must hold for the orchestrator recipe as well"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -5505,6 +5660,7 @@ mod tests {
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
             profile_pin: None,
@@ -6047,6 +6203,226 @@ mod tests {
             classify_submission(input),
             SubmitKind::InvalidAttachment(_)
         ));
+    }
+
+    // =========================================================================
+    // CONTRACT A — `Profile.mcp_servers` at the tool seam (RED).
+    //
+    // MCP tools ARE tracked per server today (`McpServerHandle` owns a
+    // `name` + its `tools`), but both flattening sites (`create_session` in
+    // `src/session.rs`, `rebuild_agent_for_resolved` here) collapse the
+    // handles into one flat `Vec<Box<dyn ToolDyn>>` before the profile can
+    // see them. The locked seam is a pure filter over the per-server
+    // collection, so the gate is testable without a live MCP subprocess:
+    //
+    //     pub fn mcp_tools_for_profile(
+    //         servers: &[(String, Vec<Box<dyn ToolDyn>>)],
+    //         filter: Option<&NameFilter>,
+    //     ) -> Vec<Box<dyn ToolDyn>>
+    //
+    // Servers in input order, tools in per-server order; `None` = no gate
+    // (every server's tools — today's behaviour); `enabled: false` = none.
+    // Both flattening sites build the groups from `mcp_handles` (the new
+    // `McpServerHandle::name()` accessor) and pass
+    // `config.active_mcp_server_filter()` — boot AND rebuild, so a runtime
+    // `/profile` switch changes the rebuilt agent's MCP toolset.
+    //
+    // Compile-RED until the function lands.
+    // =========================================================================
+
+    /// Two throwaway rig tools standing in for MCP tools — `Tool::NAME` is
+    /// per-type, hence two unit structs (the same trick as `InnerEcho` in
+    /// `src/providers/mod.rs::tests`).
+    struct AlphaTool;
+    impl rig_core::tool::Tool for AlphaTool {
+        const NAME: &'static str = "alpha_tool";
+        type Error = std::convert::Infallible;
+        type Args = serde_json::Value;
+        type Output = String;
+        async fn definition(&self, _p: String) -> rig_core::completion::ToolDefinition {
+            rig_core::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "alpha".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn call(&self, _args: serde_json::Value) -> Result<String, Self::Error> {
+            Ok("alpha".to_string())
+        }
+    }
+
+    struct BetaTool;
+    impl rig_core::tool::Tool for BetaTool {
+        const NAME: &'static str = "beta_tool";
+        type Error = std::convert::Infallible;
+        type Args = serde_json::Value;
+        type Output = String;
+        async fn definition(&self, _p: String) -> rig_core::completion::ToolDefinition {
+            rig_core::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "beta".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn call(&self, _args: serde_json::Value) -> Result<String, Self::Error> {
+            Ok("beta".to_string())
+        }
+    }
+
+    /// The fixture collection: server `alpha` with one tool, server `beta`
+    /// with one tool — the shape both flattening sites produce.
+    fn mcp_fixture_servers() -> Vec<(String, Vec<Box<dyn rig_core::tool::ToolDyn>>)> {
+        use rig_core::tool::ToolDyn;
+        vec![
+            (
+                "alpha".to_string(),
+                vec![Box::new(AlphaTool) as Box<dyn ToolDyn>],
+            ),
+            (
+                "beta".to_string(),
+                vec![Box::new(BetaTool) as Box<dyn ToolDyn>],
+            ),
+        ]
+    }
+
+    fn tool_names(tools: &[Box<dyn rig_core::tool::ToolDyn>]) -> Vec<String> {
+        tools.iter().map(|t| t.name()).collect()
+    }
+
+    /// `None` = no gate: every server's tools, in server order.
+    /// (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_none_keeps_every_server_in_order() {
+        let servers = mcp_fixture_servers();
+        let tools = mcp_tools_for_profile(servers, None);
+        assert_eq!(
+            tool_names(&tools),
+            vec!["alpha_tool", "beta_tool"],
+            "no gate ⇒ every server's tools, in server order"
+        );
+    }
+
+    /// `only: [alpha]` ⇒ only alpha's tools reach the agent.
+    /// (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_only_keeps_named_servers() {
+        let servers = mcp_fixture_servers();
+        let gate = crate::config::NameFilter {
+            only: vec!["alpha".into()],
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert_eq!(
+            tool_names(&tools),
+            vec!["alpha_tool"],
+            "only: [alpha] ⇒ only alpha's tools"
+        );
+    }
+
+    /// `disabled: [alpha]` ⇒ everything but alpha's tools.
+    /// (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_disabled_drops_named_servers() {
+        let servers = mcp_fixture_servers();
+        let gate = crate::config::NameFilter {
+            disabled: vec!["alpha".into()],
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert_eq!(
+            tool_names(&tools),
+            vec!["beta_tool"],
+            "disabled: [alpha] ⇒ all servers but alpha"
+        );
+    }
+
+    /// `enabled: false` ⇒ no MCP tools at all (the servers keep running).
+    /// (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_enabled_false_keeps_nothing() {
+        let servers = mcp_fixture_servers();
+        let gate = crate::config::NameFilter {
+            enabled: false,
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert!(
+            tools.is_empty(),
+            "enabled: false ⇒ no MCP tools, got: {:?}",
+            tool_names(&tools)
+        );
+    }
+
+    /// Anti-astonishment (the `NameFilter` rule): EMPTY lists are a no-op —
+    /// `only: []` never means "none". (RED — the function does not exist
+    /// yet.)
+    #[test]
+    fn mcp_tools_for_profile_empty_lists_allow_all() {
+        for gate in [
+            crate::config::NameFilter {
+                only: vec![],
+                ..Default::default()
+            },
+            crate::config::NameFilter {
+                disabled: vec![],
+                ..Default::default()
+            },
+        ] {
+            // Fresh fixture per iteration: `mcp_tools_for_profile` now
+            // consumes the groups by value (tools aren't `Clone`), so the
+            // same `servers` binding cannot be reused across loop passes.
+            let servers = mcp_fixture_servers();
+            let tools = mcp_tools_for_profile(servers, Some(&gate));
+            assert_eq!(
+                tool_names(&tools),
+                vec!["alpha_tool", "beta_tool"],
+                "an empty list must be a no-op, got: {:?}",
+                tool_names(&tools)
+            );
+        }
+    }
+
+    /// A name the config layer would have rejected still filters to
+    /// nothing at the pure seam (validation is upstream; the filter must
+    /// not panic or leak tools on an unknown name). (RED — the function
+    /// does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_only_unknown_name_keeps_nothing() {
+        let servers = mcp_fixture_servers();
+        let gate = crate::config::NameFilter {
+            only: vec!["ghost".into()],
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert!(
+            tools.is_empty(),
+            "only: [ghost] matches no server ⇒ no tools, got: {:?}",
+            tool_names(&tools)
+        );
+    }
+
+    /// Edge: a server with ZERO tools contributes nothing and must not
+    /// break the filter. (RED — the function does not exist yet.)
+    #[test]
+    fn mcp_tools_for_profile_skips_server_with_no_tools() {
+        use rig_core::tool::ToolDyn;
+        let servers = vec![
+            ("alpha".to_string(), Vec::<Box<dyn ToolDyn>>::new()),
+            (
+                "beta".to_string(),
+                vec![Box::new(BetaTool) as Box<dyn ToolDyn>],
+            ),
+        ];
+        let gate = crate::config::NameFilter {
+            only: vec!["alpha".into()],
+            ..Default::default()
+        };
+        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        assert!(
+            tools.is_empty(),
+            "an allowed server with no tools yields no tools, got: {:?}",
+            tool_names(&tools)
+        );
     }
 
     // --- MCP tests (pre-existing) -------------------------------------------
@@ -7618,6 +7994,7 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
             profile_pin: None,
@@ -7679,6 +8056,7 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
             profile_pin: None,
@@ -7724,6 +8102,7 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
             profile_pin: None,
@@ -7882,6 +8261,7 @@ pipelines:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
             profile_pin: None,
@@ -8747,6 +9127,7 @@ profiles:
             skills: crate::skills::SkillRegistry::default(),
             vector_store: None,
             memory_enabled: false,
+            agents_md_enabled: true,
             tools_filter: crate::config::NameFilter::default(),
             prompt_head: None,
             profile_pin: profile_pin.map(str::to_string),
@@ -9248,6 +9629,131 @@ profiles:
                 "profile".to_string(),
             ],
             "the profile's disabled tab must be gone from the client view"
+        );
+    }
+
+    // =========================================================================
+    // CONTRACT B — `Profile.agents_md` at the `handle_select_profile`
+    // harness (RED / guard).
+    //
+    // The repo tree carries a sentinel `agents.md`; the rebuild seam
+    // recomputes `ctx.system_prompt` from the session cwd, so the rebuilt
+    // prompt is observable without touching the agent. Selecting a profile
+    // with `agents_md: false` must rebuild on a prompt WITHOUT the
+    // sentinel; a profile without the key keeps today's behaviour (WITH it).
+    //
+    // The first test is RED today for the right reason: `agents_md:` is an
+    // unknown profile key, so the reload fails and the selection is refused
+    // (`outcome` is `Err` before any prompt assertion runs).
+    // =========================================================================
+
+    /// Selecting a profile with `agents_md: false` rebuilds the agent on a
+    /// system prompt WITHOUT the repo's agents.md content.
+    /// (RED — the profile key does not exist yet.)
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_agents_md_false_omits_agents_md_from_rebuilt_prompt() {
+        const MASTER: &str = "\
+providers:
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: llama3
+        alias: local
+default_model: local
+profiles:
+  web:
+    agents_md: false
+";
+        let (outcome, sm, ctx) = with_master_config(MASTER, |repo| async move {
+            std::fs::write(repo.join("agents.md"), "SENTINEL-HARNESS-AGENTS")
+                .expect("write sentinel agents.md");
+            let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                profile_handler_fixture(&repo, MASTER, None);
+            let mut config = config;
+            let mut ctx = ctx;
+            let mut agent_slot = agent_slot;
+            let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+            let outcome = AgentRunner::handle_select_profile(
+                Some("web".into()),
+                &mut agent_slot,
+                &mut config,
+                &Some(sm.clone()),
+                &hook_cell,
+                &info_cell,
+                &mut event_processor,
+                Some(&mut ctx),
+            )
+            .await;
+            (outcome, sm, ctx)
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "selecting the agents_md profile must succeed: {outcome:?}"
+        );
+        assert!(
+            any_system_message(&sm, "Profile 'web' selected"),
+            "the selection must be announced"
+        );
+        assert!(
+            !ctx.system_prompt.contains("SENTINEL-HARNESS-AGENTS"),
+            "agents_md: false must keep agents.md out of the rebuilt prompt; prompt: {}",
+            ctx.system_prompt
+        );
+    }
+
+    /// Guard: a profile WITHOUT `agents_md:` keeps today's behaviour — the
+    /// rebuilt prompt still carries the repo's agents.md. (GREEN today;
+    /// must stay green: absent = unchanged.)
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn handle_select_profile_without_agents_md_keeps_agents_md_in_rebuilt_prompt() {
+        const MASTER: &str = "\
+providers:
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: llama3
+        alias: local
+default_model: local
+profiles:
+  web:
+    tools:
+      disabled: [bash]
+";
+        let (outcome, _sm, ctx) = with_master_config(MASTER, |repo| async move {
+            std::fs::write(repo.join("agents.md"), "SENTINEL-HARNESS-AGENTS")
+                .expect("write sentinel agents.md");
+            let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                profile_handler_fixture(&repo, MASTER, None);
+            let mut config = config;
+            let mut ctx = ctx;
+            let mut agent_slot = agent_slot;
+            let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+            let outcome = AgentRunner::handle_select_profile(
+                Some("web".into()),
+                &mut agent_slot,
+                &mut config,
+                &Some(sm.clone()),
+                &hook_cell,
+                &info_cell,
+                &mut event_processor,
+                Some(&mut ctx),
+            )
+            .await;
+            (outcome, sm, ctx)
+        })
+        .await;
+
+        assert!(outcome.is_ok(), "happy path must succeed: {outcome:?}");
+        assert!(
+            ctx.system_prompt.contains("SENTINEL-HARNESS-AGENTS"),
+            "absent agents_md: must keep the repo's agents.md in the rebuilt prompt; prompt: {}",
+            ctx.system_prompt
         );
     }
 }

@@ -323,6 +323,7 @@ fn delegate_tool_for_registry(registry: std::sync::Arc<SubAgentRegistry>) -> Del
         event_sink: None,
         retry: peakbot::config::RetryConfig::default(),
         timeouts: peakbot::config::TimeoutsConfig::default(),
+        agents_md_ceiling: true,
     };
     DelegateTool::new(std::sync::Arc::new(deps))
 }

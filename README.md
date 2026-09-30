@@ -107,11 +107,19 @@ the user can pick from, so a runtime `/profile` choice is a convenience
 always boot with `--profile <name>` (the picker then empties and the Profile
 tab hides).
 
-A profile can override five keys: `tools:`, `memory:`, `pipelines:`,
-`system_prompt:`, and `ui:`. The first three each use the shared filter
-documented in [Tool, Skill & Pipeline Filters](#tool-skill--pipeline-filters);
+A profile can override seven keys: `tools:`, `memory:`, `pipelines:`,
+`mcp_servers:`, `agents_md:`, `system_prompt:`, and `ui:`. The first three
+each use the shared filter documented in
+[Tool, Skill & Pipeline Filters](#tool-skill--pipeline-filters);
 `system_prompt:` is documented in [System Prompt](#system-prompt) below; `ui:`
 covers the web tabs in the paragraph after this.
+
+`mcp_servers:` is that same name filter applied to the master config's
+`mcp_servers:` list: only the surviving servers' tools reach the agent
+(`only:` allowlist, `disabled:` blocklist, `enabled: false` for none), and a
+name the master never declares is a boot error. `agents_md:` is a plain bool
+— `false` omits the repo's `agents.md` section from the system prompt and
+caps every sub-agent to the same ceiling.
 
 `ui:` controls which web tabs a profile shows, using the same filter semantics
 as the other keys: a `tabs:` block with `only:` / `disabled:` (XOR, as in

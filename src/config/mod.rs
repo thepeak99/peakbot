@@ -389,6 +389,17 @@ pub struct Config {
     /// re-apply it.
     #[serde(skip)]
     pub active_profile: Option<String>,
+
+    /// Whether to inject the repo's `agents.md` into the main agent's system
+    /// prompt. Never deserialized — the YAML key lives on `Profile.agents_md`;
+    /// this is the ceiling `apply_profile` writes into, so the prompt builder
+    /// has one bool to read regardless of whether a profile is active.
+    /// Defaults to `true` (today's behaviour) — `default_true` because a
+    /// bare `#[serde(skip)]` would fall back to `bool::default()` (`false`)
+    /// on every direct `serde_yaml::from_str::<Config>`, silently stripping
+    /// agents.md from every prompt with no profile involved.
+    #[serde(skip, default = "default_true")]
+    pub agents_md: bool,
 }
 
 /// A named overlay over the effective config. Every field is optional:
@@ -407,6 +418,12 @@ pub struct Profile {
     /// `None` = every declared pipeline, i.e. today's behaviour.
     #[serde(default)]
     pub pipelines: Option<NameFilter>,
+    /// Narrows which MCP SERVERS' tools reach the agent built under this
+    /// profile (blocklist XOR allowlist, over the master's `mcp_servers[].name`
+    /// list). Servers keep running either way — this only gates which
+    /// server's tools the agent receives. `None` = every server's tools.
+    #[serde(default)]
+    pub mcp_servers: Option<NameFilter>,
     /// Takes the static-prompt slot for this profile: sets `system_prompt` and
     /// clears any `persona` the master/per-repo merge resolved to.
     #[serde(default)]
@@ -414,6 +431,11 @@ pub struct Profile {
     /// Web-UI tab visibility for this profile, filtered by [`TAB_NAMES`].
     #[serde(default)]
     pub ui: Option<ProfileUi>,
+    /// Whether to inject the repo's `agents.md` into the main agent's system
+    /// prompt. `None` = unchanged (today's behaviour: injected). Also the
+    /// ceiling over a sub-agent role's own `agents_md` opt-in.
+    #[serde(default)]
+    pub agents_md: Option<bool>,
 }
 
 impl Profile {
@@ -430,11 +452,17 @@ impl Profile {
         if self.pipelines.is_some() {
             out.push("pipelines");
         }
+        if self.mcp_servers.is_some() {
+            out.push("mcp_servers");
+        }
         if self.system_prompt.is_some() {
             out.push("system_prompt");
         }
         if self.ui.is_some() {
             out.push("ui");
+        }
+        if self.agents_md.is_some() {
+            out.push("agents_md");
         }
         out
     }
@@ -1848,6 +1876,7 @@ impl Default for Config {
             timeouts: TimeoutsConfig::default(),
             profiles: HashMap::new(),
             active_profile: None,
+            agents_md: true,
         }
     }
 }
@@ -2083,6 +2112,18 @@ impl Config {
         names
     }
 
+    /// The active profile's `mcp_servers:` gate, or `None` — the derivation
+    /// both agent-build sites (boot and rebuild) consume to decide which
+    /// MCP servers' tools the agent receives. No active profile, or a
+    /// profile without the key, means "no gate" (every server's tools),
+    /// never "allow nothing".
+    pub fn active_mcp_server_filter(&self) -> Option<&NameFilter> {
+        self.active_profile
+            .as_deref()
+            .and_then(|name| self.profiles.get(name))
+            .and_then(|profile| profile.mcp_servers.as_ref())
+    }
+
     /// Pure merge of the two config sources over defaults — the
     /// testable core shared by [`Config::load`] and [`Config::reload_for`].
     /// Master (if present) replaces defaults; per-repo (if present) is
@@ -2185,19 +2226,26 @@ fn apply_profile(mut cfg: Config, name: Option<&str>) -> Result<Config, String> 
         cfg.system_prompt = Some(s);
         cfg.persona = None;
     }
+    // The agents.md ceiling: writes into the Config-level carrier the
+    // prompt builder reads, so `agents_md: false` disables injection
+    // regardless of whether a profile is active.
+    if let Some(b) = profile.agents_md {
+        cfg.agents_md = b;
+    }
     cfg.active_profile = Some(name.to_string());
     Ok(cfg)
 }
 
-/// Validate the ACTIVE profile's `pipelines:` gate against MASTER's own
-/// `pipelines:` names — the one check that must run while master is still
-/// separate from the per-repo overlay, i.e. at the master-load step, before
-/// [`Config::merge_sources`]. Called from both [`Config::load`] and
-/// [`Config::reload_for`] (one helper, so the two paths cannot drift).
+/// Validate the ACTIVE profile's `pipelines:` and `mcp_servers:` gates
+/// against MASTER's own declared names — the one check that must run while
+/// master is still separate from the per-repo overlay, i.e. at the
+/// master-load step, before [`Config::merge_sources`]. Called from both
+/// [`Config::load`] and [`Config::reload_for`] (one helper, so the two
+/// paths cannot drift).
 ///
 /// The name universe is master's list, not the merged one: profiles are a
 /// master-config-only concept (`merge_with` refuses per-repo `profiles:`),
-/// so a gate can only name teams the master config declares. An absent
+/// so a gate can only name things the master config declares. An absent
 /// profile name is `Ok(())` here — the unknown-profile error is owned by
 /// [`apply_profile`]. Only the active profile is validated, exactly like
 /// `tools:`: an unselected profile's bad filter is inert.
@@ -2206,24 +2254,46 @@ fn validate_active_profile_filters(master: &Config, profile: Option<&str>) -> Re
     let Some(profile) = master.profiles.get(name) else {
         return Ok(());
     };
-    let Some(filter) = &profile.pipelines else {
-        return Ok(());
-    };
-    let label = format!("profiles.{name}.pipelines");
-    filter.validate_shape(&label)?;
-    let known: Vec<&str> = master.pipelines.iter().map(|p| p.name.as_str()).collect();
-    if known.is_empty() {
-        // `validate_names` would print `Known pipelines: .` — a poor message
-        // when master declares no pipelines at all. Name the first offending
-        // pipeline instead; a gate with no names stays valid.
-        if let Some(n) = filter.disabled.iter().chain(filter.only.iter()).next() {
-            return Err(format!(
-                "{label}: names pipeline '{n}', but the master config declares no pipelines."
-            ));
+    if let Some(filter) = &profile.pipelines {
+        let label = format!("profiles.{name}.pipelines");
+        filter.validate_shape(&label)?;
+        let known: Vec<&str> = master.pipelines.iter().map(|p| p.name.as_str()).collect();
+        if known.is_empty() {
+            // `validate_names` would print `Known pipelines: .` — a poor message
+            // when master declares no pipelines at all. Name the first offending
+            // pipeline instead; a gate with no names stays valid.
+            if let Some(n) = filter.disabled.iter().chain(filter.only.iter()).next() {
+                return Err(format!(
+                    "{label}: names pipeline '{n}', but the master config declares no pipelines."
+                ));
+            }
+        } else {
+            filter.validate_names(&label, "pipeline", &known)?;
         }
-        return Ok(());
     }
-    filter.validate_names(&label, "pipeline", &known)
+    if let Some(filter) = &profile.mcp_servers {
+        let label = format!("profiles.{name}.mcp_servers");
+        filter.validate_shape(&label)?;
+        let known: Vec<&str> = master
+            .mcp_servers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        if known.is_empty() {
+            // Mirrors the pipelines branch above: name the first offending
+            // server instead of printing an empty "Known servers: ." list.
+            if let Some(n) = filter.disabled.iter().chain(filter.only.iter()).next() {
+                return Err(format!(
+                    "{label}: names server '{n}', but the master config declares no MCP servers."
+                ));
+            }
+        } else {
+            filter.validate_names(&label, "server", &known)?;
+        }
+    }
+    Ok(())
 }
 
 /// Reject a config file that claims both halves of the static-prompt slot:
@@ -4539,6 +4609,8 @@ max_image_bytes: 10485760
                     pipelines: None,
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -4593,6 +4665,8 @@ max_image_bytes: 10485760
                     pipelines: None,
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -4643,6 +4717,8 @@ max_image_bytes: 10485760
                         pipelines: None,
                         system_prompt: None,
                         ui: None,
+                        mcp_servers: None,
+                        agents_md: None,
                     },
                 ),
                 (
@@ -4653,6 +4729,8 @@ max_image_bytes: 10485760
                         pipelines: None,
                         system_prompt: None,
                         ui: None,
+                        mcp_servers: None,
+                        agents_md: None,
                     },
                 ),
             ]),
@@ -4686,6 +4764,8 @@ max_image_bytes: 10485760
                     pipelines: None,
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -4699,6 +4779,8 @@ max_image_bytes: 10485760
                     pipelines: None,
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -4769,6 +4851,8 @@ max_image_bytes: 10485760
                     pipelines: None,
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -4841,6 +4925,8 @@ max_image_bytes: 10485760
                     pipelines: None,
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -4976,6 +5062,8 @@ max_image_bytes: 10485760
                     }),
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -5012,6 +5100,8 @@ max_image_bytes: 10485760
                     pipelines: None,
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -5052,6 +5142,8 @@ max_image_bytes: 10485760
             pipelines: None,
             system_prompt: None,
             ui: None,
+            mcp_servers: None,
+            agents_md: None,
         };
         assert_eq!(
             none.overridden_fields(),
@@ -5065,6 +5157,8 @@ max_image_bytes: 10485760
             pipelines: Some(NameFilter::default()),
             system_prompt: None,
             ui: None,
+            mcp_servers: None,
+            agents_md: None,
         };
         assert_eq!(
             all.overridden_fields(),
@@ -5078,6 +5172,8 @@ max_image_bytes: 10485760
             pipelines: Some(NameFilter::default()),
             system_prompt: None,
             ui: None,
+            mcp_servers: None,
+            agents_md: None,
         };
         assert_eq!(
             pipes.overridden_fields(),
@@ -5091,6 +5187,8 @@ max_image_bytes: 10485760
             pipelines: Some(NameFilter::default()),
             system_prompt: Some("FULL".to_string()),
             ui: None,
+            mcp_servers: None,
+            agents_md: None,
         };
         assert_eq!(
             all_four.overridden_fields(),
@@ -5104,11 +5202,39 @@ max_image_bytes: 10485760
             pipelines: None,
             system_prompt: Some("FULL".to_string()),
             ui: None,
+            mcp_servers: None,
+            agents_md: None,
         };
         assert_eq!(
             prompt_only.overridden_fields(),
             vec!["system_prompt"],
             "only `system_prompt` set ⇒ just that key"
+        );
+        // (f) all seven set ⇒ full declaration order, `mcp_servers` after
+        // `pipelines`, `agents_md` last (after `ui`).
+        let all_seven = Profile {
+            tools: Some(NameFilter::default()),
+            memory: Some(MemoryConfig::default()),
+            pipelines: Some(NameFilter::default()),
+            mcp_servers: Some(NameFilter::default()),
+            system_prompt: Some("FULL".to_string()),
+            ui: Some(ProfileUi {
+                tabs: Some(NameFilter::default()),
+            }),
+            agents_md: Some(false),
+        };
+        assert_eq!(
+            all_seven.overridden_fields(),
+            vec![
+                "tools",
+                "memory",
+                "pipelines",
+                "mcp_servers",
+                "system_prompt",
+                "ui",
+                "agents_md",
+            ],
+            "all seven set ⇒ declaration order, `mcp_servers` after `pipelines`, `agents_md` last"
         );
     }
 
@@ -5136,6 +5262,8 @@ max_image_bytes: 10485760
                     }),
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -5244,6 +5372,8 @@ max_image_bytes: 10485760
                     pipelines: None,
                     system_prompt: Some("FULL-PROFILE".to_string()),
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -5326,6 +5456,8 @@ max_image_bytes: 10485760
                         pipelines: None,
                         system_prompt: Some("FULL-PROFILE".to_string()),
                         ui: None,
+                        mcp_servers: None,
+                        agents_md: None,
                     },
                 )]),
                 ..Config::default()
@@ -5597,6 +5729,8 @@ max_image_bytes: 10485760
                     }),
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -5633,6 +5767,8 @@ max_image_bytes: 10485760
                     }),
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -5669,6 +5805,8 @@ max_image_bytes: 10485760
                     }),
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -5734,6 +5872,8 @@ max_image_bytes: 10485760
                     }),
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()
@@ -5832,6 +5972,8 @@ max_image_bytes: 10485760
                         }),
                         system_prompt: None,
                         ui: None,
+                        mcp_servers: None,
+                        agents_md: None,
                     },
                 )]),
                 ..Config::default()
@@ -6119,6 +6261,8 @@ profiles:
                         pipelines: Some(filter.clone()),
                         system_prompt: None,
                         ui: None,
+                        mcp_servers: None,
+                        agents_md: None,
                     },
                 )]),
                 ..Config::default()
@@ -6604,11 +6748,239 @@ profiles:
             ui: Some(ProfileUi {
                 tabs: Some(NameFilter::default()),
             }),
+            mcp_servers: None,
+            agents_md: None,
         };
         assert_eq!(
             all_five.overridden_fields(),
             vec!["tools", "memory", "pipelines", "system_prompt", "ui"],
             "all five set ⇒ declaration order, `ui` last"
+        );
+    }
+
+    // =========================================================================
+    // CONTRACT A — `Profile.mcp_servers: Option<NameFilter>` (RED).
+    //
+    // A NameFilter over MCP SERVER NAMES with the same `enabled` /
+    // `disabled` XOR `only` semantics as `pipelines:`. The servers keep
+    // running (boot-only); the gate decides which servers' tools the agent
+    // built under the profile receives.
+    //
+    // Compile-RED until the field + `Config::active_mcp_server_filter` land:
+    // every test below names a field/method that does not exist yet.
+    //
+    // The parse + validation half (unknown key, shape error, unknown name
+    // against master's list, active-profile-only scope) is pinned in
+    // `tests/profile_mcp_agents_md.rs` against the public seams.
+    // =========================================================================
+
+    /// Parse + value: an allowlist under `mcp_servers:` round-trips into the
+    /// profile's `NameFilter`. (RED — the field does not exist yet.)
+    #[test]
+    fn profile_mcp_servers_value_round_trips_from_yaml() {
+        let cfg: Config = serde_yaml::from_str(
+            "profiles:
+  web:
+    mcp_servers:
+      only: [alpha]
+",
+        )
+        .expect("mcp_servers: {only: …} must parse");
+        assert_eq!(
+            cfg.profiles.get("web").expect("profile parsed").mcp_servers,
+            Some(NameFilter {
+                only: vec!["alpha".into()],
+                ..Default::default()
+            }),
+            "the parsed gate must carry the allowlist"
+        );
+    }
+
+    /// `overridden_fields` (the boot-banner source) must report
+    /// `mcp_servers` when the profile sets it. (RED — the field does not
+    /// exist yet.)
+    #[test]
+    fn profile_overridden_fields_includes_mcp_servers_when_set() {
+        let mcp_only = Profile {
+            mcp_servers: Some(NameFilter::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            mcp_only.overridden_fields(),
+            vec!["mcp_servers"],
+            "only `mcp_servers` set ⇒ just that key"
+        );
+    }
+
+    /// The active profile's `mcp_servers:` gate, or `None` — the derivation
+    /// the agent-build seam consumes (boot AND rebuild). No profile active
+    /// ⇒ no gate. (RED — the method does not exist yet.)
+    #[test]
+    fn active_mcp_server_filter_none_when_no_profile_active() {
+        let cfg = Config::default();
+        assert!(
+            cfg.active_mcp_server_filter().is_none(),
+            "no active profile ⇒ no MCP server gate"
+        );
+    }
+
+    /// With the profile stamped active, the gate is the profile's — and it
+    /// filters by the usual `NameFilter` rules (`only` allowlist).
+    /// (RED — the method does not exist yet.)
+    #[test]
+    fn active_mcp_server_filter_reads_active_profile_gate() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "web".to_string(),
+                Profile {
+                    mcp_servers: Some(NameFilter {
+                        only: vec!["alpha".into()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            active_profile: Some("web".to_string()),
+            ..Config::default()
+        };
+        let gate = cfg
+            .active_mcp_server_filter()
+            .expect("the active profile's gate must be readable");
+        assert!(gate.allows("alpha"), "the allowlisted server must pass");
+        assert!(!gate.allows("beta"), "an unlisted server must be dropped");
+    }
+
+    /// An active profile WITHOUT a `mcp_servers:` gate means "no gate" (all
+    /// servers), not "a gate that allows nothing". (RED — the method does
+    /// not exist yet.)
+    #[test]
+    fn active_mcp_server_filter_none_when_profile_has_no_gate() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "tools_only".to_string(),
+                Profile {
+                    tools: Some(NameFilter::default()),
+                    ..Default::default()
+                },
+            )]),
+            active_profile: Some("tools_only".to_string()),
+            ..Config::default()
+        };
+        assert!(
+            cfg.active_mcp_server_filter().is_none(),
+            "a profile without mcp_servers: must mean 'no gate', not 'allow nothing'"
+        );
+    }
+
+    // =========================================================================
+    // CONTRACT B — `Profile.agents_md: Option<bool>` (RED).
+    //
+    // Absent = unchanged (default behaviour: agents.md IS injected),
+    // `false` = do not inject, `true` = inject as usual. The flag reaches
+    // the prompt builder through a Config-level carrier
+    // (`Config.agents_md: bool`, default `true`) that `apply_profile`
+    // writes — the same ceiling pattern as `tools:` / `pipelines:`.
+    //
+    // Compile-RED until the fields land. The parse half (bool type,
+    // overridden_fields) is pinned in `tests/profile_mcp_agents_md.rs`;
+    // the prompt half (`build_system_prompt` + the `handle_select_profile`
+    // harness) is pinned in `src/lib.rs::tests`.
+    // =========================================================================
+
+    /// The Config-level carrier defaults to TRUE: no profile ⇒ agents.md is
+    /// injected, exactly today's behaviour. Pins the hand-rolled
+    /// `Default for Config` — a derived `false` would silently strip
+    /// agents.md from every prompt. (RED — the field does not exist yet.)
+    #[test]
+    fn config_default_agents_md_is_true() {
+        assert!(
+            Config::default().agents_md,
+            "the default must keep agents.md injection on"
+        );
+    }
+
+    /// `apply_profile` writes the profile's `agents_md: false` into the
+    /// Config-level field — the ceiling the prompt builder reads.
+    /// (RED — the fields do not exist yet.)
+    #[test]
+    fn apply_profile_agents_md_false_sets_config_field() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "web".to_string(),
+                Profile {
+                    agents_md: Some(false),
+                    ..Default::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(cfg, Some("web")).expect("profile exists");
+        assert!(
+            !effective.agents_md,
+            "agents_md: false must disable injection in the effective config"
+        );
+        assert_eq!(
+            effective.active_profile.as_deref(),
+            Some("web"),
+            "the applied profile must be stamped"
+        );
+    }
+
+    /// `agents_md: true` explicitly re-asserts the default (inject as
+    /// usual). (RED — the fields do not exist yet.)
+    #[test]
+    fn apply_profile_agents_md_true_sets_config_field() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "web".to_string(),
+                Profile {
+                    agents_md: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(cfg, Some("web")).expect("profile exists");
+        assert!(
+            effective.agents_md,
+            "agents_md: true must keep injection on"
+        );
+    }
+
+    /// Absent `agents_md:` leaves the Config field untouched (default
+    /// true) — "absent = unchanged", like every other profile field.
+    /// (RED — the fields do not exist yet.)
+    #[test]
+    fn apply_profile_agents_md_absent_leaves_config_field_default() {
+        let cfg = Config {
+            profiles: HashMap::from([(
+                "tools_only".to_string(),
+                Profile {
+                    tools: Some(NameFilter::default()),
+                    ..Default::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(cfg, Some("tools_only")).expect("profile exists");
+        assert!(
+            effective.agents_md,
+            "a profile without agents_md: must leave the default (injection on)"
+        );
+    }
+
+    /// `overridden_fields` (the boot-banner source) must report `agents_md`
+    /// when the profile sets it. (RED — the field does not exist yet.)
+    #[test]
+    fn profile_overridden_fields_includes_agents_md_when_set() {
+        let agents_md_only = Profile {
+            agents_md: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            agents_md_only.overridden_fields(),
+            vec!["agents_md"],
+            "only `agents_md` set ⇒ just that key"
         );
     }
 
@@ -6877,6 +7249,8 @@ profiles:
                     pipelines: None,
                     system_prompt: None,
                     ui: None,
+                    mcp_servers: None,
+                    agents_md: None,
                 },
             )]),
             ..Config::default()

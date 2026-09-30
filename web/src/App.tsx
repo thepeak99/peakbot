@@ -237,7 +237,6 @@ export function App() {
           {
             id: "profile",
             label: "Profile",
-            icon: "👤",
             content: (
               <ProfilePanel
                 profiles={profiles}

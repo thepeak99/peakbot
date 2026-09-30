@@ -51,6 +51,7 @@ fn agentless_prompt_with_some_persona_replaces_crusader() {
         None,
         &cwd(),
         /* memory_enabled */ false,
+        /* agents_md_enabled */ true,
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Persona(custom.to_string())),
@@ -76,6 +77,7 @@ fn agentless_prompt_with_none_persona_keeps_crusader() {
         None,
         &cwd(),
         false,
+        /* agents_md_enabled */ true,
         false,
         None,
         /* persona */ None,
@@ -96,6 +98,7 @@ fn agentless_prompt_with_whitespace_only_persona_keeps_crusader() {
         None,
         &cwd(),
         false,
+        /* agents_md_enabled */ true,
         false,
         None,
         Some(&PromptHead::Persona("   \n  \t  \n".to_string())),
@@ -123,6 +126,7 @@ fn orchestrator_prompt_carries_configured_persona() {
         None,
         &cwd(),
         false,
+        /* agents_md_enabled */ true,
         /* subagents_active */ true,
         /* orchestrator_prompt */ None,
         Some(&PromptHead::Persona(custom.to_string())),
@@ -152,6 +156,7 @@ fn orchestrator_prompt_without_persona_carries_none_at_all() {
         None,
         &cwd(),
         false,
+        /* agents_md_enabled */ true,
         /* subagents_active */ true,
         None,
         /* persona */ None,
@@ -177,6 +182,7 @@ fn orchestrator_prompt_with_addendum_keeps_orchestrator_prompt_and_persona() {
         None,
         &cwd(),
         false,
+        /* agents_md_enabled */ true,
         true,
         Some(extra),
         Some(&PromptHead::Persona(custom.to_string())),
@@ -205,8 +211,17 @@ fn persona_to_core_join_is_a_single_newline_for_both_branches() {
     let skills = SkillRegistry::new();
     let custom = "MY CUSTOM PERSONA";
     let head = Some(PromptHead::Persona(custom.to_string()));
-    let configured = build_system_prompt(&skills, None, &cwd(), false, false, None, head.as_ref());
-    let builtin = build_system_prompt(&skills, None, &cwd(), false, false, None, None);
+    let configured = build_system_prompt(
+        &skills,
+        None,
+        &cwd(),
+        false,
+        true,
+        false,
+        None,
+        head.as_ref(),
+    );
+    let builtin = build_system_prompt(&skills, None, &cwd(), false, true, false, None, None);
 
     let core_idx_configured = configured
         .find("# Working Principles")
@@ -258,6 +273,7 @@ fn full_head_replaces_persona_and_core() {
         None,
         cwd.path(),
         /* memory_enabled */ false,
+        /* agents_md_enabled */ true,
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Full(format!("  \n{full}\n  "))),
@@ -317,6 +333,7 @@ fn full_head_keeps_every_dynamic_section() {
         None,
         cwd.path(),
         /* memory_enabled */ true,
+        /* agents_md_enabled */ true,
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Full(full.to_string())),
@@ -370,6 +387,7 @@ fn full_head_in_orchestrator_mode_keeps_orchestrator_instructions() {
         None,
         cwd.path(),
         /* memory_enabled */ false,
+        /* agents_md_enabled */ true,
         /* subagents_active */ true,
         /* orchestrator_prompt */ Some(extra),
         /* head */ Some(&PromptHead::Full(full.to_string())),
@@ -416,6 +434,7 @@ fn persona_head_still_keeps_core() {
         None,
         cwd.path(),
         /* memory_enabled */ false,
+        /* agents_md_enabled */ true,
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Persona(custom.to_string())),
@@ -482,6 +501,7 @@ fn blank_full_head_falls_back_to_built_in() {
         None,
         cwd.path(),
         /* memory_enabled */ false,
+        /* agents_md_enabled */ true,
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Full("   \n\t ".to_string())),

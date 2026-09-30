@@ -216,22 +216,32 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     let context_size = boot_model.context_size;
 
     // Each session clones the MCP tools list from the shared handles (not
-    // the subprocesses). `McpTool: Clone` makes this cheap.
+    // the subprocesses). `McpTool: Clone` makes this cheap. Grouped per
+    // server so the active profile's `mcp_servers:` gate can filter by
+    // server name at boot too (the rebuild seam does the same).
     let mcp_tools = if deps.mcp_handles.is_empty() {
         None
     } else {
         use rig_core::tool::ToolDyn;
-        let mut all = Vec::new();
-        for handle in deps.mcp_handles.iter() {
-            all.extend(
-                handle
-                    .tools()
-                    .iter()
-                    .cloned()
-                    .map(|t| Box::new(t) as Box<dyn ToolDyn>),
-            );
-        }
-        Some(all)
+        let groups: Vec<(String, Vec<Box<dyn ToolDyn>>)> = deps
+            .mcp_handles
+            .iter()
+            .map(|handle| {
+                (
+                    handle.name().to_string(),
+                    handle
+                        .tools()
+                        .iter()
+                        .cloned()
+                        .map(|t| Box::new(t) as Box<dyn ToolDyn>)
+                        .collect(),
+                )
+            })
+            .collect();
+        Some(crate::mcp_tools_for_profile(
+            groups,
+            config.active_mcp_server_filter(),
+        ))
     };
 
     // Stamp the SM *before* create_provider so the tools snapshot the
@@ -258,6 +268,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         deps.shell_kind.as_ref(),
         &session_cwd,
         config.memory.enabled,
+        config.agents_md,
         active.is_some(),
         active.and_then(|p| p.orchestrator_prompt.as_deref()),
         session_head.as_ref(),
@@ -286,6 +297,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         &deps.skills,
         &config.retry,
         &config.timeouts,
+        config.agents_md,
     )?;
 
     // Thread the resolved reasoning gates into the shared StateManager.
@@ -380,6 +392,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         skills: deps.skills.clone(),
         vector_store: deps.vector_store.clone(),
         memory_enabled: config.memory.enabled,
+        agents_md_enabled: config.agents_md,
         tools_filter: config.tools.clone(),
         prompt_head: config_head,
         profile_pin: deps.profile_pin.clone(),
