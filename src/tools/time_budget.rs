@@ -68,6 +68,27 @@ pub(crate) fn timeout_message(tool: &str, budget: Duration) -> String {
     )
 }
 
+/// The one and only wording for "a tool call panicked mid-flight". Shared by
+/// `TimeBudget::call`'s `catch_unwind` boundary so every panicking tool
+/// reports the same self-correcting shape to the model, instead of taking
+/// the whole turn down with it.
+///
+/// TODO(impl): wire this into `TimeBudget::call` behind a `catch_unwind`
+/// around the inner future (see `panicking_tool_returns_panic_result_instead_of_unwinding`
+/// and friends below). Stub only — not yet called from production code, so
+/// the real wording below is unreachable until that lands.
+#[allow(dead_code)] // TODO(impl): only exercised by tests until TimeBudget::call calls it
+pub(crate) fn panic_message(_tool: &str, _what: &str) -> String {
+    // TODO(impl): replace with the real wording:
+    // format!(
+    //     "💥 PANIC: tool `{tool}` crashed: {what}. Its work was abandoned mid-flight; \
+    //      its side effects may have partially happened — check before redoing. \
+    //      Do not retry the identical call — it will likely crash again; use a \
+    //      different tool or approach."
+    // )
+    String::new()
+}
+
 /// Wraps any `Box<dyn ToolDyn>` in a wall-clock deadline.
 pub struct TimeBudget {
     inner: Box<dyn ToolDyn>,
@@ -217,6 +238,27 @@ mod tests {
                     unreachable!()
                 })
             }),
+        }
+    }
+
+    /// Inner tool whose future panics once polled — the "panic happened
+    /// mid-flight, after the future existed" case. Used by the
+    /// `TimeBudget::call` panic-boundary tests.
+    fn panicking(name: &'static str, msg: &'static str) -> Named {
+        Named {
+            name,
+            build: Box::new(move || Box::pin(async move { panic!("{msg}") })),
+        }
+    }
+
+    /// Inner tool whose `call()` panics SYNCHRONOUSLY — before it ever hands
+    /// back a future. Exercises the other panic surface `TimeBudget::call`
+    /// must catch: the call to `self.inner.call(args)` itself, not just the
+    /// `.await` on whatever it returns.
+    fn panicking_sync(name: &'static str, msg: &'static str) -> Named {
+        Named {
+            name,
+            build: Box::new(move || -> CallFuture { panic!("{msg}") }),
         }
     }
 
@@ -665,5 +707,116 @@ mod tests {
         );
         assert!(msg.contains("fetch_page"), "tool name missing from: {msg}");
         assert!(msg.contains("35s"), "budget seconds missing from: {msg}");
+    }
+
+    // ── panic boundary (new: tool panics become tool results, not turn
+    //    aborts) ──────────────────────────────────────────────────────────
+    //
+    // `TimeBudget::call` already converts a fired deadline into `Ok(timeout_
+    // message(..))` instead of letting the inner future hang. The same
+    // decorator is the natural seam for the other way a tool call can fail
+    // to return normally: a panic. RED until `TimeBudget::call` wraps the
+    // inner future (and the inner `self.inner.call(args)` invocation) in
+    // `std::panic::catch_unwind` / `AssertUnwindSafe(..).catch_unwind()` and
+    // converts a caught panic into `Ok(panic_message(&self.name, &what))`.
+    //
+    // Every one of these tests runs its assertion body inside a
+    // `tokio::spawn` and awaits the `JoinHandle`: on master, `TimeBudget::
+    // call`'s returned future itself panics (nothing catches it), which
+    // unwinds the spawned task and reports as `Err(JoinError::is_panic() ==
+    // true)` — a clean, fast RED instead of taking the whole test binary's
+    // worker thread down with it.
+
+    /// A tool whose future panics mid-poll (after the future already
+    /// exists) must come back as `Ok(panic_message(..))`, not unwind the
+    /// caller. Pins the marker, the tool name, and the "abandoned mid-
+    /// flight" / "side effects" guidance the model self-corrects from.
+    #[tokio::test]
+    async fn panicking_tool_returns_panic_result_instead_of_unwinding() {
+        let wrapped = TimeBudget::with_budget(
+            Box::new(panicking("crashy", "kaboom")),
+            Duration::from_secs(5),
+        );
+        let handle = tokio::spawn(async move { wrapped.call("{}".to_string()).await });
+
+        let result = handle
+            .await
+            .expect("TimeBudget::call must catch the inner panic, not let it unwind the task");
+
+        let s = result.expect("a caught panic must be Ok(String), not Err(ToolError)");
+        assert!(
+            s.starts_with("💥 PANIC: tool `crashy` crashed: kaboom"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains("side effects may have partially happened"),
+            "got: {s}"
+        );
+    }
+
+    /// A tool whose `call()` itself panics SYNCHRONOUSLY — before handing
+    /// back a future at all — must be caught too. This is a distinct panic
+    /// surface from the future-poll case above: `self.inner.call(args)` is
+    /// an ordinary (non-async) function call that can panic before any
+    /// `.await` ever happens.
+    #[tokio::test]
+    async fn panic_while_building_the_inner_future_is_caught() {
+        let wrapped = TimeBudget::with_budget(
+            Box::new(panicking_sync("sync_crashy", "sync kaboom")),
+            Duration::from_secs(5),
+        );
+        let handle = tokio::spawn(async move { wrapped.call("{}".to_string()).await });
+
+        let result = handle.await.expect(
+            "TimeBudget::call must catch a panic from building the inner future, \
+             not let it unwind the task",
+        );
+
+        let s = result.expect("a caught panic must be Ok(String), not Err(ToolError)");
+        assert!(s.contains("sync kaboom"), "got: {s}");
+    }
+
+    /// `delegate` goes through the same `TimeBudget::call` boundary as any
+    /// other tool (`budget_all` wraps it identically, just with a pause
+    /// gate attached) — a panic there must be caught exactly the same way,
+    /// not escape because of the pause-aware code path.
+    #[tokio::test]
+    async fn delegate_panic_outside_its_tools_returns_panic_result() {
+        let gate = Arc::new(PauseGate::new());
+        let wrapped = TimeBudget::with_budget(
+            Box::new(panicking("delegate", "kaboom")),
+            Duration::from_secs(5),
+        )
+        .with_pause_gate(gate);
+        let handle = tokio::spawn(async move { wrapped.call("{}".to_string()).await });
+
+        let result = handle.await.expect(
+            "TimeBudget::call must catch a panic on the pause-aware path too, \
+             not let it unwind the task",
+        );
+
+        let s = result.expect("a caught panic must be Ok(String), not Err(ToolError)");
+        assert!(
+            s.starts_with("💥 PANIC: tool `delegate` crashed: kaboom"),
+            "got: {s}"
+        );
+    }
+
+    /// The shared `panic_message` must produce the canonical text — one
+    /// source of truth so `TimeBudget::call` and any future caller (e.g. a
+    /// delegate-loop salvage path) agree on the wording the model self-
+    /// corrects from. Mirrors `timeout_message_carries_tool_name_and_budget_
+    /// seconds` for the panic sibling.
+    #[test]
+    fn panic_message_carries_tool_name_and_payload() {
+        let msg = panic_message("x", "boom");
+        assert!(
+            msg.starts_with("💥 PANIC: tool `x` crashed: boom"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("Do not retry the identical call"),
+            "got: {msg}"
+        );
     }
 }
