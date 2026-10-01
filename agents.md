@@ -368,6 +368,18 @@ Comments are signal, not narration:
 
 **All changes go through Pull Requests** — no direct commits to master. Every PR adds an entry to `release-notes/current.md` describing what changed.
 
+### Worktree Workflow (Mandatory)
+
+Every new task gets its own git worktree — never implement a task directly in the main checkout.
+
+1. **Create** — branch off up-to-date master in a fresh worktree: `git worktree add ../peakbot-<slug> -b <type>/<slug>`.
+2. **Implement** — do the work inside that worktree (TDD, Zen review, etc. per this doc), then push and open a PR.
+3. **Watch CI** — poll the run to green or failed (see "CI (Gitea Actions)" below) before considering the task done. Fix and re-push on failure; keep watching.
+4. **Merge**:
+   - Explicitly instructed to merge automatically → merge once CI is green.
+   - Otherwise → do not merge. Start a `bash_bg` watcher polling the PR state until a human merges (or closes) it.
+5. **Cleanup** — only after the branch is actually merged (auto, or noticed by the watcher): remove the worktree (`git worktree remove`) and delete the now-stale branch, local and remote. Never remove a worktree or branch that isn't merged — verify first (see 2026-10-01 worktree cleanup in `memory.md` for the audit pattern: clean status, no unpushed commits, PR state == merged).
+
 ### Release notes workflow (mandatory)
 
 `current.md` is the working draft for the *next* release; the release pipeline reads `release-notes/<version>.md`, never `current.md`. Before `make release`:
