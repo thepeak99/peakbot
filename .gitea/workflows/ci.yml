@@ -19,6 +19,11 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
       GITHUB_TOKEN: ${{ github.token }}
+      # The dind runner can't sustain the default test-profile debuginfo=2
+      # codegen for peakbot's large lib test target: rustc gets OOM-killed
+      # (signal 9) mid-build. Dropping test-profile debuginfo cuts that
+      # crate's codegen memory (and speeds the build) so it fits the container.
+      CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
       - name: Checkout (no-node, pure git)
