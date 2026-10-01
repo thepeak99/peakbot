@@ -2245,9 +2245,47 @@ impl ReplUi {
     }
 }
 
+/// Should the ratatui/previous panic hook (which restores the terminal:
+/// leaves raw mode, disables mouse capture, etc.) run for a panic on this
+/// thread?
+///
+/// `ratatui::init()` installs a hook that restores the terminal on EVERY
+/// panic — including ones caught by a `catch_unwind` boundary on a tokio
+/// worker thread (the `TimeBudget::call` / `agent_loop` backstops added
+/// alongside this). On a worker thread that's actively wrong: the restore
+/// writes control sequences to a terminal a foreground render loop still
+/// owns, and on a dead tty `eprintln!` inside the hook itself can panic —
+/// aborting the process instead of recovering it.
+///
+/// Only a main-thread panic is fatal to the TUI: nothing catches it, the
+/// process is going down, so the terminal MUST be restored before it prints
+/// anything else. Worker-thread panics are caught (TimeBudget / agent_loop)
+/// and must not tear down the terminal — it is still in active use.
+///
+/// Pure function so the policy is tested without installing a real panic
+/// hook or needing a live terminal.
+fn should_restore_terminal_on_panic(thread_name: Option<&str>) -> bool {
+    thread_name == Some("main")
+}
+
 impl Ui for ReplUi {
     async fn init(&mut self) -> Result<()> {
         self.terminal = Some(ratatui::init());
+
+        // `ratatui::init()` just installed a hook that unconditionally
+        // restores the terminal on any panic. Replace it with one that only
+        // does that for a genuinely fatal main-thread panic — a panic caught
+        // on a tokio worker thread (TimeBudget / agent_loop backstops) must
+        // not touch a terminal the live render loop still owns.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if should_restore_terminal_on_panic(std::thread::current().name()) {
+                prev(info)
+            } else {
+                tracing::error!(target: "peakbot", "panic on worker thread: {info}");
+            }
+        }));
+
         execute!(std::io::stdout(), EnableMouseCapture)?;
 
         // Try to enable the Kitty keyboard protocol so we can distinguish
@@ -4757,6 +4795,39 @@ mod model_popup_tests {
         assert!(
             rx.try_recv().is_err(),
             "non-pausable sub-agent: Ctrl+P must send nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod panic_hook_tests {
+    //! Test-first specs for the TUI panic-hook policy (see
+    //! `should_restore_terminal_on_panic` above).
+    //!
+    //! `ratatui::init()` installs a panic hook that restores the terminal on
+    //! EVERY panic. Once the `TimeBudget::call` / `agent_loop` `catch_unwind`
+    //! boundaries land, most panics are *caught* on tokio worker threads —
+    //! restoring the terminal for those breaks the live render (and on a
+    //! dead tty the restore's own `eprintln!` panics inside the hook,
+    //! aborting the process). The restore must therefore run only for
+    //! main-thread panics, which are genuinely fatal and need the terminal
+    //! back before the process dies.
+    use super::should_restore_terminal_on_panic;
+
+    #[test]
+    fn terminal_restored_only_for_main_thread_panics() {
+        assert!(
+            should_restore_terminal_on_panic(Some("main")),
+            "a main-thread panic is fatal — the terminal must be restored"
+        );
+        assert!(
+            !should_restore_terminal_on_panic(Some("tokio-rt-worker")),
+            "a caught worker-thread panic must not restore the terminal — \
+             the live render loop still owns it"
+        );
+        assert!(
+            !should_restore_terminal_on_panic(None),
+            "an unnamed thread is not the main thread — no restore"
         );
     }
 }
