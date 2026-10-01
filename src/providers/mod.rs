@@ -693,9 +693,10 @@ fn gate(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
     Box::new(crate::tools::ThoughtGate::wrap(inner))
 }
 
-/// Wrap every tool in a wall-clock budget. Called at the two — and only two —
-/// places tools enter the rig builder, so "every tool the model can call is
-/// time-bounded" holds by construction. See docs/tool-time-budget-design.md.
+/// Wrap every tool in a wall-clock budget and a panic boundary. Called at the
+/// two — and only two — places tools enter the rig builder, so "every tool the
+/// model can call is time-bounded and panic-caught" holds by construction.
+/// See docs/tool-time-budget-design.md.
 ///
 /// Only `delegate` gets the session's pause gate: it is the only tool that
 /// can park mid-call (its sub-agent's hook awaits the gate), so it is the

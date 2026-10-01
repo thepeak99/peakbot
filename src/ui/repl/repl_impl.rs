@@ -2257,29 +2257,35 @@ impl ReplUi {
 /// owns, and on a dead tty `eprintln!` inside the hook itself can panic —
 /// aborting the process instead of recovering it.
 ///
-/// The fix restricts the restore to the MAIN thread only: a panic there is
-/// genuinely fatal (nothing catches it, the process is going down, so the
-/// terminal MUST be restored before it prints anything else) — everywhere
-/// else, a caught panic is already being handled upstream and the terminal
-/// is still in active use.
+/// Only a main-thread panic is fatal to the TUI: nothing catches it, the
+/// process is going down, so the terminal MUST be restored before it prints
+/// anything else. Worker-thread panics are caught (TimeBudget / agent_loop)
+/// and must not tear down the terminal — it is still in active use.
 ///
 /// Pure function so the policy is tested without installing a real panic
 /// hook or needing a live terminal.
-///
-/// TODO(impl): call this from the hook installed right after
-/// `ratatui::init()` in `ReplUi::init`, chaining to the previous/ratatui
-/// hook only when it returns `true` and otherwise just `tracing::error!`-
-/// logging the panic. Stub only — always returns `true` (the master
-/// behaviour: restore unconditionally) until that lands; see
-/// `terminal_restored_only_for_main_thread_panics`.
-#[allow(dead_code)] // TODO(impl): only exercised by its own test until ReplUi::init's hook calls it
-fn should_restore_terminal_on_panic(_thread_name: Option<&str>) -> bool {
-    true
+fn should_restore_terminal_on_panic(thread_name: Option<&str>) -> bool {
+    thread_name == Some("main")
 }
 
 impl Ui for ReplUi {
     async fn init(&mut self) -> Result<()> {
         self.terminal = Some(ratatui::init());
+
+        // `ratatui::init()` just installed a hook that unconditionally
+        // restores the terminal on any panic. Replace it with one that only
+        // does that for a genuinely fatal main-thread panic — a panic caught
+        // on a tokio worker thread (TimeBudget / agent_loop backstops) must
+        // not touch a terminal the live render loop still owns.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if should_restore_terminal_on_panic(std::thread::current().name()) {
+                prev(info)
+            } else {
+                tracing::error!(target: "peakbot", "panic on worker thread: {info}");
+            }
+        }));
+
         execute!(std::io::stdout(), EnableMouseCapture)?;
 
         // Try to enable the Kitty keyboard protocol so we can distinguish

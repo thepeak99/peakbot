@@ -101,7 +101,7 @@ Plus optional **MCP tools** from configured servers (wrapped in `LoggingToolDyn`
 
 Every tool — built-in and MCP alike — is wrapped at registration in `TimeBudget` (`src/tools/time_budget.rs`); there is no unbudgeted state. `timeouts.tool_secs` (default 30 min) is the ceiling; tools that own a longer deadline get a derived one *above* it so their own message wins: `bash`/`powershell` get `max(tool_secs, 7500s)` (above their own 7200s clamp), `delegate` gets `timeouts.delegate_secs + 300s` (above the loop's own budget, leaving room for the INTERRUPTED handoff).
 
-Expiry returns `⏱ TIMEOUT: …` as a normal tool result — the model self-corrects; the turn is not killed. Design: `docs/tool-time-budget-design.md`.
+Expiry returns `⏱ TIMEOUT: …` as a normal tool result — the model self-corrects; the turn is not killed. A tool that *panics* mid-call is caught at the same boundary and returned as `💥 PANIC: …` — also a normal tool result, so the turn is not killed. Design: `docs/tool-time-budget-design.md`.
 
 ### The `thought` field (ThoughtGate)
 
@@ -120,6 +120,7 @@ Two exceptions, registered ungated: `think` (its `thought` *is* the payload) and
 ## Error Handling
 
 - **Tool errors** → returned to the model as tool results; it self-corrects.
+- **Tool panics** → caught at the tool boundary (`TimeBudget`) and returned to the model as `💥 PANIC: …` — orchestrator, sub-agent, or `delegate` itself; the innermost wrapper wins. The model self-corrects and the turn continues. The `agent_loop` `catch_unwind` is only a backstop for panics *outside* any tool (those abort the turn like Stop).
 - **API errors** (auth, network) → surface as `PromptError`, printed; loop continues. Transient errors are retried with backoff (`is_transient_prompt_error`).
 - **Max turns exceeded** → printed as an error; user retries or rephrases.
 

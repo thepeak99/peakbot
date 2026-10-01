@@ -13,13 +13,21 @@
 //! observationally identical but arrives at the model triple-prefixed with
 //! rig's error wrappers. `Ok` keeps the wording ours.
 //!
+//! A tool call that *panics* is reported the same way — as
+//! `Ok(panic_message(..))` — so a buggy tool self-corrects instead of taking
+//! the turn down. The inner future is wrapped in `catch_unwind`, catching both
+//! a panic mid-`await` and a synchronous panic in `call` itself; the dropped
+//! future runs the same cleanup as a cancellation.
+//!
 //! See `docs/tool-time-budget-design.md`.
 
 use crate::config::TimeoutsConfig;
 use crate::state::PauseGate;
+use futures::FutureExt;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::{ToolDyn, ToolError};
 use rig_core::wasm_compat::WasmBoxedFuture;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,25 +79,14 @@ pub(crate) fn timeout_message(tool: &str, budget: Duration) -> String {
 /// The one and only wording for "a tool call panicked mid-flight". Shared by
 /// `TimeBudget::call`'s `catch_unwind` boundary so every panicking tool
 /// reports the same self-correcting shape to the model, instead of taking
-/// the whole turn down with it.
-///
-/// TODO(impl): wire this into `TimeBudget::call` behind a `catch_unwind`
-/// around the inner future (see `panicking_tool_returns_panic_result_instead_of_unwinding`
-/// and friends below). Stub only — not yet called from production code, so
-/// the real wording below is unreachable until that lands.
-#[allow(dead_code)] // TODO(impl): only exercised by tests until TimeBudget::call calls it
-pub(crate) fn panic_message(_tool: &str, _what: &str) -> String {
-    // TODO(impl): replace with the real wording:
-    // format!(
-    //     "💥 PANIC: tool `{tool}` crashed: {what}. Its work was abandoned mid-flight; \
-    //      its side effects may have partially happened — check before redoing. \
-    //      Do not retry the identical call — it will likely crash again; use a \
-    //      different tool or approach."
-    // )
-    String::new()
+/// the whole turn down with it. Same shape as `timeout_message`.
+fn panic_message(tool: &str, what: &str) -> String {
+    format!(
+        "💥 PANIC: tool `{tool}` crashed: {what}. Its work was abandoned mid-flight; its side effects may have partially happened — check before redoing. Do not retry the identical call — it will likely crash again; use a different tool or approach."
+    )
 }
 
-/// Wraps any `Box<dyn ToolDyn>` in a wall-clock deadline.
+/// Wraps any `Box<dyn ToolDyn>` in a wall-clock deadline and a panic boundary.
 pub struct TimeBudget {
     inner: Box<dyn ToolDyn>,
     /// Resolved once at wrap time. There is no "unbudgeted" state to represent.
@@ -149,24 +146,34 @@ impl ToolDyn for TimeBudget {
 
     fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, ToolError>> {
         Box::pin(async move {
+            // Build the inner future inside the guard so a synchronous panic in
+            // `call` (not just a panic mid-`await`) is caught too.
+            let guarded =
+                AssertUnwindSafe(async move { self.inner.call(args).await }).catch_unwind();
             // `delegate` can park mid-call (its sub-agent's hook awaits the
             // gate), so its deadline is pause-aware: parked time never counts
             // and a paused delegation can wait forever. Every other tool runs
             // on a plain timeout — its checkpoints sit outside its budget.
-            let outcome: Option<Result<String, ToolError>> = match &self.pause_gate {
-                Some(gate) => crate::state::pause::pause_aware_timeout(
-                    gate,
-                    self.budget,
-                    self.inner.call(args),
-                )
-                .await
-                .ok(),
-                None => tokio::time::timeout(self.budget, self.inner.call(args))
+            let outcome = match &self.pause_gate {
+                Some(gate) => crate::state::pause::pause_aware_timeout(gate, self.budget, guarded)
                     .await
                     .ok(),
+                None => tokio::time::timeout(self.budget, guarded).await.ok(),
             };
             match outcome {
-                Some(result) => result,
+                Some(Ok(result)) => result,
+                Some(Err(payload)) => {
+                    let what = crate::panic_text(payload);
+                    // `error!`, not `warn!`: a tool panic is a real bug in the
+                    // tool, not a transient condition.
+                    tracing::error!(
+                        target: "peakbot",
+                        tool = %self.name,
+                        panic = %what,
+                        "Tool call panicked; returned to the model as a tool result"
+                    );
+                    Ok(panic_message(&self.name, &what))
+                }
                 None => {
                     // `error!`, not `warn!`: a fired budget always means something
                     // is broken — a pathological upstream or a wrong constant.

@@ -556,13 +556,14 @@ enum CompletionResult {
 /// with a non-string payload) has no sensible text — "unknown panic" is the
 /// answer, not a crash trying to render it.
 ///
-/// TODO(impl): wire this into the `agent_loop` backstop just below (replacing
-/// its inline downcast) and into `TimeBudget::call`'s new panic boundary.
-/// Stub only — the wrong-but-compiling body below is intentionally always
-/// `String::new()` until that lands; see `panic_text_reads_str_and_string_payloads`.
-#[allow(dead_code)] // TODO(impl): only exercised by its own test until the two catch_unwind sites call it
-pub(crate) fn panic_text(_payload: Box<dyn std::any::Any + Send>) -> String {
-    String::new()
+/// Takes the payload by value so a `&Box<dyn Any + Send>` (a `&Box`) can't be
+/// passed in place of the owned box.
+pub(crate) fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 const SYSTEM_PROMPT_PERSONA: &str = include_str!("system_prompt_persona.txt");
@@ -1919,14 +1920,11 @@ impl AgentRunner {
                 }
             };
 
-            // A panic while handling a message aborts that turn like Stop does, instead of
-            // killing the loop with is_running stuck. Relies on panic = "unwind".
+            // Panics outside any tool (tools are caught by TimeBudget) abort the turn
+            // like Stop does, instead of killing the loop with is_running stuck. Relies
+            // on panic = "unwind".
             if let Err(payload) = std::panic::AssertUnwindSafe(dispatch).catch_unwind().await {
-                let what = payload
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("unknown panic");
+                let what = panic_text(payload);
                 if let Some(ref sm) = state_manager {
                     sm.close_interrupted_tool_call();
                     sm.set_running(false);
