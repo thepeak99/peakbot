@@ -83,6 +83,7 @@ pub use tools::{
 pub use ui::{Ui, UiAction};
 
 use anyhow::{Context, Result, anyhow};
+use futures::FutureExt;
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -1497,6 +1498,9 @@ impl AgentRunner {
     /// `UserMessage`/`Command` items are discarded until the matching
     /// `StopMarker` is consumed; the flag is then cleared. /stop = stop,
     /// queued follow-ups are dropped along with the in-flight turn.
+    ///
+    /// A panic while handling a message aborts that turn like Stop and the
+    /// loop keeps serving.
     #[allow(clippy::too_many_arguments)] // agent_loop owns rebuild + event-processor lifecycle
     async fn agent_loop(
         msg_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<QueueMessage>>,
@@ -1539,8 +1543,18 @@ impl AgentRunner {
             });
 
         loop {
-            // Wait for a message
+            // Wait for a message. The `MutexGuard` must drop before
+            // dispatch: a handler that re-enters the queue would
+            // deadlock on it.
             let msg = msg_rx.lock().await.recv().await;
+
+            // Channel closed: abort the event processor and exit.
+            let Some(msg) = msg else {
+                if let Some(h) = event_processor.take() {
+                    h.abort();
+                }
+                break;
+            };
 
             // Drain mode: discard everything that isn't the StopMarker. The
             // event loop has already zeroed the pending counter and signalled
@@ -1548,7 +1562,7 @@ impl AgentRunner {
             // queue contents until the marker arrives.
             if drain_requested.load(Ordering::Acquire) {
                 match msg {
-                    Some(QueueMessage::StopMarker { message }) => {
+                    QueueMessage::StopMarker { message } => {
                         drain_requested.store(false, Ordering::Release);
                         if let Some(ref sm) = state_manager {
                             sm.set_status(None);
@@ -1557,14 +1571,14 @@ impl AgentRunner {
                         completion_tx.send(CompletionResult::Stopped).ok();
                         continue;
                     }
-                    Some(QueueMessage::UserMessage { .. })
-                    | Some(QueueMessage::Command(_))
-                    | Some(QueueMessage::SwitchModel(_))
-                    | Some(QueueMessage::ChangeCwd(_))
-                    | Some(QueueMessage::SelectPipeline(_))
-                    | Some(QueueMessage::SelectProfile(_))
-                    | Some(QueueMessage::ListProfiles)
-                    | Some(QueueMessage::BackgroundOutputReady) => {
+                    QueueMessage::UserMessage { .. }
+                    | QueueMessage::Command(_)
+                    | QueueMessage::SwitchModel(_)
+                    | QueueMessage::ChangeCwd(_)
+                    | QueueMessage::SelectPipeline(_)
+                    | QueueMessage::SelectProfile(_)
+                    | QueueMessage::ListProfiles
+                    | QueueMessage::BackgroundOutputReady => {
                         // Discarded — pending counter was already zeroed by
                         // the event loop's drain trigger. (SwitchModel is
                         // included for safety; in practice the View only
@@ -1581,314 +1595,323 @@ impl AgentRunner {
                         // (still running, just not flushed).
                         continue;
                     }
-                    None => break,
                 }
             }
 
-            match msg {
-                Some(QueueMessage::UserMessage { text, attachments }) => {
-                    // Single-writer point: append to chat *now*, between turns.
-                    if let Some(ref sm) = state_manager {
-                        if attachments.is_empty() {
-                            sm.add_user_message(text.clone());
-                        } else {
-                            sm.add_user_message_with_attachments(text.clone(), attachments);
+            let dispatch = async {
+                match msg {
+                    QueueMessage::UserMessage { text, attachments } => {
+                        // Single-writer point: append to chat *now*, between turns.
+                        if let Some(ref sm) = state_manager {
+                            if attachments.is_empty() {
+                                sm.add_user_message(text.clone());
+                            } else {
+                                sm.add_user_message_with_attachments(text.clone(), attachments);
+                            }
+                            // Escape hatch: an interrupted conversation (provisional
+                            // or untitled) gets its definitive title now from
+                            // whatever transcript exists. The gate no-ops on a
+                            // fresh conversation's opening message; fire-and-forget.
+                            sm.maybe_generate_title();
+                            sm.decrement_pending_input();
+                            // A real human turn clears all bg cooldowns, so any
+                            // buffered background output flushes on the next drain
+                            // alongside the user's message.
+                            sm.reset_bg_cooldowns();
+                            sm.set_running(true);
                         }
-                        // Escape hatch: an interrupted conversation (provisional
-                        // or untitled) gets its definitive title now from
-                        // whatever transcript exists. The gate no-ops on a
-                        // fresh conversation's opening message; fire-and-forget.
-                        sm.maybe_generate_title();
-                        sm.decrement_pending_input();
-                        // A real human turn clears all bg cooldowns, so any
-                        // buffered background output flushes on the next drain
-                        // alongside the user's message.
-                        sm.reset_bg_cooldowns();
-                        sm.set_running(true);
+
+                        // Lazy memory compaction: run once, on the first user
+                        // message, so startup stays instant and the spinner gives
+                        // visual feedback while we work. The compaction model is
+                        // read live from StateManager inside the helper, so it
+                        // sees `/model` and `/pipeline` rebuilds.
+                        if !memory_compaction_done && config.memory.enabled {
+                            memory_compaction_done = true;
+                            if let Some(sm) = state_manager.as_ref() {
+                                Self::maybe_compact_memory(sm, config.memory.threshold_bytes).await;
+                            }
+                        }
+
+                        // Build the current-turn `Message` — attachments (if any)
+                        // are read from state, so both text and vision turns use
+                        // the same dispatch path.
+                        let current_turn = state_manager
+                            .as_ref()
+                            .and_then(|sm| sm.build_current_turn_message())
+                            .unwrap_or_else(|| {
+                                // Fallback: no state manager (test-only paths) —
+                                // pass the String through as a text-only Message.
+                                rig_core::completion::message::Message::from(text.as_str())
+                            });
+
+                        let result = Self::process_message_internal(
+                            current_turn,
+                            &state_manager,
+                            &agent,
+                            &config,
+                        )
+                        .await;
+
+                        // Mark as done — snapshot run_started_at BEFORE set_running(false) clears
+                        // it, then emit a "worked for MM:SS" system message (reuses the spinner
+                        // formatter so the post-run figure matches the live indicator).
+                        if let Some(ref sm) = state_manager {
+                            let started_at = sm.get_state().run_started_at;
+                            sm.set_running(false);
+                            if let Some(t) = started_at {
+                                sm.add_system_message(format!(
+                                    "worked for {}",
+                                    crate::ui::repl::spinner::fmt_elapsed(t)
+                                ));
+                            }
+                        }
+
+                        // Send completion notification
+                        completion_tx.send(result).ok();
+
+                        // Post-turn bg drain seam: if any background process
+                        // produced output during this turn (or while we were
+                        // parked), drain it into a synthetic user turn and
+                        // immediately run another iteration. See
+                        // `bash-background.md` § "Wiring into the agent loop".
+                        Self::run_bg_synthetic_turn_if_any(
+                            &state_manager,
+                            &agent,
+                            &config,
+                            &completion_tx,
+                        )
+                        .await;
                     }
 
-                    // Lazy memory compaction: run once, on the first user
-                    // message, so startup stays instant and the spinner gives
-                    // visual feedback while we work. The compaction model is
-                    // read live from StateManager inside the helper, so it
-                    // sees `/model` and `/pipeline` rebuilds.
-                    if !memory_compaction_done && config.memory.enabled {
-                        memory_compaction_done = true;
-                        if let Some(sm) = state_manager.as_ref() {
-                            Self::maybe_compact_memory(sm, config.memory.threshold_bytes).await;
+                    QueueMessage::BackgroundOutputReady => {
+                        // Wake-up triggered by a reader thread. Same drain
+                        // path as the post-turn seam — extracted into a
+                        // helper so the contract is identical.
+                        Self::run_bg_synthetic_turn_if_any(
+                            &state_manager,
+                            &agent,
+                            &config,
+                            &completion_tx,
+                        )
+                        .await;
+                    }
+
+                    QueueMessage::Command(cmd) => {
+                        if let Some(ref sm) = state_manager {
+                            sm.set_running(true);
+                        }
+                        // The pipeline the *current* conversation is on. `/load`
+                        // swaps the conversation (and with it the selection), so the
+                        // rebuild below needs the before-value to spot the change.
+                        let selection_before =
+                            state_manager.as_ref().and_then(|sm| sm.selected_pipeline());
+                        Self::process_command_internal(&cmd, &state_manager, &config).await;
+
+                        // `/load <arg>` may have just swapped the active
+                        // conversation to one saved against a different
+                        // wire identity. Rebuild the agent if so — same
+                        // path `/model <alias>` uses. Falls through
+                        // (no-op) when the wire id matches the running
+                        // agent or `/load` failed validation.
+                        let lcmd = cmd.trim().to_ascii_lowercase();
+                        if lcmd.starts_with("/load ") {
+                            Self::maybe_rebuild_after_load(
+                                selection_before,
+                                &mut agent,
+                                &mut config,
+                                &state_manager,
+                                &session_hook_cell,
+                                &provider_info_cell,
+                                &mut event_processor,
+                                rebuild_ctx.as_mut(),
+                            )
+                            .await;
+                        } else if lcmd == "/new" {
+                            // `/new` reset to a fresh conversation on the
+                            // active model; rebuild the agent so config/skill
+                            // edits take effect. Keeps the current model — it
+                            // does not switch to `default_model`.
+                            Self::refresh_agent_after_new(
+                                &mut agent,
+                                &mut config,
+                                &state_manager,
+                                &session_hook_cell,
+                                &provider_info_cell,
+                                &mut event_processor,
+                                rebuild_ctx.as_mut(),
+                            )
+                            .await;
+                        }
+                        if let Some(ref sm) = state_manager {
+                            sm.set_running(false);
+                        }
+                        completion_tx.send(CompletionResult::CommandDone).ok();
+                    }
+
+                    QueueMessage::StopMarker { message } => {
+                        // StopMarker outside drain mode — defensive: shouldn't
+                        // happen because the event loop always sets drain_requested
+                        // before sending. Treat as a benign acknowledgement.
+                        if let Some(ref sm) = state_manager {
+                            sm.set_status(None);
+                            sm.add_system_message(message);
+                        }
+                        completion_tx.send(CompletionResult::Stopped).ok();
+                    }
+
+                    QueueMessage::SwitchModel(alias) => {
+                        // `/model` is `/new` + boot the agent against a
+                        // different ProviderConfig. The View validated the
+                        // alias against its snapshot, but `handle_switch_model`
+                        // re-reads config first (picking up newly-added
+                        // aliases) and re-resolves, emitting a clean error if
+                        // the alias vanished under a reload.
+                        if let Some(ref sm) = state_manager {
+                            sm.set_running(true);
+                        }
+                        let outcome = Self::handle_switch_model(
+                            &alias,
+                            &mut agent,
+                            &mut config,
+                            &state_manager,
+                            &session_hook_cell,
+                            &provider_info_cell,
+                            &mut event_processor,
+                            rebuild_ctx.as_mut(),
+                        )
+                        .await;
+                        if let Some(ref sm) = state_manager {
+                            sm.decrement_pending_input();
+                            sm.set_running(false);
+                        }
+                        match outcome {
+                            Ok(()) => {
+                                completion_tx.send(CompletionResult::CommandDone).ok();
+                            }
+                            Err(msg) => {
+                                if let Some(ref sm) = state_manager {
+                                    sm.add_system_message(format!("❌ /model: {msg}"));
+                                }
+                                completion_tx.send(CompletionResult::CommandDone).ok();
+                            }
                         }
                     }
 
-                    // Build the current-turn `Message` — attachments (if any)
-                    // are read from state, so both text and vision turns use
-                    // the same dispatch path.
-                    let current_turn = state_manager
-                        .as_ref()
-                        .and_then(|sm| sm.build_current_turn_message())
-                        .unwrap_or_else(|| {
-                            // Fallback: no state manager (test-only paths) —
-                            // pass the String through as a text-only Message.
-                            rig_core::completion::message::Message::from(text.as_str())
-                        });
+                    QueueMessage::ChangeCwd(path) => {
+                        // Same rebuild seam as SwitchModel, different axis:
+                        // chdir + rebuild the system prompt + rebuild the
+                        // agent on the *current* model, then reset the
+                        // conversation like /new. The View already validated
+                        // the path; we re-validate defensively.
+                        if let Some(ref sm) = state_manager {
+                            sm.set_running(true);
+                        }
+                        let outcome = Self::handle_change_cwd(
+                            &path,
+                            &mut agent,
+                            &mut config,
+                            &state_manager,
+                            &session_hook_cell,
+                            &provider_info_cell,
+                            &mut event_processor,
+                            rebuild_ctx.as_mut(),
+                        )
+                        .await;
+                        if let Some(ref sm) = state_manager {
+                            sm.decrement_pending_input();
+                            sm.set_running(false);
+                        }
+                        if let Err(msg) = outcome
+                            && let Some(ref sm) = state_manager
+                        {
+                            sm.add_system_message(format!("❌ /cd: {msg}"));
+                        }
+                        completion_tx.send(CompletionResult::CommandDone).ok();
+                    }
 
-                    let result = Self::process_message_internal(
-                        current_turn,
-                        &state_manager,
-                        &agent,
-                        &config,
-                    )
-                    .await;
+                    QueueMessage::SelectPipeline(name) => {
+                        if let Some(ref sm) = state_manager {
+                            sm.set_running(true);
+                        }
+                        let outcome = Self::handle_select_pipeline(
+                            name,
+                            &mut agent,
+                            &mut config,
+                            &state_manager,
+                            &session_hook_cell,
+                            &provider_info_cell,
+                            &mut event_processor,
+                            rebuild_ctx.as_mut(),
+                        )
+                        .await;
+                        if let Some(ref sm) = state_manager {
+                            sm.decrement_pending_input();
+                            sm.set_running(false);
+                        }
+                        if let Err(msg) = outcome
+                            && let Some(ref sm) = state_manager
+                        {
+                            sm.add_system_message(format!("❌ /pipeline: {msg}"));
+                        }
+                        completion_tx.send(CompletionResult::CommandDone).ok();
+                    }
 
-                    // Mark as done — snapshot run_started_at BEFORE set_running(false) clears
-                    // it, then emit a "worked for MM:SS" system message (reuses the spinner
-                    // formatter so the post-run figure matches the live indicator).
-                    if let Some(ref sm) = state_manager {
-                        let started_at = sm.get_state().run_started_at;
-                        sm.set_running(false);
-                        if let Some(t) = started_at {
-                            sm.add_system_message(format!(
-                                "worked for {}",
-                                crate::ui::repl::spinner::fmt_elapsed(t)
+                    QueueMessage::SelectProfile(name) => {
+                        if let Some(ref sm) = state_manager {
+                            sm.set_running(true);
+                        }
+                        let outcome = Self::handle_select_profile(
+                            name,
+                            &mut agent,
+                            &mut config,
+                            &state_manager,
+                            &session_hook_cell,
+                            &provider_info_cell,
+                            &mut event_processor,
+                            rebuild_ctx.as_mut(),
+                        )
+                        .await;
+                        if let Some(ref sm) = state_manager {
+                            sm.decrement_pending_input();
+                            sm.set_running(false);
+                        }
+                        if let Err(msg) = outcome
+                            && let Some(ref sm) = state_manager
+                        {
+                            sm.add_system_message(format!("❌ /profile: {msg}"));
+                        }
+                        completion_tx.send(CompletionResult::CommandDone).ok();
+                    }
+
+                    QueueMessage::ListProfiles => {
+                        if let Some(ref sm) = state_manager {
+                            let pin = rebuild_ctx.as_ref().and_then(|c| c.profile_pin.as_deref());
+                            sm.add_system_message(render_profile_list(
+                                &config.profile_names(),
+                                config.active_profile.as_deref(),
+                                pin,
                             ));
                         }
-                    }
-
-                    // Send completion notification
-                    completion_tx.send(result).ok();
-
-                    // Post-turn bg drain seam: if any background process
-                    // produced output during this turn (or while we were
-                    // parked), drain it into a synthetic user turn and
-                    // immediately run another iteration. See
-                    // `bash-background.md` § "Wiring into the agent loop".
-                    Self::run_bg_synthetic_turn_if_any(
-                        &state_manager,
-                        &agent,
-                        &config,
-                        &completion_tx,
-                    )
-                    .await;
-                }
-
-                Some(QueueMessage::BackgroundOutputReady) => {
-                    // Wake-up triggered by a reader thread. Same drain
-                    // path as the post-turn seam — extracted into a
-                    // helper so the contract is identical.
-                    Self::run_bg_synthetic_turn_if_any(
-                        &state_manager,
-                        &agent,
-                        &config,
-                        &completion_tx,
-                    )
-                    .await;
-                }
-
-                Some(QueueMessage::Command(cmd)) => {
-                    if let Some(ref sm) = state_manager {
-                        sm.set_running(true);
-                    }
-                    // The pipeline the *current* conversation is on. `/load`
-                    // swaps the conversation (and with it the selection), so the
-                    // rebuild below needs the before-value to spot the change.
-                    let selection_before =
-                        state_manager.as_ref().and_then(|sm| sm.selected_pipeline());
-                    Self::process_command_internal(&cmd, &state_manager, &config).await;
-
-                    // `/load <arg>` may have just swapped the active
-                    // conversation to one saved against a different
-                    // wire identity. Rebuild the agent if so — same
-                    // path `/model <alias>` uses. Falls through
-                    // (no-op) when the wire id matches the running
-                    // agent or `/load` failed validation.
-                    let lcmd = cmd.trim().to_ascii_lowercase();
-                    if lcmd.starts_with("/load ") {
-                        Self::maybe_rebuild_after_load(
-                            selection_before,
-                            &mut agent,
-                            &mut config,
-                            &state_manager,
-                            &session_hook_cell,
-                            &provider_info_cell,
-                            &mut event_processor,
-                            rebuild_ctx.as_mut(),
-                        )
-                        .await;
-                    } else if lcmd == "/new" {
-                        // `/new` reset to a fresh conversation on the
-                        // active model; rebuild the agent so config/skill
-                        // edits take effect. Keeps the current model — it
-                        // does not switch to `default_model`.
-                        Self::refresh_agent_after_new(
-                            &mut agent,
-                            &mut config,
-                            &state_manager,
-                            &session_hook_cell,
-                            &provider_info_cell,
-                            &mut event_processor,
-                            rebuild_ctx.as_mut(),
-                        )
-                        .await;
-                    }
-                    if let Some(ref sm) = state_manager {
-                        sm.set_running(false);
-                    }
-                    completion_tx.send(CompletionResult::CommandDone).ok();
-                }
-
-                Some(QueueMessage::StopMarker { message }) => {
-                    // StopMarker outside drain mode — defensive: shouldn't
-                    // happen because the event loop always sets drain_requested
-                    // before sending. Treat as a benign acknowledgement.
-                    if let Some(ref sm) = state_manager {
-                        sm.set_status(None);
-                        sm.add_system_message(message);
-                    }
-                    completion_tx.send(CompletionResult::Stopped).ok();
-                }
-
-                Some(QueueMessage::SwitchModel(alias)) => {
-                    // `/model` is `/new` + boot the agent against a
-                    // different ProviderConfig. The View validated the
-                    // alias against its snapshot, but `handle_switch_model`
-                    // re-reads config first (picking up newly-added
-                    // aliases) and re-resolves, emitting a clean error if
-                    // the alias vanished under a reload.
-                    if let Some(ref sm) = state_manager {
-                        sm.set_running(true);
-                    }
-                    let outcome = Self::handle_switch_model(
-                        &alias,
-                        &mut agent,
-                        &mut config,
-                        &state_manager,
-                        &session_hook_cell,
-                        &provider_info_cell,
-                        &mut event_processor,
-                        rebuild_ctx.as_mut(),
-                    )
-                    .await;
-                    if let Some(ref sm) = state_manager {
-                        sm.decrement_pending_input();
-                        sm.set_running(false);
-                    }
-                    match outcome {
-                        Ok(()) => {
-                            completion_tx.send(CompletionResult::CommandDone).ok();
-                        }
-                        Err(msg) => {
-                            if let Some(ref sm) = state_manager {
-                                sm.add_system_message(format!("❌ /model: {msg}"));
-                            }
-                            completion_tx.send(CompletionResult::CommandDone).ok();
-                        }
+                        completion_tx.send(CompletionResult::CommandDone).ok();
                     }
                 }
+            };
 
-                Some(QueueMessage::ChangeCwd(path)) => {
-                    // Same rebuild seam as SwitchModel, different axis:
-                    // chdir + rebuild the system prompt + rebuild the
-                    // agent on the *current* model, then reset the
-                    // conversation like /new. The View already validated
-                    // the path; we re-validate defensively.
-                    if let Some(ref sm) = state_manager {
-                        sm.set_running(true);
-                    }
-                    let outcome = Self::handle_change_cwd(
-                        &path,
-                        &mut agent,
-                        &mut config,
-                        &state_manager,
-                        &session_hook_cell,
-                        &provider_info_cell,
-                        &mut event_processor,
-                        rebuild_ctx.as_mut(),
-                    )
-                    .await;
-                    if let Some(ref sm) = state_manager {
-                        sm.decrement_pending_input();
-                        sm.set_running(false);
-                    }
-                    if let Err(msg) = outcome
-                        && let Some(ref sm) = state_manager
-                    {
-                        sm.add_system_message(format!("❌ /cd: {msg}"));
-                    }
-                    completion_tx.send(CompletionResult::CommandDone).ok();
+            // A panic while handling a message aborts that turn like Stop does, instead of
+            // killing the loop with is_running stuck. Relies on panic = "unwind".
+            if let Err(payload) = std::panic::AssertUnwindSafe(dispatch).catch_unwind().await {
+                let what = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown panic");
+                if let Some(ref sm) = state_manager {
+                    sm.close_interrupted_tool_call();
+                    sm.set_running(false);
+                    sm.add_system_message(format!("⚠ internal error: {what} — turn aborted"));
                 }
-
-                Some(QueueMessage::SelectPipeline(name)) => {
-                    if let Some(ref sm) = state_manager {
-                        sm.set_running(true);
-                    }
-                    let outcome = Self::handle_select_pipeline(
-                        name,
-                        &mut agent,
-                        &mut config,
-                        &state_manager,
-                        &session_hook_cell,
-                        &provider_info_cell,
-                        &mut event_processor,
-                        rebuild_ctx.as_mut(),
-                    )
-                    .await;
-                    if let Some(ref sm) = state_manager {
-                        sm.decrement_pending_input();
-                        sm.set_running(false);
-                    }
-                    if let Err(msg) = outcome
-                        && let Some(ref sm) = state_manager
-                    {
-                        sm.add_system_message(format!("❌ /pipeline: {msg}"));
-                    }
-                    completion_tx.send(CompletionResult::CommandDone).ok();
-                }
-
-                Some(QueueMessage::SelectProfile(name)) => {
-                    if let Some(ref sm) = state_manager {
-                        sm.set_running(true);
-                    }
-                    let outcome = Self::handle_select_profile(
-                        name,
-                        &mut agent,
-                        &mut config,
-                        &state_manager,
-                        &session_hook_cell,
-                        &provider_info_cell,
-                        &mut event_processor,
-                        rebuild_ctx.as_mut(),
-                    )
-                    .await;
-                    if let Some(ref sm) = state_manager {
-                        sm.decrement_pending_input();
-                        sm.set_running(false);
-                    }
-                    if let Err(msg) = outcome
-                        && let Some(ref sm) = state_manager
-                    {
-                        sm.add_system_message(format!("❌ /profile: {msg}"));
-                    }
-                    completion_tx.send(CompletionResult::CommandDone).ok();
-                }
-
-                Some(QueueMessage::ListProfiles) => {
-                    if let Some(ref sm) = state_manager {
-                        let pin = rebuild_ctx.as_ref().and_then(|c| c.profile_pin.as_deref());
-                        sm.add_system_message(render_profile_list(
-                            &config.profile_names(),
-                            config.active_profile.as_deref(),
-                            pin,
-                        ));
-                    }
-                    completion_tx.send(CompletionResult::CommandDone).ok();
-                }
-
-                None => {
-                    // Channel closed, exit
-                    if let Some(handle) = event_processor.take() {
-                        handle.abort();
-                    }
-                    break;
-                }
+                completion_tx.send(CompletionResult::Error).ok();
             }
         }
     }

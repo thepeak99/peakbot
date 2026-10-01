@@ -12,6 +12,7 @@ use peakbot::{
 };
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -446,11 +447,10 @@ async fn main() -> Result<()> {
         return run_subcommand(cmd, &cli);
     }
 
-    let subscriber = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
     if mode == Mode::Stdio {
-        subscriber.with_writer(std::io::stderr).init();
+        log_subscriber(std::io::stderr).init();
     } else {
-        subscriber.init();
+        log_subscriber(std::io::stdout).init();
     }
 
     // Arm the `PEAKBOT_SNIFF` debug log before any client exists, so no LLM
@@ -719,14 +719,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Build the process-wide tracing subscriber for the given writer.
-///
-/// `main()` inlines this same builder today; the seam exists so the
-/// dead-writer regression test below can exercise the exact production
-/// configuration. The stub reproduces CURRENT behaviour — the fix lands
-/// as the one-line change the TODO names (and drops this `cfg(test)`,
-/// wiring `main()` to call the function).
-#[cfg(test)]
+/// Runtime tracing subscriber. `log_internal_errors(false)`: a failed log write is
+/// dropped, never reported via `eprintln!` — which panics when stderr is gone.
 fn log_subscriber<W>(writer: W) -> impl tracing::Subscriber + Send + Sync + 'static
 where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
@@ -734,7 +728,7 @@ where
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(writer)
-        // TODO(fix): add .log_internal_errors(false)
+        .log_internal_errors(false)
         .finish()
 }
 
