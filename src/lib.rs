@@ -8588,6 +8588,238 @@ pipelines:
         );
     }
 
+    /// A rig tool that panics once its own ToolCall row has landed in the
+    /// transcript — the production wedge in miniature: a panic inside a tool
+    /// call (dead-pty EIO → the subscriber's `eprintln!` → panic on dead
+    /// stderr) must not take the agent loop down with it.
+    struct PanicTool(Arc<StateManager>);
+
+    impl rig_core::tool::Tool for PanicTool {
+        const NAME: &'static str = "panic_tool";
+        type Error = std::convert::Infallible;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        async fn definition(&self, _p: String) -> rig_core::completion::ToolDefinition {
+            rig_core::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "panics once its ToolCall row has landed".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn call(&self, _args: serde_json::Value) -> Result<String, Self::Error> {
+            // Wait (≤5s) until the hook's ToolCall event has been processed
+            // and the row is the transcript's tail — the panic must land
+            // *after* the call is in the transcript, or the fix's
+            // `close_interrupted_tool_call` has nothing to answer.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let msgs = self.0.get_state().chat.messages;
+                if let Some(tail) = msgs.last()
+                    && tail.role == crate::ui::app_state::MessageRole::ToolCall
+                    && tail.tool_name.as_deref() == Some(Self::NAME)
+                {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("boom from panic_tool (ToolCall row never landed)");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("boom from panic_tool");
+        }
+    }
+
+    /// RED regression test for the agent-loop panic wedge: a tool that
+    /// panics mid-call must abort the *turn* — not the whole agent loop —
+    /// and the loop must keep serving.
+    ///
+    /// On master the panic unwinds the `agent_loop` task: `is_running` stays
+    /// true forever, Stop is ignored, and the session is wedged. This test
+    /// fails on its first wait (≤10s) instead of hanging.
+    ///
+    /// The planned fix wraps per-message dispatch in `catch_unwind` and, on
+    /// panic: answers the in-flight call via `close_interrupted_tool_call`,
+    /// clears `is_running`, adds a system message carrying the panic
+    /// payload, sends `CompletionResult::Error`, and keeps serving.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn panic_mid_tool_aborts_turn_and_loop_keeps_serving() {
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+        use crate::ui::app_state::MessageRole;
+        use std::sync::Arc;
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+
+        // Build the mock agent inline (mirrors `create_mock_agent`) so the
+        // panic-inducing tool is registered on the orchestrator.
+        let model = crate::mock::MockCompletionModel::new();
+        let model_clone = model.clone();
+        let (ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let hook = SessionHook::with_context_tracking(Some(ev_tx), sm.stats_arc())
+            .with_state_manager(&sm)
+            .with_wire_label("mock".to_string(), "mock-model".to_string());
+
+        let agent = rig_core::agent::AgentBuilder::new(model)
+            .preamble("test prompt")
+            .max_tokens(1024)
+            .default_max_turns(4)
+            .hook(hook.clone())
+            .tool(PanicTool(sm.clone()))
+            .build();
+
+        let info = ProviderInfo {
+            name: "mock".to_string(),
+            model: "mock-model".to_string(),
+            supports_pricing: true,
+            supports_vision: true,
+            preserve_reasoning: true,
+            display_reasoning: false,
+        };
+
+        model_clone.add_response(crate::mock::MockResponse::tool_call(
+            "panic_tool",
+            serde_json::json!({}),
+        ));
+        model_clone.add_response(crate::mock::MockResponse::text("still alive"));
+
+        // Compaction off: AgentRunner::new must not need a compaction provider.
+        let config = Config {
+            context: ContextConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let mut runner = AgentRunner::new(
+            DynAgent::Mock(agent),
+            config,
+            info,
+            SkillRegistry::default(),
+            Some(events),
+            Some(sm.clone()),
+            Arc::new(hook),
+            100_000,
+        )
+        .expect("runner builds");
+
+        let (tx, rx) = mpsc::unbounded_channel::<UiAction>();
+        let h = tokio::spawn(async move { runner.run_loop(rx).await });
+
+        tx.send(UiAction::SendMessage("go".into()))
+            .expect("the action channel is open");
+
+        // Wait (≤10s) for the turn to abort: `is_running` must clear and a
+        // system message must carry the panic payload. RED on master: the
+        // panic kills the agent-loop task, `is_running` stays true, and this
+        // times out.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = sm.get_state();
+                let aborted = state.chat.messages.iter().any(|m| {
+                    m.role == MessageRole::System
+                        && m.content.contains("internal error: boom from panic_tool")
+                });
+                if aborted && !sm.is_running() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "the panicked turn must abort within 10s (system message carrying the \
+             panic payload + is_running cleared); on master the agent-loop task \
+             dies and is_running stays true forever",
+        );
+
+        // The in-flight call must be answered with the persisted INTERRUPTED
+        // result (the row `close_interrupted_tool_call` writes). Located by
+        // call_id: the fix appends the "internal error" system row right
+        // after the answer, so the answer is not necessarily the lane's tail.
+        let msgs = sm.get_state().chat.messages;
+        let call = msgs
+            .iter()
+            .find(|m| {
+                m.source.is_orchestrator_lane()
+                    && m.role == MessageRole::ToolCall
+                    && m.tool_name.as_deref() == Some("panic_tool")
+            })
+            .expect("the panic_tool ToolCall row must be in the transcript");
+        let call_id = call.call_id.clone();
+        let answer = msgs
+            .iter()
+            .find(|m| {
+                m.source.is_orchestrator_lane()
+                    && m.role == MessageRole::ToolResult
+                    && m.call_id == call_id
+            })
+            .expect("the in-flight panic_tool call must be answered; transcript={msgs:?}");
+        assert_eq!(
+            answer.tool_name.as_deref(),
+            Some("panic_tool"),
+            "the answer must name the tool"
+        );
+        let text = answer.tool_result.as_deref().unwrap_or_default();
+        assert!(
+            text.starts_with("INTERRUPTED: the turn was stopped before `panic_tool` returned."),
+            "got: {text}"
+        );
+
+        // The answer must be persisted, not just in memory.
+        let id = sm
+            .get_current_conversation_id()
+            .expect("boot conversation exists");
+        let conv = storage.load(id).expect("conversation persists");
+        assert!(
+            conv.messages.iter().any(|m| {
+                matches!(
+                    m,
+                    crate::conversation::Message::ToolResult { call_id: cid, .. }
+                        if cid == &call_id
+                )
+            }),
+            "the INTERRUPTED result must be on disk"
+        );
+
+        // No sub-agent was running — the slot must be empty.
+        assert!(
+            sm.get_state().sub_agent.is_none(),
+            "no sub-agent exists in this test; the slot must be None"
+        );
+
+        // The loop must keep serving: the next turn runs to completion.
+        tx.send(UiAction::SendMessage("again".into()))
+            .expect("the action channel is open");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = sm.get_state();
+                let replied = state
+                    .chat
+                    .messages
+                    .iter()
+                    .any(|m| m.role == MessageRole::Agent && m.content.contains("still alive"));
+                if replied && !sm.is_running() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("after the aborted turn the loop must serve the next message within 10s");
+
+        // Teardown: closing the action channel ends run_loop promptly.
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
+    }
+
     // ── Layer B+C: /profile command + profile choice resolution (RED) ───────
     //
     // Mirrors the Stage 1.2 /pipeline tests one axis over:

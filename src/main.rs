@@ -719,6 +719,25 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Build the process-wide tracing subscriber for the given writer.
+///
+/// `main()` inlines this same builder today; the seam exists so the
+/// dead-writer regression test below can exercise the exact production
+/// configuration. The stub reproduces CURRENT behaviour — the fix lands
+/// as the one-line change the TODO names (and drops this `cfg(test)`,
+/// wiring `main()` to call the function).
+#[cfg(test)]
+fn log_subscriber<W>(writer: W) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(writer)
+        // TODO(fix): add .log_internal_errors(false)
+        .finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,5 +1105,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── Dead-writer regression (agent-loop panic wedge, fix C1) ─────────
+    //
+    // A web-mode PeakBot wedged forever when its stdout/stderr were a dead
+    // pty (EIO): a `tracing::error!` failed to write, tracing-subscriber's
+    // default `log_internal_errors(true)` reported the failure via
+    // `eprintln!`, and that `eprintln!` panicked on the dead stderr —
+    // killing the agent-loop task and leaving `is_running` true forever.
+    //
+    // The parent test re-runs this test binary with fd 2 on `/dev/full`.
+    // libtest captures eprintln! in-process by default, so the child runs
+    // with `--nocapture` to make the write hit the real (dead) fd.
+
+    /// A writer that fails every write with EIO — a dead pty in miniature.
+    struct DeadWriter;
+    impl std::io::Write for DeadWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(5)) // EIO
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore = "spawned by log_subscriber_never_panics_when_stdout_and_stderr_are_dead"]
+    fn log_subscriber_dead_writer_child() {
+        let sub = log_subscriber(|| DeadWriter);
+        tracing::subscriber::with_default(sub, || tracing::error!("write fails; must not panic"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn log_subscriber_never_panics_when_stdout_and_stderr_are_dead() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "tests::log_subscriber_dead_writer_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RUST_LOG", "error")
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .unwrap(),
+            )
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("1 passed") || stdout.contains("1 failed"),
+            "child must actually run; got: {stdout}"
+        );
+        assert!(
+            out.status.success(),
+            "logging panicked on a dead writer/stderr: {stdout}"
+        );
     }
 }
