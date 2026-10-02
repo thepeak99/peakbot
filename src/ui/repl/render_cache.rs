@@ -146,9 +146,7 @@ impl ChatRenderCache {
         if width != self.wrap_width {
             self.wrap_width = width;
             // Reset all wrapped counts; they'll be recomputed in step 3.
-            for c in &mut self.wrapped_counts {
-                *c = 0;
-            }
+            self.wrapped_counts.fill(0);
             dirty = true;
         }
 

@@ -9,8 +9,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{
-    FileEditError, MatchLevel, MatchResult, SNIPPET_CONTEXT_LINES, format_lines_numbered,
-    progressive_match, read_file, resolve_against, validate_path_exists, write_file,
+    FileEditError, MatchLevel, MatchResult, SNIPPET_CONTEXT_LINES, WritePolicy,
+    format_lines_numbered, progressive_match, read_file, resolve_for_write, validate_path_exists,
+    write_file,
 };
 
 #[derive(Deserialize)]
@@ -22,14 +23,19 @@ pub struct FileStrReplaceArgs {
 }
 
 /// Replace-text tool. `session_cwd` is the base for relative path resolution.
+/// `write_policy` gates the write — stored, wired in by the developer.
 #[derive(Default)]
 pub struct FileStrReplaceTool {
     session_cwd: PathBuf,
+    write_policy: WritePolicy,
 }
 
 impl FileStrReplaceTool {
-    pub fn new(session_cwd: PathBuf) -> Self {
-        Self { session_cwd }
+    pub fn new(session_cwd: PathBuf, write_policy: WritePolicy) -> Self {
+        Self {
+            session_cwd,
+            write_policy,
+        }
     }
 }
 
@@ -96,12 +102,15 @@ If editing fails, read the file first with `file_read` to get exact content, the
                 "new_str is required; pass \"\" to delete old_str".into(),
             ))
         } else {
-            let resolved = resolve_against(&self.session_cwd, &args.path);
-            run(
-                &resolved.to_string_lossy(),
-                &args.old_str,
-                args.new_str.as_deref(),
-                args.replace_all.unwrap_or(false),
+            resolve_for_write(&self.session_cwd, &self.write_policy, &args.path).and_then(
+                |resolved| {
+                    run(
+                        &resolved.to_string_lossy(),
+                        &args.old_str,
+                        args.new_str.as_deref(),
+                        args.replace_all.unwrap_or(false),
+                    )
+                },
             )
         };
 

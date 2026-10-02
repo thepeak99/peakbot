@@ -14,7 +14,7 @@ pub mod retry;
 
 use crate::config::{
     AnthropicCaching, AnthropicConfig, BashConfig, LlamaCppConfig, OllamaConfig, OpenAIConfig,
-    OpenRouterConfig, ProviderConfig, RetryConfig, SearXngConfig, TimeoutsConfig,
+    OpenRouterConfig, ProviderConfig, RetryConfig, SandboxConfig, SearXngConfig, TimeoutsConfig,
 };
 use crate::hooks::SessionHook;
 use crate::hooks::events::SourcedEvent;
@@ -24,7 +24,7 @@ use crate::state::StateManager;
 use crate::tools::{
     BashBgTool, BashTool, FetchPageTool, FetchUrlTool, FileCreateTool, FileInsertTool,
     FileReadTool, FileStrReplaceTool, ListDirectoryTool, PdfReadTool, PowerShellTool, SearchTool,
-    ShellKind, ThinkTool, TodoTool, ViewImageTool,
+    ShellKind, ThinkTool, TodoTool, ViewImageTool, WritePolicy,
 };
 use anyhow::{Context, Result};
 use rig_core::agent::{Agent, AgentBuilder};
@@ -240,6 +240,7 @@ pub fn create_provider(
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
     agents_md: bool,
+    sandbox: &SandboxConfig,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
@@ -265,6 +266,7 @@ pub fn create_provider(
                 retry,
                 timeouts,
                 agents_md,
+                sandbox,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -291,6 +293,7 @@ pub fn create_provider(
                 retry,
                 timeouts,
                 agents_md,
+                sandbox,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -317,6 +320,7 @@ pub fn create_provider(
                 retry,
                 timeouts,
                 agents_md,
+                sandbox,
             )?;
             Ok((
                 DynAgent::Anthropic(agent),
@@ -343,6 +347,7 @@ pub fn create_provider(
                 retry,
                 timeouts,
                 agents_md,
+                sandbox,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -369,6 +374,7 @@ pub fn create_provider(
                 retry,
                 timeouts,
                 agents_md,
+                sandbox,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -498,6 +504,7 @@ fn add_builtin_tools<M, P>(
     sub_agent_wiring: Option<SubAgentWiring>,
     timeouts: &TimeoutsConfig,
     agents_md: bool,
+    sandbox: &SandboxConfig,
 ) -> rig_core::agent::AgentBuilder<M, P, rig_core::agent::WithBuilderTools>
 where
     M: rig_core::completion::CompletionModel,
@@ -562,10 +569,23 @@ where
         None => BashBgTool::default(),
     };
 
+    // One policy per session, built once from the resolved `sandbox:` config
+    // and the session cwd — shared (cloned) by all three write tools.
+    let write_policy = WritePolicy::new(sandbox, &session_cwd);
+
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
-        gate(Box::new(FileCreateTool::new(session_cwd.clone()))),
-        gate(Box::new(FileStrReplaceTool::new(session_cwd.clone()))),
-        gate(Box::new(FileInsertTool::new(session_cwd.clone()))),
+        gate(Box::new(FileCreateTool::new(
+            session_cwd.clone(),
+            write_policy.clone(),
+        ))),
+        gate(Box::new(FileStrReplaceTool::new(
+            session_cwd.clone(),
+            write_policy.clone(),
+        ))),
+        gate(Box::new(FileInsertTool::new(
+            session_cwd.clone(),
+            write_policy,
+        ))),
         gate(Box::new(FileReadTool::new(session_cwd.clone()))),
         gate(Box::new(PdfReadTool::new(session_cwd.clone()))),
         gate(Box::new(bash_bg_tool)),
@@ -638,6 +658,10 @@ where
             // per-session (profile-applied) value, so a runtime `/profile`
             // switch changes the next delegation's preamble.
             agents_md_ceiling: agents_md,
+            // Sub-agents share the orchestrator's write policy for the
+            // active profile — same `sandbox:` the orchestrator's own
+            // write tools were built with.
+            sandbox: sandbox.clone(),
         };
         let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(deps));
         tools.push(gate(Box::new(delegate_tool)));
@@ -764,6 +788,7 @@ fn create_openrouter_agent(
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
     agents_md: bool,
+    sandbox: &SandboxConfig,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -828,6 +853,7 @@ fn create_openrouter_agent(
         }),
         timeouts,
         agents_md,
+        sandbox,
     );
 
     // Add MCP tools and build
@@ -887,6 +913,7 @@ fn create_anthropic_agent(
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
     agents_md: bool,
+    sandbox: &SandboxConfig,
 ) -> Result<(
     Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -964,6 +991,7 @@ fn create_anthropic_agent(
         }),
         timeouts,
         agents_md,
+        sandbox,
     );
 
     let agent = if let Some(tools) = mcp_tools {
@@ -1008,6 +1036,7 @@ fn create_ollama_agent(
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
     agents_md: bool,
+    sandbox: &SandboxConfig,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -1062,6 +1091,7 @@ fn create_ollama_agent(
         }),
         timeouts,
         agents_md,
+        sandbox,
     );
 
     // Add MCP tools and build
@@ -1107,6 +1137,7 @@ fn create_openai_agent(
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
     agents_md: bool,
+    sandbox: &SandboxConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -1173,6 +1204,7 @@ fn create_openai_agent(
         }),
         timeouts,
         agents_md,
+        sandbox,
     );
 
     // Add MCP tools and build
@@ -1214,6 +1246,7 @@ fn create_llamacpp_agent(
     retry: &RetryConfig,
     timeouts: &TimeoutsConfig,
     agents_md: bool,
+    sandbox: &SandboxConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -1283,6 +1316,7 @@ fn create_llamacpp_agent(
         }),
         timeouts,
         agents_md,
+        sandbox,
     );
 
     // Add MCP tools and build
@@ -1418,6 +1452,7 @@ pub(crate) fn build_sub_agent(
     vector_store: Option<&crate::vector::VectorStore>,
     context_budget: Option<usize>,
     timeouts: &TimeoutsConfig,
+    sandbox: &SandboxConfig,
 ) -> Result<(DynAgent, Arc<SessionHook>)> {
     // Events-only lane-tagged hook. No compaction gate (fresh context) — the
     // sub-agent gate terminates instead of compacting. The pause gate is the
@@ -1473,6 +1508,7 @@ pub(crate) fn build_sub_agent(
                 None,
                 timeouts,
                 true, // no `delegate` here; ceiling applied in DelegateTool::call
+                sandbox,
             );
             Ok((DynAgent::OpenRouter(builder.build()), Arc::new(hook)))
         }
@@ -1508,6 +1544,7 @@ pub(crate) fn build_sub_agent(
                 None,
                 timeouts,
                 true, // no `delegate` here; ceiling applied in DelegateTool::call
+                sandbox,
             );
             Ok((DynAgent::OpenAI(builder.build()), Arc::new(hook)))
         }
@@ -1547,6 +1584,7 @@ pub(crate) fn build_sub_agent(
                 None,
                 timeouts,
                 true, // no `delegate` here; ceiling applied in DelegateTool::call
+                sandbox,
             );
             Ok((DynAgent::Anthropic(builder.build()), Arc::new(hook)))
         }
@@ -1583,6 +1621,7 @@ pub(crate) fn build_sub_agent(
                 None,
                 timeouts,
                 true, // no `delegate` here; ceiling applied in DelegateTool::call
+                sandbox,
             );
             Ok((DynAgent::LlamaCpp(builder.build()), Arc::new(hook)))
         }
@@ -1618,6 +1657,7 @@ pub(crate) fn build_sub_agent(
                 None,
                 timeouts,
                 true, // no `delegate` here; ceiling applied in DelegateTool::call
+                sandbox,
             );
             Ok((DynAgent::Ollama(builder.build()), Arc::new(hook)))
         }
@@ -2252,6 +2292,7 @@ mod tests {
             None,  // sub-agent wiring
             &TimeoutsConfig::default(),
             true, // agents_md ceiling (no `delegate` registered here)
+            &SandboxConfig::default(),
         )
         .build();
         let defs = agent

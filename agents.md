@@ -143,6 +143,7 @@ Editing `config.yaml` or skills does not require a restart: each session verb re
 | `tools.*` (built-in filter) | `http.*` (published once into the client factory) |
 | `pipelines:` (rebuilt from per-repo config; see note) | legacy `pipeline:` (hard boot error — `PipelineSet::build` rejects it) |
 | `profiles:` (re-applied on every reload; a profile's `ui.tabs` gates the web tabs it shows) | — |
+| `sandbox:` (master/profile only) | — |
 
 `pipelines:` is now hot-reloadable on `/cd`, `/new`, `/model`, `/load`. The rebuild runs **after** the skill re-scan (so a role's `skills:` filter is validated against fresh names) and **before** `adopt_reloaded` (so it still has `&fresh_config`). A bad `pipelines:` block warns and keeps the previous set; the rest of the config is still adopted. The per-conversation selection on a non-empty conversation is **locked** (the existing "locked after first turn" rule is unchanged) — picking a team mid-conversation would risk mid-flight tool-list drift, so the reconciler only acts on a freshly minted conversation. Nothing is auto-selected: a local `.peakbot/config.yaml` declaring `pipelines:` makes teams *available*, never *active*. Legacy `pipeline:` is still a hard build error at boot — no silent adaptation, no silent zero-pipeline boot.
 
@@ -217,6 +218,13 @@ timeouts:                        # wall-clock ceilings on agent work; see
   tool_secs: 1800                # `http:` for per-socket network timeouts
   delegate_secs: 7200            # 1..=86400 each; 0 rejected at load
 
+sandbox:                         # WRITE-path gate for file_create /
+  mode: workspace-write          # file_str_replace / file_insert only.
+  writable_roots: ["~/scratch"]  # modes: off (default) | read-only | workspace-write
+                                  # workspace-write roots: session cwd is
+                                  # always included; writable_roots adds more
+                                  # (absolute or `~/...`, need not exist yet)
+
 http:                            # outbound timeouts for EVERY client (LLM,
   connect_timeout_secs: 30       # embeddings, MCP auth, web tools). 0 = disabled.
   read_timeout_secs: 1800        # seconds of silence, reset on each read
@@ -231,6 +239,39 @@ process dies — Stop still works (the per-turn cancellation token drops the
 in-flight request) but the user waits for the wrapper's read to die before the
 turn unwinds. Tools that set their own shorter total `.timeout()` (`fetch_url`,
 `fetch_page`, `web_search`) are unaffected: whichever fires first wins.
+
+### File sandbox (`sandbox:`)
+
+A WRITE-only gate over the three file-editing tools (`file_create`,
+`file_str_replace`, `file_insert`). **Reads are unrestricted in every mode**
+(`file_read`, `list_directory`, `pdf_read`, `doc_index`/`doc_search`), and
+**the shell is NEVER sandboxed** — `bash`/`bash_bg`/`powershell` and every MCP
+tool can write anywhere regardless of `sandbox:`. Three modes:
+
+- `off` (default) — unrestricted writes, today's behaviour.
+- `read-only` — the three write tools are disabled outright; every call
+  returns a `🔒 SANDBOX` error.
+- `workspace-write` — writes must resolve under the session cwd or one of
+  `writable_roots` (absolute paths or `~/...`, expanded against the home
+  dir; need not exist yet).
+
+`sandbox:` is **master-config or profile only** — exactly like `profiles:`,
+a per-repo `.peakbot/config.yaml` `sandbox:` block is ignored (with a boot
+warning); a profile that sets `sandbox:` replaces it wholesale (no field
+merge with the master's). Locked-down example: pair a read-only sandbox with
+disabling the shell so the whole toolset is read-only —
+
+```yaml
+profiles:
+  read-only-reviewer:
+    sandbox: { mode: read-only }
+    tools: { disabled: [bash, bash_bg, powershell] }
+```
+
+Known gaps, accepted for v1: the check is TOCTOU (a file can change between
+the check and the write) and doesn't defend against hardlinks into the
+sandboxed tree — not a hard security boundary, a guard against accidental
+writes.
 
 ### MCP servers
 
@@ -549,7 +590,7 @@ A sub-agent's preamble (`build_sub_agent_preamble`, rebuilt fresh per delegation
 
 ### Tools, isolation, stop
 
-Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). No sandbox in v1 — a sub-agent can write and run bash. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together. With #183 the abort is **mid-tool**, not just at the next LLM boundary: dropping the orchestrator's turn future unwinds the in-flight delegation and its sub-tool (`bash`/etc.) along with it, so the sub-agent's PTY child dies via `PtyHandle::drop` at the same instant. Stop or session teardown during a delegation persists an `INTERRUPTED` result for the in-flight `delegate` call, quoting the sub-agent's last message. Any tool call with no recorded result (crash, old transcripts) reaches the model as `INTERRUPTED` at the wire boundary (`sanitize_tool_pairs`) and is never silently dropped.
+Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegation) and no MCP tools; fresh todo list; isolated bash env (`env:` never leaks across roles). File writes honour the active `sandbox:` (sub-agents share the orchestrator's policy) — the shell does not; a sub-agent can still run bash freely. Stop during a delegation aborts the **whole turn** — sub-agent and orchestrator unwind together. With #183 the abort is **mid-tool**, not just at the next LLM boundary: dropping the orchestrator's turn future unwinds the in-flight delegation and its sub-tool (`bash`/etc.) along with it, so the sub-agent's PTY child dies via `PtyHandle::drop` at the same instant. Stop or session teardown during a delegation persists an `INTERRUPTED` result for the in-flight `delegate` call, quoting the sub-agent's last message. Any tool call with no recorded result (crash, old transcripts) reaches the model as `INTERRUPTED` at the wire boundary (`sanitize_tool_pairs`) and is never silently dropped.
 
 Pause (`/pause`, `Ctrl+P` in the TUI) is a **cooperative** gate and sub-agents only: the sub-agent finishes the step it is on, then parks before its next LLM call or tool dispatch until `/resume` (or `Ctrl+P` again). Paused time never counts against `timeouts.delegate_secs`, and Ollama sub-agents (hookless) are not pausable. Stop is unchanged: it aborts everything **including a paused sub-agent** — the parked wait is part of the turn future, so it drops with it.
 

@@ -90,6 +90,42 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+/// One line for the system-prompt env block describing the WRITE sandbox
+/// (file sandbox v1). `Off` renders nothing (`""`) so the prompt stays
+/// byte-identical to today when the sandbox is off; the other modes render
+/// a `- **File Sandbox**: …` bullet with roots shown as configured (no IO) and
+/// an explicit reminder that the shell is NOT sandboxed — reads are always
+/// unrestricted, so this line only ever describes the write gate.
+pub(crate) fn sandbox_env_line(
+    sandbox: &crate::config::SandboxConfig,
+    cwd: &std::path::Path,
+) -> String {
+    use crate::config::SandboxConfig;
+    match sandbox {
+        SandboxConfig::Off {} => String::new(),
+        SandboxConfig::ReadOnly {} => {
+            "- **File Sandbox**: read-only — file_create/file_str_replace/file_insert are \
+             disabled. Reads are unrestricted. NOT sandboxed: bash/bash_bg/powershell and MCP \
+             tools can still write anywhere.\n"
+                .to_string()
+        }
+        SandboxConfig::WorkspaceWrite { writable_roots } => {
+            let mut roots: Vec<String> = vec![cwd.to_string_lossy().to_string()];
+            roots.extend(
+                writable_roots
+                    .iter()
+                    .map(|r| r.as_path().display().to_string()),
+            );
+            format!(
+                "- **File Sandbox**: workspace-write — file_create/file_str_replace/file_insert \
+                 are limited to: [{}]. Reads are unrestricted. NOT sandboxed: \
+                 bash/bash_bg/powershell and MCP tools can still write anywhere.\n",
+                roots.join(", ")
+            )
+        }
+    }
+}
+
 /// Message types for internal queue between event loop and agent loop.
 ///
 /// **Single-writer invariant** (see `make-flow-great-again.md`):
@@ -573,7 +609,11 @@ const MEMORY_PROMPT_SECTION: &str = include_str!("system_prompt_memory.txt");
 /// The `# Environment Information` block (cwd, time, version, OS, binary,
 /// shell). Derived fresh at each call so the time is live — shared by the
 /// orchestrator prompt and every sub-agent preamble.
-pub(crate) fn env_block(shell_kind: Option<&ShellKind>, cwd: &std::path::Path) -> String {
+pub(crate) fn env_block(
+    shell_kind: Option<&ShellKind>,
+    cwd: &std::path::Path,
+    sandbox: &crate::config::SandboxConfig,
+) -> String {
     let current_time = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
@@ -582,13 +622,14 @@ pub(crate) fn env_block(shell_kind: Option<&ShellKind>, cwd: &std::path::Path) -
         .unwrap_or_else(|_| "Unknown".to_string());
 
     format!(
-        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n- **Operating System**: {}\n- **PeakBot Binary Path**: {}\n{}",
+        "\n# Environment Information\n\n- **Current Working Directory**: {}\n- **Current Time**: {}\n- **PeakBot Version**: {}\n- **Operating System**: {}\n- **PeakBot Binary Path**: {}\n{}{}",
         cwd.to_string_lossy(),
         current_time,
         PEAKBOT_VERSION,
         std::env::consts::OS,
         binary_path,
         shell_line(shell_kind),
+        sandbox_env_line(sandbox, cwd),
     )
 }
 
@@ -656,6 +697,7 @@ pub fn build_system_prompt(
     subagents_active: bool,
     orchestrator_prompt: Option<&str>,
     head: Option<&PromptHead>,
+    sandbox: &crate::config::SandboxConfig,
 ) -> String {
     let mut prompt = String::new();
 
@@ -693,7 +735,7 @@ pub fn build_system_prompt(
     }
 
     prompt.push_str(&skills.to_system_prompt_section());
-    prompt.push_str(&env_block(shell_kind, cwd));
+    prompt.push_str(&env_block(shell_kind, cwd, sandbox));
     if agents_md_enabled {
         prompt.push_str(&agents_md_section(cwd));
     }
@@ -2757,6 +2799,7 @@ impl AgentRunner {
                 .as_ref()
                 .and_then(|p| p.orchestrator_prompt.as_deref()),
             head.as_ref(),
+            &config.sandbox,
         );
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
@@ -2776,6 +2819,7 @@ impl AgentRunner {
             config.retry(),
             config.timeouts(),
             ctx.agents_md_enabled,
+            &config.sandbox,
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 
@@ -4627,7 +4671,57 @@ mod tests {
         assert_eq!(panic_text(other_payload), "unknown panic");
     }
 
-    // --- /help handler tests -------------------------------------------------
+    // --- sandbox_env_line (file sandbox v1, contracts 22/23) -----------------
+
+    #[test]
+    fn sandbox_env_line_is_empty_for_off_mode() {
+        let sandbox = crate::config::SandboxConfig::Off {};
+        let cwd = std::path::Path::new("/home/user/project");
+        assert_eq!(sandbox_env_line(&sandbox, cwd), "");
+    }
+
+    #[test]
+    fn sandbox_env_line_for_read_only_warns_shell_not_sandboxed() {
+        let sandbox = crate::config::SandboxConfig::ReadOnly {};
+        let cwd = std::path::Path::new("/home/user/project");
+        let line = sandbox_env_line(&sandbox, cwd);
+        assert!(
+            line.contains("NOT sandboxed"),
+            "read-only line must warn the shell is not sandboxed, got: {line:?}"
+        );
+        assert!(
+            line.contains("read-only"),
+            "read-only line must name the mode, got: {line:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_env_line_for_workspace_write_includes_cwd_and_roots_and_shell_warning() {
+        let sandbox = crate::config::SandboxConfig::WorkspaceWrite {
+            writable_roots: vec![
+                "/extra/one".to_string().try_into().unwrap(),
+                "/extra/two".to_string().try_into().unwrap(),
+            ],
+        };
+        let cwd = std::path::Path::new("/home/user/project");
+        let line = sandbox_env_line(&sandbox, cwd);
+        assert!(
+            line.contains("NOT sandboxed"),
+            "workspace-write line must warn the shell is not sandboxed, got: {line:?}"
+        );
+        assert!(
+            line.contains("/home/user/project"),
+            "workspace-write line must include the session cwd, got: {line:?}"
+        );
+        assert!(
+            line.contains("/extra/one"),
+            "workspace-write line must include every configured root, got: {line:?}"
+        );
+        assert!(
+            line.contains("/extra/two"),
+            "workspace-write line must include every configured root, got: {line:?}"
+        );
+    }
 
     #[tokio::test]
     async fn help_command_emits_system_message_listing_all_builtin_commands() {
@@ -4687,6 +4781,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::config::SandboxConfig::default(),
         );
         assert!(
             prompt.contains("**Shell**: powershell"),
@@ -4717,6 +4812,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::config::SandboxConfig::default(),
         );
         assert!(
             prompt.contains("**Shell**: bash"),
@@ -4743,7 +4839,17 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-CONTENT").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
+        let prompt = build_system_prompt(
+            &skills,
+            None,
+            &dir,
+            true,
+            true,
+            false,
+            None,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
 
         assert!(
             prompt.contains(&dir.to_string_lossy().to_string()),
@@ -4771,7 +4877,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
+        let prompt = build_system_prompt(
+            &skills,
+            None,
+            &dir,
+            true,
+            true,
+            false,
+            None,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             prompt.contains("# Memory.md"),
             "memory section must be present when memory is enabled"
@@ -4791,7 +4907,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, false, true, false, None, None);
+        let prompt = build_system_prompt(
+            &skills,
+            None,
+            &dir,
+            false,
+            true,
+            false,
+            None,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             !prompt.contains("# Memory.md"),
             "memory section must be omitted when memory is disabled"
@@ -4808,13 +4934,33 @@ mod tests {
         let skills = SkillRegistry::new();
         let cwd = std::env::current_dir().unwrap();
 
-        let agentless = build_system_prompt(&skills, None, &cwd, false, true, false, None, None);
+        let agentless = build_system_prompt(
+            &skills,
+            None,
+            &cwd,
+            false,
+            true,
+            false,
+            None,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             agentless.contains("CODE CRUSADER"),
             "agentless prompt must carry the persona"
         );
 
-        let orchestrator = build_system_prompt(&skills, None, &cwd, false, true, true, None, None);
+        let orchestrator = build_system_prompt(
+            &skills,
+            None,
+            &cwd,
+            false,
+            true,
+            true,
+            None,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             !orchestrator.contains("CODE CRUSADER"),
             "orchestrator prompt must drop the persona"
@@ -4833,20 +4979,50 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let extra = Some("Lead the SENTINEL-TEAM well.");
 
-        let on = build_system_prompt(&skills, None, &cwd, false, true, true, extra, None);
+        let on = build_system_prompt(
+            &skills,
+            None,
+            &cwd,
+            false,
+            true,
+            true,
+            extra,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             on.contains("SENTINEL-TEAM"),
             "orchestrator prompt must be appended when sub-agents are active"
         );
 
-        let off = build_system_prompt(&skills, None, &cwd, false, true, false, extra, None);
+        let off = build_system_prompt(
+            &skills,
+            None,
+            &cwd,
+            false,
+            true,
+            false,
+            extra,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             !off.contains("SENTINEL-TEAM"),
             "orchestrator prompt must be ignored in agentless mode"
         );
 
         // A blank orchestrator prompt adds no section.
-        let blank = build_system_prompt(&skills, None, &cwd, false, true, true, Some("   "), None);
+        let blank = build_system_prompt(
+            &skills,
+            None,
+            &cwd,
+            false,
+            true,
+            true,
+            Some("   "),
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             !blank.contains("# Orchestrator Instructions"),
             "a blank orchestrator prompt must not emit a section header"
@@ -4887,7 +5063,17 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-OFF").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, false, None, None);
+        let prompt = build_system_prompt(
+            &skills,
+            None,
+            &dir,
+            true,
+            false,
+            false,
+            None,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             !prompt.contains("SENTINEL-AGENTS-OFF"),
             "agents_md_enabled: false must omit the agents.md content"
@@ -4912,7 +5098,17 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-ON").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
+        let prompt = build_system_prompt(
+            &skills,
+            None,
+            &dir,
+            true,
+            true,
+            false,
+            None,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             prompt.contains("SENTINEL-AGENTS-ON"),
             "agents_md_enabled: true must inject the agents.md content"
@@ -4938,7 +5134,17 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-ORCH").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, true, None, None);
+        let prompt = build_system_prompt(
+            &skills,
+            None,
+            &dir,
+            true,
+            false,
+            true,
+            None,
+            None,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             !prompt.contains("SENTINEL-AGENTS-ORCH"),
             "the agents_md gate must hold for the orchestrator recipe as well"

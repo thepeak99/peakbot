@@ -60,6 +60,9 @@ pub struct SubAgentDeps {
     /// preamble, so `agents_md: false` strips even an opted-in role's
     /// agents.md section.
     pub agents_md_ceiling: bool,
+    /// The active profile's resolved `sandbox:` config — sub-agents get the
+    /// same write policy as the orchestrator (see `build_sub_agent`).
+    pub sandbox: crate::config::SandboxConfig,
 }
 
 /// The effective agents.md flag for a delegation: the role's own opt-in
@@ -75,6 +78,7 @@ fn agents_md_effective(role_agents_md: bool, profile_ceiling: bool) -> bool {
 /// `agents_md: true`). Deliberately lean — no persona, core guidance, or
 /// memory. Sections are separated by blank lines; empty pieces (no skills
 /// shown, no bg processes, no agents.md) contribute nothing.
+#[allow(clippy::too_many_arguments)] // sandbox is the new write-policy param; mirrors env_block's own growth
 fn build_sub_agent_preamble(
     role_prompt: &str,
     shell_kind: Option<&ShellKind>,
@@ -83,9 +87,10 @@ fn build_sub_agent_preamble(
     filter: &crate::config::NameFilter,
     bg: &[BgListEntry],
     agents_md: bool,
+    sandbox: &crate::config::SandboxConfig,
 ) -> String {
     let mut preamble = role_prompt.to_string();
-    preamble.push_str(&crate::env_block(shell_kind, cwd));
+    preamble.push_str(&crate::env_block(shell_kind, cwd, sandbox));
     preamble.push_str(&skills.to_system_prompt_section_filtered(filter));
     // Unlike the other sections the renderer emits bare text, so the section
     // padding lives here — and an empty render costs not even a newline.
@@ -349,6 +354,7 @@ impl Tool for DelegateTool {
             &role.skills,
             &bg_before,
             agents_md_effective(role.agents_md, deps.agents_md_ceiling),
+            &deps.sandbox,
         );
 
         // Size the gate against THIS role's model, not the orchestrator's:
@@ -372,6 +378,7 @@ impl Tool for DelegateTool {
             deps.vector_store.as_ref(),
             context_budget,
             &deps.timeouts,
+            &deps.sandbox,
         )
         .map_err(|e| DelegateError::Build {
             role: args.role.clone(),
@@ -600,6 +607,7 @@ mod tests {
             retry: crate::config::RetryConfig::default(),
             timeouts: crate::config::TimeoutsConfig::default(),
             agents_md_ceiling: true,
+            sandbox: crate::config::SandboxConfig::default(),
         };
         DelegateTool::new(Arc::new(deps))
     }
@@ -860,6 +868,7 @@ mod tests {
             retry,
             timeouts: crate::config::TimeoutsConfig::default(),
             agents_md_ceiling: true,
+            sandbox: crate::config::SandboxConfig::default(),
         };
         DelegateTool::new(Arc::new(deps))
     }
@@ -1165,8 +1174,16 @@ mod tests {
         let skills = crate::skills::SkillRegistry::default();
         let filter = crate::config::NameFilter::default();
 
-        let opted_in =
-            build_sub_agent_preamble("role prompt", None, dir.path(), &skills, &filter, &[], true);
+        let opted_in = build_sub_agent_preamble(
+            "role prompt",
+            None,
+            dir.path(),
+            &skills,
+            &filter,
+            &[],
+            true,
+            &crate::config::SandboxConfig::default(),
+        );
         assert!(
             opted_in.contains("SENTINEL-SUBAGENT-CONTEXT"),
             "agents_md: true must inject the repo's agents.md"
@@ -1180,6 +1197,7 @@ mod tests {
             &filter,
             &[],
             false,
+            &crate::config::SandboxConfig::default(),
         );
         assert!(
             !opted_out.contains("SENTINEL-SUBAGENT-CONTEXT"),
@@ -1231,8 +1249,16 @@ mod tests {
         let filter = crate::config::NameFilter::default();
         let bg = vec![running(4, "npm run dev", Some("dev-server"))];
 
-        let preamble =
-            build_sub_agent_preamble("role prompt", None, dir.path(), &skills, &filter, &bg, true);
+        let preamble = build_sub_agent_preamble(
+            "role prompt",
+            None,
+            dir.path(),
+            &skills,
+            &filter,
+            &bg,
+            true,
+            &crate::config::SandboxConfig::default(),
+        );
 
         let bg_at = preamble
             .find("# Background Processes")
@@ -1255,8 +1281,16 @@ mod tests {
         // Exited entries render as "" too, so they must cost nothing either.
         let bg = vec![exited(1, "old-thing", None)];
 
-        let preamble =
-            build_sub_agent_preamble("role prompt", None, dir.path(), &skills, &filter, &bg, true);
+        let preamble = build_sub_agent_preamble(
+            "role prompt",
+            None,
+            dir.path(),
+            &skills,
+            &filter,
+            &bg,
+            true,
+            &crate::config::SandboxConfig::default(),
+        );
 
         assert!(!preamble.contains("Background Processes"));
         assert!(
@@ -1294,6 +1328,7 @@ mod tests {
             &filter,
             &[],
             false,
+            &crate::config::SandboxConfig::default(),
         );
 
         assert!(
@@ -1324,8 +1359,16 @@ mod tests {
         // must start with this text and contain no other persona-shaped
         // prose.
         let role_prompt = "ROLE-PERSONA-SENTINEL: be terse.";
-        let preamble =
-            build_sub_agent_preamble(role_prompt, None, dir.path(), &skills, &filter, &[], false);
+        let preamble = build_sub_agent_preamble(
+            role_prompt,
+            None,
+            dir.path(),
+            &skills,
+            &filter,
+            &[],
+            false,
+            &crate::config::SandboxConfig::default(),
+        );
 
         assert!(
             preamble.starts_with(role_prompt),
@@ -1354,6 +1397,7 @@ mod tests {
             &crate::config::NameFilter,
             &[BgListEntry],
             bool,
+            &crate::config::SandboxConfig,
         ) -> String;
         let _f: PreambleFn = build_sub_agent_preamble;
     }

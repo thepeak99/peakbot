@@ -272,6 +272,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         active.is_some(),
         active.and_then(|p| p.orchestrator_prompt.as_deref()),
         session_head.as_ref(),
+        &config.sandbox,
     );
 
     // The `delegate` tool (and thus sub-agents) is registered iff a pipeline is
@@ -298,6 +299,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         &config.retry,
         &config.timeouts,
         config.agents_md,
+        &config.sandbox,
     )?;
 
     // Thread the resolved reasoning gates into the shared StateManager.

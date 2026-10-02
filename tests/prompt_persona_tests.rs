@@ -35,6 +35,7 @@
 //! NOT leak into a role preamble) lives next to the helper itself in
 //! `src/pipeline/delegate_tool.rs::tests`; it is a GREEN guard today.
 
+use peakbot::config::SandboxConfig;
 use peakbot::skills::SkillRegistry;
 use peakbot::{PromptHead, build_system_prompt, resolve_prompt_head};
 
@@ -55,6 +56,7 @@ fn agentless_prompt_with_some_persona_replaces_crusader() {
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Persona(custom.to_string())),
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.contains(custom),
@@ -81,6 +83,7 @@ fn agentless_prompt_with_none_persona_keeps_crusader() {
         false,
         None,
         /* persona */ None,
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.contains("CODE CRUSADER"),
@@ -102,6 +105,7 @@ fn agentless_prompt_with_whitespace_only_persona_keeps_crusader() {
         false,
         None,
         Some(&PromptHead::Persona("   \n  \t  \n".to_string())),
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.contains("CODE CRUSADER"),
@@ -130,6 +134,7 @@ fn orchestrator_prompt_carries_configured_persona() {
         /* subagents_active */ true,
         /* orchestrator_prompt */ None,
         Some(&PromptHead::Persona(custom.to_string())),
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.contains(custom),
@@ -160,6 +165,7 @@ fn orchestrator_prompt_without_persona_carries_none_at_all() {
         /* subagents_active */ true,
         None,
         /* persona */ None,
+        &SandboxConfig::default(),
     );
     assert!(
         !prompt.contains("CODE CRUSADER"),
@@ -186,6 +192,7 @@ fn orchestrator_prompt_with_addendum_keeps_orchestrator_prompt_and_persona() {
         true,
         Some(extra),
         Some(&PromptHead::Persona(custom.to_string())),
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.contains(extra),
@@ -220,8 +227,19 @@ fn persona_to_core_join_is_a_single_newline_for_both_branches() {
         false,
         None,
         head.as_ref(),
+        &SandboxConfig::default(),
     );
-    let builtin = build_system_prompt(&skills, None, &cwd(), false, true, false, None, None);
+    let builtin = build_system_prompt(
+        &skills,
+        None,
+        &cwd(),
+        false,
+        true,
+        false,
+        None,
+        None,
+        &SandboxConfig::default(),
+    );
 
     let core_idx_configured = configured
         .find("# Working Principles")
@@ -277,6 +295,7 @@ fn full_head_replaces_persona_and_core() {
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Full(format!("  \n{full}\n  "))),
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.starts_with(full),
@@ -337,6 +356,7 @@ fn full_head_keeps_every_dynamic_section() {
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Full(full.to_string())),
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.starts_with(full),
@@ -391,6 +411,7 @@ fn full_head_in_orchestrator_mode_keeps_orchestrator_instructions() {
         /* subagents_active */ true,
         /* orchestrator_prompt */ Some(extra),
         /* head */ Some(&PromptHead::Full(full.to_string())),
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.starts_with(full),
@@ -438,6 +459,7 @@ fn persona_head_still_keeps_core() {
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Persona(custom.to_string())),
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.contains(custom),
@@ -505,6 +527,7 @@ fn blank_full_head_falls_back_to_built_in() {
         /* subagents_active */ false,
         /* orchestrator_prompt */ None,
         /* head */ Some(&PromptHead::Full("   \n\t ".to_string())),
+        &SandboxConfig::default(),
     );
     assert!(
         prompt.contains("CODE CRUSADER"),

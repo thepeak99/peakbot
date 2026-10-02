@@ -11,10 +11,12 @@ use std::path::{Path, PathBuf};
 mod create;
 mod insert;
 mod str_replace;
+mod write_policy;
 
 pub use create::FileCreateTool;
 pub use insert::FileInsertTool;
 pub use str_replace::FileStrReplaceTool;
+pub use write_policy::{SandboxDenied, WritePolicy};
 
 pub(crate) const SNIPPET_CONTEXT_LINES: usize = 4;
 
@@ -29,6 +31,21 @@ pub fn resolve_against(base: &Path, raw: &str) -> PathBuf {
         return p.to_path_buf();
     }
     base.join(p)
+}
+
+/// Resolve a raw path for a WRITE, then gate it through the sandbox policy.
+/// `Unrestricted` is byte-identical to [`resolve_against`]; otherwise the
+/// resolved (non-canonical) path is checked and a denial surfaces as
+/// `FileEditError::Sandbox`. On success the NON-canonical resolved path is
+/// returned, exactly as today — canonicalization is a check-only concern.
+pub(crate) fn resolve_for_write(
+    cwd: &Path,
+    policy: &WritePolicy,
+    raw: &str,
+) -> Result<PathBuf, FileEditError> {
+    let resolved = resolve_against(cwd, raw);
+    policy.check(&resolved)?;
+    Ok(resolved)
 }
 
 /// Level of matching that was used to find the text
@@ -92,6 +109,8 @@ pub enum FileEditError {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Sandbox(#[from] SandboxDenied),
 }
 
 // ── IO helpers ────────────────────────────────────────────────────────
@@ -823,7 +842,7 @@ mod tests {
         // Spec item 1 — the schema is the first line of defence: a model
         // that reads the schema must see new_str as required and learn
         // that "" is the deletion path.
-        let tool = FileStrReplaceTool::new(PathBuf::from("/tmp"));
+        let tool = FileStrReplaceTool::new(PathBuf::from("/tmp"), WritePolicy::default());
         let def = tool.definition(String::new()).await;
         let params = &def.parameters;
 
@@ -885,7 +904,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf(), WritePolicy::default());
         let result = tool.call(args).await;
         match result {
             Err(e) => {
@@ -924,7 +943,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf(), WritePolicy::default());
         let result = tool.call(args).await;
         match result {
             Err(e) => {
@@ -964,7 +983,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf(), WritePolicy::default());
         let out = tool
             .call(args)
             .await
@@ -1000,7 +1019,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf(), WritePolicy::default());
         let out = tool
             .call(args)
             .await
@@ -1032,7 +1051,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf(), WritePolicy::default());
         let out = tool
             .call(args)
             .await
@@ -1063,7 +1082,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf(), WritePolicy::default());
         let out = tool
             .call(args)
             .await
@@ -1098,7 +1117,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf(), WritePolicy::default());
         let out = tool
             .call(args)
             .await
@@ -1122,6 +1141,94 @@ mod tests {
 
         insert::run(path.to_str().unwrap(), 0, "zero").expect("insert should succeed");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "zero\none\ntwo\n");
+    }
+
+    // ── write sandbox (contract 20): WritePolicy::Denied gates every tool ──
+    //
+    // Drives each tool through `Tool::call()` (not the `run()` core) because
+    // the sandbox gate lives at the `call()` boundary, same reasoning as the
+    // required-new_str tests above. RED until the developer wires
+    // `resolve_for_write` into each tool's `call()`.
+
+    #[tokio::test]
+    async fn file_create_denied_by_sandbox_leaves_no_file_on_disk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("denied_create.txt");
+
+        let tool = FileCreateTool::new(dir.path().to_path_buf(), WritePolicy::Denied);
+        let args: create::FileCreateArgs = serde_json::from_value(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "file_text": "hello"
+        }))
+        .unwrap();
+        let err = tool
+            .call(args)
+            .await
+            .expect_err("a denied sandbox write must error");
+        assert!(
+            matches!(err, FileEditError::Sandbox(_)),
+            "expected FileEditError::Sandbox, got: {err:?}"
+        );
+        assert!(
+            !path.exists(),
+            "a denied write must never touch the filesystem"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_str_replace_denied_by_sandbox_leaves_file_unchanged() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("denied_replace.txt");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+
+        let tool = FileStrReplaceTool::new(dir.path().to_path_buf(), WritePolicy::Denied);
+        let args: str_replace::FileStrReplaceArgs = serde_json::from_value(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "old_str": "beta",
+            "new_str": "BETA"
+        }))
+        .unwrap();
+        let err = tool
+            .call(args)
+            .await
+            .expect_err("a denied sandbox write must error");
+        assert!(
+            matches!(err, FileEditError::Sandbox(_)),
+            "expected FileEditError::Sandbox, got: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha beta gamma",
+            "a denied write must leave the file byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_insert_denied_by_sandbox_leaves_file_unchanged() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("denied_insert.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+
+        let tool = FileInsertTool::new(dir.path().to_path_buf(), WritePolicy::Denied);
+        let args: insert::FileInsertArgs = serde_json::from_value(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "insert_line": 0,
+            "insert_text": "zero"
+        }))
+        .unwrap();
+        let err = tool
+            .call(args)
+            .await
+            .expect_err("a denied sandbox write must error");
+        assert!(
+            matches!(err, FileEditError::Sandbox(_)),
+            "expected FileEditError::Sandbox, got: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "one\ntwo\n",
+            "a denied write must leave the file byte-identical"
+        );
     }
 }
 

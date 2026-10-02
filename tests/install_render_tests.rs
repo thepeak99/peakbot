@@ -357,8 +357,9 @@ fn windows_task_xml_is_utf16_le_with_bom() {
     // Every subsequent byte pair must be a valid UTF-16LE code unit, and
     // the result, decoded back to UTF-8, must start with `<?xml`.
     let mut u16_units: Vec<u16> = Vec::with_capacity((bytes.len() - 2) / 2);
-    for chunk in bytes[2..].chunks_exact(2) {
-        u16_units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    let (chunks, _) = bytes[2..].as_chunks::<2>();
+    for chunk in chunks {
+        u16_units.push(u16::from_le_bytes(*chunk));
     }
     let decoded = String::from_utf16(&u16_units).expect("body must be valid UTF-16LE");
     assert!(
@@ -376,10 +377,8 @@ fn windows_task_xml_decoded_matches_the_locked_artifact() {
     )
     .unwrap();
     let bytes = render_task_xml(&plan);
-    let u16_units: Vec<u16> = bytes[2..]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    let (chunks, _) = bytes[2..].as_chunks::<2>();
+    let u16_units: Vec<u16> = chunks.iter().map(|c| u16::from_le_bytes(*c)).collect();
     let decoded = String::from_utf16(&u16_units).unwrap();
     let expected = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n  <RegistrationInfo>\n    <Description>PeakBot agent (web UI)</Description>\n  </RegistrationInfo>\n  <Triggers>\n    <LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>DOMAIN\\user</UserId>\n    </LogonTrigger>\n  </Triggers>\n  <Principals>\n    <Principal id=\"Author\">\n      <UserId>DOMAIN\\user</UserId>\n      <LogonType>InteractiveToken</LogonType>\n      <RunLevel>LeastPrivilege</RunLevel>\n    </Principal>\n  </Principals>\n  <Settings>\n    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n    <StartWhenAvailable>true</StartWhenAvailable>\n    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n    <Enabled>true</Enabled>\n  </Settings>\n  <Actions Context=\"Author\">\n    <Exec>\n      <Command>C:\\Users\\you\\AppData\\Local\\Programs\\peakbot\\peakbot.exe</Command>\n      <Arguments>--bind 127.0.0.1:7823</Arguments>\n    </Exec>\n  </Actions>\n</Task>\n";
     assert_eq!(decoded, expected);
@@ -394,10 +393,8 @@ fn windows_task_xml_does_not_embed_a_token() {
     )
     .unwrap();
     let bytes = render_task_xml(&plan);
-    let u16_units: Vec<u16> = bytes[2..]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    let (chunks, _) = bytes[2..].as_chunks::<2>();
+    let u16_units: Vec<u16> = chunks.iter().map(|c| u16::from_le_bytes(*c)).collect();
     let decoded = String::from_utf16(&u16_units).unwrap();
     assert!(
         !decoded.contains("s3cret"),

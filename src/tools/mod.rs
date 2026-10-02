@@ -24,7 +24,7 @@ pub use doc_index::DocIndexTool;
 pub use doc_search::DocSearchTool;
 pub use fetch_page::FetchPageTool;
 pub use fetch_url::FetchUrlTool;
-pub use file_edit::{FileCreateTool, FileInsertTool, FileStrReplaceTool};
+pub use file_edit::{FileCreateTool, FileInsertTool, FileStrReplaceTool, WritePolicy};
 pub use file_read::FileReadTool;
 pub use list_directory::ListDirectoryTool;
 pub use pdf_read::PdfReadTool;

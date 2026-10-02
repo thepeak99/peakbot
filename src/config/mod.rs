@@ -17,7 +17,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Provider type enum - identifies which LLM provider to use
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -280,6 +280,74 @@ impl Default for LlamaCppConfig {
     }
 }
 
+/// WRITE-path sandbox mode (plan: file sandbox v1). Reads are unrestricted
+/// in every mode; the shell is never sandboxed — this only gates
+/// `file_create` / `file_str_replace` / `file_insert`.
+///
+/// Struct variants (not unit variants) for `Off`/`ReadOnly` so a stray key
+/// under them is caught by `deny_unknown_fields` instead of silently
+/// swallowed — the empty-braces shape is the "no extra fields" idiom.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SandboxConfig {
+    Off {},
+    ReadOnly {},
+    WorkspaceWrite {
+        #[serde(default)]
+        writable_roots: Vec<WritableRoot>,
+    },
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self::Off {}
+    }
+}
+
+/// A validated, absolute `writable_roots:` entry. The sole constructor is
+/// `TryFrom<String>` (via `#[serde(try_from)]`) so an un-expanded `~` or a
+/// relative path can never reach `WritePolicy`.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(try_from = "String")]
+pub struct WritableRoot(PathBuf);
+
+impl TryFrom<String> for WritableRoot {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        // `~` / `~/…` (any separator after `~`) expands against the home dir;
+        // everything else must already be absolute. `~user` and relatives
+        // fall through to the absolute check and fail with one message.
+        let path = Path::new(&s);
+        let is_tilde = s == "~"
+            || s.strip_prefix('~')
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(std::path::is_separator);
+        let resolved = if is_tilde {
+            let home = dirs::home_dir().ok_or("No home directory to expand '~'")?;
+            let rest = path
+                .strip_prefix("~")
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            home.join(rest)
+        } else {
+            path.to_path_buf()
+        };
+        if !resolved.is_absolute() {
+            return Err(format!(
+                "writable root '{s}' must be absolute or start with '~/'"
+            ));
+        }
+        Ok(WritableRoot(resolved))
+    }
+}
+
+impl WritableRoot {
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -400,6 +468,13 @@ pub struct Config {
     /// agents.md from every prompt with no profile involved.
     #[serde(skip, default = "default_true")]
     pub agents_md: bool,
+
+    /// WRITE-path sandbox for `file_create` / `file_str_replace` /
+    /// `file_insert`. Reads are unrestricted in all modes; the shell is
+    /// never sandboxed. Master-config only — a per-repo `.peakbot/config.yaml`
+    /// `sandbox:` block is ignored (with a boot warning), same as `profiles:`.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 /// A named overlay over the effective config. Every field is optional:
@@ -436,6 +511,10 @@ pub struct Profile {
     /// ceiling over a sub-agent role's own `agents_md` opt-in.
     #[serde(default)]
     pub agents_md: Option<bool>,
+    /// Replaces `sandbox:` wholesale (no field merge) — a profile that sets
+    /// a sandbox mode fully owns the write policy for the session.
+    #[serde(default)]
+    pub sandbox: Option<SandboxConfig>,
 }
 
 impl Profile {
@@ -463,6 +542,9 @@ impl Profile {
         }
         if self.agents_md.is_some() {
             out.push("agents_md");
+        }
+        if self.sandbox.is_some() {
+            out.push("sandbox");
         }
         out
     }
@@ -1839,6 +1921,10 @@ impl Config {
         // checked-out repo must not be able to redefine the deployment's
         // guarantees; `Config::load` warns when a per-repo config declares a
         // `profiles:` block.
+
+        // sandbox — deliberately NOT adopted: master/profile only, for the
+        // same reason as `profiles:` above. `Config::load` warns when a
+        // per-repo config declares a non-default `sandbox:` block.
     }
 }
 
@@ -1877,6 +1963,7 @@ impl Default for Config {
             profiles: HashMap::new(),
             active_profile: None,
             agents_md: true,
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -2017,7 +2104,7 @@ impl Config {
                 .unwrap_or_else(|| ".peakbot/config.yaml".to_string());
             validate_prompt_slot(per_repo, &per_repo_label).map_err(anyhow::Error::msg)?;
         }
-        warn_if_per_repo_declares_profiles(per_repo.as_ref());
+        warn_if_per_repo_declares_master_only(per_repo.as_ref());
         let merged = Self::merge_sources(master, per_repo);
         let config = apply_profile(merged, profile).map_err(anyhow::Error::msg)?;
 
@@ -2080,7 +2167,7 @@ impl Config {
             let per_repo_label = cwd.join(".peakbot/config.yaml").display().to_string();
             validate_prompt_slot(per_repo, &per_repo_label)?;
         }
-        warn_if_per_repo_declares_profiles(per_repo.as_ref());
+        warn_if_per_repo_declares_master_only(per_repo.as_ref());
         apply_profile(Self::merge_sources(master, per_repo), profile)
     }
 
@@ -2232,6 +2319,11 @@ fn apply_profile(mut cfg: Config, name: Option<&str>) -> Result<Config, String> 
     if let Some(b) = profile.agents_md {
         cfg.agents_md = b;
     }
+    // The sandbox is replaced wholesale — a profile that sets it fully owns
+    // the write policy; there is no field-level merge.
+    if let Some(s) = profile.sandbox {
+        cfg.sandbox = s;
+    }
     cfg.active_profile = Some(name.to_string());
     Ok(cfg)
 }
@@ -2311,13 +2403,20 @@ fn validate_prompt_slot(cfg: &Config, source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Master-only profiles (§1.5): a `profiles:` block in a per-repo config is
-/// never merged in (`merge_with` skips it), but silently dropping user config
-/// is astonishing — warn once whenever one is present.
-fn warn_if_per_repo_declares_profiles(per_repo: Option<&Config>) {
-    if per_repo.is_some_and(|c| !c.profiles.is_empty()) {
+/// Master-only config (§1.5, extended for file sandbox v1): a `profiles:` or
+/// non-default `sandbox:` block in a per-repo config is never merged in
+/// (`merge_with` skips both), but silently dropping user config is
+/// astonishing — warn once per key whenever one is present.
+fn warn_if_per_repo_declares_master_only(per_repo: Option<&Config>) {
+    let Some(cfg) = per_repo else { return };
+    if !cfg.profiles.is_empty() {
         tracing::warn!(
             "⚠ .peakbot/config.yaml declares `profiles:` — ignored (profiles are master-config only)."
+        );
+    }
+    if cfg.sandbox != SandboxConfig::default() {
+        tracing::warn!(
+            "per-repo config declares `sandbox:` — ignored; the sandbox can only be set in the master config or a profile"
         );
     }
 }
@@ -4611,6 +4710,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -4667,6 +4767,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -4719,6 +4820,7 @@ max_image_bytes: 10485760
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        sandbox: None,
                     },
                 ),
                 (
@@ -4731,6 +4833,7 @@ max_image_bytes: 10485760
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        sandbox: None,
                     },
                 ),
             ]),
@@ -4766,6 +4869,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -4781,6 +4885,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -4853,6 +4958,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -4927,6 +5033,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -5064,6 +5171,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -5102,6 +5210,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -5144,6 +5253,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            sandbox: None,
         };
         assert_eq!(
             none.overridden_fields(),
@@ -5159,6 +5269,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            sandbox: None,
         };
         assert_eq!(
             all.overridden_fields(),
@@ -5174,6 +5285,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            sandbox: None,
         };
         assert_eq!(
             pipes.overridden_fields(),
@@ -5189,6 +5301,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            sandbox: None,
         };
         assert_eq!(
             all_four.overridden_fields(),
@@ -5204,6 +5317,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            sandbox: None,
         };
         assert_eq!(
             prompt_only.overridden_fields(),
@@ -5222,6 +5336,7 @@ max_image_bytes: 10485760
                 tabs: Some(NameFilter::default()),
             }),
             agents_md: Some(false),
+            sandbox: None,
         };
         assert_eq!(
             all_seven.overridden_fields(),
@@ -5264,6 +5379,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -5374,6 +5490,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -5458,6 +5575,7 @@ max_image_bytes: 10485760
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        sandbox: None,
                     },
                 )]),
                 ..Config::default()
@@ -5731,6 +5849,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -5769,6 +5888,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -5807,6 +5927,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -5874,6 +5995,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -5974,6 +6096,7 @@ max_image_bytes: 10485760
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        sandbox: None,
                     },
                 )]),
                 ..Config::default()
@@ -6263,6 +6386,7 @@ profiles:
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        sandbox: None,
                     },
                 )]),
                 ..Config::default()
@@ -6750,6 +6874,7 @@ profiles:
             }),
             mcp_servers: None,
             agents_md: None,
+            sandbox: None,
         };
         assert_eq!(
             all_five.overridden_fields(),
@@ -7251,6 +7376,7 @@ profiles:
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    sandbox: None,
                 },
             )]),
             ..Config::default()
@@ -7543,6 +7669,209 @@ profiles:
                 "session", "todo", "files", "tasks", "bash", "agents", "profile",
             ],
             "an empty ui block ('ui: {{}}') is 'no filter', not 'no tabs'"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // File sandbox v1 — `sandbox:` config (contracts 1-10)
+    //
+    // RED expectations: contracts 2 & 5 (WritableRoot validation), 8
+    // (apply_profile wholesale replace) and 9 (overridden_fields) are the
+    // genuinely-unimplemented paths and must FAIL. Contracts 1, 3, 4, 6 and 7
+    // are serde behaviours baked into the `SandboxConfig`/`WritableRoot` type
+    // definitions, and contract 10 (merge never adopts a per-repo sandbox)
+    // holds because `merge_with` simply never touches the field — those pass
+    // trivially and act as guards.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Test helper: build a `WritableRoot` from a string, panicking if the
+    /// (future) validator rejects a path the test intends to be valid.
+    fn wr_root(s: &str) -> WritableRoot {
+        WritableRoot::try_from(s.to_string())
+            .unwrap_or_else(|e| panic!("test root '{s}' must be valid: {e}"))
+    }
+
+    // contract 1 — an absent `sandbox:` block resolves to `Off` (the Default).
+    #[test]
+    fn sandbox_absent_defaults_to_off() {
+        let cfg: Config = serde_yaml::from_str("cost_tracking: true").unwrap();
+        assert_eq!(cfg.sandbox, SandboxConfig::Off {});
+    }
+
+    // contract 2 — workspace-write parses; a `~` root expands to the home dir.
+    #[test]
+    fn sandbox_workspace_write_parses_and_expands_tilde_root() {
+        let cfg: SandboxConfig =
+            serde_yaml::from_str("mode: workspace-write\nwritable_roots: [\"/a\", \"~/b\"]")
+                .expect("workspace-write with roots must parse");
+        match cfg {
+            SandboxConfig::WorkspaceWrite { writable_roots } => {
+                assert_eq!(writable_roots[0].as_path(), Path::new("/a"));
+                let home = dirs::home_dir().expect("HOME must be set in the test env");
+                assert_eq!(
+                    writable_roots[1].as_path(),
+                    home.join("b"),
+                    "`~/b` must expand to <home>/b"
+                );
+            }
+            other => panic!("expected workspace-write, got {other:?}"),
+        }
+    }
+
+    // contract 3 — an unknown mode is a hard parse error.
+    #[test]
+    fn sandbox_unknown_mode_is_rejected() {
+        let err = serde_yaml::from_str::<SandboxConfig>("mode: bogus")
+            .expect_err("an unknown sandbox mode must fail to parse");
+        assert!(err.to_string().contains("bogus"), "got: {err}");
+    }
+
+    // contract 4 — `writable_roots` under read-only/off is an unknown field.
+    #[test]
+    fn sandbox_writable_roots_under_read_only_or_off_is_rejected() {
+        for mode in ["read-only", "off"] {
+            let yaml = format!("mode: {mode}\nwritable_roots: [\"/a\"]");
+            let err = serde_yaml::from_str::<SandboxConfig>(&yaml)
+                .expect_err("writable_roots under a non-workspace mode must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("unknown field"), "{mode}: got: {msg}");
+            assert!(msg.contains("writable_roots"), "{mode}: got: {msg}");
+        }
+    }
+
+    // contract 5 — relative, empty and `~user` roots are rejected.
+    #[test]
+    fn writable_root_rejects_relative_empty_and_tilde_user() {
+        for bad in ["src", "", "~bob/x"] {
+            let err = WritableRoot::try_from(bad.to_string())
+                .expect_err(&format!("root '{bad}' must be rejected"));
+            assert!(
+                err.contains("must be absolute"),
+                "root '{bad}': expected the absolute-or-tilde message, got: {err}"
+            );
+            assert!(
+                err.contains("writable root"),
+                "root '{bad}': message must name it a writable root, got: {err}"
+            );
+        }
+    }
+
+    // contract 6 — `writable_roots` with no `mode` ⇒ missing field `mode`.
+    #[test]
+    fn sandbox_writable_roots_without_mode_is_rejected() {
+        let err = serde_yaml::from_str::<SandboxConfig>("writable_roots: [\"/a\"]")
+            .expect_err("writable_roots without a mode must fail to parse");
+        let msg = err.to_string();
+        assert!(msg.contains("missing field"), "got: {msg}");
+        assert!(msg.contains("mode"), "got: {msg}");
+    }
+
+    // contract 7 — an unknown key under a profile's sandbox is rejected.
+    #[test]
+    fn sandbox_unknown_key_under_profile_sandbox_is_rejected() {
+        let yaml =
+            "profiles:\n  locked:\n    sandbox:\n      mode: read-only\n      bogus_key: 1\n";
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .expect_err("an unknown key under a profile sandbox must fail to parse");
+        assert!(err.to_string().contains("bogus_key"), "got: {err}");
+    }
+
+    // contract 8 — a profile's sandbox replaces the base WHOLESALE.
+    #[test]
+    fn apply_profile_sandbox_replaces_wholesale() {
+        let base = SandboxConfig::WorkspaceWrite {
+            writable_roots: vec![wr_root("/a"), wr_root("/b")],
+        };
+        let master = Config {
+            sandbox: base.clone(),
+            profiles: HashMap::from([(
+                "empty".to_string(),
+                Profile {
+                    sandbox: Some(SandboxConfig::WorkspaceWrite {
+                        writable_roots: vec![],
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(master, Some("empty")).expect("profile exists");
+        assert_eq!(
+            effective.sandbox,
+            SandboxConfig::WorkspaceWrite {
+                writable_roots: vec![]
+            },
+            "a profile sandbox must replace the base wholesale (no field merge)"
+        );
+    }
+
+    // contract 8 (base-kept half) — no profile, or a profile without a
+    // sandbox, leaves the base sandbox untouched.
+    #[test]
+    fn apply_profile_without_sandbox_keeps_base() {
+        let base = SandboxConfig::WorkspaceWrite {
+            writable_roots: vec![wr_root("/a")],
+        };
+        // (a) no profile at all ⇒ base untouched.
+        let master = Config {
+            sandbox: base.clone(),
+            ..Config::default()
+        };
+        assert_eq!(
+            apply_profile(master.clone(), None).unwrap().sandbox,
+            base,
+            "no profile ⇒ base sandbox untouched"
+        );
+        // (b) a profile that does NOT set a sandbox ⇒ base untouched.
+        let master2 = Config {
+            sandbox: base.clone(),
+            profiles: HashMap::from([(
+                "nosand".to_string(),
+                Profile {
+                    ..Default::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        assert_eq!(
+            apply_profile(master2, Some("nosand")).unwrap().sandbox,
+            base,
+            "a profile without a sandbox must leave the base sandbox alone"
+        );
+    }
+
+    // contract 9 — `overridden_fields` names `sandbox` when a profile sets it.
+    #[test]
+    fn profile_overridden_fields_includes_sandbox_when_set() {
+        let profile = Profile {
+            sandbox: Some(SandboxConfig::ReadOnly {}),
+            ..Default::default()
+        };
+        let fields = profile.overridden_fields();
+        assert!(
+            fields.contains(&"sandbox"),
+            "a profile that sets a sandbox must report `sandbox` as overridden, got: {fields:?}"
+        );
+    }
+
+    // contract 10 — merge never adopts a per-repo sandbox (master wins).
+    #[test]
+    fn merge_keeps_master_sandbox_and_ignores_per_repo() {
+        let master = Config {
+            sandbox: SandboxConfig::ReadOnly {},
+            ..Config::default()
+        };
+        let repo = Config {
+            sandbox: SandboxConfig::WorkspaceWrite {
+                writable_roots: vec![wr_root("/repo")],
+            },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master.clone()), Some(repo));
+        assert_eq!(
+            merged.sandbox,
+            SandboxConfig::ReadOnly {},
+            "a per-repo `sandbox:` block must be ignored; master's wins"
         );
     }
 }

@@ -7,7 +7,7 @@ use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{FileEditError, resolve_against, write_file};
+use super::{FileEditError, WritePolicy, resolve_for_write, write_file};
 
 #[derive(Deserialize)]
 pub struct FileCreateArgs {
@@ -17,15 +17,20 @@ pub struct FileCreateArgs {
 
 /// Create-a-file tool. `session_cwd` is the directory relative paths resolve
 /// against; the `Default` empty path leaves relatives anchored at the process
-/// cwd (tests / no state manager).
+/// cwd (tests / no state manager). `write_policy` gates the write — stored
+/// and consulted at the `call()` boundary; `Default` is `Unrestricted`.
 #[derive(Default)]
 pub struct FileCreateTool {
     session_cwd: PathBuf,
+    write_policy: WritePolicy,
 }
 
 impl FileCreateTool {
-    pub fn new(session_cwd: PathBuf) -> Self {
-        Self { session_cwd }
+    pub fn new(session_cwd: PathBuf, write_policy: WritePolicy) -> Self {
+        Self {
+            session_cwd,
+            write_policy,
+        }
     }
 }
 
@@ -75,8 +80,8 @@ and editing it later."
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(&self.session_cwd, &args.path);
-        let result = run(&resolved.to_string_lossy(), args.file_text.as_deref());
+        let result = resolve_for_write(&self.session_cwd, &self.write_policy, &args.path)
+            .and_then(|resolved| run(&resolved.to_string_lossy(), args.file_text.as_deref()));
 
         match &result {
             Ok(output) => tracing::info!(

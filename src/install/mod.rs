@@ -707,10 +707,8 @@ pub(crate) fn run(program: &str, args: &[&str]) -> Result<CommandRun, InstallErr
 /// Sniffing the BOM here means no platform module has to care.
 pub(crate) fn decode_output(bytes: &[u8]) -> String {
     if let [0xFF, 0xFE, rest @ ..] = bytes {
-        let units: Vec<u16> = rest
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
+        let (chunks, _) = rest.as_chunks::<2>();
+        let units: Vec<u16> = chunks.iter().map(|c| u16::from_le_bytes(*c)).collect();
         return String::from_utf16_lossy(&units);
     }
     String::from_utf8_lossy(bytes).into_owned()
