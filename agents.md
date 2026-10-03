@@ -128,7 +128,7 @@ Two exceptions, registered ungated: `think` (its `thought` *is* the payload) and
 
 Loaded from `config.yaml` in the platform config dir, merged with a per-repo `.peakbot/config.yaml`; environment variables take precedence. Key env vars: `PROVIDER` (JSON provider config), `AGENT_MAX_TURNS`, `MCP_SERVERS` (JSON), `SEARXNG_BASE_URL`, `PEAKBOT_WEB_TOKEN`, `RUST_LOG`.
 
-`RUST_LOG` controls `tracing`-style log verbosity: unset, errors only. For a service install consider `RUST_LOG=peakbot=info` (systemd: `systemctl --user edit peakbot` → `[Service]` / `Environment=RUST_LOG=peakbot=info`).
+`RUST_LOG` controls `tracing`-style log verbosity: unset → `peakbot` warnings and other crates' errors (`--tui`: errors only, since its logs share the stdout ratatui draws on — set `RUST_LOG` explicitly to override). Transient-retry warnings (orchestrator and sub-agent) are therefore recorded by default in web/stdio mode. For a service install consider `RUST_LOG=peakbot=info` (systemd: `systemctl --user edit peakbot` → `[Service]` / `Environment=RUST_LOG=peakbot=info`).
 
 ### Live reload on session verbs (`/new`, `/model`, `/cd`, `/load`)
 
@@ -565,7 +565,7 @@ Sub-agents get the full built-in toolset **minus `delegate`** (no nested delegat
 
 Pause (`/pause`, `Ctrl+P` in the TUI) is a **cooperative** gate and sub-agents only: the sub-agent finishes the step it is on, then parks before its next LLM call or tool dispatch until `/resume` (or `Ctrl+P` again). Paused time never counts against `timeouts.delegate_secs`, and Ollama sub-agents (hookless) are not pausable. Stop is unchanged: it aborts everything **including a paused sub-agent** — the parked wait is part of the turn future, so it drops with it.
 
-Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`), unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`. The whole delegation is bounded by `timeouts.delegate_secs` (default 2 h); on expiry the transcript takes that same path — summarised and returned as `INTERRUPTED`, not discarded.
+Failures are handled like the orchestrator's own: transient wire errors are retried in place (`retry.*`, shared `providers::retry`) and **resume from the last completed step** — the retry replays the failed request from the sub-agent hook's history snapshot, so finished tool calls never re-run (hookless Ollama sub-agents have no snapshot and restart from the task). Only consecutive failures *without progress* count toward `retry.max_retries`; a completed step resets the budget, and the status line shows `<role>: retrying (n/max) in Xs — resuming from step K` while backing off. Unknown tool names and tool errors go back to the sub-agent as tool results it can self-correct from. What survives that ends the delegation and comes back as a summarised `INTERRUPTED` result — see `src/pipeline/handoff.rs`. The whole delegation is bounded by `timeouts.delegate_secs` (default 2 h); on expiry the transcript takes that same path — summarised and returned as `INTERRUPTED`, not discarded.
 
 Where it lives: `src/pipeline/{delegate_tool,registry,set}.rs`, `build_sub_agent` in `src/providers/mod.rs`, `MessageSource` + lane filter in `src/ui/app_state.rs` / `src/state/state_manager.rs`.
 

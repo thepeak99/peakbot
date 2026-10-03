@@ -5,3 +5,6 @@ This file is the working draft for the next release. When a version is tagged, t
 ## Changes
 
 - docs: add mandatory "Worktree Workflow" to `agents.md` — every task gets its own worktree, implement → watch CI → merge only if told to (else a background watcher waits for a human merge) → delete the worktree/branch only once merged.
+- fix: a sub-agent delegation that hits a transient wire error (429/5xx/transport) now **resumes from the last completed step** instead of restarting from the task. The retry replays the failed request from the sub-agent hook's history snapshot, so finished tool calls no longer re-run and progress is no longer lost (previously two ~900 s proxy hangs cost ~30 min of repeated work). The retry budget (`retry.max_retries`) now counts only consecutive failures *without progress*, and the status line shows `<role>: retrying (n/max) in Xs — resuming from step K` while backing off. Ollama sub-agents are hookless and still restart from the task.
+- fix: default log filter (when `RUST_LOG` is unset) is now `error,peakbot=warn` in web/stdio mode, so transient-retry warnings (including the error text, role, attempt and snapshot length) are recorded; `--tui` keeps errors-only because its logs share the screen's stdout.
+- refactor: `DynAgent::prompt_with_history` takes `&[Message]` instead of `&mut Vec<Message>` (it never wrote to the history).

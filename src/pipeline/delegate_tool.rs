@@ -20,6 +20,7 @@ use crate::state::StateManager;
 use crate::tools::ShellKind;
 use crate::tools::todo::TodoList;
 use rig_core::completion::ToolDefinition;
+use rig_core::completion::message::Message;
 use rig_core::tool::Tool;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -378,9 +379,11 @@ impl Tool for DelegateTool {
             error: e.to_string(),
         })?;
 
-        // Fresh history — pure agents-as-tools; no memory of prior delegations.
-        let mut history = Vec::new();
-        let mut attempt = 0;
+        // Consecutive transient failures with no progress since the last one;
+        // `last_fail_len` is the snapshot length at that failure, so a longer
+        // snapshot now means the sub-agent completed a step in between.
+        let mut attempt: u32 = 0;
+        let mut last_fail_len: usize = 0;
         // The whole loop sits inside the deadline, so the wire-retry budget is
         // part of it rather than additive to it. Parked (paused) time is
         // excluded — a paused delegation can wait indefinitely without
@@ -391,33 +394,56 @@ impl Tool for DelegateTool {
         let budget = crate::tools::time_budget::delegate_loop_budget(&deps.timeouts);
         let bounded = crate::state::pause::pause_aware_timeout(&gate, budget, async {
             loop {
-                match agent
-                    .prompt_with_history(args.task.as_str(), &mut history)
-                    .await
-                {
+                // The hook snapshots `history ++ [prompt]` right before every
+                // request, so popping its tail replays exactly the request
+                // that failed. Empty (hookless Ollama) falls back to the task.
+                let mut history = hook.history_snapshot();
+                let prompt = history
+                    .pop()
+                    .unwrap_or_else(|| Message::user(args.task.as_str()));
+                match agent.prompt_with_history(prompt, &history).await {
                     Ok(text) => break Ok(text),
                     // Transient wire failures (429/5xx/transport) get the same
                     // in-place retry the main loop gives its own turns — only what
-                    // outlives the budget is worth handing back. The retry re-runs
-                    // the delegation from the task: rig owns the sub-agent's
-                    // internal loop state, which isn't resumable from out here.
+                    // outlives the budget is worth handing back.
                     Err(e) => {
+                        let snapshot = hook.history_snapshot();
+                        attempt = if snapshot.len() > last_fail_len {
+                            1
+                        } else {
+                            attempt + 1
+                        };
+                        last_fail_len = snapshot.len();
+                        // `next_retry_delay` takes the 0-indexed attempt.
                         let Some(delay) =
-                            crate::providers::retry::next_retry_delay(&e, attempt, &deps.retry)
+                            crate::providers::retry::next_retry_delay(&e, attempt - 1, &deps.retry)
                         else {
                             break Err(e);
                         };
                         tracing::warn!(
                             target: "peakbot",
                             role = %args.role,
-                            attempt = attempt + 1,
+                            attempt,
                             max_retries = deps.retry.max_retries,
                             backoff_ms = delay.as_millis(),
+                            snapshot_len = snapshot.len(),
                             error = %e,
-                            "Sub-agent request failed transiently; backing off before retry"
+                            "Sub-agent request failed transiently; backing off before resuming"
                         );
+                        let step = snapshot
+                            .iter()
+                            .filter(|m| matches!(m, Message::Assistant { .. }))
+                            .count();
+                        deps.state_manager.set_status(Some(format!(
+                            "{}: retrying ({}/{}) in {:.1}s — resuming from step {}",
+                            args.role,
+                            attempt,
+                            deps.retry.max_retries,
+                            delay.as_secs_f64(),
+                            step
+                        )));
                         tokio::time::sleep(delay).await;
-                        attempt += 1;
+                        deps.state_manager.set_status(None);
                     }
                 }
             }
@@ -426,6 +452,8 @@ impl Tool for DelegateTool {
 
         let mut result = match bounded {
             Err(_elapsed) => {
+                // The deadline can fire mid-backoff, leaving the retry status up.
+                deps.state_manager.set_status(None);
                 tracing::error!(
                     target: "peakbot",
                     role = %args.role,
@@ -2421,9 +2449,11 @@ mod tests {
             status.contains("retrying (1/1)"),
             "the status must show retry 1 of max_retries=1; got: {status}"
         );
+        // The first request failed, so the snapshot holds only the task: no
+        // assistant step has completed yet.
         assert!(
-            status.contains("resuming from step"),
-            "the status must say the retry resumes from a step; got: {status}"
+            status.contains("resuming from step 0"),
+            "the status must say the retry resumes from step 0; got: {status}"
         );
 
         let out = handle

@@ -448,9 +448,9 @@ async fn main() -> Result<()> {
     }
 
     if mode == Mode::Stdio {
-        log_subscriber(std::io::stderr).init();
+        log_subscriber(std::io::stderr, mode).init();
     } else {
-        log_subscriber(std::io::stdout).init();
+        log_subscriber(std::io::stdout, mode).init();
     }
 
     // Arm the `PEAKBOT_SNIFF` debug log before any client exists, so no LLM
@@ -719,14 +719,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The `tracing` filter directives: `RUST_LOG` verbatim when set, else the mode's
+/// default. Web/stdio record `peakbot` warnings (e.g. sub-agent retries); the TUI
+/// stays errors-only because its logs share the stdout that ratatui draws on.
+fn log_filter(env: Option<&str>, mode: Mode) -> String {
+    match (env, mode) {
+        (Some(directives), _) => directives.to_string(),
+        (None, Mode::Tui) => "error".to_string(),
+        (None, Mode::Web | Mode::Stdio) => "error,peakbot=warn".to_string(),
+    }
+}
+
 /// Runtime tracing subscriber. `log_internal_errors(false)`: a failed log write is
 /// dropped, never reported via `eprintln!` — which panics when stderr is gone.
-fn log_subscriber<W>(writer: W) -> impl tracing::Subscriber + Send + Sync + 'static
+fn log_subscriber<W>(writer: W, mode: Mode) -> impl tracing::Subscriber + Send + Sync + 'static
 where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
 {
+    let directives = log_filter(std::env::var("RUST_LOG").ok().as_deref(), mode);
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(EnvFilter::builder().parse_lossy(directives))
         .with_writer(writer)
         .log_internal_errors(false)
         .finish()
@@ -1127,8 +1139,60 @@ mod tests {
     #[test]
     #[ignore = "spawned by log_subscriber_never_panics_when_stdout_and_stderr_are_dead"]
     fn log_subscriber_dead_writer_child() {
-        let sub = log_subscriber(|| DeadWriter);
+        let sub = log_subscriber(|| DeadWriter, Mode::Web);
         tracing::subscriber::with_default(sub, || tracing::error!("write fails; must not panic"));
+    }
+
+    #[test]
+    fn log_filter_defaults_record_peakbot_warnings_except_in_the_tui() {
+        assert_eq!(log_filter(None, Mode::Web), "error,peakbot=warn");
+        assert_eq!(log_filter(None, Mode::Stdio), "error,peakbot=warn");
+        // The TUI draws on stdout, the same stream the subscriber writes to.
+        assert_eq!(log_filter(None, Mode::Tui), "error");
+    }
+
+    #[test]
+    fn log_filter_passes_rust_log_through_verbatim() {
+        for mode in [Mode::Web, Mode::Tui, Mode::Stdio] {
+            assert_eq!(log_filter(Some("peakbot=debug"), mode), "peakbot=debug");
+            assert_eq!(log_filter(Some(""), mode), "");
+        }
+    }
+
+    /// Captures formatted log lines so the default filter is checked through
+    /// the real subscriber, not just as a string.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_filter_keeps_peakbot_warnings_and_drops_other_crates() {
+        // RUST_LOG is process-global; the filter fn is what the default path uses.
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::builder().parse_lossy(log_filter(None, Mode::Web)))
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            tracing::warn!(target: "peakbot", "retry-warning");
+            tracing::warn!(target: "hyper", "other-crate-warning");
+            tracing::info!(target: "peakbot", "peakbot-info");
+            tracing::error!(target: "hyper", "other-crate-error");
+        });
+        let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("retry-warning"), "got: {out}");
+        assert!(out.contains("other-crate-error"), "got: {out}");
+        assert!(!out.contains("other-crate-warning"), "got: {out}");
+        assert!(!out.contains("peakbot-info"), "got: {out}");
     }
 
     #[cfg(target_os = "linux")]

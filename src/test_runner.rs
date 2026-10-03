@@ -196,10 +196,7 @@ impl TestRunner {
             }
 
             // Call the agent with history
-            let result = self
-                .agent
-                .prompt_with_history(&current_msg, &mut history)
-                .await;
+            let result = self.agent.prompt_with_history(&current_msg, &history).await;
 
             // Process events from the session hook to update stats
             self.process_session_hook_events();
@@ -252,11 +249,8 @@ impl TestRunner {
                         // The mock agent's prompt_with_history takes `&str`, so
                         // we need to extract the text content from the prompt.
                         let prompt_text = extract_prompt_text(&prompt);
-                        let mut history = h;
-                        let result = self
-                            .agent
-                            .prompt_with_history(&prompt_text, &mut history)
-                            .await;
+                        let history = h;
+                        let result = self.agent.prompt_with_history(&prompt_text, &history).await;
                         // Process events and check result
                         self.process_session_hook_events();
                         match result {
