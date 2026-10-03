@@ -805,6 +805,18 @@ mod tests {
         provider: crate::config::ProviderEntry,
         retry: crate::config::RetryConfig,
     ) -> DelegateTool {
+        delegate_tool_with_role_shell(sm, provider, retry, None)
+    }
+
+    /// Same wiring as `delegate_tool_with_role`, but with an explicit shell
+    /// kind: the retry/resume tests below need the `bash` tool registered so
+    /// the scripted tool call can be a cheap, countable side effect.
+    fn delegate_tool_with_role_shell(
+        sm: Arc<StateManager>,
+        provider: crate::config::ProviderEntry,
+        retry: crate::config::RetryConfig,
+        shell_kind: Option<ShellKind>,
+    ) -> DelegateTool {
         use crate::config::{
             AgentDefinition, ModelEntry, ModelRegistry, PipelineConfig, ProviderType,
         };
@@ -852,7 +864,7 @@ mod tests {
             bash_config: BashConfig::default(),
             tools_filter: crate::config::NameFilter::default(),
             state_manager: sm,
-            shell_kind: None,
+            shell_kind,
             vector_store: None,
             max_turns: 0,
             skills: crate::skills::SkillRegistry::default(),
@@ -1913,5 +1925,511 @@ mod tests {
             count, 1,
             "exactly one delegation-sentence expected, got {count} in {out:?}"
         );
+    }
+
+    // =====================================================================
+    //  Retry/resume contract — a transient wire failure mid-delegation must
+    //  resume from the hook's history snapshot, not restart from the task.
+    //
+    //  The loopback server scripts the OpenAI Responses API: each request
+    //  arrives on its own connection (the client honours `connection:
+    //  close`), its body is recorded, and the next scripted entry is served.
+    //  The scripted tool call is a `bash` append to a temp file — a cheap,
+    //  countable side effect.
+    // =====================================================================
+
+    /// A 200 Responses-API completion carrying one plain text output.
+    fn ok_text(text: &str) -> (u16, serde_json::Value) {
+        (
+            200,
+            serde_json::json!({
+                "id": "resp_123",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "anthropic/claude-3.7-sonnet",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_123",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "annotations": [], "text": text }]
+                }],
+                "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+            }),
+        )
+    }
+
+    /// A 200 Responses-API completion carrying one `bash` tool call.
+    fn ok_bash_call(command: &str) -> (u16, serde_json::Value) {
+        (
+            200,
+            serde_json::json!({
+                "id": "resp_123",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "anthropic/claude-3.7-sonnet",
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "arguments": serde_json::json!({ "command": command }).to_string(),
+                    "status": "completed"
+                }],
+                "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+            }),
+        )
+    }
+
+    /// The transient wire blip the retry loop must ride out.
+    fn transient_503() -> (u16, serde_json::Value) {
+        (
+            503,
+            serde_json::json!({ "error": { "message": "Service Unavailable" } }),
+        )
+    }
+
+    /// Scripted loopback OpenAI Responses API server. Serves one scripted
+    /// entry per request and records every request body; once the script is
+    /// exhausted (the handoff summariser can issue one extra request) the
+    /// last entry is repeated.
+    async fn scripted_responses_server(
+        script: Vec<(u16, serde_json::Value)>,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener binds");
+        let port = listener
+            .local_addr()
+            .expect("listener has an address")
+            .port();
+        let requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut next = 0usize;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while request_complete(&buf).is_none() && buf.len() < 1_048_576 {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let end = request_complete(&buf).unwrap_or(buf.len());
+                let header_end = buf
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4)
+                    .unwrap_or(0);
+                let body = String::from_utf8_lossy(&buf[header_end..end]).into_owned();
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&body).unwrap_or(serde_json::json!({})));
+                let (status, resp_body) = script
+                    .get(next)
+                    .cloned()
+                    .unwrap_or_else(|| script.last().cloned().expect("script is non-empty"));
+                next += 1;
+                let body = resp_body.to_string();
+                let reason = match status {
+                    200 => "OK",
+                    503 => "Service Unavailable",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+            }
+        });
+        (port, requests)
+    }
+
+    /// The OpenAI provider pointed at the loopback server.
+    fn openai_provider_at(port: u16) -> crate::config::ProviderEntry {
+        crate::config::ProviderEntry {
+            name: "openai".into(),
+            kind: crate::config::ProviderType::OpenAI,
+            api_key: Some("sk-test".into()),
+            base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+            preserve_reasoning: None,
+            display_reasoning: None,
+            models: vec![],
+        }
+    }
+
+    /// A retry policy with a 1ms backoff so the tests don't sleep.
+    fn tiny_retry(max_retries: u32) -> crate::config::RetryConfig {
+        crate::config::RetryConfig {
+            max_retries,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+            backoff_factor: 1.0,
+        }
+    }
+
+    /// Lines appended to the counter file — the tool's execution count.
+    fn counter_runs(counter: &std::path::Path) -> usize {
+        std::fs::read_to_string(counter)
+            .map(|c| c.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// A transient 503 mid-delegation must not restart the sub-agent from
+    /// the task: the retry replays the hook's last request snapshot — tool
+    /// call + result included — so the tool must not run a second time and
+    /// the replayed request must equal the failed one.
+    #[tokio::test]
+    async fn delegate_transient_error_resumes_from_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("counter");
+        let script = vec![
+            ok_bash_call(&format!("echo 1 >> {}", counter.display())),
+            transient_503(),
+            ok_text("done"),
+        ];
+        let (port, requests) = scripted_responses_server(script).await;
+
+        let sm = StateManager::new_arc();
+        sm.add_todo("parent task".to_string());
+        let tool = delegate_tool_with_role_shell(
+            sm.clone(),
+            openai_provider_at(port),
+            tiny_retry(3),
+            Some(ShellKind::Bash {
+                path: "/bin/bash".into(),
+            }),
+        );
+
+        let out = tool
+            .call(DelegateArgs {
+                role: "researcher".into(),
+                task: "do it".into(),
+                parent_task_id: 1,
+            })
+            .await
+            .expect("a completed delegation returns its result");
+
+        assert!(
+            out.contains("done"),
+            "the sub-agent's final text must reach the orchestrator; got: {out}"
+        );
+        assert!(
+            !out.contains("INTERRUPTED"),
+            "a transient blip must not become a handoff; got: {out}"
+        );
+
+        let reqs = requests.lock().unwrap().clone();
+        assert_eq!(
+            reqs.len(),
+            3,
+            "task + tool round-trip + one retry; got {} requests",
+            reqs.len()
+        );
+
+        let input = |i: usize| {
+            reqs[i]
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| panic!("request {i} has no input array: {}", reqs[i]))
+        };
+        // The retry must be the FAILED request replayed — the tool call and
+        // its result are already in the wire history, not a fresh task.
+        assert_eq!(
+            input(2),
+            input(1),
+            "the retry must replay the failed request (tool call + result), not restart from the task"
+        );
+        assert!(
+            input(1)
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .any(|i| i.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+                })
+                .unwrap_or(false),
+            "the failed request must carry the tool call; got: {}",
+            input(1)
+        );
+
+        assert_eq!(
+            counter_runs(&counter),
+            1,
+            "the tool must execute exactly once — the replayed request carries its result"
+        );
+    }
+
+    /// A transient failure on the very first call (empty snapshot) falls
+    /// back to the task: the retry is the same task-only request — nothing
+    /// more, nothing less.
+    #[tokio::test]
+    async fn delegate_transient_error_on_first_call_replays_task() {
+        let script = vec![transient_503(), ok_text("done")];
+        let (port, requests) = scripted_responses_server(script).await;
+
+        let sm = StateManager::new_arc();
+        sm.add_todo("parent task".to_string());
+        let tool = delegate_tool_with_role(sm.clone(), openai_provider_at(port), tiny_retry(3));
+
+        let out = tool
+            .call(DelegateArgs {
+                role: "researcher".into(),
+                task: "do it".into(),
+                parent_task_id: 1,
+            })
+            .await
+            .expect("a completed delegation returns its result");
+
+        assert!(
+            out.contains("done"),
+            "the sub-agent's final text must reach the orchestrator; got: {out}"
+        );
+        assert!(
+            !out.contains("INTERRUPTED"),
+            "a transient blip must not become a handoff; got: {out}"
+        );
+
+        let reqs = requests.lock().unwrap().clone();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "first call + one retry; got {} requests",
+            reqs.len()
+        );
+        let input = |i: usize| {
+            reqs[i]
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| panic!("request {i} has no input array: {}", reqs[i]))
+        };
+        assert_eq!(
+            input(1),
+            input(0),
+            "with an empty snapshot the retry must replay the task-only request"
+        );
+        // Task-only: one user item (the task) and no tool round-trip — the
+        // system preamble rides in every request.
+        let items = input(0).as_array().cloned().unwrap_or_default();
+        let user_items = items
+            .iter()
+            .filter(|i| i.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .count();
+        let tool_items = items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.get("type").and_then(|t| t.as_str()),
+                    Some("function_call") | Some("function_call_output")
+                )
+            })
+            .count();
+        assert_eq!(
+            user_items,
+            1,
+            "the task-only request carries exactly one user item (the task); got: {}",
+            input(0)
+        );
+        assert_eq!(
+            tool_items,
+            0,
+            "the task-only request carries no tool round-trip; got: {}",
+            input(0)
+        );
+    }
+
+    /// The retry budget counts CONSECUTIVE failures without progress: a
+    /// failure after a new tool round-trip resets the counter, so the total
+    /// failures may exceed `max_retries` as long as no two are back-to-back.
+    #[tokio::test]
+    async fn delegate_retry_counter_resets_after_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("counter");
+        let append = format!("echo 1 >> {}", counter.display());
+        // Two failures, one after each tool step — more failures than
+        // `max_retries`, but never two in a row.
+        let script = vec![
+            ok_bash_call(&append),
+            transient_503(),
+            ok_bash_call(&append),
+            transient_503(),
+            ok_text("done"),
+        ];
+        let (port, requests) = scripted_responses_server(script).await;
+
+        let sm = StateManager::new_arc();
+        sm.add_todo("parent task".to_string());
+        let tool = delegate_tool_with_role_shell(
+            sm.clone(),
+            openai_provider_at(port),
+            tiny_retry(1),
+            Some(ShellKind::Bash {
+                path: "/bin/bash".into(),
+            }),
+        );
+
+        let out = tool
+            .call(DelegateArgs {
+                role: "researcher".into(),
+                task: "do it".into(),
+                parent_task_id: 1,
+            })
+            .await
+            .expect("a completed delegation returns its result");
+
+        assert!(
+            out.contains("done"),
+            "progress between failures must reset the retry counter; got: {out}"
+        );
+        assert!(
+            !out.contains("INTERRUPTED"),
+            "no two consecutive failures occurred, so the budget must not be spent; got: {out}"
+        );
+
+        let reqs = requests.lock().unwrap().clone();
+        assert_eq!(
+            reqs.len(),
+            5,
+            "two tool steps, each followed by a 503, then the final text; got {} requests",
+            reqs.len()
+        );
+        let input = |i: usize| {
+            reqs[i]
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| panic!("request {i} has no input array: {}", reqs[i]))
+        };
+        assert_eq!(
+            input(2),
+            input(1),
+            "the retry after the first failure must replay the failed request"
+        );
+        assert_eq!(
+            input(4),
+            input(3),
+            "the retry after the second failure must replay the failed request"
+        );
+
+        assert_eq!(
+            counter_runs(&counter),
+            2,
+            "each tool step executes exactly once"
+        );
+    }
+
+    /// The companion guard: consecutive failures WITHOUT progress still
+    /// exhaust the budget — `max_retries + 1` failures in a row end the
+    /// delegation as a summarised INTERRUPTED handoff, exactly as today.
+    #[tokio::test]
+    async fn delegate_gives_up_after_consecutive_failures_without_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("counter");
+        let script = vec![
+            ok_bash_call(&format!("echo 1 >> {}", counter.display())),
+            transient_503(),
+            transient_503(),
+            ok_text("summary"), // the handoff summariser's request
+        ];
+        let (port, _requests) = scripted_responses_server(script).await;
+
+        let sm = StateManager::new_arc();
+        sm.add_todo("parent task".to_string());
+        let tool = delegate_tool_with_role_shell(
+            sm.clone(),
+            openai_provider_at(port),
+            tiny_retry(1),
+            Some(ShellKind::Bash {
+                path: "/bin/bash".into(),
+            }),
+        );
+
+        let out = tool
+            .call(DelegateArgs {
+                role: "researcher".into(),
+                task: "do it".into(),
+                parent_task_id: 1,
+            })
+            .await
+            .expect("a dead sub-agent comes back as a handoff, not an error");
+
+        assert!(
+            out.contains("INTERRUPTED"),
+            "consecutive failures without progress must end in a summarised handoff; got: {out}"
+        );
+        assert_eq!(
+            counter_runs(&counter),
+            1,
+            "the tool step runs once; the failures burn the budget, not the work"
+        );
+    }
+
+    /// While backing off, the operator sees where the retry stands: the
+    /// role, retry n/max, and the step the resume continues from.
+    #[tokio::test]
+    async fn delegate_retry_status_reports_role_progress_and_step() {
+        let script = vec![transient_503(), ok_text("done")];
+        let (port, _requests) = scripted_responses_server(script).await;
+
+        let sm = StateManager::new_arc();
+        sm.add_todo("parent task".to_string());
+        // A visible backoff window so the status is observable while set.
+        let retry = crate::config::RetryConfig {
+            max_retries: 1,
+            initial_delay_ms: 500,
+            max_delay_ms: 500,
+            backoff_factor: 1.0,
+        };
+        let tool = delegate_tool_with_role(sm.clone(), openai_provider_at(port), retry);
+
+        let handle = tokio::spawn(async move {
+            tool.call(DelegateArgs {
+                role: "researcher".into(),
+                task: "do it".into(),
+                parent_task_id: 1,
+            })
+            .await
+        });
+
+        let mut seen = None;
+        for _ in 0..600 {
+            if let Some(status) = sm.get_state().status_message.clone()
+                && status.contains("retrying")
+            {
+                seen = Some(status);
+                break;
+            }
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let status =
+            seen.expect("the backoff must surface a retry status on the session status line");
+        assert!(
+            status.contains("researcher"),
+            "the status must name the role; got: {status}"
+        );
+        assert!(
+            status.contains("retrying (1/1)"),
+            "the status must show retry 1 of max_retries=1; got: {status}"
+        );
+        assert!(
+            status.contains("resuming from step"),
+            "the status must say the retry resumes from a step; got: {status}"
+        );
+
+        let out = handle
+            .await
+            .expect("call task must not panic")
+            .expect("a completed delegation returns its result");
+        assert!(out.contains("done"), "the retry must land; got: {out}");
     }
 }
