@@ -3241,7 +3241,7 @@ impl AgentRunner {
             // of truth), unless the previous iteration set a one-shot
             // override (the post-compaction case — see `history_override`
             // above).
-            let mut history = derive_history_for_iteration(&mut history_override, state_manager);
+            let history = derive_history_for_iteration(&mut history_override, state_manager);
             // Stop = drop this future. Everything the turn owns is below it
             // (#183 design §0.1): the wire request, the tool call, the
             // sub-agent, the PTY child that dies through `PtyHandle::drop`.
@@ -3257,7 +3257,7 @@ impl AgentRunner {
                     }
                     return CompletionResult::Stopped;
                 }
-                r = agent.as_ref().prompt_with_history(current_turn.clone(), &mut history) => r,
+                r = agent.as_ref().prompt_with_history(current_turn.clone(), &history) => r,
             };
 
             match result {

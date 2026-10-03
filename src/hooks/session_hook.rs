@@ -1326,6 +1326,87 @@ mod tests {
             "the orchestrator's on_completion_call must continue"
         );
     }
+
+    /// The snapshot is the failed request itself: `history ++ [prompt]`,
+    /// where the prompt is the request's LAST message. Resumption pops that
+    /// prompt and re-sends the rest — so the snapshot must end with the
+    /// prompt, and every tool call in it must carry its result (an orphaned
+    /// tool call would 400 on replay).
+    #[tokio::test]
+    async fn sub_agent_snapshot_ends_with_prompt_and_pairs_complete() {
+        use rig_core::completion::message::{ToolResultContent, UserContent};
+
+        let hook = SessionHook::new(None).with_sub_agent_gate(None);
+
+        let task = user_msg("task");
+        let tool_call = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call(
+                "call-1",
+                "bash",
+                serde_json::json!({ "command": "echo 1" }),
+            )),
+        };
+        let tool_result = Message::User {
+            content: OneOrMany::one(UserContent::tool_result(
+                "call-1",
+                OneOrMany::one(ToolResultContent::text("ok")),
+            )),
+        };
+
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &tool_result,
+                &[task, tool_call],
+            )
+            .await;
+        assert!(
+            matches!(action, HookAction::Continue),
+            "no budget = no gate"
+        );
+
+        let snap = hook.history_snapshot();
+        assert_eq!(snap.len(), 3, "snapshot must be history ++ [prompt]");
+        assert_eq!(
+            snap.last(),
+            Some(&tool_result),
+            "the snapshot must end with the prompt — popping it yields the failed request"
+        );
+
+        // Every tool call in the snapshot has its result paired on the same
+        // id, so the replayed request is wire-legal (no orphaned tool call).
+        let mut calls: Vec<String> = Vec::new();
+        let mut results: Vec<String> = Vec::new();
+        for m in &snap {
+            match m {
+                Message::Assistant { content, .. } => {
+                    for c in content.iter() {
+                        if let AssistantContent::ToolCall(tc) = c {
+                            calls.push(tc.call_id.clone().unwrap_or_else(|| tc.id.clone()));
+                        }
+                    }
+                }
+                Message::User { content } => {
+                    for c in content.iter() {
+                        if let UserContent::ToolResult(tr) = c {
+                            results.push(tr.call_id.clone().unwrap_or_else(|| tr.id.clone()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            calls,
+            vec!["call-1".to_string()],
+            "one tool call in the snapshot"
+        );
+        assert!(
+            results.iter().any(|r| calls.contains(r)),
+            "every tool call must have its matching result in the snapshot; calls={calls:?} results={results:?}"
+        );
+    }
 }
 
 /// Sub-agent-only hook state. `SessionHook: Clone` shallow-copies Arc handles,

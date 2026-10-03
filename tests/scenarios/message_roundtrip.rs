@@ -207,11 +207,11 @@ async fn user_message_not_duplicated_production_flow() {
     state_manager.add_user_message(msg.to_string());
 
     // Step 2: Get history (now includes the user message we just added)
-    let mut history = state_manager.get_agent_history();
+    let history = state_manager.get_agent_history();
 
     // Step 3: Call agent with the same message as prompt (rig appends it to history)
     let agent = DynAgent::Mock(agent);
-    let _result = agent.prompt_with_history(msg, &mut history).await;
+    let _result = agent.prompt_with_history(msg, &history).await;
 
     // Inspect what was actually sent to the LLM
     let requests = mock_model.get_recorded_requests();
