@@ -419,6 +419,42 @@ mod tests {
         assert!(json.contains(r#""active":true"#), "json = {json}");
     }
 
+    // ── conversations_list kill-refusal error (RED) ────────────────────────
+    //
+    // The kill refusal rides the existing conversations_list reply: `error`
+    // is `Some(…)` iff the kill was refused because the session is still
+    // running. When `None`, the key must be omitted entirely
+    // (skip_serializing_if) so every non-kill reply keeps its current
+    // byte-identical shape. Compile-RED until the `error` field lands.
+
+    #[test]
+    fn conversations_list_omits_error_when_none() {
+        let m = OutboundMessage::ConversationsList {
+            items: vec![],
+            error: None,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            json, r#"{"type":"conversations_list","items":[]}"#,
+            "a null error must be omitted, not serialised as null"
+        );
+    }
+
+    #[test]
+    fn conversations_list_serializes_error_when_some() {
+        let m = OutboundMessage::ConversationsList {
+            items: vec![],
+            error: Some("Can't kill a running conversation — press Stop first.".to_string()),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "conversations_list");
+        assert_eq!(
+            parsed["error"], "Can't kill a running conversation — press Stop first.",
+            "a refused kill must carry the message on the wire"
+        );
+    }
+
     /// `State` now carries `Arc<AppState>`; serde with the `rc` feature
     /// emits the inner value with no wrapper, identical to the previous
     /// `Box<AppState>` — no frontend change. This test guards that invariant.

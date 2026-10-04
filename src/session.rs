@@ -505,30 +505,19 @@ fn rebuild_config_and_pipelines(
 }
 
 #[cfg(test)]
-mod tests {
-    //! Integration tests for `create_session`'s per-session cwd flow.
-    //!
-    //! The session's cwd is the single source of truth that flows into
-    //! the system prompt, the persisted conversation, the welcome
-    //! banner, and every path-aware tool. These tests pin the two
-    //! observable surfaces that the contract has to protect:
-    //!
-    //! - `state_manager.session_cwd()` on the resume path reflects the saved
-    //!   cwd, not the boot cwd.
-    //! - `state_manager.session_cwd()` on the fresh-mint path reflects the
-    //!   boot cwd (and the freshly minted conversation persists it 1:1).
+pub(crate) mod test_support {
+    //! Offline `SessionDeps` fixtures shared by session, registry and web tests.
 
     use super::*;
-    use crate::Conversation;
     use crate::config::{ModelEntry, ModelRegistry, ProviderEntry, ProviderType};
-    use crate::storage::{ConversationStorage, InMemoryStorage};
+    use crate::storage::ConversationStorage;
     use std::sync::Arc;
 
     /// Minimal `ModelRegistry` with one Ollama entry — the cheapest provider
     /// to build offline (no API key, no network at construction time). The
     /// URL is the loopback default; we never actually call it in these
     /// tests — we only assert on `state_manager.session_cwd()`.
-    fn ollama_registry() -> Arc<ModelRegistry> {
+    pub(crate) fn ollama_registry() -> Arc<ModelRegistry> {
         let ollama = ProviderEntry {
             name: "ollama".to_string(),
             kind: ProviderType::Ollama,
@@ -555,7 +544,7 @@ mod tests {
         )
     }
 
-    fn test_deps(
+    pub(crate) fn test_deps(
         registry: Arc<ModelRegistry>,
         storage: Arc<dyn ConversationStorage>,
     ) -> SessionDeps {
@@ -582,6 +571,28 @@ mod tests {
             profile_pin: None,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Integration tests for `create_session`'s per-session cwd flow.
+    //!
+    //! The session's cwd is the single source of truth that flows into
+    //! the system prompt, the persisted conversation, the welcome
+    //! banner, and every path-aware tool. These tests pin the two
+    //! observable surfaces that the contract has to protect:
+    //!
+    //! - `state_manager.session_cwd()` on the resume path reflects the saved
+    //!   cwd, not the boot cwd.
+    //! - `state_manager.session_cwd()` on the fresh-mint path reflects the
+    //!   boot cwd (and the freshly minted conversation persists it 1:1).
+
+    use super::test_support::{ollama_registry, test_deps};
+    use super::*;
+    use crate::Conversation;
+    use crate::config::ModelRegistry;
+    use crate::storage::{ConversationStorage, InMemoryStorage};
+    use std::sync::Arc;
 
     /// The bug-fix headline: a resume adopts the saved cwd as the session
     /// cwd, regardless of where the process happens to be running.

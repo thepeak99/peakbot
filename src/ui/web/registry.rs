@@ -383,4 +383,155 @@ mod tests {
         assert!(!idle(&s, t_reidle + Duration::from_secs(599), ttl));
         assert!(idle(&s, t_reidle + Duration::from_secs(600), ttl));
     }
+
+    // ── registry-level reaper pins (live sessions, existing API) ──────────
+    //
+    // These drive a REAL session (ollama provider, in-memory storage)
+    // through `attach`/`detach`/`reap` and pin the reaper's behaviour at
+    // the registry seam: a running session is never reaped no matter how
+    // long every socket is gone, and a finished one is reaped on the tick
+    // after its idle clock arms. They must keep passing when `kill` grows
+    // the `KillOutcome` refusal.
+
+    use crate::session::test_support;
+    use crate::storage::InMemoryStorage;
+
+    /// One registry with one attached, freshly minted session.
+    fn registry_with_session() -> (SessionRegistry, Arc<RegisteredSession>) {
+        let registry = SessionRegistry::new(Arc::new(test_support::test_deps(
+            test_support::ollama_registry(),
+            Arc::new(InMemoryStorage::default()),
+        )));
+        let registered = registry.attach(None).expect("attach mints a session");
+        (registry, registered)
+    }
+
+    #[tokio::test]
+    async fn running_session_survives_all_sockets_detaching() {
+        let (registry, registered) = registry_with_session();
+        let convo = registered.live_convo().expect("live convo");
+        let key = registered.session.conversation_id;
+        registered.session.state_manager.set_running(true);
+
+        // The only socket leaves; the agent keeps working. Three reaper
+        // ticks at a zero TTL — each one must refuse to reap.
+        registry.detach(key);
+        for _ in 0..3 {
+            registry.reap(Duration::ZERO);
+        }
+
+        assert!(
+            registry.active_ids().contains(&convo),
+            "a running session must never be reaped, even with no sockets"
+        );
+        assert!(
+            !registered.session.action_sender.is_closed(),
+            "the surviving session's action channel must stay open"
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_session_is_reaped_after_ttl() {
+        let (registry, registered) = registry_with_session();
+        let convo = registered.live_convo().expect("live convo");
+        let key = registered.session.conversation_id;
+        registered.session.state_manager.set_running(true);
+        registry.detach(key);
+        // The turn ends after the socket left: the idle clock must start
+        // NOW, not when the socket detached.
+        registered.session.state_manager.set_running(false);
+
+        registry.reap(Duration::ZERO);
+        assert!(
+            registry.active_ids().contains(&convo),
+            "the first quiescent tick arms the idle clock, never reaps"
+        );
+        registry.reap(Duration::ZERO);
+        assert!(
+            !registry.active_ids().contains(&convo),
+            "the next tick past the (zero) TTL must reap the idle session"
+        );
+    }
+
+    // ── kill refusal (RED until `kill` returns `KillOutcome`) ──────────────
+    //
+    // Contract: `kill` refuses to end a session that is mid-turn. Under the
+    // map lock: find by live convo id; if `state_manager.is_running()` →
+    // `Running` (entry untouched — not removed, no exit signalled); else
+    // remove + `signal_exit` → `Killed`; not found → `NotLive`.
+
+    /// The graceful exit rides the session's own action channel and the
+    /// controller loop processes it asynchronously — yield to the runtime
+    /// (the loop shares this test's thread) and poll with a deadline.
+    async fn wait_for_exit(sm: &crate::StateManager) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sm.exit_requested() {
+            assert!(Instant::now() < deadline, "exit was never signalled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_refuses_running_session() {
+        let (registry, registered) = registry_with_session();
+        let convo = registered.live_convo().expect("live convo");
+        registered.session.state_manager.set_running(true);
+
+        let outcome = registry.kill(convo);
+
+        assert_eq!(
+            outcome,
+            KillOutcome::Running,
+            "kill must refuse a session that is mid-turn"
+        );
+        assert!(
+            registry.active_ids().contains(&convo),
+            "a refused kill must leave the session in the registry"
+        );
+        assert!(
+            !registered.session.action_sender.is_closed(),
+            "a refused kill must not tear the session's channel down"
+        );
+        assert!(
+            !registered.session.state_manager.exit_requested(),
+            "a refused kill must not signal exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_idle_session_still_removes() {
+        let (registry, registered) = registry_with_session();
+        let convo = registered.live_convo().expect("live convo");
+
+        let outcome = registry.kill(convo);
+
+        assert_eq!(
+            outcome,
+            KillOutcome::Killed,
+            "kill must end an idle session"
+        );
+        assert!(
+            !registry.active_ids().contains(&convo),
+            "a granted kill must remove the session from the registry"
+        );
+        wait_for_exit(&registered.session.state_manager).await;
+    }
+
+    #[tokio::test]
+    async fn kill_unknown_convo_is_not_live() {
+        let (registry, registered) = registry_with_session();
+        let convo = registered.live_convo().expect("live convo");
+
+        let outcome = registry.kill(Uuid::new_v4());
+
+        assert_eq!(
+            outcome,
+            KillOutcome::NotLive,
+            "an unknown convo id is not live"
+        );
+        assert!(
+            registry.active_ids().contains(&convo),
+            "a miss must not disturb the live session"
+        );
+    }
 }
