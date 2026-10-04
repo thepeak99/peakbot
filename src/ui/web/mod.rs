@@ -74,7 +74,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::{Sink, SinkExt, StreamExt};
-use registry::SessionRegistry;
+use registry::{KillOutcome, SessionRegistry};
 use rust_embed::RustEmbed;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -91,6 +91,9 @@ pub mod tls;
 /// Port the web UI listens on. Fixed for now (`--port` flag is Phase 4).
 /// See `webui.md` §3 decision 1.
 pub const DEFAULT_WEB_ADDR: &str = "127.0.0.1:7823";
+
+/// Reply text when a kill is refused because a turn is running.
+pub(crate) const KILL_RUNNING_MSG: &str = "Can't kill a running conversation — press Stop first.";
 
 /// Hard constant. The writer reaper for any single frame: a stalled
 /// `sink.send` past this is treated as a half-open peer (kernel/TLS write
@@ -775,7 +778,7 @@ fn dispatch_inbound(
         Ok(InboundMessage::RequestConversations) => {
             let items = build_conversations_snapshot(state_manager, &registry.active_ids());
             out_tx
-                .send(OutboundMessage::ConversationsList { items })
+                .send(OutboundMessage::ConversationsList { items, error: None })
                 .is_ok()
         }
         Ok(InboundMessage::RequestRecentDirs) => {
@@ -783,10 +786,16 @@ fn dispatch_inbound(
             out_tx.send(OutboundMessage::RecentDirs { dirs }).is_ok()
         }
         Ok(InboundMessage::KillSession { convo }) => {
-            if let Ok(id) = Uuid::parse_str(&convo) {
-                registry.kill(id);
-            }
-            true
+            let Ok(id) = Uuid::parse_str(&convo) else {
+                return true;
+            };
+            let refused = registry.kill(id) == KillOutcome::Running;
+            // Active ids are read after the kill so the row reflects it.
+            let items = build_conversations_snapshot(state_manager, &registry.active_ids());
+            let error = refused.then(|| KILL_RUNNING_MSG.to_string());
+            out_tx
+                .send(OutboundMessage::ConversationsList { items, error })
+                .is_ok()
         }
         // Re-attach mid-stream is a client bug; ignore rather than reset.
         Ok(InboundMessage::Attach { .. }) => true,
@@ -996,6 +1005,153 @@ mod tests {
             matches!(rx.try_recv().unwrap(), UiAction::SelectProfile(None)),
             "a null-name select_profile frame must clear the binding"
         );
+    }
+
+    // ── kill_session inbound (RED until the refusal lands) ─────────────────
+    //
+    // Contract: `{"type":"kill_session","convo":id}` replies with a fresh
+    // `conversations_list` — the post-kill active ids — and carries
+    // `error: Some(KILL_RUNNING_MSG)` iff the kill was refused because the
+    // session is still running. A refused kill leaves the session live
+    // (still in the registry, no exit signalled); a granted kill removes it
+    // (its row comes back `active=false`) and signals a graceful exit.
+    //
+    // The fixture needs a registry that can mint a REAL session (ollama
+    // provider, in-memory storage), so it does not reuse `dispatch_fixture`
+    // (whose registry is storage-less).
+
+    fn kill_fixture() -> (
+        tokio::sync::mpsc::UnboundedSender<UiAction>,
+        OutboundTx,
+        OutboundRx,
+        SessionRegistry,
+    ) {
+        let (action_tx, _action_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, out_rx) = outbound_channel();
+        let deps = crate::session::test_support::test_deps(
+            crate::session::test_support::ollama_registry(),
+            Arc::new(crate::storage::InMemoryStorage::default()),
+        );
+        (
+            action_tx,
+            out_tx,
+            out_rx,
+            SessionRegistry::new(Arc::new(deps)),
+        )
+    }
+
+    /// The graceful exit rides the session's own action channel and the
+    /// controller loop processes it asynchronously — yield to the runtime
+    /// (the loop shares this test's thread) and poll with a deadline.
+    async fn wait_for_exit(sm: &StateManager) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !sm.exit_requested() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exit was never signalled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_session_on_running_convo_replies_list_with_error() {
+        let (action_tx, out_tx, mut out_rx, registry) = kill_fixture();
+        let registered = registry.attach(None).expect("attach mints a session");
+        let sm = registered.session.state_manager.clone();
+        let convo = registered.live_convo().expect("live convo");
+        // Persist the minted conversation so it shows up in the reply's list.
+        sm.save_conversation();
+        sm.set_running(true);
+
+        let kept = dispatch_inbound(
+            &format!("{{\"type\":\"kill_session\",\"convo\":\"{convo}\"}}"),
+            &action_tx,
+            &out_tx,
+            &sm,
+            &registry,
+        );
+        assert!(kept, "kill_session must keep the socket loop alive");
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.next())
+            .await
+            .expect("kill_session must reply within 5s")
+            .expect("kill_session must reply with a conversations_list");
+        match &reply {
+            OutboundMessage::ConversationsList { error, .. } => {
+                assert_eq!(
+                    error.as_deref(),
+                    Some(KILL_RUNNING_MSG),
+                    "a refused kill must carry the refusal message"
+                );
+            }
+            other => panic!("kill_session must reply with conversations_list, got {other:?}"),
+        }
+        // The reply's items are the post-kill snapshot: the session is still
+        // bound, so the conversation's row must still be active.
+        let parsed: serde_json::Value = serde_json::to_value(&reply).unwrap();
+        let items = parsed["items"].as_array().expect("items must be an array");
+        let row = items
+            .iter()
+            .find(|c| c["id"] == convo.to_string())
+            .expect("the refused-kill conversation must still be listed");
+        assert_eq!(row["active"], true, "a refused kill leaves the row active");
+        assert!(
+            registry.active_ids().contains(&convo),
+            "a refused kill must leave the session live"
+        );
+        assert!(!sm.exit_requested(), "a refused kill must not signal exit");
+    }
+
+    #[tokio::test]
+    async fn kill_session_on_idle_convo_replies_list_without_error() {
+        let (action_tx, out_tx, mut out_rx, registry) = kill_fixture();
+        let registered = registry.attach(None).expect("attach mints a session");
+        let sm = registered.session.state_manager.clone();
+        let convo = registered.live_convo().expect("live convo");
+        // Persist the minted conversation so it shows up in the reply's list.
+        sm.save_conversation();
+
+        let kept = dispatch_inbound(
+            &format!("{{\"type\":\"kill_session\",\"convo\":\"{convo}\"}}"),
+            &action_tx,
+            &out_tx,
+            &sm,
+            &registry,
+        );
+        assert!(kept, "kill_session must keep the socket loop alive");
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.next())
+            .await
+            .expect("kill_session must reply within 5s")
+            .expect("kill_session must reply with a conversations_list");
+        match &reply {
+            OutboundMessage::ConversationsList { error, .. } => {
+                assert!(error.is_none(), "a granted kill must not carry an error");
+            }
+            other => panic!("kill_session must reply with conversations_list, got {other:?}"),
+        }
+        // The reply's items are the post-kill snapshot: the conversation is
+        // still saved, but no session is bound to it anymore.
+        let parsed: serde_json::Value = serde_json::to_value(&reply).unwrap();
+        assert!(
+            parsed.get("error").is_none(),
+            "the error key must be omitted, not null, when there is no error"
+        );
+        let items = parsed["items"].as_array().expect("items must be an array");
+        let row = items
+            .iter()
+            .find(|c| c["id"] == convo.to_string())
+            .expect("the killed conversation must still be listed");
+        assert_eq!(
+            row["active"], false,
+            "the killed conversation's row must be inactive"
+        );
+        assert!(
+            !registry.active_ids().contains(&convo),
+            "a granted kill must remove the session from the registry"
+        );
+        wait_for_exit(&sm).await;
     }
 
     /// Spawn the real axum router on a random loopback port, then

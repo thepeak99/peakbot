@@ -54,6 +54,7 @@ export function ConversationsPicker({
   // Open the dropdown upward instead of downward. Set when the chip lives in
   // the mobile bottom bar, where a downward menu would clip off-screen.
   dropUp = false,
+  error,
 }: {
   conversations: ConversationSummary[];
   hasTranscript: boolean;
@@ -61,6 +62,8 @@ export function ConversationsPicker({
   onLoad: (id: string) => void;
   onKill: (id: string) => void;
   dropUp?: boolean;
+  // Kill-refusal message from the last list reply; null when none.
+  error: string | null;
 }) {
   const [open, setOpen] = useState(false);
   // The list arrives async after onOpen(); show a loading hint until it does
@@ -291,6 +294,14 @@ export function ConversationsPicker({
                 )}
               </div>
             ))
+          )}
+          {error && !loading && (
+            <div
+              role="alert"
+              className="sticky bottom-0 border-t border-zinc-800 bg-zinc-900 px-3 py-2 text-xs text-red-400"
+            >
+              {error}
+            </div>
           )}
         </div>
       )}

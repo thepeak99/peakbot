@@ -253,7 +253,7 @@ export type OutboundMessage =
   | { type: "attached"; convo: string }
   | { type: "models_available"; active: string; models: ModelInfo[] }
   | { type: "state"; state: AppState }
-  | { type: "conversations_list"; items: ConversationSummary[] }
+  | { type: "conversations_list"; items: ConversationSummary[]; error?: string }
   | {
       type: "dir_listing";
       path: string;

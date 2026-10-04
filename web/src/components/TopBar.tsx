@@ -27,6 +27,7 @@ export function TopBar({
   dirListing,
   recentDirs,
   conversations,
+  conversationsError,
   send,
   onSwitchModel,
   onLoadConversation,
@@ -48,6 +49,7 @@ export function TopBar({
   dirListing: DirListing | null;
   recentDirs: string[];
   conversations: ConversationSummary[];
+  conversationsError: string | null;
   send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
   onLoadConversation: (id: string) => void;
@@ -72,6 +74,7 @@ export function TopBar({
       <div className="hidden items-center gap-3 lg:flex">
         <ConversationsPicker
           conversations={conversations}
+          error={conversationsError}
           hasTranscript={hasTranscript}
           onOpen={() => send({ type: "request_conversations" })}
           onLoad={onLoadConversation}

@@ -55,6 +55,7 @@ export function App() {
     models,
     activeAlias,
     conversations,
+    conversationsError,
     commands,
     dirListing,
     recentDirs,
@@ -281,6 +282,7 @@ export function App() {
         dirListing={dirListing}
         recentDirs={recentDirs}
         conversations={conversations}
+        conversationsError={conversationsError}
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={(id) => switchConvo(id)}
@@ -358,6 +360,7 @@ export function App() {
 
    <BottomBar
         conversations={conversations}
+        conversationsError={conversationsError}
         models={models}
         activeAlias={stats?.modelAlias || activeAlias}
         hasTranscript={hasTranscript}

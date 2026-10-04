@@ -286,7 +286,7 @@ otherwise (a pin is a lockdown, so the picker is empty then).
 | `--token <secret>` | — | Guards every route; prefer `PEAKBOT_WEB_TOKEN` (keeps it out of shell history) |
 | `--tls` / `--tls-name <NAME>` | off | HTTPS with the built-in CA; `--tls-name` adds SANs (repeatable) |
 
-**Sticky sessions** (#118): a conversation is addressed as `?convo=<uuid>`; a live session (StateManager + controller loop) stays bound to it independently of any socket. Reconnects and multiple tabs re-attach to the same running session. A session is reaped only when **fully idle** — no sockets, agent not mid-turn, no live `bash_bg` children — for `web.session_ttl_secs` (default 600; `web.reaper_tick_secs` 60). See `src/ui/web/registry.rs`.
+**Sticky sessions** (#118): a conversation is addressed as `?convo=<uuid>`; a live session (StateManager + controller loop) stays bound to it independently of any socket. Reconnects and multiple tabs re-attach to the same running session. A session is reaped only when **fully idle** — no sockets, agent not mid-turn, no live `bash_bg` children — for `web.session_ttl_secs` (default 600; `web.reaper_tick_secs` 60). See `src/ui/web/registry.rs`. Killing a live session (✕ on a conversation row) is refused while a turn runs — Stop first; running turns, including delegations, continue with no browser attached.
 
 **Auth**: the token is presented once as `?token=…`; the server sets a `peakbot_token` cookie which authenticates everything after, including the `/ws` upgrade. Single-operator shared secret, not a user system.
 
