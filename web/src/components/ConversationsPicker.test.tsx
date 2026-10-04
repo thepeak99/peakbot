@@ -130,6 +130,14 @@ describe("ConversationsPicker — kill error line", () => {
 
     await openPicker(el);
 
+    // Opening starts a reload; the alert only shows once a fresh list
+    // (new `conversations` reference) lands and loading clears.
+    await render({
+      ...baseProps,
+      error: KILL_ERROR,
+      conversations: [convo("a1", true), convo("b2"), convo("c3")],
+    });
+
     const alert = findAlert(el);
     expect(alert, "an alert element must render when error is set").not.toBeNull();
     expect(alert!.textContent).toContain("Can't kill a running conversation");
