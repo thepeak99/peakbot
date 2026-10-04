@@ -74,7 +74,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::{Sink, SinkExt, StreamExt};
-use registry::SessionRegistry;
+use registry::{KillOutcome, SessionRegistry};
 use rust_embed::RustEmbed;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -91,6 +91,9 @@ pub mod tls;
 /// Port the web UI listens on. Fixed for now (`--port` flag is Phase 4).
 /// See `webui.md` §3 decision 1.
 pub const DEFAULT_WEB_ADDR: &str = "127.0.0.1:7823";
+
+/// Reply text when a kill is refused because a turn is running.
+pub(crate) const KILL_RUNNING_MSG: &str = "Can't kill a running conversation — press Stop first.";
 
 /// Hard constant. The writer reaper for any single frame: a stalled
 /// `sink.send` past this is treated as a half-open peer (kernel/TLS write
@@ -775,7 +778,7 @@ fn dispatch_inbound(
         Ok(InboundMessage::RequestConversations) => {
             let items = build_conversations_snapshot(state_manager, &registry.active_ids());
             out_tx
-                .send(OutboundMessage::ConversationsList { items })
+                .send(OutboundMessage::ConversationsList { items, error: None })
                 .is_ok()
         }
         Ok(InboundMessage::RequestRecentDirs) => {
@@ -783,10 +786,16 @@ fn dispatch_inbound(
             out_tx.send(OutboundMessage::RecentDirs { dirs }).is_ok()
         }
         Ok(InboundMessage::KillSession { convo }) => {
-            if let Ok(id) = Uuid::parse_str(&convo) {
-                registry.kill(id);
-            }
-            true
+            let Ok(id) = Uuid::parse_str(&convo) else {
+                return true;
+            };
+            let refused = registry.kill(id) == KillOutcome::Running;
+            // Active ids are read after the kill so the row reflects it.
+            let items = build_conversations_snapshot(state_manager, &registry.active_ids());
+            let error = refused.then(|| KILL_RUNNING_MSG.to_string());
+            out_tx
+                .send(OutboundMessage::ConversationsList { items, error })
+                .is_ok()
         }
         // Re-attach mid-stream is a client bug; ignore rather than reset.
         Ok(InboundMessage::Attach { .. }) => true,

@@ -237,8 +237,13 @@ pub(crate) enum OutboundMessage {
     /// snapshot around without deep-copying ~8 MiB; serialises identically
     /// to the previous `Box` (no frontend change).
     State { state: Arc<AppState> },
-    /// Reply to `request_conversations`; empty when no storage is configured.
-    ConversationsList { items: Vec<ConversationSummaryWire> },
+    /// Reply to `request_conversations` and `kill_session`; empty when no
+    /// storage is configured. `error` is set iff a kill was refused.
+    ConversationsList {
+        items: Vec<ConversationSummaryWire>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Reply to `request_recent_dirs`; empty when no storage is configured.
     RecentDirs { dirs: Vec<String> },
     /// One-shot answer to `list_dir` — a transient request/response for the

@@ -15,6 +15,7 @@ import { ConversationsPicker } from "./ConversationsPicker";
 // viewport.
 export function BottomBar({
   conversations,
+  conversationsError,
   models,
   activeAlias,
   hasTranscript,
@@ -27,6 +28,7 @@ export function BottomBar({
   lockedReason = null,
 }: {
   conversations: ConversationSummary[];
+  conversationsError: string | null;
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
@@ -42,6 +44,7 @@ export function BottomBar({
     <footer className="flex min-h-14 items-center gap-2 border-t border-zinc-800 bg-zinc-950/80 px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] backdrop-blur lg:hidden">
       <ConversationsPicker
         conversations={conversations}
+        error={conversationsError}
         hasTranscript={hasTranscript}
         onOpen={() => send({ type: "request_conversations" })}
         onLoad={onLoadConversation}

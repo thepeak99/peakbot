@@ -15,7 +15,8 @@
 //! [`SessionRegistry::kill`] signals a graceful `/exit` (which sets
 //! `exit_requested` → broadcast → attached sockets close → their `Arc`s
 //! drop → last `action_sender` drops → `clear_bg` runs) and removes the entry
-//! so no new attach finds it. Aborting would leak PTYs.
+//! so no new attach finds it. Aborting would leak PTYs. A kill is refused
+//! while a turn runs (`KillOutcome::Running`) — Stop is the only way to end one.
 //!
 //! ## Concurrency
 //!
@@ -31,6 +32,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Result of [`SessionRegistry::kill`].
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillOutcome {
+    /// Session removed and signalled to exit.
+    Killed,
+    /// A turn is running; the session is untouched.
+    Running,
+    /// No live session on that conversation.
+    NotLive,
+}
 
 /// Attached-socket count + idle clock for one session — the reaper's input.
 /// Split out from the session so the expiry decision is unit-testable without
@@ -220,18 +233,26 @@ impl SessionRegistry {
     /// End the session currently on conversation `convo` for everyone: remove
     /// it so no new attach finds it, then signal a graceful exit (which
     /// unwinds the controller loop and kills its bg PTY children once the last
-    /// socket drops).
-    pub fn kill(&self, convo: Uuid) {
+    /// socket drops). Refused while a turn runs — removing it would orphan the
+    /// turn; only `is_running` counts (Stop spares bg children, kill cleans them).
+    pub fn kill(&self, convo: Uuid) -> KillOutcome {
         let mut map = self.inner.map.lock().unwrap();
-        let key = map
+        let found = map
             .values()
             .find(|r| r.live_convo() == Some(convo))
-            .map(|r| r.key);
-        if let Some(key) = key
-            && let Some(entry) = map.remove(&key)
-        {
-            entry.signal_exit();
-        }
+            .map(|r| (r.key, r.session.state_manager.is_running()));
+        let outcome = match found {
+            None => KillOutcome::NotLive,
+            Some((_, true)) => KillOutcome::Running,
+            Some((key, false)) => {
+                if let Some(entry) = map.remove(&key) {
+                    entry.signal_exit();
+                }
+                KillOutcome::Killed
+            }
+        };
+        tracing::warn!(%convo, ?outcome, "kill_session");
+        outcome
     }
 
     /// Live conversation ids with a session bound — feeds the `active` flag on

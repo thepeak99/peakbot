@@ -232,7 +232,7 @@ fn dispatch_stdin_line(
             // is "active" in the sticky-session sense.
             let items = build_conversations_snapshot(state_manager, &Default::default());
             out_tx
-                .send(OutboundMessage::ConversationsList { items })
+                .send(OutboundMessage::ConversationsList { items, error: None })
                 .is_ok()
         }
         Ok(InboundMessage::RequestRecentDirs) => {

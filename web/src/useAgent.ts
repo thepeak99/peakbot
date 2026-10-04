@@ -26,6 +26,7 @@ export interface AgentConnection {
   models: ModelInfo[];
   activeAlias: string;
   conversations: ConversationSummary[];
+  conversationsError: string | null;
   commands: SlashCommand[];
   /** Latest `dir_listing` reply for the cwd picker (request/response over the
    * socket, not part of AppState — browsing is ephemeral). `null` until the
@@ -70,6 +71,9 @@ export function useAgent(): AgentConnection {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [activeAlias, setActiveAlias] = useState("");
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [conversationsError, setConversationsError] = useState<string | null>(
+    null,
+  );
   const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [dirListing, setDirListing] = useState<DirListing | null>(null);
   const [recentDirs, setRecentDirs] = useState<string[]>([]);
@@ -154,6 +158,7 @@ export function useAgent(): AgentConnection {
             break;
           case "conversations_list":
             setConversations(msg.items);
+            setConversationsError(msg.error ?? null);
             break;
           case "dir_listing":
             setDirListing({
@@ -221,6 +226,7 @@ export function useAgent(): AgentConnection {
     models,
     activeAlias,
     conversations,
+    conversationsError,
     commands,
     dirListing,
     recentDirs,
