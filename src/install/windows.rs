@@ -277,10 +277,8 @@ mod tests {
     }
 
     fn decode(bytes: &[u8]) -> String {
-        let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
+        let (units, _trailing) = bytes[2..].as_chunks::<2>();
+        let units: Vec<u16> = units.iter().map(|c| u16::from_le_bytes(*c)).collect();
         String::from_utf16(&units).unwrap()
     }
 

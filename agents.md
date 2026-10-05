@@ -86,7 +86,7 @@ All tools live in `src/tools/` and implement `rig::tool::Tool` (`NAME`, `Args`, 
 | `file_read` | `file_read.rs` | Read with line ranges |
 | `pdf_read` | `pdf_read.rs` | PDF → text/markdown (`pdf_oxide`), page ranges, 50k-char cap |
 | `list_directory` | `list_directory.rs` | Listing with recursion (max depth 3) |
-| `fetch_url` | `fetch_url.rs` | HTTP GET, raw body |
+| `fetch_url` | `fetch_url.rs` | HTTP GET (POST when `fetch_url.allow_post`), raw body |
 | `fetch_page` | `fetch_page.rs` | Fetch a web page → clean Markdown, with retry/backoff |
 | `web_search` | `search.rs` | SearXNG-based search (needs `searxng:` config) |
 | `think` | `think.rs` | Reasoning scratchpad |
@@ -139,7 +139,7 @@ Editing `config.yaml` or skills does not require a restart: each session verb re
 | `providers:` / `default_model` (new aliases resolve) | `mcp_servers` (live subprocesses) |
 | skills + system prompt | `vector_db` (redb/HNSW handle) |
 | `searxng.*`, `bash.env`, `agent_max_turns` | `web.*` (read once by the session reaper) |
-| `cost_tracking`, `context.*`, `retry.*`, `memory.*`, `timeouts.*` | `provider` (legacy block) |
+| `cost_tracking`, `context.*`, `retry.*`, `memory.*`, `timeouts.*`, `fetch_url.*` | `provider` (legacy block) |
 | `tools.*` (built-in filter) | `http.*` (published once into the client factory) |
 | `pipelines:` (rebuilt from per-repo config; see note) | legacy `pipeline:` (hard boot error — `PipelineSet::build` rejects it) |
 | `profiles:` (re-applied on every reload; a profile's `ui.tabs` gates the web tabs it shows) | — |
@@ -182,6 +182,9 @@ The legacy single-provider block (`provider: { type: …, config: { … } }`) is
 ```yaml
 bash:
   env: { MY_API_KEY: "…" }      # extra env for all shell commands
+
+fetch_url:
+  allow_post: false               # true = fetch_url may also POST; not a security boundary while bash is enabled
 
 searxng:
   base_url: https://searx.example.com

@@ -92,7 +92,7 @@ impl TestHarness {
             .tool(peakbot::FileInsertTool::default())
             .tool(peakbot::FileReadTool::default())
             .tool(peakbot::ListDirectoryTool::default())
-            .tool(peakbot::FetchUrlTool)
+            .tool(peakbot::FetchUrlTool::default())
             .tool(peakbot::ThinkTool)
             .build();
 
