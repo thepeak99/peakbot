@@ -29,38 +29,32 @@
 // one-line notice and a softened placeholder: the view is a transcript filter,
 // input still goes to the orchestrator.
 //
-// Images: paste, drag-drop, or click the 📎 clip button to attach image files.
-// Attachments show as
-// removable chips above the input and are kept OUT of the visible textarea
-// (a multi-MB data URL there would be unreadable and would break the palette
-// query). On submit each becomes a `[img:data:<mime>;base64,…]` token appended
-// to the sent text — the backend's `vision.rs` resolves the data URI exactly
-// like a `[img:/path]` token. Over-size files are rejected client-side before
-// they hit the wire; a non-vision model is rejected server-side.
+// Attachments: 📎, paste, or drop (DropOverlay, owned by App) add files of any
+// type. Each uploads immediately (`useAttachments`, lifted into App) and shows
+// as a chip above the input; submit sends only the uploaded ids, never bytes.
+// Send is blocked until every chip is done and none is in error.
 
 import { useRef, useState, useLayoutEffect } from "react";
 import type { SlashCommand } from "../state";
 import type { SubAgentRun } from "../types";
+import type { Attachments } from "../useAttachments";
 import { useMediaQuery } from "../useMediaQuery";
-
-// Mirror of vision.rs MAX_IMAGE_BYTES — fail fast before shipping a doomed frame.
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const MAX_IMAGES = 8;
+import { AttachmentChip } from "./AttachmentChip";
 
 // Composer height budget. The textarea rests at a single row and grows with
 // its content up to a hard cap, past which it scrolls internally. Values are px.
 const MIN_H = 40; // one text row — roughly line-height + vertical padding
 const MAX_H = 192; // ~6 rows — beyond this the textarea scrolls internally
 
-type PendingImage = { id: string; name: string; dataUrl: string };
-
-const readAsDataUrl = (file: File) =>
-  new Promise<string>((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result as string);
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(file);
-  });
+// Inert default so the Composer works standalone (no upload plumbing).
+const NO_ATTACHMENTS: Attachments = {
+  pending: [],
+  add: () => {},
+  remove: () => {},
+  reset: () => {},
+  ids: [],
+  ready: true,
+};
 
 export function Composer({
   isRunning,
@@ -74,11 +68,13 @@ export function Composer({
   watchingRole,
   onClearWatch,
   pendingInput,
+  attachments = NO_ATTACHMENTS,
+  supportsVision = true,
 }: {
   isRunning: boolean;
   connected: boolean;
   commands: SlashCommand[];
-  onSend: (text: string) => void;
+  onSend: (text: string, attachmentIds: string[]) => void;
   onStop: () => void;
   /** The currently-running sub-agent (view type), or null when the turn is
    * orchestrator-only / between sub-agent invocations. Drives the
@@ -97,13 +93,14 @@ export function Composer({
   /** Server-side queue depth (`AppState.pending_input_count`). While running,
    * >0 means stopping would drop queued sends, so Stop warns about it. */
   pendingInput: number;
+  /** Upload state, owned by App so the drop overlay shares it. */
+  attachments?: Attachments;
+  /** `AppState.supports_vision` — drives the ⚠ on image chips. */
+  supportsVision?: boolean;
 }) {
   const [text, setText] = useState("");
   const [selected, setSelected] = useState(0);
   const [dismissed, setDismissed] = useState(false);
-  const [images, setImages] = useState<PendingImage[]>([]);
-  const [dragOver, setDragOver] = useState(false);
-  const [attachError, setAttachError] = useState<string | null>(null);
   // True when the primary input is a touch device (phone, tablet, laptop in
   // tablet mode). Gates Enter-to-send so an accidental tap on the on-screen
   // return key never fires a half-typed message.
@@ -134,60 +131,18 @@ export function Composer({
   const showPalette = !isRunning && !dismissed && matches.length > 0;
   const sel = Math.min(selected, matches.length - 1);
 
-  const addFiles = async (files: File[]) => {
-    const imgs = files.filter((f) => f.type.startsWith("image/"));
-    if (imgs.length === 0) return;
-    setAttachError(null);
-    for (const f of imgs) {
-      if (f.size > MAX_IMAGE_BYTES) {
-        setAttachError(`"${f.name || "image"}" is too large (max 10 MB).`);
-        continue;
-      }
-      let dataUrl: string;
-      try {
-        dataUrl = await readAsDataUrl(f);
-      } catch {
-        setAttachError(`Could not read "${f.name || "image"}".`);
-        continue;
-      }
-      // Functional update so back-to-back adds see the live count, not the
-      // stale render-time snapshot; drop silently past the cap.
-      let capped = false;
-      setImages((prev) => {
-        if (prev.length >= MAX_IMAGES) {
-          capped = true;
-          return prev;
-        }
-        return [
-          ...prev,
-          { id: crypto.randomUUID(), name: f.name || "pasted image", dataUrl },
-        ];
-      });
-      if (capped) {
-        setAttachError(`At most ${MAX_IMAGES} images per message.`);
-        break;
-      }
-    }
-  };
-
-  const removeImage = (id: string) =>
-    setImages((prev) => prev.filter((i) => i.id !== id));
-
   const onPickFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
-    void addFiles(Array.from(e.target.files ?? []));
+    attachments.add(Array.from(e.target.files ?? []));
     e.target.value = ""; // reset so re-picking the same file fires onChange again
   };
 
   const submit = () => {
     const trimmed = text.trim();
-    if ((!trimmed && images.length === 0) || !connected) return;
-    const tokens = images.map((i) => `[img:${i.dataUrl}]`).join(" ");
-    const payload = [trimmed, tokens].filter(Boolean).join(" ");
-    onSend(payload);
+    if (!canSend) return;
+    onSend(trimmed, attachments.ids);
     setText("");
-    setImages([]);
+    attachments.reset();
     setDismissed(false);
-    setAttachError(null);
   };
 
   const accept = (cmd: SlashCommand) => {
@@ -203,17 +158,10 @@ export function Composer({
 
   const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const files = Array.from(e.clipboardData.files);
-    if (files.some((f) => f.type.startsWith("image/"))) {
+    if (files.length > 0) {
       e.preventDefault();
-      void addFiles(files);
+      attachments.add(files);
     }
-  };
-
-  const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setDragOver(false);
-    if (!connected) return;
-    void addFiles(Array.from(e.dataTransfer.files));
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -263,8 +211,14 @@ export function Composer({
   // Content half of `canSend`, split out because it also picks which running
   // controls are mounted: empty box → icon-only Pause/Stop, content → the
   // labelled Queue button alone.
-  const hasContent = !!text.trim() || images.length > 0;
-  const canSend = connected && hasContent;
+  const hasContent = !!text.trim() || attachments.ids.length > 0;
+  // Chips still uploading (or errored) must not be silently left behind.
+  const canSend = connected && hasContent && attachments.ready;
+  const sendBlockedReason = !attachments.ready
+    ? attachments.pending.some((c) => c.state === "error")
+      ? "Remove the failed attachment to send"
+      : "Waiting for uploads to finish"
+    : undefined;
 
   // One label for the always-mounted dispatch button: mid-turn sends are
   // queued server-side, so while running it reads "Queue".
@@ -303,19 +257,7 @@ export function Composer({
             </div>
           )}
 
-          <div
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragOver(true);
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={onDrop}
-            className={`flex flex-col gap-2 rounded-xl border bg-zinc-900 p-2 ${
-              dragOver
-                ? "border-emerald-600 bg-emerald-950/20"
-                : "border-zinc-800 focus-within:border-zinc-700"
-            }`}
-          >
+          <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-900 p-2 focus-within:border-zinc-700">
             {/* Inside the box (not the desktop-only hint row below) so it also
                 shows on touch: selecting a role filters the transcript, it does
                 not re-route input. */}
@@ -338,26 +280,15 @@ export function Composer({
               </div>
             )}
 
-            {images.length > 0 && (
-              <div className="flex flex-wrap gap-2 px-1 pt-1">
-                {images.map((img) => (
-                  <div
-                    key={img.id}
-                    className="group relative h-16 w-16 overflow-hidden rounded-md border border-zinc-700"
-                  >
-                    <img
-                      src={img.dataUrl}
-                      alt={img.name}
-                      className="h-full w-full object-cover"
-                    />
-                    <button
-                      onClick={() => removeImage(img.id)}
-                      title={`Remove ${img.name}`}
-                      className="absolute right-0.5 top-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-zinc-950/80 text-xs leading-none text-zinc-300 opacity-0 group-hover:opacity-100 hover:bg-red-900"
-                    >
-                      ×
-                    </button>
-                  </div>
+            {attachments.pending.length > 0 && (
+              <div className="flex flex-wrap items-start gap-2 px-1 pt-1">
+                {attachments.pending.map((chip) => (
+                  <AttachmentChip
+                    key={chip.key}
+                    chip={chip}
+                    supportsVision={supportsVision}
+                    onRemove={() => attachments.remove(chip.key)}
+                  />
                 ))}
               </div>
             )}
@@ -366,7 +297,6 @@ export function Composer({
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/*"
                 multiple
                 onChange={onPickFiles}
                 className="hidden"
@@ -375,8 +305,8 @@ export function Composer({
                 type="button"
                 disabled={!connected}
                 onClick={() => fileInputRef.current?.click()}
-                title="Attach images"
-                aria-label="Attach images"
+                title="Attach files"
+                aria-label="Attach files"
                 className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <svg
@@ -441,6 +371,7 @@ export function Composer({
                 <button
                   onClick={submit}
                   disabled={!canSend}
+                  title={sendBlockedReason}
                   className="rounded-lg bg-emerald-700 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
                 >
                   {actionLabel}
@@ -455,9 +386,6 @@ export function Composer({
           <div className="mt-1.5 px-1 text-[11px] text-zinc-600">
             ⏳ {pendingInput} queued · sent when this turn ends · Stop discards them
           </div>
-        )}
-        {attachError && (
-          <div className="mt-1.5 px-1 text-[11px] text-red-400">{attachError}</div>
         )}
         {/* Hints are desktop-only — on touch screens they eat vertical real
             estate under the composer for no benefit. */}
@@ -480,7 +408,7 @@ export function Composer({
           <span>
             <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">📎</kbd> or{" "}
             <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">paste</kbd> /{" "}
-            <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">drag</kbd> an image
+            <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">drag</kbd> files
           </span>
         </div>
       </div>

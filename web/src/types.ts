@@ -2,6 +2,8 @@
 // display contract (kept from the Phase-0 mock). `adapt.ts` maps the wire
 // `AppState` (state.ts) into these; components never see raw wire types.
 
+import type { WireAttachment } from "./state";
+
 export type MessageRole =
   | "user"
   | "agent"
@@ -9,6 +11,11 @@ export type MessageRole =
   | "toolCall"
   | "toolResult"
   | "summary";
+
+/** A transcript attachment; `url` serves the stored bytes (GET /api/uploads). */
+export interface AttachmentView extends WireAttachment {
+  url: string;
+}
 
 export interface ChatMessage {
   role: MessageRole;
@@ -25,6 +32,8 @@ export interface ChatMessage {
    * the renderer emits nothing and users without the opt-in see no change.
    * Always undefined for non-assistant messages. */
   thinking?: string[];
+  /** Files attached to a user message; undefined (never `[]`) when none. */
+  attachments?: AttachmentView[];
 }
 
 // Which agent's view the UI is scoped to (chat/todo/stats). "global" = all

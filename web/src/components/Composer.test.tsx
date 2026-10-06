@@ -2,7 +2,7 @@
 //
 // ─── New spec (icon-only running controls, no media queries) ─────────────
 // Let `hasContent` = the composer has non-whitespace text OR at least one
-// attached image (the existing `canSend` condition, minus the `connected`
+// done attachment (the existing `canSend` condition, minus the `connected`
 // gate).
 //
 //   1. IDLE (not running): unchanged — a labelled "Send" button; no Stop,
@@ -90,7 +90,7 @@ interface ComposerProps {
   isRunning: boolean;
   connected: boolean;
   commands: SlashCommand[];
-  onSend: (text: string) => void;
+  onSend: (text: string, attachmentIds: string[]) => void;
   onStop: () => void;
   subAgent: SubAgentRun | null;
   onPause: () => void;
@@ -224,43 +224,6 @@ const pressEnter = async (el: HTMLTextAreaElement): Promise<void> => {
       new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
     );
   });
-};
-
-/** Attaches a fake image via the hidden file input, driving the same path a
- *  user picking a file would (`onPickFiles` → `addFiles`, which reads it
- *  via `FileReader.readAsDataURL`). jsdom has no global `DataTransfer`, so
- *  the file input's `files` is stubbed directly with a minimal array-like
- *  `FileList` (indexable + `length` + iterable is all `Array.from` needs).
- *
- *  jsdom fires `FileReader.onload` on a later task (not a fixed number of
- *  ticks), so the helper polls — inside `act`, so the resulting `setImages`
- *  render is wrapped — until the attachment chip is committed. A valid
- *  under-size image is guaranteed to produce one; if it never appears the
- *  caller's own assertions (chip present / Queue enabled) fail. */
-const attachImage = async (el: HTMLDivElement, name = "photo.png"): Promise<void> => {
-  const input = el.querySelector('input[type="file"]') as HTMLInputElement;
-  const file = new File(["fake-bytes"], name, { type: "image/png" });
-  const fileList = {
-    0: file,
-    length: 1,
-    item: (i: number) => (i === 0 ? file : null),
-    [Symbol.iterator]: function* () {
-      yield file;
-    },
-  } as unknown as FileList;
-  Object.defineProperty(input, "files", { value: fileList, configurable: true });
-  await act(async () => {
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  });
-  const deadline = Date.now() + 2000;
-  while (
-    !el.querySelector(`img[alt="${name}"]`) &&
-    Date.now() < deadline
-  ) {
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 5));
-    });
-  }
 };
 
 // ─── 1. IDLE: unchanged ───────────────────────────────────────────────────
@@ -509,24 +472,29 @@ describe("Composer — action buttons: running, has content (spec 3)", () => {
     expect(controlByName(el, "Resume"), "expected Resume to be absent").toBeNull();
   });
 
-  it("running + attached image, no text: hasContent via image alone hides Stop and shows Queue", async () => {
-    // Skips nothing: the file-input stub (see `attachImage`) makes this
-    // feasible without a real `DataTransfer` (jsdom doesn't implement one).
-    const el = await mount(makeProps({ isRunning: true, subAgent: null }));
-
-    // Sanity: before attaching, we're in the "no content" state.
-    expect(controlByName(el, "Stop")).not.toBeNull();
-    expect(buttonWithText(el, "Queue")).toBeNull();
-
-    await attachImage(el, "shot.png");
+  it("running + done attachment, no text: hasContent via attachment alone hides Stop and shows Queue", async () => {
+    // Upload state is owned by App and passed in as the `attachments` prop
+    // (T12); a standalone Composer mounts with the inert no-op default, so
+    // the old file-input → FileReader path no longer produces chips here.
+    // A done chip with an id is what makes hasContent true.
+    const api = attachmentsApi({
+      pending: [doneImageChip("id-img")],
+      ids: ["id-img"],
+      ready: true,
+    });
+    const el = await t12Mount(
+      makeProps({ isRunning: true, subAgent: null }),
+      api,
+      true,
+    );
 
     expect(
       buttonWithText(el, "Queue"),
-      "expected 'Queue' once an image is attached, even with no typed text",
+      "expected 'Queue' once an attachment is done, even with no typed text",
     ).not.toBeNull();
     expect(
       controlByName(el, "Stop"),
-      "expected Stop to disappear once an image makes hasContent true",
+      "expected Stop to disappear once an attachment makes hasContent true",
     ).toBeNull();
   });
 
@@ -540,29 +508,32 @@ describe("Composer — action buttons: running, has content (spec 3)", () => {
     await click(queue);
 
     expect(props.onSend).toHaveBeenCalledTimes(1);
-    expect(props.onSend).toHaveBeenCalledWith("queue me up");
+    expect(props.onSend).toHaveBeenCalledWith("queue me up", []);
     expect(props.onStop).not.toHaveBeenCalled();
     expect(textarea.value).toBe("");
   });
 
-  it("clicking 'Queue' with an attached image and no text sends the image token and clears the attachment chip", async () => {
+  it("clicking 'Queue' with a done attachment and no text sends the attachment ids (no data: token) and resets the chips", async () => {
+    // The redesign sends uploaded ids, never `[img:data:…]` tokens in the
+    // text; chips clear via attachments.reset() after sending.
     const props = makeProps({ isRunning: true });
-    const el = await mount(props);
-    await attachImage(el, "shot.png");
-    expect(el.querySelector('img[alt="shot.png"]')).not.toBeNull();
+    const api = attachmentsApi({
+      pending: [doneImageChip("id-img")],
+      ids: ["id-img"],
+      ready: true,
+    });
+    const el = await t12Mount(props, api, true);
 
     const queue = buttonWithText(el, "Queue")!;
     await click(queue);
 
     expect(props.onSend).toHaveBeenCalledTimes(1);
-    expect((props.onSend as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatch(
-      /^\[img:data:image\/png;base64,.*\]$/,
-    );
+    expect(props.onSend).toHaveBeenCalledWith("", ["id-img"]);
     expect(props.onStop).not.toHaveBeenCalled();
     expect(
-      el.querySelector('img[alt="shot.png"]'),
-      "expected the attachment chip to clear after sending",
-    ).toBeNull();
+      api.reset,
+      "expected reset() to clear the attachment chips after sending",
+    ).toHaveBeenCalledTimes(1);
   });
 
   // T6 from the original suite — unaffected by the button-visibility change:

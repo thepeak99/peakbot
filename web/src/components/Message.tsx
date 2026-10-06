@@ -3,7 +3,16 @@ import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
 import { memo, useState, type ComponentProps } from "react";
-import type { ChatMessage, MessageRole } from "../types";
+import type { AttachmentView, ChatMessage, MessageRole } from "../types";
+import {
+  GROUP_STYLE,
+  extLabel,
+  fileGroup,
+  formatSize,
+  isThumbnailable,
+  middleTruncate,
+} from "../fileTypes";
+import { Lightbox } from "./Lightbox";
 
 // Per-role visual treatment. Mirrors the TUI's role glyphs/colours so the
 // web transcript reads the same way (src/ui/app_state.rs MessageRole +
@@ -84,8 +93,21 @@ export function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
     a.toolName === b.toolName &&
     a.fromBackground === b.fromBackground &&
     a.subAgentRole === b.subAgentRole &&
-    sameThinking(a.thinking, b.thinking)
+    sameThinking(a.thinking, b.thinking) &&
+    sameAttachments(a.attachments, b.attachments)
   );
+}
+
+// Ids are uuids, so id equality is attachment equality (the rest is derived).
+function sameAttachments(
+  a: AttachmentView[] | undefined,
+  b: AttachmentView[] | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i].id !== b[i].id) return false;
+  return true;
 }
 
 // Array comparison for the optional `thinking` field. Length first (cheap
@@ -180,6 +202,7 @@ function MessageView({ message }: { message: ChatMessage }) {
       {message.thinking && message.thinking.length > 0 && (
         <ThinkingBlocks blocks={message.thinking} />
       )}
+      {message.attachments && <Attachments attachments={message.attachments} />}
       {isMarkdown(message.role) ? (
         <div className="markdown-body text-sm leading-relaxed text-zinc-200">
           <ReactMarkdown
@@ -198,6 +221,77 @@ function MessageView({ message }: { message: ChatMessage }) {
         >
           {message.content}
         </div>
+      )}
+    </div>
+  );
+}
+
+// Link chip for a non-image attachment (or an image the browser can't render).
+function FileChip({ attachment }: { attachment: AttachmentView }) {
+  const group = fileGroup(attachment.name, attachment.mime);
+  return (
+    <a
+      href={attachment.url}
+      target="_blank"
+      rel="noopener"
+      title={attachment.name}
+      className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900/70 px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+    >
+      <span aria-hidden className={GROUP_STYLE[group].color}>
+        📄
+      </span>
+      {extLabel(attachment.name) && (
+        <span className={`text-[10px] font-semibold ${GROUP_STYLE[group].color}`}>
+          {extLabel(attachment.name)}
+        </span>
+      )}
+      <span className="truncate">
+        {middleTruncate(attachment.name)} · {formatSize(attachment.size)}
+      </span>
+    </a>
+  );
+}
+
+// 96px lazy thumbnail; a failed load degrades to the file chip so the
+// attachment is never just a broken-image icon.
+function Thumbnail({
+  attachment,
+  onOpen,
+}: {
+  attachment: AttachmentView;
+  onOpen: () => void;
+}) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <FileChip attachment={attachment} />;
+  return (
+    <img
+      src={attachment.url}
+      alt={attachment.name}
+      loading="lazy"
+      onClick={onOpen}
+      onError={() => setFailed(true)}
+      className="h-24 w-24 cursor-zoom-in rounded-md border border-zinc-700 object-cover"
+    />
+  );
+}
+
+// Right-aligned above the text, like a chat app's own-message media.
+function Attachments({ attachments }: { attachments: AttachmentView[] }) {
+  const [open, setOpen] = useState<number | null>(null);
+  // The lightbox cycles only this message's images, never its files.
+  const images = attachments.filter((a) => isThumbnailable(a.mime));
+  return (
+    <div className="mb-2 flex flex-wrap justify-end gap-2">
+      {attachments.map((a) => {
+        const at = images.indexOf(a);
+        return at === -1 ? (
+          <FileChip key={a.id} attachment={a} />
+        ) : (
+          <Thumbnail key={a.id} attachment={a} onOpen={() => setOpen(at)} />
+        );
+      })}
+      {open !== null && (
+        <Lightbox images={images} start={open} onClose={() => setOpen(null)} />
       )}
     </div>
   );

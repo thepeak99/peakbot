@@ -71,6 +71,13 @@ export function adaptMessage(m: WireChatMessage): ChatMessage {
     subAgentRole:
       m.source?.kind === "sub_agent" ? m.source.role : undefined,
     thinking,
+    attachments:
+      m.attachments && m.attachments.length > 0
+        ? m.attachments.map((a) => ({
+            ...a,
+            url: `/api/uploads/${a.convo}/${a.id}`,
+          }))
+        : undefined,
   };
 }
 
