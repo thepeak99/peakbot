@@ -64,7 +64,7 @@ async fn post_upload(
 ) -> reqwest::Response {
     let mut req = client()
         .post(format!("http://{addr}/api/uploads"))
-        .query(&[("convo", convo.to_string()), ("name", name)])
+        .query(&[("convo", convo.to_string()), ("name", name.to_string())])
         .body(body);
     if let Some(ct) = content_type {
         req = req.header(reqwest::header::CONTENT_TYPE, ct);

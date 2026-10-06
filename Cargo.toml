@@ -31,6 +31,9 @@ dirs = "6"
 gethostname = "1"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
+# Direct dep (transitive via url/reqwest) for the RFC 5987 `filename*`
+# percent-encoding in the upload serve headers (src/ui/web/uploads.rs).
+percent-encoding = "2.3"
 regex = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 # Direct dep (transitive via ratatui) for terminal-cell-accurate `.width()` in
