@@ -9720,4 +9720,241 @@ mod tests {
         sm.set_profile_view(vec!["only-one".to_string()], vec!["session".to_string()]);
         assert_eq!(sm.get_state().profiles, vec!["only-one".to_string()]);
     }
+
+    // ── T6 — attachment turn building (file-uploads design §5.4 / §5.5) ────
+    //
+    // **Status: compile-fail until T5/T6 land.** Written against the locked
+    // design interface:
+    // - `crate::attachments::{UploadStore, Attachment, AttachmentKind,
+    //   model_note}` (new module, §3.1/§5.1).
+    // - `StateManager::with_uploads(store)` (§5.5).
+    // - `user_content_from_chat_message(msg, supports_vision, store)` — the
+    //   3-arg turn builder (§5.4), still a private free fn in this module.
+    //
+    // The turn-builder tests drive the private fn directly with a tempdir
+    // store (deterministic, no SM state needed); the delete_conversation
+    // test exercises the SM seam.
+
+    use crate::attachments::{AttachmentKind, UploadStore, model_note};
+    use crate::config::UploadsConfig;
+    use crate::storage::FileStorage;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use rig_core::completion::message::{DocumentSourceKind, ImageMediaType, UserContent};
+
+    /// Minimal valid 1x1 PNG (same fixture as `tests/attachments_tests.rs`).
+    fn t6_png_1x1() -> Vec<u8> {
+        STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("valid base64 fixture")
+    }
+
+    fn t6_limits() -> UploadsConfig {
+        UploadsConfig {
+            max_file_mb: 50,
+            max_files: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_vision_image_emits_image_part_and_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(tmp.path().to_path_buf(), t6_limits());
+        let convo = Uuid::new_v4();
+        let png = t6_png_1x1();
+        let att = store
+            .store(convo, "cat.png", &png[..])
+            .await
+            .expect("store the PNG");
+
+        let msg = ChatMessage::user_with_attachments("what's this?".to_string(), vec![att.clone()]);
+        let content = user_content_from_chat_message(&msg, true, &store);
+
+        assert_eq!(
+            content.len(),
+            2,
+            "vision + Image must be [Image, Text]: {content:?}"
+        );
+        let UserContent::Image(img) = content.first_ref() else {
+            panic!("first part must be the image: {content:?}");
+        };
+        let DocumentSourceKind::Base64(b64) = &img.data else {
+            panic!("the image must be base64 of the stored file, not a URL: {img:?}");
+        };
+        assert_eq!(
+            STANDARD.decode(b64).expect("valid base64"),
+            png,
+            "the image part must be the stored file bytes"
+        );
+        assert_eq!(img.media_type, Some(ImageMediaType::PNG));
+
+        let UserContent::Text(t) = content.last_ref() else {
+            panic!("second part must be the text: {content:?}");
+        };
+        let expected = format!(
+            "what's this?\n\n{}",
+            model_note(&store, std::slice::from_ref(&att))
+        );
+        assert_eq!(
+            t.text, expected,
+            "the text part must be content + the fixed-format note"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_non_vision_image_is_text_only_with_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(tmp.path().to_path_buf(), t6_limits());
+        let convo = Uuid::new_v4();
+        let png = t6_png_1x1();
+        let att = store
+            .store(convo, "cat.png", &png[..])
+            .await
+            .expect("store the PNG");
+
+        let msg = ChatMessage::user_with_attachments("what's this?".to_string(), vec![att.clone()]);
+        let content = user_content_from_chat_message(&msg, false, &store);
+
+        // No image part — the vision fallback is simply its absence.
+        assert_eq!(
+            content.len(),
+            1,
+            "non-vision must be [Text] only: {content:?}"
+        );
+        let UserContent::Text(t) = content.first_ref() else {
+            panic!("the single part must be text: {content:?}");
+        };
+        let expected = format!(
+            "what's this?\n\n{}",
+            model_note(&store, std::slice::from_ref(&att))
+        );
+        assert_eq!(
+            t.text, expected,
+            "the note must still list the image (the model reads it as a file)"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_file_attachment_is_text_only_with_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(tmp.path().to_path_buf(), t6_limits());
+        let convo = Uuid::new_v4();
+        let att = store
+            .store(convo, "spec.pdf", &b"%PDF-1.4 fake bytes"[..])
+            .await
+            .expect("store the PDF");
+        assert_eq!(att.kind, AttachmentKind::File, "PDF must classify as File");
+
+        let msg =
+            ChatMessage::user_with_attachments("summarise this".to_string(), vec![att.clone()]);
+        // Even on a vision model a File attachment never becomes an image part.
+        let content = user_content_from_chat_message(&msg, true, &store);
+
+        assert_eq!(content.len(), 1, "File must be [Text] only: {content:?}");
+        let UserContent::Text(t) = content.first_ref() else {
+            panic!("the single part must be text: {content:?}");
+        };
+        let expected = format!(
+            "summarise this\n\n{}",
+            model_note(&store, std::slice::from_ref(&att))
+        );
+        assert_eq!(t.text, expected);
+    }
+
+    #[tokio::test]
+    async fn turn_deleted_image_file_skips_part_without_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(tmp.path().to_path_buf(), t6_limits());
+        let convo = Uuid::new_v4();
+        let png = t6_png_1x1();
+        let att = store
+            .store(convo, "cat.png", &png[..])
+            .await
+            .expect("store the PNG");
+
+        // The stored file vanishes after the fact (design §4.4 failure row).
+        std::fs::remove_file(store.path(&att)).expect("delete the stored file");
+
+        let msg = ChatMessage::user_with_attachments("what's this?".to_string(), vec![att.clone()]);
+        // Must not panic: the image part is skipped with a warning…
+        let content = user_content_from_chat_message(&msg, true, &store);
+
+        assert_eq!(content.len(), 1, "deleted file → [Text] only: {content:?}");
+        let UserContent::Text(t) = content.first_ref() else {
+            panic!("the single part must be text: {content:?}");
+        };
+        // …and the note still lists the path, so the model can find the
+        // (missing) file with its tools.
+        let expected = format!(
+            "what's this?\n\n{}",
+            model_note(&store, std::slice::from_ref(&att))
+        );
+        assert_eq!(t.text, expected);
+    }
+
+    #[tokio::test]
+    async fn turn_no_attachments_is_plain_text_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(tmp.path().to_path_buf(), t6_limits());
+
+        let msg = ChatMessage::user("hello".to_string());
+        let content = user_content_from_chat_message(&msg, true, &store);
+
+        // Byte-identical to today: a single Text part, no note.
+        assert_eq!(
+            content.len(),
+            1,
+            "text-only must stay one part: {content:?}"
+        );
+        let UserContent::Text(t) = content.first_ref() else {
+            panic!("the single part must be text: {content:?}");
+        };
+        assert_eq!(t.text, "hello");
+    }
+
+    #[tokio::test]
+    async fn delete_conversation_removes_upload_dir() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let uploads_root = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(uploads_root.path().to_path_buf(), t6_limits());
+        let mut sm = StateManager::new().with_uploads(store.clone());
+        // Test seam: this module is a child of `state_manager`, so it may set
+        // the private `storage` field directly (no public ctor takes both
+        // storage and uploads; `with_uploads` consumes self before the Arc).
+        sm.storage = Some(Arc::new(
+            FileStorage::new(storage_dir.path().to_path_buf()).expect("file storage"),
+        ));
+
+        let id = Uuid::new_v4();
+        let mut conv = Conversation::new(
+            "doomed".into(),
+            "mock".into(),
+            "mock-model".into(),
+            ".".into(),
+        );
+        conv.id = id;
+        sm.storage
+            .as_ref()
+            .unwrap()
+            .save(&conv)
+            .expect("save the conversation");
+
+        let png = t6_png_1x1();
+        store
+            .store(id, "cat.png", &png[..])
+            .await
+            .expect("store an upload under the conversation");
+        let convo_dir = uploads_root.path().join(id.to_string());
+        assert!(
+            convo_dir.exists(),
+            "the upload dir must exist before delete"
+        );
+
+        sm.delete_conversation(id).expect("delete must succeed");
+
+        assert!(
+            !convo_dir.exists(),
+            "delete_conversation must remove <root>/<id> (best-effort store cleanup)"
+        );
+    }
 }

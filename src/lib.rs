@@ -6085,9 +6085,12 @@ mod tests {
 
     #[test]
     fn classify_plain_text_is_user_message() {
+        // T7: `UserMessage` merged with `MultimodalMessage` — plain text is
+        // `UserMessage { text, image_tokens: [] }`.
         assert!(matches!(
             classify_submission("hello world"),
-            SubmitKind::UserMessage(s) if s == "hello world"
+            SubmitKind::UserMessage { text, image_tokens }
+                if text == "hello world" && image_tokens.is_empty()
         ));
     }
 
@@ -6180,7 +6183,7 @@ mod tests {
         // A slash that isn't at the start (after trim) is chat content.
         assert!(matches!(
             classify_submission("TODO: /foo or /bar?"),
-            SubmitKind::UserMessage(_)
+            SubmitKind::UserMessage { .. }
         ));
     }
 
@@ -6189,11 +6192,11 @@ mod tests {
         // The Enter handler already drops empty buffers; defensive default.
         assert!(matches!(
             classify_submission(""),
-            SubmitKind::UserMessage(_)
+            SubmitKind::UserMessage { .. }
         ));
         assert!(matches!(
             classify_submission("   "),
-            SubmitKind::UserMessage(_)
+            SubmitKind::UserMessage { .. }
         ));
     }
 
@@ -6242,35 +6245,85 @@ mod tests {
         ));
     }
 
+    // ── T7 — `[img:]` token grammar at classify time (design §3.2/§4.1, A1) ─
+    //
+    // `classify_submission` is grammar-only now: NO I/O, NO file resolution
+    // (that moved to `attachments::collect` at enqueue), NO vision gate
+    // (that is deleted). Tokens travel as raw strings in
+    // `UserMessage { text, image_tokens }`.
+    //
+    // RED: `SubmitKind::UserMessage { text, image_tokens }` and
+    // `InvalidAttachment(attachments::AttachError)` do not exist yet.
+
     #[test]
-    fn classify_inline_image_path_is_multimodal() {
-        use std::io::Write;
-        // Create a real tempfile the classifier can resolve.
-        let path = std::env::temp_dir().join(format!(
-            "peakbot-classify-{}-{}.png",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let mut f = std::fs::File::create(&path).expect("create");
-        f.write_all(b"x").expect("write");
-        let input = format!("describe [img:{}]", path.display());
-        match classify_submission(&input) {
-            SubmitKind::MultimodalMessage { text, attachments } => {
-                assert_eq!(text, "describe");
-                assert_eq!(attachments.len(), 1);
+    fn classify_img_path_token_is_extracted_not_resolved() {
+        // The file does not need to exist — classify never touches the disk.
+        let input = "describe [img:/does/not/matter-7f8a.png]";
+        match classify_submission(input) {
+            SubmitKind::UserMessage { text, image_tokens } => {
+                assert_eq!(text.trim(), "describe");
+                assert_eq!(image_tokens, vec!["/does/not/matter-7f8a.png"]);
             }
-            other => panic!("expected MultimodalMessage, got {other:?}"),
+            other => panic!("expected UserMessage with image_tokens, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn classify_inline_image_missing_is_invalid_attachment() {
-        let input = "look at [img:/does/not/exist-7f8a.png]";
-        assert!(matches!(
-            classify_submission(input),
-            SubmitKind::InvalidAttachment(_)
-        ));
+    fn classify_img_url_token_is_kept_as_normal_token() {
+        // Amendment A1: `[img:http(s)://…]` is NOT a grammar error. It stays
+        // a normal token; `collect` downloads it into the store at enqueue.
+        let input = "[img:https://example.com/a.png] please";
+        match classify_submission(input) {
+            SubmitKind::UserMessage { text, image_tokens } => {
+                assert_eq!(text.trim(), "please");
+                assert_eq!(image_tokens, vec!["https://example.com/a.png"]);
+            }
+            other => panic!("URL tokens must stay UserMessage (A1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_img_data_uri_token_is_invalid_attachment() {
+        // A1: `[img:data:…]` is a grammar error — the inline data: producer
+        // (the old web composer) is gone; the user re-attaches the file.
+        let input = "look at [img:data:image/png;base64,iVBORw0K]";
+        match classify_submission(input) {
+            SubmitKind::InvalidAttachment(e) => {
+                assert!(
+                    matches!(e, crate::attachments::AttachError::DataUriToken),
+                    "data: tokens must map to DataUriToken, got {e:?}"
+                );
+            }
+            other => panic!("expected InvalidAttachment(DataUriToken), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_multiple_img_tokens_keep_text_order() {
+        let input = "[img:/a/one.png] and [img:/b/two.png]";
+        match classify_submission(input) {
+            SubmitKind::UserMessage { text, image_tokens } => {
+                assert_eq!(text.trim(), "and");
+                assert_eq!(image_tokens, vec!["/a/one.png", "/b/two.png"]);
+            }
+            other => panic!("expected UserMessage with both tokens, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_unterminated_img_token_stays_literal() {
+        // No closing bracket → the buffer stays literal (today's behaviour).
+        let input = "see [img: /tmp/unfinished";
+        match classify_submission(input) {
+            SubmitKind::UserMessage { text, image_tokens } => {
+                assert!(
+                    text.contains("[img:"),
+                    "unterminated token must stay literal: {text:?}"
+                );
+                assert!(image_tokens.is_empty());
+            }
+            other => panic!("expected literal UserMessage, got {other:?}"),
+        }
     }
 
     // =========================================================================
@@ -8673,6 +8726,7 @@ pipelines:
         sm: &Arc<StateManager>,
         tool: Box<dyn ToolDyn>,
         responses: Vec<crate::mock::MockResponse>,
+        supports_vision: bool,
     ) -> (
         crate::mock::MockCompletionModel,
         mpsc::UnboundedSender<UiAction>,
@@ -8697,7 +8751,7 @@ pipelines:
             name: "mock".to_string(),
             model: "mock-model".to_string(),
             supports_pricing: true,
-            supports_vision: true,
+            supports_vision,
             preserve_reasoning: true,
             display_reasoning: false,
         };
@@ -8730,6 +8784,259 @@ pipelines:
         let (tx, rx) = mpsc::unbounded_channel::<UiAction>();
         let h = tokio::spawn(async move { runner.run_loop(rx).await });
         (model_clone, tx, h)
+    }
+
+    // ── T7 — controller attachment ingest (file-uploads design §4.1) ───────
+    //
+    // **Status: compile-fail until T7 lands.** Written against the locked
+    // design interface: `UiAction::SendMessage { text, attachments }`
+    // (§3.2), `StateManager::with_uploads` (§5.5), and the `collect`-based
+    // ingest that replaces the deleted vision gate. The `PanicTool` is
+    // registered but never called (the mock answers with plain text).
+
+    /// Shared fixture: a boot conversation plus a tempdir upload store wired
+    /// into the SM. `tmp` must outlive the test (the store's root lives there).
+    #[cfg(feature = "mock")]
+    fn attachment_ingest_fixture() -> (
+        Arc<StateManager>,
+        crate::attachments::UploadStore,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::attachments::UploadStore::new(
+            tmp.path().to_path_buf(),
+            crate::config::UploadsConfig {
+                max_file_mb: 50,
+                max_files: 10,
+            },
+        );
+        let sm = Arc::new(StateManager::new().with_uploads(store.clone()));
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+        (sm, store, tmp)
+    }
+
+    /// Unknown attachment id → system "❌ …", and NOTHING is queued: no user
+    /// row, no LLM call (design §4.1 `collect` → `find` → None).
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controller_unknown_attachment_id_refuses_and_queues_nothing() {
+        use crate::ui::app_state::MessageRole;
+
+        let (sm, _store, _tmp) = attachment_ingest_fixture();
+        let (model, tx, h) = spawn_mock_runner(&sm, Box::new(PanicTool(sm.clone())), vec![], true);
+
+        tx.send(UiAction::SendMessage {
+            text: "hi".to_string(),
+            attachments: vec![uuid::Uuid::new_v4()],
+        })
+        .expect("the action channel is open");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let msgs = sm.get_state().chat.messages;
+                if msgs
+                    .iter()
+                    .any(|m| m.role == MessageRole::System && m.content.starts_with("❌"))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an unknown attachment id must surface a ❌ system message within 10s");
+
+        let msgs = sm.get_state().chat.messages;
+        assert!(
+            !msgs.iter().any(|m| m.role == MessageRole::User),
+            "a refused send must not queue a user message: {msgs:?}"
+        );
+        assert_eq!(
+            model.request_count(),
+            0,
+            "a refused send must not call the model"
+        );
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
+    }
+
+    /// `/new` carrying ids → refusal, and `/new` is NOT run (design §4.1:
+    /// Command + non-empty attachments → system "❌ Attachments can't be sent
+    /// with a /command.", not queued).
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controller_command_with_attachments_is_refused() {
+        use crate::ui::app_state::MessageRole;
+
+        let (sm, _store, _tmp) = attachment_ingest_fixture();
+        let convo_before = sm
+            .get_current_conversation_id()
+            .expect("boot conversation exists");
+
+        let (model, tx, h) = spawn_mock_runner(&sm, Box::new(PanicTool(sm.clone())), vec![], true);
+
+        tx.send(UiAction::SendMessage {
+            text: "/new".to_string(),
+            attachments: vec![uuid::Uuid::new_v4()],
+        })
+        .expect("the action channel is open");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let msgs = sm.get_state().chat.messages;
+                if msgs.iter().any(|m| {
+                    m.role == MessageRole::System
+                        && m.content
+                            .contains("Attachments can't be sent with a /command")
+                }) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("/new with attachments must surface the refusal system message within 10s");
+
+        assert_eq!(
+            sm.get_current_conversation_id(),
+            Some(convo_before),
+            "the refused /new must not switch conversations"
+        );
+        assert_eq!(
+            model.request_count(),
+            0,
+            "a refused command must not call the model"
+        );
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
+    }
+
+    /// Regression of the OLD vision refusal (deleted in T7): a non-vision
+    /// model + an image attachment is QUEUED — the image degrades to a file
+    /// reference at turn-build time, it is never refused at ingest.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controller_non_vision_model_with_image_attachment_is_queued() {
+        use crate::ui::app_state::MessageRole;
+        use base64::Engine;
+
+        let (sm, store, _tmp) = attachment_ingest_fixture();
+        let convo_id = sm
+            .get_current_conversation_id()
+            .expect("boot conversation exists");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("valid base64 fixture");
+        let att = store
+            .store(convo_id, "cat.png", &png[..])
+            .await
+            .expect("store the PNG");
+
+        // supports_vision = false: the old gate would have refused this send.
+        let (model, tx, h) = spawn_mock_runner(
+            &sm,
+            Box::new(PanicTool(sm.clone())),
+            vec![crate::mock::MockResponse::text("ok")],
+            false,
+        );
+
+        tx.send(UiAction::SendMessage {
+            text: "what's in this?".to_string(),
+            attachments: vec![att.id],
+        })
+        .expect("the action channel is open");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = sm.get_state();
+                let landed = state
+                    .chat
+                    .messages
+                    .iter()
+                    .any(|m| m.role == MessageRole::User && m.content == "what's in this?");
+                if landed && !sm.is_running() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "non-vision model + image attachment must be QUEUED (the old vision \
+             refusal is gone); the user row must land within 10s",
+        );
+
+        assert_eq!(
+            model.request_count(),
+            1,
+            "the queued turn must run exactly one LLM request"
+        );
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
+    }
+
+    /// 11 ids with `max_files: 10` → TooMany refusal (the count check runs
+    /// before any lookup/copy, so the ids need not exist), nothing queued.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controller_eleven_attachments_with_max_ten_is_too_many() {
+        use crate::ui::app_state::MessageRole;
+
+        let (sm, _store, _tmp) = attachment_ingest_fixture();
+        let (model, tx, h) = spawn_mock_runner(&sm, Box::new(PanicTool(sm.clone())), vec![], true);
+
+        let ids: Vec<uuid::Uuid> = (0..11).map(|_| uuid::Uuid::new_v4()).collect();
+        tx.send(UiAction::SendMessage {
+            text: "x".to_string(),
+            attachments: ids,
+        })
+        .expect("the action channel is open");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let msgs = sm.get_state().chat.messages;
+                if msgs.iter().any(|m| {
+                    m.role == MessageRole::System
+                        && m.content.starts_with("❌")
+                        && m.content.contains("11")
+                        && m.content.contains("10")
+                }) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("11 ids with max_files 10 must surface a TooMany ❌ message within 10s");
+
+        let msgs = sm.get_state().chat.messages;
+        assert!(
+            !msgs.iter().any(|m| m.role == MessageRole::User),
+            "a TooMany refusal must not queue a user message: {msgs:?}"
+        );
+        assert_eq!(
+            model.request_count(),
+            0,
+            "a TooMany refusal must not call the model"
+        );
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
     }
 
     /// A rig tool that panics once its own ToolCall row has landed in the
@@ -8814,6 +9121,7 @@ pipelines:
                 crate::mock::MockResponse::tool_call("panic_tool", serde_json::json!({})),
                 crate::mock::MockResponse::text("recovered"),
             ],
+            true,
         );
 
         tx.send(UiAction::SendMessage("go".into()))
@@ -8922,6 +9230,7 @@ pipelines:
                 crate::mock::MockResponse::tool_call("panic_tool", serde_json::json!({})),
                 crate::mock::MockResponse::text("still alive"),
             ],
+            true,
         );
 
         tx.send(UiAction::SendMessage("go".into()))

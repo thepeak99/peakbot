@@ -401,6 +401,64 @@ mod tests {
         assert!(matches!(m, InboundMessage::KillSession { convo } if convo == "xyz"));
     }
 
+    // ── T7 — send_message attachments (file-uploads design §5.3) ───────────
+    //
+    // RED: `InboundMessage::SendMessage.attachments` (`#[serde(default)]
+    // Vec<Uuid>`) does not exist yet. A malformed UUID must invalidate the
+    // whole frame — that is what produces the existing `invalid inbound
+    // JSON` error frame on the wire.
+
+    #[test]
+    fn send_message_without_attachments_field_defaults_to_empty() {
+        // Backward compatible: old clients (and stdio) omit the field.
+        let m: InboundMessage =
+            serde_json::from_str(r#"{"type":"send_message","text":"x"}"#).unwrap();
+        match m {
+            InboundMessage::SendMessage { text, attachments } => {
+                assert_eq!(text, "x");
+                assert!(
+                    attachments.is_empty(),
+                    "absent attachments must default to []"
+                );
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_message_with_attachment_ids_parses() {
+        let m: InboundMessage = serde_json::from_str(
+            r#"{"type":"send_message","text":"what's in these?","attachments":["5b7c1a2e-0000-4000-8000-000000000001","9e21f4d6-0000-4000-8000-000000000002"]}"#,
+        )
+        .unwrap();
+        match m {
+            InboundMessage::SendMessage { text, attachments } => {
+                assert_eq!(text, "what's in these?");
+                assert_eq!(attachments.len(), 2);
+                assert_eq!(
+                    attachments[0].to_string(),
+                    "5b7c1a2e-0000-4000-8000-000000000001"
+                );
+                assert_eq!(
+                    attachments[1].to_string(),
+                    "9e21f4d6-0000-4000-8000-000000000002"
+                );
+            }
+            other => panic!("expected SendMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_message_with_malformed_uuid_is_invalid_frame() {
+        assert!(
+            serde_json::from_str::<InboundMessage>(
+                r#"{"type":"send_message","text":"x","attachments":["not-a-uuid"]}"#
+            )
+            .is_err(),
+            "a malformed attachment UUID must invalidate the frame"
+        );
+    }
+
     #[test]
     fn attached_serializes_with_tag_and_convo() {
         let m = OutboundMessage::Attached {

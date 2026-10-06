@@ -4,6 +4,7 @@
 //! Unit tests for individual components live in their respective source files.
 
 mod anthropic_provider_build;
+mod attachment_turn_tests;
 mod bash_tests;
 mod bg_tests;
 mod chat_render_tests;
