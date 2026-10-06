@@ -8,8 +8,8 @@
 //!   buffer and resolves them to [`ImageAttachment`]s. TOKEN is a `data:` URI
 //!   (browser paste/drop, decoded to `Base64`), a path when it starts with
 //!   `/`, `~`, or `./`, or otherwise a URL (must contain `://`).
-//! - [`load_image_from_path`] — direct path → attachment, enforcing
-//!   [`MAX_IMAGE_BYTES`] and media-type inference.
+//! - [`load_image_from_path`] — direct path → [`LoadedImage`] (bytes + media
+//!   type), enforcing [`MAX_IMAGE_BYTES`] and media-type inference.
 //! - [`model_supports_vision`] — model name → whether image input is accepted.
 //!
 //! ## Adapter (wire boundary)
@@ -28,6 +28,17 @@ pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Maximum number of `[img:…]` attachments allowed in a single submission.
 pub const MAX_IMAGES_PER_TURN: usize = 8;
+
+/// A local image loaded from disk: the bytes, the inferred media type, and
+/// the file's basename for display. The one result of
+/// [`load_image_from_path`] — it can never be a URL, which is what makes the
+/// old `ImageSource` match at the call sites unnecessary.
+#[derive(Debug, Clone)]
+pub struct LoadedImage {
+    pub display_name: String,
+    pub bytes: Vec<u8>,
+    pub media_type: ImageMediaType,
+}
 
 /// Where an image came from. Two variants, no hidden state.
 ///
@@ -158,8 +169,8 @@ fn extension_for(media_type: &ImageMediaType) -> &'static str {
 }
 
 /// Load an image from disk. Infers media type from the extension, enforces
-/// [`MAX_IMAGE_BYTES`], and returns a `Base64` attachment.
-pub fn load_image_from_path(path: &Path) -> Result<ImageAttachment, AttachmentError> {
+/// [`MAX_IMAGE_BYTES`], and returns the bytes with their media type.
+pub fn load_image_from_path(path: &Path) -> Result<LoadedImage, AttachmentError> {
     // Read metadata first — rejects oversize without touching the file body.
     let metadata = match std::fs::metadata(path) {
         Ok(md) => md,
@@ -201,10 +212,10 @@ pub fn load_image_from_path(path: &Path) -> Result<ImageAttachment, AttachmentEr
         .unwrap_or("image")
         .to_string();
 
-    Ok(ImageAttachment {
+    Ok(LoadedImage {
         display_name,
-        source: ImageSource::Base64 { bytes, media_type },
-        detail: None,
+        bytes,
+        media_type,
     })
 }
 
@@ -263,14 +274,14 @@ fn resolve_token(token: &str) -> Result<ImageAttachment, AttachmentError> {
     if token.starts_with("data:") {
         load_image_from_data_uri(token)
     } else if token.starts_with('/') || token.starts_with("./") {
-        load_image_from_path(Path::new(token))
+        load_path_attachment(Path::new(token))
     } else if let Some(rest) = token.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_default();
         let expanded = PathBuf::from(home).join(rest);
-        load_image_from_path(&expanded)
+        load_path_attachment(&expanded)
     } else if token == "~" {
         let home = std::env::var("HOME").unwrap_or_default();
-        load_image_from_path(Path::new(&home))
+        load_path_attachment(Path::new(&home))
     } else if token.contains("://") {
         Ok(ImageAttachment {
             display_name: token.to_string(),
@@ -280,6 +291,21 @@ fn resolve_token(token: &str) -> Result<ImageAttachment, AttachmentError> {
     } else {
         Err(AttachmentError::InvalidToken(token.to_string()))
     }
+}
+
+/// Path tokens still feed the old `ImageAttachment` wire type (the
+/// controller swap lands with the `attachments::Attachment` data model), so
+/// the `LoadedImage` result is wrapped back into a `Base64` source here.
+fn load_path_attachment(path: &Path) -> Result<ImageAttachment, AttachmentError> {
+    let loaded = load_image_from_path(path)?;
+    Ok(ImageAttachment {
+        display_name: loaded.display_name,
+        source: ImageSource::Base64 {
+            bytes: loaded.bytes,
+            media_type: loaded.media_type,
+        },
+        detail: None,
+    })
 }
 
 /// Known-vision model patterns. Conservative: unknown models → `false`.
@@ -387,18 +413,13 @@ mod tests {
     #[test]
     fn load_image_from_path_reads_bytes_and_infers_type() {
         let path = write_tempfile("png", b"fake png bytes");
-        let att = load_image_from_path(&path).expect("load");
+        let loaded = load_image_from_path(&path).expect("load");
         assert_eq!(
-            att.display_name,
+            loaded.display_name,
             path.file_name().unwrap().to_str().unwrap()
         );
-        match att.source {
-            ImageSource::Base64 { bytes, media_type } => {
-                assert_eq!(bytes, b"fake png bytes");
-                assert_eq!(media_type, ImageMediaType::PNG);
-            }
-            _ => panic!("expected Base64 variant"),
-        }
+        assert_eq!(loaded.bytes, b"fake png bytes");
+        assert_eq!(loaded.media_type, ImageMediaType::PNG);
         let _ = std::fs::remove_file(&path);
     }
 

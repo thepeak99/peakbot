@@ -145,11 +145,8 @@ impl ImageLinks {
         // Miss: recompute. load_image_from_path is the single "servable local
         // image" gate (extension allow-list + MAX_IMAGE_BYTES via its own stat).
         let image = stamp.and_then(|_| {
-            let att = crate::vision::load_image_from_path(&abs).ok()?;
-            let crate::vision::ImageSource::Base64 { bytes, media_type } = att.source else {
-                return None;
-            };
-            crate::image_cache::spill(&bytes, media_type, &att.display_name)
+            let loaded = crate::vision::load_image_from_path(&abs).ok()?;
+            crate::image_cache::spill(&loaded.bytes, loaded.media_type, &loaded.display_name)
         });
 
         let entry = match stamp {

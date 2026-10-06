@@ -21,8 +21,8 @@
 //!   `InvalidToken` (design §7 T3 "bare word→InvalidToken").
 
 use peakbot::attachments::{
-    collect, human_size, model_note, parse_image_tokens, sanitize_name, AttachError, Attachment,
-    AttachmentKind, UploadStore,
+    AttachError, Attachment, AttachmentKind, UploadStore, collect, human_size, model_note,
+    parse_image_tokens, sanitize_name,
 };
 use peakbot::config::UploadsConfig;
 use std::net::SocketAddr;
@@ -256,8 +256,14 @@ async fn remove_conversation_removes_only_that_convo() {
     stored(&store, b, "y.png", &png).await;
 
     store.remove_conversation(a);
-    assert!(!dir.path().join(a.to_string()).exists(), "convo a must be gone");
-    assert!(dir.path().join(b.to_string()).exists(), "convo b must survive");
+    assert!(
+        !dir.path().join(a.to_string()).exists(),
+        "convo a must be gone"
+    );
+    assert!(
+        dir.path().join(b.to_string()).exists(),
+        "convo b must survive"
+    );
 }
 
 #[tokio::test]
@@ -284,7 +290,10 @@ async fn png_bytes_named_txt_are_classified_image_png() {
         AttachmentKind::Image,
         "magic bytes must beat the extension"
     );
-    assert_eq!(att.mime, "image/png", "mime must come from the sniffed format");
+    assert_eq!(
+        att.mime, "image/png",
+        "mime must come from the sniffed format"
+    );
 }
 
 #[tokio::test]
@@ -297,7 +306,10 @@ async fn jpeg_bytes_named_png_get_mime_image_jpeg() {
     let att = stored(&store, convo, ".png", &jpeg).await;
     assert_eq!(att.kind, AttachmentKind::Image);
     assert_eq!(att.mime, "image/jpeg");
-    assert_eq!(att.name, "png", "leading dot must be trimmed by sanitize_name");
+    assert_eq!(
+        att.name, "png",
+        "leading dot must be trimmed by sanitize_name"
+    );
 }
 
 #[tokio::test]
@@ -350,7 +362,9 @@ async fn heic_is_file() {
     let store = UploadStore::new(dir.path().to_path_buf(), default_limits());
     let convo = Uuid::new_v4();
     // ftyp box header, not in image::guess_format's magic table.
-    let heic = [0xFF, 0x01, 0x00, 0x00, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63];
+    let heic = [
+        0xFF, 0x01, 0x00, 0x00, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63,
+    ];
 
     let att = stored(&store, convo, "photo.heic", &heic).await;
     assert_eq!(att.kind, AttachmentKind::File);
@@ -393,7 +407,10 @@ fn parse_multiple_tokens_in_order_with_stripped_text() {
         vec!["/a.png".to_string(), "~/b.jpg".to_string()],
         "tokens must come back in text order"
     );
-    assert!(!text.contains("[img:"), "tokens must be stripped from the text");
+    assert!(
+        !text.contains("[img:"),
+        "tokens must be stripped from the text"
+    );
     assert!(
         text.contains("see") && text.contains("ok"),
         "surrounding text must survive; got {text:?}"
@@ -508,9 +525,15 @@ async fn collect_directory_token_is_not_a_file() {
     let d = cwd.path().join("adir");
     std::fs::create_dir(&d).unwrap();
 
-    let err = collect(&store, convo, cwd.path(), vec![d.to_string_lossy().into_owned()], vec![])
-        .await
-        .expect_err("a directory token must be NotAFile");
+    let err = collect(
+        &store,
+        convo,
+        cwd.path(),
+        vec![d.to_string_lossy().into_owned()],
+        vec![],
+    )
+    .await
+    .expect_err("a directory token must be NotAFile");
     match err {
         AttachError::NotAFile(p) => assert_eq!(p, d),
         other => panic!("expected NotAFile, got {other:?}"),
@@ -605,9 +628,15 @@ async fn collect_url_without_basename_stored_as_file() {
     let convo = Uuid::new_v4();
     let addr = spawn_url_server(vec![("/", b"root bytes".to_vec())]).await;
 
-    let atts = collect(&store, convo, cwd.path(), vec![format!("http://{addr}/")], vec![])
-        .await
-        .expect("a URL with an empty path basename must fall back to 'file'");
+    let atts = collect(
+        &store,
+        convo,
+        cwd.path(),
+        vec![format!("http://{addr}/")],
+        vec![],
+    )
+    .await
+    .expect("a URL with an empty path basename must fall back to 'file'");
     assert_eq!(atts[0].name, "file");
 }
 
@@ -683,8 +712,8 @@ async fn model_note_exact_golden_string() {
         "[Attached files — read them with your file tools]\n\
          - spec.pdf (application/pdf, 2.3 MB): {}\n\
          - cat.png (image/png, 1.2 KB): {}",
-        store.path(&spec),
-        store.path(&cat),
+        store.path(&spec).display(),
+        store.path(&cat).display(),
     );
     assert_eq!(note, expected);
 }

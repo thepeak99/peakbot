@@ -8,6 +8,7 @@
 /// could drift from the binary the user actually runs.
 pub const PEAKBOT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod attachments;
 pub mod bg_processes;
 pub mod config;
 mod context_manager;
@@ -2544,6 +2545,9 @@ impl AgentRunner {
             ("mcp_servers", config.mcp_servers != fresh.mcp_servers),
             ("vector_db", config.vector_db != fresh.vector_db),
             ("web", config.web != fresh.web),
+            // `uploads` is boot-only like `web.*`: the running session's
+            // UploadStore keeps the boot limits until restart.
+            ("uploads", config.uploads != fresh.uploads),
             // `http` is baked into the HTTP clients at boot; it was missing
             // here, so edits were adopted into the config yet never applied.
             ("http", config.http != fresh.http),

@@ -56,8 +56,9 @@ portable-pty = "0.9"
 # so no features need to be enabled. Already in `Cargo.lock:5610` at 0.7.18
 # as a transitive dep via `rig-core`; this entry promotes it to direct so
 # the stub `turn_cancel_token()` and the real implementation can name the
-# type without a `cfg(test)` shim.
-tokio-util = { version = "0.7" }
+# type without a `cfg(test)` shim. `io` adds `StreamReader` for streaming
+# URL-token downloads straight into the upload store (src/attachments.rs).
+tokio-util = { version = "0.7", features = ["io"] }
 
 # MCP OAuth 2.1 (#19, src/mcp_auth.rs): one-shot localhost callback listener.
 # The `query` extractor URL-decodes auto (Linear `%3A`-encodes the auth code).

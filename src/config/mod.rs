@@ -13,7 +13,7 @@ pub use model_registry::{ModelEntry, ModelRegistry, ProviderEntry, RegistryError
 
 use anyhow::Context;
 use directories_next::ProjectDirs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
@@ -365,6 +365,12 @@ pub struct Config {
     #[serde(default)]
     pub web: WebConfig,
 
+    /// Upload limits (per-file size, per-message count). Boot-only, like
+    /// `web.*` — the `UploadStore` holds the boot value for the session's
+    /// lifetime; edits need a restart.
+    #[serde(default)]
+    pub uploads: UploadsConfig,
+
     /// Built-in tool filter (blocklist `disabled:` XOR allowlist `only:`).
     /// Absent block = every tool available.
     #[serde(default)]
@@ -403,6 +409,37 @@ pub struct Config {
     /// agents.md from every prompt with no profile involved.
     #[serde(skip, default = "default_true")]
     pub agents_md: bool,
+}
+
+/// Upload limits for the web composer and `[img:]` tokens. Boot-only (like
+/// `web.*`): the `UploadStore` keeps the boot value, and the reload diff in
+/// `reload_session_config` warns on changes.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UploadsConfig {
+    /// Per-file ceiling in MB (valid 1..=1024).
+    #[serde(default = "default_max_file_mb")]
+    pub max_file_mb: u32,
+    /// Per-message attachment ceiling (valid 1..=100): uploads + tokens.
+    #[serde(default = "default_max_files")]
+    pub max_files: u32,
+}
+
+impl Default for UploadsConfig {
+    fn default() -> Self {
+        Self {
+            max_file_mb: default_max_file_mb(),
+            max_files: default_max_files(),
+        }
+    }
+}
+
+fn default_max_file_mb() -> u32 {
+    50
+}
+
+fn default_max_files() -> u32 {
+    10
 }
 
 /// A named overlay over the effective config. Every field is optional:
@@ -1902,6 +1939,7 @@ impl Default for Config {
             pipelines: Vec::new(),
             vector_db: None,
             web: WebConfig::default(),
+            uploads: UploadsConfig::default(),
             tools: NameFilter::default(),
             http: HttpConfig::default(),
             timeouts: TimeoutsConfig::default(),
@@ -2187,6 +2225,20 @@ impl Config {
         self.tools
             .validate_names("tools", "tool", BUILTIN_TOOL_NAMES)?;
         self.timeouts.validate()?;
+        // Upload limits: a 0 MB file or 0 files per message is a typo, not a
+        // policy — both are rejected at load, not at upload time.
+        if !(1..=1024).contains(&self.uploads.max_file_mb) {
+            return Err(format!(
+                "uploads.max_file_mb: must be 1..=1024, got {}",
+                self.uploads.max_file_mb
+            ));
+        }
+        if !(1..=100).contains(&self.uploads.max_files) {
+            return Err(format!(
+                "uploads.max_files: must be 1..=100, got {}",
+                self.uploads.max_files
+            ));
+        }
         // A blank `system_prompt` is a config error: unlike `persona`, there is
         // no sensible "empty full prompt" — the built-in head is the only
         // fallback. Trim only to test emptiness; never mutate the stored string.

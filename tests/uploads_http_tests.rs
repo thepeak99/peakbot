@@ -109,7 +109,14 @@ async fn upload_3mb_returns_200_and_attachment_json() {
     let convo = Uuid::new_v4();
     let body = vec![0u8; 3 * 1024 * 1024];
 
-    let resp = post_upload(&addr, &convo, "big.bin", body, Some("application/octet-stream")).await;
+    let resp = post_upload(
+        &addr,
+        &convo,
+        "big.bin",
+        body,
+        Some("application/octet-stream"),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         200,
@@ -120,21 +127,30 @@ async fn upload_3mb_returns_200_and_attachment_json() {
     assert_eq!(v["size"], 3 * 1024 * 1024);
     assert_eq!(v["kind"], "file");
     assert_eq!(v["convo"], convo.to_string());
-    assert!(v["id"].as_str().is_some(), "Attachment JSON must carry an id");
+    assert!(
+        v["id"].as_str().is_some(),
+        "Attachment JSON must carry an id"
+    );
 }
 
 #[tokio::test]
 async fn upload_over_limit_returns_413_and_leaves_no_dir() {
-    let (addr, dir, _store) =
-        spawn_uploads(UploadsConfig {
-            max_file_mb: 1,
-            max_files: 10,
-        })
-        .await;
+    let (addr, dir, _store) = spawn_uploads(UploadsConfig {
+        max_file_mb: 1,
+        max_files: 10,
+    })
+    .await;
     let convo = Uuid::new_v4();
     let body = vec![0u8; 2 * 1024 * 1024];
 
-    let resp = post_upload(&addr, &convo, "big.bin", body, Some("application/octet-stream")).await;
+    let resp = post_upload(
+        &addr,
+        &convo,
+        "big.bin",
+        body,
+        Some("application/octet-stream"),
+    )
+    .await;
     assert_eq!(resp.status(), 413);
     let v: serde_json::Value = resp.json().await.unwrap();
     assert!(
@@ -184,7 +200,11 @@ async fn upload_bad_convo_uuid_returns_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "bad convo uuid must be a 400 Query rejection");
+    assert_eq!(
+        resp.status(),
+        400,
+        "bad convo uuid must be a 400 Query rejection"
+    );
 }
 
 #[tokio::test]
@@ -192,7 +212,14 @@ async fn upload_path_traversal_name_stored_sanitized() {
     let (addr, _dir, _store) = spawn_uploads(default_limits()).await;
     let convo = Uuid::new_v4();
 
-    let resp = post_upload(&addr, &convo, "../../x", b"data".to_vec(), Some("application/octet-stream")).await;
+    let resp = post_upload(
+        &addr,
+        &convo,
+        "../../x",
+        b"data".to_vec(),
+        Some("application/octet-stream"),
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["name"], "x", "name must be sanitized to the bare leaf");
@@ -239,7 +266,10 @@ async fn get_png_headers_inline_with_sandbox() {
         .unwrap()
         .to_str()
         .unwrap();
-    assert!(csp.contains("sandbox"), "png must carry a sandbox CSP; got {csp}");
+    assert!(
+        csp.contains("sandbox"),
+        "png must carry a sandbox CSP; got {csp}"
+    );
 }
 
 #[tokio::test]
@@ -262,7 +292,9 @@ async fn get_pdf_headers_inline_without_sandbox() {
         .unwrap();
     assert!(disp.starts_with("inline"), "pdf must be inline; got {disp}");
     assert!(
-        resp.headers().get(reqwest::header::CONTENT_SECURITY_POLICY).is_none(),
+        resp.headers()
+            .get(reqwest::header::CONTENT_SECURITY_POLICY)
+            .is_none(),
         "pdf must NOT carry a sandbox CSP (Chrome's PDF viewer refuses sandboxed docs)"
     );
 }
@@ -302,7 +334,13 @@ async fn get_md_served_as_text_plain_inline_with_sandbox() {
 async fn get_html_served_as_octet_stream_attachment() {
     let (addr, _dir, _store) = spawn_uploads(default_limits()).await;
     let convo = Uuid::new_v4();
-    let id = upload_id(&addr, &convo, "page.html", b"<html><body>hi</body></html>".to_vec()).await;
+    let id = upload_id(
+        &addr,
+        &convo,
+        "page.html",
+        b"<html><body>hi</body></html>".to_vec(),
+    )
+    .await;
 
     let resp = get_file(&addr, &convo, &id).await;
     assert_eq!(resp.status(), 200);
@@ -357,7 +395,10 @@ async fn get_svg_served_as_octet_stream_attachment() {
         .unwrap()
         .to_str()
         .unwrap();
-    assert!(disp.starts_with("attachment"), "svg must be attachment; got {disp}");
+    assert!(
+        disp.starts_with("attachment"),
+        "svg must be attachment; got {disp}"
+    );
     assert!(
         resp.headers()
             .get(reqwest::header::CONTENT_SECURITY_POLICY)
