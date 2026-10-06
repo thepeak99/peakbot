@@ -44,7 +44,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Composer } from "./Composer";
-import type { InboundMessage, SlashCommand } from "../state";
+import type { InboundMessage, SlashCommand, WireAttachment } from "../state";
 import type { SubAgentRun } from "../types";
 
 // React 19's `flushSync` checks `IS_REACT_ACT_ENVIRONMENT`; set once so the
@@ -808,5 +808,221 @@ describe("Composer — Stop stays as is", () => {
     });
 
     expect(sent).toEqual([{ type: "stop" }]);
+  });
+});
+
+// ─── T12: attachments (chips, send gating, paste, vision ⚠) ───────────────
+// RED: Composer.tsx still uses the old image-only data-URI path. Contract
+// (design T12 + §5.7): the useAttachments result is lifted into App.tsx and
+// passed to Composer as the `attachments` prop; `supportsVision` carries
+// AppState.supports_vision.
+//
+// ASSUMPTION: submit calls onSend(text, ids); App builds the
+// {type:"send_message", text, attachments: ids} frame, and the Composer
+// calls attachments.reset() after sending.
+
+type PendingChip = { key: string; file: File; preview?: string } & (
+  | { state: "uploading"; progress: number; abort: () => void }
+  | { state: "done"; attachment: WireAttachment }
+  | { state: "error"; message: string }
+);
+
+interface AttachmentsApi {
+  pending: PendingChip[];
+  add: (files: File[]) => void;
+  remove: (key: string) => void;
+  reset: () => void;
+  ids: string[];
+  ready: boolean;
+}
+
+const T12_CONVO = "11111111-1111-4111-8111-111111111111";
+
+const pngFile = (): File => new File(["png-bytes"], "cat.png", { type: "image/png" });
+const pdfFile = (): File => new File(["pdf-bytes"], "spec.pdf", { type: "application/pdf" });
+
+function doneImageChip(id: string, preview?: string): PendingChip {
+  return {
+    key: `k-${id}`,
+    file: pngFile(),
+    preview,
+    state: "done",
+    attachment: {
+      id,
+      convo: T12_CONVO,
+      name: "cat.png",
+      mime: "image/png",
+      size: 1234,
+      kind: "image",
+    },
+  };
+}
+
+function donePdfChip(id: string): PendingChip {
+  return {
+    key: `k-${id}`,
+    file: pdfFile(),
+    state: "done",
+    attachment: {
+      id,
+      convo: T12_CONVO,
+      name: "spec.pdf",
+      mime: "application/pdf",
+      size: 2411724,
+      kind: "file",
+    },
+  };
+}
+
+const uploadingChip = (): PendingChip => ({
+  key: "k-up",
+  file: pdfFile(),
+  state: "uploading",
+  progress: 0.4,
+  abort: () => {},
+});
+
+const errorChip = (message: string): PendingChip => ({
+  key: "k-err",
+  file: pdfFile(),
+  state: "error",
+  message,
+});
+
+function attachmentsApi(over: Partial<AttachmentsApi> = {}): AttachmentsApi {
+  return {
+    pending: [],
+    add: vi.fn(),
+    remove: vi.fn(),
+    reset: vi.fn(),
+    ids: [],
+    ready: true,
+    ...over,
+  };
+}
+
+// The new props are not on Composer's type yet (that is the point of the
+// RED state); the cast keeps the mount call site clean while the
+// runtime still forwards every prop through the spread.
+const t12Mount = (
+  base: ComposerProps,
+  attachments: AttachmentsApi,
+  supportsVision: boolean,
+): Promise<HTMLDivElement> =>
+  mount({ ...base, attachments, supportsVision } as unknown as ComposerProps);
+
+describe("Composer — attachments (T12)", () => {
+  it("renders a done image attachment as a thumbnail chip (img with the preview src)", async () => {
+    const api = attachmentsApi({ pending: [doneImageChip("id-img", "blob:preview-1")] });
+    const el = await t12Mount(makeProps(), api, true);
+
+    const img = el.querySelector('img[alt="cat.png"]');
+    expect(img, "expected a thumbnail chip for the image attachment").not.toBeNull();
+    expect(img!.getAttribute("src")).toBe("blob:preview-1");
+  });
+
+  it("renders a done pdf attachment as an icon chip with name and size, no <img>", async () => {
+    const api = attachmentsApi({ pending: [donePdfChip("id-pdf")] });
+    const el = await t12Mount(makeProps(), api, true);
+
+    expect(el.querySelector("img"), "file chips must not render an <img>").toBeNull();
+    const chipEl = Array.from(el.querySelectorAll("*")).find((n) =>
+      (n.textContent ?? "").includes("spec.pdf"),
+    );
+    expect(chipEl, "expected a chip carrying the file name").toBeDefined();
+    expect(chipEl!.textContent).toContain("2.3 MB");
+
+    // The file input no longer restricts types (accept removed, any type).
+    const input = el.querySelector('input[type="file"]');
+    expect(input).not.toBeNull();
+    expect(input!.getAttribute("accept")).toBeNull();
+  });
+
+  it("disables Send while a chip is uploading", async () => {
+    const api = attachmentsApi({ pending: [uploadingChip()], ready: false });
+    const el = await t12Mount(makeProps(), api, true);
+
+    expect(buttonWithText(el, "Send")!.disabled).toBe(true);
+  });
+
+  it("disables Send while an error chip exists", async () => {
+    const api = attachmentsApi({
+      pending: [errorChip("Too large (61.2 MB · max 50 MB)")],
+      ready: false,
+    });
+    const el = await t12Mount(makeProps(), api, true);
+
+    expect(buttonWithText(el, "Send")!.disabled).toBe(true);
+  });
+
+  it("enables Send with only a done attachment and empty text", async () => {
+    const api = attachmentsApi({
+      pending: [donePdfChip("id-pdf")],
+      ids: ["id-pdf"],
+      ready: true,
+    });
+    const el = await t12Mount(makeProps(), api, true);
+
+    expect(buttonWithText(el, "Send")!.disabled).toBe(false);
+  });
+
+  it("submit sends the text with the attachment ids and resets the chips", async () => {
+    // ASSUMPTION (1 line): submit calls onSend(text, ids); App builds the
+    // {type:"send_message", text, attachments: ids} frame.
+    const onSend = vi.fn();
+    const api = attachmentsApi({
+      pending: [doneImageChip("id-a"), donePdfChip("id-b")],
+      ids: ["id-a", "id-b"],
+      ready: true,
+    });
+    const el = await t12Mount(makeProps({ onSend }), api, true);
+
+    const textarea = el.querySelector("textarea")!;
+    await typeInto(textarea, "what's in these?");
+    await click(buttonWithText(el, "Send")!);
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("what's in these?", ["id-a", "id-b"]);
+    expect(api.reset).toHaveBeenCalledTimes(1);
+  });
+
+  it("attaches non-image clipboard files on paste", async () => {
+    const add = vi.fn();
+    const api = attachmentsApi({ add });
+    const el = await t12Mount(makeProps(), api, true);
+    const textarea = el.querySelector("textarea")!;
+
+    const pdf = pdfFile();
+    const png = pngFile();
+    const files = [pdf, png];
+    const ev = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "clipboardData", { value: { files, items: [] } });
+
+    await act(async () => {
+      textarea.dispatchEvent(ev);
+    });
+
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(add).toHaveBeenCalledWith(files);
+  });
+
+  it("shows a ⚠ with a 'Model can't view images' title for an image when supports_vision=false", async () => {
+    const api = attachmentsApi({ pending: [doneImageChip("id-img")] });
+    const el = await t12Mount(makeProps(), api, false);
+
+    const warn = Array.from(el.querySelectorAll("[title]")).find((n) =>
+      (n.getAttribute("title") ?? "").includes("Model can't view images"),
+    );
+    expect(warn, "expected a ⚠ title for an image on a non-vision model").toBeDefined();
+  });
+
+  it("shows no vision warning for an image when supports_vision=true", async () => {
+    const api = attachmentsApi({ pending: [doneImageChip("id-img")] });
+    const el = await t12Mount(makeProps(), api, true);
+
+    const warn = Array.from(el.querySelectorAll("[title]")).find((n) =>
+      (n.getAttribute("title") ?? "").includes("Model can't view images"),
+    );
+    expect(warn ?? null).toBeNull();
   });
 });
