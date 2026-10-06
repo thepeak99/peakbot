@@ -143,6 +143,7 @@ Editing `config.yaml` or skills does not require a restart: each session verb re
 | `tools.*` (built-in filter) | `http.*` (published once into the client factory) |
 | `pipelines:` (rebuilt from per-repo config; see note) | legacy `pipeline:` (hard boot error — `PipelineSet::build` rejects it) |
 | `profiles:` (re-applied on every reload; a profile's `ui.tabs` gates the web tabs it shows) | — |
+| — | `uploads:` (max_file_mb / max_files, read once) |
 
 `pipelines:` is now hot-reloadable on `/cd`, `/new`, `/model`, `/load`. The rebuild runs **after** the skill re-scan (so a role's `skills:` filter is validated against fresh names) and **before** `adopt_reloaded` (so it still has `&fresh_config`). A bad `pipelines:` block warns and keeps the previous set; the rest of the config is still adopted. The per-conversation selection on a non-empty conversation is **locked** (the existing "locked after first turn" rule is unchanged) — picking a team mid-conversation would risk mid-flight tool-list drift, so the reconciler only acts on a freshly minted conversation. Nothing is auto-selected: a local `.peakbot/config.yaml` declaring `pipelines:` makes teams *available*, never *active*. Legacy `pipeline:` is still a hard build error at boot — no silent adaptation, no silent zero-pipeline boot.
 
@@ -223,6 +224,10 @@ timeouts:                        # wall-clock ceilings on agent work; see
 http:                            # outbound timeouts for EVERY client (LLM,
   connect_timeout_secs: 30       # embeddings, MCP auth, web tools). 0 = disabled.
   read_timeout_secs: 1800        # seconds of silence, reset on each read
+
+uploads:                         # boot-only (restart to apply), like `web.*`
+  max_file_mb: 50                # 1..=1024, per file
+  max_files: 10                  # 1..=100, per message (uploads + `[img:]` tokens)
 ```
 
 `read_timeout` bounds *silence*, not duration — but completions are
@@ -448,16 +453,36 @@ Release body + tag message come from `NOTES=<path>`, else `release-notes/<v>.md`
 
 ## Vision (image input)
 
-Attach images inline with `[img:TOKEN]` tokens: filesystem path (`/`, `~`, `./` prefix), URL (`://`), or `data:` URI. Limits (`src/vision.rs`): 10 MB/image, 8 images/turn, png/jpg/gif/webp. Failures surface as system messages, never silently.
+Attachments are files stored per conversation under
+`<data_local_dir>/peakbot/uploads/<convo>/<id>/<name>` and persisted as
+references on the user message, so they survive `/load` and any session
+reload. Two kinds: **Image** — `png`/`jpg`/`gif`/`webp`, ≤ 10 MB each —
+and **File** — anything else.
 
-Gating rules (the part worth memorizing):
+How the model sees them:
+- **Vision models** get the image bytes inline on the message parts.
+- **Non-vision models** get the image as a path reference (a file, not
+  image data), so they never refuse it.
+- Every attachment is listed, by absolute path, in an
+  `[Attached files — read them with your file tools]` note on the turn
+  prompt.
 
-- `model_supports_vision(model)` is a conservative name-substring detector (gpt-4o/claude-3+/gemini/pixtral/llava/qwen-vl…); unknown names default to **false**.
-- **The `anthropic` provider gates on transport, not model name**: its Messages transport carries images natively, so `[img:…]` works for *any* model name there (local GGUFs, gateway models). `supports_vision_for(provider, model) = provider=="anthropic" || model_supports_vision(model)`.
-- Per-model `vision: true|false` overrides auto-detection via `providers::resolve_supports_vision` — the single point feeding both the `[img:…]` gate and `view_image` registration. `view_image` only delivers on the Anthropic transport, so `vision: true` elsewhere enables `[img:…]` but not `view_image`.
-- Provider quirks: Anthropic requires base64 (refuses URLs); OpenAI accepts both; OpenRouter **silently substitutes a placeholder** for tool-result images; Ollama drops them.
+Inputs: web uploads go through `POST /api/uploads` and are served back by
+the token-gated `GET /api/uploads/{convo}/{id}`. In the TUI, `[img:/path]`
+and `[img:https://…]` copy the file/URL into the store. `[img:data:…]` is
+no longer accepted.
 
-Images persist **inline** as base64 in the conversation JSON. Internals: `vision.rs::parse_attachments_inline` → `state_manager.rs::user_content_from_attachment` → same prompt path as text turns.
+Gating (see `src/vision.rs`): `supports_vision_for(provider, model)` is a
+conservative name-substring detector (gpt-4o/claude-3+/gemini/pixtral/
+llava/qwen-vl…; unknown names default to **false**). The `anthropic`
+provider gates on transport, not model name — its Messages transport
+carries images natively, so any model name works there. Per-model
+`vision: true|false` overrides auto-detection via
+`providers::resolve_supports_vision` and also gates `view_image`
+(Anthropic transport only). Limits (`uploads.{max_file_mb, max_files}`,
+boot-only): ≤ 10 MB per file by default, plus a per-message cap on
+attachments + `[img:]` tokens. Failures surface as system messages,
+never silently.
 
 ## Multi-agent pipeline (orchestrator + sub-agents)
 
