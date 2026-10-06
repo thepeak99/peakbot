@@ -298,6 +298,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
         &config.retry,
         &config.timeouts,
         config.agents_md,
+        &config.fetch_url,
     )?;
 
     // Thread the resolved reasoning gates into the shared StateManager.

@@ -340,6 +340,9 @@ pub struct Config {
     /// Bash tool configuration (env vars, etc.)
     #[serde(default)]
     pub bash: BashConfig,
+    /// `fetch_url` tool configuration (POST opt-in).
+    #[serde(default)]
+    pub fetch_url: FetchUrlConfig,
     /// Retry configuration for API errors
     #[serde(default)]
     pub retry: RetryConfig,
@@ -414,6 +417,10 @@ pub struct Profile {
     /// Replaces `memory:` wholesale.
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
+    /// Replaces `fetch_url:` wholesale. `None` = inherit; `Some` replaces
+    /// wholesale (so `fetch_url: {}` means `allow_post: false`).
+    #[serde(default)]
+    pub fetch_url: Option<FetchUrlConfig>,
     /// Narrows the effective `pipelines:` list (blocklist XOR allowlist).
     /// `None` = every declared pipeline, i.e. today's behaviour.
     #[serde(default)]
@@ -448,6 +455,9 @@ impl Profile {
         }
         if self.memory.is_some() {
             out.push("memory");
+        }
+        if self.fetch_url.is_some() {
+            out.push("fetch_url");
         }
         if self.pipelines.is_some() {
             out.push("pipelines");
@@ -928,6 +938,11 @@ impl Config {
     /// Get the wall-clock tool/delegation budgets
     pub fn timeouts(&self) -> &TimeoutsConfig {
         &self.timeouts
+    }
+
+    /// Get the `fetch_url` tool configuration
+    pub fn fetch_url(&self) -> &FetchUrlConfig {
+        &self.fetch_url
     }
 
     /// Get pipeline configuration if present
@@ -1687,6 +1702,16 @@ pub struct BashConfig {
     pub env: Option<HashMap<String, String>>,
 }
 
+/// Configuration for the `fetch_url` tool.
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct FetchUrlConfig {
+    /// Let `fetch_url` send POST requests (default false). Off = the schema
+    /// shows GET only. Not a security boundary while `bash` is enabled.
+    #[serde(default)]
+    pub allow_post: bool,
+}
+
 /// Configuration for retry logic with exponential backoff
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1788,6 +1813,11 @@ impl Config {
             self.bash = other.bash;
         }
 
+        // fetch_url - only override if explicitly set
+        if other.fetch_url != FetchUrlConfig::default() {
+            self.fetch_url = other.fetch_url.clone();
+        }
+
         // retry - always override if other has non-default
         if other.retry != RetryConfig::default() {
             self.retry = other.retry;
@@ -1866,6 +1896,7 @@ impl Default for Config {
             },
             conversation: None,
             bash: BashConfig::default(),
+            fetch_url: FetchUrlConfig::default(),
             retry: RetryConfig::default(),
             pipeline: None,
             pipelines: Vec::new(),
@@ -2212,6 +2243,9 @@ fn apply_profile(mut cfg: Config, name: Option<&str>) -> Result<Config, String> 
     }
     if let Some(m) = profile.memory {
         cfg.memory = m;
+    }
+    if let Some(f) = profile.fetch_url {
+        cfg.fetch_url = f;
     }
     // The pipelines gate: a ceiling over the effective (merged) list.
     // `retain` keeps declaration order; `enabled: false` clears everything.
@@ -4611,6 +4645,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -4667,6 +4702,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -4719,6 +4755,7 @@ max_image_bytes: 10485760
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        fetch_url: None,
                     },
                 ),
                 (
@@ -4731,6 +4768,7 @@ max_image_bytes: 10485760
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        fetch_url: None,
                     },
                 ),
             ]),
@@ -4766,6 +4804,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -4781,6 +4820,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -4853,6 +4893,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -4927,6 +4968,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -5064,6 +5106,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -5102,6 +5145,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -5144,6 +5188,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            fetch_url: None,
         };
         assert_eq!(
             none.overridden_fields(),
@@ -5159,6 +5204,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            fetch_url: None,
         };
         assert_eq!(
             all.overridden_fields(),
@@ -5174,6 +5220,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            fetch_url: None,
         };
         assert_eq!(
             pipes.overridden_fields(),
@@ -5189,6 +5236,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            fetch_url: None,
         };
         assert_eq!(
             all_four.overridden_fields(),
@@ -5204,6 +5252,7 @@ max_image_bytes: 10485760
             ui: None,
             mcp_servers: None,
             agents_md: None,
+            fetch_url: None,
         };
         assert_eq!(
             prompt_only.overridden_fields(),
@@ -5222,6 +5271,7 @@ max_image_bytes: 10485760
                 tabs: Some(NameFilter::default()),
             }),
             agents_md: Some(false),
+            fetch_url: None,
         };
         assert_eq!(
             all_seven.overridden_fields(),
@@ -5264,6 +5314,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -5374,6 +5425,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -5458,6 +5510,7 @@ max_image_bytes: 10485760
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        fetch_url: None,
                     },
                 )]),
                 ..Config::default()
@@ -5731,6 +5784,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -5769,6 +5823,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -5807,6 +5862,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -5874,6 +5930,7 @@ max_image_bytes: 10485760
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -5974,6 +6031,7 @@ max_image_bytes: 10485760
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        fetch_url: None,
                     },
                 )]),
                 ..Config::default()
@@ -6263,6 +6321,7 @@ profiles:
                         ui: None,
                         mcp_servers: None,
                         agents_md: None,
+                        fetch_url: None,
                     },
                 )]),
                 ..Config::default()
@@ -6750,6 +6809,7 @@ profiles:
             }),
             mcp_servers: None,
             agents_md: None,
+            fetch_url: None,
         };
         assert_eq!(
             all_five.overridden_fields(),
@@ -6909,6 +6969,7 @@ profiles:
                 "web".to_string(),
                 Profile {
                     agents_md: Some(false),
+                    fetch_url: None,
                     ..Default::default()
                 },
             )]),
@@ -6935,6 +6996,7 @@ profiles:
                 "web".to_string(),
                 Profile {
                     agents_md: Some(true),
+                    fetch_url: None,
                     ..Default::default()
                 },
             )]),
@@ -6975,6 +7037,7 @@ profiles:
     fn profile_overridden_fields_includes_agents_md_when_set() {
         let agents_md_only = Profile {
             agents_md: Some(false),
+            fetch_url: None,
             ..Default::default()
         };
         assert_eq!(
@@ -7251,6 +7314,7 @@ profiles:
                     ui: None,
                     mcp_servers: None,
                     agents_md: None,
+                    fetch_url: None,
                 },
             )]),
             ..Config::default()
@@ -7543,6 +7607,244 @@ profiles:
                 "session", "todo", "files", "tasks", "bash", "agents", "profile",
             ],
             "an empty ui block ('ui: {{}}') is 'no filter', not 'no tabs'"
+        );
+    }
+
+    // ── fetch_url config (POST support) ────────────────────────────────────
+    //
+    // RED: written against the locked spec — `FetchUrlConfig`,
+    // `Config.fetch_url`, and `Profile.fetch_url` do not exist yet.
+
+    #[test]
+    fn fetch_url_absent_defaults_allow_post_false() {
+        let cfg: Config = serde_yaml::from_str("agent_max_turns: 4\n").expect("must parse");
+        assert_eq!(cfg.fetch_url, FetchUrlConfig::default());
+        assert!(!cfg.fetch_url.allow_post);
+    }
+
+    #[test]
+    fn fetch_url_allow_post_true_parses() {
+        let cfg: Config =
+            serde_yaml::from_str("fetch_url:\n  allow_post: true\n").expect("must parse");
+        assert!(cfg.fetch_url.allow_post);
+    }
+
+    #[test]
+    fn fetch_url_unknown_field_rejected() {
+        let err = serde_yaml::from_str::<Config>("fetch_url:\n  allow_put: true\n")
+            .expect_err("deny_unknown_fields must reject allow_put");
+        assert!(err.to_string().contains("allow_put"), "got: {err}");
+    }
+
+    #[test]
+    fn merge_with_per_repo_fetch_url_overrides_master() {
+        // Same rule as `bash`: per-repo replaces master iff non-default.
+        let mut master = Config::default();
+        master.merge_with(Config {
+            fetch_url: FetchUrlConfig { allow_post: true },
+            ..Config::default()
+        });
+        assert!(
+            master.fetch_url.allow_post,
+            "per-repo true must override master default"
+        );
+
+        // The iff half: a default per-repo must NOT clobber a non-default master.
+        let mut master = Config {
+            fetch_url: FetchUrlConfig { allow_post: true },
+            ..Config::default()
+        };
+        master.merge_with(Config::default());
+        assert!(
+            master.fetch_url.allow_post,
+            "default per-repo must leave master alone"
+        );
+    }
+
+    /// C1: master false + profile {allow_post: true} → true.
+    #[test]
+    fn apply_profile_fetch_url_true_overrides_master_false() {
+        let master = Config {
+            profiles: HashMap::from([(
+                "posty".to_string(),
+                Profile {
+                    fetch_url: Some(FetchUrlConfig { allow_post: true }),
+                    ..Default::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let effective = apply_profile(master, Some("posty")).expect("profile exists");
+        assert!(
+            effective.fetch_url.allow_post,
+            "profile must win over master"
+        );
+    }
+
+    /// C2: per-repo true + profile {allow_post: false} → false.
+    #[test]
+    fn apply_profile_fetch_url_false_overrides_per_repo_true() {
+        let master = Config {
+            profiles: HashMap::from([(
+                "nopro".to_string(),
+                Profile {
+                    fetch_url: Some(FetchUrlConfig { allow_post: false }),
+                    ..Default::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            fetch_url: FetchUrlConfig { allow_post: true },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        assert!(
+            merged.fetch_url.allow_post,
+            "precondition: per-repo true beats master default"
+        );
+        let effective = apply_profile(merged, Some("nopro")).expect("profile exists");
+        assert!(
+            !effective.fetch_url.allow_post,
+            "profile false must beat per-repo true"
+        );
+    }
+
+    /// C3: a profile without the fetch_url key leaves the merged value
+    /// unchanged — checked for both a true and a false base.
+    #[test]
+    fn apply_profile_without_fetch_url_leaves_merged_value() {
+        for base in [true, false] {
+            let master = Config {
+                profiles: HashMap::from([("plain".to_string(), Profile::default())]),
+                ..Config::default()
+            };
+            let repo = Config {
+                fetch_url: FetchUrlConfig { allow_post: base },
+                ..Config::default()
+            };
+            let merged = Config::merge_sources(Some(master), Some(repo));
+            // base=false is the default, so per-repo does not override — but
+            // the merged value is `base` either way.
+            assert_eq!(
+                merged.fetch_url.allow_post, base,
+                "precondition (base {base})"
+            );
+            let effective = apply_profile(merged, Some("plain")).expect("profile exists");
+            assert_eq!(
+                effective.fetch_url.allow_post, base,
+                "a profile without fetch_url must leave the merged value (base {base})"
+            );
+        }
+    }
+
+    /// C4: profile `fetch_url: {}` is Some(default) — a wholesale replace to
+    /// GET-only, even over a per-repo true.
+    #[test]
+    fn apply_profile_empty_fetch_url_block_sets_false() {
+        let master = Config {
+            profiles: HashMap::from([(
+                "empty".to_string(),
+                Profile {
+                    fetch_url: Some(FetchUrlConfig::default()),
+                    ..Default::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let repo = Config {
+            fetch_url: FetchUrlConfig { allow_post: true },
+            ..Config::default()
+        };
+        let merged = Config::merge_sources(Some(master), Some(repo));
+        assert!(merged.fetch_url.allow_post, "precondition: per-repo true");
+        let effective = apply_profile(merged, Some("empty")).expect("profile exists");
+        assert!(
+            !effective.fetch_url.allow_post,
+            "`fetch_url: {{}}` must reset to GET-only"
+        );
+    }
+
+    /// C5: `profiles.x.fetch_url.allow_put: true` is a parse error.
+    #[test]
+    fn profile_fetch_url_unknown_field_rejected() {
+        let err = serde_yaml::from_str::<Config>(
+            "profiles:\n  x:\n    fetch_url:\n      allow_put: true\n",
+        )
+        .expect_err("deny_unknown_fields must reject profiles.x.fetch_url.allow_put");
+        assert!(err.to_string().contains("allow_put"), "got: {err}");
+    }
+
+    /// C6: `overridden_fields` names "fetch_url" only when the profile sets it.
+    #[test]
+    fn overridden_fields_names_fetch_url_only_when_set() {
+        let set = Profile {
+            fetch_url: Some(FetchUrlConfig { allow_post: true }),
+            ..Default::default()
+        };
+        assert!(
+            set.overridden_fields().contains(&"fetch_url"),
+            "a set fetch_url must be reported as overridden"
+        );
+        let unset = Profile::default();
+        assert!(
+            !unset.overridden_fields().contains(&"fetch_url"),
+            "an absent fetch_url must not be reported as overridden"
+        );
+    }
+
+    /// R1: boot with a profile that enables allow_post, then a reload with no
+    /// profile must come back to the base value — the profile is an overlay,
+    /// not a permanent mutation of the master config.
+    #[test]
+    fn reload_for_none_drops_profile_fetch_url_back_to_base() {
+        let _env_guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let master_tmp = tempfile::tempdir().expect("master tmpdir");
+        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
+
+        // Point the master config at a tempdir. On Linux `ProjectDirs` honors
+        // XDG_CONFIG_HOME; save/restore so the test leaves no global state.
+        let original = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
+
+        // Master config: allow_post lives ONLY in the profile.
+        let config_dir = get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+        std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+        std::fs::write(
+            config_dir.join("config.yaml"),
+            "profiles:\n  posty:\n    fetch_url:\n      allow_post: true\n",
+        )
+        .expect("write master config");
+
+        // The live config, as boot with `--profile posty` would have produced it.
+        let live = Config {
+            fetch_url: FetchUrlConfig { allow_post: true },
+            active_profile: Some("posty".to_string()),
+            profiles: HashMap::from([(
+                "posty".to_string(),
+                Profile {
+                    fetch_url: Some(FetchUrlConfig { allow_post: true }),
+                    ..Default::default()
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let reloaded = live
+            .reload_for(repo_tmp.path(), None)
+            .expect("reload must succeed");
+
+        // Restore the env var BEFORE asserting (panic-safety).
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            !reloaded.fetch_url.allow_post,
+            "a reload with no profile must drop the overlay and return to the base value"
         );
     }
 }

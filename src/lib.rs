@@ -2776,6 +2776,7 @@ impl AgentRunner {
             config.retry(),
             config.timeouts(),
             ctx.agents_md_enabled,
+            config.fetch_url(),
         )
         .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
 

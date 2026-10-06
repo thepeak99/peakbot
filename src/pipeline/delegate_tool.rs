@@ -61,6 +61,9 @@ pub struct SubAgentDeps {
     /// preamble, so `agents_md: false` strips even an opted-in role's
     /// agents.md section.
     pub agents_md_ceiling: bool,
+    /// The `fetch_url` tool config — the sub-agent's fetch_url is built from
+    /// the same `FetchUrlConfig` the orchestrator's was (one knob, both lanes).
+    pub fetch_url: crate::config::FetchUrlConfig,
 }
 
 /// The effective agents.md flag for a delegation: the role's own opt-in
@@ -373,6 +376,7 @@ impl Tool for DelegateTool {
             deps.vector_store.as_ref(),
             context_budget,
             &deps.timeouts,
+            &deps.fetch_url,
         )
         .map_err(|e| DelegateError::Build {
             role: args.role.clone(),
@@ -628,8 +632,68 @@ mod tests {
             retry: crate::config::RetryConfig::default(),
             timeouts: crate::config::TimeoutsConfig::default(),
             agents_md_ceiling: true,
+            fetch_url: crate::config::FetchUrlConfig::default(),
         };
         DelegateTool::new(Arc::new(deps))
+    }
+
+    /// RED: written against the locked spec — `SubAgentDeps.fetch_url` does
+    /// not exist yet. The sub-agent's fetch_url tool must be built from the
+    /// same `FetchUrlConfig` the orchestrator received (create_provider
+    /// threads `&config.fetch_url` into both), so the deps struct carries it.
+    #[test]
+    fn sub_agent_deps_carry_the_fetch_url_config() {
+        use crate::config::{
+            ModelEntry, ModelRegistry, PipelineConfig, ProviderEntry, ProviderType,
+        };
+
+        let provider = ProviderEntry {
+            name: "openai".into(),
+            kind: ProviderType::OpenAI,
+            api_key: Some("sk-test".into()),
+            base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
+            models: vec![ModelEntry {
+                name: "gpt-4o".into(),
+                alias: Some("gpt4".into()),
+                max_tokens: None,
+                temperature: None,
+                extra_params: None,
+                prompt_caching: None,
+                vision: None,
+                context_size: None,
+                preserve_reasoning: true,
+                display_reasoning: false,
+            }],
+        };
+        let model_registry =
+            ModelRegistry::build(&[provider], Some("gpt4")).expect("test model registry builds");
+        let pipeline_config = PipelineConfig::default();
+        let registry = SubAgentRegistry::new(&pipeline_config, &model_registry, &[])
+            .expect("empty role registry builds");
+
+        let deps = SubAgentDeps {
+            registry: Arc::new(registry),
+            searxng: None,
+            bash_config: BashConfig::default(),
+            tools_filter: crate::config::NameFilter::default(),
+            state_manager: StateManager::new_arc(),
+            shell_kind: None,
+            vector_store: None,
+            max_turns: 0,
+            skills: crate::skills::SkillRegistry::default(),
+            event_sink: None,
+            retry: crate::config::RetryConfig::default(),
+            timeouts: crate::config::TimeoutsConfig::default(),
+            agents_md_ceiling: true,
+            fetch_url: crate::config::FetchUrlConfig { allow_post: true },
+        };
+        assert_eq!(
+            deps.fetch_url,
+            crate::config::FetchUrlConfig { allow_post: true },
+            "the orchestrator's fetch_url config must reach the sub-agent deps"
+        );
     }
 
     /// The delegate surface is exactly `{role, task, parent_task_id}` — the
@@ -900,6 +964,7 @@ mod tests {
             retry,
             timeouts: crate::config::TimeoutsConfig::default(),
             agents_md_ceiling: true,
+            fetch_url: crate::config::FetchUrlConfig::default(),
         };
         DelegateTool::new(Arc::new(deps))
     }
