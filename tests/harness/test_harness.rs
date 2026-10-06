@@ -68,9 +68,34 @@ impl TestHarness {
         context_config: ContextConfig,
         context_window: usize,
     ) -> Self {
+        Self::build(
+            preamble,
+            context_config,
+            context_window,
+            StateManager::new(),
+        )
+    }
+
+    /// Create a harness whose StateManager owns the given upload store
+    /// (tests inject a tempdir root so attachments resolve hermetically).
+    pub fn with_uploads(store: peakbot::attachments::UploadStore) -> Self {
+        Self::build(
+            "You are a helpful assistant.",
+            ContextConfig::default(),
+            TestRunner::DEFAULT_CONTEXT_WINDOW,
+            StateManager::new().with_uploads(store),
+        )
+    }
+
+    fn build(
+        preamble: &str,
+        context_config: ContextConfig,
+        context_window: usize,
+        state_manager: StateManager,
+    ) -> Self {
         let mock_model = MockCompletionModel::new();
         let mock_model_clone = mock_model.clone();
-        let state_manager = Arc::new(StateManager::new());
+        let state_manager = Arc::new(state_manager);
 
         // Create event channel - both TestHarness and TestRunner share the sender
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -137,6 +162,17 @@ impl TestHarness {
     /// - History management
     pub async fn run_message(&mut self, message: &str) -> String {
         self.runner.run_message(message).await
+    }
+
+    /// Like [`Self::run_message`], with stored attachments on the user row.
+    pub async fn run_message_with_attachments(
+        &mut self,
+        message: &str,
+        attachments: Vec<peakbot::attachments::Attachment>,
+    ) -> String {
+        self.runner
+            .run_message_with_attachments(message, attachments)
+            .await
     }
 
     /// Get current state snapshot

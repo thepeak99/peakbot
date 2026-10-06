@@ -11,6 +11,7 @@
 //! ```json
 //! {"type":"attach","convo":"aabbcc-…"}     // first frame; convo may be null
 //! {"type":"send_message","text":"hello"}   // slash commands ride this too
+//! {"type":"send_message","text":"hi","attachments":["<upload-uuid>"]}  // ids optional
 //! {"type":"stop"}
 //! {"type":"switch_model","alias":"sonnet"}
 //! {"type":"switch_cwd","path":"~/proj"}    // maps to UiAction::ChangeCwd
@@ -42,6 +43,7 @@ use crate::config::ModelRegistry;
 use crate::ui::app_state::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// Inbound message types from the client.
 #[derive(Debug, Deserialize)]
@@ -57,6 +59,10 @@ pub(crate) enum InboundMessage {
     /// classifies it internally.
     SendMessage {
         text: String,
+        /// Upload ids from `POST /api/uploads`; absent ⇒ none (old clients
+        /// and stdio).
+        #[serde(default)]
+        attachments: Vec<Uuid>,
     },
     Stop,
     /// Request the currently-running (pausable) sub-agent pause at its

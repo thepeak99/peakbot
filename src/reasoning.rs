@@ -1,7 +1,7 @@
 //! Reasoning/thinking-block carrier for Anthropic (and Anthropic-compatible
 //! via the Messages API) provider responses.
 //!
-//! Sibling to `src/vision.rs` (which models `ImageAttachment` — the
+//! Sibling to `src/vision.rs` (which models image attachments — the
 //! existing precedent for "opaque provider payload that rides the
 //! transcript to the wire").
 //!

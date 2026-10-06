@@ -99,6 +99,13 @@ pub struct StateManager {
     storage: Option<Arc<dyn ConversationStorage>>,
     current_conversation: Arc<Mutex<Option<Conversation>>>,
 
+    // ── File uploads (file-uploads design §5.5) ──────────────────────────────
+    /// Per-conversation upload store. Built at boot from `config.uploads`
+    /// (`UploadStore::default_root()`); the root is created lazily, so a
+    /// session that never attaches touches no disk. `with_uploads` is the
+    /// only override seam (tests inject a tempdir).
+    uploads: crate::attachments::UploadStore,
+
     // ── Background processes (`bash_bg` tool) ────────────────────────────────
     /// Long-running PTY-attached processes spawned by the `bash_bg` tool.
     /// Lock is held only synchronously — never across `.await`. See
@@ -202,6 +209,17 @@ impl StateManager {
         sm
     }
 
+    /// Session constructor: optional storage plus the boot upload store,
+    /// applied before the `Arc` exists (`with_uploads` consumes `self`).
+    pub fn new_arc_for_session(
+        storage: Option<Arc<dyn ConversationStorage>>,
+        uploads: crate::attachments::UploadStore,
+    ) -> Arc<Self> {
+        let sm = Arc::new(Self::new_inner(storage).with_uploads(uploads));
+        *sm.self_ref.write().unwrap() = Some(Arc::downgrade(&sm));
+        sm
+    }
+
     /// Create a bare StateManager (no Arc, no auto-compaction).
     pub fn new() -> Self {
         Self::new_inner(None)
@@ -218,6 +236,12 @@ impl StateManager {
             self_ref: RwLock::new(None),
             storage,
             current_conversation: Arc::new(Mutex::new(None)),
+            // Default root + default limits: `create_session` overrides both
+            // from the boot config via `with_uploads` before the first turn.
+            uploads: crate::attachments::UploadStore::new(
+                crate::attachments::UploadStore::default_root(),
+                crate::config::UploadsConfig::default(),
+            ),
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             bg_notify_tx: RwLock::new(None),
             bash_stdin_tx: RwLock::new(None),
@@ -247,6 +271,37 @@ impl StateManager {
                 thinking: Vec::new(),
             }),
         }
+    }
+
+    /// Override the upload store (tests inject a tempdir root). Also stamps
+    /// `AppState.upload_limits` so the web composer's client-side pre-checks
+    /// match the store's enforced limits.
+    pub fn with_uploads(mut self, store: crate::attachments::UploadStore) -> Self {
+        let limits = store.limits();
+        self.uploads = store;
+        // Scoped so the write guard (which borrows `self.state`) ends
+        // before `self` moves out.
+        {
+            let mut state = self.state.write().unwrap();
+            state.upload_limits = limits;
+        }
+        self
+    }
+
+    /// The per-conversation upload store (turn building, ingest, delete).
+    pub fn uploads(&self) -> &crate::attachments::UploadStore {
+        &self.uploads
+    }
+
+    /// Stamp whether the active model accepts image input. Set from
+    /// `ProviderInfo.supports_vision` at the same two sites as
+    /// `set_wire_reasoning` (boot + rebuild). The turn builder reads it to
+    /// decide whether image attachments become image parts; a `false` model
+    /// degrades them to path references in the model note.
+    pub fn set_supports_vision(&self, on: bool) {
+        let mut state = self.state.write().unwrap();
+        state.supports_vision = on;
+        self.notify_update(&state);
     }
 
     // ── Context Compaction ──────────────────────────────────────────────────────
@@ -402,7 +457,7 @@ impl StateManager {
     /// Run compaction: produce a plan, apply it, return the result.
     async fn run_compaction(&self, cm: &ContextManager) -> Option<CompactionResult> {
         let messages = self.get_chat_messages();
-        match cm.compact(&messages).await {
+        match cm.compact(&messages, &self.uploads).await {
             Ok(plan) => {
                 let result = cm.estimate_compaction(&messages, plan.boundary);
                 if result.num_discarded > 0 {
@@ -1659,7 +1714,11 @@ impl StateManager {
                 self.clear_current_conversation();
                 self.clear_chat();
             }
-            storage.delete(id)
+            storage.delete(id)?;
+            // Bytes die with the conversation (best-effort; a failure here
+            // must not fail the delete that already succeeded).
+            self.uploads.remove_conversation(id);
+            Ok(())
         } else {
             Err(anyhow::anyhow!("Storage not configured"))
         }
@@ -1771,11 +1830,13 @@ impl StateManager {
                 .map(|msg| match msg {
                     ConvMsg::User {
                         content,
+                        attachments,
                         compacted,
                         source,
                         timestamp,
                     } => {
                         let mut m = ChatMessage::user(content.clone());
+                        m.attachments = attachments.clone();
                         m.compacted = *compacted;
                         m.source = source.clone();
                         m.timestamp = timestamp.with_timezone(&chrono::Local);
@@ -1922,6 +1983,7 @@ impl StateManager {
                 .filter_map(|msg| match msg.role {
                     MessageRole::User => Some(ConvMsg::User {
                         content: msg.content.clone(),
+                        attachments: msg.attachments.clone(),
                         compacted: msg.compacted,
                         source: msg.source.clone(),
                         timestamp: msg.timestamp.with_timezone(&chrono::Utc),
@@ -2067,14 +2129,14 @@ impl StateManager {
         }
     }
 
-    /// Add a user message carrying image attachments.
+    /// Add a user message carrying file attachments.
     ///
     /// Same persistence behaviour as [`add_user_message`]; compaction is not
     /// triggered here (handled at the wire boundary by `SessionHook`).
     pub fn add_user_message_with_attachments(
         &self,
         content: String,
-        attachments: Vec<crate::vision::ImageAttachment>,
+        attachments: Vec<crate::attachments::Attachment>,
     ) {
         self.clear_response_thinking();
         // Image-only turns derive no title (blank text ⇒ None).
@@ -2439,8 +2501,9 @@ impl StateManager {
         // prevents fresh captures outside Anthropic, so this guards
         // `/load` on a foreign provider.
         let wire_reasoning = *self.wire_reasoning.read().unwrap();
+        let supports_vision = state.supports_vision;
 
-        Self::convert_history_to_rig(&sanitized, wire_reasoning)
+        Self::convert_history_to_rig(&sanitized, wire_reasoning, supports_vision, self.uploads())
     }
 
     /// Convert ONE chat row to a rig message (the compaction-resumption
@@ -2452,6 +2515,8 @@ impl StateManager {
     /// constructor of `AssistantContent::Reasoning`.
     fn last_msg_to_rig(
         msg: &crate::ui::app_state::ChatMessage,
+        supports_vision: bool,
+        store: &crate::attachments::UploadStore,
     ) -> rig_core::completion::message::Message {
         use crate::ui::app_state::MessageRole;
         use rig_core::completion::message::{
@@ -2461,7 +2526,7 @@ impl StateManager {
         use rig_core::one_or_many::OneOrMany;
         match msg.role {
             MessageRole::User => RigMessage::User {
-                content: user_content_from_chat_message(msg),
+                content: user_content_from_chat_message(msg, supports_vision, store),
             },
             MessageRole::Agent => RigMessage::Assistant {
                 id: None,
@@ -2560,6 +2625,8 @@ impl StateManager {
     fn convert_history_to_rig(
         sanitized: &[crate::ui::app_state::ChatMessage],
         wire_reasoning: bool,
+        supports_vision: bool,
+        store: &crate::attachments::UploadStore,
     ) -> Vec<rig_core::completion::message::Message> {
         use crate::ui::app_state::MessageRole;
         use rig_core::completion::message::{
@@ -2574,7 +2641,7 @@ impl StateManager {
             match msg.role {
                 MessageRole::User => {
                     out.push(RigMessage::User {
-                        content: user_content_from_chat_message(msg),
+                        content: user_content_from_chat_message(msg, supports_vision, store),
                     });
                     i += 1;
                 }
@@ -2846,9 +2913,10 @@ impl StateManager {
             .iter()
             .rev()
             .find(|m| m.is_orchestrator_context() && m.role == MessageRole::User)?;
+        let supports_vision = state.supports_vision;
 
         Some(RigMessage::User {
-            content: user_content_from_chat_message(last_user),
+            content: user_content_from_chat_message(last_user, supports_vision, self.uploads()),
         })
     }
 
@@ -2909,13 +2977,15 @@ impl StateManager {
         // thinking blocks in the same thinking-first wire order — the
         // one place where forgetting the change produces a live 400.
         let wire_reasoning = *self.wire_reasoning.read().unwrap();
-        let history = Self::convert_history_to_rig(head, wire_reasoning);
+        let supports_vision = state.supports_vision;
+        let history =
+            Self::convert_history_to_rig(head, wire_reasoning, supports_vision, self.uploads());
 
         // ── Build prompt: the last message converted to a rig Message ───────
         // Mirror the pre-change shape — for a single message at the tail of
         // the transcript, the resumption helper keeps it as a one-element
         // rig message regardless of whether it carries thinking.
-        let prompt = Self::last_msg_to_rig(tail);
+        let prompt = Self::last_msg_to_rig(tail, supports_vision, self.uploads());
 
         Some((prompt, history))
     }
@@ -3389,67 +3459,73 @@ impl SyntheticTurn {
     }
 }
 
-/// Build a `OneOrMany<UserContent>` from a `ChatMessage` (User role).
+/// Turn builder (file-uploads design §5.4): a user `ChatMessage` → rig
+/// `UserContent`.
 ///
-/// Order is `[Image*, Text]` — matches rig's sample message and provider
-/// expectations. A text-only message collapses to `OneOrMany::one(Text)`;
-/// otherwise attachments come first, then the caption.
+/// 1. **Image parts** — for each attachment, iff `supports_vision`,
+///    `kind == Image`, the mime maps to a media type, and the stored file
+///    reads back: `[Image*, Text]` order, base64 of the stored bytes. A
+///    read error skips the part with a warning (the note still lists the
+///    path, so the model can find the file missing if it looks).
+/// 2. **Text part** — `msg.content` joined to the model note with `\n\n`
+///    (the note lists ALL attachments, images included; empty content lets
+///    the note stand alone).
+/// 3. With no attachments the output is `OneOrMany::one(Text(content))`,
+///    byte-identical to the pre-uploads wire.
 fn user_content_from_chat_message(
     msg: &crate::ui::app_state::ChatMessage,
+    supports_vision: bool,
+    store: &crate::attachments::UploadStore,
 ) -> rig_core::one_or_many::OneOrMany<rig_core::completion::message::UserContent> {
-    use rig_core::completion::message::{Text, UserContent};
-    use rig_core::one_or_many::OneOrMany;
-
-    if msg.attachments.is_empty() {
-        return OneOrMany::one(UserContent::Text(Text::new(msg.content.clone())));
-    }
-
-    let mut parts: Vec<UserContent> = msg
-        .attachments
-        .iter()
-        .map(user_content_from_attachment)
-        .collect();
-    parts.push(UserContent::Text(Text::new(msg.content.clone())));
-
-    // `OneOrMany::many` errors on empty input; we always have ≥2 parts here.
-    OneOrMany::many(parts).expect("attachments present → non-empty parts")
-}
-
-/// Adapter at the wire boundary — converts a UI-level `ImageAttachment` into
-/// a `rig_core::UserContent::Image`.
-///
-/// **Detail defaulting (load-bearing):** rig-core's OpenAI provider rejects
-/// base64 images with `detail: None` (`"OpenAI image URI must have image
-/// detail"`). URL-shaped images get `unwrap_or_default()` → `Auto` for free
-/// inside rig, but base64 does not. We default to `Auto` here for both
-/// sources so the contract is uniform regardless of provider or source kind.
-/// Explicit user-set details (Low/High) are preserved.
-fn user_content_from_attachment(
-    att: &crate::vision::ImageAttachment,
-) -> rig_core::completion::message::UserContent {
-    use crate::vision::ImageSource;
+    use crate::attachments::{AttachmentKind, model_note};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use rig_core::completion::message::{DocumentSourceKind, Image, ImageDetail, UserContent};
+    use rig_core::completion::message::{
+        DocumentSourceKind, Image, ImageDetail, Text, UserContent,
+    };
+    use rig_core::one_or_many::OneOrMany;
 
-    let detail = Some(att.detail.clone().unwrap_or(ImageDetail::Auto));
+    let note = model_note(store, &msg.attachments);
+    let text = if note.is_empty() {
+        msg.content.clone()
+    } else if msg.content.is_empty() {
+        note
+    } else {
+        format!("{}\n\n{}", msg.content, note)
+    };
 
-    match &att.source {
-        ImageSource::Base64 { bytes, media_type } => UserContent::Image(Image {
-            // rig stores Base64 as a string; encode at the boundary so we
-            // keep our in-memory representation honest (raw bytes).
-            data: DocumentSourceKind::Base64(STANDARD.encode(bytes)),
-            media_type: Some(media_type.clone()),
-            detail: detail.clone(),
-            additional_params: None,
-        }),
-        ImageSource::Url(url) => UserContent::Image(Image {
-            data: DocumentSourceKind::Url(url.clone()),
-            media_type: None,
-            detail,
-            additional_params: None,
-        }),
+    let mut parts: Vec<UserContent> = Vec::new();
+    if supports_vision {
+        for a in &msg.attachments {
+            if a.kind != AttachmentKind::Image {
+                continue;
+            }
+            // I4: kind == Image ⇒ mime is one of the four sniffed mimes, so
+            // this is a type-level total match, not a defensive check.
+            let Some(media_type) = crate::vision::media_type_from_mime(&a.mime) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(store.path(a)) else {
+                tracing::warn!(
+                    attachment = %a.id,
+                    "attachment file missing; skipping image part"
+                );
+                continue;
+            };
+            parts.push(UserContent::Image(Image {
+                data: DocumentSourceKind::Base64(STANDARD.encode(bytes)),
+                media_type: Some(media_type),
+                // rig's OpenAI provider rejects base64 images without a
+                // detail — `Auto` is the uniform default.
+                detail: Some(ImageDetail::Auto),
+                additional_params: None,
+            }));
+        }
     }
+    parts.push(UserContent::Text(Text::new(text)));
+
+    // `OneOrMany::many` errors on empty input; the text part is always there.
+    OneOrMany::many(parts).expect("the text part is always pushed")
 }
 
 impl Default for StateManager {
@@ -4711,6 +4787,7 @@ mod tests {
         // `MessageSource::SubAgent { role }` — the `add_*` helpers hard-code Human.
         conv.messages.push(Message::User {
             content: "research this".into(),
+            attachments: Vec::new(),
             compacted: false,
             source: MessageSource::Human,
             timestamp: chrono::Utc::now(),
@@ -4874,6 +4951,7 @@ mod tests {
         );
         conv.messages.push(Message::User {
             content: "run the thing".into(),
+            attachments: Vec::new(),
             compacted: false,
             source: MessageSource::Human,
             timestamp: chrono::Utc::now(),
@@ -5126,6 +5204,7 @@ mod tests {
             Conversation::new("test".into(), "prov".into(), "model".into(), String::new());
         conv.messages.push(ConvMsg::User {
             content: "hello".into(),
+            attachments: Vec::new(),
             compacted: false,
             source: crate::ui::app_state::MessageSource::Human,
             timestamp: t_user,
@@ -5592,17 +5671,27 @@ mod tests {
 
     // ── Vision / multimodal history ───────────────────────────────────────
 
-    fn sample_attachment(name: &str) -> crate::vision::ImageAttachment {
-        use crate::vision::{ImageAttachment, ImageSource};
-        use rig_core::completion::message::ImageMediaType;
-        ImageAttachment {
-            display_name: name.to_string(),
-            source: ImageSource::Base64 {
-                bytes: vec![1, 2, 3, 4],
-                media_type: ImageMediaType::PNG,
-            },
-            detail: None,
+    /// A reference-only attachment (no file on disk) — enough for wire
+    /// shape tests that never read bytes.
+    fn sample_attachment(name: &str) -> crate::attachments::Attachment {
+        use crate::attachments::{Attachment, AttachmentKind};
+        Attachment {
+            id: uuid::Uuid::new_v4(),
+            convo: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            mime: "image/png".to_string(),
+            size: 4,
+            kind: AttachmentKind::Image,
         }
+    }
+
+    /// A store rooted at a path that never exists — for tests that only
+    /// exercise the no-attachment / text-only wire paths.
+    fn dummy_store() -> crate::attachments::UploadStore {
+        crate::attachments::UploadStore::new(
+            std::path::PathBuf::from("/nonexistent-uploads-root"),
+            crate::config::UploadsConfig::default(),
+        )
     }
 
     #[test]
@@ -5627,15 +5716,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn get_agent_history_emits_image_then_text_order_when_attachments_present() {
+    #[tokio::test]
+    async fn get_agent_history_emits_image_then_text_order_when_attachments_present() {
+        use base64::Engine;
         use rig_core::completion::message::{Message as RigMessage, UserContent};
 
-        let sm = StateManager::new();
-        sm.add_user_message_with_attachments(
-            "what's this?".to_string(),
-            vec![sample_attachment("a.png"), sample_attachment("b.png")],
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::attachments::UploadStore::new(
+            tmp.path().to_path_buf(),
+            crate::config::UploadsConfig::default(),
         );
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("valid base64 fixture");
+        let convo = Uuid::new_v4();
+        let a = store
+            .store(convo, "a.png", &png[..])
+            .await
+            .expect("store a");
+        let b = store
+            .store(convo, "b.png", &png[..])
+            .await
+            .expect("store b");
+
+        let sm = StateManager::new().with_uploads(store);
+        sm.set_supports_vision(true);
+        sm.add_user_message_with_attachments("what's this?".to_string(), vec![a, b]);
         sm.add_assistant_message("a cat".to_string());
         // Add a trailing text user to push the multimodal message *into* history.
         sm.add_user_message("follow-up".to_string());
@@ -5911,22 +6017,45 @@ mod tests {
         assert_eq!(tr_id, "call_x");
     }
 
-    #[test]
-    fn build_current_turn_message_returns_multimodal_when_attachments_present() {
-        use rig_core::completion::message::{Message as RigMessage, UserContent};
+    #[tokio::test]
+    async fn build_current_turn_message_returns_multimodal_when_attachments_present() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use rig_core::completion::message::{
+            DocumentSourceKind, Message as RigMessage, UserContent,
+        };
 
-        let sm = StateManager::new();
-        sm.add_user_message_with_attachments(
-            "explain".to_string(),
-            vec![sample_attachment("x.png")],
+        // A stored PNG + a vision-flagged SM: the turn must be [Image, Text].
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::attachments::UploadStore::new(
+            tmp.path().to_path_buf(),
+            crate::config::UploadsConfig::default(),
         );
+        let sm = StateManager::new().with_uploads(store.clone());
+        sm.set_supports_vision(true);
+
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("valid base64 fixture");
+        let att = store
+            .store(Uuid::new_v4(), "x.png", &png[..])
+            .await
+            .expect("store the PNG");
+
+        sm.add_user_message_with_attachments("explain".to_string(), vec![att]);
 
         let msg = sm.build_current_turn_message().expect("user msg exists");
         match msg {
             RigMessage::User { content } => {
                 let parts: Vec<_> = content.iter().collect();
                 assert_eq!(parts.len(), 2);
-                assert!(matches!(parts[0], UserContent::Image(_)));
+                let UserContent::Image(img) = &parts[0] else {
+                    panic!("first part must be the image: {parts:?}")
+                };
+                let DocumentSourceKind::Base64(b64) = &img.data else {
+                    panic!("image must be base64 of the stored file: {img:?}");
+                };
+                assert_eq!(STANDARD.decode(b64).expect("valid base64"), png);
                 assert!(matches!(parts[1], UserContent::Text(_)));
             }
             _ => panic!("expected User message"),
@@ -5935,69 +6064,37 @@ mod tests {
 
     /// Regression: rig-core's OpenAI provider rejects base64 images that don't
     /// carry an `ImageDetail` (`"OpenAI image URI must have image detail"`).
-    /// PeakBot constructs attachments with `detail: None`, so the wire-boundary
-    /// adapter MUST default to `ImageDetail::Auto` to keep OpenAI happy and
-    /// match the behaviour rig already gives URL-shaped images.
-    #[test]
-    fn user_content_from_attachment_defaults_base64_detail_to_auto() {
+    /// The turn builder MUST default to `ImageDetail::Auto` on every image
+    /// part it emits.
+    #[tokio::test]
+    async fn turn_builder_defaults_image_detail_to_auto() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
         use rig_core::completion::message::{ImageDetail, UserContent};
 
-        let att = sample_attachment("cat.png");
-        assert!(att.detail.is_none(), "fixture must start with no detail");
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::attachments::UploadStore::new(
+            tmp.path().to_path_buf(),
+            crate::config::UploadsConfig::default(),
+        );
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("valid base64 fixture");
+        let att = store
+            .store(Uuid::new_v4(), "cat.png", &png[..])
+            .await
+            .expect("store the PNG");
 
-        match user_content_from_attachment(&att) {
-            UserContent::Image(img) => {
-                assert_eq!(
-                    img.detail,
-                    Some(ImageDetail::Auto),
-                    "base64 attachments must carry a detail at the wire boundary"
-                );
-            }
-            other => panic!("expected Image content, got {other:?}"),
-        }
-    }
-
-    /// Same defaulting must apply to URL attachments — keeps the contract
-    /// uniform across `ImageSource` variants. (rig's OpenAI provider already
-    /// `unwrap_or_default()`s URLs, but we shouldn't rely on that asymmetry.)
-    #[test]
-    fn user_content_from_attachment_defaults_url_detail_to_auto() {
-        use crate::vision::{ImageAttachment, ImageSource};
-        use rig_core::completion::message::{ImageDetail, UserContent};
-
-        let att = ImageAttachment {
-            display_name: "https://example.com/x.png".to_string(),
-            source: ImageSource::Url("https://example.com/x.png".to_string()),
-            detail: None,
+        let msg = ChatMessage::user_with_attachments("see".to_string(), vec![att]);
+        let content = user_content_from_chat_message(&msg, true, &store);
+        let UserContent::Image(img) = content.first_ref() else {
+            panic!("first part must be the image: {content:?}");
         };
-
-        match user_content_from_attachment(&att) {
-            UserContent::Image(img) => {
-                assert_eq!(img.detail, Some(ImageDetail::Auto));
-            }
-            other => panic!("expected Image content, got {other:?}"),
-        }
-    }
-
-    /// An explicitly-set detail must NOT be overwritten by the default.
-    #[test]
-    fn user_content_from_attachment_preserves_explicit_detail() {
-        use crate::vision::{ImageAttachment, ImageSource};
-        use rig_core::completion::message::{ImageDetail, ImageMediaType, UserContent};
-
-        let att = ImageAttachment {
-            display_name: "x.png".to_string(),
-            source: ImageSource::Base64 {
-                bytes: vec![1, 2, 3],
-                media_type: ImageMediaType::PNG,
-            },
-            detail: Some(ImageDetail::High),
-        };
-
-        match user_content_from_attachment(&att) {
-            UserContent::Image(img) => assert_eq!(img.detail, Some(ImageDetail::High)),
-            other => panic!("expected Image content, got {other:?}"),
-        }
+        assert_eq!(
+            img.detail,
+            Some(ImageDetail::Auto),
+            "image parts must carry a detail at the wire boundary"
+        );
     }
 
     #[test]
@@ -8511,7 +8608,7 @@ mod tests {
             text: "thinking text".to_string(),
             signature: "sig.SGXabc123XYZ-==".to_string(),
         }];
-        let rig = StateManager::last_msg_to_rig(&msg);
+        let rig = StateManager::last_msg_to_rig(&msg, false, &dummy_store());
         match rig {
             rig_core::completion::message::Message::Assistant { content, .. } => {
                 let kinds: Vec<&str> = content
@@ -8719,8 +8816,10 @@ mod tests {
             let msg = &sanitized[i];
             match msg.role {
                 MessageRole::User => {
+                    // Pre-change behaviour: text-only (the reference
+                    // transcripts carry no attachments).
                     out.push(RigMessage::User {
-                        content: super::user_content_from_chat_message(msg),
+                        content: OneOrMany::one(UserContent::Text(Text::new(msg.content.clone()))),
                     });
                     i += 1;
                 }
@@ -8969,7 +9068,12 @@ mod tests {
         // 1. wire_reasoning == false — blocks and ids present, gate closed.
         let t = two_response_transcript(true, true);
         assert_eq!(
-            wire_json(&StateManager::convert_history_to_rig(&t, false)),
+            wire_json(&StateManager::convert_history_to_rig(
+                &t,
+                false,
+                false,
+                &dummy_store()
+            )),
             wire_json(&legacy_convert_history_to_rig(&t, false)),
             "with the wire gate closed the rebuild must be byte-identical to the legacy one",
         );
@@ -8977,7 +9081,12 @@ mod tests {
         // 2. No captured blocks anywhere (ids still present).
         let t = two_response_transcript(false, true);
         assert_eq!(
-            wire_json(&StateManager::convert_history_to_rig(&t, true)),
+            wire_json(&StateManager::convert_history_to_rig(
+                &t,
+                true,
+                false,
+                &dummy_store()
+            )),
             wire_json(&legacy_convert_history_to_rig(&t, true)),
             "a transcript with no thinking blocks must be byte-identical to the legacy rebuild",
         );
@@ -8985,7 +9094,12 @@ mod tests {
         // 3. All-`None` transcript (legacy rows), no blocks.
         let t = two_response_transcript(false, false);
         assert_eq!(
-            wire_json(&StateManager::convert_history_to_rig(&t, true)),
+            wire_json(&StateManager::convert_history_to_rig(
+                &t,
+                true,
+                false,
+                &dummy_store()
+            )),
             wire_json(&legacy_convert_history_to_rig(&t, true)),
             "an all-None transcript must be byte-identical to the legacy rebuild",
         );
@@ -9008,7 +9122,12 @@ mod tests {
             }
         }
         assert_eq!(
-            wire_json(&StateManager::convert_history_to_rig(&t, true)),
+            wire_json(&StateManager::convert_history_to_rig(
+                &t,
+                true,
+                false,
+                &dummy_store()
+            )),
             wire_json(&legacy_convert_history_to_rig(&t, true)),
             "a run that is a single response must be byte-identical to the legacy rebuild",
         );
@@ -9018,7 +9137,12 @@ mod tests {
         // for a rebuild that never segments at all.
         let t = two_response_transcript(true, true);
         assert_ne!(
-            wire_json(&StateManager::convert_history_to_rig(&t, true)),
+            wire_json(&StateManager::convert_history_to_rig(
+                &t,
+                true,
+                false,
+                &dummy_store()
+            )),
             wire_json(&legacy_convert_history_to_rig(&t, true)),
             "a two-response run with replayable blocks MUST differ from the legacy rebuild — \
              that difference is the fix",

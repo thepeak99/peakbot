@@ -1611,7 +1611,10 @@ impl ReplUi {
                     let msg = self.ui_state.input_buffer.clone();
                     self.multiline_mode = false;
                     if !msg.trim().is_empty() && !self.try_intercept_switch_command(&msg) {
-                        let _ = self.action_sender.send(UiAction::SendMessage(msg));
+                        let _ = self.action_sender.send(UiAction::SendMessage {
+                            text: msg,
+                            attachments: Vec::new(),
+                        });
                     }
                     self.ui_state.clear_input();
                 } else {
@@ -1856,7 +1859,10 @@ impl ReplUi {
             KeyCode::Enter => {
                 let msg = self.ui_state.input_buffer.clone();
                 if !msg.trim().is_empty() && !self.try_intercept_switch_command(&msg) {
-                    let _ = self.action_sender.send(UiAction::SendMessage(msg));
+                    let _ = self.action_sender.send(UiAction::SendMessage {
+                        text: msg,
+                        attachments: Vec::new(),
+                    });
                 }
                 self.ui_state.clear_input();
                 // A composition just ended; ensure multiline mode is off
@@ -2134,9 +2140,10 @@ impl ReplUi {
                     format!("/{}", item.value)
                 };
                 if submit && !item.takes_args {
-                    let _ = self
-                        .action_sender
-                        .send(UiAction::SendMessage(completed.clone()));
+                    let _ = self.action_sender.send(UiAction::SendMessage {
+                        text: completed.clone(),
+                        attachments: Vec::new(),
+                    });
                     self.ui_state.clear_input();
                     // Slash command submitted = composition ended; exit
                     // multiline mode. See test
@@ -2169,9 +2176,10 @@ impl ReplUi {
                         // Defensive fallthrough: registry was attached
                         // when the popup was built, so this path isn't
                         // expected to fire. Still, be conservative.
-                        let _ = self
-                            .action_sender
-                            .send(UiAction::SendMessage(completed.clone()));
+                        let _ = self.action_sender.send(UiAction::SendMessage {
+                            text: completed.clone(),
+                            attachments: Vec::new(),
+                        });
                     }
                     self.ui_state.clear_input();
                     self.multiline_mode = false;
@@ -3233,7 +3241,7 @@ mod command_popup_tests {
         // Buffer cleared after submit (same as regular Enter behaviour)
         assert_eq!(ui.ui_state.input_buffer, "");
         match rx.try_recv() {
-            Ok(UiAction::SendMessage(m)) => assert_eq!(m, "/stats"),
+            Ok(UiAction::SendMessage { text: m, .. }) => assert_eq!(m, "/stats"),
             other => panic!("expected SendMessage(/stats), got {:?}", other),
         }
     }
@@ -3851,7 +3859,7 @@ mod multiline_mode_tests {
         assert!(!ui.multiline_mode, "second Ctrl+G must turn mode off");
         assert_eq!(ui.ui_state.input_buffer, "", "buffer must be cleared");
         match rx.try_recv() {
-            Ok(UiAction::SendMessage(m)) => assert_eq!(m, "hello\nworld"),
+            Ok(UiAction::SendMessage { text: m, .. }) => assert_eq!(m, "hello\nworld"),
             other => panic!("expected SendMessage(\"hello\\nworld\"), got {other:?}"),
         }
     }
@@ -3914,7 +3922,7 @@ mod multiline_mode_tests {
         ui.handle_keyboard_input(press(KeyCode::Enter));
 
         match rx.try_recv() {
-            Ok(UiAction::SendMessage(m)) => assert_eq!(m, "hello"),
+            Ok(UiAction::SendMessage { text: m, .. }) => assert_eq!(m, "hello"),
             other => panic!("expected SendMessage, got {other:?}"),
         }
         assert_eq!(ui.ui_state.input_buffer, "");
@@ -4005,7 +4013,7 @@ mod multiline_mode_tests {
 
         // Sanity: the slash command was submitted.
         match rx.try_recv() {
-            Ok(UiAction::SendMessage(m)) => assert_eq!(m, "/stats"),
+            Ok(UiAction::SendMessage { text: m, .. }) => assert_eq!(m, "/stats"),
             other => panic!("expected SendMessage(\"/stats\"), got {other:?}"),
         }
 

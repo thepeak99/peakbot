@@ -95,7 +95,6 @@ fn entry_count(dir: &Path) -> usize {
 async fn spawn_url_server(files: Vec<(&'static str, Vec<u8>)>) -> SocketAddr {
     let mut router = axum::Router::new();
     for (path, bytes) in files {
-        let bytes = bytes;
         router = router.route(path, axum::routing::get(move || async move { bytes }));
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -512,19 +512,18 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_when_attachments_are_added() {
-        use crate::vision::{ImageAttachment, ImageSource};
-        use rig_core::completion::message::ImageMediaType;
+        use crate::attachments::{Attachment, AttachmentKind};
 
         let text_only = ChatMessage::user("same text".to_string());
         let with_image = ChatMessage::user_with_attachments(
             "same text".to_string(),
-            vec![ImageAttachment {
-                display_name: "cat.png".into(),
-                source: ImageSource::Base64 {
-                    bytes: vec![1, 2, 3],
-                    media_type: ImageMediaType::PNG,
-                },
-                detail: None,
+            vec![Attachment {
+                id: uuid::Uuid::new_v4(),
+                convo: uuid::Uuid::new_v4(),
+                name: "cat.png".into(),
+                mime: "image/png".into(),
+                size: 3,
+                kind: AttachmentKind::Image,
             }],
         );
 

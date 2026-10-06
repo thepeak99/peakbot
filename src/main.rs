@@ -625,6 +625,10 @@ async fn main() -> Result<()> {
         mcp_tools_count,
         skills_count,
         profile_pin: cli.profile.clone(),
+        uploads: peakbot::attachments::UploadStore::new(
+            peakbot::attachments::UploadStore::default_root(),
+            config.uploads,
+        ),
     });
 
     use peakbot::ui::{ReplUi, StdioUi, WebUi, build_models_snapshot};

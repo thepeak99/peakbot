@@ -21,8 +21,9 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::attachments::{Attachment, AttachmentKind, human_size};
 use crate::ui::app_state::{ChatMessage, MessageRole};
-use crate::vision::{ImageAttachment, ImageSource};
+use crate::vision::media_type_from_mime;
 
 /// Convert a [`ChatMessage`] into styled [`Line`]s.
 ///
@@ -48,33 +49,20 @@ pub trait MessageRenderer: Send + Sync {
 #[derive(Default)]
 pub struct PlainRenderer;
 
-/// Format one attachment as a single-line bracket annotation, e.g.
-/// `[image: cat.png · PNG · 1.2 KB]` or `[image: https://example.com/a.jpg]`.
+/// Format one attachment as a single-line annotation: images as
+/// `[image: cat.png · PNG · 1.2 KB]`, everything else as `📄 spec.pdf · 2.3 MB`.
 ///
 /// Public-in-crate because the cache tests exercise it directly.
-pub(crate) fn format_attachment_line(a: &ImageAttachment) -> String {
-    match &a.source {
-        ImageSource::Base64 { bytes, media_type } => {
-            format!(
-                "[image: {} · {:?} · {}]",
-                a.display_name,
-                media_type,
-                fmt_bytes(bytes.len())
-            )
-        }
-        ImageSource::Url(_) => format!("[image: {}]", a.display_name),
-    }
-}
-
-fn fmt_bytes(n: usize) -> String {
-    const KB: usize = 1024;
-    const MB: usize = 1024 * 1024;
-    if n >= MB {
-        format!("{:.1} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.1} KB", n as f64 / KB as f64)
-    } else {
-        format!("{n} B")
+pub(crate) fn format_attachment_line(a: &Attachment) -> String {
+    let size = human_size(a.size);
+    match a.kind {
+        AttachmentKind::Image => match media_type_from_mime(&a.mime) {
+            Some(media_type) => format!("[image: {} · {:?} · {}]", a.name, media_type, size),
+            // I4 makes this unreachable for stored images; a hand-edited
+            // conversation file still renders rather than panics.
+            None => format!("[image: {} · {}]", a.name, size),
+        },
+        AttachmentKind::File => format!("📄 {} · {}", a.name, size),
     }
 }
 
@@ -215,7 +203,7 @@ mod tests {
     //
     // RED: `crate::attachments::{Attachment, AttachmentKind}` does not exist
     // yet, and `format_attachment_line` still takes the old
-    // `vision::ImageAttachment` (deleted in T4/T5). These tests target the
+    // the old `vision::ImageAttachment`. These tests target the
     // locked design §7-T5 contract:
     //   Image → `[image: cat.png · PNG · 1.2 KB]`  (label = `media_type_from_mime` Debug)
     //   File  → `📄 spec.pdf · 2.3 MB`

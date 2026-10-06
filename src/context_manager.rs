@@ -172,7 +172,14 @@ impl ContextManager {
     /// Produce a CompactionPlan by summarizing older messages.
     /// This is a pure function — it reads messages but doesn't mutate them.
     /// The actual tagging is done by StateManager::apply_compaction().
-    pub async fn compact(&self, messages: &[ChatMessage]) -> Result<CompactionPlan> {
+    ///
+    /// `uploads` lets the summary input carry each attachment's stored path
+    /// (the model note), so a summarised turn doesn't lose its files.
+    pub async fn compact(
+        &self,
+        messages: &[ChatMessage],
+        uploads: &crate::attachments::UploadStore,
+    ) -> Result<CompactionPlan> {
         let model = self
             .compaction_model
             .as_ref()
@@ -208,7 +215,7 @@ impl ContextManager {
             .filter(|m| m.is_orchestrator_context())
             .collect();
 
-        let formatted = format_chat_messages_for_summary(&to_summarize);
+        let formatted = format_chat_messages_for_summary(&to_summarize, uploads);
 
         let prompt = format!(
             "Summarize this conversation concisely. Preserve: key decisions, important facts, \
@@ -265,7 +272,10 @@ impl ContextManager {
 
 /// Format ChatMessages for the summarization prompt.
 /// Includes all message types: user, agent, tool calls, and tool results.
-fn format_chat_messages_for_summary(messages: &[&ChatMessage]) -> String {
+fn format_chat_messages_for_summary(
+    messages: &[&ChatMessage],
+    uploads: &crate::attachments::UploadStore,
+) -> String {
     use crate::ui::app_state::MessageRole;
 
     let mut output = String::new();
@@ -274,7 +284,14 @@ fn format_chat_messages_for_summary(messages: &[&ChatMessage]) -> String {
     for msg in messages {
         match msg.role {
             MessageRole::User => {
-                output.push_str(&format!("User: {}\n\n", msg.content));
+                output.push_str(&format!("User: {}\n", msg.content));
+                // Same note the model saw, so the paths survive compaction.
+                let note = crate::attachments::model_note(uploads, &msg.attachments);
+                if !note.is_empty() {
+                    output.push_str(&note);
+                    output.push('\n');
+                }
+                output.push('\n');
             }
             MessageRole::Agent => {
                 output.push_str(&format!("Assistant: {}\n\n", msg.content));
@@ -352,6 +369,35 @@ mod tests {
     use super::*;
     use crate::ui::app_state::MessageRole;
 
+    /// A store no test stores into — enough for the no-attachment paths.
+    fn test_store() -> crate::attachments::UploadStore {
+        crate::attachments::UploadStore::new(
+            std::path::PathBuf::from("/nonexistent-uploads-root"),
+            crate::config::UploadsConfig::default(),
+        )
+    }
+
+    #[test]
+    fn summary_input_carries_attachment_paths() {
+        let store = test_store();
+        let att = crate::attachments::Attachment {
+            id: uuid::Uuid::new_v4(),
+            convo: uuid::Uuid::new_v4(),
+            name: "spec.pdf".into(),
+            mime: "application/pdf".into(),
+            size: 10,
+            kind: crate::attachments::AttachmentKind::File,
+        };
+        let path = store.path(&att);
+        let msg = ChatMessage::user_with_attachments("read this".into(), vec![att]);
+        let formatted = format_chat_messages_for_summary(&[&msg], &store);
+        assert!(formatted.contains("User: read this"), "{formatted}");
+        assert!(
+            formatted.contains(path.to_str().unwrap()),
+            "the stored path must survive into the summary input: {formatted}"
+        );
+    }
+
     #[test]
     fn test_default_config() {
         let config = ContextConfig::default();
@@ -396,7 +442,7 @@ mod tests {
         ];
 
         let refs: Vec<&ChatMessage> = messages.iter().collect();
-        let formatted = format_chat_messages_for_summary(&refs);
+        let formatted = format_chat_messages_for_summary(&refs, &test_store());
 
         assert!(formatted.contains("User: List my files"));
         assert!(formatted.contains("Assistant [called bash("));
@@ -413,7 +459,7 @@ mod tests {
         ];
 
         let refs: Vec<&ChatMessage> = messages.iter().collect();
-        let formatted = format_chat_messages_for_summary(&refs);
+        let formatted = format_chat_messages_for_summary(&refs, &test_store());
 
         assert!(formatted.contains("Previous summary: Previous work: set up the project"));
         assert!(formatted.contains("User: Continue from where we left off"));
@@ -519,7 +565,7 @@ mod tests {
 
         // format_chat_messages_for_summary doesn't filter compacted — that's the caller's job.
         // But verify it formats both if passed both.
-        let formatted = format_chat_messages_for_summary(&messages);
+        let formatted = format_chat_messages_for_summary(&messages, &test_store());
         assert!(formatted.contains("old message"));
         assert!(formatted.contains("new message"));
     }
@@ -629,7 +675,7 @@ mod tests {
         ];
 
         let plan = cm
-            .compact(&messages)
+            .compact(&messages, &test_store())
             .await
             .expect("compact must succeed with mock summarizer queued");
 

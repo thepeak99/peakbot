@@ -138,8 +138,21 @@ impl TestRunner {
 
     /// Process a message through the full agentic loop.
     pub async fn run_message(&mut self, message: &str) -> String {
+        self.run_message_with_attachments(message, Vec::new()).await
+    }
+
+    /// Like [`Self::run_message`], but the user row carries stored
+    /// attachments (mirrors production's `add_user_message_with_attachments`
+    /// at dequeue).
+    pub async fn run_message_with_attachments(
+        &mut self,
+        message: &str,
+        attachments: Vec<crate::attachments::Attachment>,
+    ) -> String {
         let history = self.state_manager.get_agent_history();
-        let result = self.process_message_internal(message, history).await;
+        let result = self
+            .process_message_internal(message, history, attachments)
+            .await;
 
         match result {
             ProcessResult::Success(response) => response,
@@ -164,6 +177,7 @@ impl TestRunner {
         &mut self,
         msg: &str,
         mut history: Vec<Message>,
+        attachments: Vec<crate::attachments::Attachment>,
     ) -> ProcessResult {
         let current_msg = msg.to_string();
 
@@ -171,7 +185,13 @@ impl TestRunner {
         // mirroring agent_loop in production. The legacy ordering (append
         // after) is what allowed user-text to wedge between an in-flight
         // ToolCall and its ToolResult.
-        self.state_manager.add_user_message(current_msg.clone());
+        let has_attachments = !attachments.is_empty();
+        if has_attachments {
+            self.state_manager
+                .add_user_message_with_attachments(current_msg.clone(), attachments);
+        } else {
+            self.state_manager.add_user_message(current_msg.clone());
+        }
 
         // Mark as running
         self.state_manager.set_running(true);
@@ -195,8 +215,18 @@ impl TestRunner {
                 history = self.state_manager.get_agent_history();
             }
 
-            // Call the agent with history
-            let result = self.agent.prompt_with_history(&current_msg, &history).await;
+            // Call the agent with history. An attachment turn sends the
+            // built wire message (image parts + note), exactly as production
+            // does via `build_current_turn_message`; a text turn keeps the
+            // plain-string prompt.
+            let result = match self
+                .state_manager
+                .build_current_turn_message()
+                .filter(|_| has_attachments)
+            {
+                Some(turn) => self.agent.prompt_with_history(turn, &history).await,
+                None => self.agent.prompt_with_history(&current_msg, &history).await,
+            };
 
             // Process events from the session hook to update stats
             self.process_session_hook_events();

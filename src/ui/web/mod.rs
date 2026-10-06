@@ -754,9 +754,9 @@ fn dispatch_inbound(
     registry: &SessionRegistry,
 ) -> bool {
     match serde_json::from_str::<InboundMessage>(line) {
-        Ok(InboundMessage::SendMessage { text }) => {
-            action_sender.send(UiAction::SendMessage(text)).is_ok()
-        }
+        Ok(InboundMessage::SendMessage { text, attachments }) => action_sender
+            .send(UiAction::SendMessage { text, attachments })
+            .is_ok(),
         Ok(InboundMessage::Stop) => action_sender.send(UiAction::RequestStop).is_ok(),
         // Pause/resume the running sub-agent — same immediate path as Stop
         // (the controller handles them without queueing behind the turn).
@@ -800,7 +800,10 @@ fn dispatch_inbound(
         // Re-attach mid-stream is a client bug; ignore rather than reset.
         Ok(InboundMessage::Attach { .. }) => true,
         Ok(InboundMessage::Shutdown) => {
-            let _ = action_sender.send(UiAction::SendMessage("/exit".to_string()));
+            let _ = action_sender.send(UiAction::SendMessage {
+                text: "/exit".to_string(),
+                attachments: Vec::new(),
+            });
             false
         }
         Err(e) => out_tx
@@ -924,6 +927,10 @@ mod tests {
             mcp_tools_count: 0,
             skills_count: 0,
             profile_pin: None,
+            uploads: crate::attachments::UploadStore::new(
+                crate::attachments::UploadStore::default_root(),
+                crate::config::UploadsConfig::default(),
+            ),
         };
         let registry = SessionRegistry::new(Arc::new(deps));
         (action_tx, action_rx, out_tx, sm, registry)
