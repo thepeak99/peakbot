@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  adaptMessage,
   adaptStats,
   adaptSubAgent,
   assignDelegationCalls,
@@ -12,7 +13,7 @@ import {
   todosFromMessages,
   viewLabel,
 } from "./adapt";
-import type { AppState, WireChatMessage, WireStats } from "./state";
+import type { AppState, WireAttachment, WireChatMessage, WireStats } from "./state";
 import type { TodoNode } from "./types";
 
 // Minimal transcript builder: a `todo` tool call carrying the given args JSON.
@@ -722,5 +723,82 @@ describe("adaptSubAgent", () => {
 
   it("normalises an explicit null sub_agent to null", () => {
     expect(adaptSubAgent(stateWithSubAgent(null))).toBeNull();
+  });
+});
+
+// ─── T9: attachments ──────────────────────────────────────────────────────
+// RED: §5.7 — WireChatMessage carries `attachments?: WireAttachment[]` and
+// adaptMessage maps each one to an AttachmentView with
+// `url = /api/uploads/${convo}/${id}`; absent stays undefined (so the
+// renderer can use a single truthy check, as with `thinking`).
+
+describe("adaptMessage — attachments (T9)", () => {
+  const CONVO = "11111111-1111-4111-8111-111111111111";
+  const wireAttachment = (over: Partial<WireAttachment> = {}): WireAttachment => ({
+    id: "22222222-2222-4222-8222-222222222222",
+    convo: CONVO,
+    name: "spec.pdf",
+    mime: "application/pdf",
+    size: 2411724,
+    kind: "file",
+    ...over,
+  });
+
+  it("maps attachments to view attachments with url = /api/uploads/{convo}/{id}", () => {
+    const adapted = adaptMessage({
+      role: "user",
+      content: "what's in these?",
+      timestamp: "2026-01-01T00:00:00Z",
+      attachments: [
+        wireAttachment(),
+        wireAttachment({
+          id: "33333333-3333-4333-8333-333333333333",
+          name: "cat.png",
+          mime: "image/png",
+          size: 1234,
+          kind: "image",
+        }),
+      ],
+    });
+
+    expect(adapted.attachments).toEqual([
+      {
+        id: "22222222-2222-4222-8222-222222222222",
+        convo: CONVO,
+        name: "spec.pdf",
+        mime: "application/pdf",
+        size: 2411724,
+        kind: "file",
+        url: `/api/uploads/${CONVO}/22222222-2222-4222-8222-222222222222`,
+      },
+      {
+        id: "33333333-3333-4333-8333-333333333333",
+        convo: CONVO,
+        name: "cat.png",
+        mime: "image/png",
+        size: 1234,
+        kind: "image",
+        url: `/api/uploads/${CONVO}/33333333-3333-4333-8333-333333333333`,
+      },
+    ]);
+  });
+
+  it("leaves attachments undefined when the wire message has none", () => {
+    const adapted = adaptMessage({
+      role: "user",
+      content: "hi",
+      timestamp: "2026-01-01T00:00:00Z",
+    });
+    expect(adapted.attachments).toBeUndefined();
+  });
+
+  it("treats an empty attachments array as no attachments", () => {
+    const adapted = adaptMessage({
+      role: "user",
+      content: "hi",
+      timestamp: "2026-01-01T00:00:00Z",
+      attachments: [],
+    });
+    expect(adapted.attachments ?? []).toEqual([]);
   });
 });

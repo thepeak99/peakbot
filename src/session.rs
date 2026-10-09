@@ -72,6 +72,9 @@ pub struct SessionDeps {
     /// The boot `--profile` pin. `config` was loaded under it; every session
     /// runs under it and refuses runtime profile selection.
     pub profile_pin: Option<String>,
+    /// The upload store, built once at boot from `config.uploads` (the
+    /// limits are boot-only). Cloned into each session's `StateManager`.
+    pub uploads: crate::attachments::UploadStore,
 }
 
 /// One running, independent agent: its `StateManager` (Model), the write
@@ -119,10 +122,8 @@ pub struct Session {
 pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Session> {
     // Per-session Model. Storage (if any) is shared — it writes distinct
     // files per conversation id.
-    let state_manager = match &deps.storage {
-        Some(storage) => StateManager::new_arc_with_storage(storage.clone()),
-        None => StateManager::new_arc(),
-    };
+    let state_manager =
+        StateManager::new_arc_for_session(deps.storage.clone(), deps.uploads.clone());
 
     if let Some(sk) = deps.shell_kind.as_ref() {
         state_manager.set_shell(sk.executable().to_string());
@@ -310,6 +311,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     state_manager
         .set_wire_reasoning(provider_info.name == "anthropic" && provider_info.preserve_reasoning);
     state_manager.set_display_reasoning(provider_info.display_reasoning);
+    state_manager.set_supports_vision(provider_info.supports_vision);
 
     // Stamp the wire identity `(provider_name, model)` and the display
     // alias for the booted model (resumed model or registry default).
@@ -570,6 +572,10 @@ pub(crate) mod test_support {
             mcp_tools_count: 0,
             skills_count: 0,
             profile_pin: None,
+            uploads: crate::attachments::UploadStore::new(
+                crate::attachments::UploadStore::default_root(),
+                crate::config::UploadsConfig::default(),
+            ),
         }
     }
 }
@@ -742,6 +748,10 @@ mod tests {
             mcp_tools_count: 0,
             skills_count: 0,
             profile_pin: None,
+            uploads: crate::attachments::UploadStore::new(
+                crate::attachments::UploadStore::default_root(),
+                crate::config::UploadsConfig::default(),
+            ),
         }
     }
 

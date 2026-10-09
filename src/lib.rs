@@ -8,6 +8,7 @@
 /// could drift from the binary the user actually runs.
 pub const PEAKBOT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod attachments;
 pub mod bg_processes;
 pub mod config;
 mod context_manager;
@@ -108,7 +109,7 @@ use tracing::debug;
 enum QueueMessage {
     UserMessage {
         text: String,
-        attachments: Vec<crate::vision::ImageAttachment>,
+        attachments: Vec<crate::attachments::Attachment>,
     },
     Command(String),
     /// Signals that stop was requested. Carries the already-rendered system
@@ -154,7 +155,7 @@ enum QueueMessage {
 
 /// How should a submitted input buffer be routed by the event loop?
 ///
-/// The REPL emits every Enter-submission as `UiAction::SendMessage(msg)` —
+/// The REPL emits every Enter-submission as `UiAction::SendMessage { text, .. }` —
 /// the popup path and the plain-typed path go through the same action.
 /// `classify_submission` is the single chokepoint that decides whether the
 /// text is a slash command (dispatched internally) or a user turn (sent to
@@ -177,18 +178,16 @@ enum SubmitKind {
     ResumeCommand,
     /// Any other `/xxx` — routed to `process_command_internal`.
     Command(String),
-    /// Plain chat content — sent to the LLM.
-    UserMessage(String),
-    /// User turn with one or more `[img:…]` attachments parsed from the
-    /// buffer. Capability-checked against `ProviderInfo::supports_vision`
-    /// before dispatch.
-    MultimodalMessage {
+    /// Plain chat content — sent to the LLM. `image_tokens` are the raw
+    /// `[img:…]` token bodies (grammar-checked only; `attachments::collect`
+    /// resolves them at enqueue).
+    UserMessage {
         text: String,
-        attachments: Vec<crate::vision::ImageAttachment>,
+        image_tokens: Vec<String>,
     },
-    /// `[img:…]` parsed but failed (missing file, too large, invalid token…).
+    /// `[img:…]` grammar error (`data:` URI, unknown scheme, bare word).
     /// Surfaces as a system error; does not reach the LLM.
-    InvalidAttachment(crate::vision::AttachmentError),
+    InvalidAttachment(crate::attachments::AttachError),
     /// `/pipeline [name|none|off]` — bind this conversation to a named team,
     /// not an LLM turn.
     PipelineCommand(PipelineSubmission),
@@ -268,14 +267,17 @@ fn classify_submission(msg: &str) -> SubmitKind {
     if msg.starts_with('/') {
         return SubmitKind::Command(msg.to_string());
     }
-    // Try inline image parsing FIRST — before deciding it's plain text.
-    // A buffer without `[img:` returns `(buf, [])` immediately (cheap).
-    match crate::vision::parse_attachments_inline(msg) {
-        Ok((text, attachments)) if !attachments.is_empty() => SubmitKind::MultimodalMessage {
+    // Grammar only — no I/O. Tokens are resolved (and copied into the
+    // store) by `attachments::collect` at enqueue.
+    match crate::attachments::parse_image_tokens(msg) {
+        Ok((text, image_tokens)) if !image_tokens.is_empty() => SubmitKind::UserMessage {
             text: text.trim().to_string(),
-            attachments,
+            image_tokens,
         },
-        Ok(_) => SubmitKind::UserMessage(msg.to_string()),
+        Ok(_) => SubmitKind::UserMessage {
+            text: msg.to_string(),
+            image_tokens: Vec::new(),
+        },
         Err(e) => SubmitKind::InvalidAttachment(e),
     }
 }
@@ -896,11 +898,6 @@ impl RebuildContext {
 /// inner Arc immediately so the guard never spans an await point.
 pub type SharedSessionHook = Arc<std::sync::RwLock<Arc<SessionHook>>>;
 
-/// Shared cell holding the *currently active* `ProviderInfo`. Same
-/// shape and reasoning as [`SharedSessionHook`] — needed for the
-/// vision-capability gate in the multimodal arm of `event_loop`.
-pub type SharedProviderInfo = Arc<std::sync::RwLock<Arc<ProviderInfo>>>;
-
 /// AgentRunner — the Controller in MVC.
 ///
 /// Receives input (UiAction) from Views, calls the agent, writes results to
@@ -908,7 +905,6 @@ pub type SharedProviderInfo = Arc<std::sync::RwLock<Arc<ProviderInfo>>>;
 pub struct AgentRunner {
     agent: Arc<DynAgent>,
     config: Config,
-    provider_info: ProviderInfo,
     #[allow(unused)]
     skills: SkillRegistry,
     state_manager: Option<Arc<StateManager>>,
@@ -971,6 +967,9 @@ impl AgentRunner {
 
         // Initialize ContextManager inside StateManager (StateManager owns it)
         if let Some(ref sm) = state_manager {
+            // Idempotent with the boot stamp in `create_session`; covers
+            // callers that build the runner directly (test harnesses).
+            sm.set_supports_vision(provider_info.supports_vision);
             let cm = ContextManager::new(
                 config.context.clone(),
                 context_size,
@@ -986,7 +985,6 @@ impl AgentRunner {
         Ok(Self {
             agent,
             config,
-            provider_info,
             skills,
             state_manager,
             session_hook,
@@ -1092,14 +1090,11 @@ impl AgentRunner {
         let state_manager_for_agent = self.state_manager.clone();
         let config_for_agent = self.config.clone();
         let event_receiver = self.event_receiver.take();
-        // Shared cells for state that swaps on `/model` rebuild. The
-        // event loop reads through these so `/stop` always cancels the
-        // active prompt and the multimodal-vision gate always reflects
-        // the active model. See [`SharedSessionHook`] / [`SharedProviderInfo`].
+        // Shared cell for state that swaps on `/model` rebuild. The event
+        // loop reads through it so `/stop` always cancels the active
+        // prompt. See [`SharedSessionHook`].
         let session_hook_cell: SharedSessionHook =
             Arc::new(std::sync::RwLock::new(self.session_hook.clone()));
-        let provider_info_cell: SharedProviderInfo =
-            Arc::new(std::sync::RwLock::new(Arc::new(self.provider_info.clone())));
         // The rebuild context is consumed once into the agent loop. If
         // it's `None`, `/model` switches are inert (the loop emits a
         // system-message error if a `SwitchModel` action somehow
@@ -1118,7 +1113,6 @@ impl AgentRunner {
             let completion_tx = completion_tx.clone();
             let drain_requested = drain_requested.clone();
             let session_hook_cell = session_hook_cell.clone();
-            let provider_info_cell = provider_info_cell.clone();
 
             async move {
                 Self::event_loop(
@@ -1128,7 +1122,6 @@ impl AgentRunner {
                     state_manager,
                     session_hook_cell,
                     config_model,
-                    provider_info_cell,
                     drain_requested,
                 )
                 .await;
@@ -1140,7 +1133,6 @@ impl AgentRunner {
             let completion_tx = completion_tx.clone();
             let drain_requested = drain_requested.clone();
             let session_hook_cell = session_hook_cell.clone();
-            let provider_info_cell = provider_info_cell.clone();
 
             async move {
                 Self::agent_loop(
@@ -1152,7 +1144,6 @@ impl AgentRunner {
                     drain_requested,
                     event_receiver,
                     session_hook_cell,
-                    provider_info_cell,
                     rebuild_ctx,
                 )
                 .await;
@@ -1203,7 +1194,6 @@ impl AgentRunner {
         state_manager: Option<Arc<StateManager>>,
         _session_hook_cell: SharedSessionHook,
         config_model: String,
-        provider_info_cell: SharedProviderInfo,
         drain_requested: Arc<std::sync::atomic::AtomicBool>,
     ) {
         use std::sync::atomic::Ordering;
@@ -1255,12 +1245,31 @@ impl AgentRunner {
 
         while let Some(action) = action_receiver.recv().await {
             match action {
-                UiAction::SendMessage(msg) => {
+                UiAction::SendMessage {
+                    text: msg,
+                    attachments,
+                } => {
                     // Route by shape of the text. Slash commands must NOT
                     // be sent to the LLM, and must NOT be appended as user
                     // messages — their handlers emit their own system
                     // output. See `classify_submission` docs.
-                    match classify_submission(&msg) {
+                    let kind = classify_submission(&msg);
+                    // Attachments only ride a user turn; a command never
+                    // consumes them, so refuse loudly instead of dropping.
+                    if !attachments.is_empty()
+                        && !matches!(
+                            kind,
+                            SubmitKind::UserMessage { .. } | SubmitKind::InvalidAttachment(_)
+                        )
+                    {
+                        if let Some(ref sm) = state_manager {
+                            sm.add_system_message(
+                                "❌ Attachments can't be sent with a /command.".to_string(),
+                            );
+                        }
+                        continue;
+                    }
+                    match kind {
                         SubmitKind::StopCommand => {
                             request_stop_and_drain(&state_manager, &msg_tx, &drain_requested).await;
                         }
@@ -1293,7 +1302,40 @@ impl AgentRunner {
                             // Dispatched by agent_loop via process_command_internal.
                             msg_tx.send(QueueMessage::Command(cmd)).await.ok();
                         }
-                        SubmitKind::UserMessage(text) => {
+                        SubmitKind::UserMessage { text, image_tokens } => {
+                            // Resolve ids + `[img:]` tokens into stored
+                            // attachments for the CURRENT conversation. Any
+                            // failure is a ❌ system message and nothing is
+                            // queued (the model is never called).
+                            let resolved = if image_tokens.is_empty() && attachments.is_empty() {
+                                Vec::new()
+                            } else {
+                                // No SM ⇒ no store and no conversation to resolve against.
+                                let Some(ref sm) = state_manager else {
+                                    continue;
+                                };
+                                let Some(convo) = sm.get_current_conversation_id() else {
+                                    sm.add_system_message(
+                                        "❌ No active conversation to attach files to.".to_string(),
+                                    );
+                                    continue;
+                                };
+                                match crate::attachments::collect(
+                                    sm.uploads(),
+                                    convo,
+                                    &sm.session_cwd(),
+                                    image_tokens,
+                                    attachments,
+                                )
+                                .await
+                                {
+                                    Ok(atts) => atts,
+                                    Err(e) => {
+                                        sm.add_system_message(format!("❌ {e}"));
+                                        continue;
+                                    }
+                                }
+                            };
                             // Single-writer invariant: do NOT call
                             // add_user_message here. The agent loop appends
                             // user input to chat at dequeue time, between
@@ -1305,38 +1347,8 @@ impl AgentRunner {
                             msg_tx
                                 .send(QueueMessage::UserMessage {
                                     text,
-                                    attachments: Vec::new(),
+                                    attachments: resolved,
                                 })
-                                .await
-                                .ok();
-                        }
-                        SubmitKind::MultimodalMessage { text, attachments } => {
-                            // Capability guardrail — fail loud rather than drop images silently.
-                            // Read the active provider_info through the
-                            // shared cell so a `/model` switch to a
-                            // vision-capable model takes effect
-                            // immediately without process restart.
-                            let pi = provider_info_cell.read().unwrap().clone();
-                            if !pi.supports_vision {
-                                if let Some(ref sm) = state_manager {
-                                    sm.add_system_message(format!(
-                                        "❌ Model `{}` does not support vision. Switch to a \
-                                         vision-capable model in config.yaml (e.g. \
-                                         `anthropic/claude-3.5-sonnet`, `gpt-4o`, \
-                                         `google/gemini-2.0-flash-001`).",
-                                        pi.model
-                                    ));
-                                }
-                                continue;
-                            }
-                            // Single-writer invariant: attachments travel
-                            // through the channel; the agent loop is the
-                            // sole writer of `add_user_message_with_attachments`.
-                            if let Some(ref sm) = state_manager {
-                                sm.increment_pending_input();
-                            }
-                            msg_tx
-                                .send(QueueMessage::UserMessage { text, attachments })
                                 .await
                                 .ok();
                         }
@@ -1533,14 +1545,13 @@ impl AgentRunner {
         drain_requested: Arc<std::sync::atomic::AtomicBool>,
         initial_event_receiver: Option<mpsc::UnboundedReceiver<SourcedEvent>>,
         session_hook_cell: SharedSessionHook,
-        provider_info_cell: SharedProviderInfo,
         mut rebuild_ctx: Option<RebuildContext>,
     ) {
         use std::sync::atomic::Ordering;
 
         // The agent reference is `mut` here — `/model` rebuilds it
-        // in-place between turns. `provider_info_cell` and
-        // `session_hook_cell` are mirrored into the live event_loop.
+        // in-place between turns. `session_hook_cell` is mirrored into the
+        // live event_loop.
         let mut agent = initial_agent;
 
         // Memory compaction is deferred to the first user message so
@@ -1744,7 +1755,6 @@ impl AgentRunner {
                                 &mut config,
                                 &state_manager,
                                 &session_hook_cell,
-                                &provider_info_cell,
                                 &mut event_processor,
                                 rebuild_ctx.as_mut(),
                             )
@@ -1759,7 +1769,6 @@ impl AgentRunner {
                                 &mut config,
                                 &state_manager,
                                 &session_hook_cell,
-                                &provider_info_cell,
                                 &mut event_processor,
                                 rebuild_ctx.as_mut(),
                             )
@@ -1798,7 +1807,6 @@ impl AgentRunner {
                             &mut config,
                             &state_manager,
                             &session_hook_cell,
-                            &provider_info_cell,
                             &mut event_processor,
                             rebuild_ctx.as_mut(),
                         )
@@ -1835,7 +1843,6 @@ impl AgentRunner {
                             &mut config,
                             &state_manager,
                             &session_hook_cell,
-                            &provider_info_cell,
                             &mut event_processor,
                             rebuild_ctx.as_mut(),
                         )
@@ -1862,7 +1869,6 @@ impl AgentRunner {
                             &mut config,
                             &state_manager,
                             &session_hook_cell,
-                            &provider_info_cell,
                             &mut event_processor,
                             rebuild_ctx.as_mut(),
                         )
@@ -1889,7 +1895,6 @@ impl AgentRunner {
                             &mut config,
                             &state_manager,
                             &session_hook_cell,
-                            &provider_info_cell,
                             &mut event_processor,
                             rebuild_ctx.as_mut(),
                         )
@@ -1952,7 +1957,6 @@ impl AgentRunner {
         config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
-        provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
     ) -> Result<(), String> {
@@ -2001,7 +2005,6 @@ impl AgentRunner {
             config,
             &sm_for_provider,
             session_hook_cell,
-            provider_info_cell,
             event_processor,
             state_manager,
             ctx,
@@ -2075,7 +2078,6 @@ impl AgentRunner {
         config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
-        provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
     ) -> Result<(), String> {
@@ -2121,7 +2123,6 @@ impl AgentRunner {
             config,
             &sm,
             session_hook_cell,
-            provider_info_cell,
             event_processor,
             state_manager,
             ctx,
@@ -2171,7 +2172,6 @@ impl AgentRunner {
         config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
-        provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
     ) -> Result<(), String> {
@@ -2202,7 +2202,6 @@ impl AgentRunner {
             config,
             &sm,
             session_hook_cell,
-            provider_info_cell,
             event_processor,
             state_manager,
             ctx,
@@ -2249,7 +2248,6 @@ impl AgentRunner {
         config: &mut Config,
         sm: &Arc<StateManager>,
         session_hook_cell: &SharedSessionHook,
-        provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         state_manager: &Option<Arc<StateManager>>,
         ctx: &mut RebuildContext,
@@ -2284,7 +2282,6 @@ impl AgentRunner {
             config,
             sm,
             session_hook_cell,
-            provider_info_cell,
             event_processor,
             state_manager,
             ctx,
@@ -2336,7 +2333,6 @@ impl AgentRunner {
         config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
-        provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
     ) -> Result<(), String> {
@@ -2401,7 +2397,6 @@ impl AgentRunner {
             config,
             &sm,
             session_hook_cell,
-            provider_info_cell,
             event_processor,
             state_manager,
             ctx,
@@ -2544,6 +2539,9 @@ impl AgentRunner {
             ("mcp_servers", config.mcp_servers != fresh.mcp_servers),
             ("vector_db", config.vector_db != fresh.vector_db),
             ("web", config.web != fresh.web),
+            // `uploads` is boot-only like `web.*`: the running session's
+            // UploadStore keeps the boot limits until restart.
+            ("uploads", config.uploads != fresh.uploads),
             // `http` is baked into the HTTP clients at boot; it was missing
             // here, so edits were adopted into the config yet never applied.
             ("http", config.http != fresh.http),
@@ -2656,7 +2654,6 @@ impl AgentRunner {
         config: &mut Config,
         sm_for_provider: &Arc<StateManager>,
         session_hook_cell: &SharedSessionHook,
-        provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         state_manager: &Option<Arc<StateManager>>,
         ctx: &mut RebuildContext,
@@ -2794,16 +2791,13 @@ impl AgentRunner {
         sm_for_provider
             .set_wire_reasoning(new_info.name == "anthropic" && new_info.preserve_reasoning);
         sm_for_provider.set_display_reasoning(new_info.display_reasoning);
+        sm_for_provider.set_supports_vision(new_info.supports_vision);
 
-        // Publish through the shared cells *first* so the event_loop's
-        // /stop and vision-gate paths immediately see the new state.
+        // Publish through the shared cell *first* so the event_loop's /stop
+        // path immediately sees the new hook.
         {
             let mut hook_guard = session_hook_cell.write().unwrap();
             *hook_guard = new_hook;
-        }
-        {
-            let mut pi_guard = provider_info_cell.write().unwrap();
-            *pi_guard = Arc::new(new_info.clone());
         }
         *agent_slot = Arc::new(new_agent);
 
@@ -2877,7 +2871,6 @@ impl AgentRunner {
         config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
-        provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
     ) {
@@ -3012,7 +3005,6 @@ impl AgentRunner {
             config,
             &sm_for_provider,
             session_hook_cell,
-            provider_info_cell,
             event_processor,
             state_manager,
             ctx,
@@ -3043,7 +3035,6 @@ impl AgentRunner {
         config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
-        provider_info_cell: &SharedProviderInfo,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
     ) {
@@ -3094,7 +3085,6 @@ impl AgentRunner {
             config,
             &sm_arc,
             session_hook_cell,
-            provider_info_cell,
             event_processor,
             state_manager,
             ctx,
@@ -5788,12 +5778,11 @@ mod tests {
             ..Config::default()
         };
         let mut ctx = rebuild_ctx_for(registry_with_anthropic_and_ollama());
-        let (mock_agent, mock_info, _rx, mock_hook, _mock_model) =
+        let (mock_agent, _mock_info, _rx, mock_hook, _mock_model) =
             crate::providers::create_mock_agent("test prompt", 4, sm.clone())
                 .expect("mock agent builds");
         let mut agent_slot: Arc<DynAgent> = Arc::new(mock_agent);
         let hook_cell: SharedSessionHook = Arc::new(std::sync::RwLock::new(mock_hook));
-        let info_cell: SharedProviderInfo = Arc::new(std::sync::RwLock::new(Arc::new(mock_info)));
         let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
         let sm_opt = Some(sm.clone());
 
@@ -5809,7 +5798,6 @@ mod tests {
             &mut config,
             &sm,
             &hook_cell,
-            &info_cell,
             &mut event_processor,
             &sm_opt,
             &mut ctx,
@@ -5830,7 +5818,6 @@ mod tests {
             &mut config,
             &sm,
             &hook_cell,
-            &info_cell,
             &mut event_processor,
             &sm_opt,
             &mut ctx,
@@ -6085,9 +6072,12 @@ mod tests {
 
     #[test]
     fn classify_plain_text_is_user_message() {
+        // T7: `UserMessage` merged with `MultimodalMessage` — plain text is
+        // `UserMessage { text, image_tokens: [] }`.
         assert!(matches!(
             classify_submission("hello world"),
-            SubmitKind::UserMessage(s) if s == "hello world"
+            SubmitKind::UserMessage { text, image_tokens }
+                if text == "hello world" && image_tokens.is_empty()
         ));
     }
 
@@ -6180,7 +6170,7 @@ mod tests {
         // A slash that isn't at the start (after trim) is chat content.
         assert!(matches!(
             classify_submission("TODO: /foo or /bar?"),
-            SubmitKind::UserMessage(_)
+            SubmitKind::UserMessage { .. }
         ));
     }
 
@@ -6189,11 +6179,11 @@ mod tests {
         // The Enter handler already drops empty buffers; defensive default.
         assert!(matches!(
             classify_submission(""),
-            SubmitKind::UserMessage(_)
+            SubmitKind::UserMessage { .. }
         ));
         assert!(matches!(
             classify_submission("   "),
-            SubmitKind::UserMessage(_)
+            SubmitKind::UserMessage { .. }
         ));
     }
 
@@ -6242,35 +6232,85 @@ mod tests {
         ));
     }
 
+    // ── T7 — `[img:]` token grammar at classify time (design §3.2/§4.1, A1) ─
+    //
+    // `classify_submission` is grammar-only now: NO I/O, NO file resolution
+    // (that moved to `attachments::collect` at enqueue), NO vision gate
+    // (that is deleted). Tokens travel as raw strings in
+    // `UserMessage { text, image_tokens }`.
+    //
+    // RED: `SubmitKind::UserMessage { text, image_tokens }` and
+    // `InvalidAttachment(attachments::AttachError)` do not exist yet.
+
     #[test]
-    fn classify_inline_image_path_is_multimodal() {
-        use std::io::Write;
-        // Create a real tempfile the classifier can resolve.
-        let path = std::env::temp_dir().join(format!(
-            "peakbot-classify-{}-{}.png",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let mut f = std::fs::File::create(&path).expect("create");
-        f.write_all(b"x").expect("write");
-        let input = format!("describe [img:{}]", path.display());
-        match classify_submission(&input) {
-            SubmitKind::MultimodalMessage { text, attachments } => {
-                assert_eq!(text, "describe");
-                assert_eq!(attachments.len(), 1);
+    fn classify_img_path_token_is_extracted_not_resolved() {
+        // The file does not need to exist — classify never touches the disk.
+        let input = "describe [img:/does/not/matter-7f8a.png]";
+        match classify_submission(input) {
+            SubmitKind::UserMessage { text, image_tokens } => {
+                assert_eq!(text.trim(), "describe");
+                assert_eq!(image_tokens, vec!["/does/not/matter-7f8a.png"]);
             }
-            other => panic!("expected MultimodalMessage, got {other:?}"),
+            other => panic!("expected UserMessage with image_tokens, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn classify_inline_image_missing_is_invalid_attachment() {
-        let input = "look at [img:/does/not/exist-7f8a.png]";
-        assert!(matches!(
-            classify_submission(input),
-            SubmitKind::InvalidAttachment(_)
-        ));
+    fn classify_img_url_token_is_kept_as_normal_token() {
+        // Amendment A1: `[img:http(s)://…]` is NOT a grammar error. It stays
+        // a normal token; `collect` downloads it into the store at enqueue.
+        let input = "[img:https://example.com/a.png] please";
+        match classify_submission(input) {
+            SubmitKind::UserMessage { text, image_tokens } => {
+                assert_eq!(text.trim(), "please");
+                assert_eq!(image_tokens, vec!["https://example.com/a.png"]);
+            }
+            other => panic!("URL tokens must stay UserMessage (A1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_img_data_uri_token_is_invalid_attachment() {
+        // A1: `[img:data:…]` is a grammar error — the inline data: producer
+        // (the old web composer) is gone; the user re-attaches the file.
+        let input = "look at [img:data:image/png;base64,iVBORw0K]";
+        match classify_submission(input) {
+            SubmitKind::InvalidAttachment(e) => {
+                assert!(
+                    matches!(e, crate::attachments::AttachError::DataUriToken),
+                    "data: tokens must map to DataUriToken, got {e:?}"
+                );
+            }
+            other => panic!("expected InvalidAttachment(DataUriToken), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_multiple_img_tokens_keep_text_order() {
+        let input = "[img:/a/one.png] and [img:/b/two.png]";
+        match classify_submission(input) {
+            SubmitKind::UserMessage { text, image_tokens } => {
+                assert_eq!(text.trim(), "and");
+                assert_eq!(image_tokens, vec!["/a/one.png", "/b/two.png"]);
+            }
+            other => panic!("expected UserMessage with both tokens, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_unterminated_img_token_stays_literal() {
+        // No closing bracket → the buffer stays literal (today's behaviour).
+        let input = "see [img: /tmp/unfinished";
+        match classify_submission(input) {
+            SubmitKind::UserMessage { text, image_tokens } => {
+                assert!(
+                    text.contains("[img:"),
+                    "unterminated token must stay literal: {text:?}"
+                );
+                assert!(image_tokens.is_empty());
+            }
+            other => panic!("expected literal UserMessage, got {other:?}"),
+        }
     }
 
     // =========================================================================
@@ -7216,23 +7256,27 @@ headers:
     /// call must keep its image content after refresh — guards against a
     /// `last_msg_to_rig` regression that would silently drop vision on
     /// retry.
-    #[test]
-    fn refresh_attempt_from_transcript_preserves_user_image_attachments() {
-        use crate::vision::{ImageAttachment, ImageSource};
-        use rig_core::completion::message::{ImageMediaType, Message as RigMessage, UserContent};
+    #[tokio::test]
+    async fn refresh_attempt_from_transcript_preserves_user_image_attachments() {
+        use base64::Engine;
+        use rig_core::completion::message::{Message as RigMessage, UserContent};
 
-        let sm = StateManager::new();
-        sm.add_user_message_with_attachments(
-            "what is in this image?".to_string(),
-            vec![ImageAttachment {
-                display_name: "screencap.png".to_string(),
-                source: ImageSource::Base64 {
-                    bytes: vec![1, 2, 3, 4],
-                    media_type: ImageMediaType::PNG,
-                },
-                detail: None,
-            }],
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::attachments::UploadStore::new(
+            tmp.path().to_path_buf(),
+            crate::config::UploadsConfig::default(),
         );
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("valid base64 fixture");
+        let att = store
+            .store(uuid::Uuid::new_v4(), "screencap.png", &png[..])
+            .await
+            .expect("store the PNG");
+
+        let sm = StateManager::new().with_uploads(store);
+        sm.set_supports_vision(true);
+        sm.add_user_message_with_attachments("what is in this image?".to_string(), vec![att]);
         // A second user-facing row so the retry has a tail to consider —
         // an assistant turn precedes the retried attempt in production;
         // here we retry the very first (and only) turn, mirroring a 429
@@ -7538,7 +7582,7 @@ headers:
         // Mid-sentence slash stays chat content.
         assert!(matches!(
             classify_submission("TODO: /pipeline foo"),
-            SubmitKind::UserMessage(_)
+            SubmitKind::UserMessage { .. }
         ));
     }
 
@@ -8585,8 +8629,11 @@ pipelines:
         let (tx, rx) = mpsc::unbounded_channel::<UiAction>();
         let h = tokio::spawn(async move { runner.run_loop(rx).await });
 
-        tx.send(UiAction::SendMessage("go".into()))
-            .expect("the action channel is open");
+        tx.send(UiAction::SendMessage {
+            text: "go".into(),
+            attachments: Vec::new(),
+        })
+        .expect("the action channel is open");
 
         // Wait (≤10s) until the ToolCall row has landed and the tool is in
         // flight, then close the action channel (session teardown).
@@ -8673,6 +8720,7 @@ pipelines:
         sm: &Arc<StateManager>,
         tool: Box<dyn ToolDyn>,
         responses: Vec<crate::mock::MockResponse>,
+        supports_vision: bool,
     ) -> (
         crate::mock::MockCompletionModel,
         mpsc::UnboundedSender<UiAction>,
@@ -8697,7 +8745,7 @@ pipelines:
             name: "mock".to_string(),
             model: "mock-model".to_string(),
             supports_pricing: true,
-            supports_vision: true,
+            supports_vision,
             preserve_reasoning: true,
             display_reasoning: false,
         };
@@ -8730,6 +8778,259 @@ pipelines:
         let (tx, rx) = mpsc::unbounded_channel::<UiAction>();
         let h = tokio::spawn(async move { runner.run_loop(rx).await });
         (model_clone, tx, h)
+    }
+
+    // ── T7 — controller attachment ingest (file-uploads design §4.1) ───────
+    //
+    // **Status: compile-fail until T7 lands.** Written against the locked
+    // design interface: `UiAction::SendMessage { text, attachments }`
+    // (§3.2), `StateManager::with_uploads` (§5.5), and the `collect`-based
+    // ingest that replaces the deleted vision gate. The `PanicTool` is
+    // registered but never called (the mock answers with plain text).
+
+    /// Shared fixture: a boot conversation plus a tempdir upload store wired
+    /// into the SM. `tmp` must outlive the test (the store's root lives there).
+    #[cfg(feature = "mock")]
+    fn attachment_ingest_fixture() -> (
+        Arc<StateManager>,
+        crate::attachments::UploadStore,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::attachments::UploadStore::new(
+            tmp.path().to_path_buf(),
+            crate::config::UploadsConfig {
+                max_file_mb: 50,
+                max_files: 10,
+            },
+        );
+        let sm = Arc::new(StateManager::new().with_uploads(store.clone()));
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+        (sm, store, tmp)
+    }
+
+    /// Unknown attachment id → system "❌ …", and NOTHING is queued: no user
+    /// row, no LLM call (design §4.1 `collect` → `find` → None).
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controller_unknown_attachment_id_refuses_and_queues_nothing() {
+        use crate::ui::app_state::MessageRole;
+
+        let (sm, _store, _tmp) = attachment_ingest_fixture();
+        let (model, tx, h) = spawn_mock_runner(&sm, Box::new(PanicTool(sm.clone())), vec![], true);
+
+        tx.send(UiAction::SendMessage {
+            text: "hi".to_string(),
+            attachments: vec![uuid::Uuid::new_v4()],
+        })
+        .expect("the action channel is open");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let msgs = sm.get_state().chat.messages;
+                if msgs
+                    .iter()
+                    .any(|m| m.role == MessageRole::System && m.content.starts_with("❌"))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an unknown attachment id must surface a ❌ system message within 10s");
+
+        let msgs = sm.get_state().chat.messages;
+        assert!(
+            !msgs.iter().any(|m| m.role == MessageRole::User),
+            "a refused send must not queue a user message: {msgs:?}"
+        );
+        assert_eq!(
+            model.request_count(),
+            0,
+            "a refused send must not call the model"
+        );
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
+    }
+
+    /// `/new` carrying ids → refusal, and `/new` is NOT run (design §4.1:
+    /// Command + non-empty attachments → system "❌ Attachments can't be sent
+    /// with a /command.", not queued).
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controller_command_with_attachments_is_refused() {
+        use crate::ui::app_state::MessageRole;
+
+        let (sm, _store, _tmp) = attachment_ingest_fixture();
+        let convo_before = sm
+            .get_current_conversation_id()
+            .expect("boot conversation exists");
+
+        let (model, tx, h) = spawn_mock_runner(&sm, Box::new(PanicTool(sm.clone())), vec![], true);
+
+        tx.send(UiAction::SendMessage {
+            text: "/new".to_string(),
+            attachments: vec![uuid::Uuid::new_v4()],
+        })
+        .expect("the action channel is open");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let msgs = sm.get_state().chat.messages;
+                if msgs.iter().any(|m| {
+                    m.role == MessageRole::System
+                        && m.content
+                            .contains("Attachments can't be sent with a /command")
+                }) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("/new with attachments must surface the refusal system message within 10s");
+
+        assert_eq!(
+            sm.get_current_conversation_id(),
+            Some(convo_before),
+            "the refused /new must not switch conversations"
+        );
+        assert_eq!(
+            model.request_count(),
+            0,
+            "a refused command must not call the model"
+        );
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
+    }
+
+    /// Regression of the OLD vision refusal (deleted in T7): a non-vision
+    /// model + an image attachment is QUEUED — the image degrades to a file
+    /// reference at turn-build time, it is never refused at ingest.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controller_non_vision_model_with_image_attachment_is_queued() {
+        use crate::ui::app_state::MessageRole;
+        use base64::Engine;
+
+        let (sm, store, _tmp) = attachment_ingest_fixture();
+        let convo_id = sm
+            .get_current_conversation_id()
+            .expect("boot conversation exists");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("valid base64 fixture");
+        let att = store
+            .store(convo_id, "cat.png", &png[..])
+            .await
+            .expect("store the PNG");
+
+        // supports_vision = false: the old gate would have refused this send.
+        let (model, tx, h) = spawn_mock_runner(
+            &sm,
+            Box::new(PanicTool(sm.clone())),
+            vec![crate::mock::MockResponse::text("ok")],
+            false,
+        );
+
+        tx.send(UiAction::SendMessage {
+            text: "what's in this?".to_string(),
+            attachments: vec![att.id],
+        })
+        .expect("the action channel is open");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = sm.get_state();
+                let landed = state
+                    .chat
+                    .messages
+                    .iter()
+                    .any(|m| m.role == MessageRole::User && m.content == "what's in this?");
+                if landed && !sm.is_running() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "non-vision model + image attachment must be QUEUED (the old vision \
+             refusal is gone); the user row must land within 10s",
+        );
+
+        assert_eq!(
+            model.request_count(),
+            1,
+            "the queued turn must run exactly one LLM request"
+        );
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
+    }
+
+    /// 11 ids with `max_files: 10` → TooMany refusal (the count check runs
+    /// before any lookup/copy, so the ids need not exist), nothing queued.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controller_eleven_attachments_with_max_ten_is_too_many() {
+        use crate::ui::app_state::MessageRole;
+
+        let (sm, _store, _tmp) = attachment_ingest_fixture();
+        let (model, tx, h) = spawn_mock_runner(&sm, Box::new(PanicTool(sm.clone())), vec![], true);
+
+        let ids: Vec<uuid::Uuid> = (0..11).map(|_| uuid::Uuid::new_v4()).collect();
+        tx.send(UiAction::SendMessage {
+            text: "x".to_string(),
+            attachments: ids,
+        })
+        .expect("the action channel is open");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let msgs = sm.get_state().chat.messages;
+                if msgs.iter().any(|m| {
+                    m.role == MessageRole::System
+                        && m.content.starts_with("❌")
+                        && m.content.contains("11")
+                        && m.content.contains("10")
+                }) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("11 ids with max_files 10 must surface a TooMany ❌ message within 10s");
+
+        let msgs = sm.get_state().chat.messages;
+        assert!(
+            !msgs.iter().any(|m| m.role == MessageRole::User),
+            "a TooMany refusal must not queue a user message: {msgs:?}"
+        );
+        assert_eq!(
+            model.request_count(),
+            0,
+            "a TooMany refusal must not call the model"
+        );
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), h)
+            .await
+            .expect("run_loop must finish within 10s of the action channel closing")
+            .expect("the run_loop task must not panic");
     }
 
     /// A rig tool that panics once its own ToolCall row has landed in the
@@ -8814,10 +9115,14 @@ pipelines:
                 crate::mock::MockResponse::tool_call("panic_tool", serde_json::json!({})),
                 crate::mock::MockResponse::text("recovered"),
             ],
+            true,
         );
 
-        tx.send(UiAction::SendMessage("go".into()))
-            .expect("the action channel is open");
+        tx.send(UiAction::SendMessage {
+            text: "go".into(),
+            attachments: Vec::new(),
+        })
+        .expect("the action channel is open");
 
         // Wait (≤10s) for the SAME turn to recover: the model's follow-up
         // text ("recovered") must land and the loop must finish the turn
@@ -8922,10 +9227,14 @@ pipelines:
                 crate::mock::MockResponse::tool_call("panic_tool", serde_json::json!({})),
                 crate::mock::MockResponse::text("still alive"),
             ],
+            true,
         );
 
-        tx.send(UiAction::SendMessage("go".into()))
-            .expect("the action channel is open");
+        tx.send(UiAction::SendMessage {
+            text: "go".into(),
+            attachments: Vec::new(),
+        })
+        .expect("the action channel is open");
 
         // Wait (≤10s) for the turn to abort: `is_running` must clear and a
         // system message must carry the panic payload.
@@ -9004,8 +9313,11 @@ pipelines:
         );
 
         // The loop must keep serving: the next turn runs to completion.
-        tx.send(UiAction::SendMessage("again".into()))
-            .expect("the action channel is open");
+        tx.send(UiAction::SendMessage {
+            text: "again".into(),
+            attachments: Vec::new(),
+        })
+        .expect("the action channel is open");
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let state = sm.get_state();
@@ -9106,7 +9418,7 @@ pipelines:
         // Mid-sentence slash stays chat content.
         assert!(matches!(
             classify_submission("TODO: /profile foo"),
-            SubmitKind::UserMessage(_)
+            SubmitKind::UserMessage { .. }
         ));
     }
 
@@ -9545,7 +9857,6 @@ profiles:
         RebuildContext,
         Arc<DynAgent>,
         SharedSessionHook,
-        SharedProviderInfo,
     ) {
         let sm = StateManager::new_arc();
         sm.set_session_cwd(repo_tmp.to_path_buf());
@@ -9554,7 +9865,7 @@ profiles:
         let registry = config.build_model_registry().expect("registry builds");
         let pipelines = crate::pipeline::PipelineSet::build(&config, &registry, Some(&[]))
             .expect("pipelines build");
-        let (mock_agent, mock_info, _rx, mock_hook, _mock_model) =
+        let (mock_agent, _mock_info, _rx, mock_hook, _mock_model) =
             crate::providers::create_mock_agent("test prompt", 4, sm.clone())
                 .expect("mock agent builds");
         let ctx = RebuildContext {
@@ -9581,7 +9892,6 @@ profiles:
             ctx,
             Arc::new(mock_agent),
             Arc::new(std::sync::RwLock::new(mock_hook)),
-            Arc::new(std::sync::RwLock::new(Arc::new(mock_info))),
         )
     }
 
@@ -9640,7 +9950,7 @@ profiles:
     async fn handle_select_profile_applies_profile_and_rebuilds_agent() {
         let (outcome, sm, config, agent_before, agent_after) =
             with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                let (sm, config, ctx, agent_slot, hook_cell) =
                     profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
                 let agent_before = Arc::as_ptr(&agent_slot);
                 let mut config = config;
@@ -9653,7 +9963,6 @@ profiles:
                     &mut config,
                     &Some(sm.clone()),
                     &hook_cell,
-                    &info_cell,
                     &mut event_processor,
                     Some(&mut ctx),
                 )
@@ -9704,7 +10013,7 @@ profiles:
     async fn handle_select_profile_refused_when_locked_leaves_state_untouched() {
         let (outcome, sm, config, agent_before, agent_after) =
             with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                let (sm, config, ctx, agent_slot, hook_cell) =
                     profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
                 // Seed a real turn — the conversation is now locked.
                 sm.add_user_message("hi".into());
@@ -9720,7 +10029,6 @@ profiles:
                     &mut config,
                     &Some(sm.clone()),
                     &hook_cell,
-                    &info_cell,
                     &mut event_processor,
                     Some(&mut ctx),
                 )
@@ -9765,7 +10073,7 @@ profiles:
     async fn handle_select_profile_pinned_refuses_other_names() {
         let (outcome, sm, config, agent_before, agent_after) =
             with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                let (sm, config, ctx, agent_slot, hook_cell) =
                     profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, Some("web"));
                 let agent_before = Arc::as_ptr(&agent_slot);
                 let mut config = config;
@@ -9778,7 +10086,6 @@ profiles:
                     &mut config,
                     &Some(sm.clone()),
                     &hook_cell,
-                    &info_cell,
                     &mut event_processor,
                     Some(&mut ctx),
                 )
@@ -9799,7 +10106,7 @@ profiles:
         // Re-naming the pin itself: Unchanged — Ok, silent, no rebuild.
         let (outcome, sm, _config, agent_before, agent_after) =
             with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                let (sm, config, ctx, agent_slot, hook_cell) =
                     profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, Some("web"));
                 let agent_before = Arc::as_ptr(&agent_slot);
                 let mut config = config;
@@ -9812,7 +10119,6 @@ profiles:
                     &mut config,
                     &Some(sm.clone()),
                     &hook_cell,
-                    &info_cell,
                     &mut event_processor,
                     Some(&mut ctx),
                 )
@@ -9838,7 +10144,7 @@ profiles:
     async fn handle_select_profile_unknown_name_refused_lists_available() {
         let (outcome, sm, config, agent_before, agent_after) =
             with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                let (sm, config, ctx, agent_slot, hook_cell) =
                     profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
                 let agent_before = Arc::as_ptr(&agent_slot);
                 let mut config = config;
@@ -9851,7 +10157,6 @@ profiles:
                     &mut config,
                     &Some(sm.clone()),
                     &hook_cell,
-                    &info_cell,
                     &mut event_processor,
                     Some(&mut ctx),
                 )
@@ -9887,7 +10192,7 @@ profiles:
         // Disk master: only `web` (the profile was just removed).
         let (outcome, sm, config, agent_before, agent_after) =
             with_master_config(PROFILE_HANDLER_MASTER_NO_RESEARCH, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                let (sm, config, ctx, agent_slot, hook_cell) =
                     profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
                 // Pre-stage the previous pair the rollback must restore.
                 sm.set_selected_profile(Some("web".into()));
@@ -9903,7 +10208,6 @@ profiles:
                     &mut config,
                     &Some(sm.clone()),
                     &hook_cell,
-                    &info_cell,
                     &mut event_processor,
                     Some(&mut ctx),
                 )
@@ -9951,7 +10255,7 @@ profiles:
     async fn handle_select_profile_pipeline_gate_drops_filtered_selection_with_warning() {
         let (outcome, sm, config, ctx_pipelines, agent_before, agent_after) =
             with_master_config(PROFILE_HANDLER_MASTER_GATED, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                let (sm, config, ctx, agent_slot, hook_cell) =
                     profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER_GATED, None);
                 // The user is currently on `web-team` — the profile's gate
                 // keeps only `research-crew`.
@@ -9967,7 +10271,6 @@ profiles:
                     &mut config,
                     &Some(sm.clone()),
                     &hook_cell,
-                    &info_cell,
                     &mut event_processor,
                     Some(&mut ctx),
                 )
@@ -10033,7 +10336,7 @@ profiles:
     async fn handle_select_profile_updates_visible_tabs() {
         let (outcome, profiles_view, tabs_view) =
             with_master_config(PROFILE_HANDLER_MASTER_TABS, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+                let (sm, config, ctx, agent_slot, hook_cell) =
                     profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER_TABS, None);
                 let mut config = config;
                 let mut ctx = ctx;
@@ -10045,7 +10348,6 @@ profiles:
                     &mut config,
                     &Some(sm.clone()),
                     &hook_cell,
-                    &info_cell,
                     &mut event_processor,
                     Some(&mut ctx),
                 )
@@ -10112,7 +10414,7 @@ profiles:
         let (outcome, sm, ctx) = with_master_config(MASTER, |repo| async move {
             std::fs::write(repo.join("agents.md"), "SENTINEL-HARNESS-AGENTS")
                 .expect("write sentinel agents.md");
-            let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+            let (sm, config, ctx, agent_slot, hook_cell) =
                 profile_handler_fixture(&repo, MASTER, None);
             let mut config = config;
             let mut ctx = ctx;
@@ -10124,7 +10426,6 @@ profiles:
                 &mut config,
                 &Some(sm.clone()),
                 &hook_cell,
-                &info_cell,
                 &mut event_processor,
                 Some(&mut ctx),
             )
@@ -10171,7 +10472,7 @@ profiles:
         let (outcome, _sm, ctx) = with_master_config(MASTER, |repo| async move {
             std::fs::write(repo.join("agents.md"), "SENTINEL-HARNESS-AGENTS")
                 .expect("write sentinel agents.md");
-            let (sm, config, ctx, agent_slot, hook_cell, info_cell) =
+            let (sm, config, ctx, agent_slot, hook_cell) =
                 profile_handler_fixture(&repo, MASTER, None);
             let mut config = config;
             let mut ctx = ctx;
@@ -10183,7 +10484,6 @@ profiles:
                 &mut config,
                 &Some(sm.clone()),
                 &hook_cell,
-                &info_cell,
                 &mut event_processor,
                 Some(&mut ctx),
             )

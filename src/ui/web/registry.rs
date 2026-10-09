@@ -165,10 +165,10 @@ impl RegisteredSession {
 
     /// Signal a graceful exit — the teardown path that runs `clear_bg`.
     fn signal_exit(&self) {
-        let _ = self
-            .session
-            .action_sender
-            .send(UiAction::SendMessage("/exit".to_string()));
+        let _ = self.session.action_sender.send(UiAction::SendMessage {
+            text: "/exit".to_string(),
+            attachments: Vec::new(),
+        });
     }
 }
 

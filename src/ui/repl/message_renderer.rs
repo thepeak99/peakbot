@@ -21,8 +21,9 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::attachments::{Attachment, AttachmentKind, human_size};
 use crate::ui::app_state::{ChatMessage, MessageRole};
-use crate::vision::{ImageAttachment, ImageSource};
+use crate::vision::media_type_from_mime;
 
 /// Convert a [`ChatMessage`] into styled [`Line`]s.
 ///
@@ -48,33 +49,20 @@ pub trait MessageRenderer: Send + Sync {
 #[derive(Default)]
 pub struct PlainRenderer;
 
-/// Format one attachment as a single-line bracket annotation, e.g.
-/// `[image: cat.png · PNG · 1.2 KB]` or `[image: https://example.com/a.jpg]`.
+/// Format one attachment as a single-line annotation: images as
+/// `[image: cat.png · PNG · 1.2 KB]`, everything else as `📄 spec.pdf · 2.3 MB`.
 ///
 /// Public-in-crate because the cache tests exercise it directly.
-pub(crate) fn format_attachment_line(a: &ImageAttachment) -> String {
-    match &a.source {
-        ImageSource::Base64 { bytes, media_type } => {
-            format!(
-                "[image: {} · {:?} · {}]",
-                a.display_name,
-                media_type,
-                fmt_bytes(bytes.len())
-            )
-        }
-        ImageSource::Url(_) => format!("[image: {}]", a.display_name),
-    }
-}
-
-fn fmt_bytes(n: usize) -> String {
-    const KB: usize = 1024;
-    const MB: usize = 1024 * 1024;
-    if n >= MB {
-        format!("{:.1} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.1} KB", n as f64 / KB as f64)
-    } else {
-        format!("{n} B")
+pub(crate) fn format_attachment_line(a: &Attachment) -> String {
+    let size = human_size(a.size);
+    match a.kind {
+        AttachmentKind::Image => match media_type_from_mime(&a.mime) {
+            Some(media_type) => format!("[image: {} · {:?} · {}]", a.name, media_type, size),
+            // I4 makes this unreachable for stored images; a hand-edited
+            // conversation file still renders rather than panics.
+            None => format!("[image: {} · {}]", a.name, size),
+        },
+        AttachmentKind::File => format!("📄 {} · {}", a.name, size),
     }
 }
 
@@ -211,23 +199,41 @@ mod tests {
         }
     }
 
-    // ── Attachment rendering ───────────────────────────────────────────
+    // ── Attachment rendering (T5: `format_attachment_line(&Attachment)`) ──
+    //
+    // RED: `crate::attachments::{Attachment, AttachmentKind}` does not exist
+    // yet, and `format_attachment_line` still takes the old
+    // the old `vision::ImageAttachment`. These tests target the
+    // locked design §7-T5 contract:
+    //   Image → `[image: cat.png · PNG · 1.2 KB]`  (label = `media_type_from_mime` Debug)
+    //   File  → `📄 spec.pdf · 2.3 MB`
+    // with sizes from `attachments::human_size` (base 1024, 1 decimal).
 
-    fn base64_attachment(name: &str, bytes: usize) -> ImageAttachment {
-        use rig_core::completion::message::ImageMediaType;
-        ImageAttachment {
-            display_name: name.to_string(),
-            source: ImageSource::Base64 {
-                bytes: vec![0u8; bytes],
-                media_type: ImageMediaType::PNG,
-            },
-            detail: None,
+    fn attachment(
+        name: &str,
+        mime: &str,
+        size: u64,
+        kind: crate::attachments::AttachmentKind,
+    ) -> crate::attachments::Attachment {
+        use crate::attachments::Attachment;
+        Attachment {
+            id: uuid::Uuid::new_v4(),
+            convo: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            mime: mime.to_string(),
+            size,
+            kind,
         }
     }
 
     #[test]
-    fn format_attachment_line_for_base64_image() {
-        let a = base64_attachment("cat.png", 1234);
+    fn format_attachment_line_for_image() {
+        let a = attachment(
+            "cat.png",
+            "image/png",
+            1234,
+            crate::attachments::AttachmentKind::Image,
+        );
         assert_eq!(
             format_attachment_line(&a),
             "[image: cat.png · PNG · 1.2 KB]"
@@ -235,23 +241,26 @@ mod tests {
     }
 
     #[test]
-    fn format_attachment_line_for_url() {
-        let a = ImageAttachment {
-            display_name: "https://example.com/a.jpg".into(),
-            source: ImageSource::Url("https://example.com/a.jpg".into()),
-            detail: None,
-        };
-        assert_eq!(
-            format_attachment_line(&a),
-            "[image: https://example.com/a.jpg]"
+    fn format_attachment_line_for_file() {
+        let a = attachment(
+            "spec.pdf",
+            "application/pdf",
+            2411724,
+            crate::attachments::AttachmentKind::File,
         );
+        assert_eq!(format_attachment_line(&a), "📄 spec.pdf · 2.3 MB");
     }
 
     #[test]
     fn plain_renderer_prepends_attachment_line_before_content() {
         let msg = ChatMessage::user_with_attachments(
             "what's this?".to_string(),
-            vec![base64_attachment("cat.png", 234 * 1024)],
+            vec![attachment(
+                "cat.png",
+                "image/png",
+                234 * 1024,
+                crate::attachments::AttachmentKind::Image,
+            )],
         );
         let lines = PlainRenderer.render(&msg, 80);
         assert_eq!(lines.len(), 2, "one attachment line + one content line");
@@ -266,10 +275,20 @@ mod tests {
     #[test]
     fn plain_renderer_emits_one_line_per_attachment() {
         let msg = ChatMessage::user_with_attachments(
-            "two images".to_string(),
+            "two attachments".to_string(),
             vec![
-                base64_attachment("a.png", 100),
-                base64_attachment("b.png", 200),
+                attachment(
+                    "a.png",
+                    "image/png",
+                    100,
+                    crate::attachments::AttachmentKind::Image,
+                ),
+                attachment(
+                    "b.pdf",
+                    "application/pdf",
+                    200,
+                    crate::attachments::AttachmentKind::File,
+                ),
             ],
         );
         let lines = PlainRenderer.render(&msg, 80);

@@ -26,6 +26,8 @@ export default defineConfig({
     proxy: {
       "/ws": { target: "ws://127.0.0.1:8080", ws: true },
       "/commands": { target: "http://127.0.0.1:8080" },
+      // Uploads (POST/GET /api/uploads) — same CORS/SPA-fallback reasoning.
+      "/api": { target: "http://127.0.0.1:8080" },
     },
   },
 });

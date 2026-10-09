@@ -18,6 +18,22 @@ export interface WireMessageSource {
   role?: string; // present when kind === "sub_agent"
 }
 
+/** A stored upload reference (src/attachments.rs `Attachment`) — never bytes. */
+export interface WireAttachment {
+  id: string;
+  convo: string;
+  name: string;
+  mime: string;
+  size: number;
+  kind: "image" | "file";
+}
+
+/** Server upload limits (`uploads:` config), carried on every state frame. */
+export interface UploadLimits {
+  max_file_mb: number;
+  max_files: number;
+}
+
 export interface WireChatMessage {
   role: WireRole;
   content?: string;
@@ -36,6 +52,8 @@ export interface WireChatMessage {
    * is the default (no `display_reasoning` or no blocks); absent ⇔ empty for
    * the renderer. */
   thinking?: { text: string }[];
+  /** User-message attachments; omitted by the server when empty. */
+  attachments?: WireAttachment[];
 }
 
 export interface WireChat {
@@ -195,6 +213,11 @@ export interface AppState {
    * should render. Optional so old wire snapshots parse; an absent field
    * means "no rule yet" — show every tab (see `tabs.ts` filterTabs). */
   visible_tabs?: string[];
+  /** Whether the active model takes image input; drives the chip ⚠. Optional
+   * so old snapshots parse (absent → treated as vision-capable, no ⚠). */
+  supports_vision?: boolean;
+  /** Upload limits for the client-side pre-checks. */
+  upload_limits?: UploadLimits;
 }
 
 /** One configured pipeline — the wire projection of `PipelineInfo`
@@ -268,7 +291,7 @@ export type OutboundMessage =
 
 export type InboundMessage =
   | { type: "attach"; convo: string | null }
-  | { type: "send_message"; text: string }
+  | { type: "send_message"; text: string; attachments?: string[] }
   | { type: "stop" }
   /** Request the running (pausable) sub-agent pause at its next checkpoint.
    * Idempotent — the backend ignores it when nothing is running. */

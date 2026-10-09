@@ -4,7 +4,7 @@
 
 use crate::image_cache::{self, ImageRef};
 use crate::tools::image_fit::{self, fit_under_ceiling};
-use crate::vision::{AttachmentError, ImageSource, load_image_from_path};
+use crate::vision::{AttachmentError, load_image_from_path};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rig_core::completion::ToolDefinition;
@@ -179,13 +179,8 @@ impl Tool for ViewImageTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         // Reuse the user-attachment loader: path resolution, the 10 MB cap,
         // media-type inference, and the format allowlist all live there.
-        let attachment = load_image_from_path(Path::new(&args.path))?;
-
-        let (bytes, media_type) = match attachment.source {
-            ImageSource::Base64 { bytes, media_type } => (bytes, media_type),
-            // load_image_from_path only ever returns Base64.
-            ImageSource::Url(_) => unreachable!("this should never happen"),
-        };
+        let loaded = load_image_from_path(Path::new(&args.path))?;
+        let (bytes, media_type) = (loaded.bytes, loaded.media_type);
 
         // auto_resize:false must refuse an oversized image without ever
         // decoding it; fit_under_ceiling has no notion of auto_resize, so

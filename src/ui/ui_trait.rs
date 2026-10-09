@@ -31,7 +31,14 @@ pub enum UiAction {
     /// Send a message to the agent, or — if the text starts with `/` —
     /// a slash command to be dispatched internally. The event loop in
     /// `AgentRunner` classifies via `classify_submission`.
-    SendMessage(String),
+    ///
+    /// `attachments` are upload ids from `POST /api/uploads` (web) — empty
+    /// for the TUI, which attaches via `[img:]` tokens in `text`. The
+    /// controller resolves them against the current conversation.
+    SendMessage {
+        text: String,
+        attachments: Vec<uuid::Uuid>,
+    },
 
     /// Request the agent to stop (Esc key).
     RequestStop,

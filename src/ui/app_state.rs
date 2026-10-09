@@ -175,6 +175,20 @@ pub struct AppState {
     /// back as `None`.
     #[serde(default)]
     pub sub_agent: Option<SubAgentRun>,
+
+    /// Whether the active model accepts image input. Set at boot and on
+    /// every rebuild from `ProviderInfo.supports_vision`; the turn builder
+    /// reads it to decide whether image attachments become image parts.
+    /// Top-level (not in `stats`) because `sync_stats_to_ui` rebuilds the
+    /// stats block wholesale and would overwrite it.
+    #[serde(default)]
+    pub supports_vision: bool,
+
+    /// The boot upload limits (`uploads:` config). The web composer reads
+    /// them for client-side pre-checks. Top-level for the same reason as
+    /// `supports_vision`.
+    #[serde(default)]
+    pub upload_limits: crate::config::UploadsConfig,
 }
 
 impl AppState {
@@ -258,15 +272,17 @@ pub struct ChatMessage {
     /// Display content (formatted for UI rendering)
     pub content: String,
 
-    /// Image attachments for user messages.
+    /// File attachments for user messages — references to immutable stored
+    /// files, never bytes (see `crate::attachments`).
     ///
     /// Empty for all non-user messages and for text-only user messages.
     /// Skipped from JSON when empty → zero size overhead for existing
     /// conversations. Converted to `rig_core::UserContent::Image` at the wire
     /// boundary in `StateManager::get_agent_history` /
-    /// `build_current_turn_message`.
+    /// `build_current_turn_message` (vision models only; everything else
+    /// rides in the model note as a path).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<crate::vision::ImageAttachment>,
+    pub attachments: Vec<crate::attachments::Attachment>,
 
     /// Images to DISPLAY with this row, by reference. Never model input —
     /// that is `attachments`. Empty for every row but a `view_image` result.
@@ -429,14 +445,14 @@ impl ChatMessage {
         }
     }
 
-    /// Create a user message with image attachments.
+    /// Create a user message with file attachments.
     ///
-    /// Mirrors [`ChatMessage::user`] but carries images that will be
-    /// converted to `rig_core::UserContent::Image` at the wire boundary. Intended
-    /// for `[img:…]` inline syntax flowing through `SubmitKind::MultimodalMessage`.
+    /// Mirrors [`ChatMessage::user`] but carries attachment references that
+    /// the turn builder turns into image parts (vision models) and the model
+    /// note (always).
     pub fn user_with_attachments(
         content: String,
-        attachments: Vec<crate::vision::ImageAttachment>,
+        attachments: Vec<crate::attachments::Attachment>,
     ) -> Self {
         Self {
             role: MessageRole::User,

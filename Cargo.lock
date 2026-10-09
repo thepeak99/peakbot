@@ -3169,6 +3169,7 @@ dependencies = [
  "open",
  "pdf_oxide",
  "peakbot",
+ "percent-encoding",
  "portable-pty",
  "pulldown-cmark",
  "ratatui",

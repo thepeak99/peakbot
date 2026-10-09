@@ -92,6 +92,12 @@ pub enum Message {
     User {
         /// Message content
         content: String,
+        /// File attachments — references to immutable stored files (see
+        /// `crate::attachments`). `#[serde(default)]` keeps pre-uploads
+        /// files loading; the skip keeps text-only rows byte-identical on
+        /// disk (the `persist_byte_identical` contract).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::attachments::Attachment>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         compacted: bool,
         #[serde(default, skip_serializing_if = "MessageSource::is_human")]
@@ -181,6 +187,7 @@ impl Message {
     pub fn user(content: String) -> Self {
         Message::User {
             content,
+            attachments: Vec::new(),
             compacted: false,
             source: MessageSource::Human,
             timestamp: Utc::now(),
@@ -368,6 +375,24 @@ impl Conversation {
     /// Add a user message to the conversation
     pub fn add_user_message(&mut self, content: String) {
         self.messages.push(Message::user(content));
+        self.metadata.message_count = self.messages.len();
+        self.updated_at = Utc::now();
+    }
+
+    /// Add a user message carrying file attachments (references to stored
+    /// files — see `crate::attachments`).
+    pub fn add_user_message_with_attachments(
+        &mut self,
+        content: String,
+        attachments: Vec<crate::attachments::Attachment>,
+    ) {
+        self.messages.push(Message::User {
+            content,
+            attachments,
+            compacted: false,
+            source: MessageSource::Human,
+            timestamp: Utc::now(),
+        });
         self.metadata.message_count = self.messages.len();
         self.updated_at = Utc::now();
     }
@@ -1230,6 +1255,7 @@ mod tests {
         });
         conv.messages.push(Message::User {
             content: "[bg output]".into(),
+            attachments: Vec::new(),
             compacted: false,
             source: MessageSource::Background {
                 proc_ids: vec![3, 7],

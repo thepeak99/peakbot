@@ -13,6 +13,7 @@ import { Transcript, type TranscriptHandle } from "./components/Transcript";
 import { EmptyTranscript } from "./components/EmptyTranscript";
 import { BashPanel } from "./components/BashPanel";
 import { Composer } from "./components/Composer";
+import { DropOverlay } from "./components/DropOverlay";
 import { TopBar } from "./components/TopBar";
 import { BottomBar } from "./components/BottomBar";
 import { TabbedDrawer } from "./components/TabbedDrawer";
@@ -23,12 +24,13 @@ import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
 import { ProfilePanel } from "./components/ProfilePanel";
 import { useAgent } from "./useAgent";
+import { useAttachments } from "./useAttachments";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
 import { filterTabs, resolveActiveTab } from "./tabs";
 import type { ViewFilter } from "./types";
-import { selectProfile } from "./state";
+import { selectProfile, type UploadLimits } from "./state";
 import {
   adaptBashPanel,
   adaptBg,
@@ -48,6 +50,9 @@ import {
   viewLabel,
 } from "./adapt";
 
+// Matches the server default (`uploads:` config) until the first state frame.
+const DEFAULT_UPLOAD_LIMITS: UploadLimits = { max_file_mb: 50, max_files: 10 };
+
 export function App() {
   const {
     connected,
@@ -63,6 +68,12 @@ export function App() {
     send,
     switchConvo,
   } = useAgent();
+
+  // Lifted out of Composer so the drop overlay on <main> feeds the same chips.
+  const attachments = useAttachments(
+    state?.conversation?.id ?? null,
+    state?.upload_limits ?? DEFAULT_UPLOAD_LIMITS,
+  );
 
   // Swap favicon to a spinning loader while the agent is working
   const isRunning = state?.is_running ?? false;
@@ -300,7 +311,7 @@ export function App() {
       )}
 
       <div className="flex min-h-0 flex-1">
-        <main className="flex min-w-0 flex-1 flex-col">
+        <DropOverlay onAdd={attachments.add}>
           {/* The scope banner is a static bar above the transcript: the
               scrolling element's only child must be the virtualizer's sized
               container, or the row offsets stop matching the scroll offset. */}
@@ -342,9 +353,9 @@ export function App() {
             isRunning={isRunning}
             connected={connected}
             commands={commands}
-            onSend={(text) => {
+            onSend={(text, ids) => {
               // Sending always re-pins: you expect to see your own message.
-              send({ type: "send_message", text });
+              send({ type: "send_message", text, attachments: ids });
               transcriptRef.current?.jumpToLatest();
             }}
             onStop={() => send({ type: "stop" })}
@@ -354,8 +365,10 @@ export function App() {
             watchingRole={scopeLabel}
             onClearWatch={() => setView("global")}
             pendingInput={pendingInput}
+            attachments={attachments}
+            supportsVision={state?.supports_vision ?? true}
           />
-        </main>
+        </DropOverlay>
       </div>
 
    <BottomBar

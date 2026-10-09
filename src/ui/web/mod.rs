@@ -87,6 +87,7 @@ mod images;
 mod registry;
 pub mod setup;
 pub mod tls;
+pub mod uploads;
 
 /// Port the web UI listens on. Fixed for now (`--port` flag is Phase 4).
 /// See `webui.md` §3 decision 1.
@@ -149,6 +150,9 @@ struct WsState {
     active_alias: Arc<str>,
     /// Idle-session TTL for the reaper (from `config.web`).
     session_ttl: Duration,
+    /// The upload store, cloned from `SessionDeps` at boot. Serves the
+    /// `/api/uploads` routes merged into the main router.
+    uploads: crate::attachments::UploadStore,
 }
 
 /// `peakbot --web` — serves the embedded SPA and a `/ws` endpoint. `run`
@@ -183,6 +187,9 @@ impl WebUi {
         needs_setup: bool,
     ) -> Self {
         let web = deps.config.web.clone();
+        // `SessionRegistry::new` consumes `deps`, so clone the store out
+        // first (it is `Clone`-cheap: a PathBuf + a Copy config).
+        let uploads = deps.uploads.clone();
         Self {
             addr,
             ws_state: WsState {
@@ -190,6 +197,7 @@ impl WebUi {
                 models: Arc::new(models),
                 active_alias: active_alias.into(),
                 session_ttl: Duration::from_secs(web.session_ttl_secs),
+                uploads,
             },
             token: token.map(Into::into),
             tls,
@@ -267,6 +275,11 @@ impl Ui for WebUi {
             service: setup::ServiceFn(setup::service_op_adapter),
         };
         app = app.merge(setup::router(setup_state));
+
+        // Upload routes (file-uploads design §5.2). Merged BEFORE the
+        // token layer, so both `/api/uploads` routes are gated by the same
+        // `require_token` as `/ws`, `/commands` and `/images/{id}`.
+        app = app.merge(uploads::router(self.ws_state.uploads.clone()));
 
         // Gate every route behind the shared secret when one is configured.
         // Open by default (loopback); `main` guarantees a token exists before
@@ -754,9 +767,9 @@ fn dispatch_inbound(
     registry: &SessionRegistry,
 ) -> bool {
     match serde_json::from_str::<InboundMessage>(line) {
-        Ok(InboundMessage::SendMessage { text }) => {
-            action_sender.send(UiAction::SendMessage(text)).is_ok()
-        }
+        Ok(InboundMessage::SendMessage { text, attachments }) => action_sender
+            .send(UiAction::SendMessage { text, attachments })
+            .is_ok(),
         Ok(InboundMessage::Stop) => action_sender.send(UiAction::RequestStop).is_ok(),
         // Pause/resume the running sub-agent — same immediate path as Stop
         // (the controller handles them without queueing behind the turn).
@@ -800,7 +813,10 @@ fn dispatch_inbound(
         // Re-attach mid-stream is a client bug; ignore rather than reset.
         Ok(InboundMessage::Attach { .. }) => true,
         Ok(InboundMessage::Shutdown) => {
-            let _ = action_sender.send(UiAction::SendMessage("/exit".to_string()));
+            let _ = action_sender.send(UiAction::SendMessage {
+                text: "/exit".to_string(),
+                attachments: Vec::new(),
+            });
             false
         }
         Err(e) => out_tx
@@ -924,6 +940,10 @@ mod tests {
             mcp_tools_count: 0,
             skills_count: 0,
             profile_pin: None,
+            uploads: crate::attachments::UploadStore::new(
+                crate::attachments::UploadStore::default_root(),
+                crate::config::UploadsConfig::default(),
+            ),
         };
         let registry = SessionRegistry::new(Arc::new(deps));
         (action_tx, action_rx, out_tx, sm, registry)
@@ -1508,6 +1528,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Pins the uploads route placement: merged before the token layer, so
+    /// both `/api/uploads` routes inherit the gate (unlike `/peakbot-ca.crt`).
+    #[tokio::test]
+    async fn uploads_routes_require_token_when_gated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::attachments::UploadStore::new(
+            dir.path().to_path_buf(),
+            crate::config::UploadsConfig::default(),
+        );
+        let secret: Arc<str> = "s3cret".into();
+        let app: Router = Router::new()
+            .merge(uploads::router(store))
+            .layer(from_fn_with_state(secret, require_token));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let convo = Uuid::new_v4();
+        let resp = bare_client()
+            .post(format!(
+                "http://{addr}/api/uploads?convo={convo}&name=x.txt"
+            ))
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(b"hi".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = bare_client()
+            .get(format!("http://{addr}/api/uploads/{convo}/{convo}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

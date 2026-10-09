@@ -16,6 +16,7 @@
 //!
 //! ```json
 //! {"type":"send_message","text":"hello"}
+//! {"type":"send_message","text":"hi","attachments":["<upload-uuid>"]}   // ids optional
 //! {"type":"stop"}
 //! {"type":"pause"}
 //! {"type":"resume"}
@@ -206,9 +207,9 @@ fn dispatch_stdin_line(
     state_manager: &StateManager,
 ) -> bool {
     match serde_json::from_str::<InboundMessage>(trimmed) {
-        Ok(InboundMessage::SendMessage { text }) => {
-            action_sender.send(UiAction::SendMessage(text)).is_ok()
-        }
+        Ok(InboundMessage::SendMessage { text, attachments }) => action_sender
+            .send(UiAction::SendMessage { text, attachments })
+            .is_ok(),
         Ok(InboundMessage::Stop) => action_sender.send(UiAction::RequestStop).is_ok(),
         // Pause/resume the running sub-agent — same immediate path as Stop
         // (the controller handles them without queueing behind the turn).
@@ -245,7 +246,10 @@ fn dispatch_stdin_line(
         Ok(InboundMessage::Shutdown) => {
             // `/exit` sets `exit_requested`, which unwinds the state loop
             // and lets `main` tear down cleanly.
-            let _ = action_sender.send(UiAction::SendMessage("/exit".to_string()));
+            let _ = action_sender.send(UiAction::SendMessage {
+                text: "/exit".to_string(),
+                attachments: Vec::new(),
+            });
             false
         }
         Err(e) => out_tx
