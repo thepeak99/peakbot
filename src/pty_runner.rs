@@ -641,4 +641,243 @@ mod tests {
         }
         assert!(got_any, "expected at least one notify ping on exit");
     }
+
+    // ── Process-group kill (RED tests for the HUP-immune leak) ─────────
+
+    /// Best-effort process-group cleanup so a RED run never leaks a
+    /// HUP-immune `sleep` child. `pkill -f <marker>` matches the shell's
+    /// argv (which carries the full command line) and the grandchild.
+    #[cfg(unix)]
+    struct PkillGuard(String);
+
+    #[cfg(unix)]
+    impl Drop for PkillGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", &self.0])
+                .output();
+        }
+    }
+
+    /// Spawn a PTY child for a test; `None` (with a note) on spawn error,
+    /// matching this module's defensive skip pattern.
+    #[cfg(unix)]
+    fn spawn_pty_for_test(command: &str) -> Option<PtyHandle> {
+        match spawn(
+            SpawnParams {
+                command: command.to_string(),
+                cwd: None,
+                env: None,
+                shell: String::new(),
+                capture_cap: 50,
+                debounce: None,
+            },
+            None,
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("skipping pty test: {e}");
+                None
+            }
+        }
+    }
+
+    /// Poll the line buffer for a line containing `needle` until the
+    /// deadline.
+    #[cfg(unix)]
+    fn poll_for_line(handle: &PtyHandle, needle: &str, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let has = handle
+                .buffer
+                .lock()
+                .expect("pty buffer mutex poisoned")
+                .lines
+                .iter()
+                .any(|l| l.contains(needle));
+            if has {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Poll `status()` until it leaves `Running` or the deadline passes.
+    #[cfg(unix)]
+    fn wait_until_exited(handle: &PtyHandle, timeout: Duration) -> Option<PtyStatus> {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let st = handle.status();
+            if !st.is_running() {
+                return Some(st);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    /// A grandchild that ignores SIGHUP and keeps the PTY slave open: the
+    /// kernel's session-leader-exit hangup can't reach it, so only a
+    /// process-group kill can. The `300.121` duration is the pkill marker.
+    #[cfg(unix)]
+    #[test]
+    fn kill_reaches_hup_immune_grandchild() {
+        let Some(mut handle) =
+            spawn_pty_for_test("(trap '' HUP; exec sleep 300.121) & echo ready; wait")
+        else {
+            return;
+        };
+        let _guard = PkillGuard("sleep 300.121".into());
+
+        assert!(
+            poll_for_line(&handle, "ready", Duration::from_secs(2)),
+            "ready marker never appeared in the buffer"
+        );
+        handle.kill().expect("kill should succeed");
+
+        let st = wait_until_exited(&handle, Duration::from_secs(3));
+        assert!(
+            matches!(st, Some(PtyStatus::Exited(_))),
+            "kill must reach the HUP-immune grandchild; status after 3s: {st:?}"
+        );
+    }
+
+    /// The shell itself ignores SIGHUP, so a single-pid SIGHUP can't even
+    /// terminate the session leader — escalation to the group is the only
+    /// way out. The `300.122` duration is the pkill marker.
+    #[cfg(unix)]
+    #[test]
+    fn kill_escalates_when_shell_ignores_hup() {
+        let Some(mut handle) =
+            spawn_pty_for_test("trap '' HUP; echo ready; sleep 300.122; echo done")
+        else {
+            return;
+        };
+        let _guard = PkillGuard("sleep 300.122".into());
+
+        assert!(
+            poll_for_line(&handle, "ready", Duration::from_secs(2)),
+            "ready marker never appeared in the buffer"
+        );
+        handle.kill().expect("kill should succeed");
+
+        let st = wait_until_exited(&handle, Duration::from_secs(3));
+        assert!(
+            matches!(st, Some(PtyStatus::Exited(_))),
+            "kill must terminate a shell that ignores SIGHUP; status after 3s: {st:?}"
+        );
+    }
+
+    /// Dropping the handle is the Stop / session-teardown path: it must
+    /// take the whole process group down, not just the session leader.
+    /// The `300.123` duration is the pkill marker.
+    #[cfg(unix)]
+    #[test]
+    fn drop_kills_process_group() {
+        let Some(handle) =
+            spawn_pty_for_test("(trap '' HUP; exec sleep 300.123) & echo ready; wait")
+        else {
+            return;
+        };
+        let _guard = PkillGuard("sleep 300.123".into());
+        let buffer = handle.buffer.clone();
+
+        assert!(
+            poll_for_line(&handle, "ready", Duration::from_secs(2)),
+            "ready marker never appeared in the buffer"
+        );
+        drop(handle);
+
+        let start = Instant::now();
+        let mut st = buffer
+            .lock()
+            .expect("pty buffer mutex poisoned")
+            .status
+            .clone();
+        while st.is_running() && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+            st = buffer
+                .lock()
+                .expect("pty buffer mutex poisoned")
+                .status
+                .clone();
+        }
+        assert!(
+            !st.is_running(),
+            "dropping the handle must kill the process group; status after 3s: {st:?}"
+        );
+    }
+
+    /// Regression guard: the first signal must be SIGHUP, not SIGKILL, so
+    /// a cooperative child gets its cleanup chance (`got-hup` from the
+    /// trap) before any escalation. `pty-pg-t4` is the pkill marker.
+    #[cfg(unix)]
+    #[test]
+    fn sighup_is_delivered_before_sigkill() {
+        let Some(mut handle) = spawn_pty_for_test(
+            "trap 'echo got-hup; exit 0' HUP; echo ready; while :; do sleep 0.1; done # pty-pg-t4",
+        ) else {
+            return;
+        };
+        let _guard = PkillGuard("pty-pg-t4".into());
+
+        assert!(
+            poll_for_line(&handle, "ready", Duration::from_secs(2)),
+            "ready marker never appeared in the buffer"
+        );
+        handle.kill().expect("kill should succeed");
+
+        let st = wait_until_exited(&handle, Duration::from_secs(3));
+        assert!(
+            matches!(st, Some(PtyStatus::Exited(0))),
+            "the shell must exit 0 through its HUP trap; status after 3s: {st:?}"
+        );
+        let joined: String = handle
+            .buffer
+            .lock()
+            .expect("pty buffer mutex poisoned")
+            .lines
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("got-hup"),
+            "the HUP trap must have run before exit; buffer was: {joined:?}"
+        );
+    }
+
+    /// Idempotence: a kill that lands after the child was already reaped
+    /// must be safe — no panic, no status change. Today portable-pty
+    /// surfaces the gone pid as ESRCH (it maps it to the
+    /// `Uncategorized` kind, so match the raw errno); the planned group
+    /// killer short-circuits on `Exited` and returns `Ok(())`.
+    #[cfg(unix)]
+    #[test]
+    fn kill_after_exit_is_noop() {
+        let Some(mut handle) = spawn_pty_for_test("true") else {
+            return;
+        };
+
+        let st = wait_until_exited(&handle, Duration::from_secs(2));
+        assert!(
+            matches!(st, Some(PtyStatus::Exited(0))),
+            "`true` must exit 0; got {st:?}"
+        );
+
+        match handle.kill() {
+            Ok(()) => {}
+            Err(e) => assert_eq!(
+                e.raw_os_error(),
+                Some(3),
+                "kill after exit may only report the process as gone (ESRCH); \
+                 got {e:?}"
+            ),
+        }
+        assert!(
+            matches!(handle.status(), PtyStatus::Exited(0)),
+            "kill after exit must not change the recorded status"
+        );
+    }
 }

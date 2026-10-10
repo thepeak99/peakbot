@@ -43,6 +43,37 @@ async fn wait_for_buffered_line(sm: &StateManager, id: u32, timeout: Duration) -
     false
 }
 
+/// Best-effort process-group cleanup so a RED run never leaks the
+/// HUP-immune heartbeat loop. The per-run tempdir path is unique, so the
+/// marker can't hit anything else.
+#[cfg(unix)]
+struct PkillGuard(String);
+
+#[cfg(unix)]
+impl Drop for PkillGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &self.0])
+            .output();
+    }
+}
+
+/// Read the heartbeat file, retrying past the brief window where the
+/// writer has truncated it but not yet written the new value.
+#[cfg(unix)]
+async fn read_beat_file(path: &std::path::Path) -> Option<String> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(300) {
+        if let Ok(s) = std::fs::read_to_string(path)
+            && !s.trim().is_empty()
+        {
+            return Some(s.trim().to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    None
+}
+
 #[tokio::test]
 async fn bg_start_captures_echoed_lines_into_synthetic_turn() {
     let (sm, _rx) = make_sm_with_bridge();
@@ -241,4 +272,57 @@ async fn bg_drain_appends_synthetic_user_message_with_background_source() {
         }
         other => panic!("synthetic turn must carry Background source, got {other:?}"),
     }
+}
+
+/// `stop_bg` must kill the whole process group: a grandchild that ignores
+/// SIGHUP keeps the PTY slave open and the reader thread wedged. The
+/// heartbeat file is rewritten every 100 ms by the HUP-immune grandchild;
+/// a live one keeps growing after `stop_bg`.
+#[cfg(unix)]
+#[tokio::test]
+async fn bg_stop_kills_hup_immune_grandchild() {
+    let (sm, _rx) = make_sm_with_bridge();
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let beat = dir.path().join("beat");
+    let command = format!(
+        "(trap '' HUP; i=0; while :; do i=$((i+1)); echo $i > '{}/beat'; sleep 0.1; done) & echo ready; wait",
+        dir.path().display()
+    );
+    let _guard = PkillGuard(dir.path().display().to_string());
+
+    let entry = sm
+        .start_bg(StartParams {
+            command,
+            capture_cap: DEFAULT_CAPTURE_LINES,
+            cwd: None,
+            label: Some("pg-kill".into()),
+            cooldown: Duration::ZERO,
+            env: None,
+            shell: String::new(),
+        })
+        .expect("start_bg should succeed");
+
+    // Liveness probe: the heartbeat exists only once the HUP-immune
+    // grandchild is actually running.
+    let started = std::time::Instant::now();
+    while !beat.exists() {
+        if started.elapsed() > Duration::from_secs(3) {
+            panic!("heartbeat file never appeared — grandchild never started");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = sm.stop_bg(entry.id).expect("stop_bg should succeed");
+
+    // Two samples 1 s apart: a live grandchild rewrites the file every
+    // 100 ms, so the values must differ; a dead one freezes them.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let v1 = read_beat_file(&beat).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let v2 = read_beat_file(&beat).await;
+    assert_eq!(
+        v1, v2,
+        "the HUP-immune grandchild must be dead after stop_bg — the \
+         heartbeat kept growing (v1={v1:?}, v2={v2:?})"
+    );
 }
