@@ -6,7 +6,8 @@
 //! Foreground bash and `bash_bg` **necessarily** need the same primitive:
 //! spawn a child under a PTY (so `isatty()`-checking programs behave),
 //! read its output line-by-line, strip ANSI, push into a capped ring
-//! buffer, and SIGHUP it on drop. Maintaining two copies of this would
+//! buffer, and kill its process group on drop. Maintaining two copies of
+//! this would
 //! invite drift between them — exactly the failure mode the
 //! "one buffer, two views" rule in `make-term-great-again.md` exists to
 //! prevent.
@@ -15,7 +16,7 @@
 //!
 //! - **Shared (this module):** PTY allocation, command spawn, reader
 //!   thread (line split + ANSI strip + ring append), buffer cap +
-//!   eviction, optional notify-channel ping, child SIGHUP on drop.
+//!   eviction, optional notify-channel ping, process-group kill on drop.
 //! - **Not shared:** debounce policy, multi-process registry, circuit-
 //!   breaker bookkeeping, tier flags, drain-and-clear semantics — all
 //!   live in `bg_processes.rs` because they're registry-level concerns,
@@ -40,6 +41,9 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Maximum bytes per captured line before truncation kicks in. Protects
 /// the LLM from log floods carrying a single multi-MB line.
 pub const MAX_LINE_BYTES: usize = 4096;
+
+/// SIGHUP→SIGKILL escalation window. Must stay < tools::bash::POST_KILL_GRACE.
+pub const KILL_GRACE: Duration = Duration::from_millis(250);
 
 // ── Public types ─────────────────────────────────────────────────────────
 
@@ -137,8 +141,9 @@ pub enum SpawnError {
     TakeWriter(String),
 }
 
-/// Owning handle to a PTY-attached child. Dropping the handle SIGHUPs
-/// the child and joins the reader thread (best-effort, no block).
+/// Owning handle to a PTY-attached child. Dropping the handle kills the
+/// child's process group and joins the reader thread (best-effort, no
+/// block).
 pub struct PtyHandle {
     pub pid: u32,
     /// Shared with the reader thread. Consumers snapshot under this
@@ -149,8 +154,9 @@ pub struct PtyHandle {
     /// so we own it after `spawn` and reuse on `write_stdin`.
     writer: Box<dyn Write + Send>,
 
-    /// `ChildKiller` clone — `kill` sends `SIGHUP` on Unix / terminates
-    /// on Windows. Held separately from the child handle (which moved
+    /// `ChildKiller` clone — `kill` kills the process group on Unix
+    /// (SIGHUP, then SIGKILL after [`KILL_GRACE`]) / terminates on
+    /// Windows. Held separately from the child handle (which moved
     /// into the reader thread for `wait`) so we can signal even after
     /// the reader joins.
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -174,8 +180,9 @@ impl PtyHandle {
         Ok(bytes.len())
     }
 
-    /// Send SIGHUP / terminate. Idempotent; reader thread will observe
-    /// EOF and flip status to `Exited` on its own.
+    /// Kill the process group (SIGHUP, then SIGKILL) / terminate.
+    /// Idempotent; reader thread will observe EOF and flip status to
+    /// `Exited` on its own.
     pub fn kill(&mut self) -> std::io::Result<()> {
         self.killer.kill()
     }
@@ -307,8 +314,11 @@ pub fn spawn(
         .slave
         .spawn_command(cmd)
         .map_err(|e| SpawnError::Spawn(e.to_string()))?;
-    let pid = child.process_id().unwrap_or(0);
-    let killer = child.clone_killer();
+    // A missing pid is a spawn failure, not a fallback: 0 is not a valid
+    // pgid, and `killpg(0)` would signal peakbot's own process group.
+    let pid = child
+        .process_id()
+        .ok_or_else(|| SpawnError::Spawn("child has no pid".into()))?;
 
     // Drop the slave so EOF reaches the reader once the child exits.
     drop(pair.slave);
@@ -323,6 +333,17 @@ pub fn spawn(
         .map_err(|e| SpawnError::TakeWriter(e.to_string()))?;
 
     let buffer = Arc::new(Mutex::new(LineBuffer::new(capture_cap)));
+    // Unix: kill the child's whole process group — portable-pty's
+    // `setsid` gives the shell its own group (pgid == pid), so `killpg`
+    // reaches HUP-immune grandchildren a single-pid SIGHUP can't.
+    // Non-Unix keeps portable-pty's per-process killer unchanged.
+    #[cfg(unix)]
+    let killer: Box<dyn ChildKiller + Send + Sync> = Box::new(ProcessGroupKiller {
+        pgid: pid as libc::pid_t,
+        buffer: buffer.clone(),
+    });
+    #[cfg(not(unix))]
+    let killer = child.clone_killer();
     let reader_handle = spawn_reader(reader, buffer.clone(), child, notify_tx, debounce);
 
     Ok(PtyHandle {
@@ -332,6 +353,76 @@ pub fn spawn(
         killer,
         reader: Some(reader_handle),
     })
+}
+
+// ── Unix process-group killer ────────────────────────────────────────────
+
+/// Signals the child's whole process group, not just one pid.
+/// portable-pty's `setsid` makes `pgid == sid == pid`, and the reader
+/// reaps the shell only after PTY EOF (all slaves closed) — so while
+/// `status` is `Running`, the shell is still (at least) a zombie in this
+/// group and the pgid cannot have been reused by a stranger.
+#[cfg(unix)]
+#[derive(Debug)]
+struct ProcessGroupKiller {
+    pgid: libc::pid_t,
+    buffer: Arc<Mutex<LineBuffer>>,
+}
+
+#[cfg(unix)]
+impl ChildKiller for ProcessGroupKiller {
+    /// SIGHUP the group; if the leader is still unreaped after
+    /// [`KILL_GRACE`], SIGKILL it. Idempotent — a kill landing after the
+    /// reader reaped the shell is a clean no-op (HUP-immune children can
+    /// only survive because they hold a slave open, which keeps the
+    /// leader unreaped until they die).
+    fn kill(&mut self) -> std::io::Result<()> {
+        if !leader_unreaped(&self.buffer) {
+            return Ok(());
+        }
+        signal_group(self.pgid, libc::SIGHUP)?;
+        let buffer = self.buffer.clone();
+        let pgid = self.pgid;
+        std::thread::spawn(move || {
+            std::thread::sleep(KILL_GRACE);
+            if leader_unreaped(&buffer) {
+                let _ = signal_group(pgid, libc::SIGKILL);
+            }
+        });
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(Self {
+            pgid: self.pgid,
+            buffer: self.buffer.clone(),
+        })
+    }
+}
+
+/// `killpg` wrapper: a vanished group (ESRCH) is a successful no-op, not
+/// an error — the kill path is idempotent by contract.
+#[cfg(unix)]
+fn signal_group(pgid: libc::pid_t, sig: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::killpg(pgid, sig) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        _ => Err(err),
+    }
+}
+
+/// `true` while the reader hasn't reaped the shell (status `Running`).
+/// A poisoned mutex means the reader died — treat as reaped so `kill`
+/// degrades to a no-op instead of erroring.
+#[cfg(unix)]
+fn leader_unreaped(buffer: &Mutex<LineBuffer>) -> bool {
+    buffer
+        .lock()
+        .map(|b| b.status.is_running())
+        .unwrap_or(false)
 }
 
 /// Per-process reader thread. Streams the PTY master into the line
@@ -849,10 +940,9 @@ mod tests {
     }
 
     /// Idempotence: a kill that lands after the child was already reaped
-    /// must be safe — no panic, no status change. Today portable-pty
-    /// surfaces the gone pid as ESRCH (it maps it to the
-    /// `Uncategorized` kind, so match the raw errno); the planned group
-    /// killer short-circuits on `Exited` and returns `Ok(())`.
+    /// must be a clean no-op — no panic, no status change. The group
+    /// killer short-circuits on `Exited` (the reader reaped the shell),
+    /// so `kill` returns `Ok(())`.
     #[cfg(unix)]
     #[test]
     fn kill_after_exit_is_noop() {
@@ -866,15 +956,9 @@ mod tests {
             "`true` must exit 0; got {st:?}"
         );
 
-        match handle.kill() {
-            Ok(()) => {}
-            Err(e) => assert_eq!(
-                e.raw_os_error(),
-                Some(3),
-                "kill after exit may only report the process as gone (ESRCH); \
-                 got {e:?}"
-            ),
-        }
+        handle
+            .kill()
+            .expect("kill after exit must be a clean no-op, not an error");
         assert!(
             matches!(handle.status(), PtyStatus::Exited(0)),
             "kill after exit must not change the recorded status"

@@ -30,8 +30,9 @@
 //!    called between agent turns. The drain assembles one `[bg output]`
 //!    block per non-empty process whose cooldown has elapsed and clears
 //!    their rings. Exit notifications bypass the cooldown gate.
-//! 4. `BgRegistry::stop` (or `Drop`) calls the killer (SIGHUP on Unix),
-//!    joins the reader, and removes the process from the registry.
+//! 4. `BgRegistry::stop` (or `Drop`) calls the killer (process-group
+//!    kill on Unix), joins the reader, and removes the process from the
+//!    registry.
 //!
 //! ## Lock discipline
 //!
@@ -114,9 +115,9 @@ pub struct BgProcess {
     /// Writer end of the PTY — used by `send_line`.
     writer: Box<dyn Write + Send>,
 
-    /// `ChildKiller` clone — calling `kill` sends `SIGHUP` on Unix /
-    /// terminates the process on Windows. Held separately from the
-    /// child handle (which moved into the reader thread for `wait`)
+    /// `ChildKiller` clone — calling `kill` kills the process group on
+    /// Unix / terminates the process on Windows. Held separately from
+    /// the child handle (which moved into the reader thread for `wait`)
     /// so we can signal even after the reader joins.
     killer: Box<dyn ChildKiller + Send + Sync>,
 
@@ -356,8 +357,8 @@ impl BgRegistry {
         let Some(mut proc) = self.procs.remove(&id) else {
             return Err(BgError::NotFound(id));
         };
-        // Kill (SIGHUP on Unix). Reader will see EOF and exit on its own;
-        // we join it below.
+        // Kill the process group (Unix). Reader will see EOF and exit
+        // on its own; we join it below.
         let _ = proc.killer.kill();
         let (exit_code, final_lines) = {
             let buf = proc.buffer.lock().expect("pty buffer mutex poisoned");
