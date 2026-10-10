@@ -22,6 +22,10 @@
 //!   live in `bg_processes.rs` because they're registry-level concerns,
 //!   not per-process.
 //!
+//! ## Master lifetime
+//!
+//! The master is held until the child exits: dropping it early closes the ConPTY (killing a starting child), yet ConPTY only EOFs after the drop.
+//!
 //! ## Lock discipline
 //!
 //! The reader thread holds `Arc<Mutex<LineBuffer>>`. All buffer mutation
@@ -35,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Maximum bytes per captured line before truncation kicks in. Protects
@@ -157,7 +161,7 @@ pub struct PtyHandle {
     /// `ChildKiller` clone — `kill` kills the process group on Unix
     /// (SIGHUP, then SIGKILL after [`KILL_GRACE`]) / terminates on
     /// Windows. Held separately from the child handle (which moved
-    /// into the reader thread for `wait`) so we can signal even after
+    /// into the waiter thread for `wait`) so we can signal even after
     /// the reader joins.
     killer: Box<dyn ChildKiller + Send + Sync>,
 
@@ -337,6 +341,7 @@ pub fn spawn(
     // `setsid` gives the shell its own group (pgid == pid), so `killpg`
     // reaches HUP-immune grandchildren a single-pid SIGHUP can't.
     // Non-Unix keeps portable-pty's per-process killer unchanged.
+    // Both branches run before `spawn_reader` moves `child` away.
     #[cfg(unix)]
     let killer: Box<dyn ChildKiller + Send + Sync> = Box::new(ProcessGroupKiller {
         pgid: pid as libc::pid_t,
@@ -344,7 +349,14 @@ pub fn spawn(
     });
     #[cfg(not(unix))]
     let killer = child.clone_killer();
-    let reader_handle = spawn_reader(reader, buffer.clone(), child, notify_tx, debounce);
+    let reader_handle = spawn_reader(
+        reader,
+        buffer.clone(),
+        child,
+        pair.master,
+        notify_tx,
+        debounce,
+    );
 
     Ok(PtyHandle {
         pid,
@@ -427,16 +439,29 @@ fn leader_unreaped(buffer: &Mutex<LineBuffer>) -> bool {
 
 /// Per-process reader thread. Streams the PTY master into the line
 /// buffer, splits on `\n`, strips ANSI, and pings `notify_tx` on
-/// dirty (debounced if requested). On EOF: waits the child, flips
-/// `status` to `Exited`, sets `dirty`, and pings once unconditionally.
+/// dirty (debounced if requested). On EOF: joins the waiter for the
+/// exit code, flips `status` to `Exited`, sets `dirty`, and pings once
+/// unconditionally.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     buffer: Arc<Mutex<LineBuffer>>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn MasterPty + Send>,
     notify_tx: Option<UnboundedSender<()>>,
     debounce: Option<Duration>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        // A separate thread because the reader can't reach EOF on Windows
+        // until the master is dropped, and that must wait for the child.
+        let waiter = std::thread::spawn(move || {
+            let code = match child.wait() {
+                Ok(status) => status.exit_code() as i32,
+                Err(_) => -1,
+            };
+            drop(master);
+            code
+        });
+
         let mut buf = [0u8; 4096];
         let mut leftover: Vec<u8> = Vec::new();
         let mut last_notify: Option<Instant> = None;
@@ -478,11 +503,8 @@ fn spawn_reader(
             }
         }
 
-        // Reap exit code.
-        let code = match child.wait() {
-            Ok(status) => status.exit_code() as i32,
-            Err(_) => -1,
-        };
+        // A panicked waiter is reported like a failed `wait`.
+        let code = waiter.join().unwrap_or(-1);
         if let Ok(mut b) = buffer.lock() {
             b.status = PtyStatus::Exited(code);
             b.dirty = true;
@@ -962,6 +984,171 @@ mod tests {
         assert!(
             matches!(handle.status(), PtyStatus::Exited(0)),
             "kill after exit must not change the recorded status"
+        );
+    }
+
+    // ── Exit-reporting contract (regression guards) ─────────────────────
+    //
+    // These tests lock the observable exit-reporting contract that the
+    // ConPTY master-lifetime fix (the waiter thread holds `master` until
+    // `child.wait()` returns) must preserve: the exit code is reported
+    // as `Exited(code)`, a newline-less tail is flushed before the
+    // status flip, `dirty` is set, and the terminal ping fires — even
+    // with capture disabled.
+
+    /// Spawn a child for a test; `None` (with a logged skip) when the
+    /// platform has no usable PTY — same defensive posture as the
+    /// pre-existing e2e tests in this module.
+    fn spawn_for_test(
+        command: &str,
+        capture_cap: usize,
+        notify_tx: Option<UnboundedSender<()>>,
+    ) -> Option<PtyHandle> {
+        match spawn(
+            SpawnParams {
+                command: command.into(),
+                cwd: None,
+                env: None,
+                // Empty ⇒ `sh`, matching how the other tests here
+                // specify the shell.
+                shell: String::new(),
+                capture_cap,
+                debounce: None,
+            },
+            notify_tx,
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("skipping pty test: {e}");
+                None
+            }
+        }
+    }
+
+    /// Poll until the child reaches a terminal status, panicking past
+    /// the deadline. Mirrors the wait loop in the existing e2e tests.
+    fn wait_exited(handle: &PtyHandle, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while handle.status().is_running() {
+            if Instant::now() >= deadline {
+                panic!(
+                    "child did not reach a terminal status within {timeout:?} \
+                     (last seen: {:?})",
+                    handle.status()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The child emits a line, then exits non-zero: the exit code must
+    /// land as `Exited(3)` with the line in the ring. On Windows this is
+    /// the guard against dropping the master before the child exits
+    /// (0xC0000142).
+    #[test]
+    fn exit_reported_while_master_held() {
+        let handle = match spawn_for_test("echo hi; exit 3", 10, None) {
+            Some(h) => h,
+            None => return,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !handle.status().is_running() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("child did not reach a terminal status within 5s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let buf = handle.buffer.lock().unwrap();
+        assert_eq!(
+            buf.status,
+            PtyStatus::Exited(3),
+            "exit code 3 must be reported; lines: {:?}",
+            buf.lines
+        );
+        let joined: String = buf.lines.iter().cloned().collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("hi"),
+            "captured buffer must contain the child's output; was: {joined:?}"
+        );
+        assert!(buf.dirty, "buffer must be dirty after exit");
+    }
+
+    /// A child that exits immediately, before emitting anything, with
+    /// capture disabled (`capture_cap: 0`): the exit code must still be
+    /// reported, `dirty` still set, and the notify channel must receive
+    /// its terminal ping. Guards the "always ping once on exit" rule
+    /// through the master-lifetime refactor (the exit path must not
+    /// depend on any captured line having landed).
+    #[test]
+    fn fast_exit_still_reports() {
+        let (tx, mut rx) = unbounded_channel();
+        let handle = match spawn_for_test("exit 7", 0, Some(tx)) {
+            Some(h) => h,
+            None => return,
+        };
+
+        wait_exited(&handle, Duration::from_secs(5));
+
+        let buf = handle.buffer.lock().unwrap();
+        assert_eq!(
+            buf.status,
+            PtyStatus::Exited(7),
+            "fast child must report exit code 7 even with capture disabled"
+        );
+        assert!(buf.lines.is_empty(), "cap 0 must not retain lines");
+        assert!(
+            buf.dirty,
+            "exit must mark the buffer dirty even with capture disabled"
+        );
+
+        let mut got_any = false;
+        while rx.try_recv().is_ok() {
+            got_any = true;
+        }
+        assert!(
+            got_any,
+            "expected at least one notify ping on exit (capture disabled)"
+        );
+    }
+
+    /// Output emitted right before exit WITHOUT a trailing newline must
+    /// be flushed into the buffer by the time the status flips to
+    /// `Exited` — any observer that sees `Exited(code)` must also see
+    /// the fragment. The reader flushes `leftover` before it reaps the
+    /// child and writes the status, so the first observed terminal
+    /// state must already contain the line. (Polls at 5ms to catch an
+    /// implementation that flips status before flushing; the current
+    /// order makes this deterministic on Linux.)
+    #[test]
+    fn partial_line_flushed_before_exit() {
+        let handle = match spawn_for_test("printf partial; exit 0", 10, None) {
+            Some(h) => h,
+            None => return,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !handle.status().is_running() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("child did not reach a terminal status within 5s");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let buf = handle.buffer.lock().unwrap();
+        assert_eq!(buf.status, PtyStatus::Exited(0));
+        let joined: String = buf.lines.iter().cloned().collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("partial"),
+            "newline-less tail must be in the buffer by the time status \
+             is Exited; was: {joined:?}"
         );
     }
 }
