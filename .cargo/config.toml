@@ -2,3 +2,6 @@
 # peaks well past 32 GB and OOMs the host. Override with -j N / CARGO_BUILD_JOBS.
 [build]
 jobs = 8
+# Bound per-binary test harness threads to 8 (default = all cores); override with `-- --test-threads=N`.
+[env]
+RUST_TEST_THREADS = "8"
