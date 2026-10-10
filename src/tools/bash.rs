@@ -1,5 +1,6 @@
 use crate::pty_runner::{self, PtyStatus, SpawnError, SpawnParams};
 use crate::state::StateManager;
+use crate::tools::{ShellKind, shell_output_dir};
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
@@ -13,7 +14,6 @@ use tokio::sync::mpsc::unbounded_channel;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 7200; // 2 hours
-const TEMP_DIR_NAME: &str = "peakbot";
 
 /// Line-buffer cap for the foreground `bash` tool. A generous ring so
 /// long-running builds don't lose their preamble before we serialise the
@@ -69,8 +69,8 @@ pub struct BashArgs {
 
 #[derive(Clone)]
 pub struct BashTool {
-    /// Shell executable path (e.g. "/bin/sh" or "C:\Program Files\Git\bin\bash.exe")
-    shell: String,
+    /// The shell every call spawns with (Bash-shaped: `-c <command>`).
+    shell: ShellKind,
     /// Optional environment variables to set for the command
     env: Option<HashMap<String, String>>,
     /// Optional handle for live panel updates (`start/update/finish_bash_panel`).
@@ -87,7 +87,9 @@ pub struct BashTool {
 impl Default for BashTool {
     fn default() -> Self {
         Self {
-            shell: "/bin/sh".to_string(),
+            shell: ShellKind::Bash {
+                path: "/bin/sh".to_string(),
+            },
             env: None,
             state_manager: None,
             session_cwd: std::env::current_dir().unwrap_or_default(),
@@ -96,11 +98,11 @@ impl Default for BashTool {
 }
 
 impl BashTool {
-    /// Create a new BashTool with the given shell path and environment variables.
+    /// Create a new BashTool for the shell at `path` and environment variables.
     /// No panel updates — wire one in via [`Self::with_state_manager`].
-    pub fn new(shell: String, env: Option<HashMap<String, String>>) -> Self {
+    pub fn new(path: String, env: Option<HashMap<String, String>>) -> Self {
         Self {
-            shell,
+            shell: ShellKind::Bash { path },
             env,
             state_manager: None,
             session_cwd: std::env::current_dir().unwrap_or_default(),
@@ -195,7 +197,7 @@ impl BashTool {
 /// pipe). Mirrors the "one buffer, two views" rule from
 /// `make-term-great-again.md` — same bytes the panel sees, persisted.
 fn save_full_output(output: &str) -> std::io::Result<PathBuf> {
-    let temp_dir = std::env::temp_dir().join(TEMP_DIR_NAME);
+    let temp_dir = shell_output_dir();
     std::fs::create_dir_all(&temp_dir)?;
 
     let counter = SESSION_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -272,10 +274,11 @@ impl Tool for BashTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        let shell_name = std::path::Path::new(&self.shell)
+        let shell_name = std::path::Path::new(self.shell.executable())
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("sh");
+        let output_dir = shell_output_dir().display().to_string();
         ToolDefinition {
             name: "bash".to_string(),
             description: format!(
@@ -285,11 +288,11 @@ impl Tool for BashTool {
                 (`ls --color=auto`, `sudo`, `ssh`, `git push` credential prompts). \
                 Live output is mirrored to the on-screen bash panel while the command runs. \
                 Use `head` to show first N lines, `tail` to show last N lines (default: 100). \
-                Full output is always saved to /tmp/peakbot/ and accessible via file_read. \
+                Full output is always saved to {} and accessible via file_read. \
                 Commands run in {}. Default timeout is 30 seconds. \
                 Note: commands that block reading stdin (e.g. bare `cat`) will hang until \
                 timeout — pipe input in (`echo x | cat`) or redirect from a file.",
-                shell_name
+                output_dir, shell_name
             ),
             parameters: json!({
                 "type": "object",
@@ -924,6 +927,33 @@ mod tests {
              file grew from {len_before_stop} to {len_after} bytes during \
              the join window — the nested timeout wrapper did not propagate \
              the drop, or SIGHUP was not sent"
+        );
+    }
+
+    // ── PR2: descriptions must use `shell_output_dir()` ────────────────
+
+    /// The `bash` tool's model-facing description must name the full-output
+    /// directory via `crate::tools::shell_output_dir()` — not the
+    /// hard-coded `/tmp/peakbot/` literal (wrong on Windows, where the
+    /// temp dir is `%TEMP%`). On Linux the function yields `/tmp/peakbot`
+    /// WITHOUT a trailing slash, so "contains the function's output" and
+    /// "lacks the hard-coded `/tmp/peakbot/` literal" are distinguishable
+    /// checks (see `tools::tests::shell_output_dir_is_temp_dir_peakbot`
+    /// for the pin that the function is temp_dir/peakbot).
+    #[tokio::test]
+    async fn bash_description_uses_shell_output_dir_not_hardcoded_path() {
+        let tool = BashTool::default();
+        let def = tool.definition(String::new()).await;
+        let dir = crate::tools::shell_output_dir().display().to_string();
+        assert!(
+            def.description.contains(&dir),
+            "bash description must name the shell output dir ({dir}); was: {}",
+            def.description
+        );
+        assert!(
+            !def.description.contains("/tmp/peakbot/"),
+            "bash description must not hard-code /tmp/peakbot/; was: {}",
+            def.description
         );
     }
 }

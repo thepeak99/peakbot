@@ -1,6 +1,7 @@
+use crate::tools::{ShellKind, shell_output_dir};
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,7 +11,6 @@ use tokio::process::Command;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 7200; // 2 hours
-const TEMP_DIR_NAME: &str = "peakbot";
 
 /// Session-unique counter for generating output filenames
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -33,24 +33,25 @@ pub struct PowerShellArgs {
     tail: Option<usize>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 pub struct PowerShellTool {
-    /// Path to the PowerShell executable (pwsh.exe or powershell.exe)
-    shell: String,
+    /// The shell every call spawns with (PowerShell-shaped: `-Command`
+    /// prefixed with the UTF-8 setup — see `ShellKind::args`).
+    shell: ShellKind,
     /// Optional environment variables to set for the command
-    #[serde(default)]
     env: Option<HashMap<String, String>>,
     /// The per-session working directory every call is spawned in. Set
     /// explicitly at construction (defaults to the process cwd via `new`/
-    /// `Default`). Construction-time state, never (de)serialized.
-    #[serde(skip)]
+    /// `Default`).
     session_cwd: PathBuf,
 }
 
 impl Default for PowerShellTool {
     fn default() -> Self {
         Self {
-            shell: "pwsh".to_string(),
+            shell: ShellKind::PowerShell {
+                path: "pwsh".to_string(),
+            },
             env: None,
             session_cwd: std::env::current_dir().unwrap_or_default(),
         }
@@ -58,10 +59,10 @@ impl Default for PowerShellTool {
 }
 
 impl PowerShellTool {
-    /// Create a new PowerShellTool with the given executable and environment variables.
-    pub fn new(shell: String, env: Option<HashMap<String, String>>) -> Self {
+    /// Create a new PowerShellTool for the executable at `path` and environment variables.
+    pub fn new(path: String, env: Option<HashMap<String, String>>) -> Self {
         Self {
-            shell,
+            shell: ShellKind::PowerShell { path },
             env,
             session_cwd: std::env::current_dir().unwrap_or_default(),
         }
@@ -117,7 +118,7 @@ impl PowerShellTool {
 
 /// Save full output to temp files and return the paths
 fn save_full_output(stdout: &str, stderr: &str) -> std::io::Result<(PathBuf, PathBuf)> {
-    let temp_dir = std::env::temp_dir().join(TEMP_DIR_NAME);
+    let temp_dir = shell_output_dir();
     std::fs::create_dir_all(&temp_dir)?;
 
     let counter = SESSION_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -200,13 +201,15 @@ impl Tool for PowerShellTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        let output_dir = shell_output_dir().display().to_string();
         ToolDefinition {
             name: "powershell".to_string(),
-            description: "Run a PowerShell command and return stdout and stderr. \
+            description: format!(
+                "Run a PowerShell command and return stdout and stderr. \
                 Use `head` to show first N lines, `tail` to show last N lines (default: 100). \
-                Full output is always saved to /tmp/peakbot/ and accessible via file_read. \
+                Full output is always saved to {output_dir} and accessible via file_read. \
                 Commands run in PowerShell. Default timeout is 30 seconds."
-                .to_string(),
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -255,9 +258,8 @@ impl Tool for PowerShellTool {
 
         // Build the command with optional environment variables.
         // stdin is explicitly detached: agent tools are non-interactive.
-        let mut cmd = Command::new(&self.shell);
-        cmd.arg("-Command")
-            .arg(&args.command)
+        let mut cmd = Command::new(self.shell.executable());
+        cmd.args(self.shell.args(&args.command))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -383,5 +385,37 @@ impl Tool for PowerShellTool {
                 Err(PowerShellError::Execution(error))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PR2: descriptions must use `shell_output_dir()` ────────────────
+
+    /// The `powershell` tool's model-facing description must name the
+    /// full-output directory via `crate::tools::shell_output_dir()` —
+    /// not the hard-coded `/tmp/peakbot/` literal (wrong on Windows,
+    /// where the temp dir is `%TEMP%`). On Linux the function yields
+    /// `/tmp/peakbot` WITHOUT a trailing slash, so the two checks are
+    /// distinguishable (see `tools::tests::shell_output_dir_is_
+    /// temp_dir_peakbot` for the pin that the function is
+    /// temp_dir/peakbot).
+    #[tokio::test]
+    async fn powershell_description_uses_shell_output_dir_not_hardcoded_path() {
+        let tool = PowerShellTool::default();
+        let def = tool.definition(String::new()).await;
+        let dir = crate::tools::shell_output_dir().display().to_string();
+        assert!(
+            def.description.contains(&dir),
+            "powershell description must name the shell output dir ({dir}); was: {}",
+            def.description
+        );
+        assert!(
+            !def.description.contains("/tmp/peakbot/"),
+            "powershell description must not hard-code /tmp/peakbot/; was: {}",
+            def.description
+        );
     }
 }

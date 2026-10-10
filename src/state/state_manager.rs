@@ -134,11 +134,6 @@ pub struct StateManager {
     /// and the UI keeps the buffer instead of dropping the typed bytes.
     bash_stdin_tx: RwLock<Option<mpsc::UnboundedSender<String>>>,
 
-    // ── Background process shell ──────────────────────────────────────────────
-    /// Shell executable used by `bash_bg` when spawning background processes.
-    /// Injected by `main.rs` after shell detection. Empty until set.
-    shell: RwLock<String>,
-
     // ── Per-session working directory ─────────────────────────────────────────
     /// The directory every path-aware tool resolves against and every shell
     /// spawns in. Single source of truth for the session's cwd — never mutated
@@ -245,7 +240,6 @@ impl StateManager {
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             bg_notify_tx: RwLock::new(None),
             bash_stdin_tx: RwLock::new(None),
-            shell: RwLock::new(String::new()),
             session_cwd: RwLock::new(std::env::current_dir().unwrap_or_default()),
             // Initial token is fresh (never cancelled). `set_running(true)`
             // re-mints on every turn start (D-D / invariant I1), so the
@@ -3005,13 +2999,6 @@ impl StateManager {
         *self.bg_notify_tx.write().unwrap() = None;
     }
 
-    /// Set the shell executable used by background processes.
-    /// Called once at startup after shell detection.
-    pub fn set_shell(&self, shell: String) {
-        let mut guard = self.shell.write().unwrap();
-        *guard = shell;
-    }
-
     /// The session's working directory — the single source of truth that
     /// path-aware tools resolve against and shells spawn in. Cloned per read
     /// (tools snapshot it at agent-build time; reads are rare).
@@ -3032,16 +3019,8 @@ impl StateManager {
     /// surface it to the model immediately.
     pub fn start_bg(
         &self,
-        mut params: StartParams,
+        params: StartParams,
     ) -> Result<crate::bg_processes::BgListEntry, BgError> {
-        // Inject the detected shell if the caller didn't specify one.
-        if params.shell.is_empty() {
-            let shell = self.shell.read().unwrap().clone();
-            if !shell.is_empty() {
-                params.shell = shell;
-            }
-        }
-
         // Snapshot the sender out of the lock before crossing into the
         // registry — registry::start drops a cloned sender into the
         // reader thread.
@@ -8353,6 +8332,8 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     use std::time::Duration;
+    // PR2: `StartParams.shell` is a `ShellKind` (was `String`).
+    use crate::tools::ShellKind;
 
     /// Build the canonical T1 fixture: a `StateManager` with two live bg
     /// processes (`sleep 30` — they take 30 s to exit naturally, so they're
@@ -8370,6 +8351,8 @@ mod tests {
         sm.set_running(true);
 
         // Two bg PTY-attached processes, each running `sleep 30`.
+        // PR2: `shell` is a `ShellKind` (was a `String` filled in by
+        // `set_shell`); the fixture pins an explicit Bash kind.
         for _ in 0..2 {
             sm.start_bg(StartParams {
                 command: "sleep 30".into(),
@@ -8378,7 +8361,9 @@ mod tests {
                 label: None,
                 cooldown: Duration::ZERO,
                 env: None,
-                shell: "sh".into(),
+                shell: ShellKind::Bash {
+                    path: "sh".to_string(),
+                },
             })
             .expect("start_bg must succeed once a notify channel is attached");
         }

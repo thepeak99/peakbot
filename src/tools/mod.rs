@@ -36,3 +36,27 @@ pub use thought_gate::ThoughtGate;
 pub use time_budget::TimeBudget;
 pub use todo::{TodoArgs, TodoItem, TodoStatus, TodoTool};
 pub use view_image::ViewImageTool;
+
+/// The directory both shell tools save full output to. One source of
+/// truth — `temp_dir()/peakbot` is `%TEMP%\peakbot` on Windows, and the
+/// model-facing descriptions must not hard-code the Unix path.
+pub fn shell_output_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("peakbot")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `shell_output_dir` is the OS temp dir plus `peakbot` — the single
+    /// source of truth both shell tools must use (replacing the two
+    /// private `TEMP_DIR_NAME` consts).
+    #[test]
+    fn shell_output_dir_is_temp_dir_peakbot() {
+        assert_eq!(
+            shell_output_dir(),
+            std::env::temp_dir().join("peakbot"),
+            "shell_output_dir must be temp_dir/peakbot"
+        );
+    }
+}
