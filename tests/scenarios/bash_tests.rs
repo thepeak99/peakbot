@@ -32,6 +32,37 @@ async fn run_bash(cmd: &str, timeout_seconds: u64) -> String {
         .expect("bash tool call succeeded")
 }
 
+/// Best-effort process-group cleanup so a RED run never leaks the
+/// HUP-immune heartbeat loop. The per-run tempdir path is unique, so the
+/// marker can't hit anything else.
+#[cfg(unix)]
+struct PkillGuard(String);
+
+#[cfg(unix)]
+impl Drop for PkillGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &self.0])
+            .output();
+    }
+}
+
+/// Read the heartbeat file, retrying past the brief window where the
+/// writer has truncated it but not yet written the new value.
+#[cfg(unix)]
+async fn read_beat_file(path: &std::path::Path) -> Option<String> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(300) {
+        if let Ok(s) = std::fs::read_to_string(path)
+            && !s.trim().is_empty()
+        {
+            return Some(s.trim().to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    None
+}
+
 /// The PTY contract: the child DOES see a TTY on stdin. This is the
 /// whole point of slice 3 — `sudo`, `ssh`, and `git push` credential
 /// prompts now work because programs calling `isatty(0)` see a real
@@ -209,6 +240,67 @@ async fn bash_timeout_kills_long_running_command() {
         msg.contains("timed out"),
         "expected timeout message; got: {}",
         msg
+    );
+}
+
+/// The bash tool's timeout path must kill the whole process group: a
+/// HUP-immune grandchild keeps the PTY slave open and the reader thread
+/// wedged. The heartbeat file is rewritten every 100 ms by the
+/// grandchild; a live one keeps growing after the timeout fires.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_timeout_kills_hup_immune_grandchild() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let beat = dir.path().join("beat");
+    let command = format!(
+        "(trap '' HUP; i=0; while :; do i=$((i+1)); echo $i > '{}/beat'; sleep 0.1; done) & echo ready; wait",
+        dir.path().display()
+    );
+    let _guard = PkillGuard(dir.path().display().to_string());
+
+    let tool = BashTool::default();
+    let payload = serde_json::to_string(&json!({
+        "thought": "timeout must kill the process group",
+        "command": command,
+        "timeout_seconds": 1,
+    }))
+    .expect("serialize");
+
+    let call = tokio::spawn(async move { ToolDyn::call(&tool, payload).await });
+
+    // Liveness probe: the heartbeat exists only once the HUP-immune
+    // grandchild is actually running.
+    let started = Instant::now();
+    while !beat.exists() {
+        if started.elapsed() > Duration::from_secs(3) {
+            panic!("heartbeat file never appeared — grandchild never started");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The tool must bail with its timeout error promptly — 4 s is 4× the
+    // 1 s timeout plus the post-kill grace window.
+    let finished = tokio::time::timeout(Duration::from_secs(4), call)
+        .await
+        .expect("tool call must return within 4 s of the timeout firing")
+        .expect("tool task panicked");
+    let err = finished.expect_err("timeout should return an error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("timed out"),
+        "expected timeout message; got: {msg}"
+    );
+
+    // Two samples 1 s apart: a live grandchild rewrites the file every
+    // 100 ms, so the values must differ; a dead one freezes them.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let v1 = read_beat_file(&beat).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let v2 = read_beat_file(&beat).await;
+    assert_eq!(
+        v1, v2,
+        "the HUP-immune grandchild must be dead after the bash timeout — \
+         the heartbeat kept growing (v1={v1:?}, v2={v2:?})"
     );
 }
 

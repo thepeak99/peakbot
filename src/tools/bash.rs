@@ -32,6 +32,10 @@ const PANEL_UPDATE_DEBOUNCE: Duration = Duration::from_millis(200);
 /// tool call open forever.
 const POST_KILL_GRACE: Duration = Duration::from_millis(500);
 
+// The SIGHUP→SIGKILL escalation must complete inside the post-kill
+// grace window, or the tool gives up before SIGKILL fires.
+const _: () = assert!(POST_KILL_GRACE.as_millis() > crate::pty_runner::KILL_GRACE.as_millis());
+
 /// Tail rows mirrored into the live panel via
 /// [`StateManager::update_bash_panel_tail`]. Sized for the **web** panel,
 /// which renders a scrollable buffer (issue #121); the TUI renderer clips
@@ -448,7 +452,8 @@ impl Tool for BashTool {
                         // and let `Drop` clean up.
                         break -1;
                     }
-                    // First timeout — SIGHUP and wait for the exit ping.
+                    // First timeout — kill the process group and wait
+                    // for the exit ping.
                     let _ = handle.kill();
                     killed = true;
                 }
@@ -495,9 +500,10 @@ impl Tool for BashTool {
             sm.finish_bash_panel(exit_code, final_tail_for_panel);
         }
 
-        // Explicitly drop the handle now to SIGHUP any lingering child
-        // and join the reader thread. (Drop runs on return anyway, but
-        // doing it here keeps the OS resource lifecycle obvious.)
+        // Explicitly drop the handle now to kill any lingering process
+        // group and join the reader thread. (Drop runs on return
+        // anyway, but doing it here keeps the OS resource lifecycle
+        // obvious.)
         drop(handle);
 
         if killed {
@@ -597,7 +603,8 @@ mod tests {
     //! (T7): the design's entire `Stop = drop the turn's future` strategy rests
     //! on the fact that a `PtyHandle` owned by an `async fn` body lives in the
     //! future's state machine. Dropping the future therefore runs
-    //! `PtyHandle::drop` → `killer.kill()` → SIGHUP to the PTY session leader.
+    //! `PtyHandle::drop` → `killer.kill()` → the process-group kill (SIGHUP,
+    //! then SIGKILL, on Unix).
     //! If T7 is false on the current code, the whole design is wrong (see
     //! design §9 R1 — fallback is a `Drop`-guard, not a token-in-every-tool).
     //!
@@ -643,8 +650,8 @@ mod tests {
     /// Mechanism (from design §0.1 + §9 R1): `BashTool::call` is an `async fn`
     /// whose body-local `handle: PtyHandle` lives in the generator state. The
     /// `PtyHandle::drop` impl (`pty_runner.rs:224-234`) calls
-    /// `self.killer.kill()` (SIGHUP on Unix). So dropping the future at any
-    /// await point should terminate the child.
+    /// `self.killer.kill()` (process-group kill on Unix). So dropping the
+    /// future at any await point should terminate the child.
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_the_bash_call_future_kills_the_child() {
@@ -671,8 +678,8 @@ mod tests {
         );
 
         // Real drop: drops the Box, which drops the future state, which
-        // drops the `handle: PtyHandle` captured in the async-fn body, which
-        // runs `PtyHandle::drop` → `killer.kill()` → SIGHUP.
+        // drops the `handle: PtyHandle` captured in the async-fn body,
+        // which runs `PtyHandle::drop` → `killer.kill()` → the group kill.
         drop(fut);
 
         // Sanity: 500 ms of `date >> log; sleep 0.1` ⇒ file must be non-empty.
@@ -683,9 +690,9 @@ mod tests {
              the 500 ms activity window (got {len_after_drop} bytes)"
         );
 
-        // Give a wedged child plenty of time to keep writing. If the kill
-        // mechanism (PtyHandle::drop → killer.kill() → SIGHUP) didn't fire,
-        // the file will grow noticeably.
+        // Give a wedged child plenty of time to keep writing. If the
+        // kill mechanism (PtyHandle::drop → killer.kill() → group kill)
+        // didn't fire, the file will grow noticeably.
         sleep(Duration::from_secs(1)).await;
         let len_after_sleep = file_len(&log);
         assert_eq!(
@@ -754,8 +761,8 @@ mod tests {
 
         // Act — production: cancels the token → the racing task's
         // `cancelled()` arm wins → `tool.call` future is dropped → its
-        // `PtyHandle::drop` fires → SIGHUP. Stub: no-op, the cancel
-        // never fires, the task keeps running.
+        // `PtyHandle::drop` fires → the group kill. Stub: no-op, the
+        // cancel never fires, the task keeps running.
         sm.stop_turn_processes();
 
         // (a) The racing task must join within 500 ms.
@@ -812,7 +819,7 @@ mod tests {
     /// `timeout` future) and therefore kills the PTY child (T7's
     /// keystone property). Combined with T6 and T7, this gives us
     /// `cancel → drop → [arbitrary `async` layers] → bash PtyHandle
-    /// drop → SIGHUP`.
+    /// drop → process-group kill`.
     ///
     /// **What this test does NOT prove:** that rig's internal prompt loop
     /// properly drops an in-flight tool future when its own future is
@@ -880,8 +887,8 @@ mod tests {
         // calls `sm.stop_turn_processes()`, which cancels the per-turn
         // token (`state_manager.rs:2180-2188`). The cancel arm of the
         // `select!` wins, the `timeout` future is dropped, the bash call
-        // future inside it is dropped, `PtyHandle::drop` runs,
-        // `killer.kill()` SIGHUPs the child.
+        // future inside it is dropped, `PtyHandle::drop` runs, and
+        // `killer.kill()` kills the process group.
         sm.stop_turn_processes();
 
         // (a) The racing task must join within 500 ms. This is the
@@ -908,9 +915,8 @@ mod tests {
         let _selected = join_outcome.unwrap();
 
         // (b) The file must stop growing. This is the *child-is-dead*
-        // assertion. If SIGHUP didn't reach the bash child (or the child
-        // caught SIGHUP and ignored it — bash doesn't, but a `nohup`
-        // wrapper would), the file grows during the join window.
+        // assertion. If the group kill (SIGHUP, then SIGKILL) didn't
+        // reach the bash child, the file grows during the join window.
         let len_after = file_len(&log);
         assert_eq!(
             len_before_stop, len_after,

@@ -3165,6 +3165,7 @@ dependencies = [
  "http",
  "image",
  "insta",
+ "libc",
  "mime_guess",
  "open",
  "pdf_oxide",

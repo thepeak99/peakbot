@@ -113,6 +113,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # Chunk hashing for idempotent re-index.
 sha2 = "0.10"
 
+# Unix process-group kill (src/pty_runner.rs): `killpg` is a raw syscall,
+# so the group killer needs libc directly. Already in the lockfile (via
+# portable-pty) — this only adds a dependency edge, no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Android-only TLS roots: reqwest 0.13's `rustls-platform-verifier` panics at
 # runtime on Android (needs a JVM Context, reqwest#2968), so src/http.rs roots
 # TLS in the bundled Mozilla certs. `rustls` itself is a top-level dep above.
