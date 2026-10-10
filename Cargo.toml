@@ -133,3 +133,8 @@ tokio = { version = "1", features = ["test-util"] }
 # without changing any test code. `sync` is in tokio-util's default features
 # (`tokio-util/src/lib.rs:57`), so no features need to be enabled.
 tokio-util = { version = "0.7" }
+
+# No debuginfo for test builds: cold codegen of the large lib test binary
+# OOMs at debuginfo=2 (host and CI). Mirrors CI's CARGO_PROFILE_TEST_DEBUG=0.
+[profile.test]
+debug = false
