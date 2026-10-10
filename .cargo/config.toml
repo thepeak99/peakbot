@@ -1,0 +1,4 @@
+# Cap parallel rustc at 8: an uncapped cold 32-way build of this workspace
+# peaks well past 32 GB and OOMs the host. Override with -j N / CARGO_BUILD_JOBS.
+[build]
+jobs = 8
