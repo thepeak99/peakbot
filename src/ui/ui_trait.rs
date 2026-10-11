@@ -168,7 +168,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             "Show the working directory, or change it with /cd <path>",
             true,
         ),
-        SlashCommand::new("bg", "List background processes (bash_bg)", false),
+        SlashCommand::new("bg", "List background processes", false),
         SlashCommand::new("stop", "Stop the agent (interrupt current task)", false),
         SlashCommand::new(
             "pause",
@@ -386,6 +386,35 @@ mod tests {
                 "resume",
                 "exit",
             ],
+        );
+    }
+
+    /// PR3: the `/bg` description is shell-neutral — the bg tool's name is
+    /// shell-derived (`bash_bg` / `powershell_bg`), and this list is static,
+    /// so it must not name either (and `/help` / the popup render it on
+    /// every host).
+    #[test]
+    fn bg_command_description_does_not_name_a_shell_tool() {
+        let cmds = builtin_commands();
+        let bg = cmds
+            .iter()
+            .find(|c| c.name == "bg")
+            .expect("/bg must stay in the builtin list");
+        let lower = bg.description.to_lowercase();
+        assert!(
+            !lower.contains("bash_bg") && !lower.contains("powershell_bg"),
+            "/bg description must not name a shell-specific tool, got: {:?}",
+            bg.description
+        );
+        assert!(
+            !lower.contains("bash"),
+            "/bg description must be bash-free, got: {:?}",
+            bg.description
+        );
+        assert!(
+            lower.contains("background"),
+            "/bg description should still say what it lists, got: {:?}",
+            bg.description
         );
     }
 

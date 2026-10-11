@@ -43,7 +43,7 @@ impl Tool for FileStrReplaceTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: "Replace exact text in an existing file.\n\n\
-PREFER THIS TOOL OVER BASH/SED for in-place edits because:\n\
+PREFER THIS TOOL OVER SHELL COMMANDS for in-place edits because:\n\
 - Provides clear diffs for review\n\
 - Automatically handles whitespace differences (exact → whitespace-normalized)\n\
 - Refuses ambiguous matches unless `replace_all: true` is set\n\

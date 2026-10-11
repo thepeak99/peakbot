@@ -298,7 +298,7 @@ pub fn model_locked_message(pipeline: &str) -> String {
 ///
 /// | `StopTally`  | Output                                                |
 /// |--------------|-------------------------------------------------------|
-/// | `{ shell }`  | `Agent stopped by user (killed 1 bash process)`       |
+/// | `{ shell }`  | `Agent stopped by user (killed 1 shell process)`      |
 /// | `default()`  | `Agent stopped by user`                               |
 ///
 /// The shell clause is omitted when no foreground shell was running, so an
@@ -306,7 +306,7 @@ pub fn model_locked_message(pipeline: &str) -> String {
 /// test pins it byte-exact and so neither stop arm can disagree on wording.
 fn stop_message(t: crate::state::StopTally) -> String {
     if t.shell {
-        "Agent stopped by user (killed 1 bash process)".to_string()
+        "Agent stopped by user (killed 1 shell process)".to_string()
     } else {
         "Agent stopped by user".to_string()
     }
@@ -570,7 +570,35 @@ pub(crate) fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 
 const SYSTEM_PROMPT_PERSONA: &str = include_str!("system_prompt_persona.txt");
 const SYSTEM_PROMPT_CORE: &str = include_str!("system_prompt_core.txt");
+const SYSTEM_PROMPT_SHELL: &str = include_str!("system_prompt_shell.txt");
 const MEMORY_PROMPT_SECTION: &str = include_str!("system_prompt_memory.txt");
+
+/// The shell-specific tool guidance, rendered for the detected shell. Lives
+/// apart from the core so a host never reads another shell's tool names.
+fn shell_section(shell: &ShellKind) -> String {
+    SYSTEM_PROMPT_SHELL
+        .replace("{shell_tool}", shell.name())
+        .replace("{bg_tool}", shell.bg_tool_name())
+        .replace(
+            "{output_dir}",
+            &crate::tools::shell_output_dir().display().to_string(),
+        )
+}
+
+/// The core tool guidance, plus the shell section when a shell was detected.
+/// A `PromptHead::Full` skips both (it replaces the whole static head).
+fn core_guidance(shell: Option<&ShellKind>) -> String {
+    let mut out = String::from(SYSTEM_PROMPT_CORE);
+    if let Some(shell) = shell {
+        // The core ends without a trailing blank line; keep sections apart.
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&shell_section(shell));
+    }
+    out
+}
 
 /// The `# Environment Information` block (cwd, time, version, OS, binary,
 /// shell). Derived fresh at each call so the time is live — shared by the
@@ -619,8 +647,8 @@ pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
 ///
 /// `shell_kind` is the shell detected at startup; its presence appends a
 /// `**Shell**:` line to the environment block so the model uses the right
-/// syntax and the right shell tool name. On a PowerShell host this also
-/// overrides the bash-centric guidance baked into the static prompt.
+/// syntax and the right shell tool names; the `# Shell Tool Usage` section
+/// (see [`core_guidance`]) is rendered for the same shell.
 ///
 /// `memory_enabled` gates the `memory.md` instructions: when false the
 /// section is omitted so the model is never told to read/update memory.md.
@@ -666,7 +694,7 @@ pub fn build_system_prompt(
     // unvalidated: whitespace-only is absent, at the accessor AND here.
     match head {
         // A full head owns everything down to the dynamic sections: no
-        // built-in persona, and deliberately no `SYSTEM_PROMPT_CORE`.
+        // built-in persona, and deliberately no core guidance (shell section included).
         Some(PromptHead::Full(s)) if !s.trim().is_empty() => {
             prompt.push_str(s.trim());
             prompt.push('\n');
@@ -675,9 +703,9 @@ pub fn build_system_prompt(
             prompt.push_str(s.trim());
             // Mirrors the built-in persona's trailing single `\n` so every
             // branch produces the same byte boundary before
-            // `SYSTEM_PROMPT_CORE`.
+            // the core guidance.
             prompt.push('\n');
-            prompt.push_str(SYSTEM_PROMPT_CORE);
+            prompt.push_str(&core_guidance(shell_kind));
         }
         // The built-in crusader is the *agentless* default only. An
         // orchestrator with no configured head leads with the core
@@ -686,7 +714,7 @@ pub fn build_system_prompt(
             if !subagents_active {
                 prompt.push_str(SYSTEM_PROMPT_PERSONA);
             }
-            prompt.push_str(SYSTEM_PROMPT_CORE);
+            prompt.push_str(&core_guidance(shell_kind));
         }
     }
 
@@ -742,22 +770,21 @@ pub fn resolve_prompt_head(
     }
 }
 
-/// The `**Shell**:` env-block line, derived from the detected shell.
-///
-/// On PowerShell this is deliberately emphatic: it names the `powershell`
-/// tool and instructs PowerShell syntax, overriding the bash examples in
-/// the static prompt (the recency/specificity of this trailing line wins).
+/// The `**Shell**:` env-block line, derived from the detected shell. It
+/// names both shell tools so sub-agent preambles (which carry the env block
+/// but not the shell section) still learn them.
 /// Empty when no shell was detected (Windows with nothing installed).
 fn shell_line(shell_kind: Option<&ShellKind>) -> String {
     match shell_kind {
         Some(ShellKind::PowerShell { path }) => format!(
-            "- **Shell**: powershell ({path}) — your shell tool is named `powershell`. \
-            Write PowerShell syntax (e.g. `Select-String`, `Get-ChildItem`, `Get-Content`), \
-            NOT bash/sed/grep. The bash examples elsewhere in this prompt do not apply here.\n"
+            "- **Shell**: powershell ({path}) — your shell tools are `powershell` and \
+            `powershell_bg`. Write PowerShell syntax (e.g. `Select-String`, `Get-ChildItem`, \
+            `Get-Content`), not POSIX syntax or tools (`grep`, `sed`, `ls -la`).\n"
         ),
-        Some(ShellKind::Bash { path }) => {
-            format!("- **Shell**: bash ({path}) — use POSIX/bash syntax.\n")
-        }
+        Some(ShellKind::Bash { path }) => format!(
+            "- **Shell**: bash ({path}) — your shell tools are `bash` and `bash_bg`. \
+            Use POSIX/bash syntax.\n"
+        ),
         None => String::new(),
     }
 }
@@ -4661,10 +4688,19 @@ mod tests {
         }
     }
 
-    // --- system-prompt shell awareness (#82) ---------------------------------
+    // --- system-prompt shell awareness (#82, PR3) ---------------------------------
+    //
+    // PR3: the shell-specific guidance lives in a rendered `# Shell Tool
+    // Usage` section (from `system_prompt_shell.txt` with {shell_tool} /
+    // {bg_tool} / {output_dir} placeholders) that only exists when a shell
+    // was detected. The core is shell-neutral, and on a PowerShell host the
+    // WHOLE prompt must be bash-free (case-insensitive).
 
     #[test]
-    fn system_prompt_powershell_instructs_powershell_syntax() {
+    fn system_prompt_powershell_agentless_recipe_names_both_tools_and_hides_bash() {
+        // Isolated cwd: the repo's own agents.md mentions bash/PowerShell and
+        // would be injected into the prompt under test.
+        let cwd = tempfile::tempdir().unwrap();
         let skills = SkillRegistry::new();
         let ps = ShellKind::PowerShell {
             path: "pwsh.exe".to_string(),
@@ -4672,13 +4708,14 @@ mod tests {
         let prompt = build_system_prompt(
             &skills,
             Some(&ps),
-            &std::env::current_dir().unwrap(),
+            cwd.path(),
             true,
             true,
             false,
             None,
             None,
         );
+        // The env line + the shell section both name the shell tool…
         assert!(
             prompt.contains("**Shell**: powershell"),
             "PowerShell env line missing from prompt"
@@ -4687,14 +4724,85 @@ mod tests {
             prompt.contains("`powershell`"),
             "prompt must name the `powershell` tool on a PowerShell host"
         );
+        // …and the bg tool (PR3: the env line names BOTH tools).
         assert!(
-            prompt.contains("PowerShell syntax"),
-            "prompt must instruct PowerShell syntax on a PowerShell host"
+            prompt.contains("`powershell_bg`"),
+            "prompt must name the `powershell_bg` tool on a PowerShell host"
+        );
+        // The shell section is rendered with its new heading and the real
+        // output dir (shell_output_dir()), no unrendered placeholders.
+        assert!(
+            prompt.contains("# Shell Tool Usage"),
+            "the `# Shell Tool Usage` section must be rendered for a detected shell"
+        );
+        assert!(
+            prompt.contains(&crate::tools::shell_output_dir().display().to_string()),
+            "the shell section must embed shell_output_dir() (no hard-coded /tmp/peakbot)"
+        );
+        for placeholder in ["{shell_tool}", "{bg_tool}", "{output_dir}"] {
+            assert!(
+                !prompt.contains(placeholder),
+                "unrendered placeholder {placeholder} leaked into the prompt"
+            );
+        }
+        // The old PR2 phrasing is gone…
+        assert!(
+            !prompt.contains("do not apply"),
+            "the PR2 'bash examples elsewhere do not apply' phrasing must be gone"
+        );
+        // …and the ENTIRE agentless prompt is bash-free on a PowerShell host.
+        assert!(
+            !prompt.to_lowercase().contains("bash"),
+            "a PowerShell prompt must contain no 'bash' (case-insensitive) anywhere"
         );
     }
 
     #[test]
-    fn system_prompt_bash_does_not_instruct_powershell() {
+    fn system_prompt_powershell_orchestrator_recipe_same_contract() {
+        // The orchestrator recipe (no persona, subagents_active) must carry
+        // the same shell section and bash-free guarantee as the agentless one.
+        // Isolated cwd: the repo's own agents.md mentions bash/PowerShell and
+        // would be injected into the prompt under test.
+        let cwd = tempfile::tempdir().unwrap();
+        let skills = SkillRegistry::new();
+        let ps = ShellKind::PowerShell {
+            path: "pwsh.exe".to_string(),
+        };
+        let prompt =
+            build_system_prompt(&skills, Some(&ps), cwd.path(), true, true, true, None, None);
+        assert!(
+            prompt.contains("`powershell`"),
+            "orchestrator prompt must name the `powershell` tool"
+        );
+        assert!(
+            prompt.contains("`powershell_bg`"),
+            "orchestrator prompt must name the `powershell_bg` tool"
+        );
+        assert!(
+            prompt.contains("# Shell Tool Usage"),
+            "orchestrator prompt must render the `# Shell Tool Usage` section"
+        );
+        assert!(
+            prompt.contains(&crate::tools::shell_output_dir().display().to_string()),
+            "orchestrator shell section must embed shell_output_dir()"
+        );
+        for placeholder in ["{shell_tool}", "{bg_tool}", "{output_dir}"] {
+            assert!(
+                !prompt.contains(placeholder),
+                "unrendered placeholder {placeholder} leaked into the orchestrator prompt"
+            );
+        }
+        assert!(
+            !prompt.to_lowercase().contains("bash"),
+            "a PowerShell orchestrator prompt must contain no 'bash' (case-insensitive)"
+        );
+    }
+
+    #[test]
+    fn system_prompt_bash_recipe_names_bash_tools_and_keeps_no_powershell() {
+        // Isolated cwd: the repo's own agents.md mentions bash/PowerShell and
+        // would be injected into the prompt under test.
+        let cwd = tempfile::tempdir().unwrap();
         let skills = SkillRegistry::new();
         let bash = ShellKind::Bash {
             path: "/bin/sh".to_string(),
@@ -4702,7 +4810,7 @@ mod tests {
         let prompt = build_system_prompt(
             &skills,
             Some(&bash),
-            &std::env::current_dir().unwrap(),
+            cwd.path(),
             true,
             true,
             false,
@@ -4714,8 +4822,40 @@ mod tests {
             "bash env line missing from prompt"
         );
         assert!(
-            !prompt.contains("PowerShell syntax"),
+            prompt.contains("`bash_bg`"),
+            "prompt must name the `bash_bg` tool on a Bash host"
+        );
+        assert!(
+            prompt.contains("# Shell Tool Usage"),
+            "the `# Shell Tool Usage` section must be rendered for a Bash shell too"
+        );
+        assert!(
+            !prompt.contains("PowerShell"),
             "bash host must not carry PowerShell guidance"
+        );
+    }
+
+    #[test]
+    fn system_prompt_without_shell_has_no_shell_section_and_no_bash() {
+        // No shell (Windows with nothing installed): the shell section does
+        // not exist at all, the prompt carries no `_bg` tool name, and the
+        // core is shell-neutral — so no "bash" reference survives anywhere.
+        // Isolated cwd: the repo's own agents.md mentions bash/PowerShell and
+        // would be injected into the prompt under test.
+        let cwd = tempfile::tempdir().unwrap();
+        let skills = SkillRegistry::new();
+        let prompt = build_system_prompt(&skills, None, cwd.path(), true, true, false, None, None);
+        assert!(
+            !prompt.contains("# Shell Tool Usage"),
+            "no shell ⇒ no `# Shell Tool Usage` section"
+        );
+        assert!(
+            !prompt.contains("_bg"),
+            "no shell ⇒ no bg tool name in the prompt; got a `_bg` reference"
+        );
+        assert!(
+            !prompt.to_lowercase().contains("bash"),
+            "a no-shell prompt must be bash-free (the core is shell-neutral)"
         );
     }
 
@@ -7872,8 +8012,8 @@ headers:
         // (a) A foreground shell was running: the with-clause sentence.
         assert_eq!(
             super::stop_message(StopTally { shell: true }),
-            "Agent stopped by user (killed 1 bash process)",
-            "shell ⇒ with-clause ('killed 1 bash process')"
+            "Agent stopped by user (killed 1 shell process)",
+            "shell ⇒ with-clause ('killed 1 shell process')"
         );
 
         // (b) Nothing was running: the bare sentence, identical to today.

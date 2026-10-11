@@ -377,7 +377,9 @@ impl BgRegistry {
         Ok((exit_code, final_lines))
     }
 
-    /// Write `line` (newline-terminated) to a running process's stdin.
+    /// Write `line` to a running process's stdin, ended with `\r` — what a
+    /// real Enter key sends. Unix PTYs map it to `\n` (ICRNL); Windows
+    /// ConPTY readers (`Read-Host`) need the `\r` to submit.
     pub fn send_line(&mut self, id: u32, mut line: String) -> Result<usize, BgError> {
         let Some(proc) = self.procs.get_mut(&id) else {
             return Err(BgError::NotFound(id));
@@ -388,8 +390,8 @@ impl BgRegistry {
                 return Err(BgError::Exited(id));
             }
         }
-        if !line.ends_with('\n') {
-            line.push('\n');
+        if !line.ends_with('\r') {
+            line.push('\r');
         }
         let bytes = line.as_bytes();
         proc.writer
@@ -798,6 +800,249 @@ mod tests {
         r.clear();
         assert_eq!(r.running_count(), 0, "second clear must still be 0");
         assert_eq!(r.proc_count(), 0, "second clear must leave registry empty");
+    }
+
+    // ── PR3: send_line terminates with `\r` (a real Enter key) ──────────
+    //
+    // A real Enter key sends `\r`. Unix PTYs translate it to `\n` (ICRNL),
+    // so `read`-style prompts still submit; Windows ConPTY console readers
+    // (`Read-Host`) REQUIRE `\r` — a bare `\n` never submits (verified on a
+    // VM). Design: append `\r` on ALL platforms.
+    //
+    // Seam: `BgProcess.writer` is a `Box<dyn Write + Send>`, so a capturing
+    // writer swapped in after `insert_fake` makes the exact bytes
+    // observable with no production refactor.
+
+    /// `Write` sink that records every byte written, shared via `Arc` so
+    /// the test can read it after handing a clone to the registry.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A running fake process whose stdin writer is a [`CaptureWriter`].
+    fn insert_capturing(r: &mut BgRegistry, id: u32) -> CaptureWriter {
+        insert_fake(r, id, Duration::ZERO, PtyStatus::Running, "first");
+        let cap = CaptureWriter::default();
+        r.procs.get_mut(&id).expect("just inserted").writer = Box::new(cap.clone());
+        cap
+    }
+
+    #[test]
+    fn send_line_terminates_with_carriage_return_not_newline() {
+        let mut r = BgRegistry::new();
+        let cap = insert_capturing(&mut r, 1);
+
+        r.send_line(1, "peak".to_string()).expect("send_line");
+
+        assert_eq!(
+            cap.bytes(),
+            b"peak\r".to_vec(),
+            "send_line must end the line with a real Enter key (`\\r`), not `\\n`"
+        );
+    }
+
+    #[test]
+    fn send_line_returns_byte_count_including_the_carriage_return() {
+        let mut r = BgRegistry::new();
+        let _cap = insert_capturing(&mut r, 1);
+
+        let n = r.send_line(1, "peak".to_string()).expect("send_line");
+
+        assert_eq!(n, 5, "4 payload bytes + 1 `\\r` terminator");
+    }
+
+    #[test]
+    fn send_line_with_empty_line_sends_a_bare_enter() {
+        let mut r = BgRegistry::new();
+        let cap = insert_capturing(&mut r, 1);
+
+        let n = r.send_line(1, String::new()).expect("send_line");
+
+        assert_eq!(cap.bytes(), b"\r".to_vec(), "empty line is just Enter");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn send_line_does_not_double_an_existing_carriage_return() {
+        let mut r = BgRegistry::new();
+        let cap = insert_capturing(&mut r, 1);
+
+        let n = r.send_line(1, "peak\r".to_string()).expect("send_line");
+
+        assert_eq!(
+            cap.bytes(),
+            b"peak\r".to_vec(),
+            "a line already ending in `\\r` must not get a second terminator"
+        );
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn send_line_keeps_multibyte_utf8_payload_intact_before_the_cr() {
+        let mut r = BgRegistry::new();
+        let cap = insert_capturing(&mut r, 1);
+        let line = "héllo 你好 🚀";
+
+        let n = r.send_line(1, line.to_string()).expect("send_line");
+
+        let mut expected = line.as_bytes().to_vec();
+        expected.push(b'\r');
+        assert_eq!(cap.bytes(), expected);
+        assert_eq!(n, expected.len(), "byte count, not char count");
+    }
+
+    #[test]
+    fn send_line_to_exited_process_still_errors_and_writes_nothing() {
+        // Guard: the terminator change must not disturb the liveness check.
+        let mut r = BgRegistry::new();
+        insert_fake(&mut r, 1, Duration::ZERO, PtyStatus::Exited(0), "bye");
+        let cap = CaptureWriter::default();
+        r.procs.get_mut(&1).unwrap().writer = Box::new(cap.clone());
+
+        match r.send_line(1, "peak".to_string()) {
+            Err(BgError::Exited(1)) => {}
+            other => panic!("expected Exited(1), got {other:?}"),
+        }
+        assert!(
+            cap.bytes().is_empty(),
+            "nothing may be written to a dead process"
+        );
+    }
+
+    /// Drain `r` until `pred` holds over the accumulated lines or the
+    /// timeout elapses. Returns the lines seen either way (for the
+    /// assertion message).
+    #[cfg(unix)]
+    fn drain_until(
+        r: &mut BgRegistry,
+        timeout: Duration,
+        pred: impl Fn(&[String]) -> bool,
+    ) -> (bool, Vec<String>) {
+        let start = Instant::now();
+        let mut seen: Vec<String> = Vec::new();
+        while start.elapsed() < timeout {
+            if let Some(blocks) = r.drain_outputs(Instant::now()) {
+                for b in blocks {
+                    seen.extend(b.lines);
+                }
+            }
+            if pred(&seen) {
+                return (true, seen);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (false, seen)
+    }
+
+    /// Start `command` under `sh` with zero cooldown; `None` (with a note)
+    /// if the PTY can't be spawned, matching this crate's defensive skip.
+    #[cfg(unix)]
+    fn start_sh(r: &mut BgRegistry, command: &str) -> Option<u32> {
+        let (tx, _rx) = unbounded_channel();
+        match r.start(
+            StartParams {
+                command: command.to_string(),
+                capture_cap: 50,
+                cwd: None,
+                label: None,
+                cooldown: Duration::ZERO,
+                env: None,
+                shell: bash_shell(),
+            },
+            tx,
+        ) {
+            Ok(entry) => Some(entry.id),
+            Err(e) => {
+                eprintln!("skipping pty test: {e}");
+                None
+            }
+        }
+    }
+
+    /// Real Linux PTY: `\r` must still SUBMIT a cooked-mode `read` (the
+    /// kernel's ICRNL turns it into `\n`). Guards the cross-platform
+    /// change against breaking Unix. Already GREEN today with `\n`; stays
+    /// GREEN with `\r`.
+    #[cfg(unix)]
+    #[test]
+    fn send_line_unix_pty_read_prompt_receives_the_line() {
+        let mut r = BgRegistry::new();
+        let Some(id) = start_sh(&mut r, r#"read x; echo "got:$x""#) else {
+            return;
+        };
+
+        r.send_line(id, "peak".to_string()).expect("send_line");
+
+        let (ok, seen) = drain_until(&mut r, Duration::from_secs(5), |ls| {
+            ls.iter().any(|l| l.contains("got:peak"))
+        });
+        let _ = r.stop(id);
+        assert!(
+            ok,
+            "`read` must see `peak` after send_line (ICRNL maps `\\r` -> `\\n`); lines: {seen:?}"
+        );
+    }
+
+    /// Real Linux PTY, RAW mode (no ICRNL, no echo): the child sees the
+    /// EXACT bytes written. Proves end-to-end that the terminator on the
+    /// wire is `0d` (CR), not `0a` (LF). RED today (`0a`).
+    ///
+    /// The child waits for `ready` before we write, because `stty raw`
+    /// must have taken effect: input queued while still cooked would be
+    /// translated at receive time.
+    #[cfg(unix)]
+    #[test]
+    fn send_line_unix_pty_raw_mode_child_receives_cr_byte() {
+        let mut r = BgRegistry::new();
+        let Some(id) = start_sh(
+            &mut r,
+            "stty raw -echo; echo ready; dd bs=1 count=5 2>/dev/null | od -An -tx1",
+        ) else {
+            return;
+        };
+
+        let (ready, seen) = drain_until(&mut r, Duration::from_secs(5), |ls| {
+            ls.iter().any(|l| l.contains("ready"))
+        });
+        if !ready {
+            let _ = r.stop(id);
+            panic!("child never reported ready; lines: {seen:?}");
+        }
+
+        r.send_line(id, "peak".to_string()).expect("send_line");
+
+        let (ok, seen) = drain_until(&mut r, Duration::from_secs(5), |ls| {
+            ls.iter().any(|l| l.contains("70 65 61 6b"))
+        });
+        let _ = r.stop(id);
+        assert!(ok, "child never echoed the received bytes; lines: {seen:?}");
+        let hex = seen
+            .iter()
+            .find(|l| l.contains("70 65 61 6b"))
+            .expect("checked above");
+        assert!(
+            hex.contains("70 65 61 6b 0d"),
+            "wire bytes must be `peak` + CR (0d); od saw: {hex:?}"
+        );
+        assert!(
+            !hex.contains("0a"),
+            "no LF (0a) may be sent as the terminator; od saw: {hex:?}"
+        );
     }
 
     /// Dummy killer for tests that bypass real PTY spawning.

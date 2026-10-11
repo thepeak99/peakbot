@@ -83,6 +83,18 @@ impl ShellKind {
         }
     }
 
+    /// The background-process tool's wire name for this shell — the single
+    /// source of truth, composed as `<shell>_bg`. Bash keeps `bash_bg`;
+    /// PowerShell hosts get `powershell_bg`. The two are SEPARATE
+    /// config-addressable names (a human decision): disabling one never
+    /// disables the other.
+    pub fn bg_tool_name(&self) -> &'static str {
+        match self {
+            ShellKind::Bash { .. } => "bash_bg",
+            ShellKind::PowerShell { .. } => "powershell_bg",
+        }
+    }
+
     /// The shell executable path.
     pub fn executable(&self) -> &str {
         match self {
@@ -304,6 +316,45 @@ mod tests {
             "$OutputEncoding = [Console]::OutputEncoding = \
              [System.Text.UTF8Encoding]::new($false); "
         );
+    }
+
+    /// PR3: `bg_tool_name()` is the single source of truth for the
+    /// background tool's wire name, prefixed by the shell kind: Bash hosts
+    /// keep `bash_bg`, PowerShell hosts get `powershell_bg`. The two names
+    /// are SEPARATE config-addressable names (a human decision): disabling
+    /// one never disables the other.
+    #[test]
+    fn bg_tool_name_maps_per_shell_kind() {
+        let bash = ShellKind::Bash {
+            path: "/bin/sh".to_string(),
+        };
+        let ps = ShellKind::PowerShell {
+            path: "pwsh.exe".to_string(),
+        };
+        assert_eq!(bash.bg_tool_name(), "bash_bg");
+        assert_eq!(ps.bg_tool_name(), "powershell_bg");
+    }
+
+    /// PR3: the bg tool name composes with `name()` — `<shell>_bg` — so the
+    /// model sees the bg tool under the same family as its shell tool, and
+    /// the mapping cannot drift into a third name.
+    #[test]
+    fn bg_tool_name_is_shell_name_prefixed_with_bg() {
+        for kind in [
+            ShellKind::Bash {
+                path: "/bin/sh".to_string(),
+            },
+            ShellKind::PowerShell {
+                path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            },
+        ] {
+            assert_eq!(
+                kind.bg_tool_name(),
+                format!("{}_bg", kind.name()),
+                "bg tool name must be `<shell name>_bg` for {:?}",
+                kind.name()
+            );
+        }
     }
 
     /// `name()` must stay in lockstep with the tool names so the model

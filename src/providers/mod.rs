@@ -22,8 +22,8 @@ use crate::hooks::events::SourcedEvent;
 use crate::mock::MockCompletionModel;
 use crate::state::StateManager;
 use crate::tools::{
-    BashBgTool, BashTool, FetchPageTool, FetchUrlTool, FileCreateTool, FileInsertTool,
-    FileReadTool, FileStrReplaceTool, ListDirectoryTool, PdfReadTool, PowerShellTool, SearchTool,
+    BashTool, FetchPageTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool,
+    FileStrReplaceTool, ListDirectoryTool, PdfReadTool, PowerShellTool, SearchTool, ShellBgTool,
     ShellKind, ThinkTool, TodoTool, ViewImageTool,
 };
 use anyhow::{Context, Result};
@@ -485,8 +485,9 @@ pub fn create_mock_compaction_model() -> (CompactionModel, MockCompletionModel) 
 /// - `ShellKind::Bash` → registers `bash` tool
 /// - `ShellKind::PowerShell` → registers `powershell` tool
 ///
-/// `bash_bg` is registered in the same arm and always spawns with the
-/// same `ShellKind` — no shell ⇒ no shell tool AND no `bash_bg`.
+/// The bg tool (`bash_bg` / `powershell_bg`) is registered in the same arm
+/// and always spawns with the same `ShellKind` — no shell ⇒ no shell tool
+/// AND no bg tool.
 fn add_builtin_tools<M, P>(
     builder: rig_core::agent::AgentBuilder<M, P, rig_core::agent::NoToolConfig>,
     searxng_config: Option<&SearXngConfig>,
@@ -512,7 +513,7 @@ where
     let todo = todo_tool.unwrap_or_default();
 
     // Keep a clone for the delegate tool (built at the end) — `state_manager`
-    // is moved into `bash_bg` below.
+    // is moved into the bg tool below.
     let sm_for_delegate = state_manager.clone();
 
     // The delegate tool's outer TimeBudget must not expire while the
@@ -529,16 +530,16 @@ where
         None => std::env::current_dir().unwrap_or_default(),
     };
 
-    // Register exactly ONE shell tool and the `bash_bg` tool in the same
+    // Register exactly ONE shell tool and its bg tool in the same
     // arm: the bg tool always spawns with the shell the model sees. If no
     // shell is detected (e.g. Windows with nothing installed), neither is
     // registered.
-    let (shell_tool, bash_bg_tool) = match shell_kind {
+    let (shell_tool, bg_tool) = match shell_kind {
         Some(kind) => {
             // No state manager (test paths) ⇒ the tool still registers but
             // answers every call with the `NoStateManager` coach message.
-            let bash_bg =
-                BashBgTool::new(kind.clone(), state_manager.clone(), bash_config.env.clone());
+            let bg_tool =
+                ShellBgTool::new(kind.clone(), state_manager.clone(), bash_config.env.clone());
             let shell_tool = match kind {
                 ShellKind::PowerShell { path } => EitherTool::PowerShell(
                     PowerShellTool::new(path.clone(), bash_config.env.clone())
@@ -556,7 +557,7 @@ where
                     EitherTool::Bash(wire_bash_tool(bash, wire_bash_panel, state_manager.clone()))
                 }
             };
-            (Some(shell_tool), Some(bash_bg))
+            (Some(shell_tool), Some(bg_tool))
         }
         None => (None, None),
     };
@@ -579,9 +580,9 @@ where
         Box::new(ThinkTool),
     ];
 
-    // `bash_bg` rides on the detected shell (registered in the arm above);
+    // The bg tool rides on the detected shell (registered in the arm above);
     // keep it ahead of the shell tool in registration order.
-    if let Some(tool) = bash_bg_tool {
+    if let Some(tool) = bg_tool {
         tools.push(gate(Box::new(tool)));
     }
 
@@ -2258,10 +2259,10 @@ mod tests {
     ///
     /// PR2: the helper takes a shell kind because the shell tools are
     /// shell-dependent: `None` registers NEITHER `bash`/`powershell` NOR
-    /// `bash_bg` (the bg tool is constructed inside the same
+    /// bg tool (the bg tool is constructed inside the same
     /// `match shell_kind` arm as the shell tool); `Bash` registers
     /// `bash` + `bash_bg`; `PowerShell` registers `powershell` +
-    /// `bash_bg` (the bg tool keeps its name in this PR — rename is PR3).
+    /// `powershell_bg`.
     #[cfg(feature = "mock")]
     async fn builtin_tool_names_under(
         filter: &crate::config::NameFilter,
@@ -2292,6 +2293,99 @@ mod tests {
             .await
             .expect("tool defs");
         defs.into_iter().map(|d| d.name).collect()
+    }
+
+    /// Drive the real `add_builtin_tools` with `filter` and `shell_kind`
+    /// and return the FULL serialized tool definitions (name +
+    /// description + parameters) that survive, in registration order.
+    /// PR3 companion to [`builtin_tool_names_under`]: the name list is
+    /// checked by the registration tests; this one checks everything the
+    /// MODEL sees, including descriptions and parameter schemas.
+    #[cfg(feature = "mock")]
+    async fn builtin_tool_defs_under(
+        filter: &crate::config::NameFilter,
+        shell_kind: Option<ShellKind>,
+    ) -> Vec<serde_json::Value> {
+        let model = MockCompletionModel::new();
+        let agent = add_builtin_tools(
+            AgentBuilder::new(model),
+            None, // searxng
+            None, // todo
+            &BashConfig::default(),
+            filter,
+            None, // pipeline registry
+            None, // state manager
+            shell_kind.as_ref(),
+            None,  // vector store
+            None,  // view_image
+            false, // wire bash panel
+            None,  // sub-agent wiring
+            &TimeoutsConfig::default(),
+            true, // agents_md ceiling (no `delegate` registered here)
+            &FetchUrlConfig::default(),
+        )
+        .build();
+        let defs = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("tool defs");
+        defs.into_iter()
+            .map(|d| serde_json::to_value(&d).expect("ToolDefinition is Serialize"))
+            .collect()
+    }
+
+    /// PR3 SWEEP: on a PowerShell host, NO built-in tool definition —
+    /// name, description, or parameter schema — may contain "bash"
+    /// (case-insensitive). This is the machine-checked version of "the
+    /// model never sees bash on a PowerShell box": it catches leaks in
+    /// any tool's description (file-edit "OVER BASH", the bg tool's
+    /// bash-flavoured coaching, parameter schemas, …), not just the
+    /// shell tools.
+    ///
+    /// Note: `view_image` is not registered in this helper (it needs the
+    /// Anthropic tool-result channel), so it is out of sweep scope — its
+    /// description is checked by the file-level tests if it ever gains a
+    /// bash reference.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn builtin_tool_definitions_are_bash_free_under_powershell() {
+        let filter = crate::config::NameFilter::default();
+        let ps = ShellKind::PowerShell {
+            path: "pwsh.exe".to_string(),
+        };
+        let defs = builtin_tool_defs_under(&filter, Some(ps)).await;
+        assert!(
+            !defs.is_empty(),
+            "sweep needs the built-in core set; got no definitions"
+        );
+        let offenders: Vec<String> = defs
+            .iter()
+            .filter(|d| d.to_string().to_lowercase().contains("bash"))
+            .map(|d| d["name"].as_str().unwrap_or("?").to_string())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "built-in tool definitions must be bash-free on a PowerShell host; offenders: {offenders:?}"
+        );
+    }
+
+    /// PR3 companion pin for the sweep: on a Bash host the bg tool is
+    /// `bash_bg` — the sweep's inverse. (The Bash host legitimately
+    /// contains "bash", so this only checks the expected name is present.)
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn builtin_tool_definitions_register_bash_bg_under_bash() {
+        let filter = crate::config::NameFilter::default();
+        let bash = ShellKind::Bash {
+            path: "/bin/sh".to_string(),
+        };
+        let defs = builtin_tool_defs_under(&filter, Some(bash)).await;
+        let names: Vec<&str> = defs.iter().filter_map(|d| d["name"].as_str()).collect();
+        assert!(
+            names.contains(&"bash_bg"),
+            "Bash host must register the bash_bg definition; got {names:?}"
+        );
     }
 
     /// The tools seam honours the locked `NameFilter` semantics:
@@ -2350,18 +2444,20 @@ mod tests {
         );
     }
 
-    /// PR2: the shell tools follow the detected shell kind — and the
-    /// `bash_bg` tool with them. With no shell, neither the shell tool
-    /// NOR `bash_bg` is registered (the bg tool is constructed inside the
-    /// same `match shell_kind` arm as the shell tool, so a Windows box
-    /// with no shell at all gets no shell surface, not a broken one).
-    /// With a shell, `bash_bg` keeps its name in this PR (rename is PR3).
+    /// PR2 (updated for PR3): the shell tools follow the detected shell
+    /// kind — and the bg tool with them. The bg tool's wire name is now
+    /// shell-derived (`ShellKind::bg_tool_name()`): Bash registers
+    /// `bash` + `bash_bg`; PowerShell registers `powershell` +
+    /// `powershell_bg`; no shell registers neither shell NOR bg tool (the
+    /// bg tool is constructed inside the same `match shell_kind` arm as
+    /// the shell tool, so a Windows box with no shell at all gets no
+    /// shell surface, not a broken one).
     #[cfg(feature = "mock")]
     #[tokio::test]
     async fn builtin_shell_and_bg_tools_follow_shell_kind() {
         let filter = crate::config::NameFilter::default();
 
-        // No shell → no `bash`, no `powershell`, no `bash_bg`.
+        // No shell → no `bash`, no `powershell`, no `bash_bg`, no `powershell_bg`.
         let names = builtin_tool_names_under(&filter, None).await;
         assert!(
             !names.contains(&"bash".to_string()),
@@ -2375,8 +2471,12 @@ mod tests {
             !names.contains(&"bash_bg".to_string()),
             "no shell ⇒ no `bash_bg` tool (bg tool lives in the shell arm); got {names:?}"
         );
+        assert!(
+            !names.contains(&"powershell_bg".to_string()),
+            "no shell ⇒ no `powershell_bg` tool; got {names:?}"
+        );
 
-        // Bash → `bash` + `bash_bg`, no `powershell`.
+        // Bash → `bash` + `bash_bg`, no `powershell`, no `powershell_bg`.
         let bash = ShellKind::Bash {
             path: "/bin/sh".to_string(),
         };
@@ -2393,8 +2493,13 @@ mod tests {
             !names.contains(&"powershell".to_string()),
             "Bash shell ⇒ no `powershell` tool; got {names:?}"
         );
+        assert!(
+            !names.contains(&"powershell_bg".to_string()),
+            "Bash shell ⇒ no `powershell_bg` tool; got {names:?}"
+        );
 
-        // PowerShell (legacy 5.1 path) → `powershell` + `bash_bg`, no `bash`.
+        // PowerShell (legacy 5.1 path) → `powershell` + `powershell_bg`,
+        // no `bash` and no `bash_bg` (PR3: the bg tool is renamed per shell).
         let ps = ShellKind::PowerShell {
             path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
         };
@@ -2404,12 +2509,81 @@ mod tests {
             "PowerShell shell ⇒ `powershell` registered; got {names:?}"
         );
         assert!(
-            names.contains(&"bash_bg".to_string()),
-            "PowerShell shell ⇒ `bash_bg` registered (name unchanged in PR2); got {names:?}"
+            names.contains(&"powershell_bg".to_string()),
+            "PowerShell shell ⇒ `powershell_bg` registered (PR3: shell-derived name); got {names:?}"
         );
         assert!(
             !names.contains(&"bash".to_string()),
             "PowerShell shell ⇒ no `bash` tool; got {names:?}"
+        );
+        assert!(
+            !names.contains(&"bash_bg".to_string()),
+            "PowerShell shell ⇒ no `bash_bg` tool (PR3: renamed to `powershell_bg`); got {names:?}"
+        );
+    }
+
+    /// PR3: `bash_bg` and `powershell_bg` are SEPARATE config-addressable
+    /// names (human decision) — disabling one never disables the other,
+    /// and each only addresses the tool its own shell registers.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn powershell_bg_and_bash_bg_are_separately_disablable() {
+        let ps = ShellKind::PowerShell {
+            path: "pwsh.exe".to_string(),
+        };
+        let bash = ShellKind::Bash {
+            path: "/bin/sh".to_string(),
+        };
+        let no_powershell_bg = crate::config::NameFilter {
+            disabled: vec!["powershell_bg".into()],
+            ..Default::default()
+        };
+        let no_bash_bg = crate::config::NameFilter {
+            disabled: vec!["bash_bg".into()],
+            ..Default::default()
+        };
+
+        // PowerShell host + `disabled: [powershell_bg]` → the bg tool is
+        // gone, the shell tool survives.
+        let names = builtin_tool_names_under(&no_powershell_bg, Some(ps.clone())).await;
+        assert!(
+            !names.contains(&"powershell_bg".to_string()),
+            "disabled: [powershell_bg] must drop powershell_bg on a PowerShell host; got {names:?}"
+        );
+        assert!(
+            names.contains(&"powershell".to_string()),
+            "disabling powershell_bg must NOT disable the powershell shell tool; got {names:?}"
+        );
+
+        // PowerShell host + `disabled: [bash_bg]` → the SEPARATE name
+        // addresses nothing here: powershell_bg stays registered.
+        let names = builtin_tool_names_under(&no_bash_bg, Some(ps.clone())).await;
+        assert!(
+            names.contains(&"powershell_bg".to_string()),
+            "disabled: [bash_bg] must NOT drop powershell_bg (separate names); got {names:?}"
+        );
+        assert!(
+            names.contains(&"powershell".to_string()),
+            "disabled: [bash_bg] must not affect the powershell shell tool; got {names:?}"
+        );
+
+        // Bash host + `disabled: [bash_bg]` → bash_bg is gone, bash stays.
+        let names = builtin_tool_names_under(&no_bash_bg, Some(bash.clone())).await;
+        assert!(
+            !names.contains(&"bash_bg".to_string()),
+            "disabled: [bash_bg] must drop bash_bg on a Bash host; got {names:?}"
+        );
+        assert!(
+            names.contains(&"bash".to_string()),
+            "disabling bash_bg must NOT disable the bash shell tool; got {names:?}"
+        );
+
+        // Bash host + `disabled: [powershell_bg]` → addresses nothing:
+        // bash_bg stays registered.
+        let names = builtin_tool_names_under(&no_powershell_bg, Some(bash)).await;
+        assert!(
+            names.contains(&"bash_bg".to_string()),
+            "disabled: [powershell_bg] must NOT drop bash_bg (separate names); got {names:?}"
         );
     }
 }

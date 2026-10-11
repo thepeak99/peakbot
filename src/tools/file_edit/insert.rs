@@ -41,7 +41,7 @@ impl Tool for FileInsertTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: "Insert text at a specific line in an existing file.\n\n\
-PREFER THIS TOOL OVER BASH for inserting lines because:\n\
+PREFER THIS TOOL OVER SHELL COMMANDS for inserting lines because:\n\
 - Line-number addressing is unambiguous and platform-independent\n\
 - Preserves trailing newline if the original had one\n\
 - Returns a numbered snippet around the insertion for review\n\n\

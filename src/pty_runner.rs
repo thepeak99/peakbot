@@ -172,12 +172,13 @@ pub struct PtyHandle {
 }
 
 impl PtyHandle {
-    /// Write a line to the child's stdin. A trailing `\n` is appended
-    /// if absent. Returns the number of bytes written.
+    /// Write a line to the child's stdin. A trailing `\r` (a real Enter
+    /// key; Unix PTYs map it to `\n`, ConPTY readers require it) is
+    /// appended if absent. Returns the number of bytes written.
     pub fn write_stdin(&mut self, line: &str) -> std::io::Result<usize> {
         let mut owned = line.to_string();
-        if !owned.ends_with('\n') {
-            owned.push('\n');
+        if !owned.ends_with('\r') {
+            owned.push('\r');
         }
         let bytes = owned.as_bytes();
         self.writer.write_all(bytes)?;
@@ -664,6 +665,97 @@ mod tests {
     #[test]
     fn strip_ansi_keeps_leading_h_after_osc_st() {
         assert_eq!(strip_ansi("\x1b]0;title\x1b\\héllo"), "héllo");
+    }
+
+    // ── PR3: write_stdin terminates with `\r` (a real Enter key) ────────
+    //
+    // Same contract as `BgRegistry::send_line` (see bg_processes.rs): the
+    // sync `bash` tool's stdin forwarding goes through
+    // `PtyHandle::write_stdin`, and Windows ConPTY readers need `\r`.
+    // `PtyHandle`'s fields are private to this module, so a handle with a
+    // capturing writer can be built here directly.
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capturing_handle() -> (PtyHandle, CaptureWriter) {
+        let cap = CaptureWriter::default();
+        let handle = PtyHandle {
+            pid: 0,
+            buffer: Arc::new(Mutex::new(LineBuffer::new(1))),
+            writer: Box::new(cap.clone()),
+            killer: dummy_killer(),
+            reader: None,
+        };
+        (handle, cap)
+    }
+
+    #[test]
+    fn write_stdin_terminates_with_carriage_return_not_newline() {
+        let (mut h, cap) = capturing_handle();
+
+        let n = h.write_stdin("peak").expect("write_stdin");
+
+        assert_eq!(
+            cap.bytes(),
+            b"peak\r".to_vec(),
+            "write_stdin must end the line with a real Enter key (`\\r`), not `\\n`"
+        );
+        assert_eq!(n, 5, "byte count includes the `\\r` terminator");
+    }
+
+    #[test]
+    fn write_stdin_empty_line_sends_a_bare_enter() {
+        let (mut h, cap) = capturing_handle();
+
+        let n = h.write_stdin("").expect("write_stdin");
+
+        assert_eq!(cap.bytes(), b"\r".to_vec());
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn write_stdin_does_not_double_an_existing_carriage_return() {
+        let (mut h, cap) = capturing_handle();
+
+        h.write_stdin("peak\r").expect("write_stdin");
+
+        assert_eq!(cap.bytes(), b"peak\r".to_vec());
+    }
+
+    /// Real Linux PTY: `\r` still submits a cooked-mode `read` (ICRNL).
+    /// GREEN today and after the change — the Unix regression guard.
+    #[cfg(unix)]
+    #[test]
+    fn write_stdin_unix_pty_read_prompt_receives_the_line() {
+        let Some(mut handle) = spawn_pty_for_test(r#"read x; echo "got:$x""#) else {
+            return;
+        };
+
+        handle.write_stdin("peak").expect("write_stdin");
+
+        assert!(
+            poll_for_line(&handle, "got:peak", Duration::from_secs(5)),
+            "`read` must see `peak` after write_stdin; lines: {:?}",
+            handle.buffer.lock().unwrap().lines
+        );
+        let _ = handle.kill();
     }
 
     #[test]

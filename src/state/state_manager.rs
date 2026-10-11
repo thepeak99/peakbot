@@ -7671,7 +7671,7 @@ mod tests {
         assert!(res.is_ok());
 
         // The line lands on the receiver as-is — the tool is the one
-        // that decides whether to append a newline (write_stdin does it).
+        // that decides whether to append a newline (write_stdin appends the Enter).
         let got = rx.try_recv().expect("line should be queued");
         assert_eq!(got, "password\n");
     }
