@@ -83,8 +83,9 @@ in sync; pick one, not both.
 
 1. Copy the config into your PeakBot config directory:
    ```bash
-   cp examples/pipeline-dev-team/config.yaml ~/.config/peakbot/peakbot/config.yaml
+   cp examples/pipeline-dev-team/config.yaml ~/.config/peakbot/config.yaml
    ```
+   (macOS: `~/Library/Application Support/com.peakbot.peakbot/config.yaml`; Windows: `%APPDATA%\peakbot\peakbot\config\config.yaml`)
 2. Add your API key (or set `OPENROUTER_API_KEY`).
 3. Run PeakBot, enable sub-agents for this conversation (opt-in, before turn 1),
    then describe what you want:

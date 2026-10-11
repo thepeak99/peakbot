@@ -1960,7 +1960,7 @@ pub fn get_config_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Get the platform-specific config file path.
-/// Returns the full path to config.yaml (e.g., ~/.config/peakbot/peakbot/config.yaml).
+/// Platform config file: ~/.config/peakbot/config.yaml (Linux), %APPDATA%\peakbot\peakbot\config\config.yaml (Windows), ~/Library/Application Support/com.peakbot.peakbot/config.yaml (macOS).
 /// Returns None if the platform doesn't provide a config directory.
 pub fn get_config_file_path() -> Option<std::path::PathBuf> {
     get_config_dir().map(|dir| dir.join("config.yaml"))
@@ -2052,7 +2052,7 @@ fn load_per_repo_config(dir: &std::path::Path) -> Option<Config> {
 impl Config {
     /// Load configuration from multiple sources in priority order:
     /// 1. Defaults (lowest priority)
-    /// 2. Master config (~/.config/peakbot/peakbot/config.yaml)
+    /// 2. Master config (~/.config/peakbot/config.yaml)
     /// 3. Per-repo config (.peakbot/config.yaml in cwd) - top-level key override
     /// 4. `profile` overlay (from `--profile`, master config only — §1.4)
     ///

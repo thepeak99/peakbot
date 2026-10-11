@@ -46,8 +46,9 @@ you → orchestrator → delegate("pm", …)         → spec
 
 1. Copy the config into your PeakBot config directory:
    ```bash
-   cp examples/pipeline-team/config.yaml ~/.config/peakbot/peakbot/config.yaml
+   cp examples/pipeline-team/config.yaml ~/.config/peakbot/config.yaml
    ```
+   (macOS: `~/Library/Application Support/com.peakbot.peakbot/config.yaml`; Windows: `%APPDATA%\peakbot\peakbot\config\config.yaml`)
 2. Add your API key (or set `OPENROUTER_API_KEY`):
    ```yaml
    providers:
