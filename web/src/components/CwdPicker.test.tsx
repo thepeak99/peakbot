@@ -13,21 +13,6 @@
 //
 // Harness modeled on TopBar.test.tsx (createRoot/act off react-dom/client;
 // jsdom is auto-enabled for `src/components/**` by vitest.config.ts).
-//
-// IMPORTANT — expected to be RED before implementation for TWO reasons:
-//   1. Runtime: `recentDirs` is not read anywhere in CwdPicker.tsx today, so
-//      F (missing "Recent" rows), H/I (no recent row to click → the row
-//      lookup throws) and the `request_recent_dirs` half of E fail.
-//   2. Typecheck: `recentDirs` is not declared in CwdPicker's props
-//      interface, so `tsc --noEmit` flags the fixture. We pass props through
-//      an `as unknown as Parameters<typeof CwdPicker>[0]` cast specifically
-//      so the test still *runs* under vitest (esbuild transform, no type
-//      check) and fails on the missing behaviour rather than refusing to
-//      execute — same technique as TopBar.test.tsx. A separate
-//      `npm run typecheck` would also be RED, which is expected and fine.
-//   3. `request_recent_dirs` is not in the `InboundMessage` union (state.ts)
-//      yet; the `toContainEqual` comparisons are runtime deep-equals, so
-//      they run and fail on the missing frame rather than on types.
 
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act } from "react";
@@ -44,8 +29,7 @@ beforeAll(() => {
 
 // ─── fixture ────────────────────────────────────────────────────────────
 
-// The real CwdPicker prop interface as declared today (CwdPicker.tsx:38-43)
-// plus the single new `recentDirs` prop the feature adds.
+// The CwdPicker prop interface as declared in CwdPicker.tsx.
 interface CwdPickerPropsWithRecent {
   cwd: string;
   hasTranscript: boolean;
@@ -73,10 +57,6 @@ async function mount(props: CwdPickerPropsWithRecent): Promise<HTMLDivElement> {
   document.body.appendChild(container);
   await act(async () => {
     root = createRoot(container!);
-    // `recentDirs` is not part of CwdPicker's declared props today, so we
-    // cast through `unknown` to pass it anyway — the point of these tests is
-    // to prove the prop is currently ignored/absent, not to fight the type
-    // system. Post-implementation this cast becomes a no-op identity.
     root.render(
       <CwdPicker {...(props as unknown as Parameters<typeof CwdPicker>[0])} />,
     );
@@ -216,5 +196,42 @@ describe("CwdPicker — recent dirs", () => {
 
     expect(confirmSpy).toHaveBeenCalledTimes(1);
     expect(sent).toContainEqual({ type: "switch_cwd", path: "/recent/three" });
+  });
+});
+
+// ─── win-verbatim-paths: server-composed child paths ─────────────────────
+//
+// The picker must never compose child paths client-side: the pre-fix code
+// sent `navigate(`${browsed ?? cwd}/${e.name}`)`, which on Windows produces
+// `\\?\C:\Users\Docker/peakbot-test` (os error 123) — mixed separators the
+// backend cannot resolve. Contract: each `dir_listing` entry carries a
+// server-composed `full_path`, and clicking a dir row sends
+// `{type:"list_dir", path: e.full_path}` verbatim.
+describe("CwdPicker — server-composed child paths (win-verbatim-paths)", () => {
+  it("clicking a subdirectory row sends list_dir with the entry's full_path", async () => {
+    const sent: InboundMessage[] = [];
+    const listing: DirListing = {
+      path: "C:\\proj",
+      parent: "C:\\",
+      entries: [{ name: "sub", is_dir: true, full_path: "C:\\proj\\sub" }],
+      error: null,
+    };
+    const el = await mount({
+      ...baseProps,
+      cwd: "C:\\proj",
+      dirListing: listing,
+      send: (m) => sent.push(m),
+    });
+
+    await openPicker(el);
+    const row = findRow(el, "sub");
+    await act(async () => {
+      row.click();
+    });
+
+    // The entry's server-composed path, verbatim — no `/` concat.
+    expect(sent).toContainEqual({ type: "list_dir", path: "C:\\proj\\sub" });
+    // The pre-fix client-side concat must NOT be on the wire.
+    expect(sent).not.toContainEqual({ type: "list_dir", path: "C:\\proj/sub" });
   });
 });

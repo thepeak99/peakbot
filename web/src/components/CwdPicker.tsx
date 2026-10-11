@@ -23,7 +23,10 @@ function displayPath(path: string): string {
 }
 
 function basename(path: string): string {
-  const parts = path.replace(/\/+$/, "").split("/");
+  // Split on BOTH separator styles: Windows entries arrive as `C:\proj`
+  // (backslash), POSIX as `/project` — a `/`-only split would hand the chip
+  // the whole Windows path instead of its leaf.
+  const parts = path.replace(/[/\\]+$/, "").split(/[/\\]+/);
   return parts[parts.length - 1] || "/";
 }
 
@@ -194,7 +197,7 @@ export function CwdPicker({
               {dirs.map((e) => (
                 <button
                   key={e.name}
-                  onClick={() => navigate(`${browsed ?? cwd}/${e.name}`)}
+                  onClick={() => navigate(e.full_path)}
                   className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-800"
                 >
                   <span className="text-zinc-500">📁</span>

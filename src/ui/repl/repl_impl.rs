@@ -137,12 +137,14 @@ pub fn resolve_cd_path(arg: &str) -> Result<String, String> {
     } else {
         std::path::PathBuf::from(arg)
     };
-    // canonicalize() resolves relative paths against the process cwd and
-    // fails on a non-existent path — exactly the "clear error before any
-    // mutation" guarantee we want.
-    let canonical = expanded
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve `{arg}`: {e}"))?;
+    // `dunce::canonicalize` (not `std::path::Path::canonicalize`): resolves
+    // relative paths against the process cwd and fails on a non-existent
+    // path — the "clear error before any mutation" guarantee we want — and
+    // on Windows strips the verbatim `\\?\` prefix that std's canonicalize
+    // returns. A verbatim path leaking out here would surface in the web cwd
+    // picker and make client-side path composition fail (os error 123).
+    let canonical =
+        dunce::canonicalize(&expanded).map_err(|e| format!("cannot resolve `{arg}`: {e}"))?;
     if !canonical.is_dir() {
         return Err(format!("not a directory: {}", canonical.display()));
     }
@@ -4253,6 +4255,25 @@ mod model_popup_tests {
                 .into_owned();
             assert_eq!(got, expected);
         }
+    }
+
+    // ── win-verbatim-paths ────────────────────────────────────────────────
+    //
+    // `std::path::canonicalize` on Windows returns a verbatim `\\?\C:\...`
+    // path (required once the resolved length crosses MAX_PATH); the cwd
+    // picker then displays `\\?\C:\Users\Docker` and child navigation fails
+    // with "os error 123" because the client `/`-joins onto it. The
+    // resolved path must NEVER carry the verbatim prefix —
+    // `dunce::canonicalize` strips it.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_cd_path_never_returns_verbatim_prefix() {
+        let tmp = std::env::temp_dir();
+        let got = resolve_cd_path(&tmp.to_string_lossy()).expect("temp dir resolves");
+        assert!(
+            !got.starts_with(r"\\?\"),
+            "resolved path must not carry the verbatim `\\\\?\\` prefix: {got}"
+        );
     }
 
     #[test]

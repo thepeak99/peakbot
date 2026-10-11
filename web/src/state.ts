@@ -253,6 +253,10 @@ export interface ConversationSummary {
 export interface DirEntry {
   name: string;
   is_dir: boolean;
+  /** Server-composed absolute path of this entry (listing path + name,
+   * platform separator). Sent back verbatim as the next `list_dir`
+   * payload — the client never composes paths itself. */
+  full_path: string;
 }
 
 // A `dir_listing` reply payload (the frame minus its `type` tag).
