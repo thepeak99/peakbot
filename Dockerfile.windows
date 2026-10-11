@@ -33,6 +33,9 @@ RUN rustup target add ${TARGET} \
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
+# vendor/ must land before the dep-cache build: [patch.crates-io] in
+# Cargo.toml resolves termios from this vendored path (see vendor/README.md).
+COPY vendor/ vendor/
 
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs

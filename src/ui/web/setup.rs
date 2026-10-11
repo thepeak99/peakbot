@@ -621,7 +621,7 @@ fn build_install_info(facts_base: &FactsBase) -> InstallInfo {
     // target (the second-run case), "absent" when the file does not
     // exist yet, "other" when a different file is in the target slot.
     let install_state = match (&target, &facts_base.exe_path) {
-        (Some(t), Some(exe)) if target.as_deref() == Some(std::path::Path::new(exe)) => {
+        (Some(_t), Some(exe)) if target.as_deref() == Some(std::path::Path::new(exe)) => {
             // Cheap path: the wizard's `exe_path` already equals target.
             // Means `current_exe()` IS the install target (the common
             // case once the user has run `peakbot install`).

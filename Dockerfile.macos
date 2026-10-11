@@ -47,6 +47,9 @@ RUN rustup target add x86_64-apple-darwin aarch64-apple-darwin \
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
+# vendor/ must land before the dep-cache build: [patch.crates-io] in
+# Cargo.toml resolves termios from this vendored path (see vendor/README.md).
+COPY vendor/ vendor/
 
 # Create a dummy main so we can pre-build dependencies in a cacheable layer
 RUN mkdir -p src && \

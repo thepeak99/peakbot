@@ -151,3 +151,11 @@ tokio-util = { version = "0.7" }
 # OOMs at debuginfo=2 (host and CI). Mirrors CI's CARGO_PROFILE_TEST_DEBUG=0.
 [profile.test]
 debug = false
+
+# Vendored termios 0.2.2 carrying an `os::android` module that upstream 0.2.2
+# lacks — the portable-pty 0.8.1 pin (must stay) pulls serial 0.4.0 →
+# serial-unix 0.4.0 → termios 0.2.2, which failed Android cross-compiles.
+# See vendor/README.md. Patches only the 0.2.x semver line; termwiz's
+# termios 0.3.3 is untouched.
+[patch.crates-io]
+termios = { path = "vendor/termios-0.2.2" }
