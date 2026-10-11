@@ -484,6 +484,9 @@ pub fn create_mock_compaction_model() -> (CompactionModel, MockCompletionModel) 
 /// `shell_kind` determines which shell tool is exposed to the model:
 /// - `ShellKind::Bash` → registers `bash` tool
 /// - `ShellKind::PowerShell` → registers `powershell` tool
+///
+/// `bash_bg` is registered in the same arm and always spawns with the
+/// same `ShellKind` — no shell ⇒ no shell tool AND no `bash_bg`.
 fn add_builtin_tools<M, P>(
     builder: rig_core::agent::AgentBuilder<M, P, rig_core::agent::NoToolConfig>,
     searxng_config: Option<&SearXngConfig>,
@@ -526,42 +529,36 @@ where
         None => std::env::current_dir().unwrap_or_default(),
     };
 
-    // Register exactly ONE shell tool based on the detected environment.
-    // The model only sees the tool that matches the actual shell available.
-    // If no shell is detected (e.g. Windows with nothing installed), no
-    // shell tool is registered at all.
-    let shell_tool = match shell_kind {
-        Some(ShellKind::PowerShell { path }) => Some(EitherTool::PowerShell(
-            PowerShellTool::new(path.clone(), bash_config.env.clone())
-                .with_session_cwd(session_cwd.clone()),
-        )),
-        Some(ShellKind::Bash { path }) => {
-            // Wire the live panel (slice 3 of make-term-great-again.md)
-            // when a state manager is available AND this agent owns the
-            // panel. Sub-agents (`wire_bash_panel = false`) skip the panel
-            // so their shell output never bleeds into the orchestrator's
-            // bash panel — they still run PTY-backed against `session_cwd`.
-            let bash = BashTool::new(path.clone(), bash_config.env.clone())
-                .with_session_cwd(session_cwd.clone());
-            Some(EitherTool::Bash(wire_bash_tool(
-                bash,
-                wire_bash_panel,
-                state_manager.clone(),
-            )))
+    // Register exactly ONE shell tool and the `bash_bg` tool in the same
+    // arm: the bg tool always spawns with the shell the model sees. If no
+    // shell is detected (e.g. Windows with nothing installed), neither is
+    // registered.
+    let (shell_tool, bash_bg_tool) = match shell_kind {
+        Some(kind) => {
+            // No state manager (test paths) ⇒ the tool still registers but
+            // answers every call with the `NoStateManager` coach message.
+            let bash_bg =
+                BashBgTool::new(kind.clone(), state_manager.clone(), bash_config.env.clone());
+            let shell_tool = match kind {
+                ShellKind::PowerShell { path } => EitherTool::PowerShell(
+                    PowerShellTool::new(path.clone(), bash_config.env.clone())
+                        .with_session_cwd(session_cwd.clone()),
+                ),
+                ShellKind::Bash { path } => {
+                    // Wire the live panel (slice 3 of make-term-great-again.md)
+                    // when a state manager is available AND this agent owns
+                    // the panel. Sub-agents (`wire_bash_panel = false`) skip
+                    // the panel so their shell output never bleeds into the
+                    // orchestrator's bash panel — they still run PTY-backed
+                    // against `session_cwd`.
+                    let bash = BashTool::new(path.clone(), bash_config.env.clone())
+                        .with_session_cwd(session_cwd.clone());
+                    EitherTool::Bash(wire_bash_tool(bash, wire_bash_panel, state_manager.clone()))
+                }
+            };
+            (Some(shell_tool), Some(bash_bg))
         }
-        None => None,
-    };
-
-    // `bash_bg` requires StateManager — it has no state of its own
-    // (registry lives on StateManager). When `state_manager` is `None`
-    // (test paths that exercise providers without a state manager),
-    // fall back to the `Default` impl, which returns
-    // `BashBgError::NoStateManager` on every call. The error is a
-    // coach message rather than a panic, matching `TodoTool`'s same-
-    // shape pattern.
-    let bash_bg_tool = match state_manager {
-        Some(sm) => BashBgTool::new_with_env(sm, bash_config.env.clone()),
-        None => BashBgTool::default(),
+        None => (None, None),
     };
 
     let mut tools: Vec<Box<dyn ToolDyn>> = vec![
@@ -570,7 +567,6 @@ where
         gate(Box::new(FileInsertTool::new(session_cwd.clone()))),
         gate(Box::new(FileReadTool::new(session_cwd.clone()))),
         gate(Box::new(PdfReadTool::new(session_cwd.clone()))),
-        gate(Box::new(bash_bg_tool)),
         gate(Box::new(ListDirectoryTool::new(session_cwd.clone()))),
         gate(Box::new(FetchUrlTool::new(fetch_url))),
         gate(Box::new(FetchPageTool)),
@@ -582,6 +578,12 @@ where
         // not metadata — gating would strip the very thing it returns.
         Box::new(ThinkTool),
     ];
+
+    // `bash_bg` rides on the detected shell (registered in the arm above);
+    // keep it ahead of the shell tool in registration order.
+    if let Some(tool) = bash_bg_tool {
+        tools.push(gate(Box::new(tool)));
+    }
 
     // Add the single shell tool (bash OR powershell, never both, or none)
     if let Some(tool) = shell_tool {
@@ -2250,11 +2252,21 @@ mod tests {
     // reach the real seam.
 
     /// Drive the real `add_builtin_tools` filter seam with `filter` and
-    /// return the wire names of the tools that survive, in registration
-    /// order. No shell (`shell_kind: None`), no optional extras — the
-    /// built-in core set only.
+    /// `shell_kind` and return the wire names of the tools that survive,
+    /// in registration order. No optional extras — the built-in core set
+    /// only.
+    ///
+    /// PR2: the helper takes a shell kind because the shell tools are
+    /// shell-dependent: `None` registers NEITHER `bash`/`powershell` NOR
+    /// `bash_bg` (the bg tool is constructed inside the same
+    /// `match shell_kind` arm as the shell tool); `Bash` registers
+    /// `bash` + `bash_bg`; `PowerShell` registers `powershell` +
+    /// `bash_bg` (the bg tool keeps its name in this PR — rename is PR3).
     #[cfg(feature = "mock")]
-    async fn builtin_tool_names_under(filter: &crate::config::NameFilter) -> Vec<String> {
+    async fn builtin_tool_names_under(
+        filter: &crate::config::NameFilter,
+        shell_kind: Option<ShellKind>,
+    ) -> Vec<String> {
         let model = MockCompletionModel::new();
         let agent = add_builtin_tools(
             AgentBuilder::new(model),
@@ -2262,9 +2274,9 @@ mod tests {
             None, // todo
             &BashConfig::default(),
             filter,
-            None,  // pipeline registry
-            None,  // state manager
-            None,  // shell kind
+            None, // pipeline registry
+            None, // state manager
+            shell_kind.as_ref(),
             None,  // vector store
             None,  // view_image
             false, // wire bash panel
@@ -2286,15 +2298,23 @@ mod tests {
     /// `enabled: false` drops EVERY built-in tool (the master-switch
     /// short-circuit reaches the real seam); `only` is an allowlist;
     /// `disabled` is a blocklist.
+    ///
+    /// PR2: driven with a Bash shell kind — with no shell, `bash_bg` is
+    /// no longer registered (see `builtin_shell_and_bg_tools_follow_
+    /// shell_kind`), so the "rest of the built-ins" assertion below needs
+    /// a shell to have a `bash_bg` to keep.
     #[cfg(feature = "mock")]
     #[tokio::test]
     async fn tools_seam_honours_name_filter_enabled_only_and_disabled() {
+        let bash = ShellKind::Bash {
+            path: "/bin/sh".to_string(),
+        };
         // Master switch: `enabled: false` ⇒ NOTHING survives.
         let off = crate::config::NameFilter {
             enabled: false,
             ..Default::default()
         };
-        let names = builtin_tool_names_under(&off).await;
+        let names = builtin_tool_names_under(&off, Some(bash.clone())).await;
         assert!(
             names.is_empty(),
             "enabled: false must drop every built-in tool; got {names:?}"
@@ -2306,7 +2326,7 @@ mod tests {
             only: vec!["think".into()],
             ..Default::default()
         };
-        let names = builtin_tool_names_under(&only_think).await;
+        let names = builtin_tool_names_under(&only_think, Some(bash.clone())).await;
         assert_eq!(
             names,
             vec!["think".to_string()],
@@ -2319,7 +2339,7 @@ mod tests {
             only: vec![],
             ..Default::default()
         };
-        let names = builtin_tool_names_under(&no_think).await;
+        let names = builtin_tool_names_under(&no_think, Some(bash)).await;
         assert!(
             !names.contains(&"think".to_string()),
             "disabled: [think] must drop think; got {names:?}"
@@ -2327,6 +2347,69 @@ mod tests {
         assert!(
             names.contains(&"file_read".to_string()) && names.contains(&"bash_bg".to_string()),
             "disabled: [think] must keep the rest of the built-ins; got {names:?}"
+        );
+    }
+
+    /// PR2: the shell tools follow the detected shell kind — and the
+    /// `bash_bg` tool with them. With no shell, neither the shell tool
+    /// NOR `bash_bg` is registered (the bg tool is constructed inside the
+    /// same `match shell_kind` arm as the shell tool, so a Windows box
+    /// with no shell at all gets no shell surface, not a broken one).
+    /// With a shell, `bash_bg` keeps its name in this PR (rename is PR3).
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn builtin_shell_and_bg_tools_follow_shell_kind() {
+        let filter = crate::config::NameFilter::default();
+
+        // No shell → no `bash`, no `powershell`, no `bash_bg`.
+        let names = builtin_tool_names_under(&filter, None).await;
+        assert!(
+            !names.contains(&"bash".to_string()),
+            "no shell ⇒ no `bash` tool; got {names:?}"
+        );
+        assert!(
+            !names.contains(&"powershell".to_string()),
+            "no shell ⇒ no `powershell` tool; got {names:?}"
+        );
+        assert!(
+            !names.contains(&"bash_bg".to_string()),
+            "no shell ⇒ no `bash_bg` tool (bg tool lives in the shell arm); got {names:?}"
+        );
+
+        // Bash → `bash` + `bash_bg`, no `powershell`.
+        let bash = ShellKind::Bash {
+            path: "/bin/sh".to_string(),
+        };
+        let names = builtin_tool_names_under(&filter, Some(bash)).await;
+        assert!(
+            names.contains(&"bash".to_string()),
+            "Bash shell ⇒ `bash` registered; got {names:?}"
+        );
+        assert!(
+            names.contains(&"bash_bg".to_string()),
+            "Bash shell ⇒ `bash_bg` registered; got {names:?}"
+        );
+        assert!(
+            !names.contains(&"powershell".to_string()),
+            "Bash shell ⇒ no `powershell` tool; got {names:?}"
+        );
+
+        // PowerShell (legacy 5.1 path) → `powershell` + `bash_bg`, no `bash`.
+        let ps = ShellKind::PowerShell {
+            path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+        };
+        let names = builtin_tool_names_under(&filter, Some(ps)).await;
+        assert!(
+            names.contains(&"powershell".to_string()),
+            "PowerShell shell ⇒ `powershell` registered; got {names:?}"
+        );
+        assert!(
+            names.contains(&"bash_bg".to_string()),
+            "PowerShell shell ⇒ `bash_bg` registered (name unchanged in PR2); got {names:?}"
+        );
+        assert!(
+            !names.contains(&"bash".to_string()),
+            "PowerShell shell ⇒ no `bash` tool; got {names:?}"
         );
     }
 }

@@ -125,10 +125,6 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     let state_manager =
         StateManager::new_arc_for_session(deps.storage.clone(), deps.uploads.clone());
 
-    if let Some(sk) = deps.shell_kind.as_ref() {
-        state_manager.set_shell(sk.executable().to_string());
-    }
-
     // ── Per-session cwd ──────────────────────────────────────────────────────
     // Resume adopts the saved cwd iff it's non-empty and still points at a
     // directory. Anything else (no resume, no storage, missing/empty

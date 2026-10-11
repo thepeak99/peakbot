@@ -13,6 +13,7 @@ use crate::bg_processes::{
     BgError, BgStatus, DEFAULT_CAPTURE_LINES, DEFAULT_COOLDOWN_SECS, StartParams,
 };
 use crate::state::StateManager;
+use crate::tools::ShellKind;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
@@ -34,9 +35,12 @@ pub enum BashBgError {
 }
 
 /// The `bash_bg` tool. Stateless controller — all process state lives in
-/// `StateManager::bg`.
-#[derive(Default, Clone)]
+/// `StateManager::bg`; the `ShellKind` is fixed at construction (the tool
+/// is built inside the shell arm of `add_builtin_tools`).
+#[derive(Clone)]
 pub struct BashBgTool {
+    /// Shell every `start` spawns with.
+    shell: ShellKind,
     state_manager: Option<Arc<StateManager>>,
     /// Optional environment variables to set for spawned processes,
     /// inherited from the `bash:` config section.
@@ -44,13 +48,14 @@ pub struct BashBgTool {
 }
 
 impl BashBgTool {
-    /// Create with configured environment variables (same source as `bash`).
-    pub fn new_with_env(
-        state_manager: Arc<StateManager>,
+    pub fn new(
+        shell: ShellKind,
+        state_manager: Option<Arc<StateManager>>,
         env: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
-            state_manager: Some(state_manager),
+            shell,
+            state_manager,
             env,
         }
     }
@@ -255,7 +260,7 @@ Pick the cooldown by intent:
                     label: args.label,
                     cooldown: Duration::from_secs(cooldown_secs),
                     env: self.env.clone(),
-                    shell: String::new(),
+                    shell: self.shell.clone(),
                 })?;
                 Ok(json!({
                     "id": entry.id,
@@ -323,10 +328,21 @@ Pick the cooldown by intent:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ShellKind;
+
+    /// PR2: `BashBgTool::new(shell, sm, env)` owns its `ShellKind`
+    /// (was `new_with_env(sm, env)` + `Default`); the tool is now
+    /// constructed inside the same `match shell_kind` arm as the shell
+    /// tool, so every construction site names a shell.
+    fn bash_shell() -> ShellKind {
+        ShellKind::Bash {
+            path: "/bin/sh".to_string(),
+        }
+    }
 
     #[tokio::test]
     async fn bash_bg_without_state_manager_errors_cleanly() {
-        let tool = BashBgTool::default();
+        let tool = BashBgTool::new(bash_shell(), None, None);
         let err = tool
             .call(BashBgArgs {
                 action: "list".into(),
@@ -346,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn bash_bg_unknown_action_returns_coach_message() {
         let sm = Arc::new(StateManager::new());
-        let tool = BashBgTool::new_with_env(sm, None);
+        let tool = BashBgTool::new(bash_shell(), Some(sm), None);
         let err = tool
             .call(BashBgArgs {
                 action: "bogus".into(),
@@ -370,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn bash_bg_start_without_command_returns_coach_message() {
         let sm = Arc::new(StateManager::new());
-        let tool = BashBgTool::new_with_env(sm, None);
+        let tool = BashBgTool::new(bash_shell(), Some(sm), None);
         let err = tool
             .call(BashBgArgs {
                 action: "start".into(),
@@ -392,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn bash_bg_list_on_empty_registry_returns_empty_array() {
         let sm = Arc::new(StateManager::new());
-        let tool = BashBgTool::new_with_env(sm, None);
+        let tool = BashBgTool::new(bash_shell(), Some(sm), None);
         let out = tool
             .call(BashBgArgs {
                 action: "list".into(),

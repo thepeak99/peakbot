@@ -26,6 +26,7 @@
 //! Cleanup: every test that starts a long-lived `sleep` kills it via the
 //! `BgLeakGuard` RAII drop helper, including on assertion failure.
 
+use peakbot::ShellKind;
 use peakbot::bg_processes::{BgListEntry, StartParams};
 use peakbot::state::StateManager;
 use std::sync::Arc;
@@ -80,7 +81,9 @@ fn start_sleep<'a>(
             label: label.map(str::to_string),
             cooldown: Duration::ZERO,
             env: None,
-            shell: String::new(),
+            shell: ShellKind::Bash {
+                path: "sh".to_string(),
+            },
         })
         .expect("start_bg with attached bridge must succeed");
     assert!(

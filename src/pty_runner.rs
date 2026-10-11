@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::tools::ShellKind;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -54,8 +55,8 @@ pub const KILL_GRACE: Duration = Duration::from_millis(250);
 /// Spawn parameters. Mirrors the union of fields needed by both
 /// foreground (`bash`) and background (`bash_bg`) callers.
 pub struct SpawnParams {
-    /// Shell command line passed verbatim as `<shell> -c <command>` (or
-    /// `-Command` on PowerShell). The model owns the quoting.
+    /// Shell command line passed verbatim via [`ShellKind::args`]. The
+    /// model owns the quoting.
     pub command: String,
     /// Optional working directory.
     pub cwd: Option<String>,
@@ -63,8 +64,8 @@ pub struct SpawnParams {
     /// take precedence. Source is the `bash:` config section, identical
     /// for both tools.
     pub env: Option<std::collections::HashMap<String, String>>,
-    /// Shell executable. Empty ⇒ defaults to `sh` for backward compat.
-    pub shell: String,
+    /// Shell that runs `command`; owns the executable and its arguments.
+    pub shell: ShellKind,
     /// Ring-buffer capacity in lines. `0` disables capture (the reader
     /// still drains the PTY so the child doesn't block, but lines are
     /// discarded — useful for fire-and-forget watchers).
@@ -281,12 +282,6 @@ pub fn spawn(
         debounce,
     } = params;
 
-    // Shell + arg flag — same logic that `bg_processes` had inline.
-    let shell = if shell.is_empty() { "sh" } else { &shell };
-    let lower = shell.to_lowercase();
-    let is_powershell = lower.contains("pwsh") || lower.contains("powershell");
-    let cmd_arg = if is_powershell { "-Command" } else { "-c" };
-
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -297,9 +292,8 @@ pub fn spawn(
         })
         .map_err(|e| SpawnError::OpenPty(e.to_string()))?;
 
-    let mut cmd = CommandBuilder::new(shell);
-    cmd.arg(cmd_arg);
-    cmd.arg(&command);
+    let mut cmd = CommandBuilder::new(shell.executable());
+    cmd.args(shell.args(&command));
     if let Some(d) = cwd.as_ref() {
         cmd.cwd(d);
     }
@@ -612,6 +606,12 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc::unbounded_channel;
 
+    fn test_shell() -> ShellKind {
+        ShellKind::Bash {
+            path: "sh".to_string(),
+        }
+    }
+
     #[test]
     fn strip_ansi_removes_csi() {
         let s = "\x1b[31merror.log\x1b[0m";
@@ -626,6 +626,44 @@ mod tests {
     #[test]
     fn strip_ansi_drops_trailing_cr() {
         assert_eq!(strip_ansi("line\r"), "line");
+    }
+
+    // ── PR2 diagnostics: the "dropped leading h" bug hunt ──────────────
+    //
+    // Reported bug: on Windows ConPTY the leading `h` was dropped from
+    // `héllo 你好`. These four pins isolate WHICH layer drops it:
+    // if all four pass on the current code, `strip_ansi` is exonerated
+    // and the drop happens upstream (CP437 codepage → `from_utf8_lossy`
+    // in the reader), which is what PR2's `PS_UTF8_SETUP` + ShellKind
+    // spawn path targets. The e2e `spawn_utf8_output_roundtrips_byte_exact`
+    // test below is the Windows-side guard.
+
+    /// Plain multi-script UTF-8 with no escapes: the leading `h` must
+    /// survive byte-exact.
+    #[test]
+    fn strip_ansi_keeps_leading_h_for_plain_utf8() {
+        assert_eq!(strip_ansi("héllo 你好"), "héllo 你好");
+    }
+
+    /// A CSI sequence (cursor show/hide) immediately before the text:
+    /// consuming the CSI must not eat the following `h`.
+    #[test]
+    fn strip_ansi_keeps_leading_h_after_csi() {
+        assert_eq!(strip_ansi("\x1b[?25lhéllo"), "héllo");
+    }
+
+    /// An OSC title sequence terminated by BEL immediately before the
+    /// text: consuming the OSC must not eat the following `h`.
+    #[test]
+    fn strip_ansi_keeps_leading_h_after_osc_bel() {
+        assert_eq!(strip_ansi("\x1b]0;title\x07héllo"), "héllo");
+    }
+
+    /// An OSC title sequence terminated by ST (`ESC \`) immediately
+    /// before the text: same contract as the BEL form.
+    #[test]
+    fn strip_ansi_keeps_leading_h_after_osc_st() {
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\héllo"), "héllo");
     }
 
     #[test]
@@ -680,7 +718,7 @@ mod tests {
                 command: "echo hello-pty".into(),
                 cwd: None,
                 env: None,
-                shell: String::new(),
+                shell: test_shell(),
                 capture_cap: 10,
                 debounce: None,
             },
@@ -726,7 +764,7 @@ mod tests {
                 command: "true".into(),
                 cwd: None,
                 env: None,
-                shell: String::new(),
+                shell: test_shell(),
                 capture_cap: 0,
                 debounce: None,
             },
@@ -781,7 +819,7 @@ mod tests {
                 command: command.to_string(),
                 cwd: None,
                 env: None,
-                shell: String::new(),
+                shell: test_shell(),
                 capture_cap: 50,
                 debounce: None,
             },
@@ -1009,9 +1047,7 @@ mod tests {
                 command: command.into(),
                 cwd: None,
                 env: None,
-                // Empty ⇒ `sh`, matching how the other tests here
-                // specify the shell.
-                shell: String::new(),
+                shell: test_shell(),
                 capture_cap,
                 debounce: None,
             },
@@ -1149,6 +1185,80 @@ mod tests {
             joined.contains("partial"),
             "newline-less tail must be in the buffer by the time status \
              is Exited; was: {joined:?}"
+        );
+    }
+
+    // ── PR2: ShellKind spawn + UTF-8 round-trip (RED until implemented) ─
+    //
+    // `SpawnParams.shell` becomes `ShellKind` (was `String`; the
+    // executable-name guessing + "sh" fallback are deleted). This test
+    // pins both the new spawn surface and the Windows ConPTY UTF-8
+    // contract in one e2e: non-ASCII output must arrive byte-exact —
+    // no U+FFFD substitution (CP437 codepage mangling) and no dropped
+    // leading `h` (the reported Windows regression on `héllo 你好`).
+    // On Linux this runs through `/bin/sh`; on Windows the same test
+    // shape exercises the ConPTY path once `args()` lands.
+
+    #[test]
+    fn spawn_utf8_output_roundtrips_byte_exact() {
+        use crate::tools::ShellKind;
+
+        let handle = match spawn(
+            SpawnParams {
+                // Octal escapes so the command line itself is pure
+                // ASCII: the UTF-8 bytes are produced by the child,
+                // exactly as a real Windows shell would emit them.
+                command: r"printf 'h\303\251llo \344\275\240\345\245\275 \360\237\232\200\n'"
+                    .to_string(),
+                cwd: None,
+                env: None,
+                shell: ShellKind::Bash {
+                    path: "/bin/sh".to_string(),
+                },
+                capture_cap: 10,
+                debounce: None,
+            },
+            None,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("skipping pty test: {e}");
+                return;
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !handle.status().is_running() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("child did not reach a terminal status within 5s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let buf = handle.buffer.lock().unwrap();
+        assert_eq!(buf.status, PtyStatus::Exited(0));
+
+        // The captured line must be EXACTLY the expected text — leading
+        // `h` intact, accented `é`, CJK, and the 4-byte emoji all
+        // byte-exact. `==` (not `contains`) so a leading-byte drop fails
+        // loudly.
+        let expected = "héllo 你好 🚀";
+        assert!(
+            buf.lines.iter().any(|l| l == expected),
+            "captured line must equal {expected:?} exactly \
+             (guards the dropped-leading-'h' Windows regression); \
+             lines: {:?}",
+            buf.lines
+        );
+        // No U+FFFD anywhere — the CP437→`from_utf8_lossy` mangle would
+        // surface as replacement characters.
+        assert!(
+            buf.lines.iter().all(|l| !l.contains('\u{FFFD}')),
+            "no line may contain U+FFFD (codepage mangle); lines: {:?}",
+            buf.lines
         );
     }
 }

@@ -54,6 +54,7 @@ use portable_pty::ChildKiller;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::pty_runner::{self, LineBuffer, PtyStatus, SpawnError, SpawnParams as PtySpawnParams};
+use crate::tools::ShellKind;
 
 /// Default ring-buffer capacity when `capture_output_lines` is omitted.
 pub const DEFAULT_CAPTURE_LINES: usize = 200;
@@ -137,9 +138,8 @@ pub struct StartParams {
     /// Optional environment variables to set for the spawned process,
     /// inherited from the `bash:` config section (same source as `bash`).
     pub env: Option<std::collections::HashMap<String, String>>,
-    /// Shell executable to use (e.g. "sh", "bash", "pwsh", "powershell").
-    /// If empty, defaults to "sh" for backward compatibility.
-    pub shell: String,
+    /// Shell that runs `command`.
+    pub shell: ShellKind,
 }
 
 /// A drained chunk of output, one per contributing process.
@@ -532,8 +532,17 @@ fn bg_status_from(proc: &BgProcess, buf: &LineBuffer) -> BgStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ShellKind;
     use std::collections::VecDeque;
     use tokio::sync::mpsc::unbounded_channel;
+
+    /// PR2: `StartParams.shell` is a `ShellKind` (was `String` with an
+    /// empty ⇒ "sh" fallback). Test fixtures pin an explicit Bash kind.
+    fn bash_shell() -> ShellKind {
+        ShellKind::Bash {
+            path: "sh".to_string(),
+        }
+    }
 
     #[test]
     fn registry_assigns_monotonic_ids() {
@@ -548,7 +557,7 @@ mod tests {
                     label: None,
                     cooldown: Duration::ZERO,
                     env: None,
-                    shell: String::new(),
+                    shell: bash_shell(),
                 },
                 tx.clone(),
             )
@@ -563,7 +572,7 @@ mod tests {
                     label: None,
                     cooldown: Duration::ZERO,
                     env: None,
-                    shell: String::new(),
+                    shell: bash_shell(),
                 },
                 tx,
             )

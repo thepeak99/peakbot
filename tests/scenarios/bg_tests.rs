@@ -11,6 +11,7 @@
 //! `sh` on `$PATH`. They're tagged `tokio::test` because they wait
 //! for short async sleeps to let the reader thread drain the PTY.
 
+use peakbot::ShellKind;
 use peakbot::bg_processes::{DEFAULT_CAPTURE_LINES, StartParams};
 use peakbot::state::StateManager;
 use std::sync::Arc;
@@ -85,7 +86,9 @@ async fn bg_start_captures_echoed_lines_into_synthetic_turn() {
             label: None,
             cooldown: Duration::ZERO,
             env: None,
-            shell: String::new(),
+            shell: ShellKind::Bash {
+                path: "sh".to_string(),
+            },
         })
         .expect("start_bg should succeed");
     assert!(entry.id >= 1, "id should be monotonic from 1");
@@ -121,7 +124,9 @@ async fn bg_zero_cooldown_drains_in_real_time() {
             label: Some("telegram".into()),
             cooldown: Duration::ZERO,
             env: None,
-            shell: String::new(),
+            shell: ShellKind::Bash {
+                path: "sh".to_string(),
+            },
         })
         .expect("start_bg should succeed");
 
@@ -149,7 +154,9 @@ async fn bg_stop_returns_exit_code_and_final_lines() {
             label: None,
             cooldown: Duration::ZERO,
             env: None,
-            shell: String::new(),
+            shell: ShellKind::Bash {
+                path: "sh".to_string(),
+            },
         })
         .expect("start_bg should succeed");
 
@@ -184,7 +191,9 @@ async fn bg_list_reflects_running_state() {
             label: Some("sleeper".into()),
             cooldown: Duration::ZERO,
             env: None,
-            shell: String::new(),
+            shell: ShellKind::Bash {
+                path: "sh".to_string(),
+            },
         })
         .expect("start_bg");
 
@@ -211,7 +220,9 @@ async fn bg_clear_kills_all_processes() {
             label: None,
             cooldown: Duration::ZERO,
             env: None,
-            shell: String::new(),
+            shell: ShellKind::Bash {
+                path: "sh".to_string(),
+            },
         })
         .expect("start a")
         .id;
@@ -223,7 +234,9 @@ async fn bg_clear_kills_all_processes() {
             label: None,
             cooldown: Duration::ZERO,
             env: None,
-            shell: String::new(),
+            shell: ShellKind::Bash {
+                path: "sh".to_string(),
+            },
         })
         .expect("start b")
         .id;
@@ -247,7 +260,9 @@ async fn bg_drain_appends_synthetic_user_message_with_background_source() {
             label: None,
             cooldown: Duration::ZERO,
             env: None,
-            shell: String::new(),
+            shell: ShellKind::Bash {
+                path: "sh".to_string(),
+            },
         })
         .expect("start_bg");
     let got = wait_for_buffered_line(&sm, entry.id, Duration::from_secs(3)).await;
@@ -298,7 +313,9 @@ async fn bg_stop_kills_hup_immune_grandchild() {
             label: Some("pg-kill".into()),
             cooldown: Duration::ZERO,
             env: None,
-            shell: String::new(),
+            shell: ShellKind::Bash {
+                path: "sh".to_string(),
+            },
         })
         .expect("start_bg should succeed");
 

@@ -9,6 +9,11 @@
 
 use std::path::Path;
 
+/// PS 5.1 pipes in the OEM codepage; this forces UTF-8 both ways, on the same
+/// line as the command so error line numbers don't shift.
+pub const PS_UTF8_SETUP: &str =
+    "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ";
+
 /// The kind of shell detected on this system.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShellKind {
@@ -70,7 +75,7 @@ impl ShellKind {
         None
     }
 
-    /// Human-readable name for diagnostics.
+    /// Tool/shell name; matches the registered tool's `NAME`.
     pub fn name(&self) -> &'static str {
         match self {
             ShellKind::Bash { .. } => "bash",
@@ -85,17 +90,15 @@ impl ShellKind {
         }
     }
 
-    /// The argument used to pass a command string.
-    pub fn cmd_arg(&self) -> &'static str {
+    /// Arguments that make this shell run `command` and exit. The single
+    /// place that knows each shell's command flag and per-shell setup.
+    pub fn args(&self, command: &str) -> [String; 2] {
         match self {
-            ShellKind::Bash { .. } => "-c",
-            ShellKind::PowerShell { .. } => "-Command",
+            ShellKind::Bash { .. } => ["-c".to_string(), command.to_string()],
+            ShellKind::PowerShell { .. } => {
+                ["-Command".to_string(), format!("{PS_UTF8_SETUP}{command}")]
+            }
         }
-    }
-
-    /// Whether this is a Bash-like shell.
-    pub fn is_bash(&self) -> bool {
-        matches!(self, ShellKind::Bash { .. })
     }
 }
 
@@ -186,21 +189,138 @@ mod tests {
     /// Serialize tests that mutate process-global environment variables.
     static ENV_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
+    /// PR2: `cmd_arg()` / `is_bash()` are removed; the command flag lives
+    /// in `args()`. This test is the migrated version of
+    /// `shell_kind_name_matches_variant` — it pins name + first arg per
+    /// variant.
     #[test]
-    fn shell_kind_name_matches_variant() {
+    fn shell_kind_name_and_command_flag_match_variant() {
         let bash = ShellKind::Bash {
             path: "/bin/sh".to_string(),
         };
         assert_eq!(bash.name(), "bash");
-        assert!(bash.is_bash());
-        assert_eq!(bash.cmd_arg(), "-c");
+        assert_eq!(bash.args("echo hi")[0], "-c");
 
         let ps = ShellKind::PowerShell {
             path: "pwsh.exe".to_string(),
         };
         assert_eq!(ps.name(), "powershell");
-        assert!(!ps.is_bash());
-        assert_eq!(ps.cmd_arg(), "-Command");
+        assert_eq!(ps.args("Get-Process")[0], "-Command");
+    }
+
+    // ── PR2: `args()` + `PS_UTF8_SETUP` (RED until implemented) ─────────
+
+    /// Bash-style shells pass the command verbatim after `-c`.
+    #[test]
+    fn bash_args_are_c_flag_and_command() {
+        let bash = ShellKind::Bash {
+            path: "/bin/sh".to_string(),
+        };
+        assert_eq!(
+            bash.args("echo hi"),
+            ["-c".to_string(), "echo hi".to_string()]
+        );
+
+        // A Git Bash path on Windows is still Bash-shaped.
+        let git_bash = ShellKind::Bash {
+            path: r"C:\Program Files\Git\bin\bash.exe".to_string(),
+        };
+        assert_eq!(
+            git_bash.args("ls -la"),
+            ["-c".to_string(), "ls -la".to_string()]
+        );
+    }
+
+    /// pwsh.exe (PowerShell 7+) gets `-Command` with the UTF-8 setup
+    /// prefixed and the command appended.
+    #[test]
+    fn powershell_pwsh_args_prepend_utf8_setup() {
+        let ps = ShellKind::PowerShell {
+            path: r"C:\Program Files\PowerShell\7\pwsh.exe".to_string(),
+        };
+        let args = ps.args("Write-Host hi");
+        assert_eq!(args[0], "-Command");
+        assert!(
+            args[1].starts_with(PS_UTF8_SETUP),
+            "args[1] must start with the UTF-8 setup, was: {0:?}",
+            args[1]
+        );
+        assert!(
+            args[1].ends_with("Write-Host hi"),
+            "args[1] must end with the command, was: {0:?}",
+            args[1]
+        );
+    }
+
+    /// powershell.exe (legacy 5.1) gets the SAME treatment as pwsh — the
+    /// codepage fix must not depend on which binary is installed.
+    #[test]
+    fn powershell_legacy_51_args_prepend_utf8_setup() {
+        let ps = ShellKind::PowerShell {
+            path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+        };
+        let args = ps.args("Get-Process");
+        assert_eq!(args[0], "-Command");
+        assert!(
+            args[1].starts_with(PS_UTF8_SETUP),
+            "legacy powershell.exe must get the UTF-8 setup too, was: {0:?}",
+            args[1]
+        );
+        assert!(
+            args[1].ends_with("Get-Process"),
+            "args[1] must end with the command, was: {0:?}",
+            args[1]
+        );
+    }
+
+    /// The setup must force BOM-less UTF-8 (`UTF8Encoding]::new($false)`)
+    /// and stay a single line: the whole thing rides on one `-Command`
+    /// argument. A multi-line command keeps its own newlines — only the
+    /// *setup portion* must be newline-free.
+    #[test]
+    fn powershell_utf8_setup_is_single_line_and_bomless() {
+        let ps = ShellKind::PowerShell {
+            path: "pwsh.exe".to_string(),
+        };
+        let cmd = "line one\nline two";
+        let args = ps.args(cmd);
+        assert!(
+            args[1].contains("UTF8Encoding]::new($false)"),
+            "setup must construct UTF8Encoding with $false (no BOM), was: {0:?}",
+            args[1]
+        );
+        let setup = &args[1][..PS_UTF8_SETUP.len()];
+        assert!(
+            !setup.contains('\n'),
+            "the setup portion must contain no newline, was: {setup:?}"
+        );
+        assert!(
+            args[1].ends_with(cmd),
+            "a multi-line command must keep its own newlines verbatim, was: {0:?}",
+            args[1]
+        );
+        assert_eq!(
+            PS_UTF8_SETUP,
+            "$OutputEncoding = [Console]::OutputEncoding = \
+             [System.Text.UTF8Encoding]::new($false); "
+        );
+    }
+
+    /// `name()` must stay in lockstep with the tool names so the model
+    /// sees one shell under one name.
+    #[test]
+    fn shell_kind_name_matches_tool_names() {
+        use super::super::{BashTool, PowerShellTool};
+        use rig_core::tool::Tool;
+
+        let bash = ShellKind::Bash {
+            path: "/bin/sh".to_string(),
+        };
+        let ps = ShellKind::PowerShell {
+            path: "pwsh.exe".to_string(),
+        };
+        assert_eq!(bash.name(), BashTool::NAME);
+        assert_eq!(ps.name(), PowerShellTool::NAME);
     }
 
     #[test]
@@ -253,8 +373,9 @@ mod tests {
             "ShellKind::detect() should always return Some on Linux"
         );
         let sk = kind.unwrap();
+        // PR2: `is_bash()` is removed — match on the variant directly.
         assert!(
-            sk.is_bash(),
+            matches!(sk, ShellKind::Bash { .. }),
             "Linux detection should yield Bash, got: {:?}",
             sk
         );
