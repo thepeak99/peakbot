@@ -13,6 +13,7 @@ export const BUILTIN_TOOL_NAMES = [
   "list_directory",
   "pdf_read",
   "powershell",
+  "powershell_bg",
   "think",
   "todo",
   "view_image",

@@ -434,7 +434,7 @@ impl Tool for BashTool {
                     // the slot is held in the state manager, but cheap
                     // to handle). The loop continues either way.
                     if let Some(line) = line {
-                        // `write_stdin` appends `\n` if missing — see
+                        // `write_stdin` appends `\r` (Enter) if missing — see
                         // `pty_runner::PtyHandle::write_stdin`. Errors
                         // here mean the child closed stdin (e.g. exited
                         // mid-prompt). We swallow + log; the next loop

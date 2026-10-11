@@ -40,7 +40,7 @@ impl Tool for FileCreateTool {
             name: Self::NAME.to_string(),
             description: "Create a new file. Fails if the file already exists \
                 — use `file_str_replace` to edit existing files.\n\n\
-PREFER THIS TOOL OVER BASH for creating files because:\n\
+PREFER THIS TOOL OVER SHELL COMMANDS for creating files because:\n\
 - Path may be absolute or relative to the working directory\n\
 - Auto-creates missing parent directories\n\
 - Safer: refuses to clobber existing files\n\

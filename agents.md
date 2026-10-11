@@ -48,14 +48,12 @@ Flow: `SessionHook` emits an `AgentEvent` per LLM call → async channel → `Ag
 
 ### Background Processes (`src/bg_processes.rs`)
 
-Long-running PTY-backed processes spawned by the `bash_bg` tool. Each process gets a numeric id, a ring buffer of captured output, and a per-process `cooldown_secs` (default 60) that paces output injection.
+Long-running PTY-backed processes spawned by the background-process tool (`bash_bg` on Bash hosts, `powershell_bg` on PowerShell hosts — the wire name is per-shell, `ShellKind::bg_tool_name`). Each process gets a numeric id, a ring buffer of captured output, and a per-process `cooldown_secs` (default 60) that paces output injection.
 
-- `bash_bg start` spawns a PTY via `portable-pty` under `sh -c`; a reader thread streams ANSI-stripped lines into the ring buffer and pings the agent loop.
+- `start` spawns a PTY via `portable-pty` under the detected shell; a reader thread streams ANSI-stripped lines into the ring buffer and pings the agent loop.
 - Between turns, `StateManager::drain_bg_output_into_synthetic_turn` builds a `[bg output]` block per eligible buffer and runs an agent turn over it, persisted with `MessageSource::Background { proc_ids }`.
 - Cooldown coalesces chatty output into one flush per window; `cooldown_secs: 0` = real-time (for external-input bridges). **Process exits always bypass the cooldown.** A real user message resets all cooldowns so buffered output flushes alongside it.
 - `/new`, `/model`, `/load` kill all bg processes. The registry is in-memory only — nothing survives a restart.
-
-Details: `bash-background.md`.
 
 ### Skills System (`src/skills/`)
 
@@ -77,11 +75,13 @@ All tools live in `src/tools/` and implement `rig::tool::Tool` (`NAME`, `Args`, 
 
 **The authoritative tool list is `BUILTIN_TOOL_NAMES` in `src/config/mod.rs`** — keep any table below in sync with it, never the other way round.
 
+Exactly **one shell + bg tool pair** is registered per detected shell: Bash hosts get `bash` + `bash_bg`, PowerShell hosts get `powershell` + `powershell_bg`, never both. `tools:` filter names are **per-shell** — `disabled: [bash_bg]` does NOT disable `powershell_bg` (they are separate names in `BUILTIN_TOOL_NAMES`).
+
 | Tool | File | Notes |
 |------|------|-------|
 | `bash` | `bash.rs` | Shell execution with timeout; output truncated to last ~50k chars, full output saved to /tmp/peakbot/ |
 | `powershell` | `powershell.rs` | Windows counterpart of `bash` — one shell tool is registered based on the detected shell (`shell_detect.rs`), never both |
-| `bash_bg` | `bash_bg.rs` | Long-running PTY processes (start/stop/list/send_line); synthetic `[bg output]` turns, per-process cooldown |
+| `bash_bg` / `powershell_bg` | `shell_bg.rs` | Long-running PTY processes (start/stop/list/send_line); synthetic `[bg output]` turns, per-process cooldown. Wire name is per-shell (`ShellKind::bg_tool_name`) |
 | `file_create` / `file_str_replace` / `file_insert` | `file_edit/` | Create / replace (whitespace-flexible fallback) / insert-at-line |
 | `file_read` | `file_read.rs` | Read with line ranges |
 | `pdf_read` | `pdf_read.rs` | PDF → text/markdown (`pdf_oxide`), page ranges, 50k-char cap |
@@ -330,7 +330,7 @@ src/
 ├── skills/                 # skill discovery + SKILL.md parsing
 ├── vector/                 # VectorStore, embeddings client, parse/chunk
 ├── ui/                     # app_state, wire types; repl/ (ratatui), web/ (axum+WS+TLS), stdio/
-├── bg_processes.rs         # BgRegistry (bash_bg PTY processes)
+├── bg_processes.rs         # BgRegistry (background-process PTY processes)
 ├── context_manager.rs      # compaction
 ├── conversation*.rs        # conversation data + persistence + titles
 ├── vision.rs               # [img:…] parsing, model vision detection

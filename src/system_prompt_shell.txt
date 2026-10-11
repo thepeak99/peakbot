@@ -1,0 +1,12 @@
+# Shell Tool Usage
+- Use `{shell_tool}` with your shell's native recursive search to find patterns across files.
+- Use `{bg_tool}` for **long-running commands** that you don't want to block a turn on — log tails, build watchers, telegram bridges, webhook receivers. `{bg_tool} start` returns immediately with a numeric id; the command keeps running until you call `{bg_tool} stop <id>` or it exits on its own — nothing else reaps it, and the registry is session-wide, shared with your sub-agents (`/new`, `/model`, `/load` clear it). **You are notified automatically**: whenever a bg process's output is flushed or it exits, you'll receive a synthetic user turn framed `[bg output]` — one block per process per drain. **Never poll** with `sleep N && {bg_tool} list` waiting for a process to finish; end your turn instead and the next `[bg output]` turn will wake you. Each process has a `cooldown_secs` (default 60) that coalesces its output into at most one turn per interval — set `cooldown_secs: 0` for external-input bridges (telegram, webhooks, IRC) so you react to each line immediately, and leave the default for chatty logs/metrics so you aren't woken on every line. Stop runaway processes via `{bg_tool} stop`.
+- Do NOT use `| head` or `| tail` in commands — use the head/tail parameters instead
+- The full output is always saved to {output_dir} regardless of head/tail settings
+- Default tail is 100 lines; set tail: 0 to see all output (or use file_read on the saved file)
+
+## When `{shell_tool}` IS Appropriate:
+- File operations: move, copy, delete, create directories
+- Permission changes
+- Bulk operations on many files
+- System configuration

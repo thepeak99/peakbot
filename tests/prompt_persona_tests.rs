@@ -36,7 +36,7 @@
 //! `src/pipeline/delegate_tool.rs::tests`; it is a GREEN guard today.
 
 use peakbot::skills::SkillRegistry;
-use peakbot::{PromptHead, build_system_prompt, resolve_prompt_head};
+use peakbot::{PromptHead, ShellKind, build_system_prompt, resolve_prompt_head};
 
 fn cwd() -> std::path::PathBuf {
     std::env::temp_dir()
@@ -260,17 +260,28 @@ fn persona_to_core_join_is_a_single_newline_for_both_branches() {
 
 #[test]
 fn full_head_replaces_persona_and_core() {
-    // `Full` owns the entire static head: the built-in persona AND
-    // `SYSTEM_PROMPT_CORE` are both suppressed. A deployment that disables
-    // bash/think/todo must not ship coaching for tools the model cannot call.
-    // The padded input also pins the `trim()` — the prompt must open on the
-    // trimmed text, not the raw payload.
+    // `Full` owns the entire static head: the built-in persona AND the core
+    // tool guidance (including the shell section — PR3 moved the bash
+    // coaching into `# Shell Tool Usage`, which is part of the core
+    // guidance) are all suppressed. A deployment that disables
+    // bash/think/todo must not ship coaching for tools the model cannot
+    // call. The padded input also pins the `trim()` — the prompt must open
+    // on the trimmed text, not the raw payload.
+    //
+    // PR3: driven WITH a shell (previously `None`, which made the
+    // shell-section assertions pass vacuously after the `# Bash Tool
+    // Usage` rename): with a Bash shell present, a Full head must still
+    // suppress `# Shell Tool Usage` — the section follows the core, and
+    // the core is what a Full head replaces.
     let skills = SkillRegistry::new();
+    let bash = ShellKind::Bash {
+        path: "/bin/sh".to_string(),
+    };
     let full = "RESEARCH ONLY — read files and cite sources, never edit.";
     let cwd = tempfile::tempdir().expect("isolated cwd");
     let prompt = build_system_prompt(
         &skills,
-        None,
+        Some(&bash),
         cwd.path(),
         /* memory_enabled */ false,
         /* agents_md_enabled */ true,
@@ -284,16 +295,16 @@ fn full_head_replaces_persona_and_core() {
         &prompt[..prompt.len().min(80)]
     );
     assert!(
-        !prompt.contains("### NEVER Use Bash/sed/awk For:"),
-        "a Full head must suppress the core bash coaching (system_prompt_core.txt:24)"
+        !prompt.contains("# Working Principles"),
+        "a Full head must suppress the core guidance (system_prompt_core.txt:1)"
     );
     assert!(
-        !prompt.contains("# Bash Tool Usage"),
-        "a Full head must suppress the core `# Bash Tool Usage` section (system_prompt_core.txt:49)"
+        !prompt.contains("# Shell Tool Usage"),
+        "a Full head must suppress the `# Shell Tool Usage` section even with a shell present"
     );
     assert!(
         !prompt.contains("- Do NOT use `| head` or `| tail` in commands"),
-        "a Full head must suppress the core head/tail coaching line (system_prompt_core.txt:50)"
+        "a Full head must suppress the shell head/tail coaching (now in the shell section)"
     );
     assert!(
         !prompt.contains("CODE CRUSADER"),
@@ -378,13 +389,20 @@ fn full_head_in_orchestrator_mode_keeps_orchestrator_instructions() {
     // The override is UNCONDITIONAL: in orchestrator mode the `# Orchestrator
     // Instructions` block still follows the Full head, and the crusader and
     // the core are still absent — the same head semantics in both recipes.
+    //
+    // PR3: driven WITH a shell so the `# Shell Tool Usage` suppression is
+    // not vacuous (a Full head replaces the core guidance, which carries
+    // the shell section when a shell exists).
     let skills = SkillRegistry::new();
+    let bash = ShellKind::Bash {
+        path: "/bin/sh".to_string(),
+    };
     let full = "RESEARCH ONLY — read files and cite sources, never edit.";
     let extra = "SENTINEL-ORCH-EXTRA: delegate to the team.";
     let cwd = tempfile::tempdir().expect("isolated cwd");
     let prompt = build_system_prompt(
         &skills,
-        None,
+        Some(&bash),
         cwd.path(),
         /* memory_enabled */ false,
         /* agents_md_enabled */ true,
@@ -410,12 +428,12 @@ fn full_head_in_orchestrator_mode_keeps_orchestrator_instructions() {
         "the built-in crusader must stay absent in orchestrator mode"
     );
     assert!(
-        !prompt.contains("### NEVER Use Bash/sed/awk For:"),
-        "the core bash coaching must stay absent in orchestrator mode"
+        !prompt.contains("# Working Principles"),
+        "the core guidance must stay absent in orchestrator mode (Full head)"
     );
     assert!(
-        !prompt.contains("# Bash Tool Usage"),
-        "the core `# Bash Tool Usage` section must stay absent in orchestrator mode"
+        !prompt.contains("# Shell Tool Usage"),
+        "the `# Shell Tool Usage` section must stay absent in orchestrator mode (Full head)"
     );
 }
 
@@ -426,12 +444,20 @@ fn persona_head_still_keeps_core() {
     // Persona and Full into one arm. (The existing join test also fails if
     // the core disappears here, via its `expect("core marker must be
     // present")` precondition — this names the invariant directly.)
+    //
+    // PR3: driven WITH a Bash shell — the core guidance carries the
+    // `# Shell Tool Usage` section, so a Persona head must keep BOTH the
+    // neutral core and the rendered shell section (whereas a Full head
+    // suppresses both, pinned in `full_head_replaces_persona_and_core`).
     let skills = SkillRegistry::new();
+    let bash = ShellKind::Bash {
+        path: "/bin/sh".to_string(),
+    };
     let custom = "SENTINEL-CUSTOM-PERSONA";
     let cwd = tempfile::tempdir().expect("isolated cwd");
     let prompt = build_system_prompt(
         &skills,
-        None,
+        Some(&bash),
         cwd.path(),
         /* memory_enabled */ false,
         /* agents_md_enabled */ true,
@@ -448,8 +474,8 @@ fn persona_head_still_keeps_core() {
         "the Persona head must keep the core guidance (system_prompt_core.txt:1)"
     );
     assert!(
-        prompt.contains("### NEVER Use Bash/sed/awk For:"),
-        "a deep core line must survive the Persona head (system_prompt_core.txt:24)"
+        prompt.contains("# Shell Tool Usage"),
+        "the Persona head must keep the rendered `# Shell Tool Usage` section (a shell is present)"
     );
     assert!(
         !prompt.contains("CODE CRUSADER"),

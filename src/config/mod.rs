@@ -1636,6 +1636,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "list_directory",
     "pdf_read",
     "powershell",
+    "powershell_bg",
     "think",
     "todo",
     "view_image",
@@ -2544,6 +2545,37 @@ mod tests {
         assert!(
             t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
                 .is_ok()
+        );
+    }
+
+    /// PR3: `powershell_bg` is a SEPARATE known tool name — `tools.disabled`
+    /// may name it without a typo error, exactly like `bash_bg` (which must
+    /// keep working for Bash hosts).
+    #[test]
+    fn tools_filter_validate_names_accepts_powershell_bg() {
+        let t = NameFilter {
+            disabled: vec!["powershell_bg".into()],
+            ..Default::default()
+        };
+        assert!(
+            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
+                .is_ok(),
+            "powershell_bg must be a known built-in tool name (typo catch must not fire)"
+        );
+    }
+
+    /// PR3 companion pin: adding `powershell_bg` must not have displaced
+    /// `bash_bg` from the known universe — Bash hosts still address it.
+    #[test]
+    fn tools_filter_validate_names_still_accepts_bash_bg() {
+        let t = NameFilter {
+            disabled: vec!["bash_bg".into()],
+            ..Default::default()
+        };
+        assert!(
+            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
+                .is_ok(),
+            "bash_bg must remain a known built-in tool name"
         );
     }
 

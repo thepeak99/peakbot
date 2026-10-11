@@ -1,13 +1,16 @@
-//! `bash_bg` — manage long-running background processes.
+//! `shell_bg` — manage long-running background processes.
 //!
-//! Sibling to the synchronous `bash` tool. Where `bash` blocks the turn
-//! until the command exits and returns its captured output, `bash_bg`
-//! spawns a PTY-backed process, returns a numeric id immediately, and
-//! streams the process's output into a ring buffer. Output reaches the
-//! LLM via the agent loop's drain seams (between turns and on idle wake-
-//! up) as synthetic user turns framed with a `[bg output]` header.
+//! Sibling to the synchronous shell tool (`bash` / `powershell`). Where the
+//! shell tool blocks the turn until the command exits and returns its
+//! captured output, this tool spawns a PTY-backed process, returns a
+//! numeric id immediately, and streams the process's output into a ring
+//! buffer. Output reaches the LLM via the agent loop's drain seams
+//! (between turns and on idle wake-up) as synthetic user turns framed with
+//! a `[bg output]` header.
 //!
-//! See `bash-background.md` for the full design.
+//! The wire name is per-shell (`bash_bg` / `powershell_bg`, see
+//! `ShellKind::bg_tool_name`), and the model-facing description is a
+//! template filled from the owned `ShellKind`.
 
 use crate::bg_processes::{
     BgError, BgStatus, DEFAULT_CAPTURE_LINES, DEFAULT_COOLDOWN_SECS, StartParams,
@@ -23,8 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
-pub enum BashBgError {
-    #[error("state manager not initialised; bash_bg cannot operate")]
+pub enum ShellBgError {
+    #[error("state manager not initialised; the background-process tool cannot operate")]
     NoStateManager,
     #[error("invalid action `{0}` — expected one of: start, stop, list, send_line")]
     InvalidAction(String),
@@ -34,12 +37,12 @@ pub enum BashBgError {
     Bg(#[from] BgError),
 }
 
-/// The `bash_bg` tool. Stateless controller — all process state lives in
-/// `StateManager::bg`; the `ShellKind` is fixed at construction (the tool
-/// is built inside the shell arm of `add_builtin_tools`).
+/// The background-process tool. Stateless controller — all process state
+/// lives in `StateManager::bg`; the `ShellKind` is fixed at construction
+/// (the tool is built inside the shell arm of `add_builtin_tools`).
 #[derive(Clone)]
-pub struct BashBgTool {
-    /// Shell every `start` spawns with.
+pub struct ShellBgTool {
+    /// Shell every `start` spawns with; also names the tool on the wire.
     shell: ShellKind,
     state_manager: Option<Arc<StateManager>>,
     /// Optional environment variables to set for spawned processes,
@@ -47,7 +50,7 @@ pub struct BashBgTool {
     env: Option<HashMap<String, String>>,
 }
 
-impl BashBgTool {
+impl ShellBgTool {
     pub fn new(
         shell: ShellKind,
         state_manager: Option<Arc<StateManager>>,
@@ -63,7 +66,7 @@ impl BashBgTool {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
-pub struct BashBgArgs {
+pub struct ShellBgArgs {
     /// One of: `start`, `stop`, `list`, `send_line`.
     pub action: String,
 
@@ -99,26 +102,20 @@ pub struct BashBgArgs {
     pub id: Option<u32>,
 
     // ── send_line ──────────────────────────────────────────────────
-    /// Line to write to the process's stdin. A trailing newline is
-    /// added automatically if absent.
+    /// Line to write to the process's stdin. Terminated with `\r` (Enter)
+    /// unless it already ends with one.
     #[serde(default)]
     pub line: Option<String>,
 }
 
-impl Tool for BashBgTool {
-    const NAME: &'static str = "bash_bg";
-    type Error = BashBgError;
-    type Args = BashBgArgs;
-    type Output = Value;
+/// Model-facing description with `{shell_tool}` / `{bg_tool}` placeholders,
+/// filled per shell in `definition()`. Kept as a template (not `format!`)
+/// so the prose can freely contain literal braces and backticks.
+const DESCRIPTION_TEMPLATE: &str = r#"Manage long-running background processes via a PTY.
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: r#"Manage long-running background processes via a PTY.
-
-Distinct from the synchronous `bash` tool: `bash_bg start` returns
+Distinct from the synchronous `{shell_tool}` tool: `{bg_tool} start` returns
 immediately with a numeric id; the process keeps running until you call
-`bash_bg stop <id>` or it exits on its own. The registry is session-wide
+`{bg_tool} stop <id>` or it exits on its own. The registry is session-wide
 and shared by every agent in this session — ids are one namespace, and a
 process outlives the turn that started it. If you are a sub-agent, it
 also outlives your delegation: hand it back or stop it.
@@ -133,22 +130,22 @@ runtime will deliver new turns to you automatically whenever:
 
 The new turn arrives as a synthetic user message framed with
 `[bg output]`. Each contributing process gets one block with a header
-like `─── #3 `tail -f log` (12 new lines) ───` or
-`─── #3 `tail -f log` (exited, code 0, 2 final lines) ───`.
+like `─── #3 `npm run dev` (12 new lines) ───` or
+`─── #3 `npm run dev` (exited, code 0, 2 final lines) ───`.
 
-**DO NOT** poll. **DO NOT** `sleep N && bash_bg list` to wait for a
-process to finish. **DO NOT** spin on `bash_bg list` between turns.
+**DO NOT** poll. **DO NOT** `sleep N && {bg_tool} list` to wait for a
+process to finish. **DO NOT** spin on `{bg_tool} list` between turns.
 That wastes turns and tokens for no reason — the framework already
 guarantees you'll be re-woken on output or exit.
 
-The correct pattern after `bash_bg start`:
+The correct pattern after `{bg_tool} start`:
   1. If you have other work to do this turn, do it.
   2. Otherwise, finish your turn with a brief text reply (e.g.
      "Started build #3 in background; I'll review the output when
      it lands."). The next synthetic `[bg output]` turn is your
      cue to act.
 
-Use `bash_bg list` only for an on-demand status check the user asked
+Use `{bg_tool} list` only for an on-demand status check the user asked
 for, never as a wait loop.
 
 ## Cooldown (output pacing)
@@ -185,7 +182,7 @@ Pick the cooldown by intent:
 
 ## Notes
 
-  • The registry is shared session state. `bash_bg list` shows every
+  • The registry is shared session state. `{bg_tool} list` shows every
     process in the session, including ones another agent started.
     Do not stop a process you did not start unless you were asked to.
   • `/new`, `/model`, and `/load` kill all background processes.
@@ -193,8 +190,27 @@ Pick the cooldown by intent:
   • Stopped/exited processes are removed from the registry on the
     next drain (after their final tail is delivered to you).
   • A real user message flushes all buffered bg output immediately,
-    regardless of cooldown."#
-                .to_string(),
+    regardless of cooldown."#;
+
+impl Tool for ShellBgTool {
+    // rig requires a const; the wire name is per-shell — see `name()`.
+    const NAME: &'static str = "bash_bg";
+    type Error = ShellBgError;
+    type Args = ShellBgArgs;
+    type Output = Value;
+
+    fn name(&self) -> String {
+        self.shell.bg_tool_name().into()
+    }
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        let shell_tool = self.shell.name();
+        let description = DESCRIPTION_TEMPLATE
+            .replace("{shell_tool}", shell_tool)
+            .replace("{bg_tool}", self.shell.bg_tool_name());
+        ToolDefinition {
+            name: self.name(),
+            description,
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -205,7 +221,9 @@ Pick the cooldown by intent:
                     },
                     "command": {
                         "type": "string",
-                        "description": "Shell command to spawn (required for `start`). Executed via the detected shell (bash/sh on Unix, PowerShell on Windows)."
+                        "description": format!(
+                            "Shell command to spawn (required for `start`). Executed via the detected shell (`{shell_tool}` syntax)."
+                        )
                     },
                     "capture_output_lines": {
                         "type": "integer",
@@ -232,7 +250,7 @@ Pick the cooldown by intent:
                     },
                     "line": {
                         "type": "string",
-                        "description": "Text to write to the process's stdin (required for `send_line`). Newline appended if absent."
+                        "description": "Text to write to the process's stdin (required for `send_line`). Enter (`\\r`) is appended if absent."
                     }
                 },
                 "required": ["action"]
@@ -244,13 +262,13 @@ Pick the cooldown by intent:
         let sm = self
             .state_manager
             .as_ref()
-            .ok_or(BashBgError::NoStateManager)?;
+            .ok_or(ShellBgError::NoStateManager)?;
 
         match args.action.as_str() {
             "start" => {
                 let command = args
                     .command
-                    .ok_or(BashBgError::MissingField("command", "start"))?;
+                    .ok_or(ShellBgError::MissingField("command", "start"))?;
                 let capture_cap = args.capture_output_lines.unwrap_or(DEFAULT_CAPTURE_LINES);
                 let cooldown_secs = args.cooldown_secs.unwrap_or(DEFAULT_COOLDOWN_SECS);
                 let entry = sm.start_bg(StartParams {
@@ -275,7 +293,7 @@ Pick the cooldown by intent:
                 }))
             }
             "stop" => {
-                let id = args.id.ok_or(BashBgError::MissingField("id", "stop"))?;
+                let id = args.id.ok_or(ShellBgError::MissingField("id", "stop"))?;
                 let (exit_code, final_lines) = sm.stop_bg(id)?;
                 Ok(json!({
                     "id": id,
@@ -310,17 +328,17 @@ Pick the cooldown by intent:
             "send_line" => {
                 let id = args
                     .id
-                    .ok_or(BashBgError::MissingField("id", "send_line"))?;
+                    .ok_or(ShellBgError::MissingField("id", "send_line"))?;
                 let line = args
                     .line
-                    .ok_or(BashBgError::MissingField("line", "send_line"))?;
+                    .ok_or(ShellBgError::MissingField("line", "send_line"))?;
                 let bytes_written = sm.send_bg_line(id, line)?;
                 Ok(json!({
                     "id": id,
                     "bytes_written": bytes_written,
                 }))
             }
-            other => Err(BashBgError::InvalidAction(other.to_string())),
+            other => Err(ShellBgError::InvalidAction(other.to_string())),
         }
     }
 }
@@ -330,52 +348,43 @@ mod tests {
     use super::*;
     use crate::tools::ShellKind;
 
-    /// PR2: `BashBgTool::new(shell, sm, env)` owns its `ShellKind`
-    /// (was `new_with_env(sm, env)` + `Default`); the tool is now
-    /// constructed inside the same `match shell_kind` arm as the shell
-    /// tool, so every construction site names a shell.
     fn bash_shell() -> ShellKind {
         ShellKind::Bash {
             path: "/bin/sh".to_string(),
         }
     }
 
-    #[tokio::test]
-    async fn bash_bg_without_state_manager_errors_cleanly() {
-        let tool = BashBgTool::new(bash_shell(), None, None);
-        let err = tool
-            .call(BashBgArgs {
-                action: "list".into(),
-                command: None,
-                capture_output_lines: None,
-                cwd: None,
-                label: None,
-                cooldown_secs: None,
-                id: None,
-                line: None,
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BashBgError::NoStateManager));
+    fn ps_shell() -> ShellKind {
+        ShellKind::PowerShell {
+            path: "pwsh.exe".to_string(),
+        }
+    }
+
+    fn args(action: &str) -> ShellBgArgs {
+        ShellBgArgs {
+            action: action.into(),
+            command: None,
+            capture_output_lines: None,
+            cwd: None,
+            label: None,
+            cooldown_secs: None,
+            id: None,
+            line: None,
+        }
     }
 
     #[tokio::test]
-    async fn bash_bg_unknown_action_returns_coach_message() {
+    async fn bg_without_state_manager_errors_cleanly() {
+        let tool = ShellBgTool::new(bash_shell(), None, None);
+        let err = tool.call(args("list")).await.unwrap_err();
+        assert!(matches!(err, ShellBgError::NoStateManager));
+    }
+
+    #[tokio::test]
+    async fn bg_unknown_action_returns_coach_message() {
         let sm = Arc::new(StateManager::new());
-        let tool = BashBgTool::new(bash_shell(), Some(sm), None);
-        let err = tool
-            .call(BashBgArgs {
-                action: "bogus".into(),
-                command: None,
-                capture_output_lines: None,
-                cwd: None,
-                label: None,
-                cooldown_secs: None,
-                id: None,
-                line: None,
-            })
-            .await
-            .unwrap_err();
+        let tool = ShellBgTool::new(bash_shell(), Some(sm), None);
+        let err = tool.call(args("bogus")).await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("start"));
         assert!(msg.contains("stop"));
@@ -384,44 +393,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_bg_start_without_command_returns_coach_message() {
+    async fn bg_start_without_command_returns_coach_message() {
         let sm = Arc::new(StateManager::new());
-        let tool = BashBgTool::new(bash_shell(), Some(sm), None);
-        let err = tool
-            .call(BashBgArgs {
-                action: "start".into(),
-                command: None,
-                capture_output_lines: None,
-                cwd: None,
-                label: None,
-                cooldown_secs: None,
-                id: None,
-                line: None,
-            })
-            .await
-            .unwrap_err();
+        let tool = ShellBgTool::new(bash_shell(), Some(sm), None);
+        let err = tool.call(args("start")).await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("command"));
         assert!(msg.contains("start"));
     }
 
     #[tokio::test]
-    async fn bash_bg_list_on_empty_registry_returns_empty_array() {
+    async fn bg_list_on_empty_registry_returns_empty_array() {
         let sm = Arc::new(StateManager::new());
-        let tool = BashBgTool::new(bash_shell(), Some(sm), None);
-        let out = tool
-            .call(BashBgArgs {
-                action: "list".into(),
-                command: None,
-                capture_output_lines: None,
-                cwd: None,
-                label: None,
-                cooldown_secs: None,
-                id: None,
-                line: None,
-            })
-            .await
-            .unwrap();
+        let tool = ShellBgTool::new(bash_shell(), Some(sm), None);
+        let out = tool.call(args("list")).await.unwrap();
         assert_eq!(out["processes"].as_array().unwrap().len(), 0);
+    }
+
+    /// Error text reaches a PowerShell model verbatim — it must stay
+    /// shell-neutral.
+    #[test]
+    fn errors_are_shell_neutral() {
+        for err in [
+            ShellBgError::NoStateManager,
+            ShellBgError::InvalidAction("x".into()),
+            ShellBgError::MissingField("command", "start"),
+        ] {
+            assert!(
+                !err.to_string().to_lowercase().contains("bash"),
+                "error text must not name bash: {err}"
+            );
+        }
+    }
+
+    /// The rig `const NAME` stays `"bash_bg"` — a compile-time constant
+    /// cannot depend on the detected shell. The dynamic `name()` (next
+    /// test) is what carries the per-shell identity.
+    #[test]
+    fn const_name_stays_bash_bg() {
+        assert_eq!(ShellBgTool::NAME, "bash_bg");
+    }
+
+    /// `name()` returns the shell-derived wire name — never the const —
+    /// and stays in lockstep with `ShellKind::bg_tool_name()`, the single
+    /// source of truth.
+    #[test]
+    fn name_follows_shell_bg_tool_name() {
+        let ps = ShellBgTool::new(ps_shell(), None, None);
+        assert_eq!(ps.name(), "powershell_bg");
+        assert_eq!(ps.name(), ps_shell().bg_tool_name());
+
+        let bash = ShellBgTool::new(bash_shell(), None, None);
+        assert_eq!(bash.name(), "bash_bg");
+        assert_eq!(bash.name(), bash_shell().bg_tool_name());
+    }
+
+    /// `definition().name` must equal `name()` — the wire name the model
+    /// sees is the shell-derived one, for both shells.
+    #[tokio::test]
+    async fn definition_name_matches_name_for_both_shells() {
+        for tool in [
+            ShellBgTool::new(bash_shell(), None, None),
+            ShellBgTool::new(ps_shell(), None, None),
+        ] {
+            let def = tool.definition(String::new()).await;
+            assert_eq!(
+                def.name,
+                tool.name(),
+                "definition name must match name() for shell {}",
+                tool.name()
+            );
+        }
+    }
+
+    /// A PowerShell host's bg tool must not mention bash ANYWHERE in its
+    /// description, and no `{placeholder}` may leak to the model.
+    #[tokio::test]
+    async fn powershell_bg_description_is_bash_free_and_placeholder_free() {
+        let tool = ShellBgTool::new(ps_shell(), None, None);
+        let def = tool.definition(String::new()).await;
+        let lower = def.description.to_lowercase();
+        assert!(
+            !lower.contains("bash"),
+            "powershell_bg description must not mention bash; found in: {}",
+            def.description
+        );
+        assert!(
+            !def.description.contains('{'),
+            "unrendered placeholder leaked into powershell_bg description: {}",
+            def.description
+        );
+    }
+
+    /// The example command in the description is shell-neutral
+    /// (`npm run dev`), not the bash-ism `tail -f`.
+    #[tokio::test]
+    async fn powershell_bg_description_uses_neutral_example_command() {
+        let tool = ShellBgTool::new(ps_shell(), None, None);
+        let def = tool.definition(String::new()).await;
+        assert!(
+            def.description.contains("npm run dev"),
+            "description example should be the neutral `npm run dev`; got: {}",
+            def.description
+        );
+        assert!(
+            !def.description.contains("tail -f"),
+            "description must not keep the bash-ism `tail -f` example; got: {}",
+            def.description
+        );
+    }
+
+    /// On a Bash host the description keeps naming `bash_bg` and `bash`,
+    /// and still renders placeholder-free.
+    #[tokio::test]
+    async fn bash_bg_description_mentions_bash_tools_and_renders() {
+        let tool = ShellBgTool::new(bash_shell(), None, None);
+        let def = tool.definition(String::new()).await;
+        assert!(
+            def.description.contains("bash_bg"),
+            "bash bg description must name `bash_bg`; got: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("bash"),
+            "bash bg description must name the `bash` tool; got: {}",
+            def.description
+        );
+        assert!(
+            !def.description.contains('{'),
+            "unrendered placeholder leaked into bash_bg description: {}",
+            def.description
+        );
     }
 }

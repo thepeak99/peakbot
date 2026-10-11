@@ -303,6 +303,63 @@ mod tests {
         );
     }
 
+    // ── PR3: shell-neutral descriptions ────────────────────────────────
+    //
+    // The file-edit tools tell the model to prefer them over the shell.
+    // That text must say "SHELL COMMANDS", not "BASH": on a PowerShell
+    // host the model has no `bash` tool, and the sweep in
+    // `providers::tests::builtin_tool_definitions_are_bash_free_under_powershell`
+    // would trip on it. These pin each tool individually so a failure
+    // names the offender, and pin the replacement wording.
+
+    #[tokio::test]
+    async fn file_create_description_is_shell_neutral() {
+        let tool = FileCreateTool::new(PathBuf::from("/tmp"));
+        let def = tool.definition(String::new()).await;
+        assert!(
+            !def.description.to_lowercase().contains("bash"),
+            "file_create description must not mention bash, got: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("OVER SHELL COMMANDS"),
+            "file_create must say 'OVER SHELL COMMANDS', got: {}",
+            def.description
+        );
+    }
+
+    #[tokio::test]
+    async fn file_insert_description_is_shell_neutral() {
+        let tool = FileInsertTool::new(PathBuf::from("/tmp"));
+        let def = tool.definition(String::new()).await;
+        assert!(
+            !def.description.to_lowercase().contains("bash"),
+            "file_insert description must not mention bash, got: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("OVER SHELL COMMANDS"),
+            "file_insert must say 'OVER SHELL COMMANDS', got: {}",
+            def.description
+        );
+    }
+
+    #[tokio::test]
+    async fn file_str_replace_description_is_shell_neutral() {
+        let tool = FileStrReplaceTool::new(PathBuf::from("/tmp"));
+        let def = tool.definition(String::new()).await;
+        assert!(
+            !def.description.to_lowercase().contains("bash"),
+            "file_str_replace description must not mention bash, got: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("OVER SHELL COMMANDS"),
+            "file_str_replace must say 'OVER SHELL COMMANDS', got: {}",
+            def.description
+        );
+    }
+
     // ── create ─────────────────────────────────────────────────────────
 
     #[test]
