@@ -218,3 +218,48 @@ describe("CwdPicker — recent dirs", () => {
     expect(sent).toContainEqual({ type: "switch_cwd", path: "/recent/three" });
   });
 });
+
+// ─── win-verbatim-paths: server-composed child paths ─────────────────────
+//
+// RED (runtime + typecheck): the picker navigates sub-directories with a
+// CLIENT-SIDE concat, `navigate(`${browsed ?? cwd}/${e.name}`)` (CwdPicker.tsx
+// ~line 197). On Windows that produces `\\?\C:\Users\Docker/peakbot-test`
+// (os error 123) — mixed separators the backend cannot resolve. The locked
+// contract: each `dir_listing` entry carries a server-composed `full_path`
+// (state.ts `DirEntry` gains `full_path: string`; wire.rs `DirEntryWire`
+// gains `full_path: String`), and clicking a dir row sends
+// `{type:"list_dir", path: e.full_path}` verbatim.
+//
+// As with the recent-dirs block above: `full_path` is not in `DirEntry` yet,
+// so `tsc --noEmit` flags the fixture — expected RED. Under vitest (esbuild,
+// no typecheck) the fixture's extra property is present at runtime and the
+// test runs, failing on the assertion: today the click sends
+// `C:\proj/sub`, not the entry's `C:\proj\sub`.
+describe("CwdPicker — server-composed child paths (win-verbatim-paths)", () => {
+  it("clicking a subdirectory row sends list_dir with the entry's full_path", async () => {
+    const sent: InboundMessage[] = [];
+    const listing: DirListing = {
+      path: "C:\\proj",
+      parent: "C:\\",
+      entries: [{ name: "sub", is_dir: true, full_path: "C:\\proj\\sub" }],
+      error: null,
+    };
+    const el = await mount({
+      ...baseProps,
+      cwd: "C:\\proj",
+      dirListing: listing,
+      send: (m) => sent.push(m),
+    });
+
+    await openPicker(el);
+    const row = findRow(el, "sub");
+    await act(async () => {
+      row.click();
+    });
+
+    // The entry's server-composed path, verbatim — no `/` concat.
+    expect(sent).toContainEqual({ type: "list_dir", path: "C:\\proj\\sub" });
+    // The pre-fix client-side concat must NOT be on the wire.
+    expect(sent).not.toContainEqual({ type: "list_dir", path: "C:\\proj/sub" });
+  });
+});

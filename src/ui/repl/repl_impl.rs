@@ -4255,6 +4255,26 @@ mod model_popup_tests {
         }
     }
 
+    // ── win-verbatim-paths (RED on Windows) ───────────────────────────────
+    //
+    // `std::path::canonicalize` on Windows returns a verbatim `\\?\C:\...`
+    // path (required once the resolved length crosses MAX_PATH); the cwd
+    // picker then displays `\\?\C:\Users\Docker` and child navigation fails
+    // with "os error 123" because the client `/`-joins onto it. The
+    // resolved path must NEVER carry the verbatim prefix — the fix lands as
+    // `dunce::canonicalize`, which strips it.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_cd_path_never_returns_verbatim_prefix() {
+        let tmp = std::env::temp_dir();
+        let got = resolve_cd_path(&tmp.to_string_lossy())
+            .expect("temp dir resolves");
+        assert!(
+            !got.starts_with(r"\\?\"),
+            "resolved path must not carry the verbatim `\\\\?\\` prefix: {got}"
+        );
+    }
+
     #[test]
     fn abbreviate_path_returns_short_path_unchanged() {
         let p = std::path::Path::new("/tmp/proj");
