@@ -144,6 +144,12 @@ pub fn build_models_snapshot(registry: &ModelRegistry) -> Vec<ModelInfo> {
 pub(crate) struct DirEntryWire {
     pub name: String,
     pub is_dir: bool,
+    /// The server-composed absolute path of this entry (listing path +
+    /// name, joined with the platform separator). The client sends this
+    /// back verbatim as the next `list_dir` payload — it never composes
+    /// paths itself (a client-side `/` concat is garbage on Windows, where
+    /// verbatim-style paths don't accept `/` as a separator: os error 123).
+    pub full_path: String,
 }
 
 /// Build a `dir_listing` reply for `path`. Resolves via the shared `/cd`
@@ -177,7 +183,12 @@ pub(crate) fn build_dir_listing(path: &str) -> OutboundMessage {
                     return None;
                 }
                 let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                Some(DirEntryWire { name, is_dir })
+                let full_path = dir.join(&name).to_string_lossy().into_owned();
+                Some(DirEntryWire {
+                    name,
+                    is_dir,
+                    full_path,
+                })
             })
             .collect(),
         Err(e) => {
@@ -389,17 +400,13 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    // ── win-verbatim-paths: server-composed child paths (RED) ─────────────
+    // ── win-verbatim-paths: server-composed child paths ─────────────
     //
     // The cwd picker must never compose child paths client-side: it used to
     // send `${browsed}/${name}` — a `/`-joined path that is garbage on
     // Windows (`\\?\C:\Users\Docker/peakbot-test` → os error 123). The
     // server composes every entry's full path and the client sends it back
     // verbatim in `list_dir`.
-    //
-    // RED: `DirEntryWire` has no `full_path` field yet — this test fails to
-    // compile until `build_dir_listing` populates `full_path: String` =
-    // `dir.join(&name).to_string_lossy()`.
 
     #[test]
     fn build_dir_listing_entries_carry_server_composed_full_paths() {
@@ -431,13 +438,18 @@ mod tests {
                         "full_path of `{}` must be the server-composed join of `{path}`",
                         e.name
                     );
-                    // The composed path must round-trip through the shared
-                    // `/cd` resolver — i.e. be usable as the next `list_dir`
-                    // payload (this is what breaks today on Windows).
-                    assert!(
-                        crate::ui::repl::repl_impl::resolve_cd_path(&e.full_path).is_ok(),
-                        "resolve_cd_path must accept the server-composed full_path: {expected}"
-                    );
+                    // The composed path of a *directory* entry must round-trip
+                    // through the shared `/cd` resolver — i.e. be usable as the
+                    // next `list_dir` payload (this is what breaks today on
+                    // Windows). File entries are deliberately skipped: the
+                    // `/cd` resolver rejects non-directories by design, and the
+                    // picker only ever sends `list_dir` for dir rows.
+                    if e.is_dir {
+                        assert!(
+                            crate::ui::repl::repl_impl::resolve_cd_path(&e.full_path).is_ok(),
+                            "resolve_cd_path must accept the server-composed full_path: {expected}"
+                        );
+                    }
                     // And the field must ride the wire so the SPA can read it.
                     let json = serde_json::to_string(e).unwrap();
                     assert!(

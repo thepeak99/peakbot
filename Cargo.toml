@@ -28,6 +28,11 @@ http = "1"
 chrono = "0.4"
 directories-next = "2"
 dirs = "6"
+# Windows: `dunce::canonicalize` strips the verbatim `\\?\` prefix that
+# `std::path::canonicalize` returns there, so the cwd picker never sees
+# (or client-side `/`-concatenates onto) a verbatim path. Already in the
+# lockfile transitively (via portable-pty) — this only promotes the edge.
+dunce = "1"
 gethostname = "1"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }

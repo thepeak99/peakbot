@@ -3174,6 +3174,7 @@ dependencies = [
  "directories-next",
  "dirs",
  "docx-lite",
+ "dunce",
  "futures",
  "gethostname",
  "http",
