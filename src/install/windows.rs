@@ -86,10 +86,11 @@ fn to_utf16le_with_bom(s: &str) -> Vec<u8> {
     bytes
 }
 
-/// `%USERDOMAIN%\%USERNAME%`, falling back to `%USERNAME%` alone. Off
-/// Windows there are no such variables, so the renderer emits the
-/// placeholder and stays a pure function of its input — that is what lets
-/// Linux CI pin the whole artifact byte-for-byte (§E.9).
+/// `whoami` output is authoritative — under Windows OpenSSH, `USERDOMAIN`
+/// is `WORKGROUP` (Win32-OpenSSH #2407), so env vars alone can't name the
+/// account. Off Windows there are no such variables, so the renderer emits
+/// the placeholder and stays a pure function of its input — that is what
+/// lets Linux CI pin the whole artifact byte-for-byte (§E.9).
 ///
 /// `cfg!` rather than `#[cfg]` on purpose: both branches are portable, and
 /// a runtime `if` keeps them both type-checked on every target.
@@ -97,10 +98,57 @@ fn task_user_id() -> String {
     if !cfg!(windows) {
         return PLACEHOLDER_USER.to_string();
     }
-    format_user_id(
+    if let Ok(r) = run("whoami", &[])
+        && let Some(id) = parse_whoami(&r.stdout)
+    {
+        return id;
+    }
+    fallback_user_id(
         env_var("USERDOMAIN").as_deref(),
         env_var("USERNAME").as_deref(),
+        env_var("COMPUTERNAME").as_deref(),
     )
+}
+
+/// Parse the output of `whoami` (no args) into `DOMAIN\\user`. Pure.
+/// `Some` only for a single, non-blank line with a backslash and non-empty
+/// parts on both sides; everything else is `None`.
+fn parse_whoami(output: &str) -> Option<String> {
+    let line = output.trim();
+    // Exactly one line left after trim.
+    if line.is_empty() || line.contains('\n') || line.contains('\r') {
+        return None;
+    }
+    let (domain, user) = line.split_once('\\')?;
+    if domain.is_empty() || user.is_empty() {
+        return None;
+    }
+    Some(line.to_string())
+}
+
+/// Pure env-var fallback for [`task_user_id`] when `whoami` is unusable.
+/// Returns `String` (`PLACEHOLDER_USER` when there is no user name); a
+/// missing or `WORKGROUP` (case-insensitive) `userdomain` is replaced by
+/// `computername` (Win32-OpenSSH sets `USERDOMAIN=WORKGROUP`, issue #2407).
+fn fallback_user_id(
+    userdomain: Option<&str>,
+    username: Option<&str>,
+    computername: Option<&str>,
+) -> String {
+    let user = match username {
+        Some(u) => u,
+        None => return PLACEHOLDER_USER.to_string(),
+    };
+    // WORKGROUP (any case) is OpenSSH's lie, not a domain; no domain at all
+    // means "the machine itself" → the computer name.
+    let domain = match userdomain {
+        Some(d) if !d.eq_ignore_ascii_case("workgroup") => Some(d),
+        _ => computername,
+    };
+    match domain {
+        Some(d) => format!("{d}\\{user}"),
+        None => user.to_string(),
+    }
 }
 
 /// An environment variable that is present and not blank.
@@ -109,18 +157,6 @@ fn env_var(key: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-}
-
-/// Pure half of [`task_user_id`], so the three cases are testable anywhere.
-fn format_user_id(domain: Option<&str>, user: Option<&str>) -> String {
-    match (domain, user) {
-        (Some(d), Some(u)) => format!("{d}\\{u}"),
-        (None, Some(u)) => u.to_string(),
-        // No user name at all: emit the placeholder rather than invalid
-        // XML — schtasks then fails loudly instead of registering a task
-        // that runs as nobody.
-        _ => PLACEHOLDER_USER.to_string(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,14 +359,6 @@ mod tests {
     }
 
     #[test]
-    fn format_user_id_covers_the_three_cases() {
-        assert_eq!(format_user_id(Some("CORP"), Some("you")), "CORP\\you");
-        assert_eq!(format_user_id(None, Some("you")), "you");
-        assert_eq!(format_user_id(Some("CORP"), None), PLACEHOLDER_USER);
-        assert_eq!(format_user_id(None, None), PLACEHOLDER_USER);
-    }
-
-    #[test]
     fn settings_carry_the_four_load_bearing_values() {
         let xml = render_task_xml_for(&plan("C:\\peakbot.exe"), "DOMAIN\\user");
         // PT0S: the 72-hour default would silently kill the agent.
@@ -359,5 +387,112 @@ mod tests {
         assert!(service_status().expect("status").installed);
         assert!(!uninstall_service().expect("uninstall").installed);
         assert!(!temp_xml_path().exists(), "temp XML must not survive");
+    }
+
+    // ── parse_whoami ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_whoami_accepts_and_trims_a_domain_user() {
+        let cases: &[(&str, &str)] = &[
+            ("host\\user\r\n", "host\\user"),
+            ("host\\user\n", "host\\user"),
+            ("host\\user", "host\\user"),
+            ("  DOMAIN\\Jane Doe \n", "DOMAIN\\Jane Doe"),
+            ("win-cbtf92k3hq0\\docker\r\n", "win-cbtf92k3hq0\\docker"),
+            ("\t CORP\\you \r\n\r\n", "CORP\\you"),
+            ("MÜNCHEN\\José\r\n", "MÜNCHEN\\José"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                parse_whoami(input).as_deref(),
+                Some(*want),
+                "input={input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_whoami_rejects_unusable_output() {
+        let cases: &[&str] = &[
+            "",
+            "   \r\n",
+            "\n\n",
+            "nobackslash",
+            "nobackslash\r\n",
+            "\\user",
+            "host\\",
+            "host\\\r\n",
+            "\\",
+            " \\ ",
+            "host\\user\r\nother\\user2\r\n",
+            "ERROR: something\r\nhost\\user",
+        ];
+        for input in cases {
+            assert_eq!(parse_whoami(input), None, "input={input:?}");
+        }
+    }
+
+    // ── fallback_user_id ────────────────────────────────────────────
+    // Choice: returns `String` (not `Option`), consistent with `task_user_id`:
+    // no user name => PLACEHOLDER_USER; no usable domain
+    // and no computer name => bare user name.
+
+    #[test]
+    fn fallback_user_id_uses_computername_for_workgroup_domain_any_case() {
+        for d in ["WORKGROUP", "workgroup", "WorkGroup"] {
+            assert_eq!(
+                fallback_user_id(Some(d), Some("docker"), Some("WIN-HOST")),
+                "WIN-HOST\\docker",
+                "domain={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_user_id_uses_computername_when_domain_missing() {
+        assert_eq!(
+            fallback_user_id(None, Some("docker"), Some("WIN-HOST")),
+            "WIN-HOST\\docker"
+        );
+    }
+
+    #[test]
+    fn fallback_user_id_keeps_a_real_domain() {
+        assert_eq!(
+            fallback_user_id(Some("CORP"), Some("you"), Some("WIN-HOST")),
+            "CORP\\you"
+        );
+        assert_eq!(
+            fallback_user_id(Some("CORP"), Some("you"), None),
+            "CORP\\you"
+        );
+        // Only the exact word WORKGROUP is special, not a prefix of it.
+        assert_eq!(
+            fallback_user_id(Some("WORKGROUP2"), Some("you"), Some("WIN-HOST")),
+            "WORKGROUP2\\you"
+        );
+    }
+
+    #[test]
+    fn fallback_user_id_without_username_is_the_placeholder() {
+        assert_eq!(
+            fallback_user_id(Some("CORP"), None, Some("WIN-HOST")),
+            PLACEHOLDER_USER
+        );
+        assert_eq!(
+            fallback_user_id(Some("WORKGROUP"), None, Some("WIN-HOST")),
+            PLACEHOLDER_USER
+        );
+        assert_eq!(fallback_user_id(None, None, None), PLACEHOLDER_USER);
+    }
+
+    #[test]
+    fn fallback_user_id_without_any_domain_source_is_the_bare_username() {
+        // Mirrors `format_user_id(None, Some(u)) == u`.
+        assert_eq!(fallback_user_id(None, Some("you"), None), "you");
+        assert_eq!(
+            fallback_user_id(Some("WORKGROUP"), Some("you"), None),
+            "you"
+        );
     }
 }
