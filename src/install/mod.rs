@@ -341,6 +341,27 @@ pub enum InstallError {
     Unsupported(String),
 }
 
+/// Copy `src` to `dst` through ONE write handle: create/truncate, stream the
+/// bytes, (unix) chmod 0o755 on that handle, then `sync_all()` on that same
+/// handle. Windows' `FlushFileBuffers` needs `GENERIC_WRITE`, so syncing a
+/// freshly opened read-only handle fails with `ERROR_ACCESS_DENIED`.
+fn copy_file_synced(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut src_file = std::fs::File::open(src)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)?;
+    std::io::copy(&mut src_file, &mut f)?;
+    // Set the mode on the open handle: no second lookup, no TOC window.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    f.sync_all()
+}
+
 /// Copy `src` to `dst` per the §E.4 8-step algorithm. `dst` should be
 /// the install target (use [`install_target`]).
 pub fn install_binary_to(src: &Path, dst: &Path) -> Result<InstallOutcome, InstallError> {
@@ -377,13 +398,7 @@ pub fn install_binary_to(src: &Path, dst: &Path) -> Result<InstallOutcome, Insta
     // Step 6 — copy, set perms, fsync. Any failure must clean up `tmp`
     // so we don't leave a half-written exe on disk (step 8).
     let copy_result = (|| -> Result<(), InstallError> {
-        std::fs::copy(&source, &tmp).map_err(InstallError::Io)?;
-        #[cfg(unix)]
-        set_executable_mode(&tmp)?;
-        // fsync the data so a power loss between rename and the OS's
-        // lazy flush doesn't leave us with an empty target.
-        let f = std::fs::File::open(&tmp).map_err(InstallError::Io)?;
-        f.sync_all().map_err(InstallError::Io)?;
+        copy_file_synced(&source, &tmp).map_err(InstallError::Io)?;
         Ok(())
     })();
     if let Err(e) = copy_result {
@@ -453,16 +468,6 @@ pub fn install_binary() -> Result<InstallOutcome, InstallError> {
     let dst = install_target()
         .ok_or_else(|| InstallError::Io(io::Error::other("no install target for this platform")))?;
     install_binary_to(&src, &dst)
-}
-
-#[cfg(unix)]
-fn set_executable_mode(path: &Path) -> Result<(), InstallError> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)
-        .map_err(InstallError::Io)?
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).map_err(InstallError::Io)
 }
 
 // ===========================================================================
@@ -1193,5 +1198,128 @@ mod tests {
         assert_eq!(RunState::Running.as_wire(), "running");
         assert_eq!(RunState::Stopped.as_wire(), "stopped");
         assert_eq!(RunState::Unknown.as_wire(), "unknown");
+    }
+
+    // ── copy_file_synced (Windows `peakbot install` ACCESS_DENIED fix) ──
+
+    #[test]
+    fn copy_file_synced_copies_content_byte_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        // Non-UTF-8, NULs, CRLF, and bigger than one io::copy buffer.
+        let mut payload: Vec<u8> = (0..=255u8).collect();
+        payload.extend_from_slice(b"\r\n\0\xFF\xFE");
+        payload.extend(std::iter::repeat_n(0xABu8, 200_000));
+        std::fs::write(&src, &payload).unwrap();
+
+        copy_file_synced(&src, &dst).expect("copy must succeed");
+
+        assert_eq!(std::fs::read(&dst).unwrap(), payload);
+        // The source is untouched.
+        assert_eq!(std::fs::read(&src).unwrap(), payload);
+    }
+
+    #[test]
+    fn copy_file_synced_copies_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("empty");
+        let dst = dir.path().join("out");
+        std::fs::write(&src, b"").unwrap();
+        copy_file_synced(&src, &dst).expect("copy must succeed");
+        assert!(dst.is_file());
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn copy_file_synced_overwrites_and_truncates_a_longer_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"short").unwrap();
+        std::fs::write(&dst, b"this is a much longer pre-existing file").unwrap();
+
+        copy_file_synced(&src, &dst).expect("copy must succeed");
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"short");
+    }
+
+    #[test]
+    fn copy_file_synced_errors_when_the_source_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("does-not-exist");
+        let dst = dir.path().join("dst");
+        let e = copy_file_synced(&src, &dst).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "got {e:?}");
+    }
+
+    #[test]
+    fn copy_file_synced_errors_when_the_destination_directory_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"x").unwrap();
+        let dst = dir.path().join("no-such-dir").join("dst");
+        assert!(copy_file_synced(&src, &dst).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_file_synced_makes_the_destination_executable_0o755() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        copy_file_synced(&src, &dst).expect("copy must succeed");
+
+        let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "dst must be executable, mode={mode:o}");
+        assert_eq!(mode & 0o777, 0o755, "mode={mode:o}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_file_synced_works_from_a_read_only_source_and_leaves_dst_writable_and_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"payload").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        copy_file_synced(&src, &dst).expect("read-only source must be copyable");
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+        let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "dst must be executable, mode={mode:o}");
+        assert_ne!(mode & 0o200, 0, "dst must be owner-writable, mode={mode:o}");
+        // Writable in practice, not just by mode bits.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dst)
+            .expect("dst must be openable for write");
+        // The source keeps its read-only mode.
+        let smode = std::fs::metadata(&src).unwrap().permissions().mode();
+        assert_eq!(smode & 0o777, 0o444);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_file_synced_resets_mode_of_a_pre_existing_non_executable_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old old old").unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        copy_file_synced(&src, &dst).expect("copy must succeed");
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "mode={mode:o}");
     }
 }
