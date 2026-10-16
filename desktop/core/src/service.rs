@@ -1,10 +1,12 @@
 //! Service state, launch planning, dialogs (DESIGN §3.4/§4.4/§5.2).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use semver::Version;
 
+use crate::consts::SERVICE_PORT;
 use crate::phase::Dialog;
+use crate::settings::{Protocol, Settings};
 use crate::sys::RunOutput;
 use crate::version::{DeclinedReplace, InstalledVersion};
 
@@ -19,6 +21,9 @@ pub enum RunState {
 pub struct InstalledService {
     pub exe: Option<PathBuf>,
     pub run: RunState,
+    /// The `TLS:` status line (added by #375) — the service's protocol
+    /// source (invariant I3): `on` ⇒ https.
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,8 +53,19 @@ pub fn status_args() -> [&'static str; 2] {
     ["service", "status"]
 }
 
-pub fn service_install_args() -> [&'static str; 4] {
-    ["service", "install", "--bind", "127.0.0.1:7823"]
+/// `["service","install","--bind","{host}:7823"]` + `["--tls"]` when
+/// https. The token never appears in argv (I7).
+pub fn service_install_args(s: Settings) -> Vec<String> {
+    let mut args = vec![
+        "service".to_string(),
+        "install".to_string(),
+        "--bind".to_string(),
+        format!("{}:{}", s.bind_host(), SERVICE_PORT),
+    ];
+    if s.protocol() == Protocol::Https {
+        args.push("--tls".to_string());
+    }
+    args
 }
 
 pub fn service_uninstall_args() -> [&'static str; 2] {
@@ -79,6 +95,7 @@ pub fn parse_service_status(out: &RunOutput) -> ServiceState {
     let mut installed: Option<bool> = None;
     let mut exe: Option<PathBuf> = None;
     let mut run: Option<RunState> = None;
+    let mut tls = false;
     for line in out.stdout.lines() {
         let line = line.trim();
         if let Some(v) = line.strip_prefix("Installed:") {
@@ -95,12 +112,15 @@ pub fn parse_service_status(out: &RunOutput) -> ServiceState {
                 // `unknown` or anything unrecognised.
                 _ => RunState::Unknown,
             });
+        } else if let Some(v) = line.strip_prefix("TLS:") {
+            tls = v.trim() == "on";
         }
     }
     match installed {
         Some(true) => ServiceState::Installed(InstalledService {
             exe,
             run: run.unwrap_or(RunState::Unknown),
+            tls,
         }),
         Some(false) => ServiceState::NotInstalled,
         None => ServiceState::Unavailable {
@@ -201,6 +221,40 @@ pub fn port_busy_dialog() -> Dialog {
     }
 }
 
+/// `Action::SaveSettings` confirm — session mode (design #377 §5.1).
+pub fn settings_relaunch_dialog() -> Dialog {
+    Dialog {
+        title: "Apply settings?".into(),
+        body: "PeakBot will restart with the new settings. \
+               Conversations that are running now will be interrupted."
+            .into(),
+        ok: "Restart".into(),
+        cancel: Some("Cancel".into()),
+    }
+}
+
+/// `Action::SaveSettings` confirm — service mode (design #377 §5.1).
+pub fn settings_reinstall_dialog() -> Dialog {
+    Dialog {
+        title: "Apply settings?".into(),
+        body: "The background service will be reinstalled with the new settings \
+               and restarted. Conversations that are running now will be interrupted."
+            .into(),
+        ok: "Reinstall".into(),
+        cancel: Some("Cancel".into()),
+    }
+}
+
+/// The settings file write failed (design #377 §5.1); nothing was applied.
+pub fn save_failed_dialog(path: &Path, err: &str) -> Dialog {
+    Dialog {
+        title: "Couldn't save settings".into(),
+        body: format!("{}\n{}", path.display(), err),
+        ok: "OK".into(),
+        cancel: None,
+    }
+}
+
 pub fn command_failed_dialog(command: &str, output: &str) -> Dialog {
     Dialog {
         title: "Background service error".into(),
@@ -226,6 +280,7 @@ pub fn service_log_hint() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn run_out(code: Option<i32>, stdout: &str, stderr: &str) -> RunOutput {
         RunOutput {
@@ -235,7 +290,7 @@ mod tests {
         }
     }
 
-    // §9.1 case 7.
+    // §9.1 case 7 (updated for #377: `InstalledService` carries `tls`).
     #[test]
     fn t07_parse_service_status_installed_running_sample() {
         let out = run_out(
@@ -248,11 +303,12 @@ mod tests {
             ServiceState::Installed(InstalledService {
                 exe: Some(PathBuf::from("/home/u/.local/bin/peakbot")),
                 run: RunState::Running,
+                tls: false,
             })
         );
     }
 
-    // §9.1 case 8.
+    // §9.1 case 8 (updated for #377: `InstalledService` carries `tls`).
     #[test]
     fn t08_exec_path_with_spaces_and_missing_exec() {
         let out = run_out(
@@ -265,6 +321,7 @@ mod tests {
             ServiceState::Installed(InstalledService {
                 exe: Some(PathBuf::from("/home/user with space/.local/bin/peakbot")),
                 run: RunState::Running,
+                tls: false,
             }),
             "a space in the Exec path must be preserved"
         );
@@ -275,11 +332,12 @@ mod tests {
             ServiceState::Installed(InstalledService {
                 exe: None,
                 run: RunState::Running,
+                tls: false,
             })
         );
     }
 
-    // §9.1 case 9.
+    // §9.1 case 9 (updated for #377: `InstalledService` carries `tls`).
     #[test]
     fn t09_state_words() {
         let base = |state: &str| run_out(Some(0), &format!("Installed: true\n{state}\n"), "");
@@ -288,6 +346,7 @@ mod tests {
             ServiceState::Installed(InstalledService {
                 exe: None,
                 run: RunState::Stopped,
+                tls: false,
             })
         );
         assert_eq!(
@@ -295,6 +354,7 @@ mod tests {
             ServiceState::Installed(InstalledService {
                 exe: None,
                 run: RunState::Unknown,
+                tls: false,
             })
         );
         // Missing State line → Unknown.
@@ -304,6 +364,7 @@ mod tests {
             ServiceState::Installed(InstalledService {
                 exe: None,
                 run: RunState::Unknown,
+                tls: false,
             })
         );
     }
@@ -365,6 +426,7 @@ mod tests {
         let mut svc = InstalledService {
             exe: Some(PathBuf::from("/x/peakbot")),
             run: RunState::Running,
+            tls: false,
         };
 
         // Row: Unavailable → Session.
@@ -531,15 +593,121 @@ mod tests {
         assert_eq!(d.cancel.as_deref(), Some("Keep current"));
     }
 
-    // §9.1 case 16.
+    // §9.1 case 16 (updated for #377: `service_install_args` takes the
+    // settings — 3 exact variants).
     #[test]
     fn t16_arg_builders_are_exact() {
+        use crate::settings::{Protocol, Settings};
         assert_eq!(status_args(), ["service", "status"]);
         assert_eq!(
-            service_install_args(),
-            ["service", "install", "--bind", "127.0.0.1:7823"]
+            service_install_args(Settings::default()),
+            vec![
+                "service".to_string(),
+                "install".to_string(),
+                "--bind".to_string(),
+                "127.0.0.1:7823".to_string()
+            ]
+        );
+        assert_eq!(
+            service_install_args(Settings::Loopback {
+                protocol: Protocol::Https,
+                token: true
+            }),
+            vec![
+                "service".to_string(),
+                "install".to_string(),
+                "--bind".to_string(),
+                "127.0.0.1:7823".to_string(),
+                "--tls".to_string()
+            ]
+        );
+        assert_eq!(
+            service_install_args(Settings::Remote),
+            vec![
+                "service".to_string(),
+                "install".to_string(),
+                "--bind".to_string(),
+                "0.0.0.0:7823".to_string(),
+                "--tls".to_string()
+            ]
         );
         assert_eq!(service_uninstall_args(), ["service", "uninstall"]);
         assert_eq!(install_args(), ["install"]);
+    }
+
+    // Design #377 t71: the `TLS:` status line (added by #375) is the
+    // service's protocol source (invariant I3).
+    #[test]
+    fn t71_tls_status_line_parses() {
+        let status = |tls: &str| {
+            run_out(
+                Some(0),
+                &format!("Installed: true\nExec:      /x/peakbot\nState:     running\n{tls}\n"),
+                "",
+            )
+        };
+        assert_eq!(
+            parse_service_status(&status("TLS:       on")),
+            ServiceState::Installed(InstalledService {
+                exe: Some(PathBuf::from("/x/peakbot")),
+                run: RunState::Running,
+                tls: true,
+            }),
+            "`TLS:       on` ⇒ tls: true"
+        );
+        assert_eq!(
+            parse_service_status(&status("TLS:       off")),
+            ServiceState::Installed(InstalledService {
+                exe: Some(PathBuf::from("/x/peakbot")),
+                run: RunState::Running,
+                tls: false,
+            }),
+            "`TLS:       off` ⇒ tls: false"
+        );
+        // A pre-#375 status output has no TLS line at all.
+        let out = run_out(
+            Some(0),
+            "Installed: true\nExec:      /x/peakbot\nState:     running\n",
+            "",
+        );
+        assert_eq!(
+            parse_service_status(&out),
+            ServiceState::Installed(InstalledService {
+                exe: Some(PathBuf::from("/x/peakbot")),
+                run: RunState::Running,
+                tls: false,
+            }),
+            "missing TLS line ⇒ tls: false"
+        );
+    }
+
+    // Design #377 t72: the three new SaveSettings dialogs, verbatim.
+    #[test]
+    fn t72_settings_dialog_strings_are_exact() {
+        let d = settings_relaunch_dialog();
+        assert_eq!(d.title, "Apply settings?");
+        assert_eq!(
+            d.body,
+            "PeakBot will restart with the new settings. \
+             Conversations that are running now will be interrupted."
+        );
+        assert_eq!(d.ok, "Restart");
+        assert_eq!(d.cancel.as_deref(), Some("Cancel"));
+
+        let d = settings_reinstall_dialog();
+        assert_eq!(d.title, "Apply settings?");
+        assert_eq!(
+            d.body,
+            "The background service will be reinstalled with the new settings \
+             and restarted. Conversations that are running now will be interrupted."
+        );
+        assert_eq!(d.ok, "Reinstall");
+        assert_eq!(d.cancel.as_deref(), Some("Cancel"));
+
+        let d = save_failed_dialog(Path::new("/data/settings.json"), "disk full");
+        assert_eq!(d.title, "Couldn't save settings");
+        assert_eq!(d.body, "/data/settings.json\ndisk full");
+        assert_eq!(d.ok, "OK");
+        assert_eq!(d.cancel, None, "info dialog (no cancel)");
     }
 }

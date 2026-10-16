@@ -44,5 +44,12 @@ pub fn act(action: UiAction, app: AppHandle, tx: State<'_, ActionTx>) -> Result<
             app.exit(0);
             Ok(())
         }
+        // The settings page's background row (design #377 §5.2); the
+        // status page never emits it, so this arm is only reachable
+        // from the (later) settings window.
+        UiAction::ToggleBackground => {
+            tx.0.send(Action::ToggleBackground)
+                .map_err(|e| e.to_string())
+        }
     }
 }

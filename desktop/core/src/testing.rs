@@ -89,6 +89,8 @@ pub(crate) struct FakeSysState {
     pub files: HashMap<PathBuf, String>,
     /// Paths `write_private` was called on (the 0600 set).
     pub private_files: HashSet<PathBuf>,
+    /// Paths where `write_private` fails (design #377 t83).
+    pub fail_writes: HashSet<PathBuf>,
     pub port_free: HashMap<u16, bool>,
     pub free_port_value: u16,
     pub cmdline: HashMap<u32, String>,
@@ -170,12 +172,17 @@ impl FakeSys {
     }
 
     /// Seed an in-memory file (web-token, config.yaml, pidfile, …).
-    pub fn seed_file(&self, path: impl Into<PathBuf>, contents: &str) {
+    pub fn seed_file(&self, path: impl Into<PathBuf>, contents: impl Into<String>) {
         self.state
             .lock()
             .unwrap()
             .files
-            .insert(path.into(), contents.to_string());
+            .insert(path.into(), contents.into());
+    }
+
+    /// Make `write_private` fail for this path (design #377 t83).
+    pub fn fail_write(&self, path: impl Into<PathBuf>) {
+        self.state.lock().unwrap().fail_writes.insert(path.into());
     }
 
     pub fn file(&self, path: &Path) -> Option<String> {
@@ -351,6 +358,9 @@ impl Sys for FakeSys {
     }
 
     fn write_private(&self, path: &Path, contents: &str) -> io::Result<()> {
+        if self.state.lock().unwrap().fail_writes.contains(path) {
+            return Err(io::Error::other("fake write failure"));
+        }
         {
             let mut st = self.state.lock().unwrap();
             st.files.insert(path.to_path_buf(), contents.to_string());

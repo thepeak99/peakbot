@@ -9,18 +9,22 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::service::ServiceState;
+use crate::settings::Protocol;
 use crate::token::Token;
 
-/// Where the webview points. A session ALWAYS carries a token (illegal
-/// state unrepresentable, §3.8-1).
+/// Where the webview points. The protocol + optional token come from
+/// `settings.json` (session) / the `TLS:` status line (service) —
+/// `token: None` ⇔ web-token file absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Session {
         port: u16,
-        token: Token,
+        protocol: Protocol,
+        token: Option<Token>,
     },
     /// `token: None` ⇔ web-token file absent (tokenless loopback service).
     Service {
+        protocol: Protocol,
         token: Option<Token>,
     },
 }
@@ -34,35 +38,51 @@ impl Mode {
         }
     }
 
-    /// `http://127.0.0.1:<port>/` [+ `?token=<percent-encoded>`].
+    pub fn protocol(&self) -> Protocol {
+        match self {
+            Mode::Session { protocol, .. } => *protocol,
+            Mode::Service { protocol, .. } => *protocol,
+        }
+    }
+
+    /// `{scheme}://127.0.0.1:<port>/` [+ `?token=<percent-encoded>`].
+    /// Always 127.0.0.1, even when remote (0.0.0.0 accepts loopback).
     pub fn url(&self) -> Url {
-        let mut u = Url::parse(&format!("http://127.0.0.1:{}/", self.port()))
-            .expect("static host is a valid URL");
+        let mut u = Url::parse(&format!(
+            "{}://127.0.0.1:{}/",
+            self.protocol().scheme(),
+            self.port()
+        ))
+        .expect("static host is a valid URL");
         if let Some(tok) = self.token() {
             u.query_pairs_mut().append_pair("token", tok.as_str());
         }
         u
     }
 
-    /// `http://127.0.0.1:<port>/commands` [+ `?token=…`].
+    /// `{scheme}://127.0.0.1:<port>/commands` [+ `?token=…`].
     pub fn probe_url(&self) -> Url {
-        let mut u = Url::parse(&format!("http://127.0.0.1:{}/commands", self.port()))
-            .expect("static host is a valid URL");
+        let mut u = Url::parse(&format!(
+            "{}://127.0.0.1:{}/commands",
+            self.protocol().scheme(),
+            self.port()
+        ))
+        .expect("static host is a valid URL");
         if let Some(tok) = self.token() {
             u.query_pairs_mut().append_pair("token", tok.as_str());
         }
         u
     }
 
-    /// `"http://127.0.0.1:<port>"`.
+    /// `"{scheme}://127.0.0.1:<port>"`.
     pub fn origin(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port())
+        format!("{}://127.0.0.1:{}", self.protocol().scheme(), self.port())
     }
 
     fn token(&self) -> Option<&Token> {
         match self {
-            Mode::Session { token, .. } => Some(token),
-            Mode::Service { token } => token.as_ref(),
+            Mode::Session { token, .. } => token.as_ref(),
+            Mode::Service { token, .. } => token.as_ref(),
         }
     }
 }
@@ -129,6 +149,9 @@ pub enum UiAction {
     OpenLogs,
     ReinstallService,
     Quit,
+    /// The settings page's background row (design #377 §4.2); `status_view`
+    /// never emits it.
+    ToggleBackground,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -307,14 +330,17 @@ pub struct Dialog {
 mod tests {
     use super::*;
     use crate::service::{InstalledService, RunState};
+    use crate::settings::Protocol;
 
-    // §9.1 case 28.
+    // §9.1 case 28 (updated for #377: `Mode` carries the protocol; the
+    // session token is optional).
     #[test]
     fn t28_mode_session_url_and_probe_url() {
         let tok = Token::parse("tok+en&1").expect("token with + & parses");
         let m = Mode::Session {
             port: 7824,
-            token: tok,
+            protocol: Protocol::Http,
+            token: Some(tok),
         };
         assert_eq!(m.port(), 7824);
         let url = m.url();
@@ -331,10 +357,67 @@ mod tests {
         );
     }
 
-    // §9.1 case 29.
+    // Design #377 t73: the https variants and the tokenless session.
+    #[test]
+    fn t73_mode_https_urls_and_tokenless_session() {
+        let tok = Token::parse("tok+en&1").expect("token with + & parses");
+
+        // https session.
+        let m = Mode::Session {
+            port: 7824,
+            protocol: Protocol::Https,
+            token: Some(tok.clone()),
+        };
+        assert_eq!(
+            m.url().to_string(),
+            "https://127.0.0.1:7824/?token=tok%2Ben%261"
+        );
+        assert_eq!(
+            m.probe_url().to_string(),
+            "https://127.0.0.1:7824/commands?token=tok%2Ben%261"
+        );
+        assert_eq!(m.origin(), "https://127.0.0.1:7824");
+
+        // Tokenless session: no `?token=` anywhere.
+        let m = Mode::Session {
+            port: 7824,
+            protocol: Protocol::Http,
+            token: None,
+        };
+        assert_eq!(m.url().to_string(), "http://127.0.0.1:7824/");
+        assert_eq!(m.probe_url().to_string(), "http://127.0.0.1:7824/commands");
+        assert_eq!(m.origin(), "http://127.0.0.1:7824");
+
+        // https service, tokened and tokenless.
+        let m = Mode::Service {
+            protocol: Protocol::Https,
+            token: Some(tok),
+        };
+        assert_eq!(m.port(), 7823);
+        assert_eq!(
+            m.url().to_string(),
+            "https://127.0.0.1:7823/?token=tok%2Ben%261"
+        );
+        assert_eq!(
+            m.probe_url().to_string(),
+            "https://127.0.0.1:7823/commands?token=tok%2Ben%261"
+        );
+        assert_eq!(m.origin(), "https://127.0.0.1:7823");
+        let m = Mode::Service {
+            protocol: Protocol::Https,
+            token: None,
+        };
+        assert_eq!(m.url().to_string(), "https://127.0.0.1:7823/");
+        assert_eq!(m.probe_url().to_string(), "https://127.0.0.1:7823/commands");
+    }
+
+    // §9.1 case 29 (updated for #377: `Mode` carries the protocol).
     #[test]
     fn t29_mode_service_url_and_origin() {
-        let m = Mode::Service { token: None };
+        let m = Mode::Service {
+            protocol: Protocol::Http,
+            token: None,
+        };
         assert_eq!(m.port(), 7823);
         assert_eq!(m.url().to_string(), "http://127.0.0.1:7823/");
         assert_eq!(m.origin(), "http://127.0.0.1:7823");
@@ -381,12 +464,16 @@ mod tests {
         let tok = Token::parse("t").expect("parses");
         let sv = status_view(&Phase::Ready(Mode::Session {
             port: 7824,
-            token: tok,
+            protocol: Protocol::Http,
+            token: Some(tok),
         }));
         assert_eq!(sv.kind, "ready");
         assert_eq!(sv.title, "Opening PeakBot…");
         assert!(sv.actions.is_empty());
-        let sv = status_view(&Phase::Ready(Mode::Service { token: None }));
+        let sv = status_view(&Phase::Ready(Mode::Service {
+            protocol: Protocol::Http,
+            token: None,
+        }));
         assert_eq!(sv.kind, "ready");
         assert_eq!(sv.title, "Opening PeakBot…");
         assert!(sv.actions.is_empty());
@@ -518,12 +605,17 @@ mod tests {
         let tok = Token::parse("t").expect("parses");
         let ready_session = Phase::Ready(Mode::Session {
             port: 7824,
-            token: tok,
+            protocol: Protocol::Http,
+            token: Some(tok),
         });
-        let ready_service = Phase::Ready(Mode::Service { token: None });
+        let ready_service = Phase::Ready(Mode::Service {
+            protocol: Protocol::Http,
+            token: None,
+        });
         let installed = ServiceState::Installed(InstalledService {
             exe: None,
             run: RunState::Running,
+            tls: false,
         });
 
         // Starting → background disabled.
@@ -579,7 +671,7 @@ mod tests {
         assert_eq!(t.status, "PeakBot ? · starting…");
     }
 
-    // §9.1 case 32.
+    // §9.1 case 32 (updated for #377: + `toggle_background`).
     #[test]
     fn t32_ui_action_serde_wire_names() {
         for (wire, action) in [
@@ -587,6 +679,7 @@ mod tests {
             ("open_logs", UiAction::OpenLogs),
             ("reinstall_service", UiAction::ReinstallService),
             ("quit", UiAction::Quit),
+            ("toggle_background", UiAction::ToggleBackground),
         ] {
             let d: UiAction = serde_json::from_str(&format!("\"{wire}\""))
                 .unwrap_or_else(|e| panic!("{wire}: {e}"));

@@ -30,6 +30,10 @@ pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::
                             let _ = app.opener().open_url(url.to_string(), None::<&str>);
                             false
                         }
+                        // The reserved settings sentinel: block the
+                        // navigation; opening the settings window is the
+                        // later glue task (design #377 §4.1).
+                        NavDecision::OpenSettings => false,
                         // file:, data:, javascript:, …
                         NavDecision::Block => false,
                     }
@@ -41,10 +45,14 @@ pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::
                 move |url: tauri::Url, _features: NewWindowFeatures| {
                     // Never open an in-app popup; non-blocked URLs go to the
                     // system browser (DESIGN §4.8).
-                    if classify_navigation(&url, nav.read().expect("nav poisoned").as_deref())
-                        != NavDecision::Block
-                    {
-                        let _ = app.opener().open_url(url.to_string(), None::<&str>);
+                    match classify_navigation(&url, nav.read().expect("nav poisoned").as_deref()) {
+                        NavDecision::Allow | NavDecision::OpenExternal => {
+                            let _ = app.opener().open_url(url.to_string(), None::<&str>);
+                        }
+                        // The settings sentinel (and file:/data:/…) never
+                        // leaves: opening the settings window is the later
+                        // glue task (design #377 §4.1).
+                        NavDecision::OpenSettings | NavDecision::Block => {}
                     }
                     NewWindowResponse::Deny
                 }

@@ -65,6 +65,11 @@ impl DesktopPaths {
     pub fn peakbot_config(&self) -> PathBuf {
         self.peakbot_config_dir.join("config.yaml")
     }
+
+    /// `data_dir/settings.json` (design #377 §3.1: launch parameters only).
+    pub fn settings_file(&self) -> PathBuf {
+        self.data_dir.join("settings.json")
+    }
 }
 
 #[cfg(test)]
@@ -80,7 +85,7 @@ mod tests {
         }
     }
 
-    // §9.1 case 26.
+    // §9.1 case 26 (updated for #377: + settings_file).
     #[test]
     fn t26_sidecar_path_and_helper_file_names() {
         let p = sidecar_path(Path::new("/tmp/.mount_x/usr/bin/peakbot-desktop"));
@@ -92,6 +97,7 @@ mod tests {
         assert_eq!(d.session_log(), PathBuf::from("/logs/peakbot-session.log"));
         assert_eq!(d.web_token(), PathBuf::from("/cfg/web-token"));
         assert_eq!(d.peakbot_config(), PathBuf::from("/cfg/config.yaml"));
+        assert_eq!(d.settings_file(), PathBuf::from("/data/settings.json"));
     }
 
     // §9.1 case 27.

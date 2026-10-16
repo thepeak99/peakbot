@@ -10,11 +10,10 @@ ureq = { version = "3.4.2", default-features = false }
 getrandom = "0.3.4"
 directories-next = "2"      # same crate as peakbot's get_config_dir
 serde = { version = "1", features = ["derive"] }
+# The settings file (design #377 §3.1) is parsed in production code.
+serde_json = "1"
 log = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
 [dev-dependencies]
 tempfile = "3.27"
-# Test-only (T1): the `UiAction` wire-format test (§9.1 case 32) needs a
-# JSON serializer. Not a production dep of core.
-serde_json = "1"

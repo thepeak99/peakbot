@@ -18,8 +18,21 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// Every test that **binds a port** or **forks a child** in this binary
+/// must hold this lock. Two test-harness races (not production bugs) make
+/// port assertions flaky under the default parallel execution:
+/// 1. A forked child inherits a copy of any open fd (fork → exec/exec-
+///    exit), keeping a just-dropped listener socket in LISTEN for a few
+///    ms — the sibling's fork can land inside a test's bind→drop window.
+/// 2. A `bind(127.0.0.1, 0)` may hand out a port another test just
+///    released, stealing it between that test's drop and rebind.
+///
+/// The affected tests are short, so serializing them is cheap.
+static PORT_RACE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn real_sys_run_captures_stdout_stderr_and_exit_code() {
+    let _guard = PORT_RACE_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let script = write_script(
         dir.path(),
@@ -45,6 +58,7 @@ fn real_sys_run_missing_program_is_notfound() {
 
 #[test]
 fn real_sys_run_timeout_kills_the_child() {
+    let _guard = PORT_RACE_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let script = write_script(dir.path(), "sleepy.sh", "#!/bin/sh\nsleep 30\n");
     // Test-only short-timeout constructor — a REQUIRED addition for C8
@@ -66,6 +80,7 @@ fn real_sys_run_timeout_kills_the_child() {
 
 #[test]
 fn real_sys_spawn_interrupt_exits_within_grace() {
+    let _guard = PORT_RACE_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let script = write_script(
         dir.path(),
@@ -118,6 +133,7 @@ fn real_sys_write_private_is_mode_0600() {
 
 #[test]
 fn real_sys_free_port_is_bindable() {
+    let _guard = PORT_RACE_LOCK.lock().unwrap();
     let port = RealSys::new().free_port().expect("free_port");
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
         .expect("the returned port must be bindable");
@@ -138,4 +154,58 @@ fn real_sys_random_token_is_64_lowercase_hex_and_distinct() {
         "lowercase hex only; got {ta:?}"
     );
     assert_ne!(ta, tb, "two calls must differ");
+}
+
+// Design #377 t88 (unix): the https probe is a plain TCP connect — no TLS
+// handshake (core ureq has no TLS; #374 replaces this branch with a
+// CA-verified GET).
+#[test]
+fn t88_real_sys_probe_https_listening_and_unreachable() {
+    use peakbot_desktop_core::consts::PROBE_TIMEOUT;
+    use peakbot_desktop_core::sys::Probe;
+    use url::Url;
+
+    let _guard = PORT_RACE_LOCK.lock().unwrap();
+    let sys = RealSys::new();
+
+    // A bound listener ⇒ Listening (the socket accepts, no HTTP is spoken).
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    let probe_url = Url::parse(&format!("https://127.0.0.1:{port}/commands")).expect("url");
+    assert_eq!(
+        sys.probe(&probe_url),
+        Probe::Listening,
+        "a live TCP listener must answer the https probe as Listening"
+    );
+
+    // A closed port ⇒ Unreachable, and it must fail fast.
+    drop(listener);
+    // Sibling tests in this binary fork child processes; the forked child
+    // holds a copy of our listener fd (fork → exec/exec-exit), which can
+    // keep the socket in LISTEN for a few ms after the drop. Wait (bounded)
+    // until the port is actually refused so the probe result is
+    // deterministic — a test-harness race, not a production one. The
+    // sibling children here live at most ~500 ms, so 3 s is generous.
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .expect("a loopback addr is valid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "port {port} stayed in LISTEN past 3 s after the drop"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let start = std::time::Instant::now();
+    assert_eq!(
+        sys.probe(&probe_url),
+        Probe::Unreachable,
+        "a closed port must be Unreachable"
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed <= PROBE_TIMEOUT + Duration::from_secs(2),
+        "the failed connect must fail fast (≤ PROBE_TIMEOUT + slack); took {elapsed:?}"
+    );
 }

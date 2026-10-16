@@ -48,6 +48,9 @@ impl RunOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Probe {
     Status(u16),
+    /// TCP connect accepted, no HTTP spoken (https only, until #374
+    /// swaps in a CA-verified GET — design #377 §6 T3).
+    Listening,
     Unreachable,
 }
 
@@ -222,8 +225,18 @@ impl Sys for RealSys {
 
     /// GET with PROBE_TIMEOUT, no redirects. Any HTTP status (incl.
     /// 4xx/5xx) → `Status(code)`; transport-level failure →
-    /// `Unreachable`.
+    /// `Unreachable`. https URLs get a plain TCP connect (core ureq has
+    /// no TLS — design #377 §6 T3; #374 replaces this branch).
     fn probe(&self, url: &Url) -> Probe {
+        if url.scheme() == "https" {
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", url.port().unwrap_or(443))
+                .parse()
+                .expect("a loopback addr is valid");
+            return match std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) {
+                Ok(_) => Probe::Listening,
+                Err(_) => Probe::Unreachable,
+            };
+        }
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(PROBE_TIMEOUT))
             .max_redirects(0)
