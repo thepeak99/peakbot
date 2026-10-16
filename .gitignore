@@ -5,6 +5,7 @@ output
 *.md
 !release-notes/**/*.md
 !vendor/**/*.md
+!desktop/**/*.md
 .release-version
 .peakbot/vectors.db
 
@@ -19,3 +20,8 @@ scripts
 
 # Local wire-sniff dumps (can contain request/response bodies — never commit)
 sniff-bug.jsonl
+
+# PeakBot Desktop build artifacts (desktop/DESIGN.md §5.7)
+desktop/target/
+desktop/src-tauri/binaries/peakbot-*
+desktop/src-tauri/gen/
