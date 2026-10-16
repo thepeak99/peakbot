@@ -4,13 +4,16 @@ use crate::token::Token;
 
 /// `["--bind", "127.0.0.1:<port>"]`.
 pub fn session_args(port: u16) -> Vec<String> {
-    todo!()
+    vec!["--bind".to_string(), format!("127.0.0.1:{port}")]
 }
 
 /// `[("PEAKBOT_WEB_TOKEN", tok), ("PEAKBOT_NO_OPEN", "1")]` — exactly
 /// these two (on top of the sanitized base env).
 pub fn session_env(token: &Token) -> Vec<(String, String)> {
-    todo!()
+    vec![
+        ("PEAKBOT_WEB_TOKEN".to_string(), token.as_str().to_string()),
+        ("PEAKBOT_NO_OPEN".to_string(), "1".to_string()),
+    ]
 }
 
 /// `pidfile` content: `pid=<u32>\nport=<u16>\n`.
@@ -22,18 +25,37 @@ pub struct PidRecord {
 
 impl PidRecord {
     pub fn render(&self) -> String {
-        todo!()
+        format!("pid={}\nport={}\n", self.pid, self.port)
     }
 
     pub fn parse(s: &str) -> Option<PidRecord> {
-        todo!()
+        let mut pid: Option<u32> = None;
+        let mut port: Option<u16> = None;
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("pid=") {
+                let p: u32 = v.parse().ok()?;
+                pid = Some(p);
+            } else {
+                let v = line.strip_prefix("port=")?;
+                let p: u16 = v.parse().ok()?;
+                port = Some(p);
+            }
+        }
+        Some(PidRecord {
+            pid: pid?,
+            port: port?,
+        })
     }
 }
 
 /// Identity check for the stale-pidfile reaper (DESIGN §4.6): cmdline
 /// contains `peakbot` AND `--bind 127.0.0.1:<rec.port>`.
 pub fn is_our_sidecar(cmdline: &str, rec: &PidRecord) -> bool {
-    todo!()
+    cmdline.contains("peakbot") && cmdline.contains(&format!("--bind 127.0.0.1:{}", rec.port))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,13 +65,22 @@ pub enum EarlyExit {
 }
 
 /// Log tail contains `already in use` → PortTaken, else Crashed.
-pub fn classify_early_exit(code: Option<i32>, log_tail: &str) -> EarlyExit {
-    todo!()
+/// (`code` is kept for the locked signature; the tail is the signal.)
+pub fn classify_early_exit(_code: Option<i32>, log_tail: &str) -> EarlyExit {
+    if log_tail.contains("already in use") {
+        EarlyExit::PortTaken
+    } else {
+        EarlyExit::Crashed
+    }
 }
 
 /// Last `n` lines; fewer lines → all; empty → empty.
 pub fn tail_lines(text: &str, n: usize) -> String {
-    todo!()
+    if n == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 #[cfg(test)]

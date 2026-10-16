@@ -13,23 +13,27 @@ impl Token {
     /// Trims; `None` if empty/whitespace-only or containing any
     /// whitespace/control char.
     pub fn parse(s: &str) -> Option<Token> {
-        todo!()
+        let t = s.trim();
+        if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return None;
+        }
+        Some(Token(t.to_string()))
     }
 
     /// Delegates to `sys.random_token()`.
     pub fn generate(sys: &impl Sys) -> Token {
-        todo!()
+        sys.random_token()
     }
 
     pub fn as_str(&self) -> &str {
-        todo!()
+        &self.0
     }
 }
 
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Locked: prints "Token(***)" — never the secret (§3.2 / §3.8-7).
-        todo!()
+        f.write_str("Token(***)")
     }
 }
 

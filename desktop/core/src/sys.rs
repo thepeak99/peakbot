@@ -22,12 +22,18 @@ pub struct RunOutput {
 impl RunOutput {
     /// `code == Some(0)`.
     pub fn ok(&self) -> bool {
-        todo!()
+        self.code == Some(0)
     }
 
     /// stdout + stderr in one string (for diagnostics).
     pub fn combined(&self) -> String {
-        todo!()
+        if self.stderr.is_empty() {
+            self.stdout.clone()
+        } else if self.stdout.is_empty() {
+            self.stderr.clone()
+        } else {
+            format!("{}\n{}", self.stdout, self.stderr)
+        }
     }
 }
 
@@ -102,6 +108,9 @@ pub struct RealSys {
 }
 
 impl RealSys {
+    // The stub keeps `new()` C8-locked; a `Default` impl is not part of the
+    // §5.1 surface.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> RealSys {
         todo!()
     }
@@ -110,21 +119,21 @@ impl RealSys {
     /// report): overrides the `run` timeout so the "run timeout kills"
     /// integration test does not wait the full 60 s `RUN_TIMEOUT`. Not
     /// part of the locked §5.1 surface.
-    pub fn with_run_timeout(timeout: Duration) -> RealSys {
+    pub fn with_run_timeout(_timeout: Duration) -> RealSys {
         todo!()
     }
 }
 
 impl Sys for RealSys {
-    fn run(&self, program: &Path, args: &[&str]) -> io::Result<RunOutput> {
+    fn run(&self, _program: &Path, _args: &[&str]) -> io::Result<RunOutput> {
         todo!()
     }
 
-    fn spawn(&self, spec: SpawnSpec) -> io::Result<Box<dyn Child>> {
+    fn spawn(&self, _spec: SpawnSpec) -> io::Result<Box<dyn Child>> {
         todo!()
     }
 
-    fn probe(&self, url: &Url) -> Probe {
+    fn probe(&self, _url: &Url) -> Probe {
         todo!()
     }
 
@@ -132,7 +141,7 @@ impl Sys for RealSys {
         todo!()
     }
 
-    fn port_is_free(&self, port: u16) -> bool {
+    fn port_is_free(&self, _port: u16) -> bool {
         todo!()
     }
 
@@ -140,31 +149,31 @@ impl Sys for RealSys {
         todo!()
     }
 
-    fn read(&self, path: &Path) -> io::Result<Option<String>> {
+    fn read(&self, _path: &Path) -> io::Result<Option<String>> {
         todo!()
     }
 
-    fn write_private(&self, path: &Path, contents: &str) -> io::Result<()> {
+    fn write_private(&self, _path: &Path, _contents: &str) -> io::Result<()> {
         todo!()
     }
 
-    fn remove(&self, path: &Path) -> io::Result<()> {
+    fn remove(&self, _path: &Path) -> io::Result<()> {
         todo!()
     }
 
-    fn exists(&self, path: &Path) -> bool {
+    fn exists(&self, _path: &Path) -> bool {
         todo!()
     }
 
-    fn cmdline_of(&self, pid: u32) -> Option<String> {
+    fn cmdline_of(&self, _pid: u32) -> Option<String> {
         todo!()
     }
 
-    fn signal(&self, pid: u32, sig: Signal) {
+    fn signal(&self, _pid: u32, _sig: Signal) {
         todo!()
     }
 
-    fn sleep(&self, d: Duration) {
+    fn sleep(&self, _d: Duration) {
         todo!()
     }
 

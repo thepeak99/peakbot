@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use url::Url;
 
-use crate::sys::{Child, Sys};
+use crate::sys::{Child, Probe, Sys};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadyOutcome {
@@ -23,10 +23,32 @@ pub fn wait_ready(
     sys: &impl Sys,
     url: &Url,
     timeout: Duration,
-    child: Option<&mut dyn Child>,
+    mut child: Option<&mut dyn Child>,
     quitting: &AtomicBool,
 ) -> ReadyOutcome {
-    todo!()
+    use std::sync::atomic::Ordering;
+
+    let start = sys.now();
+    loop {
+        if quitting.load(Ordering::Relaxed) {
+            return ReadyOutcome::Cancelled;
+        }
+        if let Some(exit) = child
+            .as_deref_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
+        {
+            return ReadyOutcome::ChildExited(exit);
+        }
+        match sys.probe(url) {
+            Probe::Status(200) => return ReadyOutcome::Ready,
+            Probe::Status(401) | Probe::Status(403) => return ReadyOutcome::TokenRejected,
+            Probe::Status(_) | Probe::Unreachable => {}
+        }
+        if sys.now() - start >= timeout {
+            return ReadyOutcome::Timeout;
+        }
+        sys.sleep(crate::consts::POLL_INTERVAL);
+    }
 }
 
 #[cfg(test)]

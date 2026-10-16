@@ -28,22 +28,42 @@ pub enum Mode {
 impl Mode {
     /// `Service ⇒ SERVICE_PORT`.
     pub fn port(&self) -> u16 {
-        todo!()
+        match self {
+            Mode::Session { port, .. } => *port,
+            Mode::Service { .. } => crate::consts::SERVICE_PORT,
+        }
     }
 
     /// `http://127.0.0.1:<port>/` [+ `?token=<percent-encoded>`].
     pub fn url(&self) -> Url {
-        todo!()
+        let mut u = Url::parse(&format!("http://127.0.0.1:{}/", self.port()))
+            .expect("static host is a valid URL");
+        if let Some(tok) = self.token() {
+            u.query_pairs_mut().append_pair("token", tok.as_str());
+        }
+        u
     }
 
     /// `http://127.0.0.1:<port>/commands` [+ `?token=…`].
     pub fn probe_url(&self) -> Url {
-        todo!()
+        let mut u = Url::parse(&format!("http://127.0.0.1:{}/commands", self.port()))
+            .expect("static host is a valid URL");
+        if let Some(tok) = self.token() {
+            u.query_pairs_mut().append_pair("token", tok.as_str());
+        }
+        u
     }
 
     /// `"http://127.0.0.1:<port>"`.
     pub fn origin(&self) -> String {
-        todo!()
+        format!("http://127.0.0.1:{}", self.port())
+    }
+
+    fn token(&self) -> Option<&Token> {
+        match self {
+            Mode::Session { token, .. } => Some(token),
+            Mode::Service { token } => token.as_ref(),
+        }
     }
 }
 
@@ -122,8 +142,111 @@ pub struct StatusView {
     pub actions: Vec<UiAction>,
 }
 
+/// The locked status-page title for a start step (DESIGN §3.5).
+fn step_text(step: StartStep) -> &'static str {
+    match step {
+        StartStep::CheckingBundled => "Checking the bundled PeakBot…",
+        StartStep::CheckingService => "Looking for a background service…",
+        StartStep::StartingSession => "Starting PeakBot…",
+        StartStep::WaitingForBackend => "Waiting for PeakBot to be ready…",
+        StartStep::InstallingService => "Installing the background service…",
+        StartStep::RemovingService => "Removing the background service…",
+        StartStep::ConnectingService => "Connecting to the background service…",
+        StartStep::StoppingSession => "Stopping PeakBot…",
+    }
+}
+
 pub fn status_view(phase: &Phase) -> StatusView {
-    todo!()
+    match phase {
+        Phase::Starting(step) => StatusView {
+            kind: "starting",
+            title: step_text(*step).to_string(),
+            detail: None,
+            actions: Vec::new(),
+        },
+        Phase::Ready(_) => StatusView {
+            kind: "ready",
+            title: "Opening PeakBot…".to_string(),
+            detail: None,
+            actions: Vec::new(),
+        },
+        Phase::Failed(err) => failed_view(err),
+    }
+}
+
+fn failed_view(err: &StartError) -> StatusView {
+    let retry_logs_quit = vec![UiAction::Retry, UiAction::OpenLogs, UiAction::Quit];
+    let retry_reinstall_quit = vec![UiAction::Retry, UiAction::ReinstallService, UiAction::Quit];
+    match err {
+        StartError::SidecarMissing { path } => StatusView {
+            kind: "failed",
+            title: "The PeakBot backend is missing from this app".into(),
+            detail: Some(path.display().to_string()),
+            actions: vec![UiAction::Quit],
+        },
+        StartError::SidecarBroken { .. } => StatusView {
+            kind: "failed",
+            title: "The bundled PeakBot backend failed to run".into(),
+            detail: None,
+            actions: retry_logs_quit,
+        },
+        StartError::PortUnavailable => StatusView {
+            kind: "failed",
+            title: "Couldn't find a free local port".into(),
+            detail: None,
+            actions: vec![UiAction::Retry, UiAction::Quit],
+        },
+        StartError::SessionExited { code, log_tail } => {
+            let head = match code {
+                Some(n) => format!("exit code {n}"),
+                None => "killed by a signal".to_string(),
+            };
+            StatusView {
+                kind: "failed",
+                title: "PeakBot stopped unexpectedly".into(),
+                detail: Some(format!("{head}\n\n{log_tail}")),
+                actions: retry_logs_quit,
+            }
+        }
+        StartError::NotReady { waited } => StatusView {
+            kind: "failed",
+            title: format!("PeakBot didn't start within {} s", waited.as_secs()),
+            detail: None,
+            actions: retry_logs_quit,
+        },
+        StartError::TokenRejected { service: false } => StatusView {
+            kind: "failed",
+            title: "Another program answered on PeakBot's port".into(),
+            detail: None,
+            actions: vec![UiAction::Retry, UiAction::Quit],
+        },
+        StartError::TokenRejected { service: true } => StatusView {
+            kind: "failed",
+            title: "The background service rejected the access token".into(),
+            detail: Some(crate::service::service_log_hint().to_string()),
+            actions: retry_reinstall_quit,
+        },
+        StartError::ServiceUnreachable { .. } => StatusView {
+            kind: "failed",
+            title: format!(
+                "The background PeakBot service isn't responding on 127.0.0.1:{}",
+                crate::consts::SERVICE_PORT
+            ),
+            detail: Some(crate::service::service_log_hint().to_string()),
+            actions: retry_reinstall_quit,
+        },
+        StartError::ServiceCommandFailed { command, output } => StatusView {
+            kind: "failed",
+            title: "A background-service command failed".into(),
+            detail: Some(format!("$ {command}\n{output}")),
+            actions: vec![
+                UiAction::Retry,
+                UiAction::ReinstallService,
+                UiAction::OpenLogs,
+                UiAction::Quit,
+            ],
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +263,35 @@ pub fn tray_model(
     service: Option<&ServiceState>,
     bundled: Option<&Version>,
 ) -> TrayModel {
-    todo!()
+    let v = bundled
+        .map(Version::to_string)
+        .unwrap_or_else(|| "?".to_string());
+    let status = match phase {
+        Phase::Starting(_) => format!("PeakBot {v} · starting…"),
+        Phase::Ready(Mode::Session { port, .. }) => {
+            format!("PeakBot {v} · running (port {port})")
+        }
+        Phase::Ready(Mode::Service { .. }) => format!("PeakBot {v} · running in background"),
+        Phase::Failed(_) => format!("PeakBot {v} · error"),
+    };
+    let background_label = match service {
+        Some(ServiceState::Unavailable { .. }) => {
+            "Keep PeakBot running in background (unavailable)".to_string()
+        }
+        _ => "Keep PeakBot running in background".to_string(),
+    };
+    let background_checked = matches!(service, Some(ServiceState::Installed(_)));
+    let background_enabled = matches!(phase, Phase::Ready(_) | Phase::Failed(_))
+        && matches!(
+            service,
+            Some(ServiceState::NotInstalled) | Some(ServiceState::Installed(_))
+        );
+    TrayModel {
+        status,
+        background_checked,
+        background_enabled,
+        background_label,
+    }
 }
 
 /// A native dialog. `cancel: None` ⇒ info dialog (single OK button).

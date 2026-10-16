@@ -32,12 +32,12 @@ pub struct Controller<S: Sys, U: Ui>(std::marker::PhantomData<(S, U)>);
 
 impl<S: Sys, U: Ui> Controller<S, U> {
     /// `phase = Starting(CheckingBundled)`.
-    pub fn new(sys: S, ui: U, paths: DesktopPaths, quitting: Arc<AtomicBool>) -> Self {
+    pub fn new(_sys: S, _ui: U, _paths: DesktopPaths, _quitting: Arc<AtomicBool>) -> Self {
         todo!()
     }
 
     /// `Break` after Shutdown.
-    pub fn handle(&mut self, action: Action) -> std::ops::ControlFlow<()> {
+    pub fn handle(&mut self, _action: Action) -> std::ops::ControlFlow<()> {
         todo!()
     }
 
@@ -111,7 +111,7 @@ mod tests {
     /// `Controller::new` + `handle(Start)`, asserting we land Ready.
     fn started(sys: FakeSys, ui: FakeUi) -> Controller<FakeSys, FakeUi> {
         let mut ctrl = Controller::new(sys, ui, paths(), Arc::new(AtomicBool::new(false)));
-        ctrl.handle(Action::Start);
+        let _ = ctrl.handle(Action::Start);
         ctrl
     }
 
@@ -126,7 +126,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
         );
-        ctrl.handle(Action::Start);
+        let _ = ctrl.handle(Action::Start);
         match ctrl.phase() {
             Phase::Failed(StartError::SidecarMissing { path }) => {
                 assert_eq!(*path, PathBuf::from(SIDECAR));
@@ -155,7 +155,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
         );
-        ctrl.handle(Action::Start);
+        let _ = ctrl.handle(Action::Start);
         match ctrl.phase() {
             Phase::Failed(StartError::SidecarBroken { detail }) => {
                 assert!(!detail.is_empty(), "detail must describe the failure");
@@ -679,7 +679,7 @@ mod tests {
         );
 
         // Next Start: no dialog.
-        ctrl.handle(Action::Start);
+        let _ = ctrl.handle(Action::Start);
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
             "got {:?}",
@@ -831,7 +831,7 @@ mod tests {
             ctrl.phase()
         );
         // config.yaml absent.
-        ctrl.handle(Action::ToggleBackground);
+        let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
             "phase must be unchanged; got {:?}",
@@ -868,7 +868,7 @@ mod tests {
         sys.set_port_free(SERVICE_PORT, false);
         let ui = FakeUi::new();
         let mut ctrl = started(sys.clone(), ui.clone());
-        ctrl.handle(Action::ToggleBackground);
+        let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
             "got {:?}",
@@ -906,7 +906,7 @@ mod tests {
         let ui = FakeUi::new();
         ui.answer_confirm(false);
         let mut ctrl = started(sys.clone(), ui.clone());
-        ctrl.handle(Action::ToggleBackground);
+        let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
             "got {:?}",
@@ -954,7 +954,7 @@ mod tests {
         let mut ctrl = started(sys.clone(), ui.clone());
         let session_pid = sys.spawned_pids()[0];
 
-        ctrl.handle(Action::ToggleBackground);
+        let _ = ctrl.handle(Action::ToggleBackground);
 
         match ctrl.phase() {
             Phase::Ready(Mode::Service { token }) => {
@@ -1031,7 +1031,7 @@ mod tests {
         let ui = FakeUi::new();
         ui.answer_confirm(true);
         let mut ctrl = started(sys.clone(), ui.clone());
-        ctrl.handle(Action::ToggleBackground);
+        let _ = ctrl.handle(Action::ToggleBackground);
 
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
@@ -1089,7 +1089,7 @@ mod tests {
             "precondition; got {:?}",
             ctrl.phase()
         );
-        ctrl.handle(Action::ToggleBackground);
+        let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
             "got {:?}",
@@ -1123,7 +1123,7 @@ mod tests {
         let ui = FakeUi::new();
         ui.answer_confirm(false);
         let mut ctrl = started(sys.clone(), ui.clone());
-        ctrl.handle(Action::ToggleBackground);
+        let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
             "got {:?}",
@@ -1161,7 +1161,7 @@ mod tests {
         let ui = FakeUi::new();
         ui.answer_confirm(true);
         let mut ctrl = started(sys.clone(), ui.clone());
-        ctrl.handle(Action::ToggleBackground);
+        let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
             "unchanged mode; got {:?}",
@@ -1188,8 +1188,8 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
         );
-        ctrl.handle(Action::ToggleBackground);
-        ctrl.handle(Action::ReinstallService);
+        let _ = ctrl.handle(Action::ToggleBackground);
+        let _ = ctrl.handle(Action::ReinstallService);
         assert!(
             matches!(ctrl.phase(), Phase::Starting(StartStep::CheckingBundled)),
             "phase must be untouched; got {:?}",
@@ -1448,7 +1448,7 @@ mod tests {
         );
         let (old_pid, new_pid) = (sys.spawned_pids()[0], sys.spawned_pids()[1]);
 
-        ctrl.handle(Action::Start); // Retry
+        let _ = ctrl.handle(Action::Start); // Retry
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
             "got {:?}",

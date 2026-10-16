@@ -45,25 +45,68 @@ pub enum LaunchPlan {
 }
 
 pub fn status_args() -> [&'static str; 2] {
-    todo!()
+    ["service", "status"]
 }
 
 pub fn service_install_args() -> [&'static str; 4] {
-    todo!()
+    ["service", "install", "--bind", "127.0.0.1:7823"]
 }
 
 pub fn service_uninstall_args() -> [&'static str; 2] {
-    todo!()
+    ["service", "uninstall"]
 }
 
 pub fn install_args() -> [&'static str; 1] {
-    todo!()
+    ["install"]
 }
 
 /// Parse the stdout of `peakbot service status` (the B4-pinned text
 /// contract, DESIGN §5.2).
 pub fn parse_service_status(out: &RunOutput) -> ServiceState {
-    todo!()
+    if !out.ok() {
+        // Non-zero exit: reason = first non-empty line of stderr, else
+        // stdout, else the fixed fallback.
+        let reason = out
+            .stderr
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .or_else(|| out.stdout.lines().map(str::trim).find(|l| !l.is_empty()))
+            .unwrap_or("service status failed")
+            .to_string();
+        return ServiceState::Unavailable { reason };
+    }
+    let mut installed: Option<bool> = None;
+    let mut exe: Option<PathBuf> = None;
+    let mut run: Option<RunState> = None;
+    for line in out.stdout.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("Installed:") {
+            installed = Some(v.trim() == "true");
+        } else if let Some(v) = line.strip_prefix("Exec:") {
+            let p = v.trim();
+            if !p.is_empty() {
+                exe = Some(PathBuf::from(p));
+            }
+        } else if let Some(v) = line.strip_prefix("State:") {
+            run = Some(match v.trim() {
+                "running" => RunState::Running,
+                "stopped" => RunState::Stopped,
+                // `unknown` or anything unrecognised.
+                _ => RunState::Unknown,
+            });
+        }
+    }
+    match installed {
+        Some(true) => ServiceState::Installed(InstalledService {
+            exe,
+            run: run.unwrap_or(RunState::Unknown),
+        }),
+        Some(false) => ServiceState::NotInstalled,
+        None => ServiceState::Unavailable {
+            reason: "unrecognised service status output".into(),
+        },
+    }
 }
 
 /// The §4.4 truth table. `version_of` runs `<exe> --version`.
@@ -73,37 +116,111 @@ pub fn plan_launch(
     bundled: &Version,
     declined: Option<&DeclinedReplace>,
 ) -> LaunchPlan {
-    todo!()
+    let ServiceState::Installed(svc) = state else {
+        // Unavailable / NotInstalled ⇒ session; version_of is not called.
+        return LaunchPlan::Session;
+    };
+    let installed = version_of(svc);
+    let start_first = svc.run == RunState::Stopped;
+    let same = matches!(&installed, InstalledVersion::Known(v) if v == bundled);
+    if same || declined.is_some_and(|d| d.matches(&installed, bundled)) {
+        return LaunchPlan::ConnectService { start_first };
+    }
+    LaunchPlan::AskReplace { installed }
 }
 
 pub fn replace_dialog(installed: &InstalledVersion, bundled: &Version) -> Dialog {
-    todo!()
+    let i = match installed {
+        InstalledVersion::Known(v) => v.to_string(),
+        InstalledVersion::Unknown => "an unknown version".to_string(),
+    };
+    let mut body = format!(
+        "A PeakBot background service ({i}) is already installed. \
+         This app includes PeakBot {bundled}.\n\n\
+         Replace the service with {bundled}? This also replaces \
+         ~/.local/bin/peakbot (your \"peakbot\" command)."
+    );
+    if let InstalledVersion::Known(v) = installed
+        && v > bundled
+    {
+        body.push_str(&format!(
+            "\n\nWarning: {bundled} is OLDER than the installed {v}."
+        ));
+    }
+    let cancel = match installed {
+        InstalledVersion::Known(v) => format!("Keep {v}"),
+        InstalledVersion::Unknown => "Keep current".to_string(),
+    };
+    Dialog {
+        title: "Replace PeakBot background service?".into(),
+        body,
+        ok: "Replace".into(),
+        cancel: Some(cancel),
+    }
 }
 
 pub fn enable_dialog() -> Dialog {
-    todo!()
+    Dialog {
+        title: "Keep PeakBot running in background?".into(),
+        body: "PeakBot will be installed to ~/.local/bin/peakbot and start automatically when \
+               you log in. It keeps running after you close this window."
+            .into(),
+        ok: "Enable".into(),
+        cancel: Some("Cancel".into()),
+    }
 }
 
 pub fn disable_dialog() -> Dialog {
-    todo!()
+    Dialog {
+        title: "Remove background service?".into(),
+        body: "PeakBot will stop running in the background and will only run while this window \
+               is open. ~/.local/bin/peakbot and your settings are kept."
+            .into(),
+        ok: "Remove".into(),
+        cancel: Some("Cancel".into()),
+    }
 }
 
 pub fn finish_setup_dialog() -> Dialog {
-    todo!()
+    Dialog {
+        title: "Finish setup first".into(),
+        body: "Complete the PeakBot setup in this window, then enable background mode.".into(),
+        ok: "OK".into(),
+        cancel: None,
+    }
 }
 
 pub fn port_busy_dialog() -> Dialog {
-    todo!()
+    Dialog {
+        title: "Port 7823 is busy".into(),
+        body: "Another program (maybe a PeakBot started from a terminal) is using \
+               127.0.0.1:7823. Stop it and try again."
+            .into(),
+        ok: "OK".into(),
+        cancel: None,
+    }
 }
 
 pub fn command_failed_dialog(command: &str, output: &str) -> Dialog {
-    todo!()
+    Dialog {
+        title: "Background service error".into(),
+        body: format!("$ {command}\n{output}"),
+        ok: "OK".into(),
+        cancel: None,
+    }
 }
 
 /// Per target_os: Linux `journalctl --user -u peakbot.service`,
 /// macOS `~/Library/Logs/peakbot.log`.
 pub fn service_log_hint() -> &'static str {
-    todo!()
+    #[cfg(target_os = "macos")]
+    {
+        "~/Library/Logs/peakbot.log"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "journalctl --user -u peakbot.service"
+    }
 }
 
 #[cfg(test)]

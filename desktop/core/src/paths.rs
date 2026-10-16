@@ -17,45 +17,53 @@ pub struct DesktopPaths {
 
 /// `current_exe.parent() / sidecar_file_name()`.
 pub fn sidecar_path(current_exe: &Path) -> PathBuf {
-    todo!()
+    match current_exe.parent() {
+        Some(dir) => dir.join(sidecar_file_name()),
+        None => PathBuf::from(sidecar_file_name()),
+    }
 }
 
 /// `"peakbot"` (unix) | `"peakbot.exe"` (windows).
 pub fn sidecar_file_name() -> &'static str {
-    todo!()
+    if cfg!(windows) {
+        "peakbot.exe"
+    } else {
+        "peakbot"
+    }
 }
 
 /// `directories_next::ProjectDirs::from("com", "peakbot", "peakbot")
 /// .config_dir()` — SAME crate + args as peakbot's `get_config_dir()`,
 /// so the paths match by construction.
 pub fn peakbot_config_dir() -> Option<PathBuf> {
-    todo!()
+    directories_next::ProjectDirs::from("com", "peakbot", "peakbot")
+        .map(|p| p.config_dir().to_path_buf())
 }
 
 impl DesktopPaths {
     /// `data_dir/sidecar.pid`.
     pub fn pidfile(&self) -> PathBuf {
-        todo!()
+        self.data_dir.join("sidecar.pid")
     }
 
     /// `data_dir/declined-replace`.
     pub fn declined_file(&self) -> PathBuf {
-        todo!()
+        self.data_dir.join("declined-replace")
     }
 
     /// `log_dir/peakbot-session.log`.
     pub fn session_log(&self) -> PathBuf {
-        todo!()
+        self.log_dir.join("peakbot-session.log")
     }
 
     /// `peakbot_config_dir/web-token`.
     pub fn web_token(&self) -> PathBuf {
-        todo!()
+        self.peakbot_config_dir.join("web-token")
     }
 
     /// `peakbot_config_dir/config.yaml`.
     pub fn peakbot_config(&self) -> PathBuf {
-        todo!()
+        self.peakbot_config_dir.join("config.yaml")
     }
 }
 

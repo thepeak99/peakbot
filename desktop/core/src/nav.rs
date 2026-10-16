@@ -14,7 +14,28 @@ pub enum NavDecision {
 }
 
 pub fn classify_navigation(url: &Url, backend_origin: Option<&str>) -> NavDecision {
-    todo!()
+    // Local app origins (the bundled status page) are always in-app.
+    let scheme = url.scheme();
+    let host = url.host_str().unwrap_or("");
+    if scheme == "tauri" && host == "localhost"
+        || (scheme == "http" || scheme == "https") && host == "tauri.localhost"
+    {
+        return NavDecision::Allow;
+    }
+    match scheme {
+        "http" | "https" | "mailto" => {
+            if backend_origin
+                .and_then(|o| Url::parse(o).ok())
+                .is_some_and(|allowed| allowed.origin() == url.origin())
+            {
+                NavDecision::Allow
+            } else {
+                NavDecision::OpenExternal
+            }
+        }
+        // file:, data:, javascript:, …
+        _ => NavDecision::Block,
+    }
 }
 
 #[cfg(test)]

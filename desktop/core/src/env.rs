@@ -10,13 +10,77 @@ use std::ffi::{OsStr, OsString};
 pub fn sanitize_env(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
-    todo!()
+    let vars: Vec<(OsString, OsString)> = parent.into_iter().collect();
+    let appdir: Option<OsString> = vars
+        .iter()
+        .find(|(k, _)| k == "APPDIR")
+        .map(|(_, v)| v.clone());
+    let Some(appdir) = appdir else {
+        return vars;
+    };
+    // `$APPDIR/` — the prefix for "under APPDIR" (the exact dir counts too).
+    let appdir_slash = {
+        let mut s = appdir.clone();
+        s.push(OsStr::new("/"));
+        s
+    };
+    const DROPPED: [&str; 4] = ["APPDIR", "APPIMAGE", "ARGV0", "OWD"];
+    const LIST_PATHS: [&str; 6] = [
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "XDG_DATA_DIRS",
+        "GST_PLUGIN_SYSTEM_PATH",
+        "GST_PLUGIN_PATH",
+        "GIO_EXTRA_MODULES",
+    ];
+    vars.into_iter()
+        .filter_map(|(k, v)| {
+            let key = k.to_str().unwrap_or("");
+            if DROPPED.contains(&key) {
+                return None;
+            }
+            if LIST_PATHS.contains(&key) {
+                match v.to_str() {
+                    // Keep only the entries that are not under $APPDIR.
+                    Some(s) => {
+                        let kept: Vec<&str> = s
+                            .split(':')
+                            .filter(|e| {
+                                let os = OsStr::new(e);
+                                *os != *appdir.as_os_str()
+                                    && !os
+                                        .as_encoded_bytes()
+                                        .starts_with(appdir_slash.as_encoded_bytes())
+                            })
+                            .collect();
+                        if kept.is_empty() {
+                            return None;
+                        }
+                        return Some((k, OsString::from(kept.join(":"))));
+                    }
+                    // Non-UTF-8 list value: nothing to strip; keep as-is.
+                    None => return Some((k, v)),
+                }
+            }
+            // Any other var whose value contains $APPDIR is dropped.
+            if v.as_os_str()
+                .to_str()
+                .is_some_and(|s| appdir.to_str().is_some_and(|a| s.contains(a)))
+            {
+                return None;
+            }
+            Some((k, v))
+        })
+        .collect()
 }
 
 /// `WEBKIT_DISABLE_DMABUF_RENDERER=1` when the var is unset (Linux
 /// webkit fix, DESIGN §4.10); `None` when already set to anything.
 pub fn webkit_dmabuf_default(existing: Option<&OsStr>) -> Option<(&'static str, &'static str)> {
-    todo!()
+    match existing {
+        None => Some(("WEBKIT_DISABLE_DMABUF_RENDERER", "1")),
+        Some(_) => None,
+    }
 }
 
 #[cfg(test)]

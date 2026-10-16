@@ -5,7 +5,12 @@ use semver::Version;
 /// Parse the first line of `<sidecar> --version` output: exactly
 /// `peakbot <semver>` (trimmed).
 pub fn parse_version_output(stdout: &str) -> Option<Version> {
-    todo!()
+    let first = stdout.lines().next()?.trim();
+    let (name, rest) = first.split_once(' ')?;
+    if name != "peakbot" {
+        return None;
+    }
+    Version::parse(rest.trim()).ok()
 }
 
 /// The version of the installed service's binary. `Unknown` = exe
@@ -27,16 +32,41 @@ pub struct DeclinedReplace {
 impl DeclinedReplace {
     /// `installed=<ver|unknown>\nbundled=<ver>\n`.
     pub fn render(&self) -> String {
-        todo!()
+        let installed = match &self.installed {
+            InstalledVersion::Known(v) => v.to_string(),
+            InstalledVersion::Unknown => "unknown".to_string(),
+        };
+        format!("installed={installed}\nbundled={}\n", self.bundled)
     }
 
     pub fn parse(s: &str) -> Option<DeclinedReplace> {
-        todo!()
+        let mut installed: Option<InstalledVersion> = None;
+        let mut bundled: Option<Version> = None;
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("installed=") {
+                installed = Some(match v {
+                    "unknown" => InstalledVersion::Unknown,
+                    _ => InstalledVersion::Known(v.parse().ok()?),
+                });
+            } else {
+                let v = line.strip_prefix("bundled=")?;
+                let b = Version::parse(v).ok()?;
+                bundled = Some(b);
+            }
+        }
+        Some(DeclinedReplace {
+            installed: installed?,
+            bundled: bundled?,
+        })
     }
 
     /// Exact pair equality.
     pub fn matches(&self, installed: &InstalledVersion, bundled: &Version) -> bool {
-        todo!()
+        self.installed == *installed && &self.bundled == bundled
     }
 }
 

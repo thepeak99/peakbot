@@ -1,5 +1,6 @@
 .PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
         web dev \
+        desktop-test \
         release release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android release-publish
 
@@ -123,6 +124,14 @@ docker-build: build
 
 ## rebuild: Clean and rebuild from scratch
 rebuild: clean build
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Desktop (Tauri shell — see desktop/DESIGN.md)
+# ─────────────────────────────────────────────────────────────────────────────
+
+## desktop-test: Unit tests for the desktop core crate (desktop/core, no webkit)
+desktop-test:
+	cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Release pipeline
