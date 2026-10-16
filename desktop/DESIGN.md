@@ -1094,6 +1094,24 @@ Order matters: T-tasks (tests) precede the C-tasks they cover (RED → GREEN).
 
 **Out of scope (separate tickets).** #374 (real HTTPS readiness probe), #376 (webview trust of PeakBot's CA), #378 (Origin validation on `/ws`).
 
+### Amendment #377b — settable token + Linux webview TLS trust (2026-10-16)
+
+**Reason.** (a) The token was minted by the desktop and invisible and immutable to the user (#377 follow-up); (b) in HTTPS mode the app window showed a certificate error on Linux — WebKit had no way to trust PeakBot's CA (#376).
+
+**What changed.**
+- **§3.2 (`core::token`):** `TOKEN_MIN_LEN`/`TOKEN_MAX_LEN` (16/256), `TokenError` (`BadChars`/`TooShort`/`TooLong`, locked messages) + `parse_new_token` — the boundary rule for a **user-entered** token: trim, `""` ⇒ `Ok(None)` (keep/generate), charset `[A-Za-z0-9._-]` checked FIRST, then the length. Required because the desktop form-encodes the token (`append_pair`) and the backend compares the raw query value + raw `Set-Cookie`. `impl Serialize for Token` (raw string) so `SettingsView` can carry it; `Debug` stays `Token(***)`.
+- **§3.9 (`core::settings`):** `SaveRequest { settings, new_token }` — THE validated save payload (fields private; `parse(wire, token)`: settings error wins; token off ⇒ field ignored, never an error; token on ⇒ `parse_new_token`). `new_token` `Some` ⇒ `settings.token()`. `From<Settings>` = "save these, keep the token". `SettingsView` +`token: Option<Token>` (Some iff token on ∧ file parses; JSON `string`/`null`) and +`cert_warning: bool` (`= !cfg!(target_os = "linux")`); `settings_view` takes the file token.
+- **§3.8 (invariants):** I2 amended (the web-token holds the user's last saved value, or the value the desktop generated when none existed; written only by the controller thread). **I8:** the token value exists only in `web-token`, the session env, the webview URL/cookie, and the `settings_get` response to the `settings` window — never in `settings.json`, argv, unit/plist/task files, or logs (the TLS handler must not log the failing URI, it carries `?token=`). **I9 (Linux):** the app webview trusts a certificate only if (a) the failing URL is the **current** backend origin over https on `127.0.0.1` and (b) the presented certificate verifies against `~/.cache/peakbot/tls/ca-cert.pem` with **no** flags.
+- **§4.11 (save flow):** `handle_save_settings(SaveRequest)`: `new == current ∧ tok_new None` → return (no dialog); confirm (unchanged strings); **web-token written FIRST** (0600; failure → `save_failed_dialog(web-token path)`, nothing else written); then `settings.json` (only if changed; failure → `save_failed_dialog(settings path)`); then the existing `reconfigure_service()` / `handle_start()` — `sync_token` re-reads the file, so the new value goes live. `reconfigure_service` **is** the restart for a token-only change in service mode (no `service restart` verb exists; T-A5).
+- **§5.2/§5.4 (new, `core::nav` + `src-tauri/tls_trust.rs`, Linux-only):** `may_trust_peakbot_cert(failing, backend_origin)` — the pure trust gate (https ∧ host `127.0.0.1` ∧ same origin as the live `UiState.nav`). One `load-failed-with-tls-errors` handler on the main webview: gate → **CA signature check** (`gio::TlsCertificate::verify(None, Some(CA from `peakbot_ca_cert()`))` with no flags — an issuer-DN compare is forgeable, T-B2) → `allow_tls_certificate_for_host(cert, "127.0.0.1")` → `load_uri` on the next main-loop **idle** (re-checking the origin; not `reload()` — the committed page is still the status page) with a **same-certificate loop guard**. Everything else falls through to WebKit's error page. `core::paths::peakbot_ca_cert()` = `BaseDirs::cache_dir()/peakbot/tls/ca-cert.pem` (same base dir + file name as the backend's `dirs::cache_dir()` CA — `src/ui/web/tls.rs` documents the coupling).
+- **§5.4 (IPC):** `settings_get` reads the token file into the view; `settings_set(settings, token)` parses both into `SaveRequest` (the command names are unchanged; only the arg list grew — capabilities untouched).
+- **§5.5 (manifest):** `src-tauri` gains Linux-only `webkit2gtk = { version = "2.0.2", features = ["v2_6"] }` and `gio = "0.18"` — both already in `Cargo.lock` (pulled by wry 0.57); the lockfile gains only the two dep lines on `peakbot-desktop`.
+- **§6 (tradeoffs):** T-A1 (extra `token` arg on `settings_set`, not a wire field — the wire is the file body) / T-A2 (empty = keep/generate) / T-A3 (Generate is client-side) / T-A4 (one 16–256 rule for loopback + remote) / T-A5 (`reconfigure_service` as the restart) / **T-B1 (signal-driven trust ONLY — no backend `leaf-cert.pem`, no pre-pin: the one failing handshake covers stale leaves, restarts and re-mints; the backend is unchanged)** / T-B2 (signature, not DN) / T-B3 (live origin only) / T-B4 (macOS deferred; the cert note shows on macOS only).
+- **§8:** **R-B1** the signal path misbehaves on some WebKitGTK build → L6 decides; contingency = the researcher's steps 1–2 (backend `leaf-cert.pem` + pre-pin before `navigate`, handler kept as fallback). **R-B2** `XDG_CACHE_HOME` differs between the app and the systemd user manager → different/missing CA → the error page (fails closed; README note). **R-B3** CA deleted/rotated while a backend runs → its leaf won't verify → the error page until the backend restarts (fails closed). **R-A1** the token is visible in the settings window (the requirement). **R-A2** legacy file tokens with characters outside the set already 401 today; kept untouched (follow-up: percent-decode `token_from_query`). **R-A3** clipboard on the `tauri://` origin (secure scheme) with the `execCommand` fallback.
+- **§9.1/§9.3:** tests t90–t102; manual L1–L10 (Linux AppImage).
+
+**Out of scope (separate tickets).** #374 (CA-verified readiness probe — can reuse `peakbot_ca_cert()`), #378 (Origin validation), macOS Keychain trust (practical route: `security add-trusted-cert -r trustRoot -p ssl -k login.keychain-db`).
+
 ---
 
 ## 9. TEST PLAN
@@ -1181,7 +1199,7 @@ Order matters: T-tasks (tests) precede the C-tasks they cover (RED → GREEN).
 64. Stale reaper: pidfile + `cmdline_of` matches → Interrupt (then Kill if still alive after grace), pidfile removed; cmdline mismatch → no signal, pidfile removed; pidfile garbage → removed, no signal.
 65. `Retry` (Start) from Ready(Session) stops the old child before spawning a new one.
 
-**settings (#377; t66–t89, in `core::settings` / `core::controller` / `core::sys`; plus updated t16/t17/t19/t25/t28/t29/t32/t40/t57)**
+**settings (#377, #377b; t66–t102, in `core::token` / `core::settings` / `core::controller` / `core::nav` / `core::paths` / `core::sys`; plus updated t16/t17/t19/t25/t28/t29/t32/t40/t57/t74)**
 66. Default = http loopback, token on; `render_settings_file` byte-exact for default and `Remote`.
 67. `TryFrom<SettingsWire>`: 4 loopback combos OK; remote+https+token → `Remote`; remote+http → `Remote access requires HTTPS.`; remote+¬token → `Remote access requires the access token.`; remote+http+¬token → the HTTPS message.
 68. render→parse roundtrip for all 5 valid values.
@@ -1246,6 +1264,16 @@ M4 Token off → `~/.config/peakbot/web-token` gone and the URL has no `?token`.
 M5 On the WebKit TLS error page, does Ctrl+Shift+S still work? Record the result; if not, the README reset path stands.
 M6 Background toggle from the settings page behaves like the tray item.
 M7 Devtools on the remote page: `__TAURI__.core.invoke('settings_get')` and `invoke('settings_set', …)` both reject (criterion 8).
+L1 (#377b) Settings, token on: the field shows exactly `cat ~/.config/peakbot/web-token`.
+L2 (#377b) Type `short` → `…at least 16 characters.`; `my token is long!!` → the charset message; nothing restarts.
+L3 (#377b) Type a valid 20-char token → Save → Restart. Then: the file equals it; `stat -c %a ~/.config/peakbot/web-token` = `600`; the app reloads fine; `grep -r <token> ~/.local/share/com.peakbot.desktop/settings.json ~/.config/systemd/user/` finds nothing.
+L4 (#377b) Generate → 64 hex in the field; Copy → paste in a terminal matches; clearing the field leaves Save disabled.
+L5 (#377b) Background on, change the token → "reinstalled" dialog. Then: `curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:7823/commands?token=<old>'` = 401; the same with `<new>` = 200.
+L6 (#377b) HTTPS (session): the app window loads PeakBot with **no** certificate page; send a message (the WebSocket works).
+L7 (#377b) HTTPS + background (service): same as L6.
+L8 (#377b) Retry / switch HTTP↔HTTPS / background on↔off a few times: always loads (a new leaf each boot).
+L9 (#377b) Negative: `mv ~/.cache/peakbot/tls/ca-cert.pem /tmp/` then restart the app → WebKit cert error page (fail closed). Move it back → Retry → loads (the backend only regenerates the CA when cert *or* key is missing).
+L10 (#377b) Devtools on the remote page: `invoke('settings_get')` still rejects (I6); the browser on another device still sees its own cert prompt (unchanged).
 
 ### 9.4 Manual macOS checklist (human — no Mac in CI)
 MAC1 Unzip, move to /Applications, `xattr -dr com.apple.quarantine` → app opens (Apple Silicon and, if available, Intel).

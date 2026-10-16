@@ -11,6 +11,9 @@
 //! credential store); its private key is written `0600`. It is generated once
 //! and never silently regenerated — doing so would break every phone that
 //! already trusts it. To rotate, delete the `tls/` directory.
+//! PeakBot Desktop reads `ca-cert.pem` from this same path
+//! (desktop/core/src/paths.rs) to verify the webview's TLS against it —
+//! keep the two in sync.
 //!
 //! We deliberately avoid rcgen's `x509-parser` feature (a heavy ASN.1 parser
 //! that bloats the cross-builds). Instead the CA's identity is fixed — a
