@@ -1,0 +1,91 @@
+# PeakBot Desktop — Linux x86_64 AppImage builder
+#
+# Contract: desktop/DESIGN.md §5.7 (build contracts), §9.2 (smoke checks
+# S-L1..S-L7). The sidecar (peakbot) is NOT built here — it is built by the
+# EXISTING Dockerfile.linux and staged into the context as
+# output/peakbot-linux-amd64 by desktop/scripts/build-desktop.sh.
+#
+# Usage:
+#   sh desktop/scripts/build-desktop.sh linux
+# (or directly:)
+#   podman build -f Dockerfile.desktop-linux \
+#     --build-arg VERSION=0.23.0 \
+#     --output type=local,dest=output/desktop .
+#
+# Exports a single file: /PeakBot-Desktop-<VERSION>-linux-x86_64.AppImage
+
+FROM ubuntu:22.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Toolchain per DESIGN.md §5.7: webkit2gtk-4.1 (the webview ABI the smoke
+# check pins), appindicator/rsvg (tray + icons), plus the tools the smoke
+# check itself needs (file, binutils → objdump/readelf, xz).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libwebkit2gtk-4.1-dev \
+        libxdo-dev \
+        libssl-dev \
+        libayatana-appindicator3-dev \
+        librsvg2-dev \
+        patchelf \
+        xdg-utils \
+        file \
+        xz-utils \
+        curl \
+        ca-certificates \
+        binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node 22 (nodesource) — runs the pinned Tauri CLI via npx.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust, pinned. The desktop workspace is edition 2024 (needs >= 1.85); the
+# glue is built with 1.91.0 (the toolchain this branch was developed on).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain 1.91.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+# Bound parallel codegen: a 32-way release build of the webkit-dependent Tauri
+# stack peaks past what a shared dev host can spare.
+ENV CARGO_BUILD_JOBS=8
+
+ARG VERSION
+# Root Cargo.toml is the version source for scripts/check-version.sh (it
+# compares root [package].version against desktop [workspace.package].version).
+COPY Cargo.toml /src/Cargo.toml
+COPY desktop/ /src/desktop
+
+# The peakbot sidecar from the existing Dockerfile.linux build (unversioned
+# artifact name — must match build-desktop.sh).
+ARG SIDECAR=output/peakbot-linux-amd64
+COPY ${SIDECAR} /src/desktop/src-tauri/binaries/peakbot-x86_64-unknown-linux-gnu
+RUN chmod 755 /src/desktop/src-tauri/binaries/peakbot-x86_64-unknown-linux-gnu
+
+# Fail the build if the desktop workspace version drifted from the root.
+RUN sh /src/desktop/scripts/check-version.sh
+
+# Tauri build. `--ci`: parseable output; `--bundles appimage`: only the
+# AppImage; `-- --locked`: cargo honors the committed Cargo.lock.
+# (`tauri build` enables the tauri/custom-protocol feature automatically —
+# the ui/ status page is embedded, no devUrl.)
+# The AppImage bundler downloads linuxdeploy/appimagetool from GitHub, so this
+# step needs network access.
+WORKDIR /src/desktop/src-tauri
+RUN npx --yes @tauri-apps/cli@2.12.3 build --ci --bundles appimage -- --locked
+
+# Name the artifact per §5.7 and smoke it (S-L1..S-L7) before exporting.
+# The bundler names the file "<productName>_<version>_<arch>.AppImage"
+# (productName "PeakBot Desktop" → space becomes underscore), so glob it.
+RUN set -eu; \
+    mkdir -p /out; \
+    set -- ../target/release/bundle/appimage/*.AppImage; \
+    [ "$#" -eq 1 ] || { echo "expected exactly one AppImage in ../target/release/bundle/appimage/, got: $*"; exit 1; }; \
+    cp "$1" "/out/PeakBot-Desktop-${VERSION}-linux-x86_64.AppImage"; \
+    sh /src/desktop/scripts/smoke-linux.sh "/out/PeakBot-Desktop-${VERSION}-linux-x86_64.AppImage" "${VERSION}"
+
+# Single-file export.
+FROM scratch
+COPY --from=build /out/ /

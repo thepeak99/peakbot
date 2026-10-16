@@ -1,6 +1,6 @@
 .PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
         web dev \
-        desktop-test desktop-dev \
+        desktop-test desktop-dev desktop-linux desktop-macos desktop \
         release release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android release-publish
 
@@ -139,6 +139,19 @@ desktop-dev:
 	cargo build
 	cp target/debug/peakbot desktop/src-tauri/binaries/peakbot-$(shell rustc -vV | sed -n 's/host: //p')
 	cd desktop/src-tauri && npx --yes @tauri-apps/cli@2.12.3 dev
+
+## desktop-linux: Build the Linux x86_64 AppImage (sidecar via Dockerfile.linux,
+##                then Dockerfile.desktop-linux → output/desktop/*.AppImage)
+desktop-linux:
+	sh desktop/scripts/build-desktop.sh linux
+
+## desktop-macos: Build the macOS universal .app zip (not implemented yet — P4.2)
+desktop-macos:
+	sh desktop/scripts/build-desktop.sh macos
+
+## desktop: Build all desktop artifacts (linux + macos)
+desktop:
+	sh desktop/scripts/build-desktop.sh all
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Release pipeline

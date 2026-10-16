@@ -1,0 +1,45 @@
+# .dockerignore — keep container build contexts small.
+# Applied to ALL Dockerfiles in this repo (podman and docker both honor it).
+#
+# What the builds need from the context:
+#   Dockerfile.linux   → Cargo.toml, Cargo.lock, vendor/, build.rs, build/, src/, web/
+#   Dockerfile.desktop-linux → the above's sibling files are irrelevant, plus
+#                              desktop/ (minus heavy intermediates) and
+#                              output/peakbot-linux-amd64 (sidecar, staged by
+#                              desktop/scripts/build-desktop.sh)
+
+# VCS
+.git
+
+# Rust build outputs (huge; regenerated in-container)
+target/
+desktop/target/
+
+# Release artifacts: keep ONLY the unversioned linux sidecar that
+# Dockerfile.desktop-linux COPYs in (everything else is previous output)
+output/*
+!output/peakbot-linux-amd64
+*.tar
+
+# Desktop build intermediates (regenerated in-container; the local debug
+# sidecar staged by `make desktop-dev` is >600 MB and must never be sent)
+desktop/src-tauri/binaries/peakbot-*
+desktop/src-tauri/gen/
+
+# Frontend deps / build output (rebuilt by the Node stage in-container)
+node_modules/
+web/node_modules/
+web/dist/
+
+# Local scratch / noise
+.test/
+.playwright/
+.playwright-cli/
+sniff-bug.jsonl
+.release-version
+reports/
+audits/
+docs/
+examples/
+release-notes/
+*.md
