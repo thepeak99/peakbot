@@ -209,3 +209,62 @@ fn t88_real_sys_probe_https_listening_and_unreachable() {
         "the failed connect must fail fast (≤ PROBE_TIMEOUT + slack); took {elapsed:?}"
     );
 }
+
+// Design auto-replace t121: `RealSys::same_contents` — byte-for-byte
+// equality over files spanning several 64 KiB chunks. No sockets or
+// forks, so no PORT_RACE_LOCK.
+#[test]
+fn t121_real_sys_same_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let sys = RealSys::new();
+
+    // Two identical 200 KiB files (span three 64 KiB chunks).
+    let content = vec![0xABu8; 200 * 1024];
+    let a = dir.path().join("a.bin");
+    let b = dir.path().join("b.bin");
+    std::fs::write(&a, &content).unwrap();
+    std::fs::write(&b, &content).unwrap();
+    assert_eq!(
+        sys.same_contents(&a, &b),
+        Ok(true),
+        "identical 200 KiB files must compare equal"
+    );
+
+    // Same length, the LAST byte differs — past the 64 KiB chunk
+    // boundary (index 204799 > 65536). A comparison that stopped at the
+    // first chunk would miss it.
+    let mut diff = content.clone();
+    diff[diff.len() - 1] ^= 0xFF;
+    let c = dir.path().join("c.bin");
+    std::fs::write(&c, &diff).unwrap();
+    assert_eq!(
+        sys.same_contents(&a, &c),
+        Ok(false),
+        "a difference past the 64 KiB boundary must be found"
+    );
+
+    // Different length (the common mismatch) ⇒ false.
+    let d = dir.path().join("d.bin");
+    std::fs::write(&d, &content[..content.len() - 1]).unwrap();
+    assert_eq!(
+        sys.same_contents(&a, &d),
+        Ok(false),
+        "different lengths must not be equal"
+    );
+
+    // A path compared with itself is always equal.
+    assert_eq!(
+        sys.same_contents(&a, &a),
+        Ok(true),
+        "a file compared with itself must be equal"
+    );
+
+    // One file missing ⇒ Err(NotFound), not a silent false.
+    let missing = dir.path().join("missing.bin");
+    let res = sys.same_contents(&a, &missing);
+    assert!(
+        res.as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "a missing file must be an error of kind NotFound; got {res:?}"
+    );
+}
