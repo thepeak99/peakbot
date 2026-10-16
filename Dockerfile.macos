@@ -55,6 +55,10 @@ COPY vendor/ vendor/
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs
 
+# Align Mach-O headers to 64KB so the sidecar binary can be re-signed with
+# rcodesign by the macOS assembly step (DESIGN.md §7 B1 / §5.7).
+ENV RUSTFLAGS="-C link-arg=-Wl,-headerpad,0x4000"
+
 # Build dependencies only (cached as long as Cargo.toml/Cargo.lock don't change)
 RUN cargo zigbuild --release --target ${TARGET}
 

@@ -38,11 +38,16 @@ export interface AgentConnection {
   recentDirs: string[];
   error: string | null;
   send: (msg: InboundMessage) => void;
+  /** The conversation this socket is bound to: seeded from the URL, then
+   * following the server's `attached` / `state` (which `/new`, `/model` and
+   * `/load` move under us). `null` until a fresh session is bound. */
+  convo: string | null;
   /** Switch this client to another conversation by re-attaching: bind the new
    * id and reconnect the socket. Shares the live session if one is active,
    * else resumes it from disk — the same handshake as first load, so no
-   * `/load` (which would clear background processes). */
-  switchConvo: (id: string) => void;
+   * `/load` (which would clear background processes). `null` starts a new
+   * conversation (the server mints the session and replies `attached`). */
+  switchConvo: (id: string | null) => void;
 }
 
 function wsUrl(): string {
@@ -57,11 +62,17 @@ function convoFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get("convo");
 }
 
-/** Write `convo` into the address bar without a navigation (idempotent). */
-function setConvoInUrl(convo: string): void {
+/** Write `convo` into the address bar without a navigation (idempotent).
+ * `null` removes the param, so the next attach starts a new conversation. */
+export function setConvoInUrl(convo: string | null): void {
   const url = new URL(window.location.href);
-  if (url.searchParams.get("convo") === convo) return;
-  url.searchParams.set("convo", convo);
+  if (convo === null) {
+    if (!url.searchParams.has("convo")) return;
+    url.searchParams.delete("convo");
+  } else {
+    if (url.searchParams.get("convo") === convo) return;
+    url.searchParams.set("convo", convo);
+  }
   window.history.replaceState(null, "", url);
 }
 
@@ -86,6 +97,17 @@ export function useAgent(): AgentConnection {
   // The conversation this client is bound to. Seeded from the URL (the only
   // binding), updated by `attached`/state, re-sent verbatim on reconnect.
   const convoRef = useRef<string | null>(convoFromUrl());
+  const [convo, setConvo] = useState<string | null>(convoRef.current);
+  // Pending reconnect timer; shared so `switchConvo` can cancel it.
+  const reconnectTimerRef = useRef<number | undefined>(undefined);
+
+  // Single place that moves the binding: ref (for reconnects), state (for
+  // consumers) and the URL (refresh / bookmark / share).
+  const bindConvo = useCallback((id: string | null) => {
+    convoRef.current = id;
+    setConvo(id);
+    setConvoInUrl(id);
+  }, []);
 
   const send = useCallback((msg: InboundMessage) => {
     const ws = wsRef.current;
@@ -112,7 +134,6 @@ export function useAgent(): AgentConnection {
 
   useEffect(() => {
     closedByUs.current = false;
-    let reconnectTimer: number | undefined;
 
     const connect = () => {
       const ws = new WebSocket(wsUrl());
@@ -137,8 +158,7 @@ export function useAgent(): AgentConnection {
           case "ready":
             break;
           case "attached":
-            convoRef.current = msg.convo;
-            setConvoInUrl(msg.convo);
+            bindConvo(msg.convo);
             break;
           case "models_available":
             setModels(msg.models);
@@ -150,10 +170,7 @@ export function useAgent(): AgentConnection {
             // `/model` / `/new` move under us.
             {
               const id = msg.state?.conversation?.id;
-              if (id && id !== convoRef.current) {
-                convoRef.current = id;
-                setConvoInUrl(id);
-              }
+              if (id && id !== convoRef.current) bindConvo(id);
             }
             break;
           case "conversations_list":
@@ -183,7 +200,7 @@ export function useAgent(): AgentConnection {
         // Reconnect with capped exponential backoff.
         const delay = backoffRef.current;
         backoffRef.current = Math.min(delay * 2, 8000);
-        reconnectTimer = window.setTimeout(connect, delay);
+        reconnectTimerRef.current = window.setTimeout(connect, delay);
       };
 
       ws.onerror = () => {
@@ -196,29 +213,33 @@ export function useAgent(): AgentConnection {
 
     return () => {
       closedByUs.current = true;
-      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      window.clearTimeout(reconnectTimerRef.current);
       wsRef.current?.close();
     };
-  }, []);
+  }, [bindConvo]);
 
-  // Re-attach to another conversation: bind the id, then reconnect. Closing
-  // the old socket detaches from (but does not kill) its session; the fresh
-  // connect's `attach` frame joins the target — sharing it if live, resuming
-  // it from disk if not.
-  const switchConvo = useCallback((id: string) => {
-    if (id === convoRef.current) return;
-    convoRef.current = id;
-    setConvoInUrl(id);
-    backoffRef.current = 500;
-    const ws = wsRef.current;
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-      // onclose auto-reconnects (closedByUs is false) and re-sends `attach`
-      // with the new convoRef.
-      ws.close();
-    } else {
+  // Re-attach to another conversation: bind the id, then reconnect at once.
+  // Closing the old socket detaches from (but does not kill) its session; the
+  // fresh connect's `attach` frame joins the target — sharing it if live,
+  // resuming it from disk if not. A pending backoff reconnect is cancelled
+  // and the old socket's handlers are detached first, so a switch can never
+  // leave two sockets (or a stale `onclose` scheduling a third).
+  const switchConvo = useCallback(
+    (id: string | null) => {
+      if (id === convoRef.current) return;
+      bindConvo(id);
+      backoffRef.current = 500;
+      window.clearTimeout(reconnectTimerRef.current);
+      const ws = wsRef.current;
+      if (ws) {
+        ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+        ws.close();
+      }
+      setConnected(false);
       connectRef.current();
-    }
-  }, []);
+    },
+    [bindConvo],
+  );
 
   return {
     connected,
@@ -232,6 +253,7 @@ export function useAgent(): AgentConnection {
     recentDirs,
     error,
     send,
+    convo,
     switchConvo,
   };
 }

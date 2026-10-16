@@ -138,3 +138,52 @@ html.light .markdown-body a {
   border: 1px solid rgb(63 63 70);
   padding: 0.3rem 0.5rem;
 }
+
+/* Desktop conversation tab bar (issue #373). Uses the zinc theme vars, so the
+   light-theme remap applies; the hex fallbacks cover vars Tailwind didn't emit. */
+.ctabbar { display: flex; align-items: stretch; height: 36px; flex: none;
+           background: var(--color-zinc-950); border-bottom: 1px solid var(--color-zinc-800);
+           padding: 0 8px 0 8px; gap: 2px; position: relative; z-index: 20; }
+.ctab-scroll { display: flex; align-items: flex-end; flex: 0 1 auto; min-width: 0;
+               overflow-x: auto; overflow-y: hidden; scrollbar-width: none; gap: 2px; padding-top: 4px; }
+.ctab-scroll::-webkit-scrollbar { display: none; }
+.ctab-scroll.fade-r { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); }
+.ctab-scroll.fade-l { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); }
+.ctab-scroll.fade-l.fade-r { -webkit-mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); }
+
+.ctab { position: relative; display: flex; align-items: center; gap: 6px;
+        flex: 0 1 200px; min-width: 120px; max-width: 200px; height: 31px;
+        padding: 0 28px 0 10px; font-size: 12px; line-height: 1; cursor: pointer; user-select: none;
+        color: var(--color-zinc-500); border: 1px solid transparent; border-bottom: 0;
+        border-radius: 6px 6px 0 0; }
+.ctab:hover { background: color-mix(in oklab, var(--color-zinc-900) 70%, transparent); color: var(--color-zinc-300); }
+.ctab.active { background: var(--color-zinc-900); color: var(--color-zinc-100);
+               border-color: var(--color-zinc-800); margin-bottom: -1px; height: 32px;
+               box-shadow: inset 0 2px 0 var(--color-emerald-500, #10b981); }
+.ctab .title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctab .title.untitled { font-style: italic; }
+/* status slot: only rendered when there is something to say */
+.ctab .spin { width: 10px; height: 10px; flex: none; border-radius: 9999px;
+              border: 2px solid var(--color-amber-400, #fbbf24); border-top-color: transparent;
+              animation: ctspin 0.9s linear infinite; }
+.ctab .unread { width: 6px; height: 6px; flex: none; border-radius: 9999px; background: var(--color-sky-400, #38bdf8); margin: 0 2px; }
+@keyframes ctspin { to { transform: rotate(360deg); } }
+.ctab .x { position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+           width: 18px; height: 18px; border-radius: 4px; display: none; align-items: center; justify-content: center;
+           font-size: 14px; color: var(--color-zinc-500); background: transparent; border: 0; cursor: pointer; }
+.ctab:hover .x, .ctab.active .x { display: flex; }
+.ctab:not(:hover):not(.active) .x { display: none; }
+.ctab .x:hover { background: var(--color-zinc-700); color: var(--color-zinc-100); }
+.ctab.active:not(:hover) .x { color: var(--color-zinc-600); }
+/* hover on a tab shows × AND a tint so the hover is obvious in a still */
+.ctab:hover .title { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 6px), transparent); }
+
+.ctab-btn { align-self: center; flex: none; width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
+            border-radius: 6px; border: 1px solid transparent; background: transparent; color: var(--color-zinc-400);
+            font-size: 15px; cursor: pointer; }
+.ctab-btn:hover { background: var(--color-zinc-800); color: var(--color-zinc-200); }
+.ctab-btn.plus { margin-left: 2px; }
+.ctab-btn.arrow { width: 22px; font-size: 13px; }
+.ctab-btn[hidden] { display: none; }
+.ctab-spacer { flex: 1 1 0; min-width: 0; }
+.ctab-count { align-self: center; font: 500 10px/1 ui-monospace, monospace; color: var(--color-zinc-500); padding: 0 4px; }

@@ -789,7 +789,11 @@ fn dispatch_inbound(
         }
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
-            let items = build_conversations_snapshot(state_manager, &registry.active_ids());
+            let items = build_conversations_snapshot(
+                state_manager,
+                &registry.active_ids(),
+                &registry.running_ids(),
+            );
             out_tx
                 .send(OutboundMessage::ConversationsList { items, error: None })
                 .is_ok()
@@ -804,7 +808,11 @@ fn dispatch_inbound(
             };
             let refused = registry.kill(id) == KillOutcome::Running;
             // Active ids are read after the kill so the row reflects it.
-            let items = build_conversations_snapshot(state_manager, &registry.active_ids());
+            let items = build_conversations_snapshot(
+                state_manager,
+                &registry.active_ids(),
+                &registry.running_ids(),
+            );
             let error = refused.then(|| KILL_RUNNING_MSG.to_string());
             out_tx
                 .send(OutboundMessage::ConversationsList { items, error })

@@ -22,7 +22,7 @@
 // technique as CwdPicker.test.tsx. `npm run typecheck` would also flag
 // the fixture, which is expected and fine.
 
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ConversationsPicker } from "./ConversationsPicker";
@@ -105,6 +105,10 @@ afterEach(() => {
     container.remove();
     container = null;
   }
+  // Desktop tests install window.isTauri; always start the next test in a
+  // browser.
+  delete (window as unknown as { isTauri?: boolean }).isTauri;
+  vi.restoreAllMocks();
 });
 
 /** Click the "conversations" chip to open the dropdown (the first button). */
@@ -185,5 +189,172 @@ describe("ConversationsPicker — kill error line", () => {
     await openPicker(el);
 
     expect(findAlert(el)).toBeNull();
+  });
+});
+
+// ─── desktop tab bar (issue #373): picker behaviour split ────────────────
+//
+// Design §5 (App wiring): `ConversationsPicker` — if `isDesktop()`
+// (`window.isTauri === true`), DON'T render the "+" button and SKIP the
+// `hasTranscript` confirm in `load` (in desktop, loading opens/switches a
+// tab via the wired `onLoad` = `tabs.open`, so nothing is replaced). In a
+// browser the existing behaviour must stay UNCHANGED: the "+" opens a new
+// browser tab via `window.open(pathname, "_blank", "noopener")`, and a
+// non-empty transcript is confirmed before loading.
+//
+// The first two tests here are GREEN-today guard tests (browser behaviour
+// unchanged); the desktop tests are RED until `isDesktop()` lands in the
+// component.
+
+describe("ConversationsPicker — desktop vs browser (issue #373)", () => {
+  function setDesktop(on: boolean): void {
+    if (on) {
+      Object.defineProperty(window, "isTauri", {
+        value: true,
+        writable: true,
+        configurable: true,
+      });
+    } else {
+      delete (window as unknown as { isTauri?: boolean }).isTauri;
+    }
+  }
+
+  const NEW_TAB_BUTTON = 'button[aria-label="Open a new conversation in a new tab"]';
+
+  // ── browser: behaviour unchanged ───────────────────────────────────────
+
+  it("browser: renders the + button and opens a new browser tab (window.open)", async () => {
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    const el = await render({ ...baseProps, error: null });
+
+    const plus = el.querySelector<HTMLElement>(NEW_TAB_BUTTON);
+    expect(plus, "the browser header + must render").not.toBeNull();
+
+    await act(async () => {
+      plus!.click();
+    });
+
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    expect(openSpy).toHaveBeenCalledWith(
+      window.location.pathname,
+      "_blank",
+      "noopener",
+    );
+  });
+
+  it("browser: loading with a transcript confirms first (unchanged)", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const onLoad = vi.fn();
+    const el = await render({
+      ...baseProps,
+      error: null,
+      hasTranscript: true,
+      onLoad,
+    });
+
+    await openPicker(el);
+    await render({
+      ...baseProps,
+      error: null,
+      hasTranscript: true,
+      onLoad,
+      conversations: [convo("a1", true), convo("b2"), convo("c3")],
+    });
+
+    // Click the second row's load button (the first button is the chip).
+    const rowButtons = el.querySelectorAll<HTMLElement>(".absolute button");
+    expect(rowButtons.length, "dropdown rows must render").toBeGreaterThan(0);
+    const target = [...rowButtons].find(
+      (b) => b.textContent?.includes("convo b2"),
+    );
+    expect(target, "a row for convo b2 must render").not.toBeNull();
+
+    await act(async () => {
+      target!.click();
+    });
+
+    expect(confirmSpy, "the browser must keep the replace-confirm").toHaveBeenCalled();
+    expect(onLoad).toHaveBeenCalledWith("b2");
+  });
+
+  // ── desktop: no +, no confirm, load opens a tab ────────────────────────
+
+  it("desktop: the + button is not rendered", async () => {
+    setDesktop(true);
+    const el = await render({ ...baseProps, error: null });
+
+    expect(
+      el.querySelector(NEW_TAB_BUTTON),
+      "desktop: the header + must be hidden (the tab bar has its own +)",
+    ).toBeNull();
+  });
+
+  it("desktop: loading with a transcript skips the confirm and loads (opens a tab)", async () => {
+    setDesktop(true);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const onLoad = vi.fn();
+    const el = await render({
+      ...baseProps,
+      error: null,
+      hasTranscript: true,
+      onLoad,
+    });
+
+    await openPicker(el);
+    await render({
+      ...baseProps,
+      error: null,
+      hasTranscript: true,
+      onLoad,
+      conversations: [convo("a1", true), convo("b2"), convo("c3")],
+    });
+
+    const target = [...el.querySelectorAll<HTMLElement>(".absolute button")].find(
+      (b) => b.textContent?.includes("convo b2"),
+    );
+    expect(target, "a row for convo b2 must render").not.toBeNull();
+
+    await act(async () => {
+      target!.click();
+    });
+
+    expect(
+      confirmSpy,
+      "desktop: no replace-confirm — loading opens a tab, nothing is replaced",
+    ).not.toHaveBeenCalled();
+    expect(onLoad, "the picker must still hand the id to the tab store").toHaveBeenCalledWith("b2");
+  });
+
+  it("desktop: loading without a transcript loads directly", async () => {
+    setDesktop(true);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const onLoad = vi.fn();
+    const el = await render({
+      ...baseProps,
+      error: null,
+      hasTranscript: false,
+      onLoad,
+    });
+
+    await openPicker(el);
+    await render({
+      ...baseProps,
+      error: null,
+      hasTranscript: false,
+      onLoad,
+      conversations: [convo("a1", true), convo("b2"), convo("c3")],
+    });
+
+    const target = [...el.querySelectorAll<HTMLElement>(".absolute button")].find(
+      (b) => b.textContent?.includes("convo b2"),
+    );
+    expect(target, "a row for convo b2 must render").not.toBeNull();
+
+    await act(async () => {
+      target!.click();
+    });
+
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(onLoad).toHaveBeenCalledWith("b2");
   });
 });

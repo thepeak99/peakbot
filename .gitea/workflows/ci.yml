@@ -51,3 +51,11 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --workspace --locked
+      # Desktop core (Tauri-free logic crate) — compiles/tests in this
+      # plain rust container; the Tauri glue needs webkit and is built
+      # only in desktop.yml.
+      - name: Desktop core
+        run: |
+          cargo fmt --manifest-path desktop/Cargo.toml -p peakbot-desktop-core -- --check
+          cargo clippy --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core --all-targets -- -D warnings
+          cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core

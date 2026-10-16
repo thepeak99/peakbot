@@ -228,6 +228,10 @@ pub(crate) struct ConversationSummaryWire {
     /// `true` when a live session is currently bound to this conversation
     /// (registry membership). Runtime-only, never persisted.
     active: bool,
+    /// `true` when that live session has an agent turn in flight. Always
+    /// serialised (never omitted) so clients can rely on a bool; drives the
+    /// spinner on background desktop tabs. Runtime-only, never persisted.
+    running: bool,
 }
 
 /// Outbound message envelopes to the client. Owning (no lifetime) so any
@@ -293,16 +297,19 @@ const RECENT_DIRS_MAX: usize = 8;
 /// configured — the client treats that as "hide the picker". `active_ids`
 /// carries the conversation ids with a live session bound (a web-layer
 /// concern injected here so this stays the single snapshot builder for both
-/// transports; stdio passes an empty set).
+/// transports; stdio passes an empty set). `running_ids` is the subset of
+/// those whose agent is mid-turn (same injection rule).
 pub(crate) fn build_conversations_snapshot(
     sm: &StateManager,
     active_ids: &std::collections::HashSet<uuid::Uuid>,
+    running_ids: &std::collections::HashSet<uuid::Uuid>,
 ) -> Vec<ConversationSummaryWire> {
     sm.list_conversations()
         .unwrap_or_default()
         .into_iter()
         .map(|s| ConversationSummaryWire {
             active: active_ids.contains(&s.id),
+            running: running_ids.contains(&s.id),
             id: s.id.to_string(),
             name: s.name,
             updated_at: s.updated_at.to_rfc3339(),
@@ -556,9 +563,103 @@ mod tests {
             message_count: 0,
             model: "m".into(),
             active: true,
+            // issue #373: the background-tab spinner flag (additive).
+            running: false,
         };
         let json = serde_json::to_string(&wire).unwrap();
         assert!(json.contains(r#""active":true"#), "json = {json}");
+    }
+
+    // ── running flag (issue #373: spinners on background tabs) ──────────
+    //
+    // Contract (design §5 backend): `ConversationSummaryWire` gains
+    // `running: bool` — `true` iff a live session on this conversation is
+    // mid-turn. Plain bool: always serialised (no skip), so an old client
+    // ignores it and a new client against an old server sees absence
+    // (`running ?? false`). Compile-RED until the field lands.
+
+    #[test]
+    fn conversation_summary_carries_running_flag() {
+        let wire = ConversationSummaryWire {
+            id: "i".into(),
+            name: "n".into(),
+            updated_at: "t".into(),
+            message_count: 0,
+            model: "m".into(),
+            active: true,
+            running: true,
+        };
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains(r#""running":true"#), "json = {json}");
+
+        let idle = ConversationSummaryWire {
+            running: false,
+            ..wire
+        };
+        let json = serde_json::to_string(&idle).unwrap();
+        assert!(
+            json.contains(r#""running":false"#),
+            "an idle summary must serialise running:false, not omit the key: {json}"
+        );
+    }
+
+    /// `build_conversations_snapshot` marks the convos in `running_ids`
+    /// (the web call sites pass `&registry.running_ids()`; stdio passes an
+    /// empty set). Compile-RED until the third parameter lands.
+    #[test]
+    fn conversations_snapshot_marks_running_ids() {
+        let tmp = TempDir::new().unwrap();
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), tmp.path().join("session"));
+
+        let now = Utc::now();
+        // Two saved convos (empty cwd is fine for this test).
+        save_conv(&store, "", now);
+        save_conv(&store, "", now - chrono::Duration::seconds(60));
+
+        let list = sm.list_conversations().expect("list");
+        assert_eq!(list.len(), 2);
+        let running_id = list[0].id;
+        let idle_id = list[1].id;
+
+        let active = [running_id, idle_id]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let running = [running_id]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        let items = build_conversations_snapshot(&sm, &active, &running);
+        assert_eq!(items.len(), 2);
+        let by_id = |id: &str| {
+            items
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
+        };
+        assert!(
+            by_id(&running_id.to_string()).running,
+            "a mid-turn session's convo must carry running:true"
+        );
+        assert!(
+            !by_id(&idle_id.to_string()).running,
+            "an idle session's convo must carry running:false"
+        );
+    }
+
+    /// The stdio transport passes empty sets (no live-session concept):
+    /// every summary is inactive and not running.
+    #[test]
+    fn conversations_snapshot_is_all_false_with_empty_id_sets() {
+        let tmp = TempDir::new().unwrap();
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), tmp.path().join("session"));
+        save_conv(&store, "", Utc::now());
+
+        let empty: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+        let items = build_conversations_snapshot(&sm, &empty, &empty);
+        assert!(
+            items.iter().all(|i| !i.active && !i.running),
+            "empty id sets must yield inactive, non-running summaries: {items:?}"
+        );
     }
 
     // ── conversations_list kill-refusal error (RED) ────────────────────────

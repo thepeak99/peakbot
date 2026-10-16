@@ -10,6 +10,15 @@
 //! - `peakbot::install::path_state(path_var: &OsStr, target: &Path) -> PathState`
 //! - `peakbot::install::ServicePlan::new(exe, bind, token) -> Result<Self, PlanError>`
 //!
+//! **B2 (desktop design §7):** services must never open a browser — the
+//! Linux unit carries exactly one `Environment=` line,
+//! `Environment=PEAKBOT_NO_OPEN=1`, under `[Service]`, and the launchd
+//! plist carries an `EnvironmentVariables` dict with `PEAKBOT_NO_OPEN =
+//! 1`. The snapshots below pin that contract; the secret-free invariant
+//! (§E.5) is preserved: the token itself must never appear in any
+//! artifact. Until B2 lands in the renderers, the snapshot/Environment
+//! tests below fail — that is the RED state.
+//!
 //! The §E.1 `#[cfg(any(target_os = "X", test))]` gate means **all three
 //! platform modules compile on Linux CI** and their pure renderers are
 //! unit-testable there. The tests in this file are the contract — exact
@@ -183,8 +192,10 @@ fn path_state_hint_is_per_platform_text() {
 
 #[test]
 fn linux_unit_text_matches_the_locked_artifact() {
-    // The exact artifact text from §E.6. Snapshot test: any drift in
-    // the renderer fails this test.
+    // The exact artifact text from §E.6 + B2: one secret-free
+    // `Environment=PEAKBOT_NO_OPEN=1` line under [Service] (services
+    // must never open a browser). Snapshot test: any drift in the
+    // renderer fails this test.
     let plan = plan_loopback("/home/you/.local/bin/peakbot");
     let unit = render_unit(&plan);
     let expected = "\
@@ -194,6 +205,7 @@ After=network-online.target
 
 [Service]
 Type=simple
+Environment=PEAKBOT_NO_OPEN=1
 ExecStart=\"/home/you/.local/bin/peakbot\" --bind 127.0.0.1:7823
 Restart=on-failure
 RestartSec=5
@@ -233,14 +245,21 @@ fn linux_unit_exec_start_can_be_parsed_back_into_argv() {
 }
 
 #[test]
-fn linux_unit_does_not_embed_a_token() {
-    // §E.5: no Environment=, no EnvironmentFile=. The secret is in the
-    // web-token file (§E.5), never in the unit.
+fn linux_unit_embeds_only_the_secret_free_environment_line() {
+    // B2: a background service must never open a browser, so the unit
+    // carries EXACTLY ONE `Environment=` line — `PEAKBOT_NO_OPEN=1`.
+    // The secret-free invariant (§E.5) is preserved: that line is not a
+    // secret, and the token must still never appear in the unit.
     let plan = plan_lan_with_token("/home/you/.local/bin/peakbot");
     let unit = render_unit(&plan);
-    assert!(
-        !unit.contains("Environment="),
-        "the unit must NOT embed the token; got: {unit}"
+    let env_lines: Vec<&str> = unit
+        .lines()
+        .filter(|l| l.starts_with("Environment="))
+        .collect();
+    assert_eq!(
+        env_lines,
+        vec!["Environment=PEAKBOT_NO_OPEN=1"],
+        "the only Environment= line must be exactly Environment=PEAKBOT_NO_OPEN=1; got: {unit}"
     );
     assert!(
         !unit.contains("s3cret"),
@@ -254,6 +273,8 @@ fn linux_unit_does_not_embed_a_token() {
 
 #[test]
 fn macos_plist_matches_the_locked_artifact() {
+    // §E.7 + B2: the plist carries an `EnvironmentVariables` dict with
+    // `PEAKBOT_NO_OPEN = 1` (services must never open a browser).
     let plan = plan_loopback("/Users/you/.local/bin/peakbot");
     let plist = render_plist(&plan);
     let expected = "\
@@ -269,6 +290,11 @@ fn macos_plist_matches_the_locked_artifact() {
     <string>--bind</string>
     <string>127.0.0.1:7823</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PEAKBOT_NO_OPEN</key>
+    <string>1</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

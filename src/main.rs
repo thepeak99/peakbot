@@ -399,32 +399,11 @@ fn run_subcommand(cmd: Command, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Print a [`ServiceReport`]. One printer for all three verbs so the CLI
-/// and the wizard say the same words about the same fields (§E.12).
+/// Print a [`ServiceReport`]. The text is formatted by the install core
+/// (B4: `format_service_report` is the desktop-parsed contract); `print!`
+/// verbatim — the string already ends with a newline.
 fn print_service_report(report: &peakbot::install::ServiceReport) {
-    println!("Manager:   {}", report.manager.as_wire());
-    println!("Name:      {}", report.name);
-    if let Some(artifact) = &report.artifact {
-        println!("Artifact:  {}", artifact.display());
-    }
-    println!("Installed: {}", report.installed);
-    if let Some(exe) = &report.exe {
-        println!("Exec:      {}", exe.display());
-    }
-    println!("State:     {}", report.run_state.as_wire());
-    println!("Survives logout: {}", report.survives_logout);
-    if !report.commands.is_empty() {
-        println!("Commands:");
-        for c in &report.commands {
-            println!("  $ {c}");
-        }
-    }
-    if !report.notes.is_empty() {
-        println!("Notes:");
-        for n in &report.notes {
-            println!("  - {n}");
-        }
-    }
+    print!("{}", peakbot::install::format_service_report(report));
 }
 
 #[tokio::main]

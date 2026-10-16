@@ -643,6 +643,49 @@ pub fn service_op(op: ServiceOp) -> Result<ServiceReport, InstallError> {
     }
 }
 
+// ===========================================================================
+// B4 — the `service status` text contract.
+// ===========================================================================
+
+/// Format a [`ServiceReport`] as the CLI text block. One formatter for
+/// all three verbs so the CLI and the wizard say the same words about
+/// the same fields (§E.12). The result ends with a trailing newline —
+/// callers `print!` it, they do not `println!` it on top.
+///
+/// parsed by desktop/core::service::parse_service_status — keep labels stable
+pub fn format_service_report(report: &ServiceReport) -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    writeln!(out, "Manager:   {}", report.manager.as_wire())
+        .expect("writing to a String cannot fail");
+    writeln!(out, "Name:      {}", report.name).expect("writing to a String cannot fail");
+    if let Some(artifact) = &report.artifact {
+        writeln!(out, "Artifact:  {}", artifact.display())
+            .expect("writing to a String cannot fail");
+    }
+    writeln!(out, "Installed: {}", report.installed).expect("writing to a String cannot fail");
+    if let Some(exe) = &report.exe {
+        writeln!(out, "Exec:      {}", exe.display()).expect("writing to a String cannot fail");
+    }
+    writeln!(out, "State:     {}", report.run_state.as_wire())
+        .expect("writing to a String cannot fail");
+    writeln!(out, "Survives logout: {}", report.survives_logout)
+        .expect("writing to a String cannot fail");
+    if !report.commands.is_empty() {
+        writeln!(out, "Commands:").expect("writing to a String cannot fail");
+        for c in &report.commands {
+            writeln!(out, "  $ {c}").expect("writing to a String cannot fail");
+        }
+    }
+    if !report.notes.is_empty() {
+        writeln!(out, "Notes:").expect("writing to a String cannot fail");
+        for n in &report.notes {
+            writeln!(out, "  - {n}").expect("writing to a String cannot fail");
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Shared plumbing for the platform modules: one subprocess runner, one XML
 // escaper. Both live here so the three modules cannot drift apart on them.
@@ -750,6 +793,96 @@ mod tests {
     use std::ffi::OsStr;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
+
+    // ── B4 — the `service status` text contract ──────────────────────
+    //
+    // The desktop (peakbot-desktop-core `parse_service_status`) parses
+    // this text. The line prefixes `Installed: `, `Exec:      `,
+    // `State:     ` are THE contract — pinned here against
+    // `format_service_report`, the B4 home of today's
+    // `main.rs::print_service_report` body. RED until that fn exists.
+
+    fn sample_report() -> ServiceReport {
+        ServiceReport {
+            manager: ServiceManager::SystemdUser,
+            name: "peakbot.service".to_string(),
+            artifact: Some(PathBuf::from(
+                "/home/u/.config/systemd/user/peakbot.service",
+            )),
+            installed: true,
+            exe: Some(PathBuf::from("/home/u/.local/bin/peakbot")),
+            run_state: RunState::Running,
+            survives_logout: false,
+            commands: vec!["systemctl --user is-active peakbot.service".to_string()],
+            notes: vec!["linger is off".to_string()],
+        }
+    }
+
+    #[test]
+    fn format_service_report_pins_the_line_prefixes_desktop_parses() {
+        let text = format_service_report(&sample_report());
+        // The three desktop-parsed prefixes, exactly as
+        // print_service_report prints them today (current code wins).
+        assert!(
+            text.contains("Installed: true\n"),
+            "`Installed: ` line (one space); got: {text:?}"
+        );
+        assert!(
+            text.contains("Exec:      /home/u/.local/bin/peakbot\n"),
+            "`Exec:      ` line (six spaces); got: {text:?}"
+        );
+        assert!(
+            text.contains("State:     running\n"),
+            "`State:     ` line (five spaces); got: {text:?}"
+        );
+        // The surrounding shape the desktop must not break.
+        assert!(text.contains("Manager:   systemd-user\n"), "{text:?}");
+        assert!(text.contains("Name:      peakbot.service\n"), "{text:?}");
+        assert!(
+            text.contains("Artifact:  /home/u/.config/systemd/user/peakbot.service\n"),
+            "{text:?}"
+        );
+        assert!(text.contains("Survives logout: false\n"), "{text:?}");
+        assert!(
+            text.contains("Commands:\n  $ systemctl --user is-active peakbot.service\n"),
+            "{text:?}"
+        );
+        assert!(text.contains("Notes:\n  - linger is off\n"), "{text:?}");
+    }
+
+    #[test]
+    fn format_service_report_omits_optional_lines_when_absent() {
+        let report = ServiceReport {
+            manager: ServiceManager::LaunchdAgent,
+            name: "com.peakbot.agent".to_string(),
+            artifact: None,
+            installed: false,
+            exe: None,
+            run_state: RunState::Stopped,
+            survives_logout: false,
+            commands: Vec::new(),
+            notes: Vec::new(),
+        };
+        let text = format_service_report(&report);
+        assert!(text.contains("Installed: false\n"), "{text:?}");
+        assert!(text.contains("State:     stopped\n"), "{text:?}");
+        assert!(
+            !text.contains("Exec:"),
+            "no Exec line without an exe; {text:?}"
+        );
+        assert!(
+            !text.contains("Artifact:"),
+            "no Artifact line without an artifact; {text:?}"
+        );
+        assert!(
+            !text.contains("Commands:"),
+            "no Commands section when empty; {text:?}"
+        );
+        assert!(
+            !text.contains("Notes:"),
+            "no Notes section when empty; {text:?}"
+        );
+    }
 
     // ── §E.5 ────────────────────────────────────────────────────────
 
