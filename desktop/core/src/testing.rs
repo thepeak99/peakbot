@@ -6,8 +6,8 @@
 //! counters), `FakeUi` (scripted confirm answers, recorded
 //! phases/dialogs).
 //!
-//! These fakes are FULLY implemented — the RED state comes from the
-//! `todo!()` production stubs, never from the doubles.
+//! These fakes are FULLY implemented; the production code behind them
+//! is real, not stubs.
 
 #![allow(dead_code)] // fakes are built for the full §9.1 list up front
 

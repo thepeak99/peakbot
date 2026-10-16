@@ -1,8 +1,6 @@
 //! C8 — `RealSys` integration tests (DESIGN §7, unix only).
 //!
-//! A fake sidecar is a shell script in a tempdir. `RealSys` is a
-//! `todo!()` stub today, so every test here fails RED at runtime; they
-//! turn GREEN with C8.
+//! A fake sidecar is a shell script in a tempdir.
 
 #![cfg(unix)]
 

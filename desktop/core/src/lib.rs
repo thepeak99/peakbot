@@ -2,11 +2,11 @@
 //! (DESIGN.md §2). All decisions are pure functions plus std-only side
 //! effects behind the `Sys` trait; the Tauri glue stays logic-free.
 //!
-//! T1 (RED): the modules below carry the public signatures locked in
-//! DESIGN §3/§5 with `todo!()` bodies, and each file's `#[cfg(test)]`
-//! module carries its share of the §9.1 test list (`t01`–`t65`).
-//! `testing` holds the fakes (`FakeSys` / `FakeChild` / `FakeUi`);
-//! `tests/real_sys.rs` carries the C8 integration cases (unix only).
+//! The modules carry the public signatures locked in DESIGN §3/§5, and
+//! each file's `#[cfg(test)]` module carries its share of the §9.1 test
+//! list (`t01`–`t65`). `testing` holds the fakes (`FakeSys` /
+//! `FakeChild` / `FakeUi`); `tests/real_sys.rs` carries the C8
+//! integration cases (unix only).
 
 pub mod consts;
 pub mod controller;

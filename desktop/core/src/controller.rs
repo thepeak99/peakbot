@@ -1,12 +1,26 @@
 //! The startup/mode state machine (DESIGN §4.3–§4.6/§5.3). One owner of
 //! the child + phase ⇒ no locks, no races.
 
+use std::io;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::Receiver;
 
+use semver::Version;
+
+use crate::consts::{
+    LOG_TAIL_LINES, POLL_INTERVAL, PORT_ATTEMPTS, READY_TIMEOUT, SERVICE_PORT,
+    SESSION_PREFERRED_PORT, STOP_GRACE, TICK,
+};
 use crate::paths::DesktopPaths;
-use crate::phase::{Dialog, Phase, TrayModel};
-use crate::sys::Sys;
+use crate::phase::{Dialog, Mode, Phase, StartError, StartStep, TrayModel, tray_model};
+use crate::ready::{ReadyOutcome, wait_ready};
+use crate::service::{self, InstalledService, LaunchPlan, RunState, ServiceState};
+use crate::session::{self, EarlyExit, PidRecord};
+use crate::sys::{Child, RunOutput, Signal, SpawnSpec, Sys};
+use crate::token::Token;
+use crate::version::{DeclinedReplace, InstalledVersion, parse_version_output};
 
 /// The UI surface the controller drives (the Tauri glue implements it).
 pub trait Ui: Send {
@@ -24,37 +38,635 @@ pub enum Action {
     Shutdown(std::sync::mpsc::Sender<()>),
 }
 
-/// Owns `sys, ui, paths, quitting, phase, bundled: Option<Version>,
-/// service: Option<ServiceState>, session: Option<Session{child,port,token}>`.
-/// (The `PhantomData` pins the generics in this stub; C7 replaces it
-/// with the real fields.)
-pub struct Controller<S: Sys, U: Ui>(std::marker::PhantomData<(S, U)>);
+/// The session sidecar this controller owns (at most one, §3.8-2).
+struct Session {
+    child: Box<dyn Child>,
+    port: u16,
+    token: Token,
+}
 
-impl<S: Sys, U: Ui> Controller<S, U> {
-    /// `phase = Starting(CheckingBundled)`.
-    pub fn new(_sys: S, _ui: U, _paths: DesktopPaths, _quitting: Arc<AtomicBool>) -> Self {
-        todo!()
-    }
-
-    /// `Break` after Shutdown.
-    pub fn handle(&mut self, _action: Action) -> std::ops::ControlFlow<()> {
-        todo!()
-    }
-
-    /// Liveness: a Ready session whose child exited → Failed(SessionExited).
-    pub fn tick(&mut self) {
-        todo!()
-    }
-
-    pub fn phase(&self) -> &Phase {
-        todo!()
+impl Session {
+    fn mode(&self) -> Mode {
+        Mode::Session {
+            port: self.port,
+            token: self.token.clone(),
+        }
     }
 }
 
-/// `rx.recv_timeout(TICK)` → `handle(action)` or `tick()` (§4.1).
-pub fn run_loop<S: Sys, U: Ui>(mut ctrl: Controller<S, U>, rx: std::sync::mpsc::Receiver<Action>) {
-    let _ = (&mut ctrl, &rx);
-    todo!()
+/// Owns `sys, ui, paths, quitting, phase, bundled, service, session`
+/// (DESIGN §5.3). Every phase assignment goes through `set_phase`, which
+/// is also where the tray model is (re)emitted — a `service` refresh
+/// always lands before the next `set_phase`, so the tray checkbox mirrors
+/// the last `service status`.
+pub struct Controller<S: Sys, U: Ui> {
+    sys: S,
+    ui: U,
+    paths: DesktopPaths,
+    quitting: Arc<AtomicBool>,
+    phase: Phase,
+    /// The bundled (this app's) PeakBot version — locked equal to the
+    /// sidecar's by `check-version.sh`; the `--version` run in
+    /// CheckingBundled is a liveness check, not the version source.
+    bundled: Option<Version>,
+    service: Option<ServiceState>,
+    session: Option<Session>,
+}
+
+impl<S: Sys, U: Ui> Controller<S, U> {
+    /// `phase = Starting(CheckingBundled)`. No `phase_changed` is emitted
+    /// here — the first emission happens on the first `handle`.
+    pub fn new(sys: S, ui: U, paths: DesktopPaths, quitting: Arc<AtomicBool>) -> Self {
+        Self {
+            sys,
+            ui,
+            paths,
+            quitting,
+            phase: Phase::Starting(StartStep::CheckingBundled),
+            bundled: Version::parse(env!("CARGO_PKG_VERSION")).ok(),
+            service: None,
+            session: None,
+        }
+    }
+
+    /// `Break` after Shutdown.
+    pub fn handle(&mut self, action: Action) -> ControlFlow<()> {
+        match action {
+            Action::Start => self.handle_start(),
+            Action::ToggleBackground if !self.is_starting() => self.handle_toggle_background(),
+            Action::ReinstallService if !self.is_starting() => self.replace_service(),
+            // While Starting the tray item is disabled; ignore.
+            Action::ToggleBackground | Action::ReinstallService => {}
+            Action::Shutdown(ack) => {
+                self.stop_session();
+                let _ = ack.send(());
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Liveness: a Ready session whose child exited →
+    /// Failed(SessionExited); a no-op otherwise (incl. service mode).
+    pub fn tick(&mut self) {
+        if !matches!(self.phase, Phase::Ready(Mode::Session { .. })) {
+            return;
+        }
+        let Some(exit) = self
+            .session
+            .as_mut()
+            .and_then(|sess| sess.child.try_wait().ok().flatten())
+        else {
+            return;
+        };
+        let log_tail = self.log_tail();
+        self.session = None;
+        self.remove_pidfile();
+        self.fail(StartError::SessionExited {
+            code: exit,
+            log_tail,
+        });
+    }
+
+    pub fn phase(&self) -> &Phase {
+        &self.phase
+    }
+
+    // -------------------------------------------------------------------
+    // Phase plumbing
+    // -------------------------------------------------------------------
+
+    /// The single exit for phase changes: assign, then emit
+    /// `phase_changed` with a fresh tray model.
+    fn set_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+        let tray = tray_model(&self.phase, self.service.as_ref(), self.bundled.as_ref());
+        self.ui.phase_changed(&self.phase, &tray);
+    }
+
+    fn fail(&mut self, err: StartError) {
+        self.set_phase(Phase::Failed(err));
+    }
+
+    fn is_starting(&self) -> bool {
+        matches!(self.phase, Phase::Starting(_))
+    }
+
+    // -------------------------------------------------------------------
+    // Action::Start (DESIGN §4.3)
+    // -------------------------------------------------------------------
+
+    fn handle_start(&mut self) {
+        self.stop_session();
+        let reaped_stale = self.reap_stale_pidfile();
+
+        self.set_phase(Phase::Starting(StartStep::CheckingBundled));
+        if let Err(err) = self.check_bundled_sidecar() {
+            return self.fail(err);
+        }
+
+        let state = self.query_service_status();
+        self.service = Some(state.clone());
+        self.set_phase(Phase::Starting(StartStep::CheckingService));
+
+        let Some(bundled) = self.bundled.clone() else {
+            return self.fail(StartError::SidecarBroken {
+                detail: "bundled version unavailable".to_string(),
+            });
+        };
+        let declined = self.read_declined();
+        let plan = service::plan_launch(
+            &state,
+            |svc| self.version_of(svc),
+            &bundled,
+            declined.as_ref(),
+        );
+        match plan {
+            LaunchPlan::Session => self.launch_session(reaped_stale),
+            LaunchPlan::ConnectService { start_first } => self.connect_service(start_first, false),
+            LaunchPlan::AskReplace { installed } => {
+                let dialog = service::replace_dialog(&installed, &bundled);
+                if self.ui.confirm(&dialog) {
+                    self.replace_service();
+                } else {
+                    self.write_declined(&installed, &bundled);
+                    let start_first = matches!(
+                        &state,
+                        ServiceState::Installed(svc) if svc.run == RunState::Stopped
+                    );
+                    self.connect_service(start_first, false);
+                }
+            }
+        }
+    }
+
+    /// `<sidecar> --version`: NotFound → SidecarMissing; failed or
+    /// unparseable → SidecarBroken.
+    fn check_bundled_sidecar(&self) -> Result<(), StartError> {
+        let out = self
+            .sys
+            .run(&self.paths.sidecar, &["--version"])
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    StartError::SidecarMissing {
+                        path: self.paths.sidecar.clone(),
+                    }
+                } else {
+                    StartError::SidecarBroken {
+                        detail: e.to_string(),
+                    }
+                }
+            })?;
+        if !out.ok() || parse_version_output(&out.stdout).is_none() {
+            return Err(StartError::SidecarBroken {
+                detail: format!(
+                    "`--version` failed or was unparseable: {}",
+                    out.combined().trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn query_service_status(&self) -> ServiceState {
+        match self.sys.run(&self.paths.sidecar, &service::status_args()) {
+            Ok(out) => service::parse_service_status(&out),
+            Err(e) => ServiceState::Unavailable {
+                reason: e.to_string(),
+            },
+        }
+    }
+
+    fn refresh_service(&mut self) {
+        self.service = Some(self.query_service_status());
+    }
+
+    /// `version_of(installed)` per DESIGN §4.4: exe None → Unknown, else
+    /// `<exe> --version`.
+    fn version_of(&self, svc: &InstalledService) -> InstalledVersion {
+        let Some(exe) = &svc.exe else {
+            return InstalledVersion::Unknown;
+        };
+        match self.sys.run(exe, &["--version"]) {
+            Ok(out) if out.ok() => parse_version_output(&out.stdout)
+                .map(InstalledVersion::Known)
+                .unwrap_or(InstalledVersion::Unknown),
+            _ => InstalledVersion::Unknown,
+        }
+    }
+
+    fn read_declined(&self) -> Option<DeclinedReplace> {
+        self.sys
+            .read(&self.paths.declined_file())
+            .ok()
+            .flatten()
+            .and_then(|s| DeclinedReplace::parse(&s))
+    }
+
+    fn write_declined(&self, installed: &InstalledVersion, bundled: &Version) {
+        let d = DeclinedReplace {
+            installed: installed.clone(),
+            bundled: bundled.clone(),
+        };
+        if let Err(e) = self
+            .sys
+            .write_private(&self.paths.declined_file(), &d.render())
+        {
+            log::warn!("failed to write declined-replace: {e}");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // LAUNCH_SESSION (DESIGN §4.3)
+    // -------------------------------------------------------------------
+
+    fn launch_session(&mut self, suppress_pidfile: bool) {
+        let mut tried: Vec<u16> = Vec::new();
+        for attempt in 1..=PORT_ATTEMPTS {
+            self.set_phase(Phase::Starting(StartStep::StartingSession));
+            // 7824 if free (and not already burned by a "port taken"
+            // exit), else a fresh port from the OS.
+            let port = if self.sys.port_is_free(SESSION_PREFERRED_PORT)
+                && !tried.contains(&SESSION_PREFERRED_PORT)
+            {
+                SESSION_PREFERRED_PORT
+            } else {
+                match self.sys.free_port() {
+                    Ok(p) => p,
+                    Err(_) => return self.fail(StartError::PortUnavailable),
+                }
+            };
+            tried.push(port);
+
+            let token = Token::generate(&self.sys);
+            let spec = SpawnSpec {
+                program: self.paths.sidecar.clone(),
+                args: session::session_args(port),
+                extra_env: session::session_env(&token),
+                log: self.paths.session_log(),
+            };
+            let child = match self.sys.spawn(spec) {
+                Ok(c) => c,
+                Err(e) => {
+                    return self.fail(StartError::SidecarBroken {
+                        detail: e.to_string(),
+                    });
+                }
+            };
+            let mut sess = Session { child, port, token };
+            let mode = sess.mode();
+            let rec = PidRecord {
+                pid: sess.child.pid(),
+                port,
+            };
+            if !suppress_pidfile
+                && let Err(e) = self.sys.write_private(&self.paths.pidfile(), &rec.render())
+            {
+                log::warn!("failed to write pidfile: {e}");
+            }
+
+            self.set_phase(Phase::Starting(StartStep::WaitingForBackend));
+            match wait_ready(
+                &self.sys,
+                &mode.probe_url(),
+                READY_TIMEOUT,
+                Some(sess.child.as_mut()),
+                &self.quitting,
+            ) {
+                ReadyOutcome::Ready => {
+                    self.session = Some(sess);
+                    self.set_phase(Phase::Ready(mode));
+                    return;
+                }
+                ReadyOutcome::ChildExited(code) => {
+                    let log_tail = self.log_tail();
+                    self.remove_pidfile();
+                    if session::classify_early_exit(code, &log_tail) == EarlyExit::PortTaken {
+                        if attempt < PORT_ATTEMPTS {
+                            // The TOCTOU between free_port() and the
+                            // child's bind: retry on a new port.
+                            continue;
+                        }
+                        // Port taken on the final attempt = exhausted.
+                        self.fail(StartError::PortUnavailable);
+                        return;
+                    }
+                    self.fail(StartError::SessionExited { code, log_tail });
+                    return;
+                }
+                ReadyOutcome::Timeout => {
+                    self.stop_child(&mut sess.child);
+                    self.remove_pidfile();
+                    self.fail(StartError::NotReady {
+                        waited: READY_TIMEOUT,
+                    });
+                    return;
+                }
+                ReadyOutcome::TokenRejected => {
+                    self.stop_child(&mut sess.child);
+                    self.remove_pidfile();
+                    self.fail(StartError::TokenRejected { service: false });
+                    return;
+                }
+                // Quitting: an internal control-flow outcome, never a
+                // visible phase (§3.5).
+                ReadyOutcome::Cancelled => {
+                    self.stop_child(&mut sess.child);
+                    self.remove_pidfile();
+                    return;
+                }
+            }
+        }
+        self.fail(StartError::PortUnavailable);
+    }
+
+    // -------------------------------------------------------------------
+    // CONNECT (DESIGN §4.3)
+    // -------------------------------------------------------------------
+
+    fn connect_service(&mut self, start_first: bool, trust_install: bool) {
+        self.set_phase(Phase::Starting(StartStep::ConnectingService));
+        let token = self.read_web_token();
+        if start_first
+            && let Err((command, output)) = self.run_sidecar_cmd(&service::service_install_args())
+        {
+            return self.fail(StartError::ServiceCommandFailed { command, output });
+        }
+        let mode = Mode::Service { token };
+        match wait_ready(
+            &self.sys,
+            &mode.probe_url(),
+            READY_TIMEOUT,
+            None,
+            &self.quitting,
+        ) {
+            ReadyOutcome::Ready => self.set_phase(Phase::Ready(mode)),
+            ReadyOutcome::TokenRejected => self.fail(StartError::TokenRejected { service: true }),
+            ReadyOutcome::Timeout => {
+                if trust_install {
+                    // `service install` starts the unit itself (DESIGN
+                    // §4.3); right after a successful install the probe is
+                    // a sanity check, the command is the source of truth.
+                    self.set_phase(Phase::Ready(mode));
+                } else {
+                    self.fail(StartError::ServiceUnreachable {
+                        waited: READY_TIMEOUT,
+                    })
+                }
+            }
+            ReadyOutcome::Cancelled => {}
+            ReadyOutcome::ChildExited(_) => {} // no child in service mode
+        }
+    }
+
+    /// The web-token is exactly what the file holds — never generated
+    /// here (a generated token would not match the running service).
+    fn read_web_token(&self) -> Option<Token> {
+        self.sys
+            .read(&self.paths.web_token())
+            .ok()
+            .flatten()
+            .and_then(|s| Token::parse(&s))
+    }
+
+    /// Generate + write the web-token 0600 iff absent. When a session
+    /// token is passed (mode toggle), it is reused — the webview's token
+    /// stays stable across the port switch.
+    fn ensure_token(&self, preferred: Option<&Token>) {
+        if self
+            .sys
+            .read(&self.paths.web_token())
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        let token = preferred
+            .cloned()
+            .unwrap_or_else(|| Token::generate(&self.sys));
+        if let Err(e) = self
+            .sys
+            .write_private(&self.paths.web_token(), token.as_str())
+        {
+            log::warn!("failed to write web-token: {e}");
+        }
+    }
+
+    /// One short-lived sidecar command. Err = (command, output) for the
+    /// ServiceCommandFailed dialog/phase.
+    fn run_sidecar_cmd(&self, args: &[&str]) -> Result<RunOutput, (String, String)> {
+        let command = args.join(" ");
+        let out = self
+            .sys
+            .run(&self.paths.sidecar, args)
+            .map_err(|e| (command.clone(), e.to_string()))?;
+        if out.ok() {
+            Ok(out)
+        } else {
+            Err((command, out.combined()))
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // REPLACE (DESIGN §4.3) — also Action::ReinstallService
+    // -------------------------------------------------------------------
+
+    fn replace_service(&mut self) {
+        self.set_phase(Phase::Starting(StartStep::RemovingService));
+        // Non-zero tolerated: the unit may not be loaded.
+        let _ = self
+            .sys
+            .run(&self.paths.sidecar, &service::service_uninstall_args());
+
+        self.set_phase(Phase::Starting(StartStep::InstallingService));
+        self.ensure_token(None);
+        if let Err((command, output)) = self
+            .run_sidecar_cmd(&service::install_args())
+            .and_then(|_| self.run_sidecar_cmd(&service::service_install_args()))
+        {
+            return self.fail(StartError::ServiceCommandFailed { command, output });
+        }
+
+        self.refresh_service();
+        if let Err(e) = self.sys.remove(&self.paths.declined_file()) {
+            log::warn!("failed to remove declined-replace: {e}");
+        }
+        self.connect_service(false, true);
+    }
+
+    // -------------------------------------------------------------------
+    // Mode toggle (DESIGN §4.5)
+    // -------------------------------------------------------------------
+
+    fn handle_toggle_background(&mut self) {
+        match self.service.as_ref() {
+            Some(ServiceState::NotInstalled) => self.enable_background(),
+            Some(ServiceState::Installed(_)) => self.disable_background(),
+            // Unavailable (or no status yet): the tray item is disabled.
+            _ => {}
+        }
+    }
+
+    fn enable_background(&mut self) {
+        if !self.sys.exists(&self.paths.peakbot_config()) {
+            self.ui.message(&service::finish_setup_dialog());
+            return;
+        }
+        if !self.sys.port_is_free(SERVICE_PORT) {
+            self.ui.message(&service::port_busy_dialog());
+            return;
+        }
+        if !self.ui.confirm(&service::enable_dialog()) {
+            return;
+        }
+        // The service reuses the session's token when it takes over
+        // (stable webview token across the port switch) — capture it
+        // before the session goes away.
+        let session_token = self.session.as_ref().map(|s| s.token.clone());
+        // Stop the session BEFORE installing: two backends must never
+        // share the config/DB.
+        self.stop_session();
+
+        // REPLACE steps minus the uninstall.
+        self.set_phase(Phase::Starting(StartStep::InstallingService));
+        self.ensure_token(session_token.as_ref());
+        if let Err((command, output)) = self
+            .run_sidecar_cmd(&service::install_args())
+            .and_then(|_| self.run_sidecar_cmd(&service::service_install_args()))
+        {
+            return self.enable_failed(&command, &output);
+        }
+        self.refresh_service();
+        self.connect_service(false, true);
+    }
+
+    /// Enable failure: best-effort rollback, then the user is back where
+    /// they were (session mode).
+    fn enable_failed(&mut self, command: &str, output: &str) {
+        let _ = self
+            .sys
+            .run(&self.paths.sidecar, &service::service_uninstall_args());
+        self.refresh_service();
+        self.ui
+            .message(&service::command_failed_dialog(command, output));
+        self.launch_session(false);
+    }
+
+    fn disable_background(&mut self) {
+        if !self.ui.confirm(&service::disable_dialog()) {
+            return;
+        }
+        self.set_phase(Phase::Starting(StartStep::RemovingService));
+        match self.run_sidecar_cmd(&service::service_uninstall_args()) {
+            Ok(_) => {
+                self.refresh_service();
+                self.launch_session(false);
+            }
+            Err((command, output)) => {
+                self.refresh_service();
+                self.ui
+                    .message(&service::command_failed_dialog(&command, &output));
+                // Unchanged mode: reconnect to the still-installed service.
+                self.connect_service(false, false);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Stopping + reaping (DESIGN §4.6)
+    // -------------------------------------------------------------------
+
+    /// SIGINT → poll `try_wait` up to STOP_GRACE → SIGKILL → remove
+    /// pidfile. A no-op when there is no session.
+    fn stop_session(&mut self) {
+        let Some(mut sess) = self.session.take() else {
+            return;
+        };
+        self.set_phase(Phase::Starting(StartStep::StoppingSession));
+        self.stop_child(&mut sess.child);
+        self.remove_pidfile();
+    }
+
+    fn stop_child(&mut self, child: &mut Box<dyn Child>) {
+        child.interrupt();
+        let deadline = self.sys.now() + STOP_GRACE;
+        loop {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            if self.sys.now() >= deadline {
+                child.kill();
+                let _ = child.try_wait();
+                return;
+            }
+            self.sys.sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Stale pidfile reaper: identity-checked (cmdline) SIGINT → poll up
+    /// to STOP_GRACE → SIGKILL; the pidfile is always removed. Returns
+    /// true when a stale pidfile was found and reaped (the fresh
+    /// session then skips its pidfile write — the reaped record was the
+    /// bookkeeping for the previous crash).
+    fn reap_stale_pidfile(&mut self) -> bool {
+        let pidfile = self.paths.pidfile();
+        let Some(text) = self.sys.read(&pidfile).ok().flatten() else {
+            return false;
+        };
+        if let Some(rec) = PidRecord::parse(&text)
+            && let Some(cmd) = self.sys.cmdline_of(rec.pid)
+            && session::is_our_sidecar(&cmd, &rec)
+        {
+            self.sys.signal(rec.pid, Signal::Interrupt);
+            let deadline = self.sys.now() + STOP_GRACE;
+            while self.sys.cmdline_of(rec.pid).is_some() && self.sys.now() < deadline {
+                self.sys.sleep(POLL_INTERVAL);
+            }
+            if self.sys.cmdline_of(rec.pid).is_some() {
+                self.sys.signal(rec.pid, Signal::Kill);
+            }
+        }
+        if let Err(e) = self.sys.remove(&pidfile) {
+            log::warn!("failed to remove stale pidfile: {e}");
+        }
+        true
+    }
+
+    fn remove_pidfile(&self) {
+        if let Err(e) = self.sys.remove(&self.paths.pidfile()) {
+            log::warn!("failed to remove pidfile: {e}");
+        }
+    }
+
+    /// Last LOG_TAIL_LINES of the session log ("" if absent).
+    fn log_tail(&self) -> String {
+        match self.sys.read(&self.paths.session_log()) {
+            Ok(Some(text)) => session::tail_lines(&text, LOG_TAIL_LINES),
+            Ok(None) => String::new(),
+            Err(e) => {
+                log::warn!("failed to read session log: {e}");
+                String::new()
+            }
+        }
+    }
+}
+
+/// `rx.recv_timeout(TICK)` → `handle(action)` or `tick()` (DESIGN §4.1).
+/// The loop ends on a Shutdown Break or a disconnected channel.
+pub fn run_loop<S: Sys, U: Ui>(mut ctrl: Controller<S, U>, rx: Receiver<Action>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        match rx.recv_timeout(TICK) {
+            Ok(action) => {
+                if ctrl.handle(action) == ControlFlow::Break(()) {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => ctrl.tick(),
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1446,9 +2058,11 @@ mod tests {
             "precondition; got {:?}",
             ctrl.phase()
         );
-        let (old_pid, new_pid) = (sys.spawned_pids()[0], sys.spawned_pids()[1]);
 
         let _ = ctrl.handle(Action::Start); // Retry
+        // Snapshot AFTER the retry: pids[0] is the stopped session,
+        // pids[1] the fresh one it spawned.
+        let (old_pid, new_pid) = (sys.spawned_pids()[0], sys.spawned_pids()[1]);
         assert!(
             matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
             "got {:?}",
