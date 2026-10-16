@@ -351,27 +351,18 @@ pub fn service_op_adapter(req: JsonValue) -> Result<JsonValue, SetupOpError> {
                     .as_deref()
                     .and_then(|p| crate::install::read_web_token(p).ok().flatten()),
             };
-            // §E.5: same fallback as the CLI's `build_plan_for_install`.
-            // Inline here so the wizard hits the same target selection
-            // without depending on `main.rs`.
-            let target = crate::install::install_target();
-            let (exe, fallback_note) = match target.as_ref() {
-                Some(t) if t.exists() => (t.clone(), None),
+            // B3 (desktop design §7): when the install target does not
+            // exist, run the binary install FIRST — the same copy the
+            // `peakbot install` CLI verb performs — and point the service
+            // at the target. The wizard must never point a service at a
+            // path that does not exist (it matters for the desktop, where
+            // the wizard runs inside the window).
+            let exe = match crate::install::install_target().as_ref() {
+                Some(t) if t.exists() => t.clone(),
                 _ => {
-                    // Fallback: prefer the install target's parent
-                    // (matches the install verb) — `current_exe()` is
-                    // the test runner in CI and would surface a wrong
-                    // path. `unwrap_or_default` is fine: an empty
-                    // PathBuf is still a valid (if useless) input.
-                    let here = target
-                        .clone()
-                        .unwrap_or_else(|| std::env::current_exe().unwrap_or_default());
-                    let note = Some(format!(
-                        "the service points at {}, which is where you ran PeakBot from — \
-                         run `peakbot install` so it survives a move",
-                        here.display()
-                    ));
-                    (here, note)
+                    let outcome = crate::install::install_binary()
+                        .map_err(|e| SetupOpError::from_install_error(&e))?;
+                    outcome.target
                 }
             };
             let plan = ServicePlan::new(exe, bind, owned_token)
@@ -385,11 +376,8 @@ pub fn service_op_adapter(req: JsonValue) -> Result<JsonValue, SetupOpError> {
                 })?;
                 write_web_token(&path, t).map_err(|e| SetupOpError::from_install_error(&e))?;
             }
-            let mut report = crate::install::service_op(ServiceOp::Install { plan })
+            let report = crate::install::service_op(ServiceOp::Install { plan })
                 .map_err(|e| SetupOpError::from_install_error(&e))?;
-            if let Some(note) = fallback_note {
-                report.notes.push(note);
-            }
             Ok(service_report_to_wire(&report))
         }
         other => Err(SetupOpError::validation(format!(

@@ -28,8 +28,10 @@ const LINGER_DIR: &str = "/var/lib/systemd/linger";
 ///
 /// `ExecStart` is absolute and double-quoted: systemd splits the value on
 /// whitespace, so a home directory with a space would otherwise become two
-/// argv entries. No `Environment=` — the token lives in the `web-token`
-/// file (§E.5), never in an artifact.
+/// argv entries. Exactly one `Environment=` line — `PEAKBOT_NO_OPEN=1`
+/// (B2: a background service must never open a browser). It is
+/// secret-free; the token stays in the `web-token` file (§E.5), never in
+/// an artifact.
 pub fn render_unit(plan: &ServicePlan) -> String {
     let argv = plan.argv();
     let exe = &argv[0];
@@ -41,6 +43,7 @@ pub fn render_unit(plan: &ServicePlan) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
+         Environment=PEAKBOT_NO_OPEN=1\n\
          ExecStart=\"{exe}\" {args}\n\
          Restart=on-failure\n\
          RestartSec=5\n\

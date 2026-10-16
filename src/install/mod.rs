@@ -643,6 +643,49 @@ pub fn service_op(op: ServiceOp) -> Result<ServiceReport, InstallError> {
     }
 }
 
+// ===========================================================================
+// B4 — the `service status` text contract.
+// ===========================================================================
+
+/// Format a [`ServiceReport`] as the CLI text block. One formatter for
+/// all three verbs so the CLI and the wizard say the same words about
+/// the same fields (§E.12). The result ends with a trailing newline —
+/// callers `print!` it, they do not `println!` it on top.
+///
+/// parsed by desktop/core::service::parse_service_status — keep labels stable
+pub fn format_service_report(report: &ServiceReport) -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    writeln!(out, "Manager:   {}", report.manager.as_wire())
+        .expect("writing to a String cannot fail");
+    writeln!(out, "Name:      {}", report.name).expect("writing to a String cannot fail");
+    if let Some(artifact) = &report.artifact {
+        writeln!(out, "Artifact:  {}", artifact.display())
+            .expect("writing to a String cannot fail");
+    }
+    writeln!(out, "Installed: {}", report.installed).expect("writing to a String cannot fail");
+    if let Some(exe) = &report.exe {
+        writeln!(out, "Exec:      {}", exe.display()).expect("writing to a String cannot fail");
+    }
+    writeln!(out, "State:     {}", report.run_state.as_wire())
+        .expect("writing to a String cannot fail");
+    writeln!(out, "Survives logout: {}", report.survives_logout)
+        .expect("writing to a String cannot fail");
+    if !report.commands.is_empty() {
+        writeln!(out, "Commands:").expect("writing to a String cannot fail");
+        for c in &report.commands {
+            writeln!(out, "  $ {c}").expect("writing to a String cannot fail");
+        }
+    }
+    if !report.notes.is_empty() {
+        writeln!(out, "Notes:").expect("writing to a String cannot fail");
+        for n in &report.notes {
+            writeln!(out, "  - {n}").expect("writing to a String cannot fail");
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Shared plumbing for the platform modules: one subprocess runner, one XML
 // escaper. Both live here so the three modules cannot drift apart on them.

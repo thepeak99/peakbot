@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 /// `RunAtLoad` + `KeepAlive{SuccessfulExit:false}` is the analogue of
 /// systemd's `Restart=on-failure`: start at login, restart on crash, stay
 /// down after a clean exit. Plain `KeepAlive: true` would resurrect an
-/// agent the user deliberately quit. No token — see §E.5.
+/// agent the user deliberately quit. No token — see §E.5. The
+/// `EnvironmentVariables` dict carries exactly `PEAKBOT_NO_OPEN = 1`
+/// (B2: a background service must never open a browser); it is
+/// secret-free, the plist never embeds the token.
 pub fn render_plist(plan: &ServicePlan) -> String {
     let args = plan
         .argv()
@@ -42,6 +45,11 @@ pub fn render_plist(plan: &ServicePlan) -> String {
          \x20 <array>\n\
          {args}\
          \x20 </array>\n\
+         \x20 <key>EnvironmentVariables</key>\n\
+         \x20 <dict>\n\
+         \x20   <key>PEAKBOT_NO_OPEN</key>\n\
+         \x20   <string>1</string>\n\
+         \x20 </dict>\n\
          \x20 <key>RunAtLoad</key>\n\
          \x20 <true/>\n\
          \x20 <key>KeepAlive</key>\n\
