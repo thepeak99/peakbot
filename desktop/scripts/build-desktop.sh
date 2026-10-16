@@ -42,6 +42,13 @@ VERSION=$(awk '/^\[package\]/{p=1} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$
 
 CONTAINER_BUILDER=${CONTAINER_BUILDER:-$(command -v podman 2>/dev/null || echo docker)}
 
+# `docker build --output type=local,dest=...` requires BuildKit. podman
+# (buildah) supports it natively; for docker, force BuildKit on so the
+# invocation works on daemons where the classic builder is still default.
+if [ "$CONTAINER_BUILDER" = "docker" ]; then
+    export DOCKER_BUILDKIT=${DOCKER_BUILDKIT:-1}
+fi
+
 echo "🖥️  PeakBot Desktop $VERSION — builder: $CONTAINER_BUILDER"
 
 prune_between() {

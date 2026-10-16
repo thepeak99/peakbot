@@ -1,0 +1,80 @@
+name: Desktop build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['*']
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: AppImage + macOS zip
+    runs-on: dind
+    timeout-minutes: 120
+    # No `container:` on purpose (DESIGN.md §5.7 / Q1): the build script
+    # drives the HOST docker daemon (the dind runner ships docker), and
+    # the pure-git checkout needs only git + sh. Bind mounts
+    # (`docker run -v`) are UNSAFE on this runner (paths resolve on the
+    # host, not the job container), so the release-attach step pipes
+    # files via tar over stdin when it must run in a container.
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+    steps:
+      - name: Diagnostics
+        run: |
+          echo "--- docker version"; docker version 2>&1 | head -n 40 || true
+          echo "--- docker buildx"; docker buildx version 2>&1 || true
+          echo "--- disk"; df -h
+          echo "--- tooling"; git --version
+          node --version || true
+          command -v curl >/dev/null && curl --version | head -n1 || echo "curl: MISSING"
+          command -v jq >/dev/null && jq --version || echo "jq: MISSING"
+      - name: Ensure node (actions/upload-artifact@v3 is a JS action)
+        run: |
+          if command -v node >/dev/null 2>&1; then
+            echo "node $(node --version) present"
+            exit 0
+          fi
+          echo "node missing — installing Node.js 22 into /usr/local"
+          curl -fsSL https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz -o /tmp/node.tar.xz
+          tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+          node --version
+      - name: Checkout (no-node, pure git)
+        run: |
+          git init -q
+          git fetch --depth=1 \
+            "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Build desktop artifacts (Linux AppImage + macOS universal zip)
+        run: PRUNE=1 CONTAINER_BUILDER=docker sh desktop/scripts/build-desktop.sh all
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: desktop-artifacts
+          path: output/desktop/*
+      - name: Attach artifacts to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          GITEA_URL="${GITHUB_SERVER_URL#https://}"
+          TAG="${GITHUB_REF#refs/tags/}"
+          TOKEN="${RELEASE_TOKEN:-$GITHUB_TOKEN}"
+          [ -n "$TOKEN" ] || { echo "no token: RELEASE_TOKEN secret unset and no github.token" >&2; exit 1; }
+          if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+            echo "curl+jq present — attaching on host"
+            GITEA_URL="$GITEA_URL" REPO="$GITHUB_REPOSITORY" TAG="$TAG" TOKEN="$TOKEN" \
+              sh desktop/scripts/attach-release.sh
+          else
+            echo "curl/jq missing — attaching via alpine (no bind mounts; tar over stdin)"
+            tar -cf - desktop/scripts/attach-release.sh output/desktop |
+              docker run --rm -i \
+                -e GITEA_URL="$GITEA_URL" -e REPO="$GITHUB_REPOSITORY" \
+                -e TAG="$TAG" -e TOKEN="$TOKEN" \
+                alpine:3.20 \
+                sh -c 'set -e; apk add --no-cache curl jq >/dev/null 2>&1; mkdir -p /w; tar -xf - -C /w; cd /w; sh desktop/scripts/attach-release.sh'
+          fi
