@@ -40,6 +40,19 @@ pub fn peakbot_config_dir() -> Option<PathBuf> {
         .map(|p| p.config_dir().to_path_buf())
 }
 
+/// `directories_next::BaseDirs::cache_dir()/peakbot/tls/ca-cert.pem` —
+/// SAME base dir and file name as the backend's `dirs::cache_dir()` CA
+/// (`src/ui/web/tls.rs`): the Linux webview verifies the presented leaf
+/// against this file (design #377b §3.3).
+pub fn peakbot_ca_cert() -> Option<PathBuf> {
+    directories_next::BaseDirs::new().map(|b| {
+        b.cache_dir()
+            .join("peakbot")
+            .join("tls")
+            .join("ca-cert.pem")
+    })
+}
+
 impl DesktopPaths {
     /// `data_dir/sidecar.pid`.
     pub fn pidfile(&self) -> PathBuf {
@@ -65,6 +78,11 @@ impl DesktopPaths {
     pub fn peakbot_config(&self) -> PathBuf {
         self.peakbot_config_dir.join("config.yaml")
     }
+
+    /// `data_dir/settings.json` (design #377 §3.1: launch parameters only).
+    pub fn settings_file(&self) -> PathBuf {
+        self.data_dir.join("settings.json")
+    }
 }
 
 #[cfg(test)]
@@ -80,7 +98,7 @@ mod tests {
         }
     }
 
-    // §9.1 case 26.
+    // §9.1 case 26 (updated for #377: + settings_file).
     #[test]
     fn t26_sidecar_path_and_helper_file_names() {
         let p = sidecar_path(Path::new("/tmp/.mount_x/usr/bin/peakbot-desktop"));
@@ -92,6 +110,7 @@ mod tests {
         assert_eq!(d.session_log(), PathBuf::from("/logs/peakbot-session.log"));
         assert_eq!(d.web_token(), PathBuf::from("/cfg/web-token"));
         assert_eq!(d.peakbot_config(), PathBuf::from("/cfg/config.yaml"));
+        assert_eq!(d.settings_file(), PathBuf::from("/data/settings.json"));
     }
 
     // §9.1 case 27.
@@ -104,5 +123,15 @@ mod tests {
             Some("peakbot"),
             "got {dir:?}"
         );
+    }
+
+    // Design #377b t102: the CA lives in the same base dir as the
+    // backend's `dirs::cache_dir()` — `peakbot/tls/ca-cert.pem` (the
+    // file name the backend's tls.rs mints it under).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn t102_peakbot_ca_cert_ends_with_peakbot_tls_ca_cert_pem() {
+        let p = peakbot_ca_cert().expect("the cache dir resolves on Linux");
+        assert!(p.ends_with("peakbot/tls/ca-cert.pem"), "got {p:?}");
     }
 }

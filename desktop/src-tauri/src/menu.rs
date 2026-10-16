@@ -38,8 +38,8 @@ pub fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
                     "Window",
                     true,
                     &[
-                        PredefinedMenuItem::minimize(app, None)?,
-                        PredefinedMenuItem::maximize(app, None)?,
+                        &PredefinedMenuItem::minimize(app, None)?,
+                        &PredefinedMenuItem::maximize(app, None)?,
                     ],
                 )?;
                 menu.append_items(&[&window])?;

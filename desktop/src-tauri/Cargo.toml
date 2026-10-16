@@ -20,3 +20,9 @@ log = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Both are already in Cargo.lock (pulled by wry 0.57) — declared
+# directly for the webview TLS trust handler (tls_trust.rs, #376).
+webkit2gtk = { version = "2.0.2", features = ["v2_6"] }
+gio = "0.18"

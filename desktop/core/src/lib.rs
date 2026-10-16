@@ -17,6 +17,7 @@ pub mod phase;
 pub mod ready;
 pub mod service;
 pub mod session;
+pub mod settings;
 pub mod sys;
 pub mod token;
 pub mod version;

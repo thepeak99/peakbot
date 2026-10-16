@@ -40,7 +40,9 @@ pub fn wait_ready(
             return ReadyOutcome::ChildExited(exit);
         }
         match sys.probe(url) {
-            Probe::Status(200) => return ReadyOutcome::Ready,
+            // A listening socket counts as Ready for https (no TLS is
+            // spoken — design #377 §6 T3).
+            Probe::Status(200) | Probe::Listening => return ReadyOutcome::Ready,
             Probe::Status(401) | Probe::Status(403) => return ReadyOutcome::TokenRejected,
             Probe::Status(_) | Probe::Unreachable => {}
         }
@@ -159,5 +161,27 @@ mod tests {
         let quitting = Arc::new(AtomicBool::new(true));
         let out = wait_ready(&sys, &url, READY_TIMEOUT, None, &quitting);
         assert_eq!(out, ReadyOutcome::Cancelled);
+    }
+
+    // Design #377 t75: for https URLs the probe is a TCP connect (no TLS
+    // is spoken — core ureq has no TLS, until #374); a listening socket
+    // counts as Ready.
+    #[test]
+    fn t75_wait_ready_listening_counts_as_ready_for_https() {
+        let sys = FakeSys::new();
+        let url = Url::parse("https://127.0.0.1:7824/commands?token=tok").unwrap();
+        sys.set_probe(
+            url.to_string().as_str(),
+            vec![Probe::Unreachable, Probe::Listening],
+        );
+        let quitting = Arc::new(AtomicBool::new(false));
+        let start = sys.now();
+        let out = wait_ready(&sys, &url, READY_TIMEOUT, None, &quitting);
+        assert_eq!(out, ReadyOutcome::Ready, "Listening ⇒ Ready");
+        assert_eq!(
+            sys.now() - start,
+            POLL_INTERVAL,
+            "exactly one poll interval before the Listening answer"
+        );
     }
 }

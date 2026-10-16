@@ -1,5 +1,5 @@
 //! The tray menu (DESIGN §5.4). Item ids are locked: `status`, `open`,
-//! `background`, `logs`, `quit`.
+//! `settings`, `background`, `logs`, `quit`.
 
 use std::sync::Arc;
 
@@ -42,6 +42,7 @@ fn build_dynamic_items(app: &AppHandle) -> tauri::Result<TrayItems> {
 pub fn create(app: &AppHandle, state: &Arc<UiState>) -> tauri::Result<()> {
     let items = build_dynamic_items(app)?;
     let open = MenuItem::with_id(app, "open", "Open PeakBot", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let logs = MenuItem::with_id(app, "logs", "Open logs folder", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit PeakBot Desktop", true, None::<&str>)?;
 
@@ -51,6 +52,7 @@ pub fn create(app: &AppHandle, state: &Arc<UiState>) -> tauri::Result<()> {
             &items.status,
             &PredefinedMenuItem::separator(app)?,
             &open,
+            &settings,
             &PredefinedMenuItem::separator(app)?,
             &items.background,
             &logs,
@@ -105,6 +107,7 @@ pub fn apply(state: &Arc<UiState>, model: &TrayModel) {
 pub fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         "open" => window::focus_main(app),
+        "settings" => window::request_settings(app),
         "background" => {
             // muda auto-toggles a check item on click, before we get
             // here — re-apply the last model, then act (the controller
@@ -141,6 +144,15 @@ pub fn build_app_submenu(app: &AppHandle) -> tauri::Result<tauri::menu::Submenu<
 
     let items = build_dynamic_items(app)?;
     let open = MenuItem::with_id(app, "open", "Open PeakBot", true, None::<&str>)?;
+    // The macOS accelerator (design #377 §5.3); the same id flows through
+    // `handle_menu_event` on both the tray and the app menu.
+    let settings = MenuItem::with_id(
+        app,
+        "settings",
+        "Settings…",
+        true,
+        Some("CmdOrCtrl+Shift+S"),
+    )?;
     let logs = MenuItem::with_id(app, "logs", "Open logs folder", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit PeakBot Desktop", true, None::<&str>)?;
 
@@ -148,6 +160,7 @@ pub fn build_app_submenu(app: &AppHandle) -> tauri::Result<tauri::menu::Submenu<
     peakbot.append_items(&[
         &items.status,
         &open,
+        &settings,
         &PredefinedMenuItem::separator(app)?,
         &items.background,
         &logs,

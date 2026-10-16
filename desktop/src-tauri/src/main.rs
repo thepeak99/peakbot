@@ -4,6 +4,8 @@
 
 mod bridge;
 mod commands;
+#[cfg(target_os = "linux")]
+mod tls_trust;
 mod tray;
 mod window;
 
@@ -111,7 +113,12 @@ fn main() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![commands::status, commands::act])
+        .invoke_handler(tauri::generate_handler![
+            commands::status,
+            commands::act,
+            commands::settings_get,
+            commands::settings_set
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
 

@@ -135,6 +135,20 @@ fn parse_program_path(plist: &str) -> Option<PathBuf> {
     Some(PathBuf::from(unescape_xml(raw)))
 }
 
+/// Whether the plist's `ProgramArguments` array carries `--tls` as its own
+/// `<string>` element. Only the argv decides — other keys may mention TLS
+/// without the agent running HTTPS.
+fn parse_tls(plist: &str) -> bool {
+    let Some(array) = plist
+        .split("<key>ProgramArguments</key>")
+        .nth(1)
+        .and_then(|s| s.split("</array>").next())
+    else {
+        return false;
+    };
+    array.contains("<string>--tls</string>")
+}
+
 /// Inverse of [`super::xml_escape`] for the five entities we emit. Only
 /// used to read back our own artifact.
 fn unescape_xml(s: &str) -> String {
@@ -229,6 +243,7 @@ pub(super) fn install_service(plan: &ServicePlan) -> Result<ServiceReport, Insta
         installed: true,
         exe: Some(plan.exe().to_path_buf()),
         run_state: print_state(&uid),
+        tls: plan.tls(),
         survives_logout: false,
         commands,
         notes: vec![session_note(), gatekeeper_note(plan.exe())],
@@ -258,6 +273,7 @@ pub(super) fn uninstall_service() -> Result<ServiceReport, InstallError> {
         installed: false,
         exe: None,
         run_state: RunState::Stopped,
+        tls: false,
         survives_logout: false,
         commands,
         notes: Vec::new(),
@@ -268,10 +284,10 @@ pub(super) fn service_status() -> Result<ServiceReport, InstallError> {
     let uid = uid()?;
     let path = plist_path()?;
     let installed = path.exists();
-    let exe = std::fs::read_to_string(&path)
-        .ok()
-        .as_deref()
-        .and_then(parse_program_path);
+    let plist_text = std::fs::read_to_string(&path).ok();
+    let exe = plist_text.as_deref().and_then(parse_program_path);
+    // TLS comes from the artifact, not the (possibly stopped) agent.
+    let tls = installed && plist_text.as_deref().is_some_and(parse_tls);
 
     let mut commands = Vec::new();
     let run_state = if installed {
@@ -301,6 +317,7 @@ pub(super) fn service_status() -> Result<ServiceReport, InstallError> {
         installed,
         exe,
         run_state,
+        tls,
         survives_logout: false,
         commands,
         notes,
@@ -404,6 +421,84 @@ mod tests {
     fn notes_name_the_quarantine_fix() {
         let note = gatekeeper_note(Path::new("/Users/you/.local/bin/peakbot"));
         assert!(note.contains("xattr -d com.apple.quarantine /Users/you/.local/bin/peakbot"));
+    }
+
+    // ── #375 — TLS in the plist + parse it back out ───────────────
+
+    fn plan_tls(exe: &str) -> ServicePlan {
+        plan(exe).with_tls(true)
+    }
+
+    /// The `ProgramArguments` array body of a rendered plist.
+    fn prog_args(plist: &str) -> &str {
+        plist
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|s| s.split("</array>").next())
+            .expect("ProgramArguments array must be present")
+    }
+
+    #[test]
+    fn plist_program_arguments_carry_the_tls_flag_when_planned() {
+        // #375 criterion 1: `--tls` joins ProgramArguments after the bind
+        // address, as its own `<string>` element.
+        let plist = render_plist(&plan_tls("/Users/you/.local/bin/peakbot"));
+        assert!(
+            prog_args(&plist).contains(
+                "<string>--bind</string>\n    <string>127.0.0.1:7823</string>\n    <string>--tls</string>"
+            ),
+            "got: {plist}"
+        );
+    }
+
+    #[test]
+    fn plist_program_arguments_carry_the_tls_names_after_the_tls_flag_in_order() {
+        // #375 criterion 2: both names, after `--tls`, in the given order.
+        let p = plan("/Users/you/.local/bin/peakbot")
+            .with_tls(true)
+            .with_tls_names(vec!["a.lan".to_string(), "10.0.0.9".to_string()]);
+        let plist = render_plist(&p);
+        assert!(
+            prog_args(&plist).contains(
+                "<string>--tls</string>\n    <string>--tls-name</string>\n    <string>a.lan</string>\n    <string>--tls-name</string>\n    <string>10.0.0.9</string>"
+            ),
+            "got: {plist}"
+        );
+    }
+
+    #[test]
+    fn parse_tls_round_trips_true_for_a_tls_plist() {
+        // #375 criterion 6: render with tls → parse → true.
+        let plist = render_plist(&plan_tls("/Users/you/.local/bin/peakbot"));
+        assert!(parse_tls(&plist), "got: {plist}");
+    }
+
+    #[test]
+    fn parse_tls_round_trips_false_for_a_plain_plist() {
+        let plist = render_plist(&plan("/Users/you/.local/bin/peakbot"));
+        assert!(!parse_tls(&plist), "got: {plist}");
+    }
+
+    #[test]
+    fn tls_plist_does_not_embed_a_token() {
+        // #375 criterion 5: the secret-free invariant with TLS on — the
+        // LAN-bind + token case is where a secret *could* leak.
+        let p = ServicePlan::new(
+            PathBuf::from("/Users/you/.local/bin/peakbot"),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 7823),
+            Some("s3cret".to_string()),
+        )
+        .unwrap()
+        .with_tls(true);
+        let plist = render_plist(&p);
+        assert!(
+            plist.contains("<string>--tls</string>"),
+            "the tls flag must be in ProgramArguments; got: {plist}"
+        );
+        assert!(
+            !plist.contains("s3cret"),
+            "the token must not appear in the plist; got: {plist}"
+        );
     }
 
     #[test]

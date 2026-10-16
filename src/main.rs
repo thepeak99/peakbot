@@ -47,6 +47,14 @@ enum ServiceAction {
         bind: Option<std::net::SocketAddr>,
         #[arg(long, value_name = "SECRET")]
         token: Option<String>,
+        /// Run the service over HTTPS with the built-in CA (the same
+        /// machinery as the foreground `--tls`).
+        #[arg(long)]
+        tls: bool,
+        /// Add an extra name (DNS or IP) to the HTTPS certificate,
+        /// repeatable. Only meaningful with `--tls`.
+        #[arg(long = "tls-name", value_name = "NAME", requires = "tls")]
+        tls_name: Vec<String>,
     },
     /// Remove the service. Leaves the binary and the token file alone.
     Uninstall,
@@ -317,6 +325,8 @@ fn resolve_service_exe() -> (std::path::PathBuf, Option<String>) {
 fn build_plan_for_install(
     bind: Option<std::net::SocketAddr>,
     token: Option<&str>,
+    tls: bool,
+    tls_names: Vec<String>,
 ) -> Result<(ServicePlan, Option<String>), anyhow::Error> {
     let bind = bind.unwrap_or_else(|| {
         peakbot::ui::DEFAULT_WEB_ADDR
@@ -333,7 +343,10 @@ fn build_plan_for_install(
             .and_then(|p| peakbot::install::read_web_token(p).ok().flatten()),
     };
     let (exe, fallback_note) = resolve_service_exe();
-    Ok((ServicePlan::new(exe, bind, owned_token)?, fallback_note))
+    let plan = ServicePlan::new(exe, bind, owned_token)?
+        .with_tls(tls)
+        .with_tls_names(tls_names);
+    Ok((plan, fallback_note))
 }
 
 /// Dispatch a subcommand. Returns `Ok(())` after printing the result;
@@ -345,9 +358,15 @@ fn run_subcommand(cmd: Command, cli: &Cli) -> Result<()> {
             print_install_result(&outcome);
         }
         Command::Service { action } => match action {
-            ServiceAction::Install { bind, token } => {
-                let (plan, fallback_note) = build_plan_for_install(bind, token.as_deref())
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            ServiceAction::Install {
+                bind,
+                token,
+                tls,
+                tls_name,
+            } => {
+                let (plan, fallback_note) =
+                    build_plan_for_install(bind, token.as_deref(), tls, tls_name)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                 // If the caller passed --token explicitly, write the
                 // web-token file as a side-effect so a later
                 // `peakbot` (web) boot finds it via the chain. The
@@ -814,7 +833,7 @@ mod tests {
         .unwrap();
         match cli.command {
             Some(Command::Service {
-                action: ServiceAction::Install { bind, token },
+                action: ServiceAction::Install { bind, token, .. },
             }) => {
                 assert_eq!(bind.unwrap().port(), 7823);
                 assert_eq!(token.as_deref(), Some("abc"));
@@ -834,7 +853,8 @@ mod tests {
             Some(Command::Service {
                 action: ServiceAction::Install {
                     bind: None,
-                    token: None
+                    token: None,
+                    ..
                 }
             })
         ));
@@ -894,6 +914,63 @@ mod tests {
         // SocketAddr parsing is clap's job; an unparseable value never
         // reaches the plan layer.
         assert!(parse(&["service", "install", "--bind", "not-an-addr"]).is_err());
+    }
+
+    // ── #375 — `service install --tls` / `--tls-name`. ────────────
+
+    #[test]
+    fn cli_service_install_rejects_tls_name_without_tls() {
+        // #375 criterion 3: mirrors the top-level `requires = "tls"` —
+        // `--tls-name` alone is a clap error (non-zero exit upstream).
+        // Green today for the *wrong* reason (the flag does not exist
+        // yet, so clap rejects it as unknown) and must STAY green once
+        // the flag lands with `requires = "tls"`.
+        assert!(parse(&["service", "install", "--tls-name", "x"]).is_err());
+    }
+
+    #[test]
+    fn cli_service_install_parses_tls_and_repeatable_tls_names() {
+        let cli = parse(&[
+            "service",
+            "install",
+            "--bind",
+            "127.0.0.1:7823",
+            "--tls",
+            "--tls-name",
+            "a.lan",
+            "--tls-name",
+            "10.0.0.9",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Service {
+                action: ServiceAction::Install { tls, tls_name, .. },
+            }) => {
+                assert!(tls, "--tls must be set");
+                assert_eq!(
+                    tls_name,
+                    vec!["a.lan".to_string(), "10.0.0.9".to_string()],
+                    "names must round-trip in the given order"
+                );
+            }
+            other => panic!("expected Service::Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_service_install_defaults_tls_off_without_flags() {
+        // #375 criterion 7 (parse boundary): without the new flags the
+        // result is unchanged — tls off, no names.
+        let cli = parse(&["service", "install"]).unwrap();
+        match cli.command {
+            Some(Command::Service {
+                action: ServiceAction::Install { tls, tls_name, .. },
+            }) => {
+                assert!(!tls, "tls must default to off");
+                assert!(tls_name.is_empty(), "no names by default");
+            }
+            other => panic!("expected Service::Install, got {other:?}"),
+        }
     }
 
     #[test]

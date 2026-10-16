@@ -1,0 +1,208 @@
+<!-- peakbot-desktop-settings-page -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PeakBot Settings</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f7f7f5;
+        --fg: #1c1c1a;
+        --muted: #6b6b66;
+        --accent: #0f6b4f;
+        --accent-fg: #ffffff;
+        --danger: #b3372f;
+        --border: #d9d9d4;
+        --detail-bg: rgba(127, 127, 127, 0.12);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1c1c1a;
+          --fg: #ececea;
+          --muted: #9a9a93;
+          --accent: #2ea37a;
+          --accent-fg: #08130e;
+          --danger: #e0645c;
+          --border: #3a3a36;
+          --detail-bg: rgba(255, 255, 255, 0.08);
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main {
+        max-width: 34rem;
+        margin: 0 auto;
+        padding: 1.5rem 2rem 3rem;
+      }
+      h1 {
+        font-size: 1.4rem;
+        margin: 0 0 1rem;
+      }
+      .row {
+        margin: 0 0 1.25rem;
+      }
+      .rowlabel {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+      }
+      .controls {
+        display: flex;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+      .controls label {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        cursor: pointer;
+      }
+      .controls label.disabled,
+      .row.disabled .controls label {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .note {
+        margin: 0.4rem 0 0;
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+      .error {
+        color: var(--danger);
+      }
+      #state {
+        margin: 0.75rem 0 0;
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+      #save {
+        font: inherit;
+        padding: 0.5rem 1.1rem;
+        margin-top: 0.75rem;
+        border-radius: 8px;
+        border: 1px solid var(--accent);
+        background: var(--accent);
+        color: var(--accent-fg);
+        cursor: pointer;
+      }
+      #save:hover {
+        opacity: 0.9;
+      }
+      #save:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      #token-value {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.9em;
+        width: 100%;
+        padding: 0.45rem 0.6rem;
+        margin-top: 0.5rem;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--fg);
+      }
+      #token-field .controls {
+        margin-top: 0.4rem;
+        gap: 0.5rem;
+      }
+      #token-field button {
+        font: inherit;
+        font-size: 0.85em;
+        padding: 0.3rem 0.7rem;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--fg);
+        cursor: pointer;
+      }
+      #token-field button:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      hr {
+        border: none;
+        border-top: 1px solid var(--border);
+        margin: 1.5rem 0;
+      }
+      #no-tauri {
+        color: var(--danger);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 id="title">Settings</h1>
+      <p id="no-tauri" class="error" hidden>Internal error: no Tauri API</p>
+      <form id="form" novalidate>
+        <div class="row" id="row-protocol">
+          <span class="rowlabel">Protocol</span>
+          <div class="controls">
+            <label><input type="radio" name="protocol" value="http" /> HTTP</label>
+            <label><input type="radio" name="protocol" value="https" /> HTTPS</label>
+          </div>
+          <p id="protocol-note" class="note" hidden>
+            PeakBot uses its own certificate. The app window may show a
+            certificate warning until that certificate is trusted; browsers
+            and phones work after you accept it once.
+          </p>
+        </div>
+        <div class="row" id="row-token">
+          <span class="rowlabel">Access token</span>
+          <div class="controls">
+            <label><input type="checkbox" id="token" /> Require access token</label>
+          </div>
+          <div id="token-field" hidden>
+            <input
+              id="token-value"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="Leave empty to generate a token"
+            />
+            <div class="controls">
+              <button id="token-generate" type="button">Generate</button>
+              <button id="token-copy" type="button" disabled>Copy</button>
+            </div>
+          </div>
+          <p id="token-note" class="note" hidden></p>
+        </div>
+        <div class="row" id="row-remote">
+          <span class="rowlabel">Remote access</span>
+          <div class="controls">
+            <label><input type="checkbox" id="remote" /> Allow other devices</label>
+          </div>
+          <p class="note">
+            Listens on all network interfaces. Requires HTTPS and the access
+            token.
+          </p>
+        </div>
+        <p id="error" class="error" role="alert"></p>
+        <p id="state"></p>
+        <button id="save" type="submit">Save</button>
+      </form>
+      <hr />
+      <div class="row" id="row-background">
+        <div class="controls">
+          <label><input type="checkbox" id="background" /> Keep PeakBot running in background</label>
+        </div>
+        <p class="note">Applies immediately.</p>
+      </div>
+    </main>
+    <script src="settings.js"></script>
+  </body>
+</html>
