@@ -7,11 +7,16 @@ fn main() {
         std::env::var("TARGET").expect("cargo sets TARGET for build scripts")
     );
 
-    // Command ACL: `status` and `act` get generated `allow-`/`deny-`
-    // permissions; the status-page capability grants exactly those two.
-    tauri_build::try_build(
-        tauri_build::Attributes::new()
-            .app_manifest(tauri_build::AppManifest::new().commands(&["status", "act"])),
-    )
+    // Command ACL: `status`, `act`, `settings_get` and `settings_set` get
+    // generated `allow-`/`deny-` permissions; the capabilities grant each
+    // local window exactly its own set.
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
+        tauri_build::AppManifest::new().commands(&[
+            "status",
+            "act",
+            "settings_get",
+            "settings_set",
+        ]),
+    ))
     .expect("tauri-build failed");
 }
