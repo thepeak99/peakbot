@@ -2501,6 +2501,7 @@ dependencies = [
 name = "peakbot-desktop"
 version = "0.23.0"
 dependencies = [
+ "gio",
  "libc",
  "log",
  "peakbot-desktop-core",
@@ -2512,6 +2513,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tauri-plugin-window-state",
+ "webkit2gtk",
 ]
 
 [[package]]

@@ -12,7 +12,8 @@ use tauri_plugin_opener::OpenerExt;
 use peakbot_desktop_core::controller::Action;
 use peakbot_desktop_core::paths::DesktopPaths;
 use peakbot_desktop_core::phase::{StatusView, UiAction};
-use peakbot_desktop_core::settings::{self, Settings, SettingsView, SettingsWire};
+use peakbot_desktop_core::settings::{self, SaveRequest, SettingsView, SettingsWire};
+use peakbot_desktop_core::token::Token;
 
 use crate::bridge::UiState;
 
@@ -56,9 +57,10 @@ pub fn act(action: UiAction, app: AppHandle, tx: State<'_, ActionTx>) -> Result<
     }
 }
 
-/// The settings window's current view (design #377 §5.2): the saved
-/// `settings.json` (missing/corrupt ⇒ defaults, read-only here) plus the
-/// live tray/status state. Only the controller writes the file.
+/// The settings window's current view (design #377b §4.1): the saved
+/// `settings.json` (missing/corrupt ⇒ defaults, read-only here), the
+/// current web-token (dropped by the view when the token is off), and
+/// the live tray/status state. Only the controller writes the files.
 #[tauri::command]
 pub fn settings_get(
     state: State<'_, Arc<UiState>>,
@@ -66,22 +68,30 @@ pub fn settings_get(
 ) -> SettingsView {
     let text = std::fs::read_to_string(paths.settings_file()).ok();
     let settings = settings::load_settings(text.as_deref());
+    let token = std::fs::read_to_string(paths.web_token())
+        .ok()
+        .and_then(|t| Token::parse(&t));
     let tray = state
         .tray_model
         .lock()
         .expect("tray_model poisoned")
         .clone();
     let snapshot = state.snapshot.lock().expect("snapshot poisoned").clone();
-    settings::settings_view(settings, &tray, &snapshot, &paths.web_token())
+    settings::settings_view(settings, token, &tray, &snapshot, &paths.web_token())
 }
 
-/// Save the settings from the settings window (design #377 §5.2).
-/// `Settings::try_from` is THE boundary check: an illegal wire value
-/// (e.g. remote without HTTPS) is rejected verbatim and nothing reaches
-/// the controller or the disk.
+/// Save the settings + the optional new token from the settings window
+/// (design #377b §4.3). `SaveRequest::parse` is THE boundary check: an
+/// illegal wire value or a bad token is rejected verbatim and nothing
+/// reaches the controller or the disk. An empty token keeps the
+/// current one (or generates one).
 #[tauri::command]
-pub fn settings_set(settings: SettingsWire, tx: State<'_, ActionTx>) -> Result<(), String> {
-    let s = Settings::try_from(settings).map_err(|e| e.to_string())?;
-    tx.0.send(Action::SaveSettings(s))
+pub fn settings_set(
+    settings: SettingsWire,
+    token: String,
+    tx: State<'_, ActionTx>,
+) -> Result<(), String> {
+    let req = SaveRequest::parse(settings, &token)?;
+    tx.0.send(Action::SaveSettings(req))
         .map_err(|e| e.to_string())
 }

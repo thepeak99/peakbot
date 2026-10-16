@@ -40,6 +40,19 @@ pub fn peakbot_config_dir() -> Option<PathBuf> {
         .map(|p| p.config_dir().to_path_buf())
 }
 
+/// `directories_next::BaseDirs::cache_dir()/peakbot/tls/ca-cert.pem` —
+/// SAME base dir and file name as the backend's `dirs::cache_dir()` CA
+/// (`src/ui/web/tls.rs`): the Linux webview verifies the presented leaf
+/// against this file (design #377b §3.3).
+pub fn peakbot_ca_cert() -> Option<PathBuf> {
+    directories_next::BaseDirs::new().map(|b| {
+        b.cache_dir()
+            .join("peakbot")
+            .join("tls")
+            .join("ca-cert.pem")
+    })
+}
+
 impl DesktopPaths {
     /// `data_dir/sidecar.pid`.
     pub fn pidfile(&self) -> PathBuf {
@@ -110,5 +123,15 @@ mod tests {
             Some("peakbot"),
             "got {dir:?}"
         );
+    }
+
+    // Design #377b t102: the CA lives in the same base dir as the
+    // backend's `dirs::cache_dir()` — `peakbot/tls/ca-cert.pem` (the
+    // file name the backend's tls.rs mints it under).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn t102_peakbot_ca_cert_ends_with_peakbot_tls_ca_cert_pem() {
+        let p = peakbot_ca_cert().expect("the cache dir resolves on Linux");
+        assert!(p.ends_with("peakbot/tls/ca-cert.pem"), "got {p:?}");
     }
 }

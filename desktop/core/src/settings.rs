@@ -12,6 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::phase::{StatusView, TrayModel};
+use crate::token::{self, Token};
 
 /// The settings file version; a mismatch loads as the defaults.
 pub const SETTINGS_VERSION: u32 = 1;
@@ -187,11 +188,65 @@ pub fn load_settings(text: Option<&str>) -> Settings {
     }
 }
 
-/// What the settings window renders: the saved wire value plus the
-/// live tray/status state.
+/// THE save payload (design #377b §3.2): the validated settings plus an
+/// optional new token value. Illegal state unrepresentable — `new_token`
+/// is `Some` ⇒ `settings.token()`. Fields are private; only `parse` and
+/// `From<Settings>` build it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveRequest {
+    settings: Settings,
+    /// `None` = keep the current token, generate one if absent.
+    new_token: Option<Token>,
+}
+
+impl SaveRequest {
+    /// 1. `Settings::try_from(wire)` — a settings error wins (step 1);
+    /// 2. token off ⇒ the token field is ignored, never an error;
+    /// 3. token on ⇒ `parse_new_token` (empty ⇒ keep/generate).
+    pub fn parse(wire: SettingsWire, token: &str) -> Result<SaveRequest, String> {
+        let settings = Settings::try_from(wire).map_err(|e| e.to_string())?;
+        let new_token = if settings.token() {
+            token::parse_new_token(token).map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        Ok(SaveRequest {
+            settings,
+            new_token,
+        })
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.settings
+    }
+
+    /// `None` = keep the current token, generate one if absent.
+    pub fn new_token(&self) -> Option<&Token> {
+        self.new_token.as_ref()
+    }
+}
+
+impl From<Settings> for SaveRequest {
+    /// "Save these, keep the token."
+    fn from(settings: Settings) -> Self {
+        SaveRequest {
+            settings,
+            new_token: None,
+        }
+    }
+}
+
+/// What the settings window renders: the saved wire value, the current
+/// token, and the live tray/status state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SettingsView {
     pub settings: SettingsWire,
+    /// Some iff the token is on AND the web-token file parses; JSON
+    /// `string`/`null` for the page.
+    pub token: Option<Token>,
+    /// The app window can trust PeakBot's CA on Linux only (design
+    /// #377b §3.2): the page shows the macOS certificate note when true.
+    pub cert_warning: bool,
     pub background: bool,
     pub background_enabled: bool,
     /// `status.kind == "starting"`.
@@ -201,12 +256,16 @@ pub struct SettingsView {
 
 pub fn settings_view(
     s: Settings,
+    token: Option<Token>,
     tray: &TrayModel,
     status: &StatusView,
     web_token: &Path,
 ) -> SettingsView {
     SettingsView {
         settings: s.into(),
+        // The view drops the token when the token is off.
+        token: if s.token() { token } else { None },
+        cert_warning: !cfg!(target_os = "linux"),
         background: tray.background_checked,
         background_enabled: tray.background_enabled,
         busy: status.kind == "starting",
@@ -220,9 +279,10 @@ mod tests {
 
     use crate::phase::{StatusView, TrayModel};
     use crate::settings::{
-        Protocol, SETTINGS_VERSION, Settings, SettingsError, SettingsWire, load_settings,
-        parse_settings_file, render_settings_file, settings_view,
+        Protocol, SETTINGS_VERSION, SaveRequest, Settings, SettingsError, SettingsWire,
+        load_settings, parse_settings_file, render_settings_file, settings_view,
     };
+    use crate::token::Token;
 
     fn wire(protocol: Protocol, token: bool, remote: bool) -> SettingsWire {
         SettingsWire {
@@ -472,8 +532,9 @@ mod tests {
         }
     }
 
-    // Design #377 t74: the view is a pure mapping of saved settings +
-    // tray + status + token path; busy ⇔ kind == "starting".
+    // Design #377 t74 (updated for #377b: the view takes the file
+    // token as a new argument): the view is a pure mapping of saved
+    // settings + tray + status + token path; busy ⇔ kind == "starting".
     #[test]
     fn t74_settings_view_maps_tray_status_and_path() {
         let s = Settings::Loopback {
@@ -483,7 +544,7 @@ mod tests {
         let tray = tray();
         let web_token = Path::new("/cfg/web-token");
 
-        let v = settings_view(s, &tray, &status("ready"), web_token);
+        let v = settings_view(s, None, &tray, &status("ready"), web_token);
         assert_eq!(
             v.settings,
             wire(Protocol::Http, false, false),
@@ -494,7 +555,122 @@ mod tests {
         assert!(!v.busy, "kind \"ready\" ⇒ not busy");
         assert_eq!(v.web_token_path, "/cfg/web-token");
 
-        let v = settings_view(s, &tray, &status("starting"), web_token);
+        let v = settings_view(s, None, &tray, &status("starting"), web_token);
         assert!(v.busy, "busy ⇔ status.kind == \"starting\"");
+    }
+
+    // Design #377b t92: SaveRequest::parse — ONE validated save
+    // payload. The settings error wins over the token error; a token
+    // value can only exist in a request whose settings say "token on";
+    // the token never reaches the file body.
+    #[test]
+    fn t92_save_request_parse_validates_settings_then_token() {
+        // Step 1 wins: an illegal wire is a settings error even when
+        // the token is bad too.
+        assert_eq!(
+            SaveRequest::parse(wire(Protocol::Http, true, true), "not a valid token!"),
+            Err("Remote access requires HTTPS.".to_string())
+        );
+
+        // Token off: the field is ignored, never an error (even a
+        // 1-char "token" is fine — it is never looked at).
+        let req =
+            SaveRequest::parse(wire(Protocol::Http, false, false), "x").expect("token off is ok");
+        assert_eq!(
+            req.settings(),
+            Settings::Loopback {
+                protocol: Protocol::Http,
+                token: false
+            }
+        );
+        assert_eq!(req.new_token(), None, "token off ⇒ no token value");
+
+        // Token on + empty ⇒ "keep the current token, or generate one".
+        let req = SaveRequest::parse(wire(Protocol::Http, true, false), "").expect("empty ⇒ keep");
+        assert_eq!(req.new_token(), None);
+
+        // Token on + valid ⇒ Some; surrounding whitespace is trimmed.
+        let req = SaveRequest::parse(wire(Protocol::Http, true, false), "  abc1234567890123  ")
+            .expect("a valid token parses");
+        assert_eq!(
+            req.new_token(),
+            Some(&Token::parse("abc1234567890123").expect("parses"))
+        );
+
+        // Token on + 15 chars ⇒ the locked TooShort text.
+        assert_eq!(
+            SaveRequest::parse(wire(Protocol::Https, true, true), &"a".repeat(15)),
+            Err("The access token must be at least 16 characters.".to_string())
+        );
+
+        // The token never reaches the file body (invariant I8).
+        let req = SaveRequest::parse(wire(Protocol::Http, true, false), "abc1234567890123")
+            .expect("valid");
+        let file = render_settings_file(req.settings());
+        assert!(
+            !file.contains("abc1234567890123"),
+            "the rendered settings file must not carry the token; got {file:?}"
+        );
+
+        // From<Settings>: "save these, keep the token".
+        let req = SaveRequest::from(Settings::Remote);
+        assert_eq!(req.settings(), Settings::Remote);
+        assert_eq!(req.new_token(), None);
+    }
+
+    // Design #377b t93: the view carries the token to the settings
+    // window — Some iff the token is on AND the file parses — plus the
+    // platform cert warning (the app window can trust the CA on Linux
+    // only).
+    #[test]
+    fn t93_settings_view_carries_token_and_cert_warning() {
+        let on = Settings::Loopback {
+            protocol: Protocol::Http,
+            token: true,
+        };
+        let off = Settings::Loopback {
+            protocol: Protocol::Http,
+            token: false,
+        };
+        let tok = Token::parse("abc1234567890123").expect("parses");
+        let tray = tray();
+        let p = Path::new("/cfg/web-token");
+
+        // on + a parseable file token ⇒ Some.
+        let v = settings_view(on, Some(tok.clone()), &tray, &status("ready"), p);
+        assert_eq!(
+            v.token.as_ref().map(|t| t.as_str()),
+            Some("abc1234567890123"),
+            "token on + file token ⇒ the view carries it"
+        );
+        // off + a file token ⇒ dropped (the checkbox is off).
+        let v = settings_view(off, Some(tok.clone()), &tray, &status("ready"), p);
+        assert!(
+            v.token.is_none(),
+            "the view drops the token when the token is off"
+        );
+        // on + no file token ⇒ None (the field starts empty ⇒ generate).
+        let v = settings_view(on, None, &tray, &status("ready"), p);
+        assert!(v.token.is_none(), "no file token ⇒ None");
+
+        // JSON: "token":null / "token":"…" (the page renders it as-is).
+        let json = serde_json::to_value(settings_view(on, None, &tray, &status("ready"), p))
+            .expect("the view serialises");
+        assert_eq!(json["token"], serde_json::Value::Null);
+        let json = serde_json::to_value(settings_view(
+            on,
+            Some(tok.clone()),
+            &tray,
+            &status("ready"),
+            p,
+        ))
+        .expect("the view serialises");
+        assert_eq!(json["token"], serde_json::json!("abc1234567890123"));
+
+        // The app window can trust the CA on Linux only.
+        assert_eq!(
+            settings_view(on, None, &tray, &status("ready"), p).cert_warning,
+            !cfg!(target_os = "linux")
+        );
     }
 }

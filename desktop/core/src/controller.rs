@@ -18,7 +18,7 @@ use crate::phase::{Dialog, Mode, Phase, StartError, StartStep, TrayModel, tray_m
 use crate::ready::{ReadyOutcome, wait_ready};
 use crate::service::{self, InstalledService, LaunchPlan, RunState, ServiceState};
 use crate::session::{self, EarlyExit, PidRecord};
-use crate::settings::{self, Protocol, Settings};
+use crate::settings::{self, Protocol, SaveRequest, Settings};
 use crate::sys::{Child, RunOutput, Signal, SpawnSpec, Sys};
 use crate::token::Token;
 use crate::version::{DeclinedReplace, InstalledVersion, parse_version_output};
@@ -36,9 +36,10 @@ pub enum Action {
     Start,
     ToggleBackground,
     ReinstallService,
-    /// A validated `Settings` value (the IPC boundary already ran
-    /// `TryFrom<SettingsWire>` — design #377 §4.3).
-    SaveSettings(Settings),
+    /// The validated save payload (design #377b §3.2): the settings plus
+    /// an optional new token value (the IPC boundary already ran
+    /// `SaveRequest::parse`).
+    SaveSettings(SaveRequest),
     Shutdown(std::sync::mpsc::Sender<()>),
 }
 
@@ -605,15 +606,24 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     }
 
     // -------------------------------------------------------------------
-    // Action::SaveSettings (design #377 §4.3)
+    // Action::SaveSettings (design #377b §4.4)
     // -------------------------------------------------------------------
 
-    /// Write-then-apply: the file is the desired state; if the apply
-    /// fails the app lands in a `Failed` phase whose Retry/Reinstall
-    /// re-read the same file (no rollback machinery).
-    fn handle_save_settings(&mut self, new: Settings) {
+    /// Write-then-apply: the token file FIRST (it is the single source of
+    /// the token), then the settings file, then the existing relaunch /
+    /// reconfigure path — `sync_token` re-reads the file, so the new
+    /// value goes live. A failed write leaves everything else untouched
+    /// (no rollback machinery, T7). `reconfigure_service` IS the restart
+    /// for a token-only change in service mode (T-A5: no `service
+    /// restart` verb exists).
+    fn handle_save_settings(&mut self, req: SaveRequest) {
+        let new = req.settings();
         let current = self.settings();
-        if new == current {
+        let tok_new = req
+            .new_token()
+            .filter(|t| Some(*t) != self.read_web_token().as_ref())
+            .cloned();
+        if new == current && tok_new.is_none() {
             return; // nothing to apply; no dialog
         }
         let service_mode = matches!(self.service, Some(ServiceState::Installed(_)));
@@ -625,14 +635,24 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         if !self.ui.confirm(&dialog) {
             return; // nothing written, nothing stopped
         }
-        let path = self.paths.settings_file();
-        if let Err(e) = self
-            .sys
-            .write_private(&path, &settings::render_settings_file(new))
-        {
-            self.ui
-                .message(&service::save_failed_dialog(&path, &e.to_string()));
-            return;
+        if let Some(t) = tok_new {
+            let path = self.paths.web_token();
+            if let Err(e) = self.sys.write_private(&path, t.as_str()) {
+                self.ui
+                    .message(&service::save_failed_dialog(&path, &e.to_string()));
+                return; // nothing else written
+            }
+        }
+        if new != current {
+            let path = self.paths.settings_file();
+            if let Err(e) = self
+                .sys
+                .write_private(&path, &settings::render_settings_file(new))
+            {
+                self.ui
+                    .message(&service::save_failed_dialog(&path, &e.to_string()));
+                return;
+            }
         }
         if service_mode {
             self.reconfigure_service();
@@ -768,7 +788,7 @@ mod tests {
     use crate::paths::DesktopPaths;
     use crate::phase::{Mode, Phase, StartError, StartStep};
     use crate::session::PidRecord;
-    use crate::settings::{Protocol, Settings, render_settings_file};
+    use crate::settings::{Protocol, SaveRequest, Settings, SettingsWire, render_settings_file};
     use crate::sys::{Probe, RunOutput, Signal};
     use crate::testing::{ChildMode, Effect, FakeSys, FakeUi};
     use crate::version::{DeclinedReplace, InstalledVersion};
@@ -2638,10 +2658,13 @@ mod tests {
         sys.queue_child(crate::testing::FakeChildSpec::alive());
         ui.answer_confirm(true);
 
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Loopback {
-            protocol: Protocol::Https,
-            token: true,
-        }));
+        let _ = ctrl.handle(Action::SaveSettings(
+            Settings::Loopback {
+                protocol: Protocol::Https,
+                token: true,
+            }
+            .into(),
+        ));
 
         // The file holds the new settings, byte-exact.
         assert_eq!(
@@ -2706,10 +2729,13 @@ mod tests {
         sys.queue_child(crate::testing::FakeChildSpec::alive());
         ui.answer_confirm(true);
 
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Loopback {
-            protocol: Protocol::Http,
-            token: false,
-        }));
+        let _ = ctrl.handle(Action::SaveSettings(
+            Settings::Loopback {
+                protocol: Protocol::Http,
+                token: false,
+            }
+            .into(),
+        ));
 
         // The token file was removed BEFORE the new spawn.
         let evts = sys.events();
@@ -2781,10 +2807,13 @@ mod tests {
         let evts_before = sys.events().len();
         ui.answer_confirm(false);
 
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Loopback {
-            protocol: Protocol::Https,
-            token: true,
-        }));
+        let _ = ctrl.handle(Action::SaveSettings(
+            Settings::Loopback {
+                protocol: Protocol::Https,
+                token: true,
+            }
+            .into(),
+        ));
 
         assert!(
             ui.confirms().len() == 1,
@@ -2822,7 +2851,7 @@ mod tests {
         let mut ctrl = ready_session(sys.clone(), ui.clone());
         let evts_before = sys.events().len();
 
-        let _ = ctrl.handle(Action::SaveSettings(Settings::default()));
+        let _ = ctrl.handle(Action::SaveSettings(Settings::default().into()));
 
         assert!(ui.confirms().is_empty(), "no dialog for an unchanged save");
         assert_eq!(
@@ -2880,7 +2909,7 @@ mod tests {
         );
         ui.answer_confirm(true);
 
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Remote));
+        let _ = ctrl.handle(Action::SaveSettings(Settings::Remote.into()));
 
         // Command order: service uninstall → service install (remote).
         let runs = sys.run_args();
@@ -3003,10 +3032,13 @@ mod tests {
         );
         ui.answer_confirm(true);
 
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Loopback {
-            protocol: Protocol::Http,
-            token: false,
-        }));
+        let _ = ctrl.handle(Action::SaveSettings(
+            Settings::Loopback {
+                protocol: Protocol::Http,
+                token: false,
+            }
+            .into(),
+        ));
 
         // The web-token was removed BEFORE the service install ran.
         let evts = sys.events();
@@ -3088,7 +3120,7 @@ mod tests {
         let mut ctrl = started(sys.clone(), ui.clone());
         ui.answer_confirm(true);
 
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Remote));
+        let _ = ctrl.handle(Action::SaveSettings(Settings::Remote.into()));
 
         match ctrl.phase() {
             Phase::Failed(StartError::ServiceCommandFailed { command, output }) => {
@@ -3121,10 +3153,13 @@ mod tests {
         ui.answer_confirm(true);
         let evts_before = sys.events().len();
 
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Loopback {
-            protocol: Protocol::Https,
-            token: true,
-        }));
+        let _ = ctrl.handle(Action::SaveSettings(
+            Settings::Loopback {
+                protocol: Protocol::Https,
+                token: true,
+            }
+            .into(),
+        ));
 
         assert!(
             ui.messages()
@@ -3167,7 +3202,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
         );
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Remote));
+        let _ = ctrl.handle(Action::SaveSettings(Settings::Remote.into()));
         assert!(
             matches!(ctrl.phase(), Phase::Starting(StartStep::CheckingBundled)),
             "phase must be untouched; got {:?}",
@@ -3178,5 +3213,577 @@ mod tests {
         assert!(ui.confirms().is_empty());
         assert!(ui.messages().is_empty());
         assert!(sys.events().is_empty(), "no side effects at all");
+    }
+
+    // Design #377b t94: session mode, same settings + a new token — the
+    // web-token is written 0600 BEFORE the relaunch, settings.json is
+    // NOT written, and the new session runs with the user's token
+    // (nothing generated).
+    #[test]
+    fn t94_save_settings_session_token_only_relaunches() {
+        let new_tok = "new-user-token-123456";
+        let sys = FakeSys::new();
+        // Seed the file token so the INITIAL launch generates nothing —
+        // the "no RandomToken" assertion below checks the whole log.
+        sys.seed_file(WEB_TOKEN, "old-session-token-123456\n");
+        let ui = FakeUi::new();
+        let mut ctrl = ready_session(sys.clone(), ui.clone());
+        let old_pid = sys.spawned_pids()[0];
+        // The relaunch (handle_start) spawns a new session child.
+        sys.queue_child(crate::testing::FakeChildSpec::alive());
+        ui.answer_confirm(true);
+
+        let req = SaveRequest::parse(
+            SettingsWire {
+                protocol: Protocol::Http,
+                token: true,
+                remote: false,
+            },
+            new_tok,
+        )
+        .expect("a valid token parses");
+        let _ = ctrl.handle(Action::SaveSettings(req));
+
+        // One relaunch dialog.
+        assert_eq!(ui.confirms().len(), 1, "one save ⇒ one dialog");
+        assert_eq!(ui.confirms()[0].title, "Apply settings?");
+        assert_eq!(ui.confirms()[0].ok, "Restart");
+
+        // The web-token was written 0600 BEFORE the old child was
+        // interrupted and the new one spawned.
+        let evts = sys.events();
+        let i_tok = evts
+            .iter()
+            .position(
+                |e| matches!(e, Effect::WritePrivate { path } if path == Path::new(WEB_TOKEN)),
+            )
+            .expect("the web-token was written");
+        let i_intr = evts
+            .iter()
+            .position(|e| matches!(e, Effect::ChildInterrupt { pid } if *pid == old_pid))
+            .expect("the old child was interrupted");
+        let new_pid = sys.spawned_pids()[1];
+        let i_spawn = evts
+            .iter()
+            .position(|e| matches!(e, Effect::Spawn { pid, .. } if *pid == new_pid))
+            .expect("the relaunched session");
+        assert!(
+            i_tok < i_intr,
+            "the token file must be written before the relaunch; events: {evts:?}"
+        );
+        assert!(
+            i_tok < i_spawn,
+            "the token file must be written before the new session reads it; events: {evts:?}"
+        );
+        assert!(
+            sys.private_written().contains(Path::new(WEB_TOKEN)),
+            "the web-token was written 0600"
+        );
+        assert_eq!(sys.file(Path::new(WEB_TOKEN)).as_deref(), Some(new_tok));
+
+        // settings.json is NOT written (the settings are unchanged).
+        assert!(
+            !sys.has_file(Path::new(SETTINGS_FILE)),
+            "a token-only change must not touch settings.json"
+        );
+
+        // The new session runs with the user's token; nothing generated.
+        let spawns = sys.spawned_specs();
+        assert_eq!(spawns.len(), 2, "one relaunch");
+        assert!(
+            spawns[1]
+                .extra_env
+                .iter()
+                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == new_tok),
+            "the spawn env carries the user's token; got {:?}",
+            spawns[1].extra_env
+        );
+        assert!(
+            evts.iter().all(|e| !matches!(e, Effect::RandomToken)),
+            "no token generation; events: {evts:?}"
+        );
+
+        // Ready with the new token in the URL.
+        let mode = match ctrl.phase() {
+            Phase::Ready(m) => m.clone(),
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                mode,
+                Mode::Session {
+                    token: Some(ref t),
+                    ..
+                } if t.as_str() == new_tok
+            ),
+            "got {mode:?}"
+        );
+        assert!(
+            mode.url()
+                .to_string()
+                .ends_with(&format!("?token={new_tok}")),
+            "the webview URL carries the new token; got {:?}",
+            mode.url()
+        );
+    }
+
+    // Design #377b t95: service mode, a token-only change — the
+    // reinstall dialog, the web-token is written 0600 BEFORE
+    // `service uninstall`, the token never reaches any argv, and
+    // Ready(Service{…, Some(new)}).
+    #[test]
+    fn t95_save_settings_service_token_only_reconfigures() {
+        let new_tok = "svc-user-token-12345678";
+        let sys = FakeSys::new();
+        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
+        sys.set_run(
+            "peakbot",
+            &["service", "status"],
+            installed_status_tls("running", "off"),
+        );
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        sys.set_run(
+            "peakbot",
+            &["service", "uninstall"],
+            run_out(Some(0), "ok\n", ""),
+        );
+        sys.set_run(
+            "peakbot",
+            &["service", "install", "--bind", "127.0.0.1:7823"],
+            run_out(Some(0), "ok\n", ""),
+        );
+        let ui = FakeUi::new();
+        let mut ctrl = started(sys.clone(), ui.clone());
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Service { protocol, token, .. })
+                    if *protocol == Protocol::Http && token.is_none()
+            ),
+            "precondition: a tokenless http service; got {:?}",
+            ctrl.phase()
+        );
+        assert!(!sys.has_file(Path::new(WEB_TOKEN)), "precondition: no file");
+        ui.answer_confirm(true);
+
+        let req = SaveRequest::parse(
+            SettingsWire {
+                protocol: Protocol::Http,
+                token: true,
+                remote: false,
+            },
+            new_tok,
+        )
+        .expect("a valid token parses");
+        let _ = ctrl.handle(Action::SaveSettings(req));
+
+        // The reinstall dialog (no `service restart` verb exists;
+        // the reinstall IS the restart).
+        assert_eq!(ui.confirms().len(), 1, "one save ⇒ one dialog");
+        assert_eq!(ui.confirms()[0].title, "Apply settings?");
+        assert_eq!(ui.confirms()[0].ok, "Reinstall");
+
+        // The web-token was written 0600 BEFORE the service uninstall.
+        let evts = sys.events();
+        let i_tok = evts
+            .iter()
+            .position(
+                |e| matches!(e, Effect::WritePrivate { path } if path == Path::new(WEB_TOKEN)),
+            )
+            .expect("the web-token was written");
+        let i_uninst = evts
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Effect::Run { args, .. }
+                        if args == &["service".to_string(), "uninstall".to_string()]
+                )
+            })
+            .expect("service uninstall ran");
+        assert!(
+            i_tok < i_uninst,
+            "the token file must exist before the restarted service reads it; events: {evts:?}"
+        );
+        assert!(
+            sys.private_written().contains(Path::new(WEB_TOKEN)),
+            "the web-token was written 0600"
+        );
+        assert_eq!(sys.file(Path::new(WEB_TOKEN)).as_deref(), Some(new_tok));
+
+        // No settings.json write; the token never reaches any argv.
+        assert!(
+            !sys.has_file(Path::new(SETTINGS_FILE)),
+            "a token-only change must not touch settings.json"
+        );
+        for run in sys.run_args() {
+            assert!(
+                run.iter().all(|a| a != new_tok),
+                "the token must not appear in any argv; run: {run:?}"
+            );
+        }
+        assert!(
+            sys.spawned_specs().is_empty(),
+            "no session spawn in service mode"
+        );
+        assert!(
+            evts.iter().all(|e| !matches!(e, Effect::RandomToken)),
+            "the user's token is kept, nothing generated; events: {evts:?}"
+        );
+
+        // Ready(Service{Http, Some(new)}).
+        match ctrl.phase() {
+            Phase::Ready(Mode::Service {
+                protocol, token, ..
+            }) => {
+                assert_eq!(*protocol, Protocol::Http);
+                assert_eq!(
+                    token.as_ref().map(|t| t.as_str()),
+                    Some(new_tok),
+                    "Ready with the user's token"
+                );
+            }
+            other => panic!("expected Ready(Service), got {other:?}"),
+        }
+    }
+
+    // Design #377b t96: the same settings with a token equal to the
+    // file's token is a no-op — no dialog, no effects.
+    #[test]
+    fn t96_save_settings_same_settings_same_token_is_a_noop() {
+        let sys = FakeSys::new();
+        let ui = FakeUi::new();
+        let mut ctrl = ready_session(sys.clone(), ui.clone());
+        let file_tok = sys
+            .file(Path::new(WEB_TOKEN))
+            .expect("the launch created the web-token")
+            .trim()
+            .to_string();
+        let evts_before = sys.events().len();
+
+        let req = SaveRequest::parse(
+            SettingsWire {
+                protocol: Protocol::Http,
+                token: true,
+                remote: false,
+            },
+            &file_tok,
+        )
+        .expect("a valid token parses");
+        let _ = ctrl.handle(Action::SaveSettings(req));
+
+        assert!(
+            ui.confirms().is_empty(),
+            "no dialog for the same settings + the same token"
+        );
+        assert_eq!(
+            sys.events().len(),
+            evts_before,
+            "no side effects; events: {:?}",
+            sys.events()
+        );
+        assert_eq!(sys.spawned_specs().len(), 1, "no relaunch");
+        assert!(!sys.has_file(Path::new(SETTINGS_FILE)), "no file write");
+        assert!(
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            "got {:?}",
+            ctrl.phase()
+        );
+    }
+
+    // Design #377b t97: cancelling the confirm leaves the web-token
+    // and the settings file untouched, and nothing is spawned.
+    #[test]
+    fn t97_save_settings_cancel_writes_nothing() {
+        let new_tok = "cancel-me-token-123456789";
+        let sys = FakeSys::new();
+        let ui = FakeUi::new();
+        let mut ctrl = ready_session(sys.clone(), ui.clone());
+        let token_before = sys
+            .file(Path::new(WEB_TOKEN))
+            .expect("the launch created the web-token");
+        let evts_before = sys.events().len();
+        ui.answer_confirm(false);
+
+        let req = SaveRequest::parse(
+            SettingsWire {
+                protocol: Protocol::Https,
+                token: true,
+                remote: false,
+            },
+            new_tok,
+        )
+        .expect("a valid token parses");
+        let _ = ctrl.handle(Action::SaveSettings(req));
+
+        assert_eq!(ui.confirms().len(), 1, "the confirm dialog was shown");
+        assert_eq!(
+            sys.file(Path::new(WEB_TOKEN)),
+            Some(token_before),
+            "the web-token is untouched"
+        );
+        assert!(
+            !sys.has_file(Path::new(SETTINGS_FILE)),
+            "nothing was written"
+        );
+        assert_eq!(
+            sys.events().len(),
+            evts_before,
+            "no side effects after a cancel; events: {:?}",
+            sys.events()
+        );
+        assert_eq!(sys.spawned_specs().len(), 1, "no relaunch");
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session { protocol, .. }) if *protocol == Protocol::Http
+            ),
+            "the phase is unchanged; got {:?}",
+            ctrl.phase()
+        );
+    }
+
+    // Design #377b t98: Http→Https + a new token in ONE save — one
+    // dialog, the token write BEFORE the settings write, one relaunch
+    // with --tls carrying the user's token.
+    #[test]
+    fn t98_save_settings_protocol_and_token_together() {
+        let new_tok = "https-user-token-1234567";
+        let sys = FakeSys::new();
+        // Seed the file token so the INITIAL launch generates nothing —
+        // the "no RandomToken" assertion below checks the whole log.
+        sys.seed_file(WEB_TOKEN, "old-session-token-123456\n");
+        let ui = FakeUi::new();
+        let mut ctrl = ready_session(sys.clone(), ui.clone());
+        sys.queue_child(crate::testing::FakeChildSpec::alive());
+        ui.answer_confirm(true);
+
+        let req = SaveRequest::parse(
+            SettingsWire {
+                protocol: Protocol::Https,
+                token: true,
+                remote: false,
+            },
+            new_tok,
+        )
+        .expect("a valid token parses");
+        let _ = ctrl.handle(Action::SaveSettings(req));
+
+        assert_eq!(ui.confirms().len(), 1, "one save ⇒ one dialog");
+
+        // The token write comes first, the settings write second.
+        let evts = sys.events();
+        let i_tok = evts
+            .iter()
+            .position(
+                |e| matches!(e, Effect::WritePrivate { path } if path == Path::new(WEB_TOKEN)),
+            )
+            .expect("the web-token was written");
+        let i_file = evts
+            .iter()
+            .position(
+                |e| matches!(e, Effect::WritePrivate { path } if path == Path::new(SETTINGS_FILE)),
+            )
+            .expect("settings.json was written");
+        assert!(
+            i_tok < i_file,
+            "the token file must be written before the settings file; events: {evts:?}"
+        );
+        assert_eq!(sys.file(Path::new(WEB_TOKEN)).as_deref(), Some(new_tok));
+        assert_eq!(
+            sys.file(Path::new(SETTINGS_FILE)).as_deref(),
+            Some("{\"v\":1,\"protocol\":\"https\",\"token\":true,\"remote\":false}\n")
+        );
+
+        // One relaunch, with --tls and the user's token.
+        let spawns = sys.spawned_specs();
+        assert_eq!(spawns.len(), 2, "one relaunch");
+        assert_eq!(
+            spawns[1].args,
+            vec![
+                "--bind".to_string(),
+                "127.0.0.1:7824".to_string(),
+                "--tls".to_string()
+            ],
+            "the relaunched session must carry --tls"
+        );
+        assert!(
+            spawns[1]
+                .extra_env
+                .iter()
+                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == new_tok),
+            "the spawn env carries the user's token; got {:?}",
+            spawns[1].extra_env
+        );
+        assert!(
+            evts.iter().all(|e| !matches!(e, Effect::RandomToken)),
+            "the user's token is kept, nothing generated; events: {evts:?}"
+        );
+
+        let mode = match ctrl.phase() {
+            Phase::Ready(m) => m.clone(),
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                mode,
+                Mode::Session {
+                    protocol: Protocol::Https,
+                    token: Some(ref t),
+                    ..
+                } if t.as_str() == new_tok
+            ),
+            "got {mode:?}"
+        );
+    }
+
+    // Design #377b t99: a failing web-token write → the save-failed
+    // dialog naming the web-token path; nothing else is written,
+    // nothing restarts.
+    #[test]
+    fn t99_save_settings_token_write_failure_changes_nothing() {
+        let new_tok = "fail-write-token-1234567";
+        let sys = FakeSys::new();
+        let ui = FakeUi::new();
+        let mut ctrl = ready_session(sys.clone(), ui.clone());
+        sys.fail_write(PathBuf::from(WEB_TOKEN));
+        ui.answer_confirm(true);
+        let evts_before = sys.events().len();
+
+        let req = SaveRequest::parse(
+            SettingsWire {
+                protocol: Protocol::Https,
+                token: true,
+                remote: false,
+            },
+            new_tok,
+        )
+        .expect("a valid token parses");
+        let _ = ctrl.handle(Action::SaveSettings(req));
+
+        assert!(
+            ui.messages()
+                .iter()
+                .any(|d| d.title == "Couldn't save settings" && d.body.contains(WEB_TOKEN)),
+            "the save-failed dialog must name the web-token path; got {:?}",
+            ui.messages()
+        );
+        assert!(
+            !sys.has_file(Path::new(SETTINGS_FILE)),
+            "settings.json must not be written after a failed token write"
+        );
+        assert_eq!(
+            sys.events().len(),
+            evts_before,
+            "no side effects after the failed write; events: {:?}",
+            sys.events()
+        );
+        assert_eq!(sys.spawned_specs().len(), 1, "no relaunch");
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session { protocol, .. }) if *protocol == Protocol::Http
+            ),
+            "the phase is unchanged; got {:?}",
+            ctrl.phase()
+        );
+    }
+
+    // Design #377b t100: token off→on with a value — the file holds
+    // the user's value, and no token is generated (the empty→generate
+    // path stays locked by t40).
+    #[test]
+    fn t100_save_settings_token_off_to_on_with_value() {
+        let new_tok = "off-to-on-token-123456789";
+        let sys = FakeSys::new();
+        sys.seed_file(
+            SETTINGS_FILE,
+            render_settings_file(Settings::Loopback {
+                protocol: Protocol::Http,
+                token: false,
+            }),
+        );
+        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
+        sys.set_run(
+            "peakbot",
+            &["service", "status"],
+            run_out(Some(0), NOT_INSTALLED, ""),
+        );
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        sys.queue_child(crate::testing::FakeChildSpec {
+            mode: ChildMode::ExitsOnInterrupt,
+            exit: Some(0),
+            ..Default::default()
+        });
+        let ui = FakeUi::new();
+        let mut ctrl = started(sys.clone(), ui.clone());
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session { protocol, token, .. })
+                    if *protocol == Protocol::Http && token.is_none()
+            ),
+            "precondition: a tokenless session; got {:?}",
+            ctrl.phase()
+        );
+        assert!(!sys.has_file(Path::new(WEB_TOKEN)), "token off ⇒ no file");
+        sys.queue_child(crate::testing::FakeChildSpec::alive());
+        ui.answer_confirm(true);
+
+        let req = SaveRequest::parse(
+            SettingsWire {
+                protocol: Protocol::Http,
+                token: true,
+                remote: false,
+            },
+            new_tok,
+        )
+        .expect("a valid token parses");
+        let _ = ctrl.handle(Action::SaveSettings(req));
+
+        assert_eq!(
+            sys.file(Path::new(WEB_TOKEN)).as_deref(),
+            Some(new_tok),
+            "the file holds the user's value"
+        );
+        assert!(
+            sys.private_written().contains(Path::new(WEB_TOKEN)),
+            "the web-token was written 0600"
+        );
+        assert_eq!(
+            sys.file(Path::new(SETTINGS_FILE)).as_deref(),
+            Some(
+                render_settings_file(Settings::Loopback {
+                    protocol: Protocol::Http,
+                    token: true,
+                })
+                .as_str()
+            )
+        );
+        let evts = sys.events();
+        assert!(
+            evts.iter().all(|e| !matches!(e, Effect::RandomToken)),
+            "the user's token is kept, nothing generated; events: {evts:?}"
+        );
+        let spawns = sys.spawned_specs();
+        assert_eq!(spawns.len(), 2, "one relaunch");
+        assert!(
+            spawns[1]
+                .extra_env
+                .iter()
+                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == new_tok),
+            "the spawn env carries the user's token; got {:?}",
+            spawns[1].extra_env
+        );
+        match ctrl.phase() {
+            Phase::Ready(Mode::Session { token, .. }) => {
+                assert_eq!(
+                    token.as_ref().map(|t| t.as_str()),
+                    Some(new_tok),
+                    "Ready with the user's token"
+                );
+            }
+            other => panic!("expected Ready(Session), got {other:?}"),
+        }
     }
 }

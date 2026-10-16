@@ -75,6 +75,12 @@ pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::
             })
             .build()?;
 
+    // Linux: trust PeakBot's CA in the webview for the live backend
+    // origin (design #377b §4.5) — macOS keeps WebKit's error page
+    // and the settings note (T-B4).
+    #[cfg(target_os = "linux")]
+    crate::tls_trust::install(&win, nav.clone());
+
     // Closing the window quits the app on every OS (DESIGN §5.4).
     win.on_window_event({
         let app = app.clone();

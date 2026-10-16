@@ -4,6 +4,8 @@
 
 mod bridge;
 mod commands;
+#[cfg(target_os = "linux")]
+mod tls_trust;
 mod tray;
 mod window;
 

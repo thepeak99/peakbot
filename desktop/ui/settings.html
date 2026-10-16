@@ -105,6 +105,35 @@
         opacity: 0.4;
         cursor: default;
       }
+      #token-value {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.9em;
+        width: 100%;
+        padding: 0.45rem 0.6rem;
+        margin-top: 0.5rem;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--fg);
+      }
+      #token-field .controls {
+        margin-top: 0.4rem;
+        gap: 0.5rem;
+      }
+      #token-field button {
+        font: inherit;
+        font-size: 0.85em;
+        padding: 0.3rem 0.7rem;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--fg);
+        cursor: pointer;
+      }
+      #token-field button:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
       hr {
         border: none;
         border-top: 1px solid var(--border);
@@ -136,6 +165,19 @@
           <span class="rowlabel">Access token</span>
           <div class="controls">
             <label><input type="checkbox" id="token" /> Require access token</label>
+          </div>
+          <div id="token-field" hidden>
+            <input
+              id="token-value"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="Leave empty to generate a token"
+            />
+            <div class="controls">
+              <button id="token-generate" type="button">Generate</button>
+              <button id="token-copy" type="button" disabled>Copy</button>
+            </div>
           </div>
           <p id="token-note" class="note" hidden></p>
         </div>
