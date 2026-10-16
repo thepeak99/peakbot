@@ -9,6 +9,7 @@ import { ModelSwitcher } from "./ModelSwitcher";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
 import { NotifyToggle } from "./NotifyToggle";
+import { FocusToggle } from "./FocusToggle";
 import { ThemeToggle } from "./ThemeToggle";
 import type { NotifyPermission } from "../useTaskNotifications";
 
@@ -34,6 +35,8 @@ export function TopBar({
   notifyEnabled,
   notifyPermission,
   onToggleNotify,
+  focusMode,
+  onToggleFocus,
   lockedReason = null,
 }: {
   isRunning: boolean;
@@ -56,6 +59,8 @@ export function TopBar({
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
   onToggleNotify: () => void;
+  focusMode: boolean;
+  onToggleFocus: () => void;
   lockedReason?: string | null;
 }) {
   return (
@@ -136,6 +141,7 @@ export function TopBar({
       )}
 
       <div className="ml-auto flex items-center gap-4 font-mono text-[11px] tabular-nums text-zinc-500">
+        <FocusToggle enabled={focusMode} onToggle={onToggleFocus} />
         <ThemeToggle />
         <NotifyToggle
           enabled={notifyEnabled}
