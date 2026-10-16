@@ -65,9 +65,9 @@ pub struct Controller<S: Sys, U: Ui> {
     paths: DesktopPaths,
     quitting: Arc<AtomicBool>,
     phase: Phase,
-    /// The bundled (this app's) PeakBot version — locked equal to the
-    /// sidecar's by `check-version.sh`; the `--version` run in
-    /// CheckingBundled is a liveness check, not the version source.
+    /// The bundled (this app's) PeakBot version — the sidecar's
+    /// `--version` output, parsed in CheckingBundled (DESIGN §1: the
+    /// sidecar is the version source).
     bundled: Option<Version>,
     service: Option<ServiceState>,
     session: Option<Session>,
@@ -83,7 +83,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             paths,
             quitting,
             phase: Phase::Starting(StartStep::CheckingBundled),
-            bundled: Version::parse(env!("CARGO_PKG_VERSION")).ok(),
+            bundled: None,
             service: None,
             session: None,
         }
@@ -158,22 +158,18 @@ impl<S: Sys, U: Ui> Controller<S, U> {
 
     fn handle_start(&mut self) {
         self.stop_session();
-        let reaped_stale = self.reap_stale_pidfile();
+        self.reap_stale_pidfile();
 
         self.set_phase(Phase::Starting(StartStep::CheckingBundled));
-        if let Err(err) = self.check_bundled_sidecar() {
-            return self.fail(err);
-        }
+        let bundled = match self.check_bundled_sidecar() {
+            Ok(v) => v,
+            Err(err) => return self.fail(err),
+        };
 
         let state = self.query_service_status();
         self.service = Some(state.clone());
         self.set_phase(Phase::Starting(StartStep::CheckingService));
 
-        let Some(bundled) = self.bundled.clone() else {
-            return self.fail(StartError::SidecarBroken {
-                detail: "bundled version unavailable".to_string(),
-            });
-        };
         let declined = self.read_declined();
         let plan = service::plan_launch(
             &state,
@@ -182,8 +178,8 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             declined.as_ref(),
         );
         match plan {
-            LaunchPlan::Session => self.launch_session(reaped_stale),
-            LaunchPlan::ConnectService { start_first } => self.connect_service(start_first, false),
+            LaunchPlan::Session => self.launch_session(),
+            LaunchPlan::ConnectService { start_first } => self.connect_service(start_first),
             LaunchPlan::AskReplace { installed } => {
                 let dialog = service::replace_dialog(&installed, &bundled);
                 if self.ui.confirm(&dialog) {
@@ -194,15 +190,16 @@ impl<S: Sys, U: Ui> Controller<S, U> {
                         &state,
                         ServiceState::Installed(svc) if svc.run == RunState::Stopped
                     );
-                    self.connect_service(start_first, false);
+                    self.connect_service(start_first);
                 }
             }
         }
     }
 
     /// `<sidecar> --version`: NotFound → SidecarMissing; failed or
-    /// unparseable → SidecarBroken.
-    fn check_bundled_sidecar(&self) -> Result<(), StartError> {
+    /// unparseable → SidecarBroken. On success the parsed version is
+    /// stored as the bundled version (DESIGN §1) and returned.
+    fn check_bundled_sidecar(&mut self) -> Result<Version, StartError> {
         let out = self
             .sys
             .run(&self.paths.sidecar, &["--version"])
@@ -217,15 +214,21 @@ impl<S: Sys, U: Ui> Controller<S, U> {
                     }
                 }
             })?;
-        if !out.ok() || parse_version_output(&out.stdout).is_none() {
+        let version = if out.ok() {
+            parse_version_output(&out.stdout)
+        } else {
+            None
+        };
+        let Some(v) = version else {
             return Err(StartError::SidecarBroken {
                 detail: format!(
                     "`--version` failed or was unparseable: {}",
                     out.combined().trim()
                 ),
             });
-        }
-        Ok(())
+        };
+        self.bundled = Some(v.clone());
+        Ok(v)
     }
 
     fn query_service_status(&self) -> ServiceState {
@@ -280,7 +283,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     // LAUNCH_SESSION (DESIGN §4.3)
     // -------------------------------------------------------------------
 
-    fn launch_session(&mut self, suppress_pidfile: bool) {
+    fn launch_session(&mut self) {
         let mut tried: Vec<u16> = Vec::new();
         for attempt in 1..=PORT_ATTEMPTS {
             self.set_phase(Phase::Starting(StartStep::StartingSession));
@@ -319,9 +322,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
                 pid: sess.child.pid(),
                 port,
             };
-            if !suppress_pidfile
-                && let Err(e) = self.sys.write_private(&self.paths.pidfile(), &rec.render())
-            {
+            if let Err(e) = self.sys.write_private(&self.paths.pidfile(), &rec.render()) {
                 log::warn!("failed to write pidfile: {e}");
             }
 
@@ -384,7 +385,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     // CONNECT (DESIGN §4.3)
     // -------------------------------------------------------------------
 
-    fn connect_service(&mut self, start_first: bool, trust_install: bool) {
+    fn connect_service(&mut self, start_first: bool) {
         self.set_phase(Phase::Starting(StartStep::ConnectingService));
         let token = self.read_web_token();
         if start_first
@@ -402,18 +403,9 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         ) {
             ReadyOutcome::Ready => self.set_phase(Phase::Ready(mode)),
             ReadyOutcome::TokenRejected => self.fail(StartError::TokenRejected { service: true }),
-            ReadyOutcome::Timeout => {
-                if trust_install {
-                    // `service install` starts the unit itself (DESIGN
-                    // §4.3); right after a successful install the probe is
-                    // a sanity check, the command is the source of truth.
-                    self.set_phase(Phase::Ready(mode));
-                } else {
-                    self.fail(StartError::ServiceUnreachable {
-                        waited: READY_TIMEOUT,
-                    })
-                }
-            }
+            ReadyOutcome::Timeout => self.fail(StartError::ServiceUnreachable {
+                waited: READY_TIMEOUT,
+            }),
             ReadyOutcome::Cancelled => {}
             ReadyOutcome::ChildExited(_) => {} // no child in service mode
         }
@@ -492,7 +484,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         if let Err(e) = self.sys.remove(&self.paths.declined_file()) {
             log::warn!("failed to remove declined-replace: {e}");
         }
-        self.connect_service(false, true);
+        self.connect_service(false);
     }
 
     // -------------------------------------------------------------------
@@ -538,7 +530,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             return self.enable_failed(&command, &output);
         }
         self.refresh_service();
-        self.connect_service(false, true);
+        self.connect_service(false);
     }
 
     /// Enable failure: best-effort rollback, then the user is back where
@@ -550,7 +542,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         self.refresh_service();
         self.ui
             .message(&service::command_failed_dialog(command, output));
-        self.launch_session(false);
+        self.launch_session();
     }
 
     fn disable_background(&mut self) {
@@ -561,14 +553,14 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         match self.run_sidecar_cmd(&service::service_uninstall_args()) {
             Ok(_) => {
                 self.refresh_service();
-                self.launch_session(false);
+                self.launch_session();
             }
             Err((command, output)) => {
                 self.refresh_service();
                 self.ui
                     .message(&service::command_failed_dialog(&command, &output));
                 // Unchanged mode: reconnect to the still-installed service.
-                self.connect_service(false, false);
+                self.connect_service(false);
             }
         }
     }
@@ -605,14 +597,13 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     }
 
     /// Stale pidfile reaper: identity-checked (cmdline) SIGINT → poll up
-    /// to STOP_GRACE → SIGKILL; the pidfile is always removed. Returns
-    /// true when a stale pidfile was found and reaped (the fresh
-    /// session then skips its pidfile write — the reaped record was the
-    /// bookkeeping for the previous crash).
-    fn reap_stale_pidfile(&mut self) -> bool {
+    /// to STOP_GRACE → SIGKILL; the pidfile is always removed. The fresh
+    /// session then writes its own pidfile (DESIGN §3.8: pidfile exists
+    /// ⇔ a session child was spawned and not yet confirmed exited).
+    fn reap_stale_pidfile(&mut self) {
         let pidfile = self.paths.pidfile();
         let Some(text) = self.sys.read(&pidfile).ok().flatten() else {
-            return false;
+            return;
         };
         if let Some(rec) = PidRecord::parse(&text)
             && let Some(cmd) = self.sys.cmdline_of(rec.pid)
@@ -630,7 +621,6 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         if let Err(e) = self.sys.remove(&pidfile) {
             log::warn!("failed to remove stale pidfile: {e}");
         }
-        true
     }
 
     fn remove_pidfile(&self) {
