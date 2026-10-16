@@ -751,6 +751,88 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
 
+    // ── B4 — the `service status` text contract ──────────────────────
+    //
+    // The desktop (peakbot-desktop-core `parse_service_status`) parses
+    // this text. The line prefixes `Installed: `, `Exec:      `,
+    // `State:     ` are THE contract — pinned here against
+    // `format_service_report`, the B4 home of today's
+    // `main.rs::print_service_report` body. RED until that fn exists.
+
+    fn sample_report() -> ServiceReport {
+        ServiceReport {
+            manager: ServiceManager::SystemdUser,
+            name: "peakbot.service".to_string(),
+            artifact: Some(PathBuf::from("/home/u/.config/systemd/user/peakbot.service")),
+            installed: true,
+            exe: Some(PathBuf::from("/home/u/.local/bin/peakbot")),
+            run_state: RunState::Running,
+            survives_logout: false,
+            commands: vec!["systemctl --user is-active peakbot.service".to_string()],
+            notes: vec!["linger is off".to_string()],
+        }
+    }
+
+    #[test]
+    fn format_service_report_pins_the_line_prefixes_desktop_parses() {
+        let text = format_service_report(&sample_report());
+        // The three desktop-parsed prefixes, exactly as
+        // print_service_report prints them today (current code wins).
+        assert!(
+            text.contains("Installed: true\n"),
+            "`Installed: ` line (one space); got: {text:?}"
+        );
+        assert!(
+            text.contains("Exec:      /home/u/.local/bin/peakbot\n"),
+            "`Exec:      ` line (six spaces); got: {text:?}"
+        );
+        assert!(
+            text.contains("State:     running\n"),
+            "`State:     ` line (five spaces); got: {text:?}"
+        );
+        // The surrounding shape the desktop must not break.
+        assert!(text.contains("Manager:   systemd-user\n"), "{text:?}");
+        assert!(text.contains("Name:      peakbot.service\n"), "{text:?}");
+        assert!(
+            text.contains("Artifact:  /home/u/.config/systemd/user/peakbot.service\n"),
+            "{text:?}"
+        );
+        assert!(text.contains("Survives logout: false\n"), "{text:?}");
+        assert!(
+            text.contains("Commands:\n  $ systemctl --user is-active peakbot.service\n"),
+            "{text:?}"
+        );
+        assert!(text.contains("Notes:\n  - linger is off\n"), "{text:?}");
+    }
+
+    #[test]
+    fn format_service_report_omits_optional_lines_when_absent() {
+        let report = ServiceReport {
+            manager: ServiceManager::LaunchdAgent,
+            name: "com.peakbot.agent".to_string(),
+            artifact: None,
+            installed: false,
+            exe: None,
+            run_state: RunState::Stopped,
+            survives_logout: false,
+            commands: Vec::new(),
+            notes: Vec::new(),
+        };
+        let text = format_service_report(&report);
+        assert!(text.contains("Installed: false\n"), "{text:?}");
+        assert!(text.contains("State:     stopped\n"), "{text:?}");
+        assert!(!text.contains("Exec:"), "no Exec line without an exe; {text:?}");
+        assert!(
+            !text.contains("Artifact:"),
+            "no Artifact line without an artifact; {text:?}"
+        );
+        assert!(
+            !text.contains("Commands:"),
+            "no Commands section when empty; {text:?}"
+        );
+        assert!(!text.contains("Notes:"), "no Notes section when empty; {text:?}");
+    }
+
     // ── §E.5 ────────────────────────────────────────────────────────
 
     fn bind_loopback() -> SocketAddr {

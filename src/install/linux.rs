@@ -324,9 +324,20 @@ mod tests {
     }
 
     #[test]
-    fn unit_has_no_environment_directive() {
+    fn unit_has_exactly_one_secret_free_environment_directive() {
+        // B2: a background service must never open a browser — the unit
+        // carries exactly one `Environment=` line, `PEAKBOT_NO_OPEN=1`
+        // (secret-free; the token stays in the web-token file).
         let unit = render_unit(&plan("/home/you/.local/bin/peakbot"));
-        assert!(!unit.contains("Environment"));
+        let env_lines: Vec<&str> = unit
+            .lines()
+            .filter(|l| l.starts_with("Environment="))
+            .collect();
+        assert_eq!(
+            env_lines,
+            vec!["Environment=PEAKBOT_NO_OPEN=1"],
+            "got: {unit}"
+        );
         assert!(unit.ends_with("WantedBy=default.target\n"));
     }
 
