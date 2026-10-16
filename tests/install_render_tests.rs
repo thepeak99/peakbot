@@ -426,3 +426,181 @@ fn windows_task_xml_does_not_embed_a_token() {
         "the token must not appear in the task XML"
     );
 }
+
+// ===========================================================================
+// #375 — `service install --tls`: the three renderers emit the TLS flags.
+//
+// All three renderers run on Linux CI (the §E.1 all-platforms-compile rule);
+// the non-tls artifacts stay byte-identical to the locked snapshots above
+// (criterion 7 — those existing tests are the guard and are unchanged).
+// ===========================================================================
+
+fn plan_loopback_tls(exe: &str) -> ServicePlan {
+    plan_loopback(exe).with_tls(true)
+}
+
+fn plan_loopback_tls_named(exe: &str, names: &[&str]) -> ServicePlan {
+    plan_loopback(exe)
+        .with_tls(true)
+        .with_tls_names(names.iter().map(|s| s.to_string()).collect())
+}
+
+/// Decode a rendered Windows task artifact (UTF-16LE + BOM) back to text.
+fn decode_task_xml(bytes: &[u8]) -> String {
+    let (units, _trailing) = bytes[2..].as_chunks::<2>();
+    let units: Vec<u16> = units.iter().map(|c| u16::from_le_bytes(*c)).collect();
+    String::from_utf16(&units).expect("body must be valid UTF-16LE")
+}
+
+#[test]
+fn linux_unit_tls_matches_the_locked_artifact() {
+    // #375 criterion 1: ExecStart is exactly
+    // `"<exe>" --bind 127.0.0.1:7823 --tls` — nothing else in the unit
+    // changes.
+    let plan = plan_loopback_tls("/home/you/.local/bin/peakbot");
+    let unit = render_unit(&plan);
+    let expected = "\
+[Unit]
+Description=PeakBot agent (web UI)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PEAKBOT_NO_OPEN=1
+ExecStart=\"/home/you/.local/bin/peakbot\" --bind 127.0.0.1:7823 --tls
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+";
+    assert_eq!(unit, expected);
+}
+
+#[test]
+fn macos_plist_tls_matches_the_locked_artifact() {
+    // #375 criterion 1: `--tls` joins ProgramArguments after the bind
+    // address — nothing else in the plist changes.
+    let plan = plan_loopback_tls("/Users/you/.local/bin/peakbot");
+    let plist = render_plist(&plan);
+    let expected = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+  <key>Label</key>
+  <string>com.peakbot.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/.local/bin/peakbot</string>
+    <string>--bind</string>
+    <string>127.0.0.1:7823</string>
+    <string>--tls</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PEAKBOT_NO_OPEN</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/you/Library/Logs/peakbot.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/Library/Logs/peakbot.log</string>
+</dict>
+</plist>
+";
+    assert_eq!(plist, expected);
+}
+
+#[test]
+fn windows_task_xml_tls_decoded_matches_the_locked_artifact() {
+    // #375 criterion 1: the task's `<Arguments>` is
+    // `--bind 127.0.0.1:7823 --tls` — nothing else in the XML changes.
+    let plan = plan_loopback_tls("C:\\Users\\you\\AppData\\Local\\Programs\\peakbot\\peakbot.exe");
+    let bytes = render_task_xml(&plan);
+    let decoded = decode_task_xml(&bytes);
+    let expected = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n  <RegistrationInfo>\n    <Description>PeakBot agent (web UI)</Description>\n  </RegistrationInfo>\n  <Triggers>\n    <LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>DOMAIN\\user</UserId>\n    </LogonTrigger>\n  </Triggers>\n  <Principals>\n    <Principal id=\"Author\">\n      <UserId>DOMAIN\\user</UserId>\n      <LogonType>InteractiveToken</LogonType>\n      <RunLevel>LeastPrivilege</RunLevel>\n    </Principal>\n  </Principals>\n  <Settings>\n    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n    <StartWhenAvailable>true</StartWhenAvailable>\n    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n    <Enabled>true</Enabled>\n  </Settings>\n  <Actions Context=\"Author\">\n    <Exec>\n      <Command>C:\\Users\\you\\AppData\\Local\\Programs\\peakbot\\peakbot.exe</Command>\n      <Arguments>--bind 127.0.0.1:7823 --tls</Arguments>\n    </Exec>\n  </Actions>\n</Task>\n";
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn tls_names_emit_after_tls_in_given_order_on_all_three_renderers() {
+    // #375 criterion 2: `--tls-name a.lan --tls-name 10.0.0.9` — both
+    // names, after `--tls`, in the given order, on every platform.
+    let names = ["a.lan", "10.0.0.9"];
+
+    let unit = render_unit(&plan_loopback_tls_named(
+        "/home/you/.local/bin/peakbot",
+        &names,
+    ));
+    assert!(
+        unit.contains("--bind 127.0.0.1:7823 --tls --tls-name a.lan --tls-name 10.0.0.9"),
+        "unit: {unit}"
+    );
+
+    let plist = render_plist(&plan_loopback_tls_named(
+        "/Users/you/.local/bin/peakbot",
+        &names,
+    ));
+    assert!(
+        plist.contains(
+            "<string>--tls</string>\n    <string>--tls-name</string>\n    <string>a.lan</string>\n    <string>--tls-name</string>\n    <string>10.0.0.9</string>"
+        ),
+        "plist: {plist}"
+    );
+
+    let xml = render_task_xml(&plan_loopback_tls_named(
+        "C:\\Users\\you\\AppData\\Local\\Programs\\peakbot\\peakbot.exe",
+        &names,
+    ));
+    let decoded = decode_task_xml(&xml);
+    assert!(
+        decoded.contains(
+            "<Arguments>--bind 127.0.0.1:7823 --tls --tls-name a.lan --tls-name 10.0.0.9</Arguments>"
+        ),
+        "xml: {decoded}"
+    );
+}
+
+#[test]
+fn no_artifact_embeds_a_token_when_tls_is_on() {
+    // #375 criterion 5: the secret-free invariant (§E.5) with TLS on —
+    // the token never appears in the unit, plist, or task XML, and the
+    // Linux unit keeps exactly one `Environment=PEAKBOT_NO_OPEN=1` line.
+    let mk = |exe: &str| {
+        ServicePlan::new(PathBuf::from(exe), bind_lan(), Some("s3cret".to_string()))
+            .unwrap()
+            .with_tls(true)
+    };
+
+    let unit = render_unit(&mk("/home/you/.local/bin/peakbot"));
+    assert!(unit.contains("--tls"), "unit: {unit}");
+    assert!(!unit.contains("s3cret"), "unit: {unit}");
+    let env_lines: Vec<&str> = unit
+        .lines()
+        .filter(|l| l.starts_with("Environment="))
+        .collect();
+    assert_eq!(
+        env_lines,
+        vec!["Environment=PEAKBOT_NO_OPEN=1"],
+        "unit: {unit}"
+    );
+
+    let plist = render_plist(&mk("/Users/you/.local/bin/peakbot"));
+    assert!(plist.contains("<string>--tls</string>"), "plist: {plist}");
+    assert!(!plist.contains("s3cret"), "plist: {plist}");
+
+    let bytes = render_task_xml(&mk(
+        "C:\\Users\\you\\AppData\\Local\\Programs\\peakbot\\peakbot.exe",
+    ));
+    let decoded = decode_task_xml(&bytes);
+    assert!(decoded.contains("--tls"), "xml: {decoded}");
+    assert!(!decoded.contains("s3cret"), "xml: {decoded}");
+}

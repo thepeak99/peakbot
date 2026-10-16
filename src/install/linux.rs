@@ -77,6 +77,16 @@ fn parse_exec_start(unit: &str) -> Option<PathBuf> {
     Some(PathBuf::from(exe))
 }
 
+/// Whether the unit's `ExecStart=` argv carries a standalone `--tls` token.
+/// Only the argv decides — other lines (Environment, Description) may
+/// mention TLS without the service running HTTPS.
+fn parse_tls(unit: &str) -> bool {
+    unit.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("ExecStart="))
+        .is_some_and(|value| value.split_whitespace().any(|t| t == "--tls"))
+}
+
 /// Map `systemctl --user is-active` stdout to a run state. The words are
 /// stable ASCII (not localised); anything mid-transition or unrecognised
 /// is reported as `Unknown` rather than guessed at.
@@ -179,6 +189,7 @@ pub(super) fn install_service(plan: &ServicePlan) -> Result<ServiceReport, Insta
         installed: true,
         exe: Some(plan.exe().to_path_buf()),
         run_state: current_run_state(),
+        tls: plan.tls(),
         survives_logout,
         commands,
         notes,
@@ -211,6 +222,7 @@ pub(super) fn uninstall_service() -> Result<ServiceReport, InstallError> {
         installed: false,
         exe: None,
         run_state: RunState::Stopped,
+        tls: false,
         survives_logout: false,
         commands,
         notes: Vec::new(),
@@ -221,10 +233,10 @@ pub(super) fn service_status() -> Result<ServiceReport, InstallError> {
     preflight()?;
     let path = unit_path()?;
     let installed = path.exists();
-    let exe = std::fs::read_to_string(&path)
-        .ok()
-        .as_deref()
-        .and_then(parse_exec_start);
+    let unit_text = std::fs::read_to_string(&path).ok();
+    let exe = unit_text.as_deref().and_then(parse_exec_start);
+    // TLS comes from the artifact, not the (possibly stopped) process.
+    let tls = installed && unit_text.as_deref().is_some_and(parse_tls);
 
     let mut commands = Vec::new();
     let run_state = if installed {
@@ -249,6 +261,7 @@ pub(super) fn service_status() -> Result<ServiceReport, InstallError> {
         installed,
         exe,
         run_state,
+        tls,
         survives_logout,
         commands,
         notes,
@@ -347,6 +360,93 @@ mod tests {
     #[test]
     fn linger_note_names_the_exact_command() {
         assert!(linger_note().contains("loginctl enable-linger $USER"));
+    }
+
+    // ── #375 — TLS in the unit + parse it back out ────────────────
+
+    fn plan_tls(exe: &str) -> ServicePlan {
+        plan(exe).with_tls(true)
+    }
+
+    #[test]
+    fn unit_exec_start_carries_the_tls_flag_when_planned() {
+        // #375 criterion 1: the unit's ExecStart is exactly
+        // `"<exe>" --bind 127.0.0.1:7823 --tls`.
+        let unit = render_unit(&plan_tls("/home/you/.local/bin/peakbot"));
+        assert!(
+            unit.contains(
+                "ExecStart=\"/home/you/.local/bin/peakbot\" --bind 127.0.0.1:7823 --tls\n"
+            ),
+            "got: {unit}"
+        );
+    }
+
+    #[test]
+    fn unit_exec_start_carries_the_tls_names_after_the_tls_flag_in_order() {
+        // #375 criterion 2: both names, after `--tls`, in the given order.
+        let p = plan("/home/you/.local/bin/peakbot")
+            .with_tls(true)
+            .with_tls_names(vec!["a.lan".to_string(), "10.0.0.9".to_string()]);
+        let unit = render_unit(&p);
+        assert!(
+            unit.contains(
+                "ExecStart=\"/home/you/.local/bin/peakbot\" --bind 127.0.0.1:7823 \
+                 --tls --tls-name a.lan --tls-name 10.0.0.9\n"
+            ),
+            "got: {unit}"
+        );
+    }
+
+    #[test]
+    fn parse_tls_round_trips_true_for_a_tls_unit() {
+        // #375 criterion 6: `service status` derives TLS from the
+        // *installed artifact*, so it is correct while the service is
+        // stopped (render with tls → parse → true).
+        let unit = render_unit(&plan_tls("/home/you/.local/bin/peakbot"));
+        assert!(parse_tls(&unit), "got: {unit}");
+    }
+
+    #[test]
+    fn parse_tls_round_trips_false_for_a_plain_unit() {
+        let unit = render_unit(&plan("/home/you/.local/bin/peakbot"));
+        assert!(!parse_tls(&unit), "got: {unit}");
+    }
+
+    #[test]
+    fn parse_tls_is_false_for_a_unit_that_only_mentions_tls_elsewhere() {
+        // Only the ExecStart argv decides, and `--tls` must be a
+        // standalone token — a hand-edited unit must not false-positive.
+        let unit = "[Service]\n\
+                    Environment=TLS_NOTE=1\n\
+                    ExecStart=\"/x/peakbot\" --bind 127.0.0.1:7823 --tlsy\n";
+        assert!(!parse_tls(unit), "got: {unit}");
+    }
+
+    #[test]
+    fn tls_unit_keeps_exactly_one_secret_free_environment_line() {
+        // #375 criterion 5: TLS changes only the ExecStart argv. The
+        // LAN-bind + token case is where a secret *could* leak.
+        let p = ServicePlan::new(
+            PathBuf::from("/home/you/.local/bin/peakbot"),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 7823),
+            Some("s3cret".to_string()),
+        )
+        .unwrap()
+        .with_tls(true);
+        let unit = render_unit(&p);
+        let env_lines: Vec<&str> = unit
+            .lines()
+            .filter(|l| l.starts_with("Environment="))
+            .collect();
+        assert_eq!(
+            env_lines,
+            vec!["Environment=PEAKBOT_NO_OPEN=1"],
+            "the only Environment= line must stay exactly one; got: {unit}"
+        );
+        assert!(
+            !unit.contains("s3cret"),
+            "the token must not appear in the unit; got: {unit}"
+        );
     }
 
     #[test]

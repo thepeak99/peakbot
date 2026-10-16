@@ -321,8 +321,18 @@ service is self-contained; pass `--token` once and it is written to
 `<config_dir>/web-token` (`0600`). The token file is the source for subsequent
 runs — you do not need to export `PEAKBOT_WEB_TOKEN` to your shell.
 
+Pass `--tls` to run the service over HTTPS with the built-in CA (the same
+machinery as the foreground `--tls`); `--tls-name <NAME>` (repeatable) adds
+extra SANs to the certificate. `service status` reports the state as
+`TLS: on` / `TLS: off`, derived from the installed artifact — correct even
+while the service is stopped.
+
 Non-loopback binds **require** a token; the loopback/token invariant is
 enforced at plan-build time, not as a runtime check.
+
+Note: `web.tls: true` in `config.yaml` switches the service to HTTPS at
+runtime independently of `--tls` — `service status` reports what the
+*artifact* says, not what the config overrides.
 
 ---
 

@@ -165,6 +165,13 @@ pub struct ServicePlan {
     /// only values are rejected by [`ServicePlan::new`] so the inner
     /// `Option<String>` only ever holds `Some(real_token)` or `None`.
     token: Option<String>,
+    /// `--tls` on the service argv. Off by default so no-flag plans render
+    /// byte-identical artifacts to the pre-TLS ones; set via
+    /// [`Self::with_tls`].
+    tls: bool,
+    /// Extra certificate names (SANs): one `--tls-name <NAME>` pair each,
+    /// emitted in the given order. Empty by default.
+    tls_names: Vec<String>,
 }
 
 impl ServicePlan {
@@ -180,19 +187,46 @@ impl ServicePlan {
         if !bind.ip().is_loopback() && !token_present {
             return Err(PlanError::TokenRequired(bind));
         }
-        Ok(Self { exe, bind, token })
+        Ok(Self {
+            exe,
+            bind,
+            token,
+            tls: false,
+            tls_names: Vec::new(),
+        })
+    }
+
+    /// Enable HTTPS on the service argv. TLS only changes the argv — the
+    /// §E.5 loopback/token invariant is untouched.
+    pub fn with_tls(self, tls: bool) -> Self {
+        Self { tls, ..self }
+    }
+
+    /// Extra certificate names (SANs), one `--tls-name <NAME>` pair each,
+    /// emitted in the given order. Only meaningful with [`Self::with_tls`].
+    pub fn with_tls_names(self, tls_names: Vec<String>) -> Self {
+        Self { tls_names, ..self }
     }
 
     /// The argv that every service artifact on every platform embeds:
-    /// `<exe> --bind <addr>`. Per §E.5 no secret ever appears in any
-    /// artifact — the token comes from the `web-token` file (§E.5), not
-    /// from this list.
+    /// `<exe> --bind <addr>`, then `--tls` and one `--tls-name <NAME>` pair
+    /// per name (in the given order) when TLS is on. Per §E.5 no secret
+    /// ever appears in any artifact — the token comes from the `web-token`
+    /// file (§E.5), not from this list.
     pub fn argv(&self) -> Vec<String> {
-        vec![
+        let mut argv = vec![
             self.exe.display().to_string(),
             "--bind".to_string(),
             self.bind.to_string(),
-        ]
+        ];
+        if self.tls {
+            argv.push("--tls".to_string());
+            for name in &self.tls_names {
+                argv.push("--tls-name".to_string());
+                argv.push(name.clone());
+            }
+        }
+        argv
     }
 
     /// Read-only accessors — needed by I3's renderers (which build
@@ -206,6 +240,12 @@ impl ServicePlan {
     }
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
+    }
+    pub fn tls(&self) -> bool {
+        self.tls
+    }
+    pub fn tls_names(&self) -> &[String] {
+        &self.tls_names
     }
 }
 
@@ -616,6 +656,10 @@ pub struct ServiceReport {
     pub installed: bool,
     pub exe: Option<PathBuf>,
     pub run_state: RunState,
+    /// Whether the *installed artifact* runs with `--tls` — parsed from the
+    /// unit/plist/task argv, so it is correct while the service is stopped.
+    /// `false` when nothing is installed.
+    pub tls: bool,
     /// Linux: linger is enabled. macOS/Windows: always false — both run
     /// the agent inside the user's login session, full stop.
     pub survives_logout: bool,
@@ -668,6 +712,10 @@ pub fn format_service_report(report: &ServiceReport) -> String {
         writeln!(out, "Exec:      {}", exe.display()).expect("writing to a String cannot fail");
     }
     writeln!(out, "State:     {}", report.run_state.as_wire())
+        .expect("writing to a String cannot fail");
+    // Always emitted (unlike Exec/Artifact): the desktop parses the TLS
+    // state from this line, and "off" is a meaningful answer, not absence.
+    writeln!(out, "TLS:       {}", if report.tls { "on" } else { "off" })
         .expect("writing to a String cannot fail");
     writeln!(out, "Survives logout: {}", report.survives_logout)
         .expect("writing to a String cannot fail");
@@ -812,6 +860,7 @@ mod tests {
             installed: true,
             exe: Some(PathBuf::from("/home/u/.local/bin/peakbot")),
             run_state: RunState::Running,
+            tls: false,
             survives_logout: false,
             commands: vec!["systemctl --user is-active peakbot.service".to_string()],
             notes: vec!["linger is off".to_string()],
@@ -859,6 +908,7 @@ mod tests {
             installed: false,
             exe: None,
             run_state: RunState::Stopped,
+            tls: false,
             survives_logout: false,
             commands: Vec::new(),
             notes: Vec::new(),
@@ -884,6 +934,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn format_service_report_pins_the_tls_line_on() {
+        // #375 criterion 6 — the B4 text contract gains a `TLS:` line,
+        // derived from the *installed artifact* (correct while the service
+        // is stopped — #374's secondary signal). The desktop parses this
+        // text by label prefix, so the label and its spelling are pinned:
+        // `TLS:` space-padded to the same column as its siblings (value at
+        // column 11, like `State:     running`).
+        let report = ServiceReport {
+            tls: true,
+            ..sample_report()
+        };
+        let text = format_service_report(&report);
+        assert!(
+            text.contains("TLS:       on\n"),
+            "expected the `TLS:       on` line (TLS: + 7 spaces); got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn format_service_report_pins_the_tls_line_off() {
+        let report = ServiceReport {
+            tls: false,
+            ..sample_report()
+        };
+        let text = format_service_report(&report);
+        assert!(
+            text.contains("TLS:       off\n"),
+            "expected the `TLS:       off` line (TLS: + 7 spaces); got: {text:?}"
+        );
+        // The `on` spelling must not leak into the off report.
+        assert!(!text.contains("TLS:       on"), "{text:?}");
+    }
+
     // ── §E.5 ────────────────────────────────────────────────────────
 
     fn bind_loopback() -> SocketAddr {
@@ -904,6 +988,106 @@ mod tests {
                 "--bind".to_string(),
                 "127.0.0.1:7823".to_string(),
             ]
+        );
+    }
+
+    // ── #375 — TLS on the service plan ─────────────────────────────
+    //
+    // `peakbot service install --tls [--tls-name NAME]…`: the plan gains
+    // `tls: bool` + `tls_names: Vec<String>` (set via the `with_tls` /
+    // `with_tls_names` builders — `new` keeps its §E.5 signature), and
+    // `argv()` emits them *after* `--bind <addr>`: `--tls`, then one
+    // `--tls-name <NAME>` pair per name, in the given order. Without the
+    // flags the argv stays exactly `[exe, --bind, addr]` (the test above
+    // is the backward-compat guard).
+
+    #[test]
+    fn service_plan_tls_argv_appends_the_tls_flag_after_bind() {
+        let p = ServicePlan::new(PathBuf::from("/usr/bin/peakbot"), bind_loopback(), None)
+            .unwrap()
+            .with_tls(true);
+        assert_eq!(
+            p.argv(),
+            vec![
+                "/usr/bin/peakbot".to_string(),
+                "--bind".to_string(),
+                "127.0.0.1:7823".to_string(),
+                "--tls".to_string(),
+            ]
+        );
+        assert!(p.tls(), "the tls accessor must report the flag");
+        assert!(
+            p.tls_names().is_empty(),
+            "no --tls-name pairs without names; argv: {:?}",
+            p.argv()
+        );
+    }
+
+    #[test]
+    fn service_plan_tls_names_emit_after_tls_in_given_order() {
+        let p = ServicePlan::new(PathBuf::from("/usr/bin/peakbot"), bind_loopback(), None)
+            .unwrap()
+            .with_tls(true)
+            .with_tls_names(vec!["a.lan".to_string(), "10.0.0.9".to_string()]);
+        assert_eq!(
+            p.argv(),
+            vec![
+                "/usr/bin/peakbot".to_string(),
+                "--bind".to_string(),
+                "127.0.0.1:7823".to_string(),
+                "--tls".to_string(),
+                "--tls-name".to_string(),
+                "a.lan".to_string(),
+                "--tls-name".to_string(),
+                "10.0.0.9".to_string(),
+            ]
+        );
+        assert_eq!(
+            p.tls_names(),
+            &["a.lan".to_string(), "10.0.0.9".to_string()],
+            "names must round-trip in the given order"
+        );
+    }
+
+    #[test]
+    fn service_plan_lan_with_token_and_tls_emits_the_flags() {
+        // Non-loopback + token is the legal remote combo; TLS lands on top
+        // of it without changing the §E.5 invariant.
+        let p = ServicePlan::new(
+            PathBuf::from("/usr/bin/peakbot"),
+            bind_lan(),
+            Some("tok".to_string()),
+        )
+        .unwrap()
+        .with_tls(true);
+        assert_eq!(
+            p.argv(),
+            vec![
+                "/usr/bin/peakbot".to_string(),
+                "--bind".to_string(),
+                "0.0.0.0:7823".to_string(),
+                "--tls".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_loopback_plan_without_token_fails_with_the_existing_token_error() {
+        // #375 criterion 4: `--bind 0.0.0.0:7823 --tls` with no token must
+        // fail with the *existing* §E.5 error, unchanged. The invariant
+        // fires in the constructor — before any TLS builder is consulted —
+        // so `--tls` cannot bypass it (open question 3: no token rule
+        // change).
+        let err =
+            ServicePlan::new(PathBuf::from("/usr/bin/peakbot"), bind_lan(), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("refusing to plan a service on non-loopback 0.0.0.0:7823"),
+            "the rejected bind must be echoed; got: {msg}"
+        );
+        assert!(
+            msg.contains("a token is required"),
+            "the existing wording must survive; got: {msg}"
         );
     }
 

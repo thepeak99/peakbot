@@ -175,6 +175,17 @@ fn parse_task_command(xml: &str) -> Option<PathBuf> {
     Some(PathBuf::from(unescape_xml(trimmed)))
 }
 
+/// Whether the task's `<Arguments>` carries a standalone `--tls` token.
+/// Only the arguments decide — other elements may mention TLS without the
+/// task running HTTPS.
+fn parse_tls(xml: &str) -> bool {
+    xml.split("<Arguments>").nth(1).is_some_and(|rest| {
+        rest.split("</Arguments>")
+            .next()
+            .is_some_and(|args| args.split_whitespace().any(|t| t == "--tls"))
+    })
+}
+
 /// Inverse of [`super::xml_escape`] for the five entities we emit.
 fn unescape_xml(s: &str) -> String {
     s.replace("&lt;", "<")
@@ -235,6 +246,7 @@ pub(super) fn install_service(plan: &ServicePlan) -> Result<ServiceReport, Insta
         installed: true,
         exe: Some(plan.exe().to_path_buf()),
         run_state: RunState::Unknown,
+        tls: plan.tls(),
         survives_logout: false,
         commands: vec![created.display],
         notes: vec![console_note(), run_state_note()],
@@ -261,6 +273,7 @@ pub(super) fn uninstall_service() -> Result<ServiceReport, InstallError> {
         installed: false,
         exe: None,
         run_state: RunState::Stopped,
+        tls: false,
         survives_logout: false,
         commands,
         notes: Vec::new(),
@@ -270,6 +283,8 @@ pub(super) fn uninstall_service() -> Result<ServiceReport, InstallError> {
 pub(super) fn service_status() -> Result<ServiceReport, InstallError> {
     let query = run("schtasks", &["/Query", "/TN", APP.task, "/XML"])?;
     let installed = query.ok;
+    // TLS comes from the registered task's XML, not process state.
+    let tls = installed && parse_tls(&query.stdout);
     let exe = if installed {
         parse_task_command(&query.stdout)
     } else {
@@ -292,6 +307,7 @@ pub(super) fn service_status() -> Result<ServiceReport, InstallError> {
         } else {
             RunState::Stopped
         },
+        tls,
         survives_logout: false,
         commands: vec![query.display],
         notes,
@@ -377,6 +393,78 @@ mod tests {
         // without touching the environment — process-global mutation in a
         // parallel test run is exactly what §E.4 avoids elsewhere.
         assert_eq!(task_user_id(), PLACEHOLDER_USER);
+    }
+
+    // ── #375 — TLS in the task XML + parse it back out ────────────
+
+    fn plan_tls(exe: &str) -> ServicePlan {
+        plan(exe).with_tls(true)
+    }
+
+    const WIN_EXE: &str = "C:\\Users\\you\\AppData\\Local\\Programs\\peakbot\\peakbot.exe";
+
+    #[test]
+    fn task_xml_arguments_carry_the_tls_flag_when_planned() {
+        // #375 criterion 1: the task's `<Arguments>` is
+        // `--bind 127.0.0.1:7823 --tls`.
+        let xml = render_task_xml_for(&plan_tls(WIN_EXE), "DOMAIN\\user");
+        assert!(
+            xml.contains("<Arguments>--bind 127.0.0.1:7823 --tls</Arguments>"),
+            "got: {xml}"
+        );
+    }
+
+    #[test]
+    fn task_xml_arguments_carry_the_tls_names_after_the_tls_flag_in_order() {
+        // #375 criterion 2: both names, after `--tls`, in the given order.
+        let p = plan(WIN_EXE)
+            .with_tls(true)
+            .with_tls_names(vec!["a.lan".to_string(), "10.0.0.9".to_string()]);
+        let xml = render_task_xml_for(&p, "DOMAIN\\user");
+        assert!(
+            xml.contains(
+                "<Arguments>--bind 127.0.0.1:7823 --tls --tls-name a.lan \
+                 --tls-name 10.0.0.9</Arguments>"
+            ),
+            "got: {xml}"
+        );
+    }
+
+    #[test]
+    fn parse_tls_round_trips_true_for_a_tls_task() {
+        // #375 criterion 6: render with tls → parse → true. The status
+        // path parses the `schtasks /Query /XML` output, which carries
+        // the same `<Arguments>` element.
+        let xml = render_task_xml_for(&plan_tls(WIN_EXE), "DOMAIN\\user");
+        assert!(parse_tls(&xml), "got: {xml}");
+    }
+
+    #[test]
+    fn parse_tls_round_trips_false_for_a_plain_task() {
+        let xml = render_task_xml_for(&plan(WIN_EXE), "DOMAIN\\user");
+        assert!(!parse_tls(&xml), "got: {xml}");
+    }
+
+    #[test]
+    fn tls_task_xml_does_not_embed_a_token() {
+        // #375 criterion 5: the secret-free invariant with TLS on — the
+        // LAN-bind + token case is where a secret *could* leak.
+        let p = ServicePlan::new(
+            PathBuf::from(WIN_EXE),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 7823),
+            Some("s3cret".to_string()),
+        )
+        .unwrap()
+        .with_tls(true);
+        let xml = render_task_xml_for(&p, "DOMAIN\\user");
+        assert!(
+            xml.contains("--tls</Arguments>"),
+            "the tls flag must be in <Arguments>; got: {xml}"
+        );
+        assert!(
+            !xml.contains("s3cret"),
+            "the token must not appear in the task XML; got: {xml}"
+        );
     }
 
     #[test]

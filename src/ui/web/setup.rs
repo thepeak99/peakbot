@@ -424,6 +424,7 @@ fn service_report_to_wire(r: &crate::install::ServiceReport) -> JsonValue {
         "installed": r.installed,
         "exe": r.exe.as_ref().map(|p| p.display().to_string()),
         "run_state": r.run_state.as_wire(),
+        "tls": r.tls,
         "survives_logout": r.survives_logout,
         "commands": r.commands,
         "notes": r.notes,
