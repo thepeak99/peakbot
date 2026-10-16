@@ -133,7 +133,7 @@ release: release-bump release-tag release-build-linux release-build-windows rele
 	@echo ""
 	@echo "🎉 Release $$(grep '^version' Cargo.toml | head -1 | cut -d'\"' -f2) complete!"
 
-## release-bump: Sync branch with origin (ff-only), update Cargo.toml + Cargo.lock, commit
+## release-bump: Sync branch with origin (ff-only), update Cargo.toml + Cargo.lock + desktop workspace, commit
 release-bump:
 	@set -eu; \
 	if [ -z "$(VERSION)" ]; then \
@@ -161,9 +161,12 @@ release-bump:
 	fi; \
 	echo "📝 Bumping version to $$v..."; \
 	awk -v v="$$v" '/^\[package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml; \
+	echo "🖥️  Bumping desktop/Cargo.toml to $$v..."; \
+	awk -v v="$$v" '/^\[workspace.package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' desktop/Cargo.toml > desktop/Cargo.toml.tmp && mv desktop/Cargo.toml.tmp desktop/Cargo.toml; \
 	echo "🔒 Updating Cargo.lock..."; \
 	cargo update -p peakbot --precise "$$v" >/dev/null 2>&1 || cargo update -p peakbot >/dev/null; \
-	git add Cargo.toml Cargo.lock; \
+	cargo update --workspace --manifest-path desktop/Cargo.toml >/dev/null 2>&1; \
+	git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock; \
 	git commit -m "chore: release $$v" -m "Co-authored by PeakBot!"; \
 	echo "✅ Committed version bump to $$v"; \
 	echo "$$v" > .release-version

@@ -17,6 +17,9 @@ output
 .test/
 
 scripts
+# PeakBot Desktop scripts must remain trackable (the bare 'scripts' above
+# matches any directory named 'scripts', e.g. desktop/scripts/).
+!desktop/scripts/
 
 # Local wire-sniff dumps (can contain request/response bodies — never commit)
 sniff-bug.jsonl
