@@ -718,6 +718,21 @@ mod tests {
         )
     }
 
+    /// Exec path of an installed service whose binary is NOT the bundled
+    /// sidecar. The file name is deliberately distinct: FakeSys scripts
+    /// `run` by (file name, args), so the installed binary can report a
+    /// `--version` different from the sidecar's.
+    const INSTALLED_EXE: &str = "/home/u/.local/bin/peakbot-0.22.0";
+
+    /// `service status` for a service whose Exec path is `exe`.
+    fn installed_status_at(exe: &str, state: &str) -> RunOutput {
+        run_out(
+            Some(0),
+            &format!("Installed: true\nExec:      {exe}\nState:     {state}\n"),
+            "",
+        )
+    }
+
     const NOT_INSTALLED: &str = "Installed: false\n";
 
     /// `Controller::new` + `handle(Start)`, asserting we land Ready.
@@ -1163,12 +1178,16 @@ mod tests {
     #[test]
     fn t49_replace_flow_command_order_and_cleanup() {
         let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.22.0"));
+        // Bundled version = the sidecar's `--version` output (DESIGN §1,
+        // §4.3 CheckingBundled) — scripted distinct from the app's crate
+        // version on purpose, so the test pins the source of truth.
+        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
         sys.set_run(
             "peakbot",
             &["service", "status"],
-            installed_status("running"),
+            installed_status_at(INSTALLED_EXE, "running"),
         );
+        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
         sys.seed_file(DECLINED, "installed=0.20.0\nbundled=0.21.0\n"); // stale; must be removed
         sys.set_run(
             "peakbot",
@@ -1181,6 +1200,9 @@ mod tests {
             &["service", "install", "--bind", "127.0.0.1:7823"],
             run_out(Some(0), "ok\n", ""),
         );
+        // CONNECT after a successful install is proven by the probe
+        // (DESIGN §4.3) — script a 200, never rely on the install command.
+        sys.set_default_probe(vec![Probe::Status(200)]);
         let ui = FakeUi::new();
         ui.answer_confirm(true); // Replace
         let ctrl = started(sys.clone(), ui);
@@ -1247,12 +1269,15 @@ mod tests {
     #[test]
     fn t50_keep_flow_writes_declined_pair_and_silences_next_start() {
         let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.22.0"));
+        // Bundled version = the sidecar's `--version` output (DESIGN §1),
+        // scripted distinct from the app's crate version on purpose.
+        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
         sys.set_run(
             "peakbot",
             &["service", "status"],
-            installed_status("running"),
+            installed_status_at(INSTALLED_EXE, "running"),
         );
+        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
         sys.seed_file(WEB_TOKEN, "svc-token\n");
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
@@ -1273,10 +1298,10 @@ mod tests {
             .expect("declined-replace written");
         let declined = DeclinedReplace::parse(&content).expect("declined file parses");
         let v22 = semver::Version::parse("0.22.0").unwrap();
-        let v23 = semver::Version::parse("0.23.0").unwrap();
+        let v24 = semver::Version::parse("0.24.0").unwrap();
         assert!(
-            declined.matches(&InstalledVersion::Known(v22.clone()), &v23.clone()),
-            "the exact (installed, bundled) pair must be recorded"
+            declined.matches(&InstalledVersion::Known(v22.clone()), &v24.clone()),
+            "the exact (installed, bundled) pair must be recorded; bundled = the sidecar's --version"
         );
         assert!(
             !sys.run_args().iter().any(|r| {
@@ -1309,12 +1334,13 @@ mod tests {
     #[test]
     fn t51_stale_declined_pair_reasks() {
         let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.22.0"));
+        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
         sys.set_run(
             "peakbot",
             &["service", "status"],
-            installed_status("running"),
+            installed_status_at(INSTALLED_EXE, "running"),
         );
+        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
         // Declined for an OLDER bundled version — the pair no longer matches.
         sys.seed_file(DECLINED, "installed=0.22.0\nbundled=0.21.0\n");
         sys.seed_file(WEB_TOKEN, "svc-token\n");
@@ -1384,16 +1410,56 @@ mod tests {
         );
     }
 
+    // DESIGN §4.3: CONNECT after a successful `service install` (Replace)
+    // still reaches Ready only via the probe — a probe timeout is
+    // Failed(ServiceUnreachable), NEVER Ready (the install command is not
+    // proof the service answers).
+    #[test]
+    fn t52b_post_install_probe_timeout_is_serviceunreachable() {
+        let sys = FakeSys::new();
+        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
+        sys.set_run(
+            "peakbot",
+            &["service", "status"],
+            installed_status_at(INSTALLED_EXE, "running"),
+        );
+        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
+        sys.set_run(
+            "peakbot",
+            &["service", "uninstall"],
+            run_out(Some(0), "ok\n", ""),
+        );
+        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
+        sys.set_run(
+            "peakbot",
+            &["service", "install", "--bind", "127.0.0.1:7823"],
+            run_out(Some(0), "ok\n", ""),
+        );
+        // No probe script ⇒ every probe Unreachable.
+        let ui = FakeUi::new();
+        ui.answer_confirm(true); // Replace
+        let ctrl = started(sys.clone(), ui);
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Failed(StartError::ServiceUnreachable { .. })
+            ),
+            "a probe timeout after install must be ServiceUnreachable, never Ready; got {:?}",
+            ctrl.phase()
+        );
+    }
+
     // §9.1 case 53.
     #[test]
     fn t53_replace_service_install_failure_is_servicecommandfailed() {
         let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.22.0"));
+        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
         sys.set_run(
             "peakbot",
             &["service", "status"],
-            installed_status("running"),
+            installed_status_at(INSTALLED_EXE, "running"),
         );
+        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
         sys.set_run(
             "peakbot",
             &["service", "uninstall"],
@@ -1570,12 +1636,17 @@ mod tests {
 
         match ctrl.phase() {
             Phase::Ready(Mode::Service { token }) => {
-                let tok = sys
-                    .tokens_generated()
-                    .first()
-                    .cloned()
-                    .expect("ensure_token generated a token");
-                assert_eq!(token.as_ref().map(|t| t.as_str()), Some(tok.as_str()));
+                // ensure_token (DESIGN §4.5): generate + write 0600 iff
+                // absent. The session token is ephemeral — the service
+                // token must be exactly what the web-token file holds,
+                // whatever that token is.
+                let file = sys.file(Path::new(WEB_TOKEN)).expect("web-token written");
+                let file_tok = Token::parse(&file).expect("web-token parses");
+                assert_eq!(
+                    token.as_ref(),
+                    Some(&file_tok),
+                    "Ready's service token must equal the web-token file's contents"
+                );
             }
             other => panic!("expected Ready(Service), got {other:?}"),
         }
@@ -1956,6 +2027,26 @@ mod tests {
             sys
         }
 
+        /// Invariant 4 (DESIGN §3.8): after a Start that spawns a session,
+        /// the pidfile exists and names the NEW session's pid + port — even
+        /// when a stale pidfile was reaped just before.
+        fn fresh_pidfile(sys: &FakeSys) {
+            let rec = PidRecord::parse(
+                &sys.file(Path::new(PIDFILE))
+                    .expect("pidfile written for the new session"),
+            )
+            .expect("pidfile parses");
+            assert_eq!(
+                rec.pid,
+                sys.spawned_pids()[0],
+                "pidfile names the new session's pid"
+            );
+            assert_eq!(
+                rec.port, SESSION_PREFERRED_PORT,
+                "pidfile names the new session's port"
+            );
+        }
+
         // (a) Matching cmdline → Interrupt, then Kill (stays "alive"); pidfile removed.
         let sys = base_sys();
         sys.seed_file(PIDFILE, "pid=1234\nport=7824\n");
@@ -1993,9 +2084,11 @@ mod tests {
             })
             .expect("Kill after STOP_GRACE (the stale process stays alive in the fake)");
         assert!(i_int < i_kill, "interrupt before kill");
-        assert!(!sys.has_file(Path::new(PIDFILE)), "pidfile removed");
+        // The stale record is reaped, but the fresh session replaces it.
+        fresh_pidfile(&sys);
 
-        // (b) Mismatched cmdline (PID reuse) → no signal, pidfile removed.
+        // (b) Mismatched cmdline (PID reuse) → no signal; the fresh
+        // session rewrites the pidfile.
         let sys = base_sys();
         sys.seed_file(PIDFILE, "pid=1234\nport=7824\n");
         sys.set_cmdline(1234, "/usr/bin/vim --bind 127.0.0.1:7824");
@@ -2013,9 +2106,10 @@ mod tests {
             "no signal for a reused PID; events: {:?}",
             sys.events()
         );
-        assert!(!sys.has_file(Path::new(PIDFILE)), "pidfile removed");
+        fresh_pidfile(&sys);
 
-        // (c) Garbage pidfile → removed, no signal.
+        // (c) Garbage pidfile → removed, no signal; the fresh session
+        // rewrites the pidfile.
         let sys = base_sys();
         sys.seed_file(PIDFILE, "pid=notanumber\nport=7824\n");
         let ui = FakeUi::new();
@@ -2031,7 +2125,7 @@ mod tests {
                 .any(|e| matches!(e, Effect::Signal { .. })),
             "no signal for an unparseable pidfile"
         );
-        assert!(!sys.has_file(Path::new(PIDFILE)), "pidfile removed");
+        fresh_pidfile(&sys);
     }
 
     // §9.1 case 65.
@@ -2084,6 +2178,7 @@ mod tests {
         // The pidfile now names the new session on the preferred port.
         let rec = PidRecord::parse(&sys.file(Path::new(PIDFILE)).expect("pidfile rewritten"))
             .expect("pidfile parses");
+        assert_eq!(rec.pid, new_pid, "pidfile names the new session's pid");
         assert_eq!(rec.port, SESSION_PREFERRED_PORT);
     }
 }
