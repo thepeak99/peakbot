@@ -37,7 +37,7 @@
 //! {"type":"ready"}
 //! {"type":"models_available","active":"sonnet","models":[{"alias":"sonnet","provider_name":"openrouter","model_name":"anthropic/claude-sonnet-4.6","context_size":200000}]}
 //! {"type":"state","state":{...AppState...}}
-//! {"type":"conversations_list","items":[{"id":"<uuid>","name":"...","updated_at":"<iso8601>","message_count":42,"model":"..."}]}
+//! {"type":"conversations_list","items":[{"id":"<uuid>","name":"...","updated_at":"<iso8601>","message_count":42,"model":"...","active":false,"running":false}]}
 //! {"type":"recent_dirs","dirs":["/path/one","/path/two"]}
 //! {"type":"error","message":"..."}
 //! ```
@@ -231,7 +231,11 @@ fn dispatch_stdin_line(
         Ok(InboundMessage::RequestConversations) => {
             // stdio is single-session with no registry — no conversation
             // is "active" in the sticky-session sense.
-            let items = build_conversations_snapshot(state_manager, &Default::default());
+            let items = build_conversations_snapshot(
+                state_manager,
+                &Default::default(),
+                &Default::default(),
+            );
             out_tx
                 .send(OutboundMessage::ConversationsList { items, error: None })
                 .is_ok()

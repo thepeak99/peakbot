@@ -598,6 +598,7 @@ fn main() {
 ```
 - `window.rs`: `create_main(app, nav: Arc<RwLock<Option<String>>>)` — label `main`, title `PeakBot`, 1200×800, min 800×500, `WebviewUrl::App("index.html")`, `.on_navigation(...)`, `.on_new_window(...)`; `CloseRequested` → `app.exit(0)` (closing the window quits the app on every OS). `focus_main(app)` = show + unminimize + set_focus.
 - `tray.rs`: `create(app)` builds menu; `apply(app, &TrayModel)` updates text/checked/enabled (always re-applied after a click because muda auto-toggles check items). On macOS the same submenu `PeakBot` is appended to `Menu::default(app)` as the app menu.
+- `menu.rs` (macOS only, issue #373): `app_menu(app)` is the Tauri default menu **minus "Close Window"** (File submenu dropped, Window = minimize/maximize only), with the `PeakBot` app submenu (ids as above) first; set via `builder.menu(menu::app_menu)` in `main.rs` so Cmd+W reaches the page and the in-app tab bar closes a conversation tab instead of quitting. Never on Linux (no GTK menubar).
 - `bridge.rs`: `struct TauriUi { app: AppHandle, snapshot: Arc<Mutex<StatusView>>, nav: Arc<RwLock<Option<String>>> }` implements `core::Ui` — dialogs via `app.dialog().message(..).title(..).buttons(MessageDialogButtons::OkCancelCustom(ok,cancel) | OkCustom(ok)).blocking_show()`; `phase_changed` updates snapshot, nav origin, navigates, `tray::apply`.
 - `commands.rs`:
   ```rust

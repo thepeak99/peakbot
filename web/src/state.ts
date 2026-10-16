@@ -247,6 +247,8 @@ export interface ConversationSummary {
   message_count: number;
   model: string;
   active: boolean;
+  /** An agent turn is in flight in the live session (absent on older servers). */
+  running?: boolean;
 }
 
 // One entry in a `dir_listing` reply (src/ui/wire.rs DirEntryWire).

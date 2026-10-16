@@ -83,11 +83,9 @@ pub fn create(app: &AppHandle, state: &Arc<UiState>) -> tauri::Result<()> {
         }
     }
 
-    // macOS: the same items as the app (first) menu, keeping Tauri's
-    // default Edit/View/Window menus (needed for ⌘C/⌘V/⌘Q).
-    #[cfg(target_os = "macos")]
-    attach_app_menu(app)?;
-
+    // macOS: the app (first) menu is set by `menu::app_menu` at build time
+    // (it carries the PeakBot submenu + the default menus minus "Close
+    // Window", issue #373) — `set_menu` here would overwrite it.
     Ok(())
 }
 
@@ -135,10 +133,10 @@ pub fn handle_menu_event(app: &AppHandle, id: &str) {
     }
 }
 
-/// macOS only: a `PeakBot` app submenu with the same items, replacing
-/// Tauri's default app menu (DESIGN §5.4).
+/// macOS only: the `PeakBot` app submenu (same locked ids as the tray
+/// menu), used by `menu::app_menu` (issue #373).
 #[cfg(target_os = "macos")]
-fn attach_app_menu(app: &AppHandle) -> tauri::Result<()> {
+pub fn build_app_submenu(app: &AppHandle) -> tauri::Result<tauri::menu::Submenu<tauri::Wry>> {
     use tauri::menu::Submenu;
 
     let items = build_dynamic_items(app)?;
@@ -156,16 +154,5 @@ fn attach_app_menu(app: &AppHandle) -> tauri::Result<()> {
         &PredefinedMenuItem::separator(app)?,
         &quit,
     ])?;
-
-    // Keep the default menus, swap the first (app) item for ours.
-    let mut menu = Menu::new(app)?;
-    menu.append_items(&[&peakbot])?;
-    for item in Menu::default(app)?.items()?.into_iter().skip(1) {
-        menu.append_items(&[&item])?;
-    }
-
-    app.set_menu(menu)?;
-    // The app menu's events (not routed through the tray builder).
-    app.on_menu_event(|app, event| handle_menu_event(app, event.id().as_ref()));
-    Ok(())
+    Ok(peakbot)
 }

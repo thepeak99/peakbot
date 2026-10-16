@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ConversationSummary } from "../state";
+import { isDesktop } from "../desktop";
 
 // Conversations picker in the top bar. Opening it requests a fresh list
 // (`request_conversations`, answered off-band with `conversations_list`);
@@ -9,6 +10,8 @@ import type { ConversationSummary } from "../state";
 // short ordinal + the title, and the click carries the id ("humans hold
 // human-sized things"). Loading replaces this session's conversation, so a
 // non-empty transcript is confirmed first (same guard as model switching).
+// In the desktop app (tab bar) a load opens or switches to a tab instead, so
+// there is no confirm and the header "+" is hidden (the strip has its own).
 //
 // A sticky search input at the top of the dropdown filters the list
 // client-side (name/model substring, id prefix). Keyboard: ↑/↓ navigate,
@@ -65,6 +68,7 @@ export function ConversationsPicker({
   // Kill-refusal message from the last list reply; null when none.
   error: string | null;
 }) {
+  const desktop = isDesktop();
   const [open, setOpen] = useState(false);
   // The list arrives async after onOpen(); show a loading hint until it does
   // instead of prematurely flashing "No saved conversations."
@@ -121,7 +125,9 @@ export function ConversationsPicker({
     setSearchQuery("");
     setHighlightedIndex(0);
     inputRef.current?.blur();
+    // Desktop: loading opens (or switches to) a tab, so nothing is replaced.
     if (
+      !desktop &&
       hasTranscript &&
       !window.confirm(
         `Load "${c.name}"? This replaces the current transcript.`,
@@ -199,14 +205,17 @@ export function ConversationsPicker({
         <span className="text-zinc-600">▾</span>
       </button>
 
-      <button
-        onClick={openNewTab}
-        title="Open a new conversation in a new tab"
-        aria-label="Open a new conversation in a new tab"
-        className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 text-sm text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
-      >
-        +
-      </button>
+      {/* Desktop: the "+" lives in the tab strip instead. */}
+      {!desktop && (
+        <button
+          onClick={openNewTab}
+          title="Open a new conversation in a new tab"
+          aria-label="Open a new conversation in a new tab"
+          className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 text-sm text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+        >
+          +
+        </button>
+      )}
 
       {open && (
         <div

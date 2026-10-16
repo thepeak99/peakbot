@@ -15,6 +15,7 @@ import { BashPanel } from "./components/BashPanel";
 import { Composer } from "./components/Composer";
 import { DropOverlay } from "./components/DropOverlay";
 import { TopBar } from "./components/TopBar";
+import { ConvoTabBar } from "./components/ConvoTabBar";
 import { BottomBar } from "./components/BottomBar";
 import { TabbedDrawer } from "./components/TabbedDrawer";
 import { StatsPanel } from "./components/StatsPanel";
@@ -24,6 +25,8 @@ import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
 import { ProfilePanel } from "./components/ProfilePanel";
 import { useAgent } from "./useAgent";
+import { useConvoTabs } from "./useConvoTabs";
+import type { TabsState } from "./convoTabs";
 import { useAttachments } from "./useAttachments";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
@@ -53,7 +56,8 @@ import {
 // Matches the server default (`uploads:` config) until the first state frame.
 const DEFAULT_UPLOAD_LIMITS: UploadLimits = { max_file_mb: 50, max_files: 10 };
 
-export function App() {
+export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) {
+  const agent = useAgent();
   const {
     connected,
     state,
@@ -67,7 +71,7 @@ export function App() {
     error,
     send,
     switchConvo,
-  } = useAgent();
+  } = agent;
 
   // Lifted out of Composer so the drop overlay on <main> feeds the same chips.
   const attachments = useAttachments(
@@ -86,6 +90,17 @@ export function App() {
 
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
+  // Desktop conversation tabs (null in a browser). The title is only offered
+  // once `state` describes the conversation the socket is bound to — right
+  // after a switch it still describes the previous one.
+  const convoTabs = useConvoTabs(
+    agent,
+    initialTabs,
+    hasTranscript && state?.conversation?.id === agent.convo
+      ? (state?.conversation?.name ?? null)
+      : null,
+  );
+  const loadConversation = convoTabs ? convoTabs.open : switchConvo;
   const [drawerTab, setDrawerTab] = useState<string | null>(null);
   const drawerOpen = drawerTab !== null;
 
@@ -296,13 +311,20 @@ export function App() {
         conversationsError={conversationsError}
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
-        onLoadConversation={(id) => switchConvo(id)}
+        onLoadConversation={loadConversation}
         notifyEnabled={notify.enabled}
         notifyPermission={notify.permission}
         onToggleNotify={notify.toggle}
         lockedReason={modelLockedReason}
       />
-  
+      {convoTabs && (
+        <ConvoTabBar
+          tabs={convoTabs.views}
+          onActivate={convoTabs.activate}
+          onClose={convoTabs.close}
+          onNew={convoTabs.newTab}
+        />
+      )}
 
       {error && (
         <div className="bg-red-950/70 px-4 py-1.5 text-center text-xs text-red-300">
@@ -382,7 +404,7 @@ export function App() {
         recentDirs={recentDirs}
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
-        onLoadConversation={(id) => switchConvo(id)}
+        onLoadConversation={loadConversation}
         lockedReason={modelLockedReason}
       />
    

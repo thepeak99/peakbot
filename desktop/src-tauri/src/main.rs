@@ -77,6 +77,9 @@ mod sigint {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod menu;
+
 fn main() {
     // DESIGN §4.10: first statement, before any thread.
     if cfg!(target_os = "linux")
@@ -87,7 +90,7 @@ fn main() {
         unsafe { std::env::set_var(key, value) };
     }
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // FIRST: a second launch focuses the existing window.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             window::focus_main(app);
@@ -139,9 +142,21 @@ fn main() {
             let _ = tx.send(Action::Start);
 
             Ok(())
-        })
+        });
+    // macOS: the app menu omits "Close Window" so Cmd+W reaches the page and
+    // the tab bar closes a conversation tab (issue #373). Never on Linux:
+    // `Builder::menu` would add a GTK menubar there.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(menu::app_menu);
+
+    let app = builder
         .build(tauri::generate_context!())
         .expect("tauri app builds");
+
+    // macOS: the app menu's items (the PeakBot submenu) route through the
+    // tray's shared handler — the builder menu is not wired to `on_menu_event`.
+    #[cfg(target_os = "macos")]
+    app.on_menu_event(|app, event| tray::handle_menu_event(app, event.id().as_ref()));
 
     // SIGINT (Ctrl+C, `kill`) takes the same graceful shutdown path as a
     // window close (DESIGN §4.6): the controller stops the session

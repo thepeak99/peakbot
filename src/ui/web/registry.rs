@@ -267,6 +267,20 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Live conversation ids whose agent is mid-turn right now — feeds the
+    /// `running` flag on the conversations list (spinners on background
+    /// desktop tabs). Derived on each call, never cached.
+    pub fn running_ids(&self) -> HashSet<Uuid> {
+        self.inner
+            .map
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.session.state_manager.is_running())
+            .filter_map(|r| r.live_convo())
+            .collect()
+    }
+
     /// Kill every session that has been fully quiescent (no sockets, agent
     /// idle, no live bg children) longer than `ttl`.
     pub fn reap(&self, ttl: Duration) {
@@ -553,6 +567,38 @@ mod tests {
         assert!(
             registry.active_ids().contains(&convo),
             "a miss must not disturb the live session"
+        );
+    }
+
+    // ── running_ids (issue #373: spinners on background tabs) ─────────────
+    //
+    // Contract (design §5 backend): `running_ids()` returns the live convo
+    // ids whose `state_manager.is_running()` — the set the web call sites
+    // feed into `build_conversations_snapshot` so a background tab's turn
+    // can show its spinner (and later its unread dot). The registry
+    // derives it, never caches it: the moment the turn ends the id must be
+    // gone. Compile-RED until the method lands.
+
+    #[tokio::test]
+    async fn running_ids_lists_only_sessions_with_a_running_agent() {
+        let (registry, registered) = registry_with_session();
+        let convo = registered.live_convo().expect("live convo");
+
+        assert!(
+            registry.running_ids().is_empty(),
+            "an idle session is not running"
+        );
+
+        registered.session.state_manager.set_running(true);
+        assert!(
+            registry.running_ids().contains(&convo),
+            "a session mid-turn must appear in running_ids"
+        );
+
+        registered.session.state_manager.set_running(false);
+        assert!(
+            registry.running_ids().is_empty(),
+            "the id must leave running_ids the moment the turn ends"
         );
     }
 }
