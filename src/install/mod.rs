@@ -763,7 +763,9 @@ mod tests {
         ServiceReport {
             manager: ServiceManager::SystemdUser,
             name: "peakbot.service".to_string(),
-            artifact: Some(PathBuf::from("/home/u/.config/systemd/user/peakbot.service")),
+            artifact: Some(PathBuf::from(
+                "/home/u/.config/systemd/user/peakbot.service",
+            )),
             installed: true,
             exe: Some(PathBuf::from("/home/u/.local/bin/peakbot")),
             run_state: RunState::Running,
@@ -821,7 +823,10 @@ mod tests {
         let text = format_service_report(&report);
         assert!(text.contains("Installed: false\n"), "{text:?}");
         assert!(text.contains("State:     stopped\n"), "{text:?}");
-        assert!(!text.contains("Exec:"), "no Exec line without an exe; {text:?}");
+        assert!(
+            !text.contains("Exec:"),
+            "no Exec line without an exe; {text:?}"
+        );
         assert!(
             !text.contains("Artifact:"),
             "no Artifact line without an artifact; {text:?}"
@@ -830,7 +835,10 @@ mod tests {
             !text.contains("Commands:"),
             "no Commands section when empty; {text:?}"
         );
-        assert!(!text.contains("Notes:"), "no Notes section when empty; {text:?}");
+        assert!(
+            !text.contains("Notes:"),
+            "no Notes section when empty; {text:?}"
+        );
     }
 
     // ── §E.5 ────────────────────────────────────────────────────────
