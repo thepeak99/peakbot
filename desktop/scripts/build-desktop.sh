@@ -12,6 +12,14 @@
 #      output/desktop/PeakBot-Desktop-<v>-linux-x86_64.AppImage
 #      (the Dockerfile runs the S-L1..S-L7 smoke checks before exporting)
 #
+# macOS pipeline (cross-built on Linux — no Mac involved):
+#   1. build the peakbot sidecar with the EXISTING Dockerfile.macos
+#      (unversioned artifact: output/peakbot-macos-universal2)
+#   2. build the universal .app zip with Dockerfile.desktop-macos
+#      (zigbuild universal2 + hand-assembled bundle + rcodesign ad-hoc
+#      signing), exporting output/desktop/PeakBot-Desktop-<v>-macos-universal.zip
+#      (the Dockerfile runs the S-M1..S-M6 smoke checks before exporting)
+#
 # Environment:
 #   CONTAINER_BUILDER  podman (default) or docker
 #   PRUNE=1            run '<builder> builder prune -af' between builds (CI disk)
@@ -69,10 +77,29 @@ build_desktop_linux() {
 }
 
 build_desktop_macos() {
-    # TODO(P4.2): Dockerfile.desktop-macos (zigbuild universal2) +
-    # macos/assemble-app.sh + scripts/smoke-macos.sh. Separate task.
-    echo "❌ macOS desktop build not implemented yet (task P4.2)" >&2
-    exit 1
+    [ -f output/peakbot-macos-universal2 ] \
+        || { echo "❌ missing sidecar output/peakbot-macos-universal2 — build it first" >&2; exit 1; }
+    echo "🖥️  Building macOS universal .app (Dockerfile.desktop-macos)..."
+    mkdir -p output/desktop
+    "$CONTAINER_BUILDER" build \
+        --build-arg VERSION="$VERSION" \
+        --output type=local,dest=output/desktop \
+        -f Dockerfile.desktop-macos \
+        .
+    [ -f "output/desktop/PeakBot-Desktop-$VERSION-macos-universal.zip" ] \
+        || { echo "❌ expected output/desktop/PeakBot-Desktop-$VERSION-macos-universal.zip" >&2; exit 1; }
+    echo "✅ $(ls -lh "output/desktop/PeakBot-Desktop-$VERSION-macos-universal.zip")"
+}
+
+build_sidecar_macos() {
+    echo "🍎 Building peakbot sidecar (Dockerfile.macos)..."
+    mkdir -p output
+    "$CONTAINER_BUILDER" build \
+        --output type=local,dest=output \
+        -f Dockerfile.macos \
+        .
+    chmod +x output/peakbot-macos-universal2
+    echo "✅ $(ls -lh output/peakbot-macos-universal2)"
 }
 
 build_linux() {
@@ -81,8 +108,14 @@ build_linux() {
     build_desktop_linux
 }
 
+build_macos() {
+    build_sidecar_macos
+    prune_between
+    build_desktop_macos
+}
+
 case "$1" in
     linux) build_linux ;;
-    macos) build_desktop_macos ;;
-    all)   build_linux; prune_between; build_desktop_macos ;;
+    macos) build_macos ;;
+    all)   build_linux; prune_between; build_macos ;;
 esac

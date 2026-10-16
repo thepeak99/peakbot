@@ -1,0 +1,105 @@
+# PeakBot Desktop — macOS universal .app builder (cross-compiled on Linux)
+#
+# Contract: desktop/DESIGN.md §5.7 (build contracts), §9.2 (smoke checks
+# S-M1..S-M6). No Mac is involved: the Tauri app is cross-compiled with
+# cargo-zigbuild (universal2-apple-darwin) and the .app bundle is assembled
+# by hand + ad-hoc signed with rcodesign (the Tauri CLI cannot bundle a
+# .app on Linux).
+#
+# The sidecar (peakbot) is NOT built here — it is built by the EXISTING
+# Dockerfile.macos and staged into the context as
+# output/peakbot-macos-universal2 by desktop/scripts/build-desktop.sh.
+#
+# Usage:
+#   sh desktop/scripts/build-desktop.sh macos
+# (or directly:)
+#   podman build -f Dockerfile.desktop-macos \
+#     --build-arg VERSION=0.23.0 \
+#     --output type=local,dest=output/desktop .
+#
+# Exports a single file: /PeakBot-Desktop-<VERSION>-macos-universal.zip
+#
+# Spike-verified recipe (researcher, Tauri 2.12.4 + zigbuild):
+# - RUSTFLAGS="-C link-arg=-Wl,-headerpad,0x4000" is REQUIRED, else
+#   rcodesign fails with "insufficient room to write code signature load
+#   command" (zig-linked Mach-Os carry only the linker's ad-hoc signature).
+# - Fallback if zigbuild universal2 fails for the Tauri crate: two
+#   single-arch builds + `rcodesign macho-universal-create` (not needed as
+#   of 2026-10-16; universal2 works).
+
+FROM ghcr.io/rust-cross/cargo-zigbuild:0.23.3 AS build
+
+# Both Apple targets for the universal2 build (the image ships rustc +
+# cargo-zigbuild + zig + the macOS SDK at /opt/MacOSX11.3.sdk).
+RUN rustup target add aarch64-apple-darwin x86_64-apple-darwin \
+    && rustup target list --installed
+
+# zip: bundle assembly; unzip + file: the smoke checks need them.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        zip \
+        unzip \
+        file \
+    && rm -rf /var/lib/apt/lists/*
+
+# rcodesign (apple-codesign) — the ad-hoc signer. Pinned version + sha256
+# (verified 2026-10-16, DESIGN.md §5.7).
+RUN curl -fsSL -o /tmp/rcodesign.tar.gz \
+        https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-x86_64-unknown-linux-musl.tar.gz \
+    && echo "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002  /tmp/rcodesign.tar.gz" | sha256sum -c - \
+    && mkdir -p /tmp/rcodesign-x \
+    && tar -xzf /tmp/rcodesign.tar.gz -C /tmp/rcodesign-x \
+    && install -m 755 /tmp/rcodesign-x/apple-codesign-0.29.0-x86_64-unknown-linux-musl/rcodesign /usr/local/bin/rcodesign \
+    && rm -rf /tmp/rcodesign.tar.gz /tmp/rcodesign-x \
+    && rcodesign --help >/dev/null
+
+# Align Mach-O headers to 64KB so rcodesign can (re)sign the binaries, and
+# pin the deployment target (DESIGN.md §5.7 / §6 "macOS min OS").
+ENV RUSTFLAGS="-C link-arg=-Wl,-headerpad,0x4000" \
+    MACOSX_DEPLOYMENT_TARGET=11.0
+# Bound parallel codegen (same rationale as Dockerfile.desktop-linux).
+ENV CARGO_BUILD_JOBS=8
+
+ARG VERSION
+# Root Cargo.toml is the version source for scripts/check-version.sh (it
+# compares root [package].version against desktop [workspace.package].version).
+COPY Cargo.toml /src/Cargo.toml
+COPY desktop/ /src/desktop
+
+# The peakbot sidecar from the existing Dockerfile.macos build (unversioned
+# artifact name — must match build-desktop.sh). tauri-build checks externalBin
+# per REAL target triple, so the universal binary is staged under BOTH arch
+# names (zigbuild universal2 compiles each arch separately).
+ARG SIDECAR=output/peakbot-macos-universal2
+COPY ${SIDECAR} /src/desktop/src-tauri/binaries/peakbot-aarch64-apple-darwin
+COPY ${SIDECAR} /src/desktop/src-tauri/binaries/peakbot-x86_64-apple-darwin
+RUN chmod 755 /src/desktop/src-tauri/binaries/peakbot-aarch64-apple-darwin \
+               /src/desktop/src-tauri/binaries/peakbot-x86_64-apple-darwin
+
+# Fail the build if the desktop workspace version drifted from the root.
+RUN sh /src/desktop/scripts/check-version.sh
+
+# Cross-compile the Tauri app. `--features tauri/custom-protocol` makes
+# generate_context! embed the ui/ status page into the binary (no devUrl).
+# `--locked`: cargo honors the committed desktop/Cargo.lock.
+WORKDIR /src/desktop
+RUN cargo zigbuild --release --locked -p peakbot-desktop \
+        --features tauri/custom-protocol \
+        --target universal2-apple-darwin
+
+# assemble-app.sh / smoke-macos.sh are COPYed LAST (not via `COPY desktop/`)
+# so editing them never invalidates the expensive cargo build layer above.
+COPY desktop/macos/assemble-app.sh /src/desktop/macos/assemble-app.sh
+RUN sh /src/desktop/macos/assemble-app.sh ${VERSION} \
+        /src/desktop/target/universal2-apple-darwin/release/peakbot-desktop \
+        /src/desktop/src-tauri/binaries/peakbot-aarch64-apple-darwin \
+        /out
+
+COPY desktop/scripts/smoke-macos.sh /src/desktop/scripts/smoke-macos.sh
+RUN sh /src/desktop/scripts/smoke-macos.sh \
+        /out/PeakBot-Desktop-${VERSION}-macos-universal.zip ${VERSION}
+
+# Single-file export.
+FROM scratch
+COPY --from=build /out/ /

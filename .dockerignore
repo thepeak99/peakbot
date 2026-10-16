@@ -3,10 +3,12 @@
 #
 # What the builds need from the context:
 #   Dockerfile.linux   → Cargo.toml, Cargo.lock, vendor/, build.rs, build/, src/, web/
-#   Dockerfile.desktop-linux → the above's sibling files are irrelevant, plus
-#                              desktop/ (minus heavy intermediates) and
+#   Dockerfile.desktop-linux → desktop/ (minus heavy intermediates) and
 #                              output/peakbot-linux-amd64 (sidecar, staged by
 #                              desktop/scripts/build-desktop.sh)
+#   Dockerfile.desktop-macos → desktop/ (minus heavy intermediates) and
+#                              output/peakbot-macos-universal2 (sidecar, staged
+#                              by desktop/scripts/build-desktop.sh)
 
 # VCS
 .git
@@ -15,10 +17,11 @@
 target/
 desktop/target/
 
-# Release artifacts: keep ONLY the unversioned linux sidecar that
-# Dockerfile.desktop-linux COPYs in (everything else is previous output)
+# Release artifacts: keep ONLY the unversioned sidecars that the desktop
+# Dockerfiles COPY in (everything else is previous output)
 output/*
 !output/peakbot-linux-amd64
+!output/peakbot-macos-universal2
 *.tar
 
 # Desktop build intermediates (regenerated in-container; the local debug

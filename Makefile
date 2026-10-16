@@ -145,7 +145,8 @@ desktop-dev:
 desktop-linux:
 	sh desktop/scripts/build-desktop.sh linux
 
-## desktop-macos: Build the macOS universal .app zip (not implemented yet — P4.2)
+## desktop-macos: Build the macOS universal .app zip (sidecar via Dockerfile.macos,
+##                then Dockerfile.desktop-macos → output/desktop/*.zip)
 desktop-macos:
 	sh desktop/scripts/build-desktop.sh macos
 
