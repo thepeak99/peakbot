@@ -33,8 +33,15 @@
 //      and fails on the missing rendered output rather than refusing to
 //      execute at all. A separate `npm run typecheck` (if run) would
 //      also be RED, which is expected and fine per the task brief.
+//
+// The "focus mode toggle" block below (plan-focus-mode.md §5 case 25) is
+// RED for the same runtime reason: TopBar renders no
+// `button[aria-label="Focus mode"]` yet and ignores the `focusMode` /
+// `onToggleFocus` props, so the queries return null and the click spy is
+// never called. The pre-existing chip/sub-agent tests in this file must
+// stay GREEN — the extra fixture props are ignored by today's TopBar.
 
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { TopBar } from "./TopBar";
@@ -57,11 +64,11 @@ beforeAll(() => {
 // ─── fixture ────────────────────────────────────────────────────────────
 
 // The real TopBar prop interface as declared today (TopBar.tsx:36-53) has
-// no `statusMessage` field. We type `baseProps` as that real interface
-// PLUS the not-yet-existing field, so the fixture reads the way the
-// post-implementation call site will, while still compiling loosely
-// enough for vitest's transform to run the file.
-interface TopBarPropsWithStatus {
+// no `statusMessage`, `focusMode` or `onToggleFocus` fields. We type
+// `baseProps` as that real interface PLUS the not-yet-existing fields, so
+// the fixture reads the way the post-implementation call site will, while
+// still compiling loosely enough for vitest's transform to run the file.
+interface TopBarFixtureProps {
   isRunning: boolean;
   statusMessage: string | null;
   subAgent: SubAgentRun | null;
@@ -78,10 +85,16 @@ interface TopBarPropsWithStatus {
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
   onToggleNotify: () => void;
+  // Focus mode (plan §6.3): not on TopBar's declared props yet — the
+  // fixture carries them so the case-25 tests target the post-
+  // implementation call site. `focusMode: true` is the shipped default
+  // (D7), mirroring what App.tsx will pass once the hook exists.
+  focusMode: boolean;
+  onToggleFocus: () => void;
   lockedReason?: string | null;
 }
 
-const baseProps: TopBarPropsWithStatus = {
+const baseProps: TopBarFixtureProps = {
   connected: true,
   models: [],
   activeAlias: "gpt",
@@ -98,6 +111,8 @@ const baseProps: TopBarPropsWithStatus = {
   onLoadConversation: () => {},
   notifyEnabled: false,
   onToggleNotify: () => {},
+  focusMode: true,
+  onToggleFocus: () => {},
 };
 
 // ─── mount helper ───────────────────────────────────────────────────────
@@ -105,7 +120,7 @@ const baseProps: TopBarPropsWithStatus = {
 let container: HTMLDivElement | null = null;
 let root: Root | null = null;
 
-async function mount(props: TopBarPropsWithStatus): Promise<HTMLDivElement> {
+async function mount(props: TopBarFixtureProps): Promise<HTMLDivElement> {
   container = document.createElement("div");
   document.body.appendChild(container);
   await act(async () => {
@@ -247,5 +262,62 @@ describe("TopBar — sub-agent chip", () => {
     expect(el.textContent).toContain("working…");
     expect(el.textContent).not.toContain("🧩");
     expect(el.textContent).not.toContain("⏸");
+  });
+});
+
+// ── Focus mode toggle (plan-focus-mode.md §5 case 25, §6.2/§6.3) ──────────
+// TopBar gains `focusMode: boolean` + `onToggleFocus: () => void` and
+// renders a <FocusToggle> immediately before the <ThemeToggle>:
+// a button with aria-label="Focus mode" whose aria-pressed reflects
+// focusMode, invoking onToggleFocus on click.
+//
+// RED today: TopBar renders no such button and ignores both props, so
+// `button[aria-label="Focus mode"]` resolves to null in every test below.
+// (ThemeToggle's aria-label is "Switch to light theme" / "Switch to dark
+// theme" — selected via the "Switch to" prefix, theme-agnostic.)
+
+describe("TopBar — focus mode toggle", () => {
+  it("renders a 'Focus mode' button with aria-pressed=true when focusMode is on (the default)", async () => {
+    const el = await mount({ ...baseProps, focusMode: true });
+
+    const focusBtn = el.querySelector('button[aria-label="Focus mode"]');
+    expect(focusBtn, "TopBar must render the focus toggle button").not.toBeNull();
+    expect(focusBtn!.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("reflects focusMode=false as aria-pressed=false", async () => {
+    const el = await mount({ ...baseProps, focusMode: false });
+
+    const focusBtn = el.querySelector('button[aria-label="Focus mode"]');
+    expect(focusBtn).not.toBeNull();
+    expect(focusBtn!.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("calls onToggleFocus exactly once when the focus button is clicked", async () => {
+    const onToggleFocus = vi.fn();
+    const el = await mount({ ...baseProps, focusMode: true, onToggleFocus });
+
+    const focusBtn = el.querySelector(
+      'button[aria-label="Focus mode"]',
+    ) as HTMLButtonElement | null;
+    expect(focusBtn).not.toBeNull();
+    await act(async () => {
+      focusBtn!.click();
+    });
+    expect(onToggleFocus).toHaveBeenCalledTimes(1);
+  });
+
+  it("sits immediately before the theme toggle in the bar", async () => {
+    const el = await mount({ ...baseProps, focusMode: true });
+
+    const focusBtn = el.querySelector('button[aria-label="Focus mode"]');
+    const themeBtn = el.querySelector('button[aria-label^="Switch to"]');
+    expect(focusBtn).not.toBeNull();
+    expect(themeBtn).not.toBeNull();
+    // DOCUMENT_POSITION_FOLLOWING (0x04) set ⇒ theme button comes after
+    // the focus button in document order.
+    expect(
+      focusBtn!.compareDocumentPosition(themeBtn!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
 });

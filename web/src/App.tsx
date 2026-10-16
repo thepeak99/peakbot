@@ -16,6 +16,7 @@ import { Composer } from "./components/Composer";
 import { DropOverlay } from "./components/DropOverlay";
 import { TopBar } from "./components/TopBar";
 import { BottomBar } from "./components/BottomBar";
+import { ActivityRow } from "./components/ActivityRow";
 import { TabbedDrawer } from "./components/TabbedDrawer";
 import { StatsPanel } from "./components/StatsPanel";
 import { TodoPanel } from "./components/TodoPanel";
@@ -27,6 +28,8 @@ import { useAgent } from "./useAgent";
 import { useAttachments } from "./useAttachments";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
+import { useFocusMode } from "./useFocusMode";
+import { focusView } from "./focus";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
 import { filterTabs, resolveActiveTab } from "./tabs";
 import type { ViewFilter } from "./types";
@@ -112,6 +115,9 @@ export function App() {
   const [view, setView] = useState<ViewFilter>("global");
   // Sub-agent views only make sense once a pipeline is actually selected.
   const effectiveView: ViewFilter = selectedPipeline ? view : "global";
+  // Called once here (not in TopBar) so App can filter with the same value
+  // the button renders — two useState copies would desync (plan §6.1).
+  const focusMode = useFocusMode();
 
   // Sub-agent roster: one entry per delegation call, in call order (Phase 2 +
   // per-call). Zero backend — derived from the transcript. A role delegated to
@@ -135,13 +141,21 @@ export function App() {
     ? filterMessagesByView(state.chat.messages, effectiveView)
     : [];
 
-  // Remount token for the transcript. Switching conversation or view, or a
-  // transcript that got shorter (truncation/compaction), invalidates every
-  // measured row height and every scroll position — remounting is the whole
-  // reset story: fresh scroll element, fresh virtualizer, fresh pin state.
-  const id = `${state?.conversation?.id ?? "none"}|${effectiveView}`;
+  // Focus is a transcript-rendering concern only — the side panels keep
+  // deriving from the full message list (D12). Global-only: a scoped lane
+  // view means "show me everything" (D11).
+  const focusing = focusMode.focus && effectiveView === "global";
+  const focused = focusing ? focusView(visibleMessages, isRunning) : null;
+  const transcriptMessages = focused ? focused.visible : visibleMessages;
+
+  // Remount token for the transcript. Switching conversation or view, toggling
+  // focus, or a transcript that got shorter (truncation/compaction),
+  // invalidates every measured row height and every scroll position —
+  // remounting is the whole reset story: fresh scroll element, fresh
+  // virtualizer, fresh pin state.
+  const id = `${state?.conversation?.id ?? "none"}|${effectiveView}|${focusing ? "focus" : "all"}`;
   const [epoch, setEpoch] = useState<EpochState>({ id, count: 0, epoch: 0 });
-  const next = nextEpoch(epoch, id, visibleMessages.length);
+  const next = nextEpoch(epoch, id, transcriptMessages.length);
   if (next !== epoch) setEpoch(next); // React's documented adjust-during-render
   const resetKey = epochKey(next);
 
@@ -300,6 +314,8 @@ export function App() {
         notifyEnabled={notify.enabled}
         notifyPermission={notify.permission}
         onToggleNotify={notify.toggle}
+        focusMode={focusMode.focus}
+        onToggleFocus={focusMode.toggle}
         lockedReason={modelLockedReason}
       />
   
@@ -335,10 +351,10 @@ export function App() {
             </div>
           )}
 
-          {visibleMessages.length > 0 ? (
+          {transcriptMessages.length > 0 ? (
             <Transcript
               key={resetKey}
-              messages={visibleMessages}
+              messages={transcriptMessages}
               drawerOpen={drawerOpen}
               ref={transcriptRef}
             />
@@ -348,6 +364,8 @@ export function App() {
               scopeLabel={scopeLabel}
             />
           )}
+
+          {focusing && isRunning && <ActivityRow step={focused?.activity ?? null} />}
 
           <Composer
             isRunning={isRunning}
