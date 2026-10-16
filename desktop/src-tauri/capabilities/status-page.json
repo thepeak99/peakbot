@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "status-page",
+  "description": "Bundled local status page only. No remote origins, ever.",
+  "windows": ["main"],
+  "permissions": ["allow-status", "allow-act"]
+}

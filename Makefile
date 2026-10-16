@@ -1,6 +1,6 @@
 .PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
         web dev \
-        desktop-test \
+        desktop-test desktop-dev \
         release release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android release-publish
 
@@ -132,6 +132,13 @@ rebuild: clean build
 ## desktop-test: Unit tests for the desktop core crate (desktop/core, no webkit)
 desktop-test:
 	cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core
+
+## desktop-dev: Build peakbot (debug), stage the sidecar into src-tauri/binaries,
+##              then run the Tauri dev loop (desktop/DESIGN.md §5.7)
+desktop-dev:
+	cargo build
+	cp target/debug/peakbot desktop/src-tauri/binaries/peakbot-$(shell rustc -vV | sed -n 's/host: //p')
+	cd desktop/src-tauri && npx --yes @tauri-apps/cli@2.12.3 dev
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Release pipeline

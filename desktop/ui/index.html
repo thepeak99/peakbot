@@ -1,0 +1,128 @@
+<!-- peakbot-desktop-status-page -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PeakBot</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f7f7f5;
+        --fg: #1c1c1a;
+        --muted: #6b6b66;
+        --accent: #0f6b4f;
+        --accent-fg: #ffffff;
+        --danger: #b3372f;
+        --border: #d9d9d4;
+        --detail-bg: rgba(127, 127, 127, 0.12);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1c1c1a;
+          --fg: #ececea;
+          --muted: #9a9a93;
+          --accent: #2ea37a;
+          --accent-fg: #08130e;
+          --danger: #e0645c;
+          --border: #3a3a36;
+          --detail-bg: rgba(255, 255, 255, 0.08);
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      main {
+        text-align: center;
+        max-width: 34rem;
+        padding: 2rem;
+      }
+      #title {
+        font-size: 1.4rem;
+        margin: 0 0 0.5rem;
+      }
+      #detail {
+        white-space: pre-wrap;
+        text-align: left;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 0.85rem;
+        color: var(--muted);
+        background: var(--detail-bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 0.75rem 1rem;
+        margin: 1rem auto 0;
+        max-height: 12rem;
+        overflow: auto;
+      }
+      #spinner {
+        width: 2rem;
+        height: 2rem;
+        margin: 1.5rem auto;
+        border: 3px solid var(--border);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      #actions {
+        margin-top: 1.5rem;
+        display: flex;
+        gap: 0.6rem;
+        justify-content: center;
+        flex-wrap: wrap;
+      }
+      #actions button {
+        font: inherit;
+        padding: 0.5rem 1.1rem;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--fg);
+        cursor: pointer;
+      }
+      #actions button:hover {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+      #actions button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-fg);
+      }
+      #actions button.primary:hover {
+        opacity: 0.9;
+        color: var(--accent-fg);
+      }
+      .error {
+        color: var(--danger);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 id="title">PeakBot</h1>
+      <div id="spinner" hidden></div>
+      <pre id="detail" hidden></pre>
+      <div id="actions"></div>
+    </main>
+    <script src="status.js"></script>
+  </body>
+</html>
