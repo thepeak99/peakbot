@@ -32,3 +32,7 @@ desktop/src-tauri/gen/
 # Bundled CBDT emoji font for the fontconfig-isolation host tests
 # (fetched by `make desktop-fonttest` — never commit)
 desktop/src-tauri/linux/fonts/
+
+# The locked Windows desktop plan: absorbed into desktop/DESIGN.md
+# (amendment (windows-portable)); the full document stays on disk only.
+desktop/WINDOWS-PLAN.md

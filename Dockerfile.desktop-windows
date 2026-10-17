@@ -1,0 +1,92 @@
+# PeakBot Desktop — Windows single self-extracting portable exe (DESIGN
+# §5.7, amendment (windows-portable) 2026-10-17).
+#
+# Cross-builds the Tauri desktop app for x86_64-pc-windows-msvc with
+# `cargo xwin` — NO Tauri CLI, no NSIS, no Node (the macOS pipeline proves
+# tauri-build + tauri/custom-protocol does everything the CLI did: ACL,
+# externalBin check, icon/version .rc, static vcruntime, embedded ui/).
+# The peakbot sidecar is staged into src-tauri/binaries/ and embedded as a
+# zstd payload by src-tauri/build.rs; the app extracts it on first launch.
+#
+# Usage: podman build --build-arg VERSION=<v> \
+#          --output type=local,dest=output/desktop \
+#          -f Dockerfile.desktop-windows .
+#
+# The S-W1..S-W4 smoke checks (desktop/scripts/smoke-windows.sh) run on the
+# real artifact BEFORE the scratch export; any failure fails this build.
+
+FROM ghcr.io/rust-lang/rust:1.91-bookworm AS build
+
+# clang lld llvm: xwin C/link + llvm-rc (tauri_winres compiles the
+# icon/version .rc into .rsrc) + llvm-objdump (the S-W3 import-table
+# smoke check). file: S-W2.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        lld \
+        llvm \
+        file \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fail fast (right after the layer that installs them) if the toolchain is
+# missing: a future base-image/package change must surface here with a
+# clear message, not deep inside the cargo build. NOTE: Debian's
+# llvm-rc has NO --version subcommand (it exits 1), so the guard is
+# `command -v` + a version line from llvm-objdump.
+RUN command -v llvm-rc && command -v llvm-objdump \
+    && llvm-objdump --version | head -1
+
+RUN rustup target add x86_64-pc-windows-msvc
+
+# cargo-xwin drives the MSVC SDK download + linker environment
+# (pinned — the MSVC SDK protocol it speaks must match the version that
+# was verified by the spike). XWIN_ACCEPT_LICENSE keeps the SDK license
+# prompt non-interactive; XWIN_CACHE_DIR pins the SDK cache location so
+# the pre-warm below is reused by the real build. CARGO_BUILD_JOBS bounds
+# parallel codegen (a 32-way release build of the Tauri stack peaks past
+# what a shared dev host can spare — same rationale as the Linux build).
+ENV XWIN_ACCEPT_LICENSE=1 \
+    XWIN_CACHE_DIR=/root/.cache/cargo-xwin \
+    CARGO_BUILD_JOBS=8
+RUN cargo install --locked cargo-xwin@0.23.1
+
+# Pre-warm the MSVC SDK cache in its own layer with a throwaway xwin
+# build: the ~100 MB SDK download happens HERE, so a failure in any later
+# layer (and every rebuild) reuses it from the cache instead of
+# re-downloading.
+RUN mkdir -p /xwin-warm/src \
+    && echo "fn main() {}" > /xwin-warm/src/main.rs \
+    && printf '[package]\nname = "xwin-warm"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n' > /xwin-warm/Cargo.toml \
+    && cd /xwin-warm && cargo xwin build --release --target x86_64-pc-windows-msvc
+
+ARG VERSION
+# Root Cargo.toml is the version source for scripts/check-version.sh (it
+# compares root [package].version against desktop [workspace.package].version).
+COPY Cargo.toml /src/Cargo.toml
+COPY desktop/ /src/desktop
+
+# The peakbot sidecar from the Dockerfile.windows msvc build (unversioned
+# artifact name — must match build-desktop.sh). Named with the full target
+# triple so tauri-build's externalBin check passes; src-tauri/build.rs
+# reads the SAME file and embeds it as the zstd payload (I1: identity =
+# content — the staged bytes ARE the payload's content).
+ARG SIDECAR=output/peakbot-windows-amd64-msvc.exe
+COPY ${SIDECAR} /src/desktop/src-tauri/binaries/peakbot-x86_64-pc-windows-msvc.exe
+
+# Fail the build if the desktop workspace version drifted from the root.
+RUN sh /src/desktop/scripts/check-version.sh
+
+# The desktop build. `--features tauri/custom-protocol`: embed ui/ (the
+# status + settings pages) — what `tauri build` enables implicitly.
+# `--locked`: cargo honors the committed desktop Cargo.lock.
+WORKDIR /src/desktop
+RUN cargo xwin build --release --locked -p peakbot-desktop \
+        --target x86_64-pc-windows-msvc --features tauri/custom-protocol
+
+# Name the artifact per DESIGN §5.7 and smoke it (S-W1..S-W4) before
+# exporting. The staged sidecar is passed so S-W4 can verify the embedded
+# payload id matches the payload's content.
+RUN mkdir -p /out && cp target/x86_64-pc-windows-msvc/release/peakbot-desktop.exe /out/PeakBot-Desktop-${VERSION}-windows-x86_64.exe && sh scripts/smoke-windows.sh /out/PeakBot-Desktop-${VERSION}-windows-x86_64.exe ${VERSION} src-tauri/binaries/peakbot-x86_64-pc-windows-msvc.exe
+
+# Single-file export.
+FROM scratch
+COPY --from=build /out/ /

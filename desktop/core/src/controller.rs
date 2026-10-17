@@ -14,7 +14,7 @@ use crate::consts::{
     SESSION_PREFERRED_PORT, STOP_GRACE, TICK,
 };
 use crate::paths::DesktopPaths;
-use crate::phase::{Dialog, Mode, Phase, StartError, StartStep, TrayModel, tray_model};
+use crate::phase::{Dialog, Mode, Phase, Platform, StartError, StartStep, TrayModel, tray_model};
 use crate::ready::{ReadyOutcome, wait_ready};
 use crate::service::{self, InstalledService, LaunchPlan, ReplacePolicy, RunState, ServiceState};
 use crate::session::{self, EarlyExit, PidRecord};
@@ -61,8 +61,8 @@ impl Session {
     }
 }
 
-/// Owns `sys, ui, paths, quitting, policy, phase, bundled, service,
-/// session` (DESIGN §5.3). Every phase assignment goes through
+/// Owns `sys, ui, paths, quitting, policy, platform, phase, bundled,
+/// service, session` (DESIGN §5.3). Every phase assignment goes through
 /// `set_phase`, which is also where the tray model is (re)emitted — a
 /// `service` refresh always lands before the next `set_phase`, so the
 /// tray checkbox mirrors the last `service status`.
@@ -75,6 +75,12 @@ pub struct Controller<S: Sys, U: Ui> {
     /// in `new`, never changes. Chosen at the binary boundary
     /// (release ⇒ Auto, debug ⇒ Ask).
     policy: ReplacePolicy,
+    /// The host platform (Q1): set in `new`, never changes. Chosen once
+    /// by the glue from `cfg!(windows)` via `phase::host_platform()` —
+    /// the pure core never reads `cfg!` itself. On `Platform::Windows`
+    /// the start path is session-only: the background service is
+    /// non-functional in v1 and is never detected.
+    platform: Platform,
     phase: Phase,
     /// The bundled (this app's) PeakBot version — the sidecar's
     /// `--version` output, parsed in CheckingBundled (DESIGN §1: the
@@ -93,6 +99,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         paths: DesktopPaths,
         quitting: Arc<AtomicBool>,
         policy: ReplacePolicy,
+        platform: Platform,
     ) -> Self {
         Self {
             sys,
@@ -100,6 +107,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             paths,
             quitting,
             policy,
+            platform,
             phase: Phase::Starting(StartStep::CheckingBundled),
             bundled: None,
             service: None,
@@ -159,7 +167,12 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     /// `phase_changed` with a fresh tray model.
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
-        let tray = tray_model(&self.phase, self.service.as_ref(), self.bundled.as_ref());
+        let tray = tray_model(
+            &self.phase,
+            self.service.as_ref(),
+            self.bundled.as_ref(),
+            self.platform,
+        );
         self.ui.phase_changed(&self.phase, &tray);
     }
 
@@ -184,6 +197,21 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             Ok(v) => v,
             Err(err) => return self.fail(err),
         };
+
+        // Q1 (WINDOWS-PLAN): the background service is non-functional on
+        // Windows in v1, so it is never detected on start: no
+        // `service status`, no identity/version checks, no
+        // AutoReplace/AskReplace/ConnectService, and no
+        // `Starting(CheckingService)` step ("Looking for a background
+        // service…" must never show on Windows). The session path is the
+        // only path — exactly as when no service is installed. An old
+        // installed service is left untouched (the VM finding: it used to
+        // be silently replaced, then the connect hung 30 s into a dead
+        // end).
+        if self.platform == Platform::Windows {
+            self.launch_session();
+            return;
+        }
 
         let state = self.query_service_status();
         self.service = Some(state.clone());
@@ -844,7 +872,7 @@ mod tests {
     use super::*;
     use crate::consts::{PORT_ATTEMPTS, READY_TIMEOUT, SERVICE_PORT, SESSION_PREFERRED_PORT};
     use crate::paths::DesktopPaths;
-    use crate::phase::{Mode, Phase, StartError, StartStep};
+    use crate::phase::{Mode, Phase, Platform, StartError, StartStep};
     use crate::service::ReplacePolicy;
     use crate::session::PidRecord;
     use crate::settings::{Protocol, SaveRequest, Settings, SettingsWire, render_settings_file};
@@ -937,13 +965,37 @@ mod tests {
         started_with(sys, ui, ReplacePolicy::Ask)
     }
 
-    /// `Controller::new(…, policy)` + `handle(Start)`.
+    /// `Controller::new(…, policy)` + `handle(Start)` on `Platform::Unix`
+    /// — the pre-Q1 behaviour every existing test pins.
     fn started_with(
         sys: FakeSys,
         ui: FakeUi,
         policy: ReplacePolicy,
     ) -> Controller<FakeSys, FakeUi> {
-        let mut ctrl = Controller::new(sys, ui, paths(), Arc::new(AtomicBool::new(false)), policy);
+        started_on(sys, ui, policy, Platform::Unix)
+    }
+
+    /// `Controller::new(…, policy, platform)` + `handle(Start)`.
+    ///
+    /// CONTRACT (Q1, RED until the developer lands it): the constructor
+    /// takes the host platform as its LAST parameter — the glue decides
+    /// it once from `cfg!(windows)` via `phase::host_platform()` and
+    /// passes it into the pure core, exactly like `policy`.
+    /// `pub fn new(sys, ui, paths, quitting, policy, platform: Platform)`.
+    fn started_on(
+        sys: FakeSys,
+        ui: FakeUi,
+        policy: ReplacePolicy,
+        platform: Platform,
+    ) -> Controller<FakeSys, FakeUi> {
+        let mut ctrl = Controller::new(
+            sys,
+            ui,
+            paths(),
+            Arc::new(AtomicBool::new(false)),
+            policy,
+            platform,
+        );
         let _ = ctrl.handle(Action::Start);
         ctrl
     }
@@ -984,6 +1036,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
             ReplacePolicy::Ask,
+            Platform::Unix,
         );
         let _ = ctrl.handle(Action::Start);
         match ctrl.phase() {
@@ -1014,6 +1067,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
             ReplacePolicy::Ask,
+            Platform::Unix,
         );
         let _ = ctrl.handle(Action::Start);
         match ctrl.phase() {
@@ -2172,6 +2226,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
             ReplacePolicy::Ask,
+            Platform::Unix,
         );
         let _ = ctrl.handle(Action::ToggleBackground);
         let _ = ctrl.handle(Action::ReinstallService);
@@ -3280,6 +3335,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
             ReplacePolicy::Ask,
+            Platform::Unix,
         );
         let _ = ctrl.handle(Action::SaveSettings(Settings::Remote.into()));
         assert!(
@@ -4755,6 +4811,223 @@ mod tests {
             matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
             "got {:?}",
             ctrl.phase()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Q1 (WINDOWS-PLAN) — the Windows session-only start.
+    //
+    // The background service is non-functional on Windows in v1, so
+    // `handle_start` on `Platform::Windows` must NOT query the service
+    // status at all — no `service status` sidecar invocation, no
+    // `same_contents`/`--version` comparison against an installed
+    // service, no AutoReplace/install/uninstall — and must ALWAYS take
+    // the session path, spawning the session sidecar exactly as when no
+    // service is installed. This holds even when the fake reports a
+    // service as installed (identical binary, an older version, running
+    // or unknown state). `Platform::Unix` behaviour is unchanged and is
+    // pinned by the existing tests (t46/t47: installed ⇒ ConnectService).
+    // -------------------------------------------------------------------
+
+    // Q1: installed service whose binary is byte-IDENTICAL to the
+    // bundled sidecar (running, and unknown state) — the session path
+    // is taken and the service is never queried.
+    #[test]
+    fn q1_windows_installed_identical_start_spawns_session_without_service_status() {
+        for state in ["running", "unknown"] {
+            let sys = FakeSys::new();
+            sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
+            // The fake reports an installed service (the real-VM
+            // scenario) — on Windows it must never be queried.
+            sys.set_run(
+                "peakbot",
+                &["service", "status"],
+                installed_status_at(INSTALLED_SAME, state),
+            );
+            seed_builds_identical(&sys, INSTALLED_SAME);
+            sys.set_default_probe(vec![Probe::Status(200)]);
+            sys.queue_child(crate::testing::FakeChildSpec::alive());
+            sys.seed_file(WEB_TOKEN, "win-token\n");
+            let ui = FakeUi::new();
+            let ctrl = started_on(
+                sys.clone(),
+                ui.clone(),
+                ReplacePolicy::Ask,
+                Platform::Windows,
+            );
+
+            // (1) The session path was taken, exactly like NotInstalled.
+            assert!(
+                matches!(
+                    ctrl.phase(),
+                    Phase::Ready(Mode::Session { port, .. })
+                        if *port == SESSION_PREFERRED_PORT
+                ),
+                "Windows start must land Ready(Session) even with an installed service (state {state:?}); got {:?}",
+                ctrl.phase()
+            );
+            let spawns = sys.spawned_specs();
+            assert_eq!(spawns.len(), 1, "the session sidecar was spawned once");
+            assert_eq!(
+                spawns[0].args,
+                vec!["--bind".to_string(), "127.0.0.1:7824".to_string()],
+                "the spawn is exactly the session path's (state {state:?}); got {:?}",
+                spawns[0].args
+            );
+            assert!(
+                spawns[0]
+                    .extra_env
+                    .iter()
+                    .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == "win-token"),
+                "the session token plumbing is unchanged (state {state:?}); got {:?}",
+                spawns[0].extra_env
+            );
+
+            // (2) No service sidecar invocation at all.
+            let runs = sys.run_args();
+            assert!(
+                !runs
+                    .iter()
+                    .any(|r| r == &["service".to_string(), "status".to_string()]),
+                "Windows must not run `service status` (state {state:?}); runs: {runs:?}"
+            );
+            assert!(
+                !runs.iter().any(|r| r == &["install".to_string()]),
+                "no binary copy (state {state:?}); runs: {runs:?}"
+            );
+            assert!(
+                !runs
+                    .iter()
+                    .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
+                "no service uninstall (state {state:?}); runs: {runs:?}"
+            );
+            assert!(
+                !runs.iter().any(|r| {
+                    r.first().is_some_and(|s| s == "service")
+                        && r.get(1).is_some_and(|s| s == "install")
+                }),
+                "no service install (state {state:?}); runs: {runs:?}"
+            );
+
+            // (3) No identity/version comparison against the installed exe.
+            assert!(
+                sys.events()
+                    .iter()
+                    .all(|e| !matches!(e, Effect::SameContents { .. })),
+                "no content comparison (state {state:?}); events: {:?}",
+                sys.events()
+            );
+            assert_never_ran(&sys, INSTALLED_SAME);
+
+            // (4) The phase never becomes ConnectingService; no dialog.
+            assert!(
+                !ui.steps()
+                    .iter()
+                    .any(|p| matches!(p, Phase::Starting(StartStep::ConnectingService))),
+                "the phase must never become ConnectingService (state {state:?}); steps: {:?}",
+                ui.steps()
+            );
+            assert!(
+                ui.confirms().is_empty(),
+                "no dialog (state {state:?}); got {:?}",
+                ui.confirms()
+            );
+        }
+    }
+
+    // Q1: the real-VM dead-end — an OLDER service (0.22.0) installed
+    // with the release policy (Auto). Unfixed, `plan_launch` routes to
+    // AutoReplace and silently overwrites the installed binary, then
+    // ConnectService times out after 30 s. On Windows the start must
+    // spawn the session and touch the service in no way: no auto-
+    // replace, no replace dialog.
+    #[test]
+    fn q1_windows_installed_older_start_never_auto_replaces() {
+        let sys = FakeSys::new();
+        sys.set_run("peakbot", &["--version"], versioned("0.23.0")); // bundled
+        // Installed 0.22.0, running, a DIFFERENT build.
+        sys.set_run(
+            "peakbot",
+            &["service", "status"],
+            installed_status_at(INSTALLED_EXE, "running"),
+        );
+        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
+        seed_builds_differ(&sys, INSTALLED_EXE);
+        // The replace commands are deliberately NOT scripted: if the
+        // controller tries to replace the service, it fails loudly
+        // (like t116) — the session path must not need them.
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        sys.queue_child(crate::testing::FakeChildSpec::alive());
+        sys.seed_file(WEB_TOKEN, "win-token\n");
+        let ui = FakeUi::new();
+        let ctrl = started_on(
+            sys.clone(),
+            ui.clone(),
+            ReplacePolicy::Auto,
+            Platform::Windows,
+        );
+
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session { port, .. })
+                    if *port == SESSION_PREFERRED_PORT
+            ),
+            "the session path must be taken; got {:?}",
+            ctrl.phase()
+        );
+        let spawns = sys.spawned_specs();
+        assert_eq!(spawns.len(), 1, "the session sidecar was spawned");
+        assert_eq!(
+            spawns[0].args,
+            vec!["--bind".to_string(), "127.0.0.1:7824".to_string()],
+            "the spawn is exactly the session path's; got {:?}",
+            spawns[0].args
+        );
+
+        let runs = sys.run_args();
+        assert!(
+            !runs
+                .iter()
+                .any(|r| r == &["service".to_string(), "status".to_string()]),
+            "Windows must not run `service status`; runs: {runs:?}"
+        );
+        assert!(
+            !runs.iter().any(|r| r == &["install".to_string()]),
+            "no silent binary copy (the VM bug); runs: {runs:?}"
+        );
+        assert!(
+            !runs
+                .iter()
+                .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
+            "no service uninstall; runs: {runs:?}"
+        );
+        assert!(
+            !runs.iter().any(|r| {
+                r.first().is_some_and(|s| s == "service")
+                    && r.get(1).is_some_and(|s| s == "install")
+            }),
+            "no service install; runs: {runs:?}"
+        );
+        assert!(
+            sys.events()
+                .iter()
+                .all(|e| !matches!(e, Effect::SameContents { .. })),
+            "no content comparison; events: {:?}",
+            sys.events()
+        );
+        assert_never_ran(&sys, INSTALLED_EXE);
+        assert!(
+            !ui.steps()
+                .iter()
+                .any(|p| matches!(p, Phase::Starting(StartStep::ConnectingService))),
+            "the phase must never become ConnectingService; steps: {:?}",
+            ui.steps()
+        );
+        assert!(
+            ui.confirms().is_empty(),
+            "no replace dialog; got {:?}",
+            ui.confirms()
         );
     }
 }

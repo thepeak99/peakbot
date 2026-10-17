@@ -3,14 +3,14 @@
 
 use std::sync::Arc;
 
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_opener::OpenerExt;
 
 use peakbot_desktop_core::controller::Action;
 use peakbot_desktop_core::paths::DesktopPaths;
-use peakbot_desktop_core::phase::TrayModel;
+use peakbot_desktop_core::phase::{TrayModel, background_offered, host_platform};
 
 use crate::bridge::UiState;
 use crate::commands::ActionTx;
@@ -19,47 +19,54 @@ use crate::window;
 pub const TRAY_ID: &str = "peakbot-tray";
 
 /// The items a `TrayModel` updates (everything else is static). Kept as
-/// clones: 2.12's `TrayIcon` exposes no `get_menu()`.
+/// clones: 2.12's `TrayIcon` exposes no `get_menu()`. `background` is
+/// `None` when the platform doesn't offer the background service (Q1:
+/// Windows in v1) — the item is then absent from the menu entirely.
 pub struct TrayItems {
     pub status: MenuItem<Wry>,
-    pub background: CheckMenuItem<Wry>,
+    pub background: Option<CheckMenuItem<Wry>>,
 }
 
-fn build_dynamic_items(app: &AppHandle) -> tauri::Result<TrayItems> {
+fn build_dynamic_items(app: &AppHandle, background_visible: bool) -> tauri::Result<TrayItems> {
     let status = MenuItem::with_id(app, "status", "PeakBot", false, None::<&str>)?;
-    let background = CheckMenuItem::with_id(
-        app,
-        "background",
-        "Keep PeakBot running in background",
-        true,
-        false,
-        None::<&str>,
-    )?;
+    let background = (background_visible)
+        .then(|| {
+            CheckMenuItem::with_id(
+                app,
+                "background",
+                "Keep PeakBot running in background",
+                true,
+                false,
+                None::<&str>,
+            )
+        })
+        .transpose()?;
     Ok(TrayItems { status, background })
 }
 
 /// Build the tray icon + menu and stash the dynamic items in `state`.
 pub fn create(app: &AppHandle, state: &Arc<UiState>) -> tauri::Result<()> {
-    let items = build_dynamic_items(app)?;
+    // Q1: the background item is offered per platform (hidden on
+    // Windows in v1) — decided once, from the pure core.
+    let background_visible = background_offered(host_platform());
+    let items = build_dynamic_items(app, background_visible)?;
     let open = MenuItem::with_id(app, "open", "Open PeakBot", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let logs = MenuItem::with_id(app, "logs", "Open logs folder", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit PeakBot Desktop", true, None::<&str>)?;
 
-    let menu = Menu::with_items(
-        app,
-        &[
-            &items.status,
-            &PredefinedMenuItem::separator(app)?,
-            &open,
-            &settings,
-            &PredefinedMenuItem::separator(app)?,
-            &items.background,
-            &logs,
-            &PredefinedMenuItem::separator(app)?,
-            &quit,
-        ],
-    )?;
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    let sep3 = PredefinedMenuItem::separator(app)?;
+    let mut menu_items: Vec<&dyn IsMenuItem<Wry>> =
+        vec![&items.status, &sep1, &open, &settings, &sep2];
+    if let Some(background) = &items.background {
+        menu_items.push(background);
+    }
+    menu_items.push(&logs);
+    menu_items.push(&sep3);
+    menu_items.push(&quit);
+    let menu = Menu::with_items(app, &menu_items)?;
 
     let Some(icon) = app.default_window_icon().cloned() else {
         log::error!("no default window icon; tray not created");
@@ -98,9 +105,11 @@ pub fn apply(state: &Arc<UiState>, model: &TrayModel) {
         return;
     };
     let _ = items.status.set_text(model.status.as_str());
-    let _ = items.background.set_text(model.background_label.as_str());
-    let _ = items.background.set_checked(model.background_checked);
-    let _ = items.background.set_enabled(model.background_enabled);
+    if let Some(background) = &items.background {
+        let _ = background.set_text(model.background_label.as_str());
+        let _ = background.set_checked(model.background_checked);
+        let _ = background.set_enabled(model.background_enabled);
+    }
 }
 
 /// Shared by the tray menu and the macOS app menu (same locked ids).
@@ -142,7 +151,7 @@ pub fn handle_menu_event(app: &AppHandle, id: &str) {
 pub fn build_app_submenu(app: &AppHandle) -> tauri::Result<tauri::menu::Submenu<tauri::Wry>> {
     use tauri::menu::Submenu;
 
-    let items = build_dynamic_items(app)?;
+    let items = build_dynamic_items(app, true)?; // macOS ⇒ Unix ⇒ always offered
     let open = MenuItem::with_id(app, "open", "Open PeakBot", true, None::<&str>)?;
     // The macOS accelerator (design #377 §5.3); the same id flows through
     // `handle_menu_event` on both the tray and the app menu.
@@ -162,7 +171,10 @@ pub fn build_app_submenu(app: &AppHandle) -> tauri::Result<tauri::menu::Submenu<
         &open,
         &settings,
         &PredefinedMenuItem::separator(app)?,
-        &items.background,
+        &items
+            .background
+            .as_ref()
+            .expect("background is offered on macOS (Unix)"),
         &logs,
         &PredefinedMenuItem::separator(app)?,
         &quit,

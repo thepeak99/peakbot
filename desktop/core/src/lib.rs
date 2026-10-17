@@ -11,6 +11,7 @@
 pub mod consts;
 pub mod controller;
 pub mod env;
+pub mod extract;
 pub mod fontconfig;
 pub mod nav;
 pub mod paths;

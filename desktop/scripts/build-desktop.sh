@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# build-desktop.sh <linux|macos|all>
+# build-desktop.sh <linux|macos|windows|all>
 #
 # Single entry point for desktop artifact builds — used by the Makefile AND
 # CI (desktop/DESIGN.md §5.7). Needs only sh + a container builder.
@@ -20,6 +20,15 @@
 #      signing), exporting output/desktop/PeakBot-Desktop-<v>-macos-universal.zip
 #      (the Dockerfile runs the S-M1..S-M6 smoke checks before exporting)
 #
+# Windows pipeline (cross-built on Linux — no Windows involved):
+#   1. build the peakbot sidecar with the EXISTING Dockerfile.windows
+#      (TARGET=x86_64-pc-windows-msvc, cargo-xwin + MSVC SDK, static CRT
+#      → unversioned artifact: output/peakbot-windows-amd64-msvc.exe)
+#   2. build the portable exe with Dockerfile.desktop-windows
+#      (cargo-xwin, no Tauri CLI; the sidecar is embedded as a zstd
+#      payload) → output/desktop/PeakBot-Desktop-<v>-windows-x86_64.exe
+#      (S-W1..S-W4 run before export)
+#
 # Environment:
 #   CONTAINER_BUILDER  podman (default) or docker
 #   PRUNE=1            run '<builder> builder prune -af' between builds (CI disk)
@@ -27,8 +36,8 @@
 set -eu
 
 case "${1:-}" in
-    linux|macos|all) ;;
-    *) echo "usage: build-desktop.sh <linux|macos|all>" >&2; exit 2 ;;
+    linux|macos|windows|all) ;;
+    *) echo "usage: build-desktop.sh <linux|macos|windows|all>" >&2; exit 2 ;;
 esac
 
 # Resolve the repo root from this script's location (works from any cwd).
@@ -109,6 +118,32 @@ build_sidecar_macos() {
     echo "✅ $(ls -lh output/peakbot-macos-universal2)"
 }
 
+build_sidecar_windows() {
+    echo "🪟 Building peakbot sidecar (Dockerfile.windows, msvc/cargo-xwin)..."
+    mkdir -p output
+    "$CONTAINER_BUILDER" build \
+        --build-arg TARGET=x86_64-pc-windows-msvc \
+        --output type=local,dest=output \
+        -f Dockerfile.windows \
+        .
+    echo "✅ $(ls -lh output/peakbot-windows-amd64-msvc.exe)"
+}
+
+build_desktop_windows() {
+    [ -f output/peakbot-windows-amd64-msvc.exe ] \
+        || { echo "❌ missing sidecar output/peakbot-windows-amd64-msvc.exe — build it first" >&2; exit 1; }
+    echo "🖥️  Building Windows portable exe (Dockerfile.desktop-windows)..."
+    mkdir -p output/desktop
+    "$CONTAINER_BUILDER" build \
+        --build-arg VERSION="$VERSION" \
+        --output type=local,dest=output/desktop \
+        -f Dockerfile.desktop-windows \
+        .
+    [ -f "output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64.exe" ] \
+        || { echo "❌ expected output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64.exe" >&2; exit 1; }
+    echo "✅ $(ls -lh "output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64.exe")"
+}
+
 build_linux() {
     build_sidecar_linux
     prune_between
@@ -121,8 +156,15 @@ build_macos() {
     build_desktop_macos
 }
 
+build_windows() {
+    build_sidecar_windows
+    prune_between
+    build_desktop_windows
+}
+
 case "$1" in
-    linux) build_linux ;;
-    macos) build_macos ;;
-    all)   build_linux; prune_between; build_macos ;;
+    linux)   build_linux ;;
+    macos)   build_macos ;;
+    windows) build_windows ;;
+    all)     build_linux; prune_between; build_macos; prune_between; build_windows ;;
 esac

@@ -47,7 +47,10 @@ impl UiState {
             snapshot: Mutex::new(status_view(&starting)),
             nav: Arc::new(RwLock::new(None)),
             tray_model: Mutex::new(peakbot_desktop_core::phase::tray_model(
-                &starting, None, None,
+                &starting,
+                None,
+                None,
+                peakbot_desktop_core::phase::host_platform(),
             )),
             tray_items: Mutex::new(None),
         }

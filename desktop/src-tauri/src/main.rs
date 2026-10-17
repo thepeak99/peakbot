@@ -1,9 +1,12 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! PeakBot Desktop — the thin Tauri shell over `peakbot-desktop-core`
 //! (DESIGN §5.4). All decisions live in core; this wires the window,
 //! tray, dialogs and the controller thread together.
 
 mod bridge;
 mod commands;
+#[cfg(windows)]
+mod sidecar_payload;
 #[cfg(target_os = "linux")]
 mod tls_trust;
 mod tray;
@@ -19,6 +22,7 @@ use tauri::Manager;
 use peakbot_desktop_core::controller::{Action, Controller, run_loop};
 use peakbot_desktop_core::fontconfig;
 use peakbot_desktop_core::paths::DesktopPaths;
+use peakbot_desktop_core::phase::host_platform;
 use peakbot_desktop_core::service::ReplacePolicy;
 
 /// Bounds `RunEvent::Exit` against a controller stuck in a modal dialog.
@@ -183,7 +187,7 @@ fn main() {
             } else {
                 ReplacePolicy::Auto
             };
-            let controller = Controller::new(sys, ui, paths, quitting, policy);
+            let controller = Controller::new(sys, ui, paths, quitting, policy, host_platform());
             std::thread::Builder::new()
                 .name("controller".into())
                 .spawn(move || run_loop(controller, rx))
@@ -247,11 +251,33 @@ fn shutdown(app: &tauri::AppHandle) {
     }
 }
 
-/// `DesktopPaths` for this app (DESIGN §3.6/§3.7): sidecar next to the
-/// executable when bundled, `binaries/peakbot-<triple>` in a dev build.
+/// `DesktopPaths` for this app (DESIGN §3.6/§3.7). The sidecar is decided
+/// HERE and only here: next to the executable in Linux/macOS bundles,
+/// `binaries/peakbot-<triple>` in a dev build, and on Windows the
+/// embedded payload extracted to
+/// `%LOCALAPPDATA%\com.peakbot.desktop\bin\<version>-<sha12>\peakbot.exe`
+/// (a `peakbot.exe` next to the desktop exe is intentionally ignored —
+/// the embedded payload is the single source). Extraction failures are
+/// logged and surface as the existing `SidecarMissing` view; the next
+/// launch retries.
 fn build_paths(app: &tauri::AppHandle) -> tauri::Result<DesktopPaths> {
-    let exe = std::env::current_exe()?;
+    #[cfg(windows)]
     let sidecar = {
+        use peakbot_desktop_core::extract;
+        let bin_root = app.path().app_local_data_dir()?.join("bin");
+        let sidecar = extract::payload_path(&bin_root, sidecar_payload::ID);
+        if let Err(e) = extract::ensure_extracted(&sidecar, sidecar_payload::write_to) {
+            log::error!(
+                "could not unpack the PeakBot backend to {}: {e}",
+                sidecar.display()
+            );
+        }
+        extract::prune_siblings(&sidecar);
+        sidecar
+    };
+    #[cfg(not(windows))]
+    let sidecar = {
+        let exe = std::env::current_exe()?;
         let bundled = peakbot_desktop_core::paths::sidecar_path(&exe);
         if bundled.exists() {
             bundled

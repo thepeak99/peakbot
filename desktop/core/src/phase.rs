@@ -272,10 +272,45 @@ fn failed_view(err: &StartError) -> StatusView {
     }
 }
 
+/// The host platform the app runs on. The glue decides it ONCE from
+/// `cfg!(windows)` (in `host_platform`) and the pure core derives the
+/// visible features from it — so the decision is unit-testable on every
+/// host (`core/tests/background_platform.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    /// Background service is non-functional in v1 (Q1) — not offered.
+    Windows,
+    /// Linux/macOS — unchanged.
+    Unix,
+}
+
+/// The single place the compile target becomes a `Platform`: the Tauri
+/// glue calls it once and passes the result into the pure core
+/// (`Controller::new`, `tray_model`, the tray) — never a bare `cfg!`
+/// inside core.
+pub fn host_platform() -> Platform {
+    if cfg!(windows) {
+        Platform::Windows
+    } else {
+        Platform::Unix
+    }
+}
+
+/// Q1: the background-service toggle is NOT offered on Windows in v1
+/// (it would advertise a feature that doesn't work: schtasks has no
+/// `/Run`, `run_state` is Unknown, a console window at logon); on Unix
+/// (Linux/macOS) it stays offered, unchanged.
+pub fn background_offered(p: Platform) -> bool {
+    p != Platform::Windows
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayModel {
     /// Disabled first item.
     pub status: String,
+    /// The background checkbox item is shown only when true (Q1: hidden
+    /// on Windows in v1); derived from `background_offered`.
+    pub background_visible: bool,
     pub background_checked: bool,
     pub background_enabled: bool,
     pub background_label: String,
@@ -285,6 +320,7 @@ pub fn tray_model(
     phase: &Phase,
     service: Option<&ServiceState>,
     bundled: Option<&Version>,
+    platform: Platform,
 ) -> TrayModel {
     let v = bundled
         .map(Version::to_string)
@@ -311,6 +347,7 @@ pub fn tray_model(
         );
     TrayModel {
         status,
+        background_visible: background_offered(platform),
         background_checked,
         background_enabled,
         background_label,
@@ -623,6 +660,7 @@ mod tests {
             &Phase::Starting(StartStep::CheckingBundled),
             Some(&ServiceState::NotInstalled),
             Some(&v),
+            Platform::Unix,
         );
         assert_eq!(t.status, "PeakBot 0.23.0 · starting…");
         assert!(!t.background_checked);
@@ -630,13 +668,18 @@ mod tests {
         assert_eq!(t.background_label, "Keep PeakBot running in background");
 
         // Ready(Session) + NotInstalled → unchecked, enabled.
-        let t = tray_model(&ready_session, Some(&ServiceState::NotInstalled), Some(&v));
+        let t = tray_model(
+            &ready_session,
+            Some(&ServiceState::NotInstalled),
+            Some(&v),
+            Platform::Unix,
+        );
         assert_eq!(t.status, "PeakBot 0.23.0 · running (port 7824)");
         assert!(!t.background_checked);
         assert!(t.background_enabled);
 
         // Ready(Service) + Installed → checked, enabled.
-        let t = tray_model(&ready_service, Some(&installed), Some(&v));
+        let t = tray_model(&ready_service, Some(&installed), Some(&v), Platform::Unix);
         assert_eq!(t.status, "PeakBot 0.23.0 · running in background");
         assert!(t.background_checked);
         assert!(t.background_enabled);
@@ -646,6 +689,7 @@ mod tests {
             &Phase::Failed(StartError::PortUnavailable),
             Some(&installed),
             Some(&v),
+            Platform::Unix,
         );
         assert_eq!(t.status, "PeakBot 0.23.0 · error");
         assert!(t.background_checked);
@@ -655,7 +699,7 @@ mod tests {
         let unavail = ServiceState::Unavailable {
             reason: "no bus".into(),
         };
-        let t = tray_model(&ready_session, Some(&unavail), Some(&v));
+        let t = tray_model(&ready_session, Some(&unavail), Some(&v), Platform::Unix);
         assert_eq!(
             t.background_label,
             "Keep PeakBot running in background (unavailable)"
@@ -663,11 +707,16 @@ mod tests {
         assert!(!t.background_enabled);
 
         // service None → disabled.
-        let t = tray_model(&ready_service, None, Some(&v));
+        let t = tray_model(&ready_service, None, Some(&v), Platform::Unix);
         assert!(!t.background_enabled);
 
         // bundled None → `?`.
-        let t = tray_model(&Phase::Starting(StartStep::CheckingBundled), None, None);
+        let t = tray_model(
+            &Phase::Starting(StartStep::CheckingBundled),
+            None,
+            None,
+            Platform::Unix,
+        );
         assert_eq!(t.status, "PeakBot ? · starting…");
     }
 

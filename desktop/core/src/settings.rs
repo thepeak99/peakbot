@@ -247,6 +247,9 @@ pub struct SettingsView {
     /// The app window can trust PeakBot's CA on Linux only (design
     /// #377b §3.2): the page shows the macOS certificate note when true.
     pub cert_warning: bool,
+    /// The background row is shown only when true (Q1: hidden on
+    /// Windows in v1); = `TrayModel.background_visible`.
+    pub background_visible: bool,
     pub background: bool,
     pub background_enabled: bool,
     /// `status.kind == "starting"`.
@@ -266,6 +269,7 @@ pub fn settings_view(
         // The view drops the token when the token is off.
         token: if s.token() { token } else { None },
         cert_warning: !cfg!(target_os = "linux"),
+        background_visible: tray.background_visible,
         background: tray.background_checked,
         background_enabled: tray.background_enabled,
         busy: status.kind == "starting",
@@ -517,6 +521,7 @@ mod tests {
     fn tray() -> TrayModel {
         TrayModel {
             status: "PeakBot 0.23.0 · running (port 7824)".into(),
+            background_visible: true,
             background_checked: true,
             background_enabled: false,
             background_label: "Keep PeakBot running in background".into(),

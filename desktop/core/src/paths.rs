@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 /// The directories/files the desktop app owns (DESIGN §3.6/§3.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopPaths {
-    /// `sidecar_path(current_exe)`.
+    /// The sidecar the app runs: next to the exe in Linux/macOS bundles,
+    /// `binaries/peakbot-<triple>` in dev, the extracted payload on
+    /// Windows (`extract::payload_path`).
     pub sidecar: PathBuf,
     /// tauri `app_data_dir()`.
     pub data_dir: PathBuf,
