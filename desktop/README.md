@@ -4,6 +4,40 @@ PeakBot Desktop is a small app window around the PeakBot web UI. It ships its ow
 PeakBot backend (the *sidecar*) and starts and stops it for you. Design and
 contracts: [`DESIGN.md`](DESIGN.md).
 
+## Building
+
+Desktop artifacts are cross-built on Linux in containers (podman by default;
+`CONTAINER_BUILDER=docker` to override). Output lands in `output/desktop/`.
+
+| Command | Artifact |
+|---|---|
+| `make desktop-linux` | `PeakBot-Desktop-<v>-linux-x86_64.AppImage` |
+| `make desktop-macos` | `PeakBot-Desktop-<v>-macos-universal.zip` |
+| `make desktop-windows` | `PeakBot-Desktop-<v>-windows-x86_64.exe` |
+| `make desktop` | all three |
+
+`make desktop-windows` cross-compiles with `cargo-xwin` (MSVC target, static CRT,
+no Windows machine or wine). The PeakBot sidecar is embedded in the exe as a
+compressed payload, so the result is a single portable file. The first run
+downloads the MSVC SDK (cached in the build layers) and takes a while.
+
+## Windows
+
+- **One file, no install.** `PeakBot-Desktop-<v>-windows-x86_64.exe` runs from
+  anywhere — double-click it (from Downloads, a USB stick, a read-only folder).
+  No installer, no admin rights.
+- **Unsigned build → SmartScreen warning.** The exe is not code-signed, so
+  Windows shows "Windows protected your PC". Click **More info → Run anyway**.
+- **WebView2 required.** The app window uses Microsoft Edge WebView2, which is
+  preinstalled on Windows 11 and on almost every Windows 10. On the rare machine
+  without it, the app shows a dialog with the download link.
+- **First launch unpacks the backend.** The app extracts the bundled PeakBot
+  backend to `%LOCALAPPDATA%\com.peakbot.desktop\bin\` (about 40 MB, once per
+  version; older versions are removed automatically).
+- **Background mode is not available on Windows yet.** The "Keep PeakBot
+  running in background" option is therefore not shown on Windows; the app runs
+  in the foreground (window + tray) and the backend exits with it.
+
 ## Settings
 
 Open **Settings** with any of:
@@ -30,7 +64,8 @@ The access token is mandatory **only for remote access**. On this computer you c
 turn it off, but then any program or web page on it can control PeakBot (see
 #378) — leave it on unless you have a reason. The token lives in PeakBot's own
 `web-token` file (Linux `~/.config/peakbot/web-token`, macOS
-`~/Library/Application Support/com.peakbot.peakbot/web-token`); the settings page
+`~/Library/Application Support/com.peakbot.peakbot/web-token`, Windows
+`%APPDATA%\peakbot\peakbot\config\web-token`); the settings page
 shows the exact path and the current value. Turning the token off removes that file,
 and the terminal `peakbot` command then runs without a token too. It is not rotated
 on every launch.
@@ -73,6 +108,7 @@ Settings are saved in `settings.json` in the app's data folder:
 
 - Linux: `~/.local/share/com.peakbot.desktop/settings.json`
 - macOS: `~/Library/Application Support/com.peakbot.desktop/settings.json`
+- Windows: `%APPDATA%\com.peakbot.desktop\settings.json`
 
 **To reset to the defaults (HTTP, token on, remote off), quit the app and delete
 `settings.json`.** A missing or unreadable file always loads as the defaults.
@@ -103,6 +139,11 @@ remains licensed under OFL-1.1; the full license text ships with the app.
 - macOS: `~/.local/bin/peakbot service uninstall` (or `launchctl bootout gui/$(id -u)/com.peakbot.agent; rm ~/Library/LaunchAgents/com.peakbot.agent.plist`);
   optionally `rm ~/.local/bin/peakbot` and
   `rm -r ~/Library/Application\ Support/com.peakbot.desktop ~/Library/Logs/com.peakbot.desktop`.
+- Windows: quit the app, then delete the `PeakBot-Desktop-<v>-windows-x86_64.exe`
+  file; optionally delete `%LOCALAPPDATA%\com.peakbot.desktop` (the unpacked
+  backend + settings) and `%APPDATA%\com.peakbot.desktop` (settings). There is
+  no installer and no background task to remove. Settings in `%APPDATA%\peakbot`
+  are user data — delete them only deliberately.
 - First launch on macOS (unsigned build): `xattr -dr com.apple.quarantine "/Applications/PeakBot Desktop.app"`.
 
 Before deleting the app, untick *Keep PeakBot running in background* if you don't
