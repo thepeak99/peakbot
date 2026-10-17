@@ -2,7 +2,7 @@
 //! opens sockets, sends signals, and touches files. Tests inject the
 //! `FakeSys` from `crate::testing`.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::io::{Read, Write};
@@ -17,6 +17,23 @@ use url::Url;
 use crate::consts::{PROBE_TIMEOUT, RUN_TIMEOUT};
 use crate::env::sanitize_env;
 use crate::token::Token;
+
+/// THE only process constructor in this crate: every child goes through
+/// it, and on Windows it is created with the `CREATE_NO_WINDOW` flag, so
+/// the GUI-subsystem desktop app never spawns a console (a bare
+/// `std::process::Command` would, for EVERY child — `wmic` and
+/// `taskkill` flash consoles too).
+fn command(program: impl AsRef<OsStr>) -> Command {
+    #[allow(unused_mut)] // mut is only used in the (windows) cfg block
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
 
 /// Output of one short-lived command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +170,7 @@ impl Sys for RealSys {
     /// polled until the timeout then kill → `Err(TimedOut)`. `NotFound`
     /// if the program is missing.
     fn run(&self, program: &Path, args: &[&str]) -> io::Result<RunOutput> {
-        let mut child = Command::new(program)
+        let mut child = command(program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -215,7 +232,7 @@ impl Sys for RealSys {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&spec.log, fs::Permissions::from_mode(0o600))?;
         }
-        let child = Command::new(&spec.program)
+        let child = command(&spec.program)
             .args(&spec.args)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file.try_clone()?))
@@ -344,7 +361,7 @@ impl Sys for RealSys {
     fn cmdline_of(&self, pid: u32) -> Option<String> {
         #[cfg(unix)]
         {
-            let out = Command::new("ps")
+            let out = command("ps")
                 .args(["-o", "command=", "-p", &pid.to_string()])
                 .output()
                 .ok()?;
@@ -358,7 +375,7 @@ impl Sys for RealSys {
         {
             // Not exercised (unix is the only tested target); best
             // effort via wmic.
-            let out = Command::new("wmic")
+            let out = command("wmic")
                 .args([
                     "process",
                     "where",
@@ -394,7 +411,7 @@ impl Sys for RealSys {
                 Signal::Interrupt => vec!["/pid".into(), pid_s],
                 Signal::Kill => vec!["/pid".into(), pid_s, "/f".into()],
             };
-            let _ = Command::new("taskkill")
+            let _ = command("taskkill")
                 .args(&args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

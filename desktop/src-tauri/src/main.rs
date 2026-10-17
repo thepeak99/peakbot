@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! PeakBot Desktop — the thin Tauri shell over `peakbot-desktop-core`
 //! (DESIGN §5.4). All decisions live in core; this wires the window,
 //! tray, dialogs and the controller thread together.
