@@ -9,6 +9,9 @@
 #   Dockerfile.desktop-macos → desktop/ (minus heavy intermediates) and
 #                              output/peakbot-macos-universal2 (sidecar, staged
 #                              by desktop/scripts/build-desktop.sh)
+#   Dockerfile.desktop-windows → desktop/ (minus heavy intermediates) and
+#                              output/peakbot-windows-amd64-msvc.exe (sidecar,
+#                              staged by desktop/scripts/build-desktop.sh)
 
 # VCS
 .git
@@ -22,6 +25,7 @@ desktop/target/
 output/*
 !output/peakbot-linux-amd64
 !output/peakbot-macos-universal2
+!output/peakbot-windows-amd64-msvc.exe
 *.tar
 
 # Desktop build intermediates (regenerated in-container; the local debug
