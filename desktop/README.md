@@ -83,6 +83,18 @@ service manager.
 
 When the app starts and a background service is installed, it checks whether the installed binary is **exactly** the build the app bundles, by comparing file contents (not just the version number). If they differ, the app replaces `~/.local/bin/peakbot` and the service automatically — no dialog — keeping the service's HTTP/HTTPS mode and access token. Two exceptions: if the installed PeakBot is *newer* than the app's, the app asks first (and remembers a "Keep" answer), and development builds (built with `make desktop-dev`) always ask, so a debug binary can never silently overwrite your installed `peakbot`. If the binary can't be written, the existing service is left running and the app shows the error.
 
+## Bundled emoji font (Linux AppImage)
+
+The Linux AppImage bundles Google's **Noto Color Emoji** font
+(`NotoColorEmoji.ttf`, CBDT bitmap format) together with its **SIL Open Font
+License 1.1** text (`OFL.txt`) under `usr/share/peakbot-desktop/fonts/` in the
+AppImage. It is used only on systems whose emoji font is in a format the
+bundled web engine can't render (COLRv1 on recent Fedora): at startup the app
+points `FONTCONFIG_FILE` at a small generated config that adds the bundled
+font and hides outline color fonts. If you set your own `FONTCONFIG_FILE`,
+the app leaves it alone. The font is © the Noto Color Emoji contributors and
+remains licensed under OFL-1.1; the full license text ships with the app.
+
 ## Manual removal
 
 - Linux: `peakbot service uninstall` (or `systemctl --user disable --now peakbot.service; rm ~/.config/systemd/user/peakbot.service; systemctl --user daemon-reload`);

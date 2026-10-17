@@ -1,7 +1,7 @@
 # PeakBot Desktop — Linux x86_64 AppImage builder
 #
 # Contract: desktop/DESIGN.md §5.7 (build contracts), §9.2 (smoke checks
-# S-L1..S-L7). The sidecar (peakbot) is NOT built here — it is built by the
+# S-L1..S-L8). The sidecar (peakbot) is NOT built here — it is built by the
 # EXISTING Dockerfile.linux and staged into the context as
 # output/peakbot-linux-amd64 by desktop/scripts/build-desktop.sh.
 #
@@ -20,7 +20,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Toolchain per DESIGN.md §5.7: webkit2gtk-4.1 (the webview ABI the smoke
 # check pins), appindicator/rsvg (tray + icons), plus the tools the smoke
-# check itself needs (file, binutils → objdump/readelf, xz).
+# check itself needs (file, binutils → objdump/readelf, xz). fontconfig +
+# fonts-dejavu-core back the DESIGN §4.12 host fontconfig tests (h1–h8:
+# fc-match/fc-list, and a /usr/share/fonts sans-serif for h8).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
@@ -32,6 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         patchelf \
         xdg-utils \
         file \
+        fontconfig \
+        fonts-dejavu-core \
         xz-utils \
         curl \
         ca-certificates \
@@ -73,10 +77,19 @@ RUN sh /src/desktop/scripts/check-version.sh
 # the ui/ status page is embedded, no devUrl.)
 # The AppImage bundler downloads linuxdeploy/appimagetool from GitHub, so this
 # step needs network access.
+# DESIGN §4.12: fetch the bundled CBDT emoji font (pinned sha256) into the
+# AppImage source tree — tauri.conf.json's appimage `files` map ships it,
+# and the bundler fails the build if it is missing.
+RUN sh /src/desktop/scripts/fetch-emoji-font.sh /src/desktop/src-tauri/linux/fonts
 WORKDIR /src/desktop/src-tauri
 RUN npx --yes @tauri-apps/cli@2.12.3 build --ci --bundles appimage -- --locked
 
-# Name the artifact per §5.7 and smoke it (S-L1..S-L7) before exporting.
+# DESIGN §4.12: run the ignored host fontconfig tests (h1–h8) against the
+# container's own fontconfig — the generated config must hide every
+# color+outline font and surface the bundled CBDT emoji.
+RUN cd /src/desktop && PEAKBOT_EMOJI_FONT_DIR=/src/desktop/src-tauri/linux/fonts cargo test --locked -p peakbot-desktop-core --test fontconfig_host -- --ignored
+
+# Name the artifact per §5.7 and smoke it (S-L1..S-L8) before exporting.
 # The bundler names the file "<productName>_<version>_<arch>.AppImage"
 # (productName "PeakBot Desktop" → space becomes underscore), so glob it.
 RUN set -eu; \

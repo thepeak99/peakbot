@@ -29,7 +29,11 @@
     ],
     "linux": {
       "appimage": {
-        "bundleMediaFramework": false
+        "bundleMediaFramework": false,
+        "files": {
+          "/usr/share/peakbot-desktop/fonts/NotoColorEmoji.ttf": "linux/fonts/NotoColorEmoji.ttf",
+          "/usr/share/peakbot-desktop/fonts/OFL.txt": "linux/fonts/OFL.txt"
+        }
       }
     },
     "macOS": {

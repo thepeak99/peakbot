@@ -2,7 +2,7 @@
 #
 # smoke-linux.sh <AppImage> <version>
 #
-# Artifact smoke checks S-L1..S-L7 (desktop/DESIGN.md §9.2). Runs inside the
+# Artifact smoke checks S-L1..S-L8 (desktop/DESIGN.md §9.2). Runs inside the
 # build container (file, objdump, readelf are all present there). Exits
 # non-zero on the first failed check; the build fails with it.
 
@@ -76,5 +76,10 @@ pass "S-L6: glibc floor $max_glibc (<= GLIBC_2.34)"
 readelf -d "$R/usr/bin/peakbot-desktop" | grep -E 'NEEDED.*libwebkit2gtk-4\.1' \
     >/dev/null || fail "S-L7: peakbot-desktop does not link libwebkit2gtk-4.1"
 pass "S-L7: peakbot-desktop links libwebkit2gtk-4.1"
+
+# ── S-L8: bundled CBDT emoji font + OFL present, sha256 ok (DESIGN §4.12) ──
+sh "$(dirname "$0")/fetch-emoji-font.sh" --verify "$R/usr/share/peakbot-desktop/fonts" \
+    || fail "S-L8: bundled CBDT emoji font missing or sha256 mismatch in usr/share/peakbot-desktop/fonts"
+pass "S-L8: bundled CBDT emoji font + OFL present, sha256 ok"
 
 echo "smoke-linux: all checks passed (v$VERSION)"

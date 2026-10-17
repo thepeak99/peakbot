@@ -17,6 +17,7 @@ use std::time::Duration;
 use tauri::Manager;
 
 use peakbot_desktop_core::controller::{Action, Controller, run_loop};
+use peakbot_desktop_core::fontconfig;
 use peakbot_desktop_core::paths::DesktopPaths;
 use peakbot_desktop_core::service::ReplacePolicy;
 
@@ -93,6 +94,34 @@ fn main() {
         unsafe { std::env::set_var(key, value) };
     }
 
+    // DESIGN §4.12: bundled CBDT emoji font + generated fontconfig, before
+    // any thread. AppImage-only by construction (needs the bundled font next
+    // to the exe); a user FONTCONFIG_FILE always wins; any failure leaves
+    // the env untouched.
+    if cfg!(target_os = "linux")
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let dir = fontconfig::bundled_font_dir(&exe)
+            .filter(|d| d.join(fontconfig::EMOJI_FONT_FILE).is_file());
+        if let Some(xml) = fontconfig::emoji_fonts_conf(
+            std::env::var_os("FONTCONFIG_FILE").as_deref(),
+            dir.as_deref(),
+        ) {
+            match fontconfig::write_fonts_conf(
+                &fontconfig::fonts_conf_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref()),
+                std::process::id(),
+                &xml,
+            ) {
+                Ok(p) => {
+                    // SAFETY: single-threaded — this runs in main() before
+                    // any thread is spawned (like the §4.10 default above).
+                    unsafe { std::env::set_var("FONTCONFIG_FILE", p) };
+                }
+                Err(e) => eprintln!("peakbot-desktop: bundled emoji fontconfig not applied: {e}"),
+            }
+        }
+    }
+
     let builder = tauri::Builder::default()
         // FIRST: a second launch focuses the existing window.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -122,6 +151,11 @@ fn main() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+
+            log::info!(
+                "fontconfig: FONTCONFIG_FILE={:?}",
+                std::env::var_os("FONTCONFIG_FILE")
+            );
 
             let paths = build_paths(&handle)?;
             let ui_state = Arc::new(bridge::UiState::new());
