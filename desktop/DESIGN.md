@@ -528,7 +528,10 @@ loop:
 `sanitize_env(parent)` (pure): if `APPDIR` is set, drop `APPDIR, APPIMAGE, ARGV0, OWD`; for
 `PATH, LD_LIBRARY_PATH, XDG_DATA_DIRS, GST_PLUGIN_SYSTEM_PATH, GST_PLUGIN_PATH, GIO_EXTRA_MODULES`
 remove `:`-entries under `$APPDIR` (drop the var if nothing remains); drop any *other* var whose
-value contains `$APPDIR`. No `APPDIR` → env unchanged. Rationale: the agent spawns user shells;
+value contains `$APPDIR`. No `APPDIR` → env unchanged. (DESIGN §4.12: a
+`FONTCONFIG_FILE` whose file name starts with `peakbot-desktop-fonts-` is
+also dropped under `APPDIR` — the pid-scoped path dies with the app; the
+sidecar uses the host fontconfig.) Rationale: the agent spawns user shells;
 AppImage plumbing must not leak into them. Session spawn adds `PEAKBOT_WEB_TOKEN`, `PEAKBOT_NO_OPEN=1`;
 short-lived commands add `PEAKBOT_NO_OPEN=1` only.
 
@@ -593,6 +596,50 @@ wait_ready(mode.probe_url())  // https ⇒ Listening counts as Ready
   `self.service == Some(Installed{tls: true, ..})`, else `Http` (the `TLS:` status line,
   invariant I3 — never `settings.json`); the token is still read-only from the file (never
   generated); `start_first` uses `service_install_args(settings())`.
+
+### 4.12 Font isolation (bundled CBDT emoji, AppImage only)
+
+**Problem.** The AppImage bundles WebKit/Skia built (on ubuntu:22.04) against
+FreeType 2.11. On hosts with FreeType ≥ 2.13 (Fedora 40+) whose system emoji
+font is COLRv1 (`Noto-COLRv1.ttf`), rendering a gradient emoji (🌐/🧩, e.g. on
+the Agents tab) trips Skia's `colrv1_configure_skpaint` assertion and aborts
+the `WebKitWebProcess` — the app hangs on a blank window.
+
+**Fix.** Ship the CBDT (bitmap) `NotoColorEmoji.ttf` (OFL-1.1; fetched by
+`scripts/fetch-emoji-font.sh` with pinned sha256) inside the AppImage at
+`usr/share/peakbot-desktop/fonts/` (tauri.conf.json `bundle.linux.appimage.files`).
+At the start of `main()` (Linux, before any thread), if the bundled font
+exists in `<exe-grandparent>/share/peakbot-desktop/fonts`
+(`core::fontconfig::bundled_font_dir`) and the user has **no** `FONTCONFIG_FILE`,
+write `peakbot-desktop-fonts-<pid>.conf` into `$XDG_RUNTIME_DIR` (else the temp
+dir) via `core::fontconfig::write_fonts_conf` and point `FONTCONFIG_FILE` at it
+(`unsafe { set_var }`, edition 2024, single-threaded). The generated config
+(`core::fontconfig::render_fonts_conf`, golden-tested byte for byte):
+1. `<include ignore_missing="yes">/etc/fonts/fonts.conf</include>` — the host config;
+2. adds the bundled fonts dir;
+3. **rejects every font with `color=true` AND `outline=true`**
+   (COLRv0/COLRv1/SVG) — Skia never sees a COLRv1 glyph;
+4. aliases `emoji` → `Noto Color Emoji` so the bundled CBDT font answers.
+
+**Activation.** AppImage-only by construction: the dev build has no bundled
+font dir, and any missing piece (no grandparent, no font file, non-UTF-8 path,
+write failure) leaves the environment untouched (a failed write only logs to
+stderr). A user's own `FONTCONFIG_FILE` always wins (`emoji_fonts_conf` returns
+`None`).
+
+**Sidecar.** `sanitize_env` (§4.9) drops a `FONTCONFIG_FILE` whose file name
+starts with `peakbot-desktop-fonts-` when `APPDIR` is set — the pid-scoped path
+dies with the app; the sidecar and the shells it spawns use the host
+fontconfig.
+
+**Tests.** `t122`–`t132` (fontconfig.rs: dir derivation, golden render + XML
+escaping, user-config precedence, non-UTF-8, conf-dir choice, pid-named
+write, stale-file replace), `t133`/`t134` (env.rs: sidecar sanitize),
+`h1`–`h8` (`tests/fontconfig_host.rs`, `#[ignore]`, via `make
+desktop-fonttest`: against a real host fontconfig — bundled font answers
+family/charset queries, no color+outline font survives, no COLRv1 visible,
+non-emoji matching unchanged, file count = baseline − rejected + bundled,
+works without the host config file).
 
 ---
 
@@ -1172,6 +1219,21 @@ Order matters: T-tasks (tests) precede the C-tasks they cover (RED → GREEN).
 26. `sidecar_path("/tmp/.mount_x/usr/bin/peakbot-desktop")` → `/tmp/.mount_x/usr/bin/peakbot`; `DesktopPaths` helper file names exact.
 27. `peakbot_config_dir()` ends with `peakbot` (Linux) — `#[cfg(target_os="linux")]`.
 
+**fontconfig (§4.12)**
+122. `bundled_font_dir("/tmp/.mount_x/usr/bin/peakbot-desktop")` → `Some("/tmp/.mount_x/usr/share/peakbot-desktop/fonts")`.
+123. `bundled_font_dir` with no grandparent (`/peakbot-desktop`) → `None`.
+124. `render_fonts_conf` matches the golden XML byte for byte (incl. the trailing newline).
+125. `render_fonts_conf("/x/a&b<c>")` XML-escapes the dir (`&amp;`, `&lt;`, `&gt;`); no raw `&` leaks.
+126. `emoji_fonts_conf` → `None` when a user `FONTCONFIG_FILE` exists (user config wins).
+127. `emoji_fonts_conf(None, None)` → `None` (no bundled dir).
+128. `emoji_fonts_conf(None, Some(dir))` → `Some(render_fonts_conf(dir))`.
+129. Non-UTF-8 bundled dir → `None` (unix).
+130. `fonts_conf_dir`: absolute non-empty XDG dir wins; `None`/empty/relative → `std::env::temp_dir()`.
+131. `write_fonts_conf` writes `<dir>/peakbot-desktop-fonts-<pid>.conf` with the xml.
+132. `write_fonts_conf` replaces a stale file of the same name (no append, no keep).
+133. `sanitize_env` under `APPDIR` drops a `FONTCONFIG_FILE` naming the generated config; unrelated vars untouched.
+134. `sanitize_env` keeps a user's own `FONTCONFIG_FILE` under `APPDIR`; without `APPDIR` the generated name is kept (identity).
+
 **phase**
 28. `Mode::Session{7824, tok}.url()` = `http://127.0.0.1:7824/?token=<tok>`; token with `+`/`&` is percent-encoded; `probe_url` path `/commands`.
 29. `Mode::Service{None}.url()` = `http://127.0.0.1:7823/` (no query); `origin()` = `http://127.0.0.1:7823`.
@@ -1252,6 +1314,7 @@ Order matters: T-tasks (tests) precede the C-tasks they cover (RED → GREEN).
 - S-L5 a `.desktop` file exists at the squashfs root with `Exec=peakbot-desktop` and `Name=PeakBot Desktop`.
 - S-L6 `objdump -T usr/bin/peakbot | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1` ≤ `GLIBC_2.34`.
 - S-L7 `usr/bin/peakbot-desktop` links `libwebkit2gtk-4.1` (`ldd`/`readelf -d` NEEDED) — proves the right webkit ABI.
+- S-L8 `usr/share/peakbot-desktop/fonts/` holds `NotoColorEmoji.ttf` + `OFL.txt` with the pinned sha256s (`fetch-emoji-font.sh --verify`, DESIGN §4.12).
 
 `smoke-macos.sh <zip> <version>`:
 - S-M1 `unzip -Z1` lists exactly: `PeakBot Desktop.app/`, `…/Contents/`, `…/Contents/Info.plist`, `…/Contents/MacOS/`, `…/Contents/MacOS/peakbot-desktop`, `…/Contents/MacOS/peakbot`, `…/Contents/Resources/`, `…/Contents/Resources/icon.icns`, `…/Contents/_CodeSignature/`, `…/Contents/_CodeSignature/CodeResources` (nothing else).
@@ -1291,6 +1354,7 @@ L7 (#377b) HTTPS + background (service): same as L6.
 L8 (#377b) Retry / switch HTTP↔HTTPS / background on↔off a few times: always loads (a new leaf each boot).
 L9 (#377b) Negative: `mv ~/.cache/peakbot/tls/ca-cert.pem /tmp/` then restart the app → WebKit cert error page (fail closed). Move it back → Retry → loads (the backend only regenerates the CA when cert *or* key is missing).
 L10 (#377b) Devtools on the remote page: `invoke('settings_get')` still rejects (I6); the browser on another device still sees its own cert prompt (unchanged).
+L11 (§4.12) Fedora 40+: open the Agents tab — the emoji (🌐/🧩) render, no hang/blank window; the `WebKitWebProcess`'s environ carries the generated `FONTCONFIG_FILE` (`/run/user/1000/peakbot-desktop-fonts-<pid>.conf`), and a user's own `FONTCONFIG_FILE` is left untouched.
 
 ### 9.4 Manual macOS checklist (human — no Mac in CI)
 MAC1 Unzip, move to /Applications, `xattr -dr com.apple.quarantine` → app opens (Apple Silicon and, if available, Intel).

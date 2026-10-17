@@ -28,3 +28,7 @@ sniff-bug.jsonl
 desktop/target/
 desktop/src-tauri/binaries/peakbot-*
 desktop/src-tauri/gen/
+
+# Bundled CBDT emoji font for the fontconfig-isolation host tests
+# (fetched by `make desktop-fonttest` — never commit)
+desktop/src-tauri/linux/fonts/

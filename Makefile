@@ -1,6 +1,6 @@
 .PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
         web dev \
-        desktop-test desktop-dev desktop-linux desktop-macos desktop \
+        desktop-test desktop-fonttest desktop-dev desktop-linux desktop-macos desktop \
         release release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android release-publish
 
@@ -132,6 +132,13 @@ rebuild: clean build
 ## desktop-test: Unit tests for the desktop core crate (desktop/core, no webkit)
 desktop-test:
 	cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core
+
+## desktop-fonttest: Host fontconfig tests for the DESIGN §4.12 emoji-isolation
+##                   config — fetches NotoColorEmoji.ttf (sha-verified) and
+##                   runs the ignored desktop/core/tests/fontconfig_host.rs suite
+desktop-fonttest:
+	sh desktop/scripts/fetch-emoji-font.sh desktop/src-tauri/linux/fonts
+	PEAKBOT_EMOJI_FONT_DIR=$(CURDIR)/desktop/src-tauri/linux/fonts cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core --test fontconfig_host -- --ignored
 
 ## desktop-dev: Build peakbot (debug), stage the sidecar into src-tauri/binaries,
 ##              then run the Tauri dev loop (desktop/DESIGN.md §5.7)

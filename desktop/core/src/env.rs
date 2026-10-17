@@ -1,11 +1,13 @@
 //! Environment (DESIGN §4.9/§4.10).
 
 use std::ffi::{OsStr, OsString};
+use std::path::Path;
 
 /// AppImage plumbing removal for the sidecar env (DESIGN §4.9): if
 /// `APPDIR` is set, drop `APPDIR, APPIMAGE, ARGV0, OWD`; strip `:`-entries
-/// under `$APPDIR` from the list-path vars (drop the var if empty); drop
-/// any other var whose value contains `$APPDIR`. No `APPDIR` → unchanged
+/// under `$APPDIR` from the list-path vars (drop the var if empty); drop a
+/// `FONTCONFIG_FILE` naming the app's own generated config (DESIGN §4.12);
+/// drop any other var whose value contains `$APPDIR`. No `APPDIR` → unchanged
 /// (order preserved).
 pub fn sanitize_env(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
@@ -37,6 +39,18 @@ pub fn sanitize_env(
         .filter_map(|(k, v)| {
             let key = k.to_str().unwrap_or("");
             if DROPPED.contains(&key) {
+                return None;
+            }
+            // DESIGN §4.12: the generated config names a pid-scoped path
+            // that dies with the app — the sidecar uses the host fontconfig.
+            if key == "FONTCONFIG_FILE"
+                && v.to_str().is_some_and(|s| {
+                    Path::new(s)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(crate::fontconfig::GENERATED_CONF_PREFIX))
+                })
+            {
                 return None;
             }
             if LIST_PATHS.contains(&key) {
@@ -162,5 +176,58 @@ mod tests {
             Some(("WEBKIT_DISABLE_DMABUF_RENDERER", "1"))
         );
         assert_eq!(webkit_dmabuf_default(Some(OsStr::new("0"))), None);
+    }
+
+    // DESIGN §4.12 t133: the generated config must not leak into the
+    // sidecar env (the sidecar uses the host's fontconfig, and the
+    // generated file names a pid-scoped path that dies with the shell).
+    #[test]
+    fn t133_sanitize_env_drops_generated_fontconfig_file_under_appdir() {
+        use crate::fontconfig::GENERATED_CONF_PREFIX;
+        let generated = format!("/run/user/1000/{GENERATED_CONF_PREFIX}7.conf");
+        let input = kv(&[
+            ("APPDIR", "/tmp/.mount_ab"),
+            ("FONTCONFIG_FILE", generated.as_str()),
+            ("HOME", "/home/u"),
+        ]);
+        let out = sanitize_env(input);
+        let got: Vec<(&str, &str)> = out
+            .iter()
+            .map(|(k, v)| (k.to_str().unwrap(), v.to_str().unwrap()))
+            .collect();
+        assert!(
+            !got.iter().any(|(k, _)| *k == "FONTCONFIG_FILE"),
+            "the generated FONTCONFIG_FILE must be dropped under APPDIR; got {got:?}"
+        );
+        assert!(
+            got.iter().any(|(k, v)| *k == "HOME" && *v == "/home/u"),
+            "unrelated vars must be untouched; got {got:?}"
+        );
+    }
+
+    // DESIGN §4.12 t134: a user's OWN fontconfig file is never touched,
+    // and without APPDIR the generated name is kept (identity).
+    #[test]
+    fn t134_sanitize_env_keeps_foreign_or_user_fontconfig_file() {
+        use crate::fontconfig::GENERATED_CONF_PREFIX;
+        let generated = format!("/run/user/1000/{GENERATED_CONF_PREFIX}9.conf");
+
+        // APPDIR set + a user's own config ⇒ kept.
+        let input = kv(&[
+            ("APPDIR", "/tmp/.mount_ab"),
+            ("FONTCONFIG_FILE", "/home/u/my.conf"),
+            ("HOME", "/home/u"),
+        ]);
+        let out = sanitize_env(input);
+        assert!(
+            out.iter()
+                .any(|(k, v)| k == "FONTCONFIG_FILE" && v == "/home/u/my.conf"),
+            "a non-generated FONTCONFIG_FILE must be kept under APPDIR; got {out:?}"
+        );
+
+        // No APPDIR + the generated name ⇒ identity (kept, unchanged).
+        let input = kv(&[("FONTCONFIG_FILE", generated.as_str()), ("HOME", "/home/u")]);
+        let out = sanitize_env(input.clone());
+        assert_eq!(out, input, "no APPDIR ⇒ unchanged; got {out:?}");
     }
 }
