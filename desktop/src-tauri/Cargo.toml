@@ -6,6 +6,12 @@ publish = false
 
 [build-dependencies]
 tauri-build = { version = "2.7.3", features = [] }
+# zstd + sha2 run in build.rs (the payload packer) on EVERY host: a build
+# script can't cfg on the target, so the Linux/macOS builds compile
+# zstd-sys once (~20 s) and never use it at runtime (DESIGN amendment
+# (windows-portable)).
+zstd = "0.13"
+sha2 = "0.10"
 
 [dependencies]
 peakbot-desktop-core = { path = "../core" }
@@ -20,6 +26,11 @@ log = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
+
+[target.'cfg(windows)'.dependencies]
+# Pure-Rust zstd decoder for the embedded sidecar payload: no C dep in the
+# exe, so the static-CRT question stays one (WINDOWS-PLAN §6).
+ruzstd = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Both are already in Cargo.lock (pulled by wry 0.57) — declared
