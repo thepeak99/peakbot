@@ -56,16 +56,16 @@ mod sigint {
             unsafe { libc::fcntl(w.as_raw_fd(), libc::FD_CLOEXEC) };
         }
         unsafe {
-            libc::signal(libc::SIGINT, on_sigint as usize as libc::sighandler_t);
+            libc::signal(
+                libc::SIGINT,
+                on_sigint as *const () as usize as libc::sighandler_t,
+            );
         }
         std::thread::Builder::new()
             .name("sigint".into())
             .spawn(move || {
                 let mut buf = [0u8; 1];
-                loop {
-                    let Some((r, _)) = PIPES.get() else {
-                        break;
-                    };
+                while let Some((r, _)) = PIPES.get() {
                     let n = unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), 1) };
                     if n > 0 {
                         on_signal();

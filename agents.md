@@ -599,7 +599,7 @@ Where it lives: `src/pipeline/{delegate_tool,registry,set}.rs`, `build_sub_agent
 
 ## CI (Gitea Actions)
 
-Workflow: `.gitea/workflows/ci.yml` — single job on runner `shinpachi` (label `dind`), `rust:1.95` container. Gate = `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked` (reproduce locally with exactly those; autofix with `cargo fmt --all` + `cargo clippy --fix --allow-dirty [--tests]`).
+Workflow: `.gitea/workflows/ci.yml` — two jobs on runner `shinpachi` (label `dind`), `rust:1.95` container. Job `ci` = Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked`. Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist). No node/web build there: `desktop/ui` is committed static files. (Reproduce locally with exactly those commands; autofix with `cargo fmt --all` + `cargo clippy --fix --allow-dirty [--tests]`.)
 
 ### Inspecting a failed run
 
@@ -635,5 +635,5 @@ After pushing a fix, poll `actions/tasks?limit=1` for your head_sha reaching suc
 3. **`GITHUB_TOKEN` is NOT auto-exported** into `run:` env — mirror it: `env: { GITHUB_TOKEN: ${{ github.token }} }`.
 4. **Toolchains arrive minimal** — `rustup component add rustfmt clippy` if the gate needs them.
 5. **`runs-on:` must match an advertised runner label** (ours: `dind`).
-6. **Tests needing network/external binaries must be `#[ignore = "reason"]`** — the container has no `uvx`/`npm`/general egress; run locally with `cargo test -- --ignored`.
+6. **Tests needing network/external binaries must be `#[ignore = "reason"]`** — the container has no `uvx`; egress works (the ci job apt-installs Node 22, so npm exists only in that job). Run ignored tests locally with `cargo test -- --ignored`.
 7. **Don't copy `working-directory:` from monorepos** — peakbot's `Cargo.toml` is at the root.
