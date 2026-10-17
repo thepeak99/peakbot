@@ -272,10 +272,43 @@ fn failed_view(err: &StartError) -> StatusView {
     }
 }
 
+/// The host platform the app runs on. The glue decides it ONCE from
+/// `cfg!(windows)` (in `host_platform`) and the pure core derives the
+/// visible features from it — so the decision is unit-testable on every
+/// host (`core/tests/background_platform.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    /// Background service is non-functional in v1 (Q1) — not offered.
+    Windows,
+    /// Linux/macOS — unchanged.
+    Unix,
+}
+
+/// The single place the compile target becomes a `Platform`: the glue
+/// (tray + `tray_model`) calls this, never a bare `cfg!`.
+pub fn host_platform() -> Platform {
+    if cfg!(windows) {
+        Platform::Windows
+    } else {
+        Platform::Unix
+    }
+}
+
+/// Q1: the background-service toggle is NOT offered on Windows in v1
+/// (it would advertise a feature that doesn't work: schtasks has no
+/// `/Run`, `run_state` is Unknown, a console window at logon); on Unix
+/// (Linux/macOS) it stays offered, unchanged.
+pub fn background_offered(p: Platform) -> bool {
+    p != Platform::Windows
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayModel {
     /// Disabled first item.
     pub status: String,
+    /// The background checkbox item is shown only when true (Q1: hidden
+    /// on Windows in v1); derived from `background_offered`.
+    pub background_visible: bool,
     pub background_checked: bool,
     pub background_enabled: bool,
     pub background_label: String,
@@ -311,6 +344,7 @@ pub fn tray_model(
         );
     TrayModel {
         status,
+        background_visible: background_offered(host_platform()),
         background_checked,
         background_enabled,
         background_label,

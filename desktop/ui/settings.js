@@ -103,6 +103,11 @@ async function tick() {
     }
     $("background").checked = view.background;
     backgroundEnabled = view.background_enabled;
+    // Q1: the row is absent on platforms that don't offer the background
+    // service (Windows in v1) — the hr above it goes with it.
+    const rowHidden = !view.background_visible;
+    $("row-background").hidden = rowHidden;
+    document.querySelector("hr").hidden = rowHidden;
     busy = view.busy;
     if (!isDirty() && $("state").textContent === "Applying…") {
       $("state").textContent = "";
