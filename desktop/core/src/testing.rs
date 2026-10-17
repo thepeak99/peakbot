@@ -52,6 +52,11 @@ pub enum Effect {
     Remove {
         path: PathBuf,
     },
+    /// `same_contents(a, b)` was called (design auto-replace §3.3).
+    SameContents {
+        a: PathBuf,
+        b: PathBuf,
+    },
     Probe {
         url: Url,
     },
@@ -378,6 +383,27 @@ impl Sys for FakeSys {
             path: path.to_path_buf(),
         });
         Ok(())
+    }
+
+    /// Design auto-replace §5.1: `a == b` ⇒ true (a file always equals
+    /// itself); otherwise the seeded contents are compared; an
+    /// unseeded file is `Err(NotFound)`.
+    fn same_contents(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        self.events.lock().unwrap().push(Effect::SameContents {
+            a: a.into(),
+            b: b.into(),
+        });
+        if a == b {
+            return Ok(true); // a path always equals itself
+        }
+        let st = self.state.lock().unwrap();
+        match (st.files.get(a), st.files.get(b)) {
+            (Some(x), Some(y)) => Ok(x == y),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "FakeSys: file not seeded",
+            )),
+        }
     }
 
     fn exists(&self, path: &Path) -> bool {

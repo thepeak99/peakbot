@@ -36,14 +36,30 @@ pub enum ServiceState {
     Installed(InstalledService),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacePolicy {
+    /// Replace silently unless it would be a downgrade.
+    Auto,
+    /// Always ask (dev builds — a debug sidecar must never silently
+    /// overwrite the user's ~/.local/bin/peakbot).
+    Ask,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchPlan {
     Session,
+    /// The installed exe is byte-identical to the bundled sidecar, or the
+    /// user declined this exact (installed, bundled) pair.
     /// `start_first ⇔ run == Stopped`.
     ConnectService {
         start_first: bool,
     },
-    /// Versions differ (or unknown) and not previously declined.
+    /// The builds differ, it is not a downgrade, and the policy is Auto:
+    /// replace the binary without asking, reproducing the running
+    /// service's protocol and token.
+    AutoReplace,
+    /// The builds differ, and (policy is Ask, or installed > bundled), and
+    /// the pair was not declined.
     AskReplace {
         installed: InstalledVersion,
     },
@@ -129,24 +145,57 @@ pub fn parse_service_status(out: &RunOutput) -> ServiceState {
     }
 }
 
-/// The §4.4 truth table. `version_of` runs `<exe> --version`.
+/// The §4.2 truth table (design auto-replace; replaces DESIGN §4.4).
+/// `identical` = the installed exe's bytes equal the bundled sidecar's
+/// (A6: "cannot compare" is false); it runs BEFORE `version_of`, and
+/// neither runs for NotInstalled/Unavailable (A3). `newer` = the
+/// installed version is Known and above the bundled one (A2).
 pub fn plan_launch(
     state: &ServiceState,
+    identical: impl FnOnce(&InstalledService) -> bool,
     version_of: impl FnOnce(&InstalledService) -> InstalledVersion,
     bundled: &Version,
     declined: Option<&DeclinedReplace>,
+    policy: ReplacePolicy,
 ) -> LaunchPlan {
     let ServiceState::Installed(svc) = state else {
-        // Unavailable / NotInstalled ⇒ session; version_of is not called.
+        // Unavailable / NotInstalled ⇒ session; identical/version_of are
+        // not called.
         return LaunchPlan::Session;
     };
-    let installed = version_of(svc);
     let start_first = svc.run == RunState::Stopped;
-    let same = matches!(&installed, InstalledVersion::Known(v) if v == bundled);
-    if same || declined.is_some_and(|d| d.matches(&installed, bundled)) {
+    if identical(svc) {
+        return LaunchPlan::ConnectService { start_first };
+    }
+    let installed = version_of(svc);
+    let newer = matches!(&installed, InstalledVersion::Known(v) if v > bundled);
+    if policy == ReplacePolicy::Auto && !newer {
+        return LaunchPlan::AutoReplace;
+    }
+    if declined.is_some_and(|d| d.matches(&installed, bundled)) {
         return LaunchPlan::ConnectService { start_first };
     }
     LaunchPlan::AskReplace { installed }
+}
+
+/// The settings that reproduce the RUNNING service for a silent replace
+/// (A4). Protocol from the `TLS:` line (I3); Remote only if saved is
+/// Remote AND the service runs TLS (I1). The loopback `token` flag is
+/// carried from `saved` but is not used by `service_install_args`. The
+/// token itself lives in `web-token`, which the silent path never
+/// touches.
+pub fn running_settings(saved: Settings, tls: bool) -> Settings {
+    match (saved, tls) {
+        (Settings::Remote, true) => Settings::Remote,
+        (Settings::Remote, false) => Settings::Loopback {
+            protocol: Protocol::Http,
+            token: true,
+        },
+        (Settings::Loopback { token, .. }, tls) => Settings::Loopback {
+            protocol: if tls { Protocol::Https } else { Protocol::Http },
+            token,
+        },
+    }
 }
 
 pub fn replace_dialog(installed: &InstalledVersion, bundled: &Version) -> Dialog {
@@ -417,144 +466,572 @@ mod tests {
         Version::parse("0.23.0").unwrap()
     }
 
-    // §9.1 case 13 — every row of the §4.4 truth table.
+    // Design auto-replace §4.2 — every row of the truth table (t13,
+    // rewritten). `identical` is the byte-equality check; it runs
+    // before the version, and only for Installed.
     #[test]
     fn t13_plan_launch_truth_table() {
         let b = bundled();
         let v22 = InstalledVersion::Known(Version::parse("0.22.0").unwrap());
+        let v24 = InstalledVersion::Known(Version::parse("0.24.0").unwrap());
+        let ident = |same: bool| move |_s: &InstalledService| same;
         let vo = |i: InstalledVersion| move |_s: &InstalledService| i;
-        let mut svc = InstalledService {
+        let svc = |run: RunState| InstalledService {
+            exe: Some(PathBuf::from("/x/peakbot")),
+            run,
+            tls: false,
+        };
+
+        // Row 1: Unavailable → Session (both policies).
+        for policy in [ReplacePolicy::Auto, ReplacePolicy::Ask] {
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::Unavailable { reason: "r".into() },
+                    ident(true),
+                    vo(InstalledVersion::Unknown),
+                    &b,
+                    None,
+                    policy
+                ),
+                LaunchPlan::Session,
+                "row 1 (policy {policy:?})"
+            );
+        }
+        // Row 2: NotInstalled → Session (both policies).
+        for policy in [ReplacePolicy::Auto, ReplacePolicy::Ask] {
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::NotInstalled,
+                    ident(true),
+                    vo(InstalledVersion::Unknown),
+                    &b,
+                    None,
+                    policy
+                ),
+                LaunchPlan::Session,
+                "row 2 (policy {policy:?})"
+            );
+        }
+        // Row 3: identical → ConnectService{start_first: run==Stopped},
+        // both policies, all three run states (Unknown counts as running).
+        for policy in [ReplacePolicy::Auto, ReplacePolicy::Ask] {
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::Installed(svc(RunState::Running)),
+                    ident(true),
+                    vo(InstalledVersion::Unknown),
+                    &b,
+                    None,
+                    policy
+                ),
+                LaunchPlan::ConnectService { start_first: false },
+                "row 3 Running (policy {policy:?})"
+            );
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::Installed(svc(RunState::Stopped)),
+                    ident(true),
+                    vo(InstalledVersion::Unknown),
+                    &b,
+                    None,
+                    policy
+                ),
+                LaunchPlan::ConnectService { start_first: true },
+                "row 3 Stopped (policy {policy:?})"
+            );
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::Installed(svc(RunState::Unknown)),
+                    ident(true),
+                    vo(InstalledVersion::Unknown),
+                    &b,
+                    None,
+                    policy
+                ),
+                LaunchPlan::ConnectService { start_first: false },
+                "row 3 Unknown (policy {policy:?})"
+            );
+        }
+        // Row 4: not identical, Known == bundled, Auto → AutoReplace.
+        assert_eq!(
+            plan_launch(
+                &ServiceState::Installed(svc(RunState::Running)),
+                ident(false),
+                vo(InstalledVersion::Known(b.clone())),
+                &b,
+                None,
+                ReplacePolicy::Auto
+            ),
+            LaunchPlan::AutoReplace,
+            "row 4: same version, different build ⇒ silent replace"
+        );
+        // Row 5: not identical, Known < bundled, Auto → AutoReplace.
+        assert_eq!(
+            plan_launch(
+                &ServiceState::Installed(svc(RunState::Running)),
+                ident(false),
+                vo(v22.clone()),
+                &b,
+                None,
+                ReplacePolicy::Auto
+            ),
+            LaunchPlan::AutoReplace,
+            "row 5: older installed ⇒ silent replace"
+        );
+        // Row 6: not identical, Unknown, Auto → AutoReplace.
+        assert_eq!(
+            plan_launch(
+                &ServiceState::Installed(svc(RunState::Running)),
+                ident(false),
+                vo(InstalledVersion::Unknown),
+                &b,
+                None,
+                ReplacePolicy::Auto
+            ),
+            LaunchPlan::AutoReplace,
+            "row 6: unknown version ⇒ silent replace"
+        );
+        // Row 7: not identical, Known > bundled, declined pair matches,
+        // Auto → ConnectService, all three run states.
+        let declined_24 = DeclinedReplace {
+            installed: v24.clone(),
+            bundled: b.clone(),
+        };
+        for run in [RunState::Running, RunState::Stopped, RunState::Unknown] {
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::Installed(svc(run)),
+                    ident(false),
+                    vo(v24.clone()),
+                    &b,
+                    Some(&declined_24),
+                    ReplacePolicy::Auto
+                ),
+                LaunchPlan::ConnectService {
+                    start_first: run == RunState::Stopped
+                },
+                "row 7 {run:?}: newer + declined ⇒ connect"
+            );
+        }
+        // Row 8: not identical, Known > bundled, no decline, Auto →
+        // AskReplace (a downgrade of the user's CLI is never silent).
+        assert_eq!(
+            plan_launch(
+                &ServiceState::Installed(svc(RunState::Running)),
+                ident(false),
+                vo(v24.clone()),
+                &b,
+                None,
+                ReplacePolicy::Auto
+            ),
+            LaunchPlan::AskReplace {
+                installed: v24.clone()
+            },
+            "row 8: newer installed ⇒ the OLDER dialog"
+        );
+        // Row 9: not identical, any version, declined pair matches, Ask
+        // → ConnectService, all three run states.
+        let declined_22 = DeclinedReplace {
+            installed: v22.clone(),
+            bundled: b.clone(),
+        };
+        for run in [RunState::Running, RunState::Stopped, RunState::Unknown] {
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::Installed(svc(run)),
+                    ident(false),
+                    vo(v22.clone()),
+                    &b,
+                    Some(&declined_22),
+                    ReplacePolicy::Ask
+                ),
+                LaunchPlan::ConnectService {
+                    start_first: run == RunState::Stopped
+                },
+                "row 9 {run:?}: declined ⇒ connect (Ask)"
+            );
+        }
+        // Row 10: not identical, any version, no decline, Ask →
+        // AskReplace (dev builds keep the prompt).
+        assert_eq!(
+            plan_launch(
+                &ServiceState::Installed(svc(RunState::Running)),
+                ident(false),
+                vo(v22.clone()),
+                &b,
+                None,
+                ReplacePolicy::Ask
+            ),
+            LaunchPlan::AskReplace {
+                installed: v22.clone()
+            },
+            "row 10: Ask + Known ⇒ dialog"
+        );
+        assert_eq!(
+            plan_launch(
+                &ServiceState::Installed(svc(RunState::Running)),
+                ident(false),
+                vo(InstalledVersion::Unknown),
+                &b,
+                None,
+                ReplacePolicy::Ask
+            ),
+            LaunchPlan::AskReplace {
+                installed: InstalledVersion::Unknown
+            },
+            "row 10: Ask + Unknown ⇒ dialog"
+        );
+    }
+
+    // Design auto-replace §7.1 (t14, updated): neither `identical` nor
+    // `version_of` runs for NotInstalled/Unavailable (A3).
+    #[test]
+    fn t14_plan_launch_skips_identity_and_version_for_not_installed_and_unavailable() {
+        let b = bundled();
+        let panic_identical = |_s: &InstalledService| -> bool {
+            panic!("identical must not be called for NotInstalled/Unavailable")
+        };
+        let panic_version_of = |_s: &InstalledService| -> InstalledVersion {
+            panic!("version_of must not be called for NotInstalled/Unavailable")
+        };
+        for policy in [ReplacePolicy::Auto, ReplacePolicy::Ask] {
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::NotInstalled,
+                    panic_identical,
+                    panic_version_of,
+                    &b,
+                    None,
+                    policy
+                ),
+                LaunchPlan::Session,
+                "NotInstalled (policy {policy:?})"
+            );
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::Unavailable { reason: "r".into() },
+                    panic_identical,
+                    panic_version_of,
+                    &b,
+                    None,
+                    policy
+                ),
+                LaunchPlan::Session,
+                "Unavailable (policy {policy:?})"
+            );
+        }
+    }
+
+    // Design auto-replace §7.1: an identical build goes straight to
+    // ConnectService and `version_of` is never called (A3/T5) — both
+    // policies.
+    #[test]
+    fn t103_identical_build_never_queries_version() {
+        let b = bundled();
+        let svc = |run: RunState| InstalledService {
+            exe: Some(PathBuf::from("/x/peakbot")),
+            run,
+            tls: false,
+        };
+        let panic_version_of = |_s: &InstalledService| -> InstalledVersion {
+            panic!("version_of must not run for an identical build")
+        };
+        for policy in [ReplacePolicy::Auto, ReplacePolicy::Ask] {
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::Installed(svc(RunState::Running)),
+                    |_| true,
+                    panic_version_of,
+                    &b,
+                    None,
+                    policy
+                ),
+                LaunchPlan::ConnectService { start_first: false },
+                "Running identical (policy {policy:?})"
+            );
+            assert_eq!(
+                plan_launch(
+                    &ServiceState::Installed(svc(RunState::Stopped)),
+                    |_| true,
+                    panic_version_of,
+                    &b,
+                    None,
+                    policy
+                ),
+                LaunchPlan::ConnectService { start_first: true },
+                "Stopped identical (policy {policy:?})"
+            );
+        }
+    }
+
+    // Design auto-replace §7.1: the Auto policy rows — a differing build
+    // is replaced silently unless the installed version is newer (A2);
+    // the declined pair only gates the dialog, never AutoReplace.
+    #[test]
+    fn t104_auto_policy_rows() {
+        let b = bundled(); // 0.23.0
+        let svc = InstalledService {
             exe: Some(PathBuf::from("/x/peakbot")),
             run: RunState::Running,
             tls: false,
         };
+        let ident_false = |_s: &InstalledService| false;
+        let vo = |i: InstalledVersion| move |_s: &InstalledService| i;
+        let state = ServiceState::Installed(svc);
 
-        // Row: Unavailable → Session.
+        // Known == bundled → AutoReplace.
         assert_eq!(
             plan_launch(
-                &ServiceState::Unavailable { reason: "r".into() },
+                &state,
+                ident_false,
+                vo(InstalledVersion::Known(b.clone())),
+                &b,
+                None,
+                ReplacePolicy::Auto
+            ),
+            LaunchPlan::AutoReplace,
+            "same version, different build ⇒ silent"
+        );
+        // Known < bundled → AutoReplace.
+        let v22 = InstalledVersion::Known(Version::parse("0.22.0").unwrap());
+        assert_eq!(
+            plan_launch(&state, ident_false, vo(v22), &b, None, ReplacePolicy::Auto),
+            LaunchPlan::AutoReplace,
+            "older installed ⇒ silent"
+        );
+        // A pre-release of the bundled version is NOT newer (semver
+        // order) → AutoReplace.
+        let v_rc = InstalledVersion::Known(Version::parse("0.23.0-rc.1").unwrap());
+        assert_eq!(
+            plan_launch(&state, ident_false, vo(v_rc), &b, None, ReplacePolicy::Auto),
+            LaunchPlan::AutoReplace,
+            "0.23.0-rc.1 < 0.23.0 ⇒ not a downgrade ⇒ silent"
+        );
+        // Unknown → AutoReplace.
+        assert_eq!(
+            plan_launch(
+                &state,
+                ident_false,
                 vo(InstalledVersion::Unknown),
                 &b,
-                None
+                None,
+                ReplacePolicy::Auto
             ),
-            LaunchPlan::Session
+            LaunchPlan::AutoReplace,
+            "unknown version ⇒ silent"
         );
-        // Row: NotInstalled → Session.
+        // Known > bundled (0.23.1) → AskReplace.
+        let v231 = InstalledVersion::Known(Version::parse("0.23.1").unwrap());
         assert_eq!(
             plan_launch(
-                &ServiceState::NotInstalled,
-                vo(InstalledVersion::Unknown),
+                &state,
+                ident_false,
+                vo(v231.clone()),
                 &b,
-                None
+                None,
+                ReplacePolicy::Auto
             ),
-            LaunchPlan::Session
+            LaunchPlan::AskReplace { installed: v231 },
+            "a newer installed version is never silent (A2)"
         );
-        // Row: Installed, equal, Running → ConnectService{start_first:false}.
-        assert_eq!(
-            plan_launch(
-                &ServiceState::Installed(svc.clone()),
-                vo(InstalledVersion::Known(b.clone())),
-                &b,
-                None
-            ),
-            LaunchPlan::ConnectService { start_first: false }
-        );
-        // Same, Stopped → start_first:true.
-        svc.run = RunState::Stopped;
-        assert_eq!(
-            plan_launch(
-                &ServiceState::Installed(svc.clone()),
-                vo(InstalledVersion::Known(b.clone())),
-                &b,
-                None
-            ),
-            LaunchPlan::ConnectService { start_first: true }
-        );
-        // RunState::Unknown counts as running → start_first:false.
-        svc.run = RunState::Unknown;
-        assert_eq!(
-            plan_launch(
-                &ServiceState::Installed(svc.clone()),
-                vo(InstalledVersion::Known(b.clone())),
-                &b,
-                None
-            ),
-            LaunchPlan::ConnectService { start_first: false }
-        );
-        // Row: Installed, different Known, not declined → AskReplace.
-        svc.run = RunState::Running;
-        assert_eq!(
-            plan_launch(
-                &ServiceState::Installed(svc.clone()),
-                vo(v22.clone()),
-                &b,
-                None
-            ),
-            LaunchPlan::AskReplace {
-                installed: v22.clone()
-            }
-        );
-        // Row: different Known, declined pair matches → ConnectService.
-        let declined = DeclinedReplace {
-            installed: v22.clone(),
+        // Known > bundled + declined pair matches → ConnectService.
+        let v24 = InstalledVersion::Known(Version::parse("0.24.0").unwrap());
+        let declined_24 = DeclinedReplace {
+            installed: v24.clone(),
             bundled: b.clone(),
         };
         assert_eq!(
             plan_launch(
-                &ServiceState::Installed(svc.clone()),
-                vo(v22.clone()),
+                &state,
+                ident_false,
+                vo(v24),
                 &b,
-                Some(&declined)
+                Some(&declined_24),
+                ReplacePolicy::Auto
             ),
-            LaunchPlan::ConnectService { start_first: false }
+            LaunchPlan::ConnectService { start_first: false },
+            "newer + declined ⇒ connect without re-asking"
         );
-        // Row: Installed, Unknown, not declined → AskReplace.
-        assert_eq!(
-            plan_launch(
-                &ServiceState::Installed(svc.clone()),
-                vo(InstalledVersion::Unknown),
-                &b,
-                None
-            ),
-            LaunchPlan::AskReplace {
-                installed: InstalledVersion::Unknown
-            }
-        );
-        // Row: Unknown, declined pair matches → ConnectService.
-        let declined_u = DeclinedReplace {
-            installed: InstalledVersion::Unknown,
+        // Known == bundled + a declined (same, same) pair → STILL
+        // AutoReplace: the memory only silences the dialog, it never
+        // blocks the silent replace.
+        let declined_same = DeclinedReplace {
+            installed: InstalledVersion::Known(b.clone()),
             bundled: b.clone(),
         };
         assert_eq!(
             plan_launch(
-                &ServiceState::Installed(svc.clone()),
-                vo(InstalledVersion::Unknown),
+                &state,
+                ident_false,
+                vo(InstalledVersion::Known(b.clone())),
                 &b,
-                Some(&declined_u)
+                Some(&declined_same),
+                ReplacePolicy::Auto
             ),
-            LaunchPlan::ConnectService { start_first: false }
+            LaunchPlan::AutoReplace,
+            "declined only gates the downgrade dialog"
         );
     }
 
-    // §9.1 case 14.
+    // Design auto-replace §7.1: the Ask policy (dev builds) keeps the
+    // prompt on ANY build difference, whatever the version.
     #[test]
-    fn t14_plan_launch_skips_version_of_for_not_installed_and_unavailable() {
-        let b = bundled();
-        let panic_version_of = |_s: &InstalledService| -> InstalledVersion {
-            panic!("version_of must not be called for NotInstalled/Unavailable")
+    fn t105_ask_policy_prompts_on_any_difference() {
+        let b = bundled(); // 0.23.0
+        let svc = InstalledService {
+            exe: Some(PathBuf::from("/x/peakbot")),
+            run: RunState::Running,
+            tls: false,
         };
-        assert_eq!(
-            plan_launch(&ServiceState::NotInstalled, panic_version_of, &b, None),
-            LaunchPlan::Session
-        );
+        let ident_false = |_s: &InstalledService| false;
+        let vo = |i: InstalledVersion| move |_s: &InstalledService| i;
+        let state = ServiceState::Installed(svc);
+
+        // Same version, different build → AskReplace (dev builds never
+        // silently overwrite ~/.local/bin/peakbot).
         assert_eq!(
             plan_launch(
-                &ServiceState::Unavailable { reason: "r".into() },
-                panic_version_of,
+                &state,
+                ident_false,
+                vo(InstalledVersion::Known(b.clone())),
                 &b,
-                None
+                None,
+                ReplacePolicy::Ask
             ),
-            LaunchPlan::Session
+            LaunchPlan::AskReplace {
+                installed: InstalledVersion::Known(b.clone())
+            },
+            "Ask + same version ⇒ dialog"
+        );
+        // Older → AskReplace.
+        let v22 = InstalledVersion::Known(Version::parse("0.22.0").unwrap());
+        assert_eq!(
+            plan_launch(&state, ident_false, vo(v22), &b, None, ReplacePolicy::Ask),
+            LaunchPlan::AskReplace {
+                installed: InstalledVersion::Known(Version::parse("0.22.0").unwrap())
+            },
+            "Ask + older ⇒ dialog"
+        );
+        // Unknown → AskReplace{Unknown}.
+        assert_eq!(
+            plan_launch(
+                &state,
+                ident_false,
+                vo(InstalledVersion::Unknown),
+                &b,
+                None,
+                ReplacePolicy::Ask
+            ),
+            LaunchPlan::AskReplace {
+                installed: InstalledVersion::Unknown
+            },
+            "Ask + unknown ⇒ dialog"
+        );
+        // Declined pair matches → ConnectService (the memory still works).
+        let declined = DeclinedReplace {
+            installed: InstalledVersion::Known(b.clone()),
+            bundled: b.clone(),
+        };
+        assert_eq!(
+            plan_launch(
+                &state,
+                ident_false,
+                vo(InstalledVersion::Known(b.clone())),
+                &b,
+                Some(&declined),
+                ReplacePolicy::Ask
+            ),
+            LaunchPlan::ConnectService { start_first: false },
+            "Ask + declined ⇒ connect"
+        );
+    }
+
+    // Design auto-replace §7.1: `running_settings` reproduces the
+    // RUNNING service for a silent replace (A4/SC6): the protocol comes
+    // from the TLS line, and Remote only survives when the service runs
+    // TLS (I1: Remote ⇒ HTTPS).
+    #[test]
+    fn t106_running_settings_reproduces_service() {
+        let cases: [(Settings, bool, Settings); 4] = [
+            (
+                Settings::Loopback {
+                    protocol: Protocol::Http,
+                    token: true,
+                },
+                true,
+                Settings::Loopback {
+                    protocol: Protocol::Https,
+                    token: true,
+                },
+            ),
+            (
+                Settings::Loopback {
+                    protocol: Protocol::Https,
+                    token: false,
+                },
+                false,
+                Settings::Loopback {
+                    protocol: Protocol::Http,
+                    token: false,
+                },
+            ),
+            (Settings::Remote, true, Settings::Remote),
+            (
+                Settings::Remote,
+                false,
+                Settings::Loopback {
+                    protocol: Protocol::Http,
+                    token: true,
+                },
+            ),
+        ];
+        for (saved, tls, expected) in cases {
+            assert_eq!(
+                running_settings(saved, tls),
+                expected,
+                "saved {saved:?}, tls {tls}"
+            );
+        }
+        // And the `service install` argv of each result (SC6): the
+        // protocol flag follows the TLS line, the bind per A4, and the
+        // token never appears in argv (I7).
+        assert_eq!(
+            service_install_args(cases[0].2),
+            vec![
+                "service".to_string(),
+                "install".to_string(),
+                "--bind".to_string(),
+                "127.0.0.1:7823".to_string(),
+                "--tls".to_string(),
+            ]
+        );
+        assert_eq!(
+            service_install_args(cases[1].2),
+            vec![
+                "service".to_string(),
+                "install".to_string(),
+                "--bind".to_string(),
+                "127.0.0.1:7823".to_string(),
+            ]
+        );
+        assert_eq!(
+            service_install_args(cases[2].2),
+            vec![
+                "service".to_string(),
+                "install".to_string(),
+                "--bind".to_string(),
+                "0.0.0.0:7823".to_string(),
+                "--tls".to_string(),
+            ]
+        );
+        assert_eq!(
+            service_install_args(cases[3].2),
+            vec![
+                "service".to_string(),
+                "install".to_string(),
+                "--bind".to_string(),
+                "127.0.0.1:7823".to_string(),
+            ]
         );
     }
 

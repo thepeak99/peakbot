@@ -79,6 +79,10 @@ Settings are saved in `settings.json` in the app's data folder:
 Whether the background service is on is never stored there; it is read from the
 service manager.
 
+## Background service updates
+
+When the app starts and a background service is installed, it checks whether the installed binary is **exactly** the build the app bundles, by comparing file contents (not just the version number). If they differ, the app replaces `~/.local/bin/peakbot` and the service automatically — no dialog — keeping the service's HTTP/HTTPS mode and access token. Two exceptions: if the installed PeakBot is *newer* than the app's, the app asks first (and remembers a "Keep" answer), and development builds (built with `make desktop-dev`) always ask, so a debug binary can never silently overwrite your installed `peakbot`. If the binary can't be written, the existing service is left running and the app shows the error.
+
 ## Manual removal
 
 - Linux: `peakbot service uninstall` (or `systemctl --user disable --now peakbot.service; rm ~/.config/systemd/user/peakbot.service; systemctl --user daemon-reload`);

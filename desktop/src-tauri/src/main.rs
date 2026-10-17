@@ -18,6 +18,7 @@ use tauri::Manager;
 
 use peakbot_desktop_core::controller::{Action, Controller, run_loop};
 use peakbot_desktop_core::paths::DesktopPaths;
+use peakbot_desktop_core::service::ReplacePolicy;
 
 /// Bounds `RunEvent::Exit` against a controller stuck in a modal dialog.
 const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(6);
@@ -140,7 +141,15 @@ fn main() {
 
             let ui = bridge::TauriUi::new(handle.clone(), ui_state);
             let sys = peakbot_desktop_core::sys::RealSys::new();
-            let controller = Controller::new(sys, ui, paths, quitting);
+            // Release builds replace a stale service silently; dev/debug
+            // builds (make desktop-dev) ask — a debug sidecar must never
+            // silently overwrite the user's ~/.local/bin/peakbot.
+            let policy = if cfg!(debug_assertions) {
+                ReplacePolicy::Ask
+            } else {
+                ReplacePolicy::Auto
+            };
+            let controller = Controller::new(sys, ui, paths, quitting, policy);
             std::thread::Builder::new()
                 .name("controller".into())
                 .spawn(move || run_loop(controller, rx))
