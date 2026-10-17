@@ -22,6 +22,7 @@ use tauri::Manager;
 use peakbot_desktop_core::controller::{Action, Controller, run_loop};
 use peakbot_desktop_core::fontconfig;
 use peakbot_desktop_core::paths::DesktopPaths;
+use peakbot_desktop_core::phase::host_platform;
 use peakbot_desktop_core::service::ReplacePolicy;
 
 /// Bounds `RunEvent::Exit` against a controller stuck in a modal dialog.
@@ -186,7 +187,7 @@ fn main() {
             } else {
                 ReplacePolicy::Auto
             };
-            let controller = Controller::new(sys, ui, paths, quitting, policy);
+            let controller = Controller::new(sys, ui, paths, quitting, policy, host_platform());
             std::thread::Builder::new()
                 .name("controller".into())
                 .spawn(move || run_loop(controller, rx))
