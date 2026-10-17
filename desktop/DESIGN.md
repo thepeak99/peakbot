@@ -1112,6 +1112,23 @@ Order matters: T-tasks (tests) precede the C-tasks they cover (RED → GREEN).
 
 **Out of scope (separate tickets).** #374 (CA-verified readiness probe — can reuse `peakbot_ca_cert()`), #378 (Origin validation), macOS Keychain trust (practical route: `security add-trusted-cert -r trustRoot -p ssl -k login.keychain-db`).
 
+### Amendment (auto-replace) — silent replace of a stale background service (2026-10-17)
+
+**Reason.** A service whose *version number* matched the bundled sidecar but whose *build* did not (e.g. a re-release under the same version, or a CLI-installed older binary) kept running unnoticed: `plan_launch` compared version strings only. The locked design (external, `design-autoreplace.md`, PM-approved) changes identity to **content**: the installed exe's bytes (`Exec:` line) are compared with the bundled sidecar, and a differing, non-newer build is replaced **silently** in release builds — while dev builds (and a newer installed build) keep the prompt.
+
+**What changed.**
+- **§4.3 (REPLACE):** the order is now **copy-first in BOTH replace flows** (the design's T3): `install` (binary copy) → `service uninstall` → `service install`. A failed copy now leaves the service and the old binary intact (SC8). `replace_service` is split into `replace_service` (dialog / tray ReinstallService: saved settings + `sync_token`, #377 semantics) and `auto_replace_service` (silent: `running_settings(saved, tls)`, NO `sync_token`), both delegating to the shared `swap_binary_and_reinstall(s)`.
+- **§4.4 (truth table):** replaced by the design's §4.2 table + reference body: identity is checked **before** the version (`identical(svc)`); `AutoReplace` is a new `LaunchPlan` variant; the declined pair only gates the dialog, never the silent replace.
+- **§5.1 (`Sys` seam):** +`same_contents(a, b) -> io::Result<bool>` (length first, 64 KiB chunks, short-read-safe `read_full`; "cannot compare" = `Err` ⇒ not identical, invariant A6). `FakeSys` implements it over the in-memory files (+`Effect::SameContents`).
+- **§5.2 (`service.rs`):** +`ReplacePolicy { Auto, Ask }` (chosen in the glue by `cfg!(debug_assertions)`: release ⇒ Auto, debug ⇒ Ask — a debug sidecar must never silently overwrite `~/.local/bin/peakbot`); `plan_launch` gains the `identical` closure and the `policy` argument; +`running_settings(saved, tls)` — the silent path reproduces the RUNNING service (protocol from the `TLS:` line, I3; Remote only if saved is Remote AND the service runs TLS, I1) and never touches `web-token` (invariant A4).
+- **§5.3 (`controller.rs`):** `Controller` gains the `policy` field (`new(…, policy)`); +`is_bundled_build(svc)` (A6: exe None ⇒ false; Err ⇒ `log::warn!` + false), +`installed_tls()` (used by `connect_service`, replacing its inline match).
+- **§5.4 (glue):** `src-tauri` main.rs picks the policy from `cfg!(debug_assertions)` at the `Controller::new` call — both release build paths (`tauri build`, zigbuild `--release`) are `!debug_assertions`; `make desktop-dev` is a debug build.
+- **§3.4 (invariants):** A1 (identical ⇒ `ConnectService`, checked first), A2 (a newer installed build is never replaced without a confirmation), A3 (`identical`/`version_of` never run for `NotInstalled`/`Unavailable`; `version_of` only when the builds differ), A4 (silent replace: no `web-token` read/write/remove; protocol = pre-replace `TLS:` line; bind `0.0.0.0` only for Remote+TLS), A5 (copy before uninstall), A6 ("cannot compare" = not identical).
+- **§9.1:** t13/t14 rewritten to the new `plan_launch`; t49/t86 order assertions flipped to copy-first; new t103–t121 (service.rs t103–t106, controller t107–t120, real_sys t121).
+- **README:** new "Background service updates" paragraph.
+
+**Out of scope (separate tickets).** SHA-256 identity (Q1: byte equality is the seam's contract; only `RealSys::same_contents`'s body would change), rollback/retry after a failed `service install` (R5: next launch sees NotInstalled ⇒ session), opt-out setting, post-replace notification.
+
 ---
 
 ## 9. TEST PLAN

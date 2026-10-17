@@ -16,7 +16,7 @@ use crate::consts::{
 use crate::paths::DesktopPaths;
 use crate::phase::{Dialog, Mode, Phase, StartError, StartStep, TrayModel, tray_model};
 use crate::ready::{ReadyOutcome, wait_ready};
-use crate::service::{self, InstalledService, LaunchPlan, RunState, ServiceState};
+use crate::service::{self, InstalledService, LaunchPlan, ReplacePolicy, RunState, ServiceState};
 use crate::session::{self, EarlyExit, PidRecord};
 use crate::settings::{self, Protocol, SaveRequest, Settings};
 use crate::sys::{Child, RunOutput, Signal, SpawnSpec, Sys};
@@ -61,16 +61,20 @@ impl Session {
     }
 }
 
-/// Owns `sys, ui, paths, quitting, phase, bundled, service, session`
-/// (DESIGN §5.3). Every phase assignment goes through `set_phase`, which
-/// is also where the tray model is (re)emitted — a `service` refresh
-/// always lands before the next `set_phase`, so the tray checkbox mirrors
-/// the last `service status`.
+/// Owns `sys, ui, paths, quitting, policy, phase, bundled, service,
+/// session` (DESIGN §5.3). Every phase assignment goes through
+/// `set_phase`, which is also where the tray model is (re)emitted — a
+/// `service` refresh always lands before the next `set_phase`, so the
+/// tray checkbox mirrors the last `service status`.
 pub struct Controller<S: Sys, U: Ui> {
     sys: S,
     ui: U,
     paths: DesktopPaths,
     quitting: Arc<AtomicBool>,
+    /// How a build mismatch is resolved (design auto-replace §3.2): set
+    /// in `new`, never changes. Chosen at the binary boundary
+    /// (release ⇒ Auto, debug ⇒ Ask).
+    policy: ReplacePolicy,
     phase: Phase,
     /// The bundled (this app's) PeakBot version — the sidecar's
     /// `--version` output, parsed in CheckingBundled (DESIGN §1: the
@@ -83,12 +87,19 @@ pub struct Controller<S: Sys, U: Ui> {
 impl<S: Sys, U: Ui> Controller<S, U> {
     /// `phase = Starting(CheckingBundled)`. No `phase_changed` is emitted
     /// here — the first emission happens on the first `handle`.
-    pub fn new(sys: S, ui: U, paths: DesktopPaths, quitting: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        sys: S,
+        ui: U,
+        paths: DesktopPaths,
+        quitting: Arc<AtomicBool>,
+        policy: ReplacePolicy,
+    ) -> Self {
         Self {
             sys,
             ui,
             paths,
             quitting,
+            policy,
             phase: Phase::Starting(StartStep::CheckingBundled),
             bundled: None,
             service: None,
@@ -181,13 +192,16 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         let declined = self.read_declined();
         let plan = service::plan_launch(
             &state,
+            |svc| self.is_bundled_build(svc),
             |svc| self.version_of(svc),
             &bundled,
             declined.as_ref(),
+            self.policy,
         );
         match plan {
             LaunchPlan::Session => self.launch_session(),
             LaunchPlan::ConnectService { start_first } => self.connect_service(start_first),
+            LaunchPlan::AutoReplace => self.auto_replace_service(),
             LaunchPlan::AskReplace { installed } => {
                 let dialog = service::replace_dialog(&installed, &bundled);
                 if self.ui.confirm(&dialog) {
@@ -252,8 +266,29 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         self.service = Some(self.query_service_status());
     }
 
-    /// `version_of(installed)` per DESIGN §4.4: exe None → Unknown, else
-    /// `<exe> --version`.
+    /// A6: exe None ⇒ false; `same_contents` Err ⇒ log::warn! + false.
+    fn is_bundled_build(&self, svc: &InstalledService) -> bool {
+        svc.exe.as_deref().is_some_and(|exe| {
+            self.sys
+                .same_contents(exe, &self.paths.sidecar)
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "cannot compare {} with the bundled sidecar: {e}",
+                        exe.display()
+                    );
+                    false
+                })
+        })
+    }
+
+    /// The `TLS:` status line of the installed service (invariant I3) —
+    /// the service's protocol source.
+    fn installed_tls(&self) -> bool {
+        matches!(&self.service, Some(ServiceState::Installed(svc)) if svc.tls)
+    }
+
+    /// `version_of(installed)` per design auto-replace §4.1: exe None →
+    /// Unknown, else `<exe> --version`.
     fn version_of(&self, svc: &InstalledService) -> InstalledVersion {
         let Some(exe) = &svc.exe else {
             return InstalledVersion::Unknown;
@@ -415,9 +450,10 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         }
         // The protocol is what the service actually runs with — the
         // `TLS:` status line (invariant I3), never settings.json.
-        let protocol = match &self.service {
-            Some(ServiceState::Installed(svc)) if svc.tls => Protocol::Https,
-            _ => Protocol::Http,
+        let protocol = if self.installed_tls() {
+            Protocol::Https
+        } else {
+            Protocol::Http
         };
         let mode = Mode::Service { protocol, token };
         match wait_ready(
@@ -499,10 +535,37 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     }
 
     // -------------------------------------------------------------------
-    // REPLACE (DESIGN §4.3) — also Action::ReinstallService
+    // REPLACE (design auto-replace §4.3) — also Action::ReinstallService
     // -------------------------------------------------------------------
 
+    /// User-confirmed replace (dialog "Replace" / tray ReinstallService,
+    /// #377 semantics): the SAVED settings apply, and the token file is
+    /// synced to them.
     fn replace_service(&mut self) {
+        let s = self.settings();
+        self.sync_token(s);
+        self.swap_binary_and_reinstall(s);
+    }
+
+    /// `LaunchPlan::AutoReplace` — silent: it reproduces the RUNNING
+    /// service (protocol from the `TLS:` line, A4) and never calls
+    /// `sync_token`, so the `web-token` file is untouched and the
+    /// `service install` argv carries no `--token` (I7).
+    fn auto_replace_service(&mut self) {
+        let s = service::running_settings(self.settings(), self.installed_tls());
+        self.swap_binary_and_reinstall(s);
+    }
+
+    /// The shared replace sequence (A5): the binary copy runs FIRST, so
+    /// a failed copy leaves the service and the old binary intact.
+    /// `enable --now` doesn't restart a running unit, so the uninstall +
+    /// install pair is still what restarts the service on the new binary.
+    fn swap_binary_and_reinstall(&mut self, s: Settings) {
+        self.set_phase(Phase::Starting(StartStep::InstallingService));
+        if let Err((command, output)) = self.run_sidecar_cmd(&service::install_args()) {
+            return self.fail(StartError::ServiceCommandFailed { command, output });
+        }
+
         self.set_phase(Phase::Starting(StartStep::RemovingService));
         // Non-zero tolerated: the unit may not be loaded.
         let _ = self
@@ -510,14 +573,9 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             .run(&self.paths.sidecar, &service::service_uninstall_args());
 
         self.set_phase(Phase::Starting(StartStep::InstallingService));
-        let s = self.settings();
-        self.sync_token(s);
         let args = service::service_install_args(s);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        if let Err((command, output)) = self
-            .run_sidecar_cmd(&service::install_args())
-            .and_then(|_| self.run_sidecar_cmd(&args))
-        {
+        if let Err((command, output)) = self.run_sidecar_cmd(&args) {
             return self.fail(StartError::ServiceCommandFailed { command, output });
         }
 

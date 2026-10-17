@@ -36,14 +36,30 @@ pub enum ServiceState {
     Installed(InstalledService),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacePolicy {
+    /// Replace silently unless it would be a downgrade.
+    Auto,
+    /// Always ask (dev builds — a debug sidecar must never silently
+    /// overwrite the user's ~/.local/bin/peakbot).
+    Ask,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchPlan {
     Session,
+    /// The installed exe is byte-identical to the bundled sidecar, or the
+    /// user declined this exact (installed, bundled) pair.
     /// `start_first ⇔ run == Stopped`.
     ConnectService {
         start_first: bool,
     },
-    /// Versions differ (or unknown) and not previously declined.
+    /// The builds differ, it is not a downgrade, and the policy is Auto:
+    /// replace the binary without asking, reproducing the running
+    /// service's protocol and token.
+    AutoReplace,
+    /// The builds differ, and (policy is Ask, or installed > bundled), and
+    /// the pair was not declined.
     AskReplace {
         installed: InstalledVersion,
     },
@@ -129,24 +145,57 @@ pub fn parse_service_status(out: &RunOutput) -> ServiceState {
     }
 }
 
-/// The §4.4 truth table. `version_of` runs `<exe> --version`.
+/// The §4.2 truth table (design auto-replace; replaces DESIGN §4.4).
+/// `identical` = the installed exe's bytes equal the bundled sidecar's
+/// (A6: "cannot compare" is false); it runs BEFORE `version_of`, and
+/// neither runs for NotInstalled/Unavailable (A3). `newer` = the
+/// installed version is Known and above the bundled one (A2).
 pub fn plan_launch(
     state: &ServiceState,
+    identical: impl FnOnce(&InstalledService) -> bool,
     version_of: impl FnOnce(&InstalledService) -> InstalledVersion,
     bundled: &Version,
     declined: Option<&DeclinedReplace>,
+    policy: ReplacePolicy,
 ) -> LaunchPlan {
     let ServiceState::Installed(svc) = state else {
-        // Unavailable / NotInstalled ⇒ session; version_of is not called.
+        // Unavailable / NotInstalled ⇒ session; identical/version_of are
+        // not called.
         return LaunchPlan::Session;
     };
-    let installed = version_of(svc);
     let start_first = svc.run == RunState::Stopped;
-    let same = matches!(&installed, InstalledVersion::Known(v) if v == bundled);
-    if same || declined.is_some_and(|d| d.matches(&installed, bundled)) {
+    if identical(svc) {
+        return LaunchPlan::ConnectService { start_first };
+    }
+    let installed = version_of(svc);
+    let newer = matches!(&installed, InstalledVersion::Known(v) if v > bundled);
+    if policy == ReplacePolicy::Auto && !newer {
+        return LaunchPlan::AutoReplace;
+    }
+    if declined.is_some_and(|d| d.matches(&installed, bundled)) {
         return LaunchPlan::ConnectService { start_first };
     }
     LaunchPlan::AskReplace { installed }
+}
+
+/// The settings that reproduce the RUNNING service for a silent replace
+/// (A4). Protocol from the `TLS:` line (I3); Remote only if saved is
+/// Remote AND the service runs TLS (I1). The loopback `token` flag is
+/// carried from `saved` but is not used by `service_install_args`. The
+/// token itself lives in `web-token`, which the silent path never
+/// touches.
+pub fn running_settings(saved: Settings, tls: bool) -> Settings {
+    match (saved, tls) {
+        (Settings::Remote, true) => Settings::Remote,
+        (Settings::Remote, false) => Settings::Loopback {
+            protocol: Protocol::Http,
+            token: true,
+        },
+        (Settings::Loopback { token, .. }, tls) => Settings::Loopback {
+            protocol: if tls { Protocol::Https } else { Protocol::Http },
+            token,
+        },
+    }
 }
 
 pub fn replace_dialog(installed: &InstalledVersion, bundled: &Version) -> Dialog {
@@ -814,7 +863,7 @@ mod tests {
             plan_launch(
                 &state,
                 ident_false,
-                vo(InstalledVersion::Known(b)),
+                vo(InstalledVersion::Known(b.clone())),
                 &b,
                 Some(&declined_same),
                 ReplacePolicy::Auto
@@ -887,7 +936,7 @@ mod tests {
             plan_launch(
                 &state,
                 ident_false,
-                vo(InstalledVersion::Known(b)),
+                vo(InstalledVersion::Known(b.clone())),
                 &b,
                 Some(&declined),
                 ReplacePolicy::Ask

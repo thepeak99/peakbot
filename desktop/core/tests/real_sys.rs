@@ -224,9 +224,12 @@ fn t121_real_sys_same_contents() {
     let b = dir.path().join("b.bin");
     std::fs::write(&a, &content).unwrap();
     std::fs::write(&b, &content).unwrap();
-    assert_eq!(
-        sys.same_contents(&a, &b),
-        Ok(true),
+    // Compile note: `io::Error` is not `PartialEq`, so the tester's
+    // `assert_eq!(…, Ok(…))` cannot compile against the locked
+    // `io::Result<bool>` seam; `is_ok_and` keeps the exact
+    // pass/fail semantics.
+    assert!(
+        sys.same_contents(&a, &b).is_ok_and(|same| same),
         "identical 200 KiB files must compare equal"
     );
 
@@ -234,28 +237,29 @@ fn t121_real_sys_same_contents() {
     // boundary (index 204799 > 65536). A comparison that stopped at the
     // first chunk would miss it.
     let mut diff = content.clone();
-    diff[diff.len() - 1] ^= 0xFF;
+    // Compile note: `diff[diff.len() - 1] ^= 0xFF` is a self-referential
+    // index (mutable + immutable borrow in one expression) that current
+    // borrowck rejects; binding the index first is equivalent.
+    let last = diff.len() - 1;
+    diff[last] ^= 0xFF;
     let c = dir.path().join("c.bin");
     std::fs::write(&c, &diff).unwrap();
-    assert_eq!(
-        sys.same_contents(&a, &c),
-        Ok(false),
+    assert!(
+        sys.same_contents(&a, &c).is_ok_and(|same| !same),
         "a difference past the 64 KiB boundary must be found"
     );
 
     // Different length (the common mismatch) ⇒ false.
     let d = dir.path().join("d.bin");
     std::fs::write(&d, &content[..content.len() - 1]).unwrap();
-    assert_eq!(
-        sys.same_contents(&a, &d),
-        Ok(false),
+    assert!(
+        sys.same_contents(&a, &d).is_ok_and(|same| !same),
         "different lengths must not be equal"
     );
 
     // A path compared with itself is always equal.
-    assert_eq!(
-        sys.same_contents(&a, &a),
-        Ok(true),
+    assert!(
+        sys.same_contents(&a, &a).is_ok_and(|same| same),
         "a file compared with itself must be equal"
     );
 
