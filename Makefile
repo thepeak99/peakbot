@@ -114,10 +114,17 @@ dev:
 	( cd web && npm run dev ) & \
 	wait
 
-## clean: Remove output artifacts
+## clean: Remove ALL build artifacts (cargo targets, web SPA + node_modules, desktop sidecar/gen/fonts, outputs, release temp)
 clean:
 	rm -rf $(OUTPUT_DIR)
-	@echo "🧹 Cleaned $(OUTPUT_DIR)/"
+	cargo clean
+	cargo clean --manifest-path desktop/Cargo.toml
+	rm -rf web/dist web/node_modules
+	rm -rf desktop/src-tauri/gen desktop/src-tauri/linux/fonts
+	rm -f  desktop/src-tauri/binaries/peakbot-*
+	rm -f  .release-version
+	@mkdir -p web/dist && touch web/dist/.gitkeep desktop/src-tauri/binaries/.gitkeep
+	@echo "🧹 Cleaned all build artifacts"
 
 ## docker-build: Alias for build
 docker-build: build

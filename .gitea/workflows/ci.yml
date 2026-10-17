@@ -51,11 +51,42 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --workspace --locked
-      # Desktop core (Tauri-free logic crate) — compiles/tests in this
-      # plain rust container; the Tauri glue needs webkit and is built
-      # only in desktop.yml.
-      - name: Desktop core
+
+  # Full desktop workspace (core + Tauri glue). The glue needs the webkit2gtk
+  # system deps (same set as Dockerfile.desktop-linux); no node/web build —
+  # frontendDist desktop/ui is committed static files.
+  desktop:
+    name: desktop (core + Tauri glue)
+    runs-on: dind
+    timeout-minutes: 45
+    container: rust:1.95
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout (no-node, pure git)
         run: |
-          cargo fmt --manifest-path desktop/Cargo.toml -p peakbot-desktop-core -- --check
-          cargo clippy --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core --all-targets -- -D warnings
-          cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core
+          git init -q
+          git fetch --depth=1 \
+            "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Install rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      # Tauri 2 Linux prerequisites (same set as Dockerfile.desktop-linux).
+      - name: Install webkit/Tauri system deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            pkg-config libwebkit2gtk-4.1-dev libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Desktop fmt + clippy + test
+        run: |
+          # tauri-build fails if bundle.externalBin is missing; a placeholder suffices for check builds.
+          touch "desktop/src-tauri/binaries/peakbot-$(rustc -vV | sed -n 's/host: //p')"
+          cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path desktop/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo test --locked --manifest-path desktop/Cargo.toml --workspace
