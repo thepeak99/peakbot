@@ -1,0 +1,110 @@
+# ~/.config/peakbot/config.yaml — exactly 4 blocks: providers · mcps · profiles · general
+# Unknown keys anywhere are a load error.
+
+providers:                                   # REQUIRED, non-empty list; ProviderEntry/ModelEntry UNCHANGED
+  - name: patchnotes
+    type: openai                             # openrouter | openai | anthropic | llamacpp | ollama
+    base_url: https://ai.patchnotes.com/v1
+    api_key: pn-live-9f3e5a7c1b2d4e6f
+    models:
+      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }
+      - { name: anthropic/claude-opus-4.1,   alias: opus,   max_tokens: 8192 }
+      - { name: qwen3-coder,                 alias: qwen,   max_tokens: 32768, vision: false }
+  - name: local
+    type: ollama
+    base_url: http://127.0.0.1:11434
+    models:
+      - { name: "llama3.1:8b", alias: llama, context_size: 32768 }   # ModelEntry has no num_ctx field
+# NOTE: there is no default_model any more — every agent names its own model.
+
+mcps:                                        # optional list (default []); McpServerConfig UNCHANGED; BOOT-ONLY
+  - name: playwright                         # stdio (type omitted = stdio)
+    command: npx
+    args: ["@playwright/mcp@latest"]
+  - name: linear
+    type: streamable-http
+    url: https://mcp.linear.app/mcp
+    auth: { type: oauth }
+
+profiles:                                    # REQUIRED ordered MAP, non-empty. FIRST = default profile.
+  dev:
+    tools: { disabled: [powershell, powershell_bg] }   # NameFilter over built-in tools (no `delegate`)
+    mcps: { only: [playwright, linear] }               # NameFilter over the names in top-level `mcps`
+    fetch_url: { allow_post: false }
+    env: { GIT_PAGER: cat }                            # base bash env for the agent AND its subagents
+    memory: { enabled: true, threshold_bytes: 51200 }
+    # vector_db: absent → no doc_index/doc_search for this profile
+    ui: { tabs: { disabled: [bash] } }                 # NameFilter over TAB_NAMES
+    agents:                                  # REQUIRED ordered MAP, non-empty. FIRST = default agent.
+      team:
+        model: sonnet                        # REQUIRED alias — the STARTING model (/model may switch it)
+        persona: |                           # optional; absent = built-in persona
+          You are the tech lead. You own the architecture, you delegate the work,
+          and you review everything that comes back.
+        prompt: Research first, then design, test, build.   # optional → "# Instructions"
+        # core_guidance: true                # default; false = persona is the WHOLE static head
+        # skills: { only: [github] }         # NameFilter over discovered skills
+        # agents_md: true                    # default true for agents
+        # env: { FOO: bar }                  # overlays profile.env for THIS agent only
+        subagents:                           # optional ordered MAP; non-empty ⇒ `delegate` is registered
+          researcher:
+            model: qwen                      # optional; absent = the agent's configured model (sonnet)
+            prompt: Gather background, cite sources, hand back a brief.   # REQUIRED, non-blank
+          senior:
+            model: opus
+            prompt: Review the design and the code. Block what is wrong.
+            skills: { only: [github, gitea] }
+          tester:
+            prompt: Write the failing tests first, then make them pass.
+            # agents_md: false               # default false for subagents
+            # persona: …                     # ✗ PARSE ERROR — subagents have no persona
+      solo:
+        model: sonnet                        # single agent: no subagents → no delegate tool
+
+  research:
+    tools: { only: [web_search, fetch_page, fetch_url, think, todo, file_create] }
+    mcps: { enabled: false }                 # no MCP tools at all (NB: `only: []` means ALL — NameFilter rule)
+    memory: { enabled: false }
+    vector_db:
+      db_path: ~/research/research.db        # absolute/home path → one DB everywhere
+      embeddings:
+        base_url: https://embed.example.com/v1
+        api_key: emb-44aa9f2c
+        model: bge-m3
+        dimensions: 1024
+    agents:
+      scholar:
+        model: opus
+        core_guidance: false                 # persona below is the whole prompt head
+        persona: |
+          You are a meticulous research assistant. You verify claims against primary
+          sources and say plainly when you do not know.
+        prompt: Prefer primary sources. Cite URLs.
+        agents_md: false
+
+general:                                     # optional; every key defaulted
+  web:                                       # BOOT-ONLY
+    bind: 127.0.0.1:7823                     # CLI --bind > this > default
+    # token: "…"                             # CLI --token > $PEAKBOT_WEB_TOKEN > this
+    tls: false
+    session_ttl_secs: 600
+    reaper_tick_secs: 60
+  search:                                    # presence = web_search on (SearXNG)
+    base_url: https://searx.example.com
+    timeout_seconds: 30
+    max_results: 10
+    # bearer_token: "…"
+  context:                                   # conversation compaction
+    enabled: true
+    threshold: 0.8
+    keep_recent: 5
+    compaction_model: qwen                   # optional alias; absent = the conversation's current model
+  conversation:                              # BOOT-ONLY
+    auto_save: true
+    # storage_dir: ~/.local/share/peakbot/conversations
+  agent_max_turns: 50
+  cost_tracking: true
+  retry: { max_retries: 3, initial_delay_ms: 1000, max_delay_ms: 30000, backoff_factor: 2.0 }
+  timeouts: { tool_secs: 1800, delegate_secs: 7200 }
+  http: { connect_timeout_secs: 30, read_timeout_secs: 1800 }    # BOOT-ONLY
+  uploads: { max_file_mb: 50, max_files: 10 }                    # BOOT-ONLY
