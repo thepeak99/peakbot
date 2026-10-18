@@ -79,7 +79,11 @@ fn agents_md_effective(role_agents_md: bool, profile_ceiling: bool) -> bool {
 /// `agents_md: true`). Deliberately lean — no persona, core guidance, or
 /// memory. Sections are separated by blank lines; empty pieces (no skills
 /// shown, no bg processes, no agents.md) contribute nothing.
-fn build_sub_agent_preamble(
+// `pub` (not `pub(crate)`) only so the pre-0.24 behaviour-snapshot test
+// (tests/old_behaviour_snapshots.rs, an external crate) can pin the exact
+// preamble text; hidden from docs.
+#[doc(hidden)]
+pub fn build_sub_agent_preamble(
     role_prompt: &str,
     shell_kind: Option<&ShellKind>,
     cwd: &std::path::Path,
