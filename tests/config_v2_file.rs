@@ -271,7 +271,7 @@ fn global_example_general_block() {
             compaction_model: Some("qwen".to_string())
         }
     );
-    assert_eq!(g.conversation.auto_save, true);
+    assert!(g.conversation.auto_save);
     assert_eq!(g.conversation.storage_dir, None);
     assert_eq!(g.agent_max_turns, 50);
     assert!(g.cost_tracking);
@@ -328,7 +328,7 @@ fn repo_example_fixture_deserializes_and_keeps_order() {
     assert_eq!(sub_names, ["mid", "senior", "tester"]);
 
     // Env is a BTreeMap (spec §5.2): deterministic (sorted) order.
-    let env_keys: Vec<&str> = pbd.env.iter().map(|(k, _)| k.as_str()).collect();
+    let env_keys: Vec<&str> = pbd.env.keys().map(|k| k.as_str()).collect();
     assert_eq!(env_keys, ["CARGO_TERM_COLOR", "RUST_LOG"]);
     assert_eq!(pbd.env.get("RUST_LOG"), Some(&"peakbot=info".to_string()));
 
@@ -379,7 +379,7 @@ fn general_absent_gives_full_defaults() {
             compaction_model: None
         }
     );
-    assert_eq!(g.conversation.auto_save, true);
+    assert!(g.conversation.auto_save);
     assert_eq!(g.conversation.storage_dir, None);
     assert_eq!(g.agent_max_turns, 50);
     assert!(g.cost_tracking);

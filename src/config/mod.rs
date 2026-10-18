@@ -8,7 +8,9 @@
 // impl change with no test edits.
 #![allow(clippy::bool_assert_comparison)]
 
+pub mod file;
 pub mod model_registry;
+pub mod named;
 pub use model_registry::{ModelEntry, ModelRegistry, ProviderEntry, RegistryError, ResolvedModel};
 
 use anyhow::Context;
@@ -1217,7 +1219,12 @@ pub enum McpTransportType {
     Stdio,
     /// Server-Sent Events over HTTP
     Sse,
-    /// Streamable HTTP transport (recommended for remote servers)
+    /// Streamable HTTP transport (recommended for remote servers).
+    /// `alias`: the 0.24 layout spells the value `streamable-http` (spec §3.1,
+    /// §9.9), matching this type's `Display`; the alias makes the unchanged
+    /// struct accept both spellings. Strictly additive — old configs keep
+    /// parsing as before.
+    #[serde(alias = "streamable-http")]
     StreamableHttp,
 }
 

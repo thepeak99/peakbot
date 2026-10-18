@@ -141,7 +141,7 @@ fn named_first_returns_first_entry() {
         "one",
         "first() must be positional, not sorted"
     );
-    assert_eq!(value, 1u32);
+    assert_eq!(*value, 1u32);
 }
 
 #[test]
