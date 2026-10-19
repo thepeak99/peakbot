@@ -12,6 +12,7 @@ pub mod errors;
 pub mod file;
 pub mod model_registry;
 pub mod named;
+pub mod resolve;
 pub use model_registry::{ModelEntry, ModelRegistry, ProviderEntry, RegistryError, ResolvedModel};
 
 use anyhow::Context;

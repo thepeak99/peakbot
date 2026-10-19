@@ -1002,7 +1002,9 @@ fn repo_same_name_replaces_global_with_no_field_merge() {
 
 #[test]
 fn repo_profile_may_use_global_alias_and_any_global_mcp() {
-    let global = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nmcps:\n  - name: playwright\n    command: npx\n";
+    // The global needs its own profile (E2: `profiles` is required in the
+    // global file, spec §3.3/§6.8) — the repo profile is listed first anyway.
+    let global = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nmcps:\n  - name: playwright\n    command: npx\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\n";
     let repo = "profiles:\n  r:\n    mcps:\n      only: [playwright]\n    agents:\n      a:\n        model: a\n";
     let cfg = parse_global_repo(global, repo).expect("repo must see global aliases + mcps");
     let r = cfg.catalog.profile("r").expect("r");
