@@ -396,7 +396,7 @@ impl VectorStore {
 }
 /// Lexically normalize a path: drop `.` components, pop on `..` (never past
 /// root for absolute paths). No filesystem access — the DB file may not exist.
-fn normalize_lexical(p: &Path) -> PathBuf {
+pub(crate) fn normalize_lexical(p: &Path) -> PathBuf {
     let mut components = p.components().peekable();
     let mut result = PathBuf::new();
 

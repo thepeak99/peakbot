@@ -52,10 +52,36 @@ impl<T> Named<T> {
 }
 
 /// §4.3 N1, verbatim (the "1–64" is an en dash, U+2013).
+const INVALID_NAME_SUFFIX: &str = "' must be 1–64 characters of letters, digits, space, '_', '.', '-' with no leading/trailing space";
+
 fn invalid_name_error(name: &str) -> String {
-    format!(
-        "name '{name}' must be 1–64 characters of letters, digits, space, '_', '.', '-' with no leading/trailing space"
-    )
+    format!("name '{name}{INVALID_NAME_SUFFIX}")
+}
+
+fn duplicate_name_error(name: &str) -> String {
+    format!("duplicate name '{name}'")
+}
+
+/// A `Named` failure recognised in a serde message. serde errors are plain
+/// strings, so `Config::parse` reads the offending name back to re-path N1
+/// and re-word N2; the formats live here, next to where they are written.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum NamedFailure<'m> {
+    Invalid(&'m str),
+    Duplicate(&'m str),
+}
+
+pub(super) fn named_failure(message: &str) -> Option<NamedFailure<'_>> {
+    if let Some(name) = message
+        .strip_prefix("name '")
+        .and_then(|m| m.strip_suffix(INVALID_NAME_SUFFIX))
+    {
+        return Some(NamedFailure::Invalid(name));
+    }
+    message
+        .strip_prefix("duplicate name '")
+        .and_then(|m| m.strip_suffix('\''))
+        .map(NamedFailure::Duplicate)
 }
 
 /// §4.2: `^[A-Za-z0-9_ .-]{1,64}$` plus "trimmed == raw". Plain char checks —
@@ -93,7 +119,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Named<T> {
                     // Generic N2: the resolve layer (A4) rewrites this to
                     // `duplicate profile/agent/subagent '<n>'` by path.
                     if entries.iter().any(|(k, _)| k == &name) {
-                        return Err(serde::de::Error::custom(format!("duplicate name '{name}'")));
+                        return Err(serde::de::Error::custom(duplicate_name_error(&name)));
                     }
                     entries.push((name, value));
                 }

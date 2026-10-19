@@ -8,6 +8,7 @@
 // impl change with no test edits.
 #![allow(clippy::bool_assert_comparison)]
 
+pub mod errors;
 pub mod file;
 pub mod model_registry;
 pub mod named;

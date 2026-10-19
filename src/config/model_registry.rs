@@ -157,6 +157,19 @@ pub struct BootSelection<'a> {
     pub unavailable: Option<(String, String)>,
 }
 
+/// Canonical handle of a model: its alias if declared, else the full
+/// `<provider.name>/<model.name>` wire id, not a leaf-stripped form. This
+/// keeps the auto-generated handle predictable from the config alone and
+/// preserves any namespace prefix the wire id carries
+/// (`minimax/MiniMax-M2.7` → `<prov>/minimax/MiniMax-M2.7`).
+/// *(principle of least astonishment)*
+pub(crate) fn canonical_alias(prov: &ProviderEntry, model: &ModelEntry) -> String {
+    model
+        .alias
+        .clone()
+        .unwrap_or_else(|| format!("{}/{}", prov.name, model.name))
+}
+
 /// Errors raised while validating a `ModelRegistry` from a config.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RegistryError {
@@ -220,21 +233,7 @@ impl ModelRegistry {
 
         for prov in providers {
             for model in &prov.models {
-                // Canonical handle:
-                //   • alias if declared,
-                //   • else `<provider.name>/<model.name>` — the FULL
-                //     wire id, not a leaf-stripped form. This keeps
-                //     the auto-generated handle predictable from the
-                //     config alone (the user can construct the
-                //     `default_model:` value without reading source)
-                //     and preserves any namespace prefix the wire id
-                //     carries (`minimax/MiniMax-M2.7` →
-                //     `<prov>/minimax/MiniMax-M2.7`). *(principle of
-                //     least astonishment)*
-                let alias = model
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| format!("{}/{}", prov.name, model.name));
+                let alias = canonical_alias(prov, model);
 
                 if !is_valid_alias(&alias) {
                     return Err(RegistryError::InvalidAlias {
