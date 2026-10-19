@@ -1,0 +1,18 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model-a
+        alias: alpha
+      - name: fake-model-b
+        alias: beta
+default_model: alpha
+pipelines:
+  - name: builder
+    orchestrator:
+      model: beta
+      prompt: Build the thing.
+    agents:
+      coder:
+        prompt: Write code.

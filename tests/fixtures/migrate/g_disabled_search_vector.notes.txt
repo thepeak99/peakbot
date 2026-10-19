@@ -1,0 +1,2 @@
+searxng was disabled; the search setting was dropped.
+vector_db was disabled; the vector_db setting was dropped.

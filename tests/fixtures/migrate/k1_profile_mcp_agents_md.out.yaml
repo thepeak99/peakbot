@@ -1,0 +1,25 @@
+providers:
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - name: llama3
+        alias: local
+mcps:
+  - name: alpha
+    type: sse
+    url: http://alpha.test/sse
+  - name: beta
+    type: sse
+    url: http://beta.test/sse
+profiles:
+  default:
+    agents:
+      main:
+        model: local
+  web:
+    mcps:
+      only: [alpha]
+    agents:
+      main:
+        model: local

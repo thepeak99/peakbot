@@ -1,0 +1,52 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+mcps:
+  - name: alpha
+    type: sse
+    url: http://alpha.test/sse
+profiles:
+  default:
+    agents:
+      main:
+        model: solo
+        persona: You are the global persona.
+      team:
+        model: solo
+        persona: You are the global persona.
+        prompt: Lead the pair.
+        subagents:
+          worker:
+            prompt: Work.
+  web:
+    tools:
+      only: [web_search, fetch_page]
+    mcps:
+      only: [alpha]
+    fetch_url:
+      allow_post: true
+    memory:
+      enabled: false
+    ui:
+      tabs:
+        disabled: [bash]
+    agents:
+      main:
+        model: solo
+        persona: Web persona head.
+        core_guidance: false
+        agents_md: false
+      team:
+        model: solo
+        persona: Web persona head.
+        core_guidance: false
+        prompt: Lead the pair.
+        agents_md: false
+        subagents:
+          worker:
+            prompt: Work.
+            agents_md: false

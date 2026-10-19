@@ -1,0 +1,1 @@
+tools: 'delegate' was blocked; delegation is now on whenever an agent has subagents.

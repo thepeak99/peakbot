@@ -1,0 +1,2 @@
+pipeline 'main' was renamed to 'main-2' (name collision with the base agent).
+profile 'default' was renamed to 'default-2' (name collision with the base profile).

@@ -1,0 +1,21 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+default_model: solo
+pipelines:
+  - name: main
+    orchestrator:
+      model: solo
+      persona: The main team lead.
+      prompt: Run the main team.
+    agents:
+      worker:
+        prompt: Work.
+profiles:
+  default:
+    tools:
+      only: [web_search]

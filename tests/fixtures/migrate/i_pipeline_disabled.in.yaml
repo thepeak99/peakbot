@@ -1,0 +1,14 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+default_model: solo
+pipeline:
+  enabled: false
+  orchestrator_prompt: Lead the team.
+  agents:
+    worker:
+      prompt: Work.

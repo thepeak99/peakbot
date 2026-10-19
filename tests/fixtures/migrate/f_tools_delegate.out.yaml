@@ -1,0 +1,20 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+profiles:
+  default:
+    tools:
+      disabled: [powershell]
+    agents:
+      main:
+        model: solo
+  solo-web:
+    tools:
+      enabled: false
+    agents:
+      main:
+        model: solo

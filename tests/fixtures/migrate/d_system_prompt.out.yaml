@@ -1,0 +1,31 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+profiles:
+  default:
+    agents:
+      main:
+        model: solo
+        persona: You are a terse systems engineer. Answer with facts, not essays.
+        core_guidance: false
+      with-persona:
+        model: solo
+        persona: You are a terse systems engineer. Answer with facts, not essays.
+        core_guidance: false
+        prompt: Coordinate the pair.
+        subagents:
+          worker:
+            model: solo
+            prompt: Do the work.
+      without-persona:
+        model: solo
+        persona: You are a terse systems engineer. Answer with facts, not essays.
+        core_guidance: false
+        prompt: Coordinate solo.
+        subagents:
+          helper:
+            prompt: Assist.

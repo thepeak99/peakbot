@@ -1,0 +1,1 @@
+agent 'builder' previously ran without the built-in persona; it now gets it — set a persona to change that.
