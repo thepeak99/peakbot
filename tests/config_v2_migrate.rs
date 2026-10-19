@@ -88,7 +88,7 @@ fn fixture_path(stem: &str, ext: &str) -> std::path::PathBuf {
 }
 
 fn load_fixture(stem: &str, ext: &str) -> serde_yaml::Value {
-    let path = fixture_path(stem, ext);
+    let path = fixture_path(stem, &format!("{ext}.yaml"));
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parsing {}: {e}", path.display()))
@@ -220,6 +220,11 @@ fn golden_i_pipeline_enabled() {
 #[test]
 fn golden_i_pipeline_disabled() {
     run_golden("i_pipeline_disabled");
+}
+
+#[test]
+fn golden_j_subagent_model_fallback() {
+    run_golden("j_subagent_model_fallback");
 }
 
 #[test]
