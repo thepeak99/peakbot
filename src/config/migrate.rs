@@ -1,9 +1,17 @@
 //! Pre-0.24 → 0.24 config migration; deleted in 0.26.
 //!
-//! Pure `Value → Value` (spec §7). It never goes through the old typed
-//! `Config`: that would fill in defaults and lose the user's key order.
+//! Pure `Value → Value` (spec §7) plus the `migrate_file` IO wrapper (§7.5).
+//! The pure half never goes through the old typed `Config`: that would fill
+//! in defaults and lose the user's key order.
+
+use std::path::{Path, PathBuf};
 
 use serde_yaml::{Mapping, Value};
+
+use crate::PEAKBOT_VERSION;
+use crate::config::errors::ConfigErrors;
+use crate::config::resolve::{Config, ParseCtx, Source};
+use crate::config::save_config_at;
 
 /// Top-level keys that only the pre-0.24 layout has (spec §7.1).
 const LEGACY_TOP: [&str; 22] = [
@@ -164,6 +172,126 @@ pub fn migrate(old: &Value) -> Result<Migration, MigrateError> {
     }
     Ok(Migration {
         config: Value::Mapping(config),
+        notes,
+    })
+}
+
+// ── IO wrapper (§7.5); deleted in 0.26 ─────────────────────────────────────
+
+/// What `migrate_file` did; the CLI and the HTTP endpoint print/return it.
+#[derive(Debug)]
+pub struct MigrateReport {
+    /// The `config.yaml` that now holds the migrated bytes.
+    pub path: PathBuf,
+    /// The `.bak` holding the previous bytes.
+    pub backup: PathBuf,
+    /// Human notes (token move, repo file, warnings), in order.
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MigrateFileError {
+    /// Not an accident: a second run is a no-op the CLI exits 0 for.
+    #[error("config.yaml already uses the 0.24 layout — nothing to do.")]
+    AlreadyCurrent,
+    #[error("failed to read {0}: {1}")]
+    Read(PathBuf, String),
+    #[error("failed to parse {0}: {1}")]
+    Parse(PathBuf, String),
+    #[error("migrated config does not validate: {0}")]
+    InvalidResult(String),
+    #[error("failed to write the migrated config: {0}")]
+    Write(String),
+    #[error(transparent)]
+    Migrate(#[from] MigrateError),
+}
+
+/// §7.5: read, migrate, validate — then write. A failed migration touches
+/// neither `config.yaml` nor `config.yaml.bak`.
+pub fn migrate_file(config_path: &Path, cwd: &Path) -> Result<MigrateReport, MigrateFileError> {
+    let text = std::fs::read_to_string(config_path)
+        .map_err(|e| MigrateFileError::Read(config_path.to_path_buf(), e.to_string()))?;
+    let old: Value = serde_yaml::from_str(&text)
+        .map_err(|e| MigrateFileError::Parse(config_path.to_path_buf(), e.to_string()))?;
+    if !is_legacy(&old) {
+        return Err(MigrateFileError::AlreadyCurrent);
+    }
+    let Migration {
+        mut config,
+        mut notes,
+    } = migrate(&old)?;
+
+    let config_dir = config_path.parent().ok_or_else(|| {
+        MigrateFileError::Read(config_path.to_path_buf(), "no parent directory".to_string())
+    })?;
+
+    // Step 3: the web-token file becomes `general.web.token` (if absent).
+    let token_path = config_dir.join("web-token");
+    let token = std::fs::read_to_string(&token_path)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    if let Some(token) = &token
+        && insert_web_token(&mut config, token)
+    {
+        notes.push(format!(
+            "web-token file moved into general.web.token; renamed {}/web-token → web-token.bak.",
+            config_dir.display()
+        ));
+    }
+
+    // Steps 4–5: header + serialize, then validate BEFORE any write.
+    let body =
+        serde_yaml::to_string(&config).map_err(|e| MigrateFileError::Write(e.to_string()))?;
+    let header = format!(
+        "# migrated from the pre-0.24 layout by peakbot {PEAKBOT_VERSION} — previous file: config.yaml.bak"
+    );
+    let yaml = format!("{header}\n{body}");
+    let ctx = ParseCtx { known_skills: &[] };
+    Config::parse(
+        Source {
+            path: config_path,
+            text: &yaml,
+        },
+        None,
+        &ctx,
+    )
+    .map_err(|errors| MigrateFileError::InvalidResult(format_parse_errors(&errors)))?;
+
+    // Step 6: backup + atomic write.
+    let outcome =
+        save_config_at(config_dir, &yaml).map_err(|e| MigrateFileError::Write(e.to_string()))?;
+
+    // Step 7: rename the token file away; a failure is a note, not an error.
+    if token.is_some() {
+        let token_bak = config_dir.join("web-token.bak");
+        if let Err(e) = std::fs::rename(&token_path, &token_bak) {
+            notes.push(format!(
+                "warning: could not rename web-token → web-token.bak: {e}"
+            ));
+        }
+    }
+
+    // Step 8: a legacy repo file is noted, never touched.
+    let repo_config = cwd.join(".peakbot/config.yaml");
+    if let Ok(text) = std::fs::read_to_string(&repo_config) {
+        let legacy = serde_yaml::from_str::<Value>(&text).is_ok_and(|doc| {
+            doc.as_mapping()
+                .is_some_and(|m| m.keys().any(|k| k.as_str() != Some("profiles")))
+        });
+        if legacy {
+            notes.push(format!(
+                "{} uses the old layout and was NOT migrated — a repo config may now only contain profiles:",
+                repo_config.display()
+            ));
+        }
+    }
+
+    Ok(MigrateReport {
+        path: outcome.path,
+        backup: outcome
+            .backup
+            .unwrap_or_else(|| config_dir.join("config.yaml.bak")),
         notes,
     })
 }
@@ -714,4 +842,52 @@ fn insert_some(map: &mut Mapping, key: &str, value: Option<Value>) {
     if let Some(value) = value {
         map.insert(key.into(), value);
     }
+}
+
+/// Sets `general.web.token`, keeping key order: `web` first inside `general`,
+/// `general` last at the top level. False when the token is already present.
+fn insert_web_token(config: &mut Value, token: &str) -> bool {
+    let Some(root) = config.as_mapping_mut() else {
+        return false;
+    };
+    let general = root
+        .entry("general".into())
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    let Some(general) = general.as_mapping_mut() else {
+        return false;
+    };
+    if !general.contains_key("web") {
+        // Mapping is insertion-ordered, so rebuild with `web` first.
+        let rest = std::mem::take(general);
+        let mut rebuilt = Mapping::new();
+        rebuilt.insert("web".into(), Value::Mapping(Mapping::new()));
+        for (key, value) in rest {
+            rebuilt.insert(key, value);
+        }
+        *general = rebuilt;
+    }
+    let Some(web) = general.get_mut("web").and_then(Value::as_mapping_mut) else {
+        return false;
+    };
+    if web.get("token").is_some_and(|t| !t.is_null()) {
+        return false;
+    }
+    web.insert("token".into(), Value::String(token.to_string()));
+    true
+}
+
+/// The §4.1 error list as one `;`-joined sentence for the error message.
+fn format_parse_errors(errors: &ConfigErrors) -> String {
+    errors
+        .0
+        .iter()
+        .map(|e| {
+            if e.path.is_empty() {
+                e.message.clone()
+            } else {
+                format!("{}: {}", e.dotted_path(), e.message)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
