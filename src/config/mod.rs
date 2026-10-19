@@ -10,6 +10,7 @@
 
 pub mod errors;
 pub mod file;
+pub mod migrate;
 pub mod model_registry;
 pub mod named;
 pub mod resolve;

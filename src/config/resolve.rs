@@ -15,6 +15,7 @@ use super::errors::{ConfigError, ConfigErrors, ConfigFileKind, PathSeg, dotted};
 use super::file::{
     AgentDef, ConfigFile, Env, General, ProfileDef, RepoFile, SubagentDef, VectorDbConfig,
 };
+use super::migrate::is_legacy;
 use super::model_registry::canonical_alias;
 use super::named::{NamedFailure, named_failure};
 use super::{
@@ -27,44 +28,6 @@ use crate::vector::normalize_lexical;
 /// `profile` tab is gone and `settings` is new (spec §3.3).
 const TAB_NAMES: [&str; 7] = [
     "session", "todo", "files", "tasks", "bash", "agents", "settings",
-];
-
-/// Top-level keys that only the pre-0.24 layout has (spec §7.1).
-const LEGACY_TOP: [&str; 22] = [
-    "provider",
-    "default_model",
-    "persona",
-    "system_prompt",
-    "agent_max_turns",
-    "mcp_servers",
-    "searxng",
-    "cost_tracking",
-    "context",
-    "memory",
-    "conversation",
-    "bash",
-    "fetch_url",
-    "retry",
-    "pipeline",
-    "pipelines",
-    "vector_db",
-    "web",
-    "uploads",
-    "tools",
-    "http",
-    "timeouts",
-];
-
-/// Keys of an old overlay profile (one without `agents`), spec §7.1.
-const LEGACY_PROFILE: [&str; 8] = [
-    "tools",
-    "memory",
-    "fetch_url",
-    "pipelines",
-    "mcp_servers",
-    "system_prompt",
-    "ui",
-    "agents_md",
 ];
 
 const L1_MESSAGE: &str =
@@ -347,27 +310,6 @@ impl Config {
 }
 
 const E2_MESSAGE: &str = "declare at least one profile — the first one is the default";
-
-/// §7.1: legacy iff a legacy sign is present AND no new-only marker is, so a
-/// stray old key in a current file gets the normal P1 error instead.
-fn is_legacy(doc: &Value) -> bool {
-    let Some(root) = doc.as_mapping() else {
-        return false;
-    };
-    let profiles = || {
-        root.get("profiles")
-            .and_then(Value::as_mapping)
-            .into_iter()
-            .flat_map(|m| m.values())
-            .filter_map(Value::as_mapping)
-    };
-    let current = root.contains_key("general")
-        || root.contains_key("mcps")
-        || profiles().any(|p| p.contains_key("agents"));
-    let overlay_profile = profiles()
-        .any(|p| !p.contains_key("agents") && LEGACY_PROFILE.iter().any(|k| p.contains_key(*k)));
-    !current && (LEGACY_TOP.iter().any(|k| root.contains_key(*k)) || overlay_profile)
-}
 
 /// RP1 for every non-`profiles` key (collected), else the typed parse.
 fn parse_repo(
