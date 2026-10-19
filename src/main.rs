@@ -35,6 +35,8 @@ enum Command {
         action: ServiceAction,
     },
     /// Config lifecycle verbs.
+    // Hidden until the runtime reads the 0.24 layout.
+    #[command(hide = true)]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
