@@ -42,9 +42,6 @@ use peakbot::config::resolve::{Config, ParseCtx, Source};
 const GLOBAL_PATH: &str = "/home/u/.config/peakbot/config.yaml";
 const REPO_PATH: &str = "/home/u/repo/.peakbot/config.yaml";
 
-/// §11.2 (r1)–(r8) plus r6b (blank repo persona).
-const REPO_FIXTURES: [&str; 9] = ["r1", "r2", "r3", "r4", "r5", "r6", "r6b", "r7", "r8"];
-
 /// The one fixture whose migrated output must NOT parse (repo-only alias).
 const REPO_INVALID: &str = "r8";
 

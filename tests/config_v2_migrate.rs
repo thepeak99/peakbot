@@ -536,7 +536,7 @@ fn migrate_allows_legacy_openrouter_provider_without_model() {
     let doc: serde_yaml::Value =
         serde_yaml::from_str("provider:\n  type: openrouter\n  config:\n    api_key: k\n").unwrap();
     assert!(
-        matches!(migrate(&doc), Ok(_)),
+        migrate(&doc).is_ok(),
         "openrouter had a 0.23 default model; an absent model must migrate, not error"
     );
 }
