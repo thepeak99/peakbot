@@ -558,6 +558,19 @@ mod tests {
         assert_eq!(content_hash("t", &a), content_hash("t", &b));
     }
 
+    // The 10M HNSW default over-reserves ~35 GiB in hnsw_rs 0.3.4 — cap it.
+    #[test]
+    fn db_options_caps_hnsw_max_elements() {
+        let opts = db_options(Path::new("x/vectors.db"), 1024);
+        assert_eq!(
+            opts.hnsw_config.expect("hnsw index").max_elements,
+            HNSW_MAX_ELEMENTS
+        );
+        assert_eq!(opts.dimensions, 1024);
+        assert_eq!(opts.distance_metric, DistanceMetric::Cosine);
+        assert_eq!(opts.storage_path, "x/vectors.db");
+    }
+
     #[test]
     fn sanitize_metadata_drops_reserved_keys() {
         let mut md = HashMap::new();
