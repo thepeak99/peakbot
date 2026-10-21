@@ -131,7 +131,7 @@ fn run_repo_golden(stem: &str) {
     );
 
     // A repo file may only contain `profiles:`, and the single repo profile
-    // shadows the FIRST global profile.
+    // (if any: step 4 yields `profiles: {}`) shadows the FIRST global profile.
     let keys: Vec<&str> = first
         .config
         .as_mapping()
@@ -153,7 +153,7 @@ fn run_repo_golden(stem: &str) {
     assert!(
         repo_profiles
             .as_mapping()
-            .is_some_and(|m| m.contains_key(first_global_profile)),
+            .is_some_and(|m| m.is_empty() || m.contains_key(first_global_profile)),
         "repo {stem}: the repo profile must be named after the first global profile '{first_global_profile}'"
     );
 
@@ -266,7 +266,7 @@ fn repo_with_no_applied_keys_yields_empty_profiles() {
     for stem in ["r3", "r4", "r5"] {
         assert_eq!(
             migrated_repo(stem),
-            serde_yaml::Value::Mapping(Default::default()),
+            serde_yaml::from_str::<serde_yaml::Value>("profiles: {}\n").unwrap(),
             "repo {stem}: must be exactly `profiles: {{}}`"
         );
     }

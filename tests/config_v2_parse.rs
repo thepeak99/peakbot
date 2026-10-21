@@ -86,8 +86,7 @@ const GLOBAL_PATH: &str = "/home/u/.config/peakbot/config.yaml";
 const REPO_PATH: &str = "/home/u/work/peakbot/.peakbot/config.yaml";
 
 /// §4.3 L1, verbatim (em dash U+2014).
-const L1_MSG: &str =
-    "config.yaml uses the pre-0.24 layout — run 'peakbot config migrate' (writes config.yaml.bak)";
+const L1_MSG: &str = "config.yaml uses the pre-0.24 layout — restart PeakBot to migrate it automatically (the original is kept as config.yaml.pre-0.24)";
 
 /// The minimal valid global config: one provider, two aliases (`a`, `b`),
 /// one profile `p`, one agent `a` on model `a`.
@@ -544,7 +543,7 @@ fn rows() -> Vec<Row> {
         ),
     });
 
-    // RP2 — repo file is legacy-shaped: same message shape, one error per key.
+    // RP2 — repo file is legacy-shaped: one error for the file, replacing RP1.
     r.push(Row {
         name: "RP2",
         global: BASE,
@@ -552,7 +551,7 @@ fn rows() -> Vec<Row> {
         file: ConfigFileKind::Repo,
         path: Vec::new(),
         message: Some(
-            "only `profiles:` is allowed in a repo config — move `default_model:` to the global config (",
+            "this repo config uses the pre-0.24 layout — PeakBot migrates it automatically on the next start or /cd into this directory",
         ),
     });
 
@@ -572,9 +571,9 @@ fn rule_table_every_row_of_section_4_3() {
         assert_eq!(e.file, row.file, "case {}: file kind", row.name);
         assert_eq!(e.path, row.path, "case {}: path segments", row.name);
         if let Some(msg) = row.message {
-            // RP1/RP2: the message embeds the global file path; compare the
+            // RP1: the message embeds the global file path; compare the
             // prefix and pin the suffix separately.
-            if row.name.starts_with("RP") {
+            if row.name == "RP1" {
                 assert!(
                     e.message.starts_with(msg),
                     "case {}: message prefix, got: {}",

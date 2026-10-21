@@ -220,6 +220,255 @@ pub fn migrate(old: &Value) -> Result<Migration, MigrateError> {
     })
 }
 
+// ── Repo files (§7.6) ──────────────────────────────────────────────────────
+
+/// Repo keys that changed the default profile in 0.23.
+const REPO_APPLIED: [&str; 9] = [
+    "tools",
+    "memory",
+    "fetch_url",
+    "bash",
+    "default_model",
+    "persona",
+    "system_prompt",
+    "pipelines",
+    "pipeline",
+];
+/// Repo keys that had an effect in 0.23 but are machine-wide in 0.24.
+const REPO_MACHINE_WIDE: [&str; 9] = [
+    "provider",
+    "providers",
+    "mcp_servers",
+    "searxng",
+    "agent_max_turns",
+    "cost_tracking",
+    "context",
+    "conversation",
+    "retry",
+];
+/// Repo keys 0.23 parsed but never applied.
+const REPO_NO_EFFECT: [&str; 6] = [
+    "vector_db",
+    "web",
+    "uploads",
+    "http",
+    "timeouts",
+    "profiles",
+];
+const PROFILE_ORDER: [&str; 8] = [
+    "tools",
+    "mcps",
+    "fetch_url",
+    "env",
+    "memory",
+    "vector_db",
+    "ui",
+    "agents",
+];
+const AGENT_ORDER: [&str; 8] = [
+    "model",
+    "persona",
+    "core_guidance",
+    "prompt",
+    "skills",
+    "agents_md",
+    "env",
+    "subagents",
+];
+
+/// §7.6: a legacy repo file → `{profiles: …}` only, built on the CURRENT
+/// global file. `global` must already be a valid 0.24 document;
+/// `global_path` is used only inside note texts. No IO, deterministic.
+pub fn migrate_repo(
+    old_repo: &Value,
+    global: &Value,
+    global_path: &Path,
+) -> Result<Migration, MigrateError> {
+    let Some(root) = old_repo.as_mapping() else {
+        return Err(MigrateError::RootNotAMapping);
+    };
+    let no_profiles = |notes| Migration {
+        config: Value::Mapping(Mapping::from_iter([(
+            "profiles".into(),
+            Value::Mapping(Mapping::new()),
+        )])),
+        notes,
+    };
+
+    let mut notes = Vec::new();
+    for (key, value) in root {
+        if value.is_null() {
+            continue;
+        }
+        match key.as_str() {
+            Some(k) if REPO_APPLIED.contains(&k) => {}
+            Some(k) if REPO_MACHINE_WIDE.contains(&k) => notes.push(format!(
+                "'{k}' can no longer be set per repo and was dropped — it is machine-wide now; set it in {} if you still want it.",
+                global_path.display()
+            )),
+            Some(k) if REPO_NO_EFFECT.contains(&k) => notes.push(format!(
+                "'{k}' had no effect in a repo config before 0.24 and was dropped."
+            )),
+            // 0.23 ignored the whole file over one unknown key.
+            _ => {
+                return Ok(no_profiles(vec![format!(
+                    "this file had no effect before 0.24 (0.23 ignored it because of the unknown key '{}'), so nothing was carried over.",
+                    key.as_str().map_or_else(|| key_text(key), str::to_string)
+                )]));
+            }
+        }
+    }
+    // 0.23 replaced the pipelines only with a non-empty list.
+    let pipelines =
+        get(old_repo, "pipelines").filter(|p| p.as_sequence().is_none_or(|list| !list.is_empty()));
+    let applied = |key: &str| match key {
+        "pipelines" => pipelines.is_some(),
+        _ => get(old_repo, key).is_some(),
+    };
+    // Without a copy, later global edits keep reaching this repo.
+    if !REPO_APPLIED.iter().any(|k| applied(k)) {
+        return Ok(no_profiles(notes));
+    }
+    let Some((profile_name, base)) = global
+        .get("profiles")
+        .and_then(Value::as_mapping)
+        .and_then(|profiles| profiles.iter().next())
+    else {
+        return Ok(no_profiles(notes));
+    };
+    let profile_name = name_text(profile_name);
+    let mut profile = base.as_mapping().cloned().unwrap_or_default();
+
+    if let Some(tools) = get(old_repo, "tools") {
+        let mut delegate_blocked = false;
+        match strip_delegate(tools, &mut delegate_blocked) {
+            Some(tools) => profile.insert("tools".into(), tools),
+            None => profile.remove("tools"),
+        };
+        if delegate_blocked {
+            notes.push(DELEGATE_NOTE.to_string());
+        }
+    }
+    for key in ["memory", "fetch_url"] {
+        insert_some(&mut profile, key, get(old_repo, key).cloned());
+    }
+    // 0.23 replaced the whole `bash` block, so the env goes wholesale.
+    insert_some(
+        &mut profile,
+        "env",
+        get(old_repo, "bash").and_then(|b| get(b, "env")).cloned(),
+    );
+
+    let agents = profile
+        .get("agents")
+        .and_then(Value::as_mapping)
+        .cloned()
+        .unwrap_or_default();
+    let Some((main_key, main)) = agents.iter().next() else {
+        return Ok(no_profiles(notes));
+    };
+    let main_name = name_text(main_key);
+    let mut main = main.as_mapping().cloned().unwrap_or_default();
+
+    // The 0.23 slot rule (`merge_with`): a non-blank system_prompt wins.
+    let mut applied_settings = Vec::new();
+    if let Some(model) = get(old_repo, "default_model") {
+        main.insert("model".into(), model.clone());
+        applied_settings.push("default_model");
+    }
+    if let Some(full) = non_blank(old_repo, "system_prompt") {
+        main.insert("persona".into(), full.clone());
+        main.insert("core_guidance".into(), false.into());
+        applied_settings.push("system_prompt");
+    } else {
+        if is_blank(old_repo, "system_prompt") {
+            notes.push(BLANK_SYSTEM_PROMPT_NOTE.to_string());
+        }
+        if let Some(persona) = get(old_repo, "persona") {
+            // A blank persona meant the built-in one, and it still cleared
+            // the global system_prompt.
+            match non_blank_value(Some(persona)) {
+                Some(persona) => main.insert("persona".into(), persona.clone()),
+                None => main.remove("persona"),
+            };
+            main.remove("core_guidance");
+            applied_settings.push("persona");
+        }
+    }
+    let main = Value::Mapping(reorder(main, &AGENT_ORDER));
+
+    let replace_agents = pipelines.is_some() || get(old_repo, "pipeline").is_some();
+    let agents = if replace_agents {
+        let field = |key: &str| get(&main, key);
+        let head = match (field("persona"), field("core_guidance")) {
+            (Some(persona), Some(Value::Bool(false))) => Head::Full(persona.clone()),
+            (Some(persona), _) => Head::Persona(persona.clone()),
+            (None, _) => Head::Builtin,
+        };
+        let fallback = field("model").cloned();
+        let extra = pipeline_agents(old_repo, &main_name, fallback.as_ref(), &head, &mut notes)?;
+        let mut replaced = Mapping::from_iter([(main_key.clone(), main)]);
+        for agent in extra {
+            replaced.insert(agent.name.clone().into(), agent.into_value());
+        }
+        replaced
+    } else {
+        let mut kept = agents.clone();
+        if !applied_settings.is_empty() && kept.len() > 1 {
+            let others: Vec<String> = kept
+                .keys()
+                .skip(1)
+                .map(|k| format!("'{}'", name_text(k)))
+                .collect();
+            notes.push(format!(
+                "the settings {} from this file now apply only to agent '{main_name}'; agents {} keep their global settings.",
+                applied_settings.join(", "),
+                others.join(", ")
+            ));
+        }
+        kept.insert(main_key.clone(), main);
+        kept
+    };
+    profile.insert("agents".into(), Value::Mapping(agents));
+
+    notes.push(format!(
+        "profile '{profile_name}' in this repo is now a copy of the global profile '{profile_name}' with this file's settings applied — later edits to the global '{profile_name}' no longer reach this repo, and the other global profiles do not include this file's settings."
+    ));
+    let profiles = Mapping::from_iter([(
+        Value::from(profile_name),
+        Value::Mapping(reorder(profile, &PROFILE_ORDER)),
+    )]);
+    Ok(Migration {
+        config: Value::Mapping(Mapping::from_iter([(
+            "profiles".into(),
+            Value::Mapping(profiles),
+        )])),
+        notes,
+    })
+}
+
+/// A name key of the (valid) global file; always a string there.
+fn name_text(key: &Value) -> String {
+    key.as_str().map_or_else(|| key_text(key), str::to_string)
+}
+
+/// `map` with the keys of `order` first, in that order: a key set on a copy
+/// lands at the end of a `Mapping` otherwise.
+fn reorder(map: Mapping, order: &[&str]) -> Mapping {
+    let mut out = Mapping::new();
+    for key in order {
+        if let Some(value) = map.get(*key) {
+            out.insert((*key).into(), value.clone());
+        }
+    }
+    for (key, value) in map {
+        if !out.contains_key(&key) {
+            out.insert(key, value);
+        }
+    }
+    out
+}
+
 // ── IO wrapper (§7.5); deleted in 0.26 ─────────────────────────────────────
 
 /// What `migrate_file` did; the CLI and the HTTP endpoint print/return it.

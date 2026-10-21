@@ -1,5 +1,9 @@
 profiles:
   default:
+    tools:
+      disabled: [powershell]
+    env:
+      GIT_PAGER: cat
     agents:
       main:
         model: mid

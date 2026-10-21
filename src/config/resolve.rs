@@ -30,8 +30,8 @@ const TAB_NAMES: [&str; 7] = [
     "session", "todo", "files", "tasks", "bash", "agents", "settings",
 ];
 
-const L1_MESSAGE: &str =
-    "config.yaml uses the pre-0.24 layout — run 'peakbot config migrate' (writes config.yaml.bak)";
+const L1_MESSAGE: &str = "config.yaml uses the pre-0.24 layout — restart PeakBot to migrate it automatically (the original is kept as config.yaml.pre-0.24)";
+const RP2_MESSAGE: &str = "this repo config uses the pre-0.24 layout — PeakBot migrates it automatically on the next start or /cd into this directory";
 const F1_MESSAGE: &str = "set either `disabled` (blocklist) or `only` (allowlist), not both";
 
 /// One input file: its absolute path (for messages and repo anchoring) and
@@ -317,7 +317,13 @@ fn parse_repo(
     global_path: &Path,
     sink: &mut Sink,
 ) -> Result<Option<RepoFile>, ConfigErrors> {
-    if let Ok(Value::Mapping(root)) = serde_yaml::from_str::<Value>(src.text) {
+    let doc = serde_yaml::from_str::<Value>(src.text);
+    // RP2 replaces RP1: one error for the whole file, not one per old key.
+    if doc.as_ref().is_ok_and(is_legacy) {
+        sink.push(Vec::new(), RP2_MESSAGE);
+        return Ok(None);
+    }
+    if let Ok(Value::Mapping(root)) = doc {
         let before = sink.errors.len();
         for k in root.keys().filter(|k| k.as_str() != Some("profiles")) {
             let shown = match k.as_str() {
