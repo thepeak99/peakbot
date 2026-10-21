@@ -1,0 +1,5 @@
+profiles:
+  dev:
+    agents:
+      main:
+        model: mid

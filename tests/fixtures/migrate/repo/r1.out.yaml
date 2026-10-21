@@ -1,0 +1,17 @@
+profiles:
+  default:
+    tools:
+      disabled: [powershell]
+    env:
+      CARGO_TERM_COLOR: never
+    agents:
+      main:
+        model: senior
+        persona: You are a careful engineer.
+      dev-team:
+        model: senior
+        prompt: Delegate.
+        subagents:
+          researcher:
+            model: mid
+            prompt: Research.

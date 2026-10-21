@@ -1,0 +1,2 @@
+'providers' can no longer be set per repo and was dropped — it is machine-wide now; set it in /home/u/.config/peakbot/config.yaml if you still want it.
+profile 'default' in this repo is now a copy of the global profile 'default' with this file's settings applied — later edits to the global 'default' no longer reach this repo, and the other global profiles do not include this file's settings.

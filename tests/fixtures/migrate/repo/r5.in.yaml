@@ -1,0 +1,4 @@
+profiles:
+  fast:
+    tools:
+      only: [think]

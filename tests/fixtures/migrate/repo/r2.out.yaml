@@ -1,0 +1,14 @@
+profiles:
+  default:
+    agents:
+      main:
+        model: senior
+        persona: You are a careful engineer.
+      main-2:
+        model: mid
+        persona: You are a careful engineer.
+        prompt: New main pipeline.
+        subagents:
+          worker:
+            model: senior
+            prompt: Work.

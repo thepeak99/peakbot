@@ -1,0 +1,9 @@
+default_model: senior
+pipelines:
+  - name: main
+    orchestrator:
+      model: mid
+      prompt: New main pipeline.
+    agents:
+      worker:
+        prompt: Work.

@@ -1,0 +1,6 @@
+provider:
+  type: anthropic
+  config:
+    model: claude-sonnet-4
+    api_key: sk-ant-legacy
+    max_image_base64_bytes: 1

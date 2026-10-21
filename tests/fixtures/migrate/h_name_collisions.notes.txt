@@ -1,2 +1,10 @@
-pipeline 'main' was renamed to 'main-2' (name collision with the base agent).
-profile 'default' was renamed to 'default-2' (name collision with the base profile).
+pipeline 'main' was renamed to 'main-3' (name collision).
+pipeline 'dev' was renamed to 'dev-2' (name collision).
+pipeline 'team' was renamed to 'team-2' (name collision).
+agent 'team-2' previously ran without the built-in persona; it now gets it — set a persona to change that.
+profile 'default' was renamed to 'default-3' (name collision).
+profile 'default-3': pipelines filter removed agent 'main-2'.
+profile 'default-3': pipelines filter removed agent 'dev'.
+profile 'default-3': pipelines filter removed agent 'dev-2'.
+profile 'default-3': pipelines filter removed agent 'team'.
+profile 'default-3': pipelines filter removed agent 'team-2'.

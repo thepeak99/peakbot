@@ -1,0 +1,14 @@
+default_model: senior
+bash:
+  env:
+    CARGO_TERM_COLOR: never
+tools:
+  disabled: [powershell, delegate]
+searxng:
+  base_url: https://searx.example.com
+vector_db:
+  db_path: ./.peakbot/v.db
+  embeddings:
+    base_url: https://e.example.com/v1
+    model: bge-m3
+    dimensions: 1024

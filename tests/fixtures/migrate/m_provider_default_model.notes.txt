@@ -1,0 +1,1 @@
+provider.config.model was not set; used the 0.23 default 'anthropic/claude-3.7-sonnet'.

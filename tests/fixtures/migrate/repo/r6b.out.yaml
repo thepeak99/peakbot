@@ -1,0 +1,8 @@
+profiles:
+  default:
+    agents:
+      main:
+        model: mid
+      dev:
+        model: senior
+        prompt: Dev.

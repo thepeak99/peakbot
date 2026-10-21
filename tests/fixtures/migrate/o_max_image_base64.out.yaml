@@ -1,0 +1,12 @@
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key: sk-ant-legacy
+    models:
+      - name: claude-sonnet-4
+        alias: default
+profiles:
+  default:
+    agents:
+      main:
+        model: default

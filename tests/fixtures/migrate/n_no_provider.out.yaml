@@ -1,0 +1,12 @@
+providers:
+  - name: openrouter
+    type: openrouter
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: default
+profiles:
+  default:
+    agents:
+      main:
+        model: default
+        persona: You are a careful engineer.

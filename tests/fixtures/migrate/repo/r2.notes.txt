@@ -1,0 +1,3 @@
+pipeline 'main' was renamed to 'main-2' (name collision).
+the settings default_model from this file now apply only to agent 'main'; agents 'main-2' keep their global settings.
+profile 'default' in this repo is now a copy of the global profile 'default' with this file's settings applied — later edits to the global 'default' no longer reach this repo, and the other global profiles do not include this file's settings.

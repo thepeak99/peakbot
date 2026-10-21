@@ -1,0 +1,1 @@
+'profiles' had no effect in a repo config before 0.24 and was dropped.

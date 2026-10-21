@@ -1,0 +1,23 @@
+providers:
+  - name: patchnotes
+    type: openai
+    base_url: https://ai.patchnotes.com/v1
+    api_key: pn-fake
+    models:
+      - name: anthropic/claude-sonnet-4.5
+        alias: mid
+      - name: anthropic/claude-opus-4.1
+        alias: senior
+profiles:
+  default:
+    agents:
+      main:
+        model: mid
+        persona: You are a careful engineer.
+      dev:
+        model: senior
+        prompt: Old dev.
+  research:
+    agents:
+      main:
+        model: mid

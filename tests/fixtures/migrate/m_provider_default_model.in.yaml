@@ -1,0 +1,4 @@
+provider:
+  type: openrouter
+  config:
+    api_key: pn-legacy-key

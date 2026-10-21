@@ -1,0 +1,10 @@
+profiles:
+  default:
+    agents:
+      main:
+        model: mid
+        persona: You are a careful engineer.
+      dev:
+        model: local-coder
+        persona: You are a careful engineer.
+        prompt: Dev with the local model.
