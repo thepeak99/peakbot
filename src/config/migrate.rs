@@ -4,6 +4,7 @@
 //! The pure half never goes through the old typed `Config`: that would fill
 //! in defaults and lose the user's key order.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde_yaml::{Mapping, Value};
@@ -53,10 +54,19 @@ const LEGACY_PROFILE: [&str; 8] = [
 
 const BASE_AGENT: &str = "main";
 const BASE_PROFILE: &str = "default";
+/// The agent name of the legacy `pipeline:` block.
+const TEAM_AGENT: &str = "team";
 /// The old serde default of `vector_db.db_path`; 0.24 requires the key.
 const OLD_VECTOR_DB_PATH: &str = "./.peakbot/vectors.db";
 const DELEGATE_NOTE: &str =
     "tools: 'delegate' was blocked; delegation is now on whenever an agent has subagents.";
+const BLANK_SYSTEM_PROMPT_NOTE: &str =
+    "blank system_prompt was dropped (0.23 refused to start with it).";
+/// 0.23's `default_model()` for the openrouter provider.
+const OLD_DEFAULT_MODEL: &str = "anthropic/claude-3.7-sonnet";
+const OLD_DEFAULT_PROVIDER: &str = "openrouter";
+/// The alias the old registry synthesized for the legacy single provider.
+const LEGACY_ALIAS: &str = "default";
 
 pub struct Migration {
     pub config: Value,
@@ -72,6 +82,12 @@ pub enum MigrateError {
     PipelinesNotAList,
     #[error("pipelines[{0}] has no `name`")]
     PipelineWithoutName(usize),
+    #[error("{0}: a name must be a string")]
+    NonStringName(String),
+    #[error("provider: has no `type`")]
+    LegacyProviderType,
+    #[error("provider.config.model is required for type {0}")]
+    LegacyProviderModel(String),
 }
 
 /// §7.1: legacy iff a legacy sign is present AND no new-only marker is, so a
@@ -102,7 +118,10 @@ pub fn migrate(old: &Value) -> Result<Migration, MigrateError> {
     }
     let mut notes = Vec::new();
     let mut delegate_blocked = false;
-    let (providers, default_model) = providers(old);
+    let (providers, default_model) = providers(old, &mut notes)?;
+    if is_blank(old, "system_prompt") {
+        notes.push(BLANK_SYSTEM_PROMPT_NOTE.to_string());
+    }
     let head = Head::of(old);
 
     // Called in the order their notes are pinned: global notes, then agent
@@ -111,7 +130,20 @@ pub fn migrate(old: &Value) -> Result<Migration, MigrateError> {
     let search = search(old, &mut notes);
     let vector_db = vector_db(old, &mut notes);
     let conversation = conversation(old, &mut notes);
-    let agents = agents(old, default_model.as_ref(), &head, &mut notes)?;
+    let mut main = Agent {
+        name: BASE_AGENT.to_string(),
+        model: default_model.clone(),
+        ..Agent::default()
+    };
+    main.take_head(&head);
+    let mut agents = vec![main];
+    agents.extend(pipeline_agents(
+        old,
+        BASE_AGENT,
+        default_model.as_ref(),
+        &head,
+        &mut notes,
+    )?);
 
     let base = Profile {
         tools,
@@ -123,18 +155,30 @@ pub fn migrate(old: &Value) -> Result<Migration, MigrateError> {
         ui: None,
         agents,
     };
-    let mut overlays: Vec<(&str, &Value)> = get(old, "profiles")
+    let mut overlays: Vec<(&str, &Value)> = Vec::new();
+    for (name, overlay) in get(old, "profiles")
         .and_then(Value::as_mapping)
         .into_iter()
         .flatten()
-        .filter_map(|(name, overlay)| Some((name.as_str()?, overlay)))
-        .collect();
+    {
+        let name = name
+            .as_str()
+            .ok_or_else(|| MigrateError::NonStringName(format!("profiles.{}", key_text(name))))?;
+        overlays.push((name, overlay));
+    }
     // The old map was an unordered HashMap; sorting makes the output stable.
     overlays.sort_by_key(|(name, _)| *name);
+    let mut names = Namer::new(
+        BASE_PROFILE,
+        overlays.iter().map(|(name, _)| *name),
+        "profile",
+    );
     let overlaid: Vec<(String, Profile)> = overlays
         .into_iter()
-        .map(|(name, overlay)| {
-            overlay_profile(name, overlay, &base, &mut notes, &mut delegate_blocked)
+        .map(|(old_name, overlay)| {
+            let name = names.assign(old_name, &mut notes);
+            let profile = overlay_profile(&name, overlay, &base, &mut notes, &mut delegate_blocked);
+            (name, profile)
         })
         .collect();
     let mut profiles = Mapping::new();
@@ -422,27 +466,74 @@ impl Subagent {
 }
 
 /// `providers` verbatim; else the legacy single `provider:` synthesized the
-/// way the old registry did (`describe_legacy`), under the alias `default`.
-/// Returns the providers and the base agent's model.
-fn providers(old: &Value) -> (Option<Value>, Option<Value>) {
+/// way the old registry did (`describe_legacy`), under the alias `default`;
+/// else 0.23's built-in default provider. Returns the providers and the base
+/// agent's model.
+fn providers(
+    old: &Value,
+    notes: &mut Vec<String>,
+) -> Result<(Option<Value>, Option<Value>), MigrateError> {
     let listed =
         get(old, "providers").is_some_and(|p| p.as_sequence().is_none_or(|s| !s.is_empty()));
-    match get(old, "provider") {
-        Some(legacy) if !listed => (Some(legacy_provider(legacy)), Some("default".into())),
-        _ => (
+    if listed {
+        return Ok((
             get(old, "providers").cloned(),
             get(old, "default_model").cloned(),
-        ),
+        ));
     }
+    let providers = match get(old, "provider") {
+        Some(legacy) => legacy_provider(legacy, notes)?,
+        None => {
+            notes.push(format!(
+                "no provider was configured; added the 0.23 default ({OLD_DEFAULT_PROVIDER}, {OLD_DEFAULT_MODEL}) as alias '{LEGACY_ALIAS}' — add your api_key under providers."
+            ));
+            let model = Mapping::from_iter([
+                ("name".into(), OLD_DEFAULT_MODEL.into()),
+                ("alias".into(), LEGACY_ALIAS.into()),
+            ]);
+            let provider = Mapping::from_iter([
+                ("name".into(), OLD_DEFAULT_PROVIDER.into()),
+                ("type".into(), OLD_DEFAULT_PROVIDER.into()),
+                (
+                    "models".into(),
+                    Value::Sequence(vec![Value::Mapping(model)]),
+                ),
+            ]);
+            Value::Sequence(vec![Value::Mapping(provider)])
+        }
+    };
+    Ok((Some(providers), Some(LEGACY_ALIAS.into())))
 }
 
-fn legacy_provider(legacy: &Value) -> Value {
-    let kind = get(legacy, "type").cloned();
+/// Absent fields stay absent: the 0.24 registry's defaults (base_url,
+/// max_tokens, prompt_caching) are the 0.23 serde defaults.
+fn legacy_provider(legacy: &Value, notes: &mut Vec<String>) -> Result<Value, MigrateError> {
+    let kind = get(legacy, "type")
+        .and_then(Value::as_str)
+        .ok_or(MigrateError::LegacyProviderType)?;
     let field = |key: &str| get(legacy, "config").and_then(|c| get(c, key)).cloned();
 
+    let model_name = match field("model") {
+        Some(name) => name,
+        // Only openrouter had a serde default for `model` in 0.23.
+        None if kind == OLD_DEFAULT_PROVIDER => {
+            notes.push(format!(
+                "provider.config.model was not set; used the 0.23 default '{OLD_DEFAULT_MODEL}'."
+            ));
+            OLD_DEFAULT_MODEL.into()
+        }
+        None => return Err(MigrateError::LegacyProviderModel(kind.to_string())),
+    };
+    if field("max_image_base64_bytes").is_some() {
+        notes.push(
+            "provider.config.max_image_base64_bytes has no 0.24 equivalent and was dropped (the 0.23 legacy-provider path did not apply it either)."
+                .to_string(),
+        );
+    }
+
     let mut model = Mapping::new();
-    insert_some(&mut model, "name", field("model"));
-    model.insert("alias".into(), "default".into());
+    model.insert("name".into(), model_name);
+    model.insert("alias".into(), LEGACY_ALIAS.into());
     for key in [
         "max_tokens",
         "temperature",
@@ -454,8 +545,8 @@ fn legacy_provider(legacy: &Value) -> Value {
     }
 
     let mut provider = Mapping::new();
-    insert_some(&mut provider, "name", kind.clone());
-    insert_some(&mut provider, "type", kind);
+    provider.insert("name".into(), kind.into());
+    provider.insert("type".into(), kind.into());
     for key in [
         "api_key",
         "base_url",
@@ -468,7 +559,7 @@ fn legacy_provider(legacy: &Value) -> Value {
         "models".into(),
         Value::Sequence(vec![Value::Mapping(model)]),
     );
-    Value::Sequence(vec![Value::Mapping(provider)])
+    Ok(Value::Sequence(vec![Value::Mapping(provider)]))
 }
 
 /// `searxng` → `general.search`: presence of the block now means "on".
@@ -524,10 +615,12 @@ fn conversation(old: &Value, notes: &mut Vec<String>) -> Option<Value> {
     (!fields.is_empty()).then_some(Value::Mapping(fields))
 }
 
-/// The base profile's agents: `main`, one per `pipelines` entry, then the
-/// legacy `pipeline:` block as `team`.
-fn agents(
+/// The agents after the base one: one per `pipelines` entry, then the legacy
+/// `pipeline:` block as `team`. `base` is the base agent's name, which they
+/// must not take.
+fn pipeline_agents(
     old: &Value,
+    base: &str,
     default_model: Option<&Value>,
     head: &Head,
     notes: &mut Vec<String>,
@@ -546,66 +639,76 @@ fn agents(
         Some(Value::Sequence(list)) => list.as_slice(),
         Some(_) => return Err(MigrateError::PipelinesNotAList),
     };
-
-    let mut main = Agent {
-        name: BASE_AGENT.to_string(),
-        model: default_model.cloned(),
-        ..Agent::default()
-    };
-    main.take_head(head);
-    let mut agents = vec![main];
+    let mut pipeline_names = Vec::with_capacity(pipelines.len());
     for (index, pipeline) in pipelines.iter().enumerate() {
-        let name = get(pipeline, "name")
-            .and_then(Value::as_str)
-            .ok_or(MigrateError::PipelineWithoutName(index))?;
-        let orchestrator = get(pipeline, "orchestrator");
-        let members = get(pipeline, "agents");
+        let name = get(pipeline, "name").ok_or(MigrateError::PipelineWithoutName(index))?;
+        let name = name
+            .as_str()
+            .ok_or_else(|| MigrateError::NonStringName(format!("pipelines[{index}].name")))?;
+        pipeline_names.push(name);
+    }
+
+    let reserved = pipeline_names
+        .iter()
+        .copied()
+        .chain(team.map(|_| TEAM_AGENT));
+    let mut names = Namer::new(base, reserved, "pipeline");
+    let mut agents = Vec::new();
+    for (index, (pipeline, old_name)) in pipelines.iter().zip(pipeline_names).enumerate() {
+        let name = names.assign(old_name, notes);
         agents.push(pipeline_agent(
-            name,
-            orchestrator,
-            members,
+            Origin {
+                name,
+                old_name,
+                path: format!("pipelines[{index}].agents"),
+            },
+            get(pipeline, "orchestrator"),
+            get(pipeline, "agents"),
             default_model,
             head,
             notes,
-        ));
+        )?);
     }
     if let Some(team) = team {
         let orchestrator = get(team, "orchestrator_prompt")
             .map(|prompt| Value::Mapping(Mapping::from_iter([("prompt".into(), prompt.clone())])));
-        let members = get(team, "agents");
+        let name = names.assign(TEAM_AGENT, notes);
         agents.push(pipeline_agent(
-            "team",
+            Origin {
+                name,
+                old_name: TEAM_AGENT,
+                path: "pipeline.agents".to_string(),
+            },
             orchestrator.as_ref(),
-            members,
+            get(team, "agents"),
             default_model,
             head,
             notes,
-        ));
+        )?);
     }
     Ok(agents)
 }
 
+/// Where a pipeline agent came from: its output name, the old pipeline name a
+/// profile filter matches, and the YAML path of its members for errors.
+struct Origin<'a> {
+    name: String,
+    old_name: &'a str,
+    path: String,
+}
+
 fn pipeline_agent(
-    old_name: &str,
+    origin: Origin<'_>,
     orchestrator: Option<&Value>,
     members: Option<&Value>,
     default_model: Option<&Value>,
     head: &Head,
     notes: &mut Vec<String>,
-) -> Agent {
-    let name = if old_name == BASE_AGENT {
-        let renamed = format!("{BASE_AGENT}-2");
-        notes.push(format!(
-            "pipeline '{old_name}' was renamed to '{renamed}' (name collision with the base agent)."
-        ));
-        renamed
-    } else {
-        old_name.to_string()
-    };
+) -> Result<Agent, MigrateError> {
     let orchestrator_field = |key: &str| orchestrator.and_then(|o| get(o, key));
     let mut agent = Agent {
-        name,
-        pipeline: Some(old_name.to_string()),
+        name: origin.name,
+        pipeline: Some(origin.old_name.to_string()),
         model: orchestrator_field("model").or(default_model).cloned(),
         prompt: orchestrator_field("prompt").cloned(),
         ..Agent::default()
@@ -619,20 +722,15 @@ fn pipeline_agent(
             agent.name
         )),
     }
-    agent.subagents = members
-        .and_then(Value::as_mapping)
-        .into_iter()
-        .flatten()
-        .filter_map(|(name, def)| {
-            Some(subagent(
-                name.as_str()?,
-                def,
-                default_model,
-                agent.model.as_ref(),
-            ))
-        })
-        .collect();
-    agent
+    for (name, def) in members.and_then(Value::as_mapping).into_iter().flatten() {
+        let name = name.as_str().ok_or_else(|| {
+            MigrateError::NonStringName(format!("{}.{}", origin.path, key_text(name)))
+        })?;
+        agent
+            .subagents
+            .push(subagent(name, def, default_model, agent.model.as_ref()));
+    }
+    Ok(agent)
 }
 
 fn subagent(
@@ -656,24 +754,15 @@ fn subagent(
     }
 }
 
-/// An old overlay profile → a standalone profile: a deep copy of `base`
-/// with the overlay applied (§7.3).
+/// An old overlay profile → a standalone profile named `name`: a deep copy of
+/// `base` with the overlay applied (§7.3).
 fn overlay_profile(
-    old_name: &str,
+    name: &str,
     overlay: &Value,
     base: &Profile,
     notes: &mut Vec<String>,
     delegate_blocked: &mut bool,
-) -> (String, Profile) {
-    let name = if old_name == BASE_PROFILE {
-        let renamed = format!("{BASE_PROFILE}-2");
-        notes.push(format!(
-            "profile '{old_name}' was renamed to '{renamed}' (name collision with the base profile)."
-        ));
-        renamed
-    } else {
-        old_name.to_string()
-    };
+) -> Profile {
     let mut profile = base.clone();
     if let Some(tools) = get(overlay, "tools") {
         profile.tools = strip_delegate(tools, delegate_blocked);
@@ -706,9 +795,13 @@ fn overlay_profile(
     if let Some(full) = non_blank(overlay, "system_prompt") {
         let head = Head::Full(full.clone());
         profile.agents.iter_mut().for_each(|a| a.take_head(&head));
+    } else if is_blank(overlay, "system_prompt") {
+        notes.push(format!(
+            "profile '{name}': blank system_prompt was dropped (0.23 refused to use this profile)."
+        ));
     }
     if let Some(ui) = get(overlay, "ui") {
-        profile.ui = strip_profile_tab(ui, &name, notes);
+        profile.ui = strip_profile_tab(ui, name, notes);
     }
     // The old profile flag was a ceiling over the subagents' opt-in too.
     if is_false(overlay, "agents_md") {
@@ -719,7 +812,7 @@ fn overlay_profile(
             }
         }
     }
-    (name, profile)
+    profile
 }
 
 /// `delegate` is no longer filterable; it is on whenever subagents exist.
@@ -822,6 +915,58 @@ fn is_false(value: &Value, key: &str) -> bool {
 /// Old prompt slots treated a whitespace-only string as absent.
 fn non_blank<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     non_blank_value(get(value, key))
+}
+
+/// A present, whitespace-only string: 0.23 rejected it in `system_prompt`.
+fn is_blank(value: &Value, key: &str) -> bool {
+    get(value, key)
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.trim().is_empty())
+}
+
+/// A mapping key as the user wrote it, for `NonStringName` paths.
+fn key_text(key: &Value) -> String {
+    serde_yaml::to_string(key)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The §7.3 `unique` helper. Every original name is reserved up front, so a
+/// renamed entry never steals the name a later entry keeps.
+struct Namer {
+    used: HashSet<String>,
+    reserved: HashSet<String>,
+    /// `pipeline` or `profile`, for the rename note.
+    kind: &'static str,
+}
+
+impl Namer {
+    /// `base` is named first and always keeps its name.
+    fn new<'a>(base: &str, originals: impl Iterator<Item = &'a str>, kind: &'static str) -> Self {
+        let mut reserved: HashSet<String> = originals.map(str::to_string).collect();
+        reserved.insert(base.to_string());
+        Namer {
+            used: HashSet::from([base.to_string()]),
+            reserved,
+            kind,
+        }
+    }
+
+    fn assign(&mut self, original: &str, notes: &mut Vec<String>) -> String {
+        if self.used.insert(original.to_string()) {
+            return original.to_string();
+        }
+        let renamed = (2..)
+            .map(|k| format!("{original}-{k}"))
+            .find(|c| !self.used.contains(c) && !self.reserved.contains(c))
+            .expect("an unbounded range always yields a free name");
+        self.used.insert(renamed.clone());
+        notes.push(format!(
+            "{} '{original}' was renamed to '{renamed}' (name collision).",
+            self.kind
+        ));
+        renamed
+    }
 }
 
 fn non_blank_value(value: Option<&Value>) -> Option<&Value> {
