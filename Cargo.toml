@@ -109,8 +109,8 @@ spider_transformations = "2.39"
 # Vector DB (doc_index / doc_search). `default-features = false` drops
 # `api-embeddings` (dup reqwest 0.11) and `simd` (simsimd C lib) — both break
 # the cross-compiles; we bring our own embeddings + pure-Rust distance. Ids are
-# self-hashed (no `uuid-support`). Backends: hnsw_rs (index) + redb (storage).
-ruvector-core = { version = "=2.2.0", default-features = false, features = ["hnsw", "storage", "parallel"] }
+# self-hashed (no `uuid-support`). Backends: FlatGraph index + redb storage.
+ruvector-core = { version = "=2.4.0", default-features = false, features = ["hnsw", "storage", "parallel"] }
 # PDF text + markdown extraction (pure-Rust). `legacy-crypto` keeps R<=4 RC4/MD5
 # decrypt; all C-dep features (icc/lcms2/aws-lc/OCR/pdfium) stay off so it
 # cross-compiles clean.

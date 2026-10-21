@@ -426,8 +426,8 @@ pub(crate) fn normalize_lexical(p: &Path) -> PathBuf {
     result
 }
 
-/// Capacity hint for the HNSW index: the 10M `HnswConfig` default
-/// over-reserves ~35 GiB per open in hnsw_rs < 0.3.5 and aborts the process.
+/// Capacity hint for the HNSW index: a no-op for 2.4.0's default FlatGraph
+/// index, kept bounded for older stored configs.
 const HNSW_MAX_ELEMENTS: usize = 100_000;
 
 /// The `DbOptions` every store is created with: cosine over the embedding
