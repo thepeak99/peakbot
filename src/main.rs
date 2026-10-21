@@ -21,7 +21,7 @@ enum Mode {
     Stdio,
 }
 
-/// The installer and config verbs (plan §E.12). `args_conflicts_with_subcommands = true`
+/// The two installer verbs (plan §E.12). `args_conflicts_with_subcommands = true`
 /// on `Cli` rejects `peakbot --tui install` at the clap boundary — the only way
 /// to make an "install vs. web UI" decision impossible is to make clap refuse to
 /// parse it.
@@ -34,20 +34,6 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Config lifecycle verbs.
-    // Hidden until the runtime reads the 0.24 layout.
-    #[command(hide = true)]
-    Config {
-        #[command(subcommand)]
-        action: ConfigAction,
-    },
-}
-
-/// Sub-verbs of `peakbot config …`; deleted in 0.26 with the migration.
-#[derive(Debug, Clone, Subcommand)]
-enum ConfigAction {
-    /// Rewrite a pre-0.24 `config.yaml` into the 0.24 layout, once.
-    Migrate,
 }
 
 /// Sub-verbs of `peakbot service …`. `Install` carries its own `--bind` /
@@ -427,33 +413,6 @@ fn run_subcommand(cmd: Command, cli: &Cli) -> Result<()> {
                 print_service_report(&report);
             }
         },
-        // One-shot pre-0.24 migration; this glue is deleted in 0.26.
-        Command::Config {
-            action: ConfigAction::Migrate,
-        } => {
-            let dir = peakbot::config::get_config_dir()
-                .ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-            let config_path = dir.join("config.yaml");
-            let cwd =
-                std::env::current_dir().map_err(|e| anyhow::anyhow!("current directory: {e}"))?;
-            match peakbot::config::migrate::migrate_file(&config_path, &cwd) {
-                Ok(report) => {
-                    println!(
-                        "Migrated {} (previous file: {})",
-                        report.path.display(),
-                        report.backup.display()
-                    );
-                    for note in &report.notes {
-                        println!("{note}");
-                    }
-                }
-                // Exit 0: a second run is a no-op, not an error.
-                Err(peakbot::config::migrate::MigrateFileError::AlreadyCurrent) => {
-                    println!("config.yaml already uses the 0.24 layout — nothing to do.");
-                }
-                Err(e) => return Err(anyhow::anyhow!("{e}")),
-            }
-        }
     }
     let _ = cli; // cli is unused here today; kept so future verb args can pull from it.
     Ok(())
