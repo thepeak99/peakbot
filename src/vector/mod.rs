@@ -791,11 +791,7 @@ mod tests {
         assert_eq!(entry.vector, vec![1.0, 0.0, 0.0, 0.0]);
 
         let hits = search_all(&db, &[1.0, 0.0, 0.0, 0.0], 2);
-        assert_eq!(
-            hits.len(),
-            2,
-            "both chunks must be searchable after reopen"
-        );
+        assert_eq!(hits.len(), 2, "both chunks must be searchable after reopen");
         assert_eq!(hits[0].id, chunk_id("reopen.txt", 0));
     }
 
@@ -816,13 +812,19 @@ mod tests {
             metadata: None,
         }])
         .unwrap();
-        assert!(db.get(&id).unwrap().is_some(), "row must exist before delete");
+        assert!(
+            db.get(&id).unwrap().is_some(),
+            "row must exist before delete"
+        );
 
         assert!(
             db.delete(&id).unwrap(),
             "first delete must report the row existed"
         );
-        assert!(db.get(&id).unwrap().is_none(), "row must be gone after delete");
+        assert!(
+            db.get(&id).unwrap().is_none(),
+            "row must be gone after delete"
+        );
         assert!(
             !db.delete(&id).unwrap(),
             "deleting an absent row must report false"
