@@ -4,6 +4,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- Vector store: no longer pre-reserves ~35 GiB per open (hnsw_rs 0.3.5 fix + HNSW capacity hint capped at 100k), which could crash PeakBot during doc_index/doc_search.
 - Dev tooling: `make clean` now removes ALL build artifacts — root and desktop cargo targets, `web/dist` + `web/node_modules`, the desktop sidecar binaries, `gen/` and fetched emoji fonts, `output/`, and `.release-version` — while restoring the tracked `.gitkeep` placeholders.
 - CI: a new `desktop` job checks the full desktop workspace (core + Tauri glue) with fmt/clippy/test on every PR, so the Tauri glue crate is no longer untested between desktop.yml release builds.
 - Web UI: new **Focus mode** toggle (top bar, on by default). Hides tool calls, tool results, background turns and other intermediate steps, showing only your messages, the final answer of each turn, and any errors. While the agent works, a single live activity line shows the latest step. Preference is remembered per browser.
