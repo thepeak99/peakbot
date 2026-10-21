@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ruvector_core::types::{DbOptions, DistanceMetric, SearchQuery, VectorEntry};
+use ruvector_core::types::{DbOptions, DistanceMetric, HnswConfig, SearchQuery, VectorEntry};
 use ruvector_core::vector_db::VectorDB;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -426,6 +426,25 @@ fn normalize_lexical(p: &Path) -> PathBuf {
     result
 }
 
+/// Capacity hint for the HNSW index: the 10M `HnswConfig` default
+/// over-reserves ~35 GiB per open in hnsw_rs < 0.3.5 and aborts the process.
+const HNSW_MAX_ELEMENTS: usize = 100_000;
+
+/// The `DbOptions` every store is created with: cosine over the embedding
+/// dimension, HNSW capacity capped at [`HNSW_MAX_ELEMENTS`].
+fn db_options(path: &Path, dimensions: usize) -> DbOptions {
+    DbOptions {
+        dimensions,
+        distance_metric: DistanceMetric::Cosine,
+        storage_path: path.display().to_string(),
+        hnsw_config: Some(HnswConfig {
+            max_elements: HNSW_MAX_ELEMENTS,
+            ..HnswConfig::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Create (or reopen) the redb-backed DB at `db_path`, creating the parent
 /// directory if missing. This is the single point that touches disk, invoked
 /// lazily from [`VectorStore::db`] on the first write. Errors carry the path
@@ -441,12 +460,7 @@ fn create_db(db_path: &DbPath, dimensions: usize) -> Result<Arc<VectorDB>, Vecto
         })?;
     }
 
-    let opts = DbOptions {
-        dimensions,
-        distance_metric: DistanceMetric::Cosine,
-        storage_path: path.display().to_string(),
-        ..Default::default()
-    };
+    let opts = db_options(path, dimensions);
     let db = VectorDB::new(opts).map_err(|source| VectorStoreError::Open {
         path: path.display().to_string(),
         source,
