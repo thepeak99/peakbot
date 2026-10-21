@@ -1,0 +1,15 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+default_model: solo
+system_prompt: "   "
+persona: You are a careful engineer.
+profiles:
+  web:
+    system_prompt: "  "
+    tools:
+      only: [web_search]

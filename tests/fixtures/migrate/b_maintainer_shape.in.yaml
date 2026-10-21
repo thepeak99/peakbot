@@ -1,0 +1,78 @@
+# Anonymized copy of the maintainer's config KEY SHAPE (pre-0.24 legacy
+# schema). No real secrets or values — everything here is fake. Used by
+# tests/old_behaviour_snapshots.rs to pin the old code's behaviour.
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-api-key
+    base_url: https://api.example.com/v1
+    models:
+      - name: fake-model-mid
+        alias: mid
+      - name: fake-model-senior
+        alias: senior
+
+agent_max_turns: 30
+
+mcp_servers:
+  - name: playwright
+    type: stdio
+    command: npx
+    args:
+      - "@playwright/mcp@latest"
+    env:
+      FAKE_MCP_VAR: "1"
+    enabled: true
+
+searxng:
+  base_url: https://search.example.com
+  enabled: true
+  timeout_seconds: 30
+  max_results: 10
+
+default_model: mid
+
+vector_db:
+  enabled: true
+  db_path: .peakbot/vector.db
+  embeddings:
+    base_url: https://embeddings.example.com/v1
+    api_key: fake-embeddings-key
+    model: fake-embedding-model
+    dimensions: 384
+
+pipelines:
+  - name: dev-team
+    orchestrator:
+      model: senior
+      prompt: |
+        You lead a small dev team. Delegate implementation and research
+        to your sub-agents and keep the main thread on coordination.
+    agents:
+      developer:
+        model: mid
+        prompt: |
+          You are the developer. Implement what is asked as clean,
+          maintainable code.
+      researcher:
+        # no model — falls back to default_model (mid)
+        prompt: |
+          You are the researcher. Return a tight, well-sourced brief.
+
+profiles:
+  research:
+    tools:
+      only:
+        - file_read
+        - list_directory
+        - web_search
+    pipelines:
+      enabled: false
+    mcp_servers:
+      enabled: false
+    agents_md: false
+
+bash:
+  env:
+    FAKE_BASH_VAR_1: "1"
+    FAKE_BASH_VAR_2: "2"

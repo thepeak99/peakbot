@@ -1,0 +1,5 @@
+'searxng' can no longer be set per repo and was dropped — it is machine-wide now; set it in /home/u/.config/peakbot/config.yaml if you still want it.
+'vector_db' had no effect in a repo config before 0.24 and was dropped.
+tools: 'delegate' was blocked; delegation is now on whenever an agent has subagents.
+the settings default_model from this file now apply only to agent 'main'; agents 'dev-team' keep their global settings.
+profile 'default' in this repo is now a copy of the global profile 'default' with this file's settings applied — later edits to the global 'default' no longer reach this repo, and the other global profiles do not include this file's settings.

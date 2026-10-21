@@ -1,0 +1,21 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model-a
+        alias: alpha
+      - name: fake-model-b
+        alias: beta
+profiles:
+  default:
+    agents:
+      main:
+        model: alpha
+      builder:
+        model: beta
+        prompt: Build the thing.
+        subagents:
+          coder:
+            model: alpha
+            prompt: Write code.

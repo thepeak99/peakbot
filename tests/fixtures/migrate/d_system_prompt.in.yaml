@@ -1,0 +1,25 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+default_model: solo
+system_prompt: You are a terse systems engineer. Answer with facts, not essays.
+pipelines:
+  - name: with-persona
+    orchestrator:
+      model: solo
+      persona: This pipeline persona is outranked by system_prompt.
+      prompt: Coordinate the pair.
+    agents:
+      worker:
+        model: solo
+        prompt: Do the work.
+  - name: without-persona
+    orchestrator:
+      prompt: Coordinate solo.
+    agents:
+      helper:
+        prompt: Assist.

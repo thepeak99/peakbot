@@ -1,0 +1,13 @@
+providers:
+  - name: local
+    type: openai
+    base_url: http://localhost:8080/v1
+    api_key: local-key
+    models:
+      - name: qwen2.5-coder
+        alias: local-coder
+pipelines:
+  - name: dev
+    orchestrator:
+      model: local-coder
+      prompt: Dev with the local model.

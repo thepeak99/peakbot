@@ -1,0 +1,31 @@
+providers:
+  - name: patchnotes
+    type: openai
+    base_url: https://ai.patchnotes.com/v1
+    api_key: pn-fake
+    models:
+      - name: anthropic/claude-sonnet-4.5
+        alias: mid
+      - name: anthropic/claude-opus-4.1
+        alias: senior
+profiles:
+  default:
+    tools:
+      disabled: [powershell]
+    env:
+      GIT_PAGER: cat
+    agents:
+      main:
+        model: mid
+        persona: You are a careful engineer.
+      dev-team:
+        model: senior
+        prompt: Delegate.
+        subagents:
+          researcher:
+            model: mid
+            prompt: Research.
+  research:
+    agents:
+      main:
+        model: mid

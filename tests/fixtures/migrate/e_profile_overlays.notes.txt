@@ -1,0 +1,1 @@
+profile 'web': ui.tabs entry 'profile' removed (the profile tab no longer exists).

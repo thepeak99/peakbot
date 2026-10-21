@@ -1,0 +1,1 @@
+conversation.auto_resume / max_conversations were removed — they had no effect.

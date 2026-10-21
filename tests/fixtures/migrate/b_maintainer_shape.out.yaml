@@ -1,0 +1,77 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-api-key
+    base_url: https://api.example.com/v1
+    models:
+      - name: fake-model-mid
+        alias: mid
+      - name: fake-model-senior
+        alias: senior
+mcps:
+  - name: playwright
+    type: stdio
+    command: npx
+    args:
+      - "@playwright/mcp@latest"
+    env:
+      FAKE_MCP_VAR: "1"
+    enabled: true
+profiles:
+  default:
+    env:
+      FAKE_BASH_VAR_1: "1"
+      FAKE_BASH_VAR_2: "2"
+    vector_db:
+      db_path: .peakbot/vector.db
+      embeddings:
+        base_url: https://embeddings.example.com/v1
+        api_key: fake-embeddings-key
+        model: fake-embedding-model
+        dimensions: 384
+    agents:
+      main:
+        model: mid
+      dev-team:
+        model: senior
+        prompt: |
+          You lead a small dev team. Delegate implementation and research
+          to your sub-agents and keep the main thread on coordination.
+        subagents:
+          developer:
+            model: mid
+            prompt: |
+              You are the developer. Implement what is asked as clean,
+              maintainable code.
+          researcher:
+            model: mid
+            prompt: |
+              You are the researcher. Return a tight, well-sourced brief.
+  research:
+    tools:
+      only:
+        - file_read
+        - list_directory
+        - web_search
+    mcps:
+      enabled: false
+    env:
+      FAKE_BASH_VAR_1: "1"
+      FAKE_BASH_VAR_2: "2"
+    vector_db:
+      db_path: .peakbot/vector.db
+      embeddings:
+        base_url: https://embeddings.example.com/v1
+        api_key: fake-embeddings-key
+        model: fake-embedding-model
+        dimensions: 384
+    agents:
+      main:
+        model: mid
+        agents_md: false
+general:
+  search:
+    base_url: https://search.example.com
+    timeout_seconds: 30
+    max_results: 10
+  agent_max_turns: 30

@@ -1,0 +1,19 @@
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: k
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: sonnet
+profiles:
+  default:
+    agents:
+      main:
+        model: sonnet
+      review-team:
+        model: sonnet
+        prompt: You lead a small team.
+        subagents:
+          reviewer:
+            model: sonnet
+            prompt: Review diffs.

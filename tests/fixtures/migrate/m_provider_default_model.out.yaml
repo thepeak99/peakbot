@@ -1,0 +1,12 @@
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: pn-legacy-key
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: default
+profiles:
+  default:
+    agents:
+      main:
+        model: default

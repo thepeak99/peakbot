@@ -1,0 +1,29 @@
+# ~/workz/peakbot/.peakbot/config.yaml — may ONLY contain `profiles:`.
+# Repo profiles are listed FIRST in this cwd; the first one is the default here.
+# A repo profile with the same name as a global one REPLACES it (no merge).
+profiles:
+  peakbot-dev:
+    tools: { disabled: [powershell, powershell_bg, view_image] }
+    mcps: { only: [playwright] }             # may enable ANY global mcps entry by name
+    env: { CARGO_TERM_COLOR: never, RUST_LOG: peakbot=info }
+    vector_db:
+      db_path: ./.peakbot/vectors.db         # relative → resolved against THIS REPO's root at parse time
+      embeddings: { base_url: https://embed.example.com/v1, api_key: emb-77b01c9d, model: bge-m3, dimensions: 1024 }
+    agents:
+      team:
+        model: sonnet                        # global aliases are visible here
+        persona: You lead the PeakBot team. Zen review before any code.
+        prompt: Keep diffs small. Prefer the boring solution.
+        subagents:
+          mid:    { model: qwen, prompt: Implement the well-scoped piece you are given. }
+          senior: { model: opus, prompt: Review architecture and risk. Say stop when it is time. }
+          tester: { prompt: Cover the edge cases the team keeps missing. }
+      quick:
+        model: qwen
+
+  dev:                                       # same name as global `dev` → REPLACES it in this repo
+    mcps: { only: [playwright, linear] }
+    agents:
+      solo: { model: qwen }
+
+# providers: / mcps: / general:  → ✗ LOAD ERROR: "only `profiles:` is allowed in a repo config — move `general:` to the global config (…)"

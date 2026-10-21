@@ -1,0 +1,1 @@
+'agent_max_turns' can no longer be set per repo and was dropped — it is machine-wide now; set it in /home/u/.config/peakbot/config.yaml if you still want it.

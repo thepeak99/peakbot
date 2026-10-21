@@ -1,0 +1,72 @@
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: YOUR_API_KEY_HERE
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: sonnet
+        max_tokens: 8192
+      - name: anthropic/claude-3.5-sonnet
+        alias: sonnet-3.5
+      - name: google/gemini-2.0-flash-001
+        alias: flash
+profiles:
+  default:
+    agents:
+      main:
+        model: sonnet
+      software-team:
+        model: sonnet
+        prompt: |
+          You lead a small software team. Delegate research, review, and
+          implementation to your sub-agents. Keep the main thread focused on
+          planning and coordination.
+        subagents:
+          pm:
+            model: sonnet-3.5
+            prompt: |
+              You are the Product Manager. Turn a request into a tight product spec:
+              problem statement, core user stories, in-scope vs out-of-scope, and
+              success criteria. Be decisive; say "out of scope" when it is.
+          architect:
+            model: sonnet
+            prompt: |
+              You are the Software Architect. Given a spec, design the simplest
+              system that solves it: components, data flow, interfaces, and the key
+              tradeoffs. "Perfection is when there is nothing left to take away."
+          developer:
+            model: sonnet
+            prompt: |
+              You are the Developer. Implement the design as clean, boring,
+              maintainable code. Explain WHY on non-obvious choices, handle errors
+              gracefully, avoid premature abstraction and clever one-liners.
+          tester:
+            model: flash
+            prompt: |
+              You are the QA Engineer. Write tests that try to make the code fail:
+              happy path AND edge cases (empty, max, null, error paths). Name each
+              test by what it verifies. Report any bugs you spot with repro steps.
+            env:
+              RUN_INTEGRATION_TESTS: "1"
+      research:
+        model: sonnet-3.5
+        persona: |
+          You are a research lead — thorough, sceptical, and concise.
+          You prioritise accuracy over speed and flag uncertainty.
+        prompt: |
+          You coordinate a research team. Delegate fact-checking and source
+          critique to your sub-agents. Synthesise their findings into a concise
+          brief for the user.
+        subagents:
+          researcher:
+            model: flash
+            prompt: |
+              You research codebases, documentation, and the web. Return a tight,
+              well-sourced brief: key facts, relevant links, and any gaps.
+            skills:
+              only: [web_search, github]
+          reviewer:
+            model: sonnet
+            prompt: |
+              You critique sources and findings. Check for logical gaps,
+              unsupported claims, and missing context. Be constructive but direct.

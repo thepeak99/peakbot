@@ -1,0 +1,6 @@
+provider:
+  type: openrouter
+  config:
+    model: anthropic/claude-3.7-sonnet
+    api_key: pn-legacy-key
+    max_tokens: 4096

@@ -1,0 +1,17 @@
+providers:
+  - name: patchnotes
+    type: openai
+    base_url: https://ai.patchnotes.com/v1
+    api_key: pn-fake
+    models:
+      - name: anthropic/claude-sonnet-4.5
+        alias: mid
+profiles:
+  dev:
+    agents:
+      main:
+        model: mid
+  research:
+    agents:
+      main:
+        model: mid

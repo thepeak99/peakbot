@@ -1,0 +1,49 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+default_model: solo
+pipelines:
+  - name: main
+    orchestrator:
+      model: solo
+      persona: The main team lead.
+      prompt: Run the main team.
+    agents:
+      worker:
+        prompt: Work.
+  - name: main-2
+    orchestrator:
+      model: solo
+      persona: The second lead.
+      prompt: The second main.
+  - name: dev
+    orchestrator:
+      model: solo
+      persona: The first dev.
+      prompt: Dev one.
+  - name: dev
+    orchestrator:
+      model: solo
+      persona: The second dev.
+      prompt: Dev two.
+  - name: team
+    orchestrator:
+      model: solo
+      persona: The team lead.
+      prompt: The team pipeline.
+pipeline:
+  enabled: true
+  orchestrator_prompt: The legacy team block.
+profiles:
+  default:
+    tools:
+      only: [web_search]
+    pipelines:
+      only: [main]
+  default-2:
+    tools:
+      only: [think]

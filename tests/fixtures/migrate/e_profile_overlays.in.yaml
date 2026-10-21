@@ -1,0 +1,38 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+default_model: solo
+persona: You are the global persona.
+mcp_servers:
+  - name: alpha
+    type: sse
+    url: http://alpha.test/sse
+pipelines:
+  - name: team
+    orchestrator:
+      model: solo
+      prompt: Lead the pair.
+    agents:
+      worker:
+        prompt: Work.
+profiles:
+  web:
+    tools:
+      only: [web_search, fetch_page]
+    memory:
+      enabled: false
+    fetch_url:
+      allow_post: true
+    pipelines:
+      only: [team]
+    mcp_servers:
+      only: [alpha]
+    system_prompt: Web persona head.
+    ui:
+      tabs:
+        disabled: [profile, bash]
+    agents_md: false

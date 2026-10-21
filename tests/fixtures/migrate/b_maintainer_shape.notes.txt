@@ -1,0 +1,2 @@
+agent 'dev-team' previously ran without the built-in persona; it now gets it — set a persona to change that.
+profile 'research': pipelines filter removed agent 'dev-team'.

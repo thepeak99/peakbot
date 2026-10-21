@@ -1,0 +1,20 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+profiles:
+  default:
+    agents:
+      main:
+        model: solo
+        persona: You are a careful engineer.
+  web:
+    tools:
+      only: [web_search]
+    agents:
+      main:
+        model: solo
+        persona: You are a careful engineer.

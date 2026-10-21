@@ -1,0 +1,45 @@
+providers:
+  - name: openai
+    type: openai
+    api_key: fake-key
+    models:
+      - name: fake-model
+        alias: solo
+uploads:
+  max_file_mb: 5
+  max_files: 3
+web:
+  tls: true
+  session_ttl_secs: 300
+  reaper_tick_secs: 30
+http:
+  connect_timeout_secs: 10
+  read_timeout_secs: 100
+timeouts:
+  tool_secs: 60
+  delegate_secs: 120
+retry:
+  max_retries: 5
+cost_tracking: false
+conversation:
+  auto_resume: true
+  max_conversations: 50
+  auto_save: false
+  storage_dir: /tmp/convos
+context:
+  enabled: true
+  threshold: 0.5
+  keep_recent: 3
+  compaction_model: solo
+searxng:
+  enabled: true
+  base_url: https://search.example.com
+  bearer_token: tok
+agent_max_turns: 20
+fetch_url:
+  allow_post: true
+memory:
+  enabled: false
+  threshold_bytes: 1024
+persona: "   "
+default_model: solo

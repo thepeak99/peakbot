@@ -35,6 +35,9 @@ dirs = "6"
 dunce = "1"
 gethostname = "1"
 serde_yaml = "0.9"
+# First-error path fidelity for the 0.24 config parse (spec §4.1):
+# serde_yaml alone only reports line/column, not the YAML key path.
+serde_path_to_error = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 # Direct dep (transitive via url/reqwest) for the RFC 5987 `filename*`
 # percent-encoding in the upload serve headers (src/ui/web/uploads.rs).

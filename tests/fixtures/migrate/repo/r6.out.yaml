@@ -1,0 +1,9 @@
+profiles:
+  default:
+    agents:
+      main:
+        model: mid
+        persona: Repo persona.
+      dev:
+        model: senior
+        prompt: Dev.
