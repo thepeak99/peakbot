@@ -17,8 +17,7 @@ use peakbot::config::resolve::{Config, ParseCtx, Source};
 
 const GLOBAL_PATH: &str = "/home/u/.config/peakbot/config.yaml";
 const REPO_PATH: &str = "/home/u/repo/.peakbot/config.yaml";
-// The L1 hint text changes in A7′ (the `config migrate` CLI is deleted) and
-// the spec does not pin the new wording, so match the stable prefix only.
+// The full L1 text is pinned in `config_v2_parse`; match the stable prefix.
 const L1_PREFIX: &str = "config.yaml uses the pre-0.24 layout";
 
 const FIXTURES: [&str; 18] = [

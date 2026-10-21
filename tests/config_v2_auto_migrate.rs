@@ -29,8 +29,8 @@
 //! }
 //! ```
 //!
-//! `tests/config_v2_migrate_file.rs` (the `migrate_file` port source) is
-//! deleted with this file: its web-token cases reappear here as
+//! This replaces the old file-migration tests; their web-token cases
+//! reappear here as
 //! `auto_migrate_moves_web_token_into_config` and
 //! `auto_migrate_empty_web_token_injects_nothing`.
 //!
@@ -267,15 +267,15 @@ fn auto_migrate_legacy_global_rewrites_with_exact_header_and_created_original() 
     // The notes: the migrate note, in order.
     assert_eq!(migrated.notes, vec![DELEGATE_NOTE.to_string()]);
 
-    // The display lines are exact.
+    // The display lines are exact: the header line, then one bullet per note.
     assert_eq!(
         migrated.notices(),
-        vec![created_notice(&path)],
-        "notices() must be the exact §7.5 display lines (no notes here beyond the header line)"
+        vec![created_notice(&path), format!("  • {DELEGATE_NOTE}")],
+        "notices() must be the exact §7.5 display lines"
     );
 }
 
-/// §7.5 step 3 / ported from `config_v2_migrate_file.rs`: the `web-token`
+/// §7.5 step 3 / ported from the old file-migration tests: the `web-token`
 /// file is injected into `general.web.token` and renamed to `web-token.bak`.
 #[test]
 fn auto_migrate_moves_web_token_into_config() {
@@ -331,7 +331,7 @@ fn auto_migrate_moves_web_token_into_config() {
     );
 }
 
-/// Ported from `config_v2_migrate_file.rs`: an EMPTY token file injects
+/// Ported from the old file-migration tests: an EMPTY token file injects
 /// nothing (a blank token would fail G7).
 #[test]
 fn auto_migrate_empty_web_token_injects_nothing() {
@@ -542,7 +542,10 @@ fn auto_migrate_migrates_legacy_global_and_repo_together() {
     let outcome = auto_migrate(cfg.path(), Some(cwd.path())).expect("both files must migrate");
     assert!(!outcome.is_noop());
     assert!(outcome.global.is_some(), "the global must be migrated");
-    let repo = outcome.repo.expect("the repo file must be migrated");
+    let repo = outcome
+        .repo
+        .as_ref()
+        .expect("the repo file must be migrated");
 
     let repo_path = repo_config(cwd.path());
     assert_eq!(repo.path, repo_path);
@@ -653,7 +656,7 @@ fn auto_migrate_repo_missing_global_is_global_not_usable() {
         .expect_err("a missing global must refuse the repo migration");
     assert_eq!(err.file, ConfigFileKind::Repo);
     assert!(
-        matches!(err.reason, AutoMigrateFailure::GlobalNotUsable(msg) if msg.contains("does not exist")),
+        matches!(err.reason, AutoMigrateFailure::GlobalNotUsable(ref msg) if msg.contains("does not exist")),
         "a missing global must be GlobalNotUsable('<path> does not exist'); got {:?}",
         err.reason
     );
@@ -678,7 +681,7 @@ fn auto_migrate_repo_with_legacy_global_is_global_not_usable_and_touches_nothing
         .expect_err("a legacy global is not usable for a repo migration");
     assert_eq!(err.file, ConfigFileKind::Repo);
     assert!(
-        matches!(err.reason, AutoMigrateFailure::GlobalNotUsable(msg)
+        matches!(err.reason, AutoMigrateFailure::GlobalNotUsable(ref msg)
             if msg.contains("config.yaml uses the pre-0.24 layout")),
         "the reason must carry the global's L1 failure; got {:?}",
         err.reason

@@ -2476,7 +2476,7 @@ pub fn save_config_at(dir: &std::path::Path, yaml: &str) -> anyhow::Result<SaveO
     // 1. Backup BEFORE any write touches the live file, so a crash at any
     //    later step leaves the previous file intact under .bak.
     let backup = if final_path.exists() {
-        std::fs::copy(&final_path, &backup_path)
+        write_backup(&final_path, &backup_path)
             .with_context(|| format!("backup to {}", backup_path.display()))?;
         Some(backup_path)
     } else {
@@ -2506,11 +2506,14 @@ pub fn save_config_at(dir: &std::path::Path, yaml: &str) -> anyhow::Result<SaveO
     }
 
     // 3. Swap into place. Windows can't rename onto an existing file, so we
-    //    remove first there. On POSIX the remove is a no-op and rename is
-    //    atomic. Either way, the .bak is already in place.
-    if final_path.exists() {
-        std::fs::remove_file(&final_path)
-            .with_context(|| format!("remove old {}", final_path.display()))?;
+    //    remove first there; on POSIX rename is atomic and config.yaml never
+    //    goes missing. Either way, the .bak is already in place.
+    #[cfg(windows)]
+    {
+        if final_path.exists() {
+            std::fs::remove_file(&final_path)
+                .with_context(|| format!("remove old {}", final_path.display()))?;
+        }
     }
     std::fs::rename(&tmp_path, &final_path)
         .with_context(|| format!("rename tmp → final at {}", final_path.display()))?;
@@ -2519,6 +2522,27 @@ pub fn save_config_at(dir: &std::path::Path, yaml: &str) -> anyhow::Result<SaveO
         path: final_path,
         backup,
     })
+}
+
+/// Copies `from` to the `.bak` at `to` with mode 0600 on Unix. Not `fs::copy`:
+/// that keeps the source mode, and the config holds API keys. An existing
+/// `.bak` keeps its old mode on open, hence the explicit `set_permissions`.
+fn write_backup(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let bytes = std::fs::read(from)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(to)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(&bytes)?;
+    f.sync_all()
 }
 
 /// Write the given YAML bytes to the platform master config file

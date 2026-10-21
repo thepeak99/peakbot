@@ -1,6 +1,7 @@
 //! Pre-0.24 → 0.24 config migration; deleted in 0.26.
 //!
-//! Pure `Value → Value` (spec §7) plus the `migrate_file` IO wrapper (§7.5).
+//! Pure `Value → Value` (spec §7) plus the automatic-migration IO layer
+//! (`auto_migrate` / `auto_migrate_repo`, §7.5).
 //! The pure half never goes through the old typed `Config`: that would fill
 //! in defaults and lose the user's key order.
 
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde_yaml::{Mapping, Value};
 
 use crate::PEAKBOT_VERSION;
-use crate::config::errors::ConfigErrors;
+use crate::config::errors::{ConfigErrors, ConfigFileKind};
 use crate::config::resolve::{Config, ParseCtx, Source};
 use crate::config::save_config_at;
 
@@ -469,124 +470,333 @@ fn reorder(map: Mapping, order: &[&str]) -> Mapping {
     out
 }
 
-// ── IO wrapper (§7.5); deleted in 0.26 ─────────────────────────────────────
+// ── IO: automatic migration (§7.5); deleted in 0.26 ────────────────────────
 
-/// What `migrate_file` did; the CLI and the HTTP endpoint print/return it.
+const CONFIG_FILE: &str = "config.yaml";
+const PRE_024_SUFFIX: &str = ".pre-0.24";
+
+/// What one boot-time `auto_migrate` call rewrote.
+#[derive(Debug, Default)]
+pub struct AutoMigrateOutcome {
+    /// None: missing, not YAML, or already current.
+    pub global: Option<Migrated>,
+    /// None: not asked, global missing, repo missing, not YAML, or already current.
+    pub repo: Option<Migrated>,
+}
+
+impl AutoMigrateOutcome {
+    pub fn is_noop(&self) -> bool {
+        self.global.is_none() && self.repo.is_none()
+    }
+
+    /// The global file's display lines, then the repo file's.
+    pub fn notices(&self) -> Vec<String> {
+        self.global
+            .iter()
+            .chain(&self.repo)
+            .flat_map(Migrated::notices)
+            .collect()
+    }
+}
+
+/// One rewritten file.
 #[derive(Debug)]
-pub struct MigrateReport {
-    /// The `config.yaml` that now holds the migrated bytes.
+pub struct Migrated {
+    /// The rewritten file.
     pub path: PathBuf,
-    /// The `.bak` holding the previous bytes.
-    pub backup: PathBuf,
-    /// Human notes (token move, repo file, warnings), in order.
+    /// Where the bytes it replaced live.
+    pub original: Original,
+    /// `migrate()`/`migrate_repo()` notes, then IO notes, in order.
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum MigrateFileError {
-    /// Not an accident: a second run is a no-op the CLI exits 0 for.
-    #[error("config.yaml already uses the 0.24 layout — nothing to do.")]
-    AlreadyCurrent,
-    #[error("failed to read {0}: {1}")]
-    Read(PathBuf, String),
-    #[error("failed to parse {0}: {1}")]
-    Parse(PathBuf, String),
-    #[error("migrated config does not validate: {0}")]
-    InvalidResult(String),
-    #[error("failed to write the migrated config: {0}")]
-    Write(String),
-    #[error(transparent)]
-    Migrate(#[from] MigrateError),
+impl Migrated {
+    /// The display lines: one renderer for stderr, system messages and reload.
+    pub fn notices(&self) -> Vec<String> {
+        let path = self.path.display();
+        let first = match self.original {
+            Original::Created(_) => format!(
+                "ℹ Migrated {path} to the 0.24 layout. The previous file is kept as {path}{PRE_024_SUFFIX} — restore it to go back to PeakBot 0.23."
+            ),
+            Original::Kept(_) => format!(
+                "ℹ Migrated {path} to the 0.24 layout. {path}{PRE_024_SUFFIX} already existed and was kept; the replaced file is {path}.bak."
+            ),
+        };
+        std::iter::once(first)
+            .chain(self.notes.iter().map(|n| format!("  • {}", one_line(n))))
+            .collect()
+    }
 }
 
-/// §7.5: read, migrate, validate — then write. A failed migration touches
-/// neither `config.yaml` nor `config.yaml.bak`.
-pub fn migrate_file(config_path: &Path, cwd: &Path) -> Result<MigrateReport, MigrateFileError> {
-    let text = std::fs::read_to_string(config_path)
-        .map_err(|e| MigrateFileError::Read(config_path.to_path_buf(), e.to_string()))?;
-    let old: Value = serde_yaml::from_str(&text)
-        .map_err(|e| MigrateFileError::Parse(config_path.to_path_buf(), e.to_string()))?;
+#[derive(Debug, PartialEq, Eq)]
+pub enum Original {
+    /// This run wrote `<path>.pre-0.24` with the replaced bytes.
+    Created(PathBuf),
+    /// `<path>.pre-0.24` already existed and was left untouched; the replaced
+    /// bytes are only in `<path>.bak`.
+    Kept(PathBuf),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("could not migrate {} to the 0.24 layout: {reason}", path.display())]
+pub struct AutoMigrateError {
+    /// Boot picks needs_setup vs exit on it (§6.9).
+    pub file: ConfigFileKind,
+    /// The file that failed.
+    pub path: PathBuf,
+    pub reason: AutoMigrateFailure,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AutoMigrateFailure {
+    #[error("cannot read it: {0}")]
+    Read(std::io::Error),
+    #[error(transparent)]
+    Migrate(#[from] MigrateError),
+    /// `<dotted path>: <message>; …`
+    #[error("the migrated file does not validate: {0}")]
+    Invalid(String),
+    /// Repo only.
+    #[error("the global config must be valid first: {0}")]
+    GlobalNotUsable(String),
+    /// The `.pre-0.24`, tmp, `.bak` or rename step.
+    #[error("cannot write {}: {}", .0.display(), .1)]
+    Write(PathBuf, String),
+}
+
+/// Boot: the global `<config_dir>/config.yaml`, then (when `repo_cwd` is
+/// Some) `<repo_cwd>/.peakbot/config.yaml`. `repo_cwd` is None under a
+/// `--profile` pin (repo files are ignored there). Idempotent.
+// Wired into boot at the config cutover.
+pub fn auto_migrate(
+    config_dir: &Path,
+    repo_cwd: Option<&Path>,
+) -> Result<AutoMigrateOutcome, AutoMigrateError> {
+    let global_path = config_dir.join(CONFIG_FILE);
+    let global =
+        migrate_one(&global_path, |old| migrate_global(config_dir, old)).map_err(|reason| {
+            AutoMigrateError {
+                file: ConfigFileKind::Global,
+                path: global_path.clone(),
+                reason,
+            }
+        })?;
+    // A missing global falls through to boot's missing-config handling.
+    let repo = match repo_cwd {
+        Some(cwd) if global_path.exists() => auto_migrate_repo(config_dir, cwd)?,
+        _ => None,
+    };
+    Ok(AutoMigrateOutcome { global, repo })
+}
+
+/// Reload: only `<cwd>/.peakbot/config.yaml`. Never touches the global file.
+pub fn auto_migrate_repo(
+    config_dir: &Path,
+    cwd: &Path,
+) -> Result<Option<Migrated>, AutoMigrateError> {
+    let repo_path = cwd.join(".peakbot").join(CONFIG_FILE);
+    migrate_one(&repo_path, |old| {
+        migrate_repo_text(&config_dir.join(CONFIG_FILE), &repo_path, old)
+    })
+    .map_err(|reason| AutoMigrateError {
+        file: ConfigFileKind::Repo,
+        path: repo_path.clone(),
+        reason,
+    })
+}
+
+/// The pure step of one file: the new body (validated) and its notes.
+struct Converted {
+    body: String,
+    notes: Vec<String>,
+    /// Global only: the `web-token` file to rename once the write succeeded.
+    token_file: Option<PathBuf>,
+}
+
+/// §7.5 steps 1–7 for one file; `convert` is steps 3–4 (pure + validate).
+fn migrate_one(
+    path: &Path,
+    convert: impl FnOnce(&Value) -> Result<Converted, AutoMigrateFailure>,
+) -> Result<Option<Migrated>, AutoMigrateFailure> {
+    let original = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(AutoMigrateFailure::Read(e)),
+    };
+    // Not YAML (or not UTF-8) is not ours: `Config::load` reports it.
+    let Some(old) = std::str::from_utf8(&original)
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<Value>(text).ok())
+    else {
+        return Ok(None);
+    };
     if !is_legacy(&old) {
-        return Err(MigrateFileError::AlreadyCurrent);
+        return Ok(None);
     }
+    let Converted {
+        body,
+        mut notes,
+        token_file,
+    } = convert(&old)?;
+
+    let pre = sibling(path, PRE_024_SUFFIX);
+    let kept = keep_original(&pre, &original)?;
+    let header = header(&kept, &notes);
+    let dir = path.parent().unwrap_or(Path::new(""));
+    save_config_at(dir, &format!("{header}{body}"))
+        .map_err(|e| AutoMigrateFailure::Write(path.to_path_buf(), format!("{e:#}")))?;
+
+    if let Some(token_file) = token_file
+        && let Err(e) = std::fs::rename(&token_file, sibling(&token_file, ".bak"))
+    {
+        notes.push(format!(
+            "warning: could not rename web-token → web-token.bak: {e}"
+        ));
+    }
+    Ok(Some(Migrated {
+        path: path.to_path_buf(),
+        original: kept,
+        notes,
+    }))
+}
+
+fn migrate_global(config_dir: &Path, old: &Value) -> Result<Converted, AutoMigrateFailure> {
     let Migration {
         mut config,
         mut notes,
-    } = migrate(&old)?;
+    } = migrate(old)?;
 
-    let config_dir = config_path.parent().ok_or_else(|| {
-        MigrateFileError::Read(config_path.to_path_buf(), "no parent directory".to_string())
-    })?;
-
-    // Step 3: the web-token file becomes `general.web.token` (if absent).
     let token_path = config_dir.join("web-token");
     let token = std::fs::read_to_string(&token_path)
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    if let Some(token) = &token
-        && insert_web_token(&mut config, token)
-    {
-        notes.push(format!(
-            "web-token file moved into general.web.token; renamed {}/web-token → web-token.bak.",
-            config_dir.display()
-        ));
-    }
+    let token_file = match token {
+        Some(token) if insert_web_token(&mut config, &token) => {
+            notes.push(format!(
+                "web-token file moved into general.web.token; renamed {}/web-token → web-token.bak.",
+                config_dir.display()
+            ));
+            Some(token_path)
+        }
+        _ => None,
+    };
 
-    // Steps 4–5: header + serialize, then validate BEFORE any write.
-    let body =
-        serde_yaml::to_string(&config).map_err(|e| MigrateFileError::Write(e.to_string()))?;
-    let header = format!(
-        "# migrated from the pre-0.24 layout by peakbot {PEAKBOT_VERSION} — previous file: config.yaml.bak"
-    );
-    let yaml = format!("{header}\n{body}");
-    let ctx = ParseCtx { known_skills: &[] };
+    let body = to_yaml(&config)?;
+    let global_path = config_dir.join(CONFIG_FILE);
+    parse(&global_path, &body, None).map_err(AutoMigrateFailure::Invalid)?;
+    Ok(Converted {
+        body,
+        notes,
+        token_file,
+    })
+}
+
+fn migrate_repo_text(
+    global_path: &Path,
+    repo_path: &Path,
+    old: &Value,
+) -> Result<Converted, AutoMigrateFailure> {
+    let global_text = match std::fs::read_to_string(global_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AutoMigrateFailure::GlobalNotUsable(format!(
+                "{} does not exist",
+                global_path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(AutoMigrateFailure::GlobalNotUsable(format!(
+                "cannot read {}: {e}",
+                global_path.display()
+            )));
+        }
+    };
+    parse(global_path, &global_text, None).map_err(AutoMigrateFailure::GlobalNotUsable)?;
+    let global: Value = serde_yaml::from_str(&global_text)
+        .map_err(|e| AutoMigrateFailure::GlobalNotUsable(e.to_string()))?;
+
+    let Migration { config, notes } = migrate_repo(old, &global, global_path)?;
+    let body = to_yaml(&config)?;
+    parse(global_path, &global_text, Some((repo_path, &body)))
+        .map_err(AutoMigrateFailure::Invalid)?;
+    Ok(Converted {
+        body,
+        notes,
+        token_file: None,
+    })
+}
+
+/// `Config::parse` with no known skills (F6 warnings are ignored); the
+/// errors as one `;`-joined sentence.
+fn parse(global_path: &Path, global: &str, repo: Option<(&Path, &str)>) -> Result<(), String> {
     Config::parse(
         Source {
-            path: config_path,
-            text: &yaml,
+            path: global_path,
+            text: global,
         },
-        None,
-        &ctx,
+        repo.map(|(path, text)| Source { path, text }),
+        &ParseCtx { known_skills: &[] },
     )
-    .map_err(|errors| MigrateFileError::InvalidResult(format_parse_errors(&errors)))?;
+    .map(drop)
+    .map_err(|errors| format_parse_errors(&errors))
+}
 
-    // Step 6: backup + atomic write.
-    let outcome =
-        save_config_at(config_dir, &yaml).map_err(|e| MigrateFileError::Write(e.to_string()))?;
+fn to_yaml(config: &Value) -> Result<String, AutoMigrateFailure> {
+    serde_yaml::to_string(config).map_err(|e| AutoMigrateFailure::Invalid(e.to_string()))
+}
 
-    // Step 7: rename the token file away; a failure is a note, not an error.
-    if token.is_some() {
-        let token_bak = config_dir.join("web-token.bak");
-        if let Err(e) = std::fs::rename(&token_path, &token_bak) {
-            notes.push(format!(
-                "warning: could not rename web-token → web-token.bak: {e}"
-            ));
-        }
+/// Step 5: create-only, so the first process to get here keeps the true
+/// original and later runs never overwrite it.
+fn keep_original(pre: &Path, original: &[u8]) -> Result<Original, AutoMigrateFailure> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-
-    // Step 8: a legacy repo file is noted, never touched.
-    let repo_config = cwd.join(".peakbot/config.yaml");
-    if let Ok(text) = std::fs::read_to_string(&repo_config) {
-        let legacy = serde_yaml::from_str::<Value>(&text).is_ok_and(|doc| {
-            doc.as_mapping()
-                .is_some_and(|m| m.keys().any(|k| k.as_str() != Some("profiles")))
-        });
-        if legacy {
-            notes.push(format!(
-                "{} uses the old layout and was NOT migrated — a repo config may now only contain profiles:",
-                repo_config.display()
-            ));
+    let write_err = |e: std::io::Error| AutoMigrateFailure::Write(pre.to_path_buf(), e.to_string());
+    let mut file = match options.open(pre) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(Original::Kept(pre.to_path_buf()));
         }
-    }
+        Err(e) => return Err(write_err(e)),
+    };
+    file.write_all(original).map_err(write_err)?;
+    file.sync_all().map_err(write_err)?;
+    Ok(Original::Created(pre.to_path_buf()))
+}
 
-    Ok(MigrateReport {
-        path: outcome.path,
-        backup: outcome
-            .backup
-            .unwrap_or_else(|| config_dir.join("config.yaml.bak")),
-        notes,
-    })
+fn header(original: &Original, notes: &[String]) -> String {
+    let mut header = format!("# Migrated from the pre-0.24 layout by PeakBot {PEAKBOT_VERSION}.\n");
+    header.push_str(&match original {
+        Original::Created(_) => format!(
+            "# The previous file is kept as {CONFIG_FILE}{PRE_024_SUFFIX} — restore it to go back to PeakBot 0.23.\n"
+        ),
+        Original::Kept(_) => format!(
+            "# {CONFIG_FILE}{PRE_024_SUFFIX} already existed and was kept; the replaced file is {CONFIG_FILE}.bak.\n"
+        ),
+    });
+    for note in notes {
+        header.push_str(&format!("# - {}\n", one_line(note)));
+    }
+    header
+}
+
+/// A note in a `#` comment or a bullet must stay on its line.
+fn one_line(note: &str) -> String {
+    note.replace('\n', " ")
+}
+
+/// `<path><suffix>`, e.g. `config.yaml` → `config.yaml.pre-0.24`.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 /// The old static-prompt slot: a non-blank `system_prompt` wins over `persona`.
