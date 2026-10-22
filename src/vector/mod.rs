@@ -426,8 +426,8 @@ pub(crate) fn normalize_lexical(p: &Path) -> PathBuf {
     result
 }
 
-/// Capacity hint for the HNSW index: the 10M `HnswConfig` default
-/// over-reserves ~35 GiB per open in hnsw_rs < 0.3.5 and aborts the process.
+/// Capacity hint for the HNSW index: a no-op for 2.4.0's default FlatGraph
+/// index, kept bounded for older stored configs.
 const HNSW_MAX_ELEMENTS: usize = 100_000;
 
 /// The `DbOptions` every store is created with: cosine over the embedding
@@ -661,6 +661,285 @@ mod tests {
         assert!(
             db.get(&chunk_id(source, 2)).unwrap().is_none(),
             "orphan chunk 2 must be deleted"
+        );
+    }
+
+    /// 4-dimension config for the characterization tests below (the 3-d
+    /// `test_config` can't express the 45° vector `cosine_score_is_distance`
+    /// needs).
+    fn test_config_4d(db_path: impl Into<String>) -> VectorDbConfig {
+        VectorDbConfig {
+            enabled: true,
+            db_path: db_path.into(),
+            embeddings: EmbeddingsConfig {
+                base_url: "http://unused.invalid".into(),
+                api_key: None,
+                model: "test".into(),
+                dimensions: 4,
+            },
+        }
+    }
+
+    /// Raw-vector search seam: mirrors `VectorStore::search` minus the
+    /// embeddings call, so no network endpoint is needed.
+    fn search_all(
+        db: &VectorDB,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<ruvector_core::types::SearchResult> {
+        db.search(SearchQuery {
+            vector: query.to_vec(),
+            k,
+            filter: None,
+            ef_search: None,
+        })
+        .unwrap()
+    }
+
+    /// Sibling of `delete_chunks_from_removes_trailing_orphans`: after the
+    /// orphan reaping, a search with an orphan's exact vector must not surface
+    /// the deleted ids (the orphan test only checked `get`).
+    #[tokio::test]
+    async fn reindex_orphans_absent_from_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_4d(dir.path().join("v.db").display().to_string());
+        let store = VectorStore::open(&config).unwrap();
+        // Config path is absolute, so the session cwd is irrelevant here.
+        let db_path = store.db_path_for(Path::new(""));
+        let db = store.db(&db_path).await.unwrap();
+
+        let source = "shrinking.txt";
+        let entries = [
+            VectorEntry {
+                id: Some(chunk_id(source, 0)),
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                metadata: None,
+            },
+            VectorEntry {
+                id: Some(chunk_id(source, 1)),
+                vector: vec![0.0, 1.0, 0.0, 0.0],
+                metadata: None,
+            },
+            VectorEntry {
+                id: Some(chunk_id(source, 2)),
+                vector: vec![0.0, 0.0, 1.0, 0.0],
+                metadata: None,
+            },
+        ];
+        db.insert_batch(&entries).unwrap();
+
+        // File shrank to 1 chunk → chunks 1 and 2 are reaped.
+        store.delete_chunks_from(&db_path, source, 1).await.unwrap();
+
+        // Searching with an orphan's exact vector must not return it.
+        let hits = search_all(&db, &[0.0, 1.0, 0.0, 0.0], 4);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            !ids.contains(&chunk_id(source, 1).as_str()),
+            "orphan chunk 1 must not surface in search: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&chunk_id(source, 2).as_str()),
+            "orphan chunk 2 must not surface in search: {ids:?}"
+        );
+
+        // The surviving chunk is still found for its own vector.
+        let hits = search_all(&db, &[1.0, 0.0, 0.0, 0.0], 4);
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            [chunk_id(source, 0).as_str()]
+        );
+    }
+
+    /// Dropping every handle and reopening the same path must yield the same
+    /// data: `get` returns the stored vector and search finds the rows.
+    #[tokio::test]
+    async fn reopen_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_4d(dir.path().join("v.db").display().to_string());
+
+        {
+            let store = VectorStore::open(&config).unwrap();
+            let db_path = store.db_path_for(Path::new(""));
+            let db = store.db(&db_path).await.unwrap();
+            db.insert_batch(&[
+                VectorEntry {
+                    id: Some(chunk_id("reopen.txt", 0)),
+                    vector: vec![1.0, 0.0, 0.0, 0.0],
+                    metadata: None,
+                },
+                VectorEntry {
+                    id: Some(chunk_id("reopen.txt", 1)),
+                    vector: vec![0.0, 1.0, 0.0, 0.0],
+                    metadata: None,
+                },
+            ])
+            .unwrap();
+            // `db` and `store` (its OnceCell-cached Arc<VectorDB>) drop here,
+            // so the reopen below starts with no live handles.
+        }
+
+        // Fresh store → fresh per-path cache → true reopen of the file.
+        let store = VectorStore::open(&config).unwrap();
+        let db_path = store.db_path_for(Path::new(""));
+        let db = store.db(&db_path).await.unwrap();
+
+        let entry = db
+            .get(&chunk_id("reopen.txt", 0))
+            .unwrap()
+            .expect("chunk 0 must survive the reopen");
+        assert_eq!(entry.vector, vec![1.0, 0.0, 0.0, 0.0]);
+
+        let hits = search_all(&db, &[1.0, 0.0, 0.0, 0.0], 2);
+        assert_eq!(hits.len(), 2, "both chunks must be searchable after reopen");
+        assert_eq!(hits[0].id, chunk_id("reopen.txt", 0));
+    }
+
+    /// Deleting a row takes it out of `get` (None), makes a second delete
+    /// report `false`, and removes it from search results.
+    #[tokio::test]
+    async fn delete_then_get_none_and_absent_from_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_4d(dir.path().join("v.db").display().to_string());
+        let store = VectorStore::open(&config).unwrap();
+        let db_path = store.db_path_for(Path::new(""));
+        let db = store.db(&db_path).await.unwrap();
+
+        let id = chunk_id("deleted.txt", 0);
+        db.insert_batch(&[VectorEntry {
+            id: Some(id.clone()),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            metadata: None,
+        }])
+        .unwrap();
+        assert!(
+            db.get(&id).unwrap().is_some(),
+            "row must exist before delete"
+        );
+
+        assert!(
+            db.delete(&id).unwrap(),
+            "first delete must report the row existed"
+        );
+        assert!(
+            db.get(&id).unwrap().is_none(),
+            "row must be gone after delete"
+        );
+        assert!(
+            !db.delete(&id).unwrap(),
+            "deleting an absent row must report false"
+        );
+
+        let hits = search_all(&db, &[1.0, 0.0, 0.0, 0.0], 4);
+        assert!(
+            hits.iter().all(|h| h.id != id),
+            "deleted row must not surface in search: {hits:?}"
+        );
+    }
+
+    /// Re-inserting a deleted id with a different vector replaces the row:
+    /// `get` returns the new vector and a search for it ranks the id first.
+    #[tokio::test]
+    async fn reinsert_deleted_id_returns_new_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_4d(dir.path().join("v.db").display().to_string());
+        let store = VectorStore::open(&config).unwrap();
+        let db_path = store.db_path_for(Path::new(""));
+        let db = store.db(&db_path).await.unwrap();
+
+        let id = chunk_id("reinsert.txt", 0);
+        let old = vec![1.0, 0.0, 0.0, 0.0];
+        let new = vec![0.0, 1.0, 0.0, 0.0];
+        db.insert_batch(&[VectorEntry {
+            id: Some(id.clone()),
+            vector: old.clone(),
+            metadata: None,
+        }])
+        .unwrap();
+        assert!(
+            db.delete(&id).unwrap(),
+            "delete of the existing row must succeed"
+        );
+        db.insert_batch(&[VectorEntry {
+            id: Some(id.clone()),
+            vector: new.clone(),
+            metadata: None,
+        }])
+        .unwrap();
+
+        let entry = db.get(&id).unwrap().expect("re-inserted row must exist");
+        assert_eq!(
+            entry.vector, new,
+            "get must return the new vector, not the old one"
+        );
+
+        let hits = search_all(&db, &new, 4);
+        assert_eq!(
+            hits[0].id, id,
+            "search for the new vector must rank the id first"
+        );
+    }
+
+    /// With Cosine, `SearchResult::score` is the cosine *distance*
+    /// (1 − similarity): identical vectors score ≈ 0, orthogonal ≈ 1, and
+    /// results come back sorted ascending. `k` covers all entries so the
+    /// approximate index returns the exact ranking.
+    #[tokio::test]
+    async fn cosine_score_is_distance() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_4d(dir.path().join("v.db").display().to_string());
+        let store = VectorStore::open(&config).unwrap();
+        let db_path = store.db_path_for(Path::new(""));
+        let db = store.db(&db_path).await.unwrap();
+
+        // a = query; b orthogonal to a; c at 45° to a.
+        let a = vec![1.0, 0.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0, 0.0];
+        let c = vec![1.0, 1.0, 0.0, 0.0];
+        db.insert_batch(&[
+            VectorEntry {
+                id: Some("score-a".into()),
+                vector: a.clone(),
+                metadata: None,
+            },
+            VectorEntry {
+                id: Some("score-b".into()),
+                vector: b.clone(),
+                metadata: None,
+            },
+            VectorEntry {
+                id: Some("score-c".into()),
+                vector: c.clone(),
+                metadata: None,
+            },
+        ])
+        .unwrap();
+
+        let hits = search_all(&db, &a, 3);
+        assert_eq!(hits.len(), 3, "k covers all entries, so all must come back");
+        assert!(
+            hits.windows(2).all(|w| w[0].score <= w[1].score),
+            "results must be sorted by ascending score: {hits:?}"
+        );
+
+        assert_eq!(hits[0].id, "score-a", "identical vector must rank first");
+        assert!(
+            hits[0].score.abs() < 1e-4,
+            "identical vector scores ≈ 0 distance, got {}",
+            hits[0].score
+        );
+        assert_eq!(hits[1].id, "score-c", "45° vector must rank second");
+        let expected_c = 1.0 - std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (hits[1].score - expected_c).abs() < 1e-3,
+            "45° vector scores ≈ 1 − 1/√2, got {}",
+            hits[1].score
+        );
+        assert_eq!(hits[2].id, "score-b", "orthogonal vector must rank last");
+        assert!(
+            (hits[2].score - 1.0).abs() < 1e-3,
+            "orthogonal vector scores ≈ 1, got {}",
+            hits[2].score
         );
     }
 
