@@ -1,6 +1,6 @@
 .PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
         web dev \
-        desktop-test desktop-fonttest desktop-dev desktop-linux desktop-macos desktop-windows desktop \
+        desktop-test desktop-test-windows desktop-fonttest desktop-dev desktop-linux desktop-macos desktop-windows desktop \
         release release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android release-publish
 
@@ -139,6 +139,11 @@ rebuild: clean build
 ## desktop-test: Unit tests for the desktop core crate (desktop/core, no webkit)
 desktop-test:
 	cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core
+
+## desktop-test-windows: Static (no-docker) tests for the Windows portable-exe
+##                       pipeline (build script, Dockerfiles, Makefile, smoke)
+desktop-test-windows:
+	sh desktop/scripts/test-build-desktop-windows.sh
 
 ## desktop-fonttest: Host fontconfig tests for the DESIGN §4.12 emoji-isolation
 ##                   config — fetches NotoColorEmoji.ttf (sha-verified) and
