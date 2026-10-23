@@ -4,6 +4,43 @@ PeakBot Desktop is a small app window around the PeakBot web UI. It ships its ow
 PeakBot backend (the *sidecar*) and starts and stops it for you. Design and
 contracts: [`DESIGN.md`](DESIGN.md).
 
+## Building
+
+Desktop artifacts are cross-built on Linux in containers (podman by default;
+`CONTAINER_BUILDER=docker` to override). Output lands in `output/desktop/`.
+
+| Command | Artifact |
+|---|---|
+| `make desktop-linux` | `PeakBot-Desktop-<v>-linux-x86_64.AppImage` |
+| `make desktop-macos` | `PeakBot-Desktop-<v>-macos-universal.zip` |
+| `make desktop-windows` | `PeakBot-Desktop-<v>-windows-x86_64-setup.exe` |
+| `make desktop` | all three |
+
+`make desktop-windows` cross-compiles with `cargo-xwin` (MSVC target, no Windows
+machine or wine) and bundles an NSIS installer with the bundled PeakBot sidecar.
+The first run downloads the MSVC SDK (cached in the build layers) and takes a while.
+
+**Windows build gotchas** (both already solved in `Dockerfile.desktop-windows`,
+details in [`DESIGN.md` §5.7](DESIGN.md#57-build-contracts)): the base image must be
+Ubuntu 24.04, because Tauri's NSIS installer script needs `Win\RestartManager.nsh`,
+which only exists in NSIS ≥ 3.09 (22.04 ships 3.08 and the bundler aborts with a
+cryptic `!include` error); and the build image must install
+`libayatana-appindicator3-dev`, because the Tauri CLI (a Linux host binary) probes
+for an appindicator library via pkg-config and panics without it, even when the
+target is Windows.
+
+## Windows
+
+- **Unsigned build → SmartScreen warning.** The installer is not code-signed, so
+  Windows shows "Windows protected your PC". Click **More info → Run anyway**.
+- **WebView2.** The app window uses Microsoft Edge WebView2, which is preinstalled
+  on Windows 10 (1803+) and Windows 11. On a machine without it the installer
+  downloads the WebView2 bootstrapper (Tauri's default `downloadBootstrapper` mode),
+  so that machine needs internet access during install.
+- **Background mode** installs a Task Scheduler logon task named `PeakBot`
+  (not a Windows service). A console window opens at sign-in and stays open — that
+  is PeakBot running; minimise it rather than closing it.
+
 ## Settings
 
 Open **Settings** with any of:
@@ -30,7 +67,8 @@ The access token is mandatory **only for remote access**. On this computer you c
 turn it off, but then any program or web page on it can control PeakBot (see
 #378) — leave it on unless you have a reason. The token lives in PeakBot's own
 `web-token` file (Linux `~/.config/peakbot/web-token`, macOS
-`~/Library/Application Support/com.peakbot.peakbot/web-token`); the settings page
+`~/Library/Application Support/com.peakbot.peakbot/web-token`, Windows
+`%APPDATA%\peakbot\peakbot\config\web-token`); the settings page
 shows the exact path and the current value. Turning the token off removes that file,
 and the terminal `peakbot` command then runs without a token too. It is not rotated
 on every launch.
@@ -73,6 +111,7 @@ Settings are saved in `settings.json` in the app's data folder:
 
 - Linux: `~/.local/share/com.peakbot.desktop/settings.json`
 - macOS: `~/Library/Application Support/com.peakbot.desktop/settings.json`
+- Windows: `%APPDATA%\com.peakbot.desktop\settings.json`
 
 **To reset to the defaults (HTTP, token on, remote off), quit the app and delete
 `settings.json`.** A missing or unreadable file always loads as the defaults.
@@ -91,6 +130,11 @@ When the app starts and a background service is installed, it checks whether the
 - macOS: `~/.local/bin/peakbot service uninstall` (or `launchctl bootout gui/$(id -u)/com.peakbot.agent; rm ~/Library/LaunchAgents/com.peakbot.agent.plist`);
   optionally `rm ~/.local/bin/peakbot` and
   `rm -r ~/Library/Application\ Support/com.peakbot.desktop ~/Library/Logs/com.peakbot.desktop`.
+- Windows: untick *Keep PeakBot running in background* first (or run
+  `peakbot service uninstall`, or `schtasks /Delete /TN PeakBot /F`) — the uninstaller
+  does not remove the logon task. Then uninstall *PeakBot Desktop* from Settings → Apps;
+  optionally delete `%APPDATA%\com.peakbot.desktop`. Settings in
+  `%APPDATA%\peakbot` are user data — delete them only deliberately.
 - First launch on macOS (unsigned build): `xattr -dr com.apple.quarantine "/Applications/PeakBot Desktop.app"`.
 
 Before deleting the app, untick *Keep PeakBot running in background* if you don't

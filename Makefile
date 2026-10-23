@@ -1,6 +1,6 @@
 .PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
         web dev \
-        desktop-test desktop-dev desktop-linux desktop-macos desktop \
+        desktop-test desktop-dev desktop-linux desktop-macos desktop-windows desktop \
         release release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android release-publish
 
@@ -150,7 +150,13 @@ desktop-linux:
 desktop-macos:
 	sh desktop/scripts/build-desktop.sh macos
 
-## desktop: Build all desktop artifacts (linux + macos)
+## desktop-windows: Build the Windows x86_64 NSIS installer (sidecar via
+##                  Dockerfile.windows msvc/cargo-xwin, then
+##                  Dockerfile.desktop-windows → output/desktop/*-setup.exe)
+desktop-windows:
+	sh desktop/scripts/build-desktop.sh windows
+
+## desktop: Build all desktop artifacts (linux + macos + windows)
 desktop:
 	sh desktop/scripts/build-desktop.sh all
 

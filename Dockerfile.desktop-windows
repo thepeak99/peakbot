@@ -1,0 +1,145 @@
+# PeakBot Desktop — Windows x86_64 NSIS installer builder (cross-compiled on Linux)
+#
+# Contract: desktop/DESIGN.md §5.7 (build contracts), §9.2 (smoke checks
+# S-W1..S-W4). The sidecar (peakbot) is NOT built here — it is built by the
+# EXISTING Dockerfile.windows with TARGET=x86_64-pc-windows-msvc and staged
+# into the context as output/peakbot-windows-amd64-msvc.exe by
+# desktop/scripts/build-desktop.sh.
+#
+# Usage:
+#   sh desktop/scripts/build-desktop.sh windows
+# (or directly:)
+#   podman build -f Dockerfile.desktop-windows \
+#     --build-arg VERSION=0.23.0 \
+#     --output type=local,dest=output/desktop .
+#
+# Exports a single file: /PeakBot-Desktop-<VERSION>-windows-x86_64-setup.exe
+#
+# Tauri official cross-compile recipe (Tauri v2, Windows from Linux):
+# - the app is compiled with cargo-xwin (MSVC target + MSVC SDK, no wine);
+# - the NSIS bundler runs the system `makensis` (NSIS_PATH defaults to
+#   /usr/share/nsis) — no Windows host involved;
+# - externalBin (the peakbot sidecar) is embedded in the installer by the
+#   bundler as peakbot.exe (triple suffix stripped);
+# - the build is unsigned (SmartScreen shows an "unknown publisher" warning).
+
+# Base: ubuntu:24.04 (NSIS gotcha — see below): Tauri's installer.nsi includes
+# Win\RestartManager.nsh, which only exists in NSIS >= 3.09. Ubuntu 22.04 ships
+# 3.08 and makensis dies mid-script with a cryptic `!include` error. The
+# alternative — the pinned NSIS zips in tauri-apps/binary-releases — only
+# contain the WINDOWS makensis.exe (wine required), which this no-wine pipeline
+# does not use; so the distro package it is (pinned to the exact version).
+FROM ubuntu:24.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Toolchain per DESIGN.md §5.7 (Windows extension):
+#  - nsis=3.09-4ubuntu1: the NSIS bundler invokes the system `makensis`
+#    (stubs at /usr/share/nsis). Pinned: 3.09 is the first NSIS with
+#    Include/Win/RestartManager.nsh (required by Tauri's installer.nsi);
+#    22.04's 3.08 lacks it. The guard RUN below fails fast if this
+#    regresses.
+#  - clang/lld/llvm: the C deps (ring, zstd-sys) are compiled with clang
+#    against the MSVC SDK by cargo-xwin
+#  - p7zip-full: the S-W4 smoke check lists the NSIS payload (`7z l`)
+#  - file: the S-W2 smoke check (PE32+ classification)
+#  - libayatana-appindicator3-dev: NOT used by the Windows build. The Tauri
+#    CLI is a Linux host binary and, with the app's tray-icon feature on,
+#    its Linux-host-only code path looks the appindicator library up via
+#    pkg-config (`PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config --libs-only-L
+#    ayatana-appindicator3-0.1`) and panics ("Can't detect any appindicator
+#    library") even when the target is Windows. The result is discarded for
+#    NSIS bundles — the -dev package (a few MB) is the cheap, honest fix;
+#    a stub .pc file would work too but leans on a CLI implementation detail.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libayatana-appindicator3-dev \
+        clang \
+        lld \
+        llvm \
+        nsis=3.09-4ubuntu1 \
+        p7zip-full \
+        file \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fail fast (right after the layer that installs it) if the NSIS install
+# lacks the header Tauri's installer.nsi includes. Without this, a future
+# base-image/package change surfaces as a cryptic makensis `!include:
+# could not find: "Win\RestartManager.nsh"` deep inside the Tauri build.
+RUN test -f /usr/share/nsis/Include/Win/RestartManager.nsh \
+    || { echo "NSIS too old for Tauri: missing /usr/share/nsis/Include/Win/RestartManager.nsh (need NSIS >= 3.09)" >&2; exit 1; }
+
+# Node 22 (nodesource) — runs the pinned Tauri CLI via npx.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust, pinned. The desktop workspace is edition 2024 (needs >= 1.85); the
+# glue is built with 1.91.0 (the toolchain this branch was developed on).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain 1.91.0
+# cargo install lands here — /root/.cargo/bin MUST be on PATH, or the
+# `--runner cargo-xwin` step below fails with "cargo-xwin: command not found".
+ENV PATH="/root/.cargo/bin:${PATH}"
+# Bound parallel codegen: a 32-way release build of the Tauri stack peaks
+# past what a shared dev host can spare (same rationale as the Linux build).
+ENV CARGO_BUILD_JOBS=8
+
+# The Windows MSVC target + cargo-xwin (the runner that provides the MSVC
+# SDK + linker environment). XWIN_ACCEPT_LICENSE keeps the SDK license
+# prompt non-interactive; XWIN_CACHE_DIR pins the SDK cache location so the
+# pre-warm below is reused by the real build.
+RUN rustup target add x86_64-pc-windows-msvc
+ENV XWIN_ACCEPT_LICENSE=1 \
+    XWIN_CACHE_DIR=/root/.cache/cargo-xwin
+RUN cargo install --locked cargo-xwin
+
+# Pre-warm the MSVC SDK cache in its own layer with a throwaway xwin build:
+# the ~100 MB SDK download happens HERE, so a failure in any later layer
+# (and every rebuild) reuses it from the cache instead of re-downloading.
+RUN mkdir -p /xwin-warm/src \
+    && echo "fn main() {}" > /xwin-warm/src/main.rs \
+    && printf '[package]\nname = "xwin-warm"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n' > /xwin-warm/Cargo.toml \
+    && cd /xwin-warm && cargo xwin build --release --target x86_64-pc-windows-msvc
+
+ARG VERSION
+# Root Cargo.toml is the version source for scripts/check-version.sh (it
+# compares root [package].version against desktop [workspace.package].version).
+COPY Cargo.toml /src/Cargo.toml
+COPY desktop/ /src/desktop
+
+# The peakbot sidecar from the Dockerfile.windows msvc build (unversioned
+# artifact name — must match build-desktop.sh). Named with the full target
+# triple so the Tauri bundler picks it up via bundle.externalBin.
+ARG SIDECAR=output/peakbot-windows-amd64-msvc.exe
+COPY ${SIDECAR} /src/desktop/src-tauri/binaries/peakbot-x86_64-pc-windows-msvc.exe
+
+# Fail the build if the desktop workspace version drifted from the root.
+RUN sh /src/desktop/scripts/check-version.sh
+
+# Tauri build. `--ci`: parseable output; `--bundles nsis`: only the NSIS
+# installer (the CLI flag overrides bundle.targets in tauri.conf.json, same
+# as the Linux build); `--runner cargo-xwin`: route cargo through cargo-xwin
+# (MSVC SDK + linker); `--target x86_64-pc-windows-msvc`: the Windows target;
+# `-- --locked`: cargo honors the committed desktop Cargo.lock.
+# (`tauri build` enables the tauri/custom-protocol feature automatically —
+# the ui/ status page is embedded, no devUrl.)
+WORKDIR /src/desktop/src-tauri
+RUN npx --yes @tauri-apps/cli@2.12.3 build --ci --bundles nsis --runner cargo-xwin --target x86_64-pc-windows-msvc -- --locked
+
+# Name the artifact per §5.7 and smoke it (S-W1..S-W4) before exporting.
+# The bundler names the file "<productName>_<version>_x64-setup.exe"
+# (productName "PeakBot Desktop" → space becomes underscore), so glob it.
+RUN set -eu; \
+    mkdir -p /out; \
+    set -- ../target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe; \
+    [ "$#" -eq 1 ] || { echo "expected exactly one NSIS installer in ../target/x86_64-pc-windows-msvc/release/bundle/nsis/, got: $*"; exit 1; }; \
+    cp "$1" "/out/PeakBot-Desktop-${VERSION}-windows-x86_64-setup.exe"; \
+    sh /src/desktop/scripts/smoke-windows.sh "/out/PeakBot-Desktop-${VERSION}-windows-x86_64-setup.exe" "${VERSION}"
+
+# Single-file export.
+FROM scratch
+COPY --from=build /out/ /

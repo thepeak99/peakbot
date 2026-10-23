@@ -11,9 +11,9 @@ concurrency:
 
 jobs:
   desktop:
-    name: AppImage + macOS zip
+    name: AppImage + macOS zip + Windows NSIS
     runs-on: dind
-    timeout-minutes: 120
+    timeout-minutes: 180
     # No `container:` on purpose (DESIGN.md §5.7 / Q1): the build script
     # drives the HOST docker daemon (the dind runner ships docker), and
     # the pure-git checkout needs only git + sh. Bind mounts
@@ -51,7 +51,7 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
-      - name: Build desktop artifacts (Linux AppImage + macOS universal zip)
+      - name: Build desktop artifacts (Linux AppImage + macOS universal zip + Windows NSIS installer)
         run: PRUNE=1 CONTAINER_BUILDER=docker sh desktop/scripts/build-desktop.sh all
       - name: Upload artifacts
         uses: actions/upload-artifact@v3

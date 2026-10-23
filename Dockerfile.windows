@@ -1,6 +1,18 @@
 # PeakBot Windows Cross-Compile Builder
 # Usage: podman build --output type=local,dest=./output .
 # (or: docker build --output type=local,dest=./output .)
+#
+# Target selection (--build-arg TARGET=…):
+#   x86_64-pc-windows-gnu   (default) mingw-w64 — `make build-windows` /
+#                          `make release-build-windows` →
+#                          output/peakbot[-<v>]-windows-amd64.exe
+#   x86_64-pc-windows-msvc  clang/lld/llvm + cargo-xwin (MSVC SDK) — the
+#                          desktop pipeline (desktop/scripts/build-desktop.sh)
+#                          → output/peakbot-windows-amd64-msvc.exe
+#                          (MSVC so the sidecar links against the runtime
+#                          every Windows machine ships; VERSION is ignored
+#                          on the msvc path — the desktop pipeline stages
+#                          the unversioned artifact by name)
 
 # ── Web UI build (Node) ────────────────────────────────────────────────
 # Stage `web`: produces /web/dist with the SPA bundle. The rust build copies
@@ -18,18 +30,37 @@ RUN npm run build
 # `COPY --from=`, otherwise BuildKit will prune it along with the binary.
 FROM ghcr.io/rust-lang/rust:1.91-bookworm AS builder
 
-# Install mingw-w64 for cross-compilation to Windows
-RUN apt-get update && apt-get install -y \
-    mingw-w64 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set default build target to Windows x86_64
+# Set default build target to Windows x86_64. Declared first: the toolchain
+# RUN below branches on it (an ARG referenced before its declaration
+# expands to empty and the branch would silently pick mingw).
 ARG TARGET=x86_64-pc-windows-gnu
 ENV TARGET=${TARGET}
+
+# Cross-compile toolchain, selected by TARGET:
+#  - gnu  (default, unchanged): mingw-w64
+#  - msvc: clang/lld/llvm — cargo-xwin compiles the C deps (ring, zstd-sys)
+#          with clang against the MSVC SDK
+RUN apt-get update \
+    && if [ "${TARGET}" = "x86_64-pc-windows-msvc" ]; then \
+           apt-get install -y --no-install-recommends clang lld llvm; \
+       else \
+           apt-get install -y mingw-w64; \
+       fi \
+    && rm -rf /var/lib/apt/lists/*
 
 # Add Windows target and install cross-compile linker
 RUN rustup target add ${TARGET} \
     && rustup target list --installed
+
+# msvc only: cargo-xwin drives the MSVC SDK download + linker environment.
+# XWIN_ACCEPT_LICENSE keeps the SDK license prompt non-interactive;
+# XWIN_CACHE_DIR pins the SDK cache so the pre-warmed dep-cache build below
+# reuses it.
+ENV XWIN_ACCEPT_LICENSE=1 \
+    XWIN_CACHE_DIR=/root/.cache/cargo-xwin
+RUN if [ "${TARGET}" = "x86_64-pc-windows-msvc" ]; then \
+        cargo install --locked cargo-xwin; \
+    fi
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
@@ -40,8 +71,12 @@ COPY vendor/ vendor/
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs
 
-RUN cargo build --target ${TARGET} --release && \
-    rm -rf target/${TARGET}/deps/*.rlib target/${TARGET}/deps/*.d
+RUN if [ "${TARGET}" = "x86_64-pc-windows-msvc" ]; then \
+        cargo xwin build --target ${TARGET} --release --locked; \
+    else \
+        cargo build --target ${TARGET} --release; \
+    fi \
+    && rm -rf target/${TARGET}/deps/*.rlib target/${TARGET}/deps/*.d
 
 # build.rs MUST be in the COPY set — the dummy-main dep-cache layer doesn't
 # run it, and a new build.rs would otherwise silently never execute.
@@ -53,8 +88,27 @@ COPY build/ build/
 COPY --from=web /web/dist ./web/dist
 COPY src/ src/
 
-RUN touch src/main.rs && \
-    cargo build --target ${TARGET} --release
+RUN if [ "${TARGET}" = "x86_64-pc-windows-msvc" ]; then \
+        touch src/main.rs && cargo xwin build --release --locked --target ${TARGET}; \
+    else \
+        touch src/main.rs && cargo build --target ${TARGET} --release; \
+    fi
+
+# Stage the .exe under its release name so the scratch stage can export it
+# as-is (a scratch image has no shell to branch in):
+#  gnu  → peakbot[-VERSION]-windows-amd64.exe   (make build-windows /
+#                                              release-build-windows)
+#  msvc → peakbot-windows-amd64-msvc.exe        (desktop pipeline;
+#                                              VERSION is ignored here)
+# (ARG VERSION is re-declared: ARG scope is per-stage, and the scratch
+# stage below needs its own copy for the documentation.)
+ARG VERSION=
+RUN mkdir -p /stage \
+    && if [ "${TARGET}" = "x86_64-pc-windows-msvc" ]; then \
+           cp "target/${TARGET}/release/peakbot.exe" /stage/peakbot-windows-amd64-msvc.exe; \
+       else \
+           cp "target/${TARGET}/release/peakbot.exe" "/stage/peakbot${VERSION:+-${VERSION}}-windows-amd64.exe"; \
+       fi
 
 # Export only the .exe, named with the release/version + platform suffix so
 # the Makefile doesn't have to rename it post-build.
@@ -64,4 +118,4 @@ ARG TARGET=x86_64-pc-windows-gnu
 # Unset (default): artifact is `peakbot-windows-amd64.exe`.
 # Set to e.g. 0.2.0: artifact is `peakbot-0.2.0-windows-amd64.exe`.
 ARG VERSION=
-COPY --from=builder /build/target/${TARGET}/release/peakbot.exe /peakbot${VERSION:+-${VERSION}}-windows-amd64.exe
+COPY --from=builder /stage/ /
