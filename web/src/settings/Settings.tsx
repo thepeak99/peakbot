@@ -6,11 +6,12 @@
 //   the priority order modal → popover → Settings (an already-handled
 //   defaultPrevented Esc is left to the modal/popover).
 //
-// The section CONTENT panes (Providers, MCP, Profiles, Agent, General,
-// System, Raw YAML) land in later M5 tasks — this foundation renders a
-// neutral empty state per section so the shell is navigable, and wires the
-// full save flow: debounced validate → PUT with base_sha256 → 409 stale
-// banner / 422 error panel / 200 toast + restart banner.
+// The section CONTENT panes land across M5 tasks: Providers & Models
+// (T25, ./providers) and MCP servers (T26, ./mcp) are real; the remaining
+// sections render a neutral empty state so the shell stays navigable. The
+// shell wires the full save flow: debounced validate → PUT with
+// base_sha256 → 409 stale banner / 422 error panel / 200 toast + restart
+// banner.
 
 import { useCallback, useEffect, useReducer, useState } from "react";
 import { isDesktop } from "../desktop";
@@ -23,6 +24,8 @@ import { dotPath, route, type Section } from "./paths";
 import { RestartBanner, SaveBar } from "./SaveBar";
 import { ErrorPanel } from "./ErrorPanel";
 import { DiffModal } from "./DiffModal";
+import { ProvidersPane } from "./providers";
+import { McpsPane } from "./mcp";
 import { ToastProvider, useToast } from "./Toast";
 
 /**
@@ -430,20 +433,29 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
             )}
           </div>
 
-          {/* Placeholder pane — the real section content lands in later M5
-              tasks. Neutral empty state: title + a short description. */}
-          <p className="max-w-2xl text-xs text-zinc-500">{SECTIONS[active].desc}</p>
-          {active === "raw" && (
-            <p className="mt-2 max-w-2xl text-xs text-zinc-500">
-              ⚠ Advanced: unknown keys are rejected at boot. Edits here replace the generated
-              file on save.
-              {scope === "repo" && " The repo file may only contain profiles:."}
-            </p>
+          {/* Section panes. Providers (T25) and MCP servers (T26) are the
+              real content; the remaining sections keep a neutral empty
+              state until their M5 tasks land. */}
+          {active === "providers" ? (
+            <ProvidersPane />
+          ) : active === "mcps" ? (
+            <McpsPane />
+          ) : (
+            <>
+              <p className="max-w-2xl text-xs text-zinc-500">{SECTIONS[active].desc}</p>
+              {active === "raw" && (
+                <p className="mt-2 max-w-2xl text-xs text-zinc-500">
+                  ⚠ Advanced: unknown keys are rejected at boot. Edits here replace the generated
+                  file on save.
+                  {scope === "repo" && " The repo file may only contain profiles:."}
+                </p>
+              )}
+            </>
           )}
 
-          {/* Fields whose path matches a validation error render red (spec
-              §9.6) — until the section panes exist, the pane lists them. */}
-          {paneErrors.length > 0 && (
+          {/* Validation errors for sections without a pane yet are listed
+              here; the providers/mcp panes render their own red fields. */}
+          {paneErrors.length > 0 && active !== "providers" && active !== "mcps" && (
             <ul className="mt-4 max-w-2xl space-y-2">
               {paneErrors.map((e, i) => {
                 const pathKey = dotPath(e.path);

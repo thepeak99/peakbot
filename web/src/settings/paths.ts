@@ -2,7 +2,7 @@
 // The segment array is NEVER split on "." — profile/agent names may contain
 // dots and spaces (§4.2 name rule).
 
-import type { Seg } from "./types";
+import type { ConfigErr, Seg } from "./types";
 
 export type Section = "providers" | "mcps" | "profiles" | "general" | "system" | "raw";
 
@@ -59,4 +59,17 @@ export function route(path: Seg[]): RouteTarget {
 /** `profiles.dev.agents.team.model` — the dot rendering for an error path. */
 export function dotPath(path: Seg[]): string {
   return path.map(String).join(".");
+}
+
+/**
+ * The message of the first validation error whose path EXACTLY matches
+ * `path` (segment by segment — names may contain dots), or `undefined`.
+ * Panes pass this to their widgets' `invalid` prop (spec §9.6 red fields).
+ */
+export function errAt(errors: ConfigErr[], path: Seg[]): string | undefined {
+  return (
+    errors.find(
+      (e) => e.path.length === path.length && e.path.every((seg, i) => seg === path[i]),
+    )?.message
+  );
 }
