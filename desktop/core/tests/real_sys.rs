@@ -131,31 +131,6 @@ fn real_sys_write_private_is_mode_0600() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "top secret");
 }
 
-#[test]
-fn real_sys_free_port_is_bindable() {
-    let _guard = PORT_RACE_LOCK.lock().unwrap();
-    let port = RealSys::new().free_port().expect("free_port");
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
-        .expect("the returned port must be bindable");
-    drop(listener);
-}
-
-// §9.1 case 3.
-#[test]
-fn real_sys_random_token_is_64_lowercase_hex_and_distinct() {
-    let sys = RealSys::new();
-    let a = sys.random_token();
-    let b = sys.random_token();
-    let (ta, tb) = (a.as_str().to_string(), b.as_str().to_string());
-    assert_eq!(ta.len(), 64, "32 random bytes = 64 hex chars; got {ta:?}");
-    assert!(
-        ta.chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-        "lowercase hex only; got {ta:?}"
-    );
-    assert_ne!(ta, tb, "two calls must differ");
-}
-
 // Design #377 t88 (unix): the https probe is a plain TCP connect — no TLS
 // handshake (core ureq has no TLS; #374 replaces this branch with a
 // CA-verified GET).

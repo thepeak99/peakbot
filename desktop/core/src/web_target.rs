@@ -38,6 +38,11 @@ impl WebTarget {
     /// (spec §8.4 "When it reads it").
     pub fn url_base(&self) -> String {
         let scheme = if self.tls { "https" } else { "http" };
+        format!("{scheme}://{}", self.host_port())
+    }
+
+    /// `"<host>:<port>"` — the authority part of `url_base`.
+    pub fn host_port(&self) -> String {
         let ip = self.bind.ip();
         let host = if ip.is_loopback() || ip.is_unspecified() {
             "127.0.0.1".to_string()
@@ -47,7 +52,7 @@ impl WebTarget {
         } else {
             ip.to_string()
         };
-        format!("{scheme}://{host}:{}", self.bind.port())
+        format!("{host}:{}", self.bind.port())
     }
 }
 

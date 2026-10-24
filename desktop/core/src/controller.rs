@@ -9,19 +9,15 @@ use std::sync::mpsc::Receiver;
 
 use semver::Version;
 
-use crate::consts::{
-    LOG_TAIL_LINES, POLL_INTERVAL, PORT_ATTEMPTS, READY_TIMEOUT, SERVICE_PORT,
-    SESSION_PREFERRED_PORT, STOP_GRACE, TICK,
-};
+use crate::consts::{LOG_TAIL_LINES, POLL_INTERVAL, READY_TIMEOUT, STOP_GRACE, TICK};
 use crate::paths::DesktopPaths;
 use crate::phase::{Dialog, Mode, Phase, Platform, StartError, StartStep, TrayModel, tray_model};
 use crate::ready::{ReadyOutcome, wait_ready};
 use crate::service::{self, InstalledService, LaunchPlan, ReplacePolicy, RunState, ServiceState};
-use crate::session::{self, EarlyExit, PidRecord};
-use crate::settings::{self, Protocol, SaveRequest, Settings};
+use crate::session::{self, PidRecord};
 use crate::sys::{Child, RunOutput, Signal, SpawnSpec, Sys};
-use crate::token::Token;
 use crate::version::{DeclinedReplace, InstalledVersion, parse_version_output};
+use crate::web_target::{WebTarget, read_web_target};
 
 /// The UI surface the controller drives (the Tauri glue implements it).
 pub trait Ui: Send {
@@ -36,29 +32,16 @@ pub enum Action {
     Start,
     ToggleBackground,
     ReinstallService,
-    /// The validated save payload (design #377b §3.2): the settings plus
-    /// an optional new token value (the IPC boundary already ran
-    /// `SaveRequest::parse`).
-    SaveSettings(SaveRequest),
+    /// Restart only the PeakBot server so an edited `general.web` (or
+    /// any boot-only config) applies (spec §8.4): session mode relaunches
+    /// the child, service mode reinstalls the unit. Never the app.
+    Restart,
     Shutdown(std::sync::mpsc::Sender<()>),
 }
 
 /// The session sidecar this controller owns (at most one, §3.8-2).
 struct Session {
     child: Box<dyn Child>,
-    port: u16,
-    protocol: Protocol,
-    token: Option<Token>,
-}
-
-impl Session {
-    fn mode(&self) -> Mode {
-        Mode::Session {
-            port: self.port,
-            protocol: self.protocol,
-            token: self.token.clone(),
-        }
-    }
 }
 
 /// Owns `sys, ui, paths, quitting, policy, platform, phase, bundled,
@@ -121,9 +104,9 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             Action::Start => self.handle_start(),
             Action::ToggleBackground if !self.is_starting() => self.handle_toggle_background(),
             Action::ReinstallService if !self.is_starting() => self.replace_service(),
-            Action::SaveSettings(new) if !self.is_starting() => self.handle_save_settings(new),
+            Action::Restart if !self.is_starting() => self.handle_restart(),
             // While Starting the tray item is disabled; ignore.
-            Action::ToggleBackground | Action::ReinstallService | Action::SaveSettings(_) => {}
+            Action::ToggleBackground | Action::ReinstallService | Action::Restart => {}
             Action::Shutdown(ack) => {
                 self.stop_session();
                 let _ = ack.send(());
@@ -229,7 +212,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         match plan {
             LaunchPlan::Session => self.launch_session(),
             LaunchPlan::ConnectService { start_first } => self.connect_service(start_first),
-            LaunchPlan::AutoReplace => self.auto_replace_service(),
+            LaunchPlan::AutoReplace => self.replace_service(),
             LaunchPlan::AskReplace { installed } => {
                 let dialog = service::replace_dialog(&installed, &bundled);
                 if self.ui.confirm(&dialog) {
@@ -309,8 +292,9 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         })
     }
 
-    /// The `TLS:` status line of the installed service (invariant I3) —
-    /// the service's protocol source.
+    /// The `TLS:` status line of the installed service: on only when
+    /// `--tls` is baked into the unit (a hand-made `service install
+    /// --tls`). The desktop installs bare units, which read `general.web`.
     fn installed_tls(&self) -> bool {
         matches!(&self.service, Some(ServiceState::Installed(svc)) if svc.tls)
     }
@@ -355,110 +339,65 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     // -------------------------------------------------------------------
 
     fn launch_session(&mut self) {
-        // The settings + token are resolved once, before the port loop
-        // (design #377 §4.4): the session's token IS the web-token
-        // file's token (invariant I2).
-        let s = self.settings();
-        let token = self.sync_token(s);
-        let mut tried: Vec<u16> = Vec::new();
-        for attempt in 1..=PORT_ATTEMPTS {
-            self.set_phase(Phase::Starting(StartStep::StartingSession));
-            // 7824 if free (and not already burned by a "port taken"
-            // exit), else a fresh port from the OS.
-            let port = if self.sys.port_is_free(SESSION_PREFERRED_PORT)
-                && !tried.contains(&SESSION_PREFERRED_PORT)
-            {
-                SESSION_PREFERRED_PORT
-            } else {
-                match self.sys.free_port() {
-                    Ok(p) => p,
-                    Err(_) => return self.fail(StartError::PortUnavailable),
-                }
-            };
-            tried.push(port);
-
-            let spec = SpawnSpec {
-                program: self.paths.sidecar.clone(),
-                args: session::session_args(),
-                extra_env: session::session_env(&std::env::vars().collect::<Vec<_>>()),
-                log: self.paths.session_log(),
-            };
-            let child = match self.sys.spawn(spec) {
-                Ok(c) => c,
-                Err(e) => {
-                    return self.fail(StartError::SidecarBroken {
-                        detail: e.to_string(),
-                    });
-                }
-            };
-            let mut sess = Session {
-                child,
-                port,
-                protocol: s.protocol(),
-                token: token.clone(),
-            };
-            let mode = sess.mode();
-            let rec = PidRecord {
-                pid: sess.child.pid(),
-                port,
-            };
-            if let Err(e) = self.sys.write_private(&self.paths.pidfile(), &rec.render()) {
-                log::warn!("failed to write pidfile: {e}");
+        // general.web is read on every launch (spec §8.4); the child gets
+        // no web flags and reads the same file itself.
+        let mode = Mode::Session(self.read_web_target());
+        self.set_phase(Phase::Starting(StartStep::StartingSession));
+        let spec = SpawnSpec {
+            program: self.paths.sidecar.clone(),
+            args: session::session_args(),
+            extra_env: session::session_env(&std::env::vars().collect::<Vec<_>>()),
+            log: self.paths.session_log(),
+        };
+        let mut child = match self.sys.spawn(spec) {
+            Ok(c) => c,
+            Err(e) => {
+                return self.fail(StartError::SidecarBroken {
+                    detail: e.to_string(),
+                });
             }
+        };
+        let rec = PidRecord {
+            pid: child.pid(),
+            exe: self.paths.sidecar.clone(),
+        };
+        if let Err(e) = self.sys.write_private(&self.paths.pidfile(), &rec.render()) {
+            log::warn!("failed to write pidfile: {e}");
+        }
 
-            self.set_phase(Phase::Starting(StartStep::WaitingForBackend));
-            match wait_ready(
-                &self.sys,
-                &mode.probe_url(),
-                READY_TIMEOUT,
-                Some(sess.child.as_mut()),
-                &self.quitting,
-            ) {
-                ReadyOutcome::Ready => {
-                    self.session = Some(sess);
-                    self.set_phase(Phase::Ready(mode));
-                    return;
-                }
-                ReadyOutcome::ChildExited(code) => {
-                    let log_tail = self.log_tail();
-                    self.remove_pidfile();
-                    if session::classify_early_exit(code, &log_tail) == EarlyExit::PortTaken {
-                        if attempt < PORT_ATTEMPTS {
-                            // The TOCTOU between free_port() and the
-                            // child's bind: retry on a new port.
-                            continue;
-                        }
-                        // Port taken on the final attempt = exhausted.
-                        self.fail(StartError::PortUnavailable);
-                        return;
-                    }
-                    self.fail(StartError::SessionExited { code, log_tail });
-                    return;
-                }
-                ReadyOutcome::Timeout => {
-                    self.stop_child(&mut sess.child);
-                    self.remove_pidfile();
-                    self.fail(StartError::NotReady {
-                        waited: READY_TIMEOUT,
-                    });
-                    return;
-                }
-                ReadyOutcome::TokenRejected => {
-                    self.stop_child(&mut sess.child);
-                    self.remove_pidfile();
-                    self.fail(StartError::TokenRejected { service: false });
-                    return;
-                }
-                // Quitting: an internal control-flow outcome, never a
-                // visible phase (§3.5).
-                ReadyOutcome::Cancelled => {
-                    self.stop_child(&mut sess.child);
-                    self.remove_pidfile();
-                    return;
-                }
+        self.set_phase(Phase::Starting(StartStep::WaitingForBackend));
+        let (outcome, mode) = self.await_backend(mode, Some(&mut child));
+        match outcome {
+            ReadyOutcome::Ready => {
+                self.session = Some(Session { child });
+                self.set_phase(Phase::Ready(mode));
+            }
+            // A busy bind lands here too: the child exits and the log
+            // tail says why (spec §8.4 — no port fallback).
+            ReadyOutcome::ChildExited(code) => {
+                let log_tail = self.log_tail();
+                self.remove_pidfile();
+                self.fail(StartError::SessionExited { code, log_tail });
+            }
+            ReadyOutcome::Timeout => {
+                self.stop_child(&mut child);
+                self.remove_pidfile();
+                self.fail(StartError::NotReady {
+                    waited: READY_TIMEOUT,
+                });
+            }
+            ReadyOutcome::TokenRejected => {
+                self.stop_child(&mut child);
+                self.remove_pidfile();
+                self.fail(StartError::TokenRejected { service: false });
+            }
+            // Quitting: an internal control-flow outcome, never a
+            // visible phase (§3.5).
+            ReadyOutcome::Cancelled => {
+                self.stop_child(&mut child);
+                self.remove_pidfile();
             }
         }
-        self.fail(StartError::PortUnavailable);
     }
 
     // -------------------------------------------------------------------
@@ -467,7 +406,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
 
     fn connect_service(&mut self, start_first: bool) {
         self.set_phase(Phase::Starting(StartStep::ConnectingService));
-        let token = self.read_web_token();
+        let mode = self.service_mode();
         if start_first {
             let args = service::service_install_args();
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -475,75 +414,80 @@ impl<S: Sys, U: Ui> Controller<S, U> {
                 return self.fail(StartError::ServiceCommandFailed { command, output });
             }
         }
-        // The protocol is what the service actually runs with — the
-        // `TLS:` status line (invariant I3), never settings.json.
-        let protocol = if self.installed_tls() {
-            Protocol::Https
-        } else {
-            Protocol::Http
+        match self.await_backend(mode, None) {
+            (ReadyOutcome::Ready, mode) => self.set_phase(Phase::Ready(mode)),
+            (ReadyOutcome::TokenRejected, _) => {
+                self.fail(StartError::TokenRejected { service: true })
+            }
+            (ReadyOutcome::Timeout, mode) => self.fail(StartError::ServiceUnreachable {
+                waited: READY_TIMEOUT,
+                addr: mode.target().host_port(),
+            }),
+            (ReadyOutcome::Cancelled, _) => {}
+            (ReadyOutcome::ChildExited(_), _) => {} // no child in service mode
+        }
+    }
+
+    /// `general.web` from config.yaml (spec §8.4). Missing, legacy or
+    /// unparsable ⇒ the defaults; PeakBot reports real problems itself.
+    fn read_web_target(&self) -> WebTarget {
+        let text = match self.sys.read(&self.paths.peakbot_config()) {
+            Ok(text) => text,
+            Err(e) => {
+                log::warn!("failed to read config.yaml: {e}");
+                None
+            }
         };
-        let mode = Mode::Service { protocol, token };
-        match wait_ready(
+        read_web_target(text.as_deref())
+    }
+
+    /// The service serves `general.web`, plus TLS when the unit itself
+    /// carries `--tls` (the server's rule is `--tls || general.web.tls`).
+    fn service_mode(&self) -> Mode {
+        let mut target = self.read_web_target();
+        target.tls |= self.installed_tls();
+        Mode::Service(target)
+    }
+
+    /// Probe until the backend answers, then read `general.web` AGAIN
+    /// (spec §8.4, Z8): the child's first boot may have auto-migrated a
+    /// legacy config, moving the web-token into `general.web.token`, so
+    /// the pre-launch read can be stale. A 401 also counts as "it
+    /// answered". If the fresh read differs, probe once more with it and
+    /// return the fresh mode — that is the URL the bridge navigates to.
+    fn await_backend(
+        &self,
+        mode: Mode,
+        mut child: Option<&mut Box<dyn Child>>,
+    ) -> (ReadyOutcome, Mode) {
+        let outcome = self.wait_ready_on(&mode, child.as_deref_mut());
+        if !matches!(outcome, ReadyOutcome::Ready | ReadyOutcome::TokenRejected) {
+            return (outcome, mode);
+        }
+        let fresh = match mode {
+            Mode::Session(_) => Mode::Session(self.read_web_target()),
+            Mode::Service(_) => self.service_mode(),
+        };
+        if fresh == mode {
+            return (outcome, mode);
+        }
+        (self.wait_ready_on(&fresh, child), fresh)
+    }
+
+    fn wait_ready_on(&self, mode: &Mode, child: Option<&mut Box<dyn Child>>) -> ReadyOutcome {
+        // Written as a match so the `Box<dyn Child + 'static>` borrow is
+        // coerced to the short-lived trait object `wait_ready` takes.
+        let child: Option<&mut dyn Child> = match child {
+            Some(c) => Some(c.as_mut()),
+            None => None,
+        };
+        wait_ready(
             &self.sys,
             &mode.probe_url(),
             READY_TIMEOUT,
-            None,
+            child,
             &self.quitting,
-        ) {
-            ReadyOutcome::Ready => self.set_phase(Phase::Ready(mode)),
-            ReadyOutcome::TokenRejected => self.fail(StartError::TokenRejected { service: true }),
-            ReadyOutcome::Timeout => self.fail(StartError::ServiceUnreachable {
-                waited: READY_TIMEOUT,
-            }),
-            ReadyOutcome::Cancelled => {}
-            ReadyOutcome::ChildExited(_) => {} // no child in service mode
-        }
-    }
-
-    /// The web-token is exactly what the file holds — never generated
-    /// here (a generated token would not match the running service).
-    fn read_web_token(&self) -> Option<Token> {
-        self.sys
-            .read(&self.paths.web_token())
-            .ok()
-            .flatten()
-            .and_then(|s| Token::parse(&s))
-    }
-
-    /// The saved settings (design #377 §4.4): the file is the single
-    /// source and is read whenever it's needed; corrupt/missing ⇒
-    /// defaults.
-    fn settings(&self) -> Settings {
-        let text = self.sys.read(&self.paths.settings_file()).ok().flatten();
-        settings::load_settings(text.as_deref())
-    }
-
-    /// `"token on" ⇔ the web-token file holds a parseable token`
-    /// (invariant I2): reuse the file's token, generate + write 0600 if
-    /// absent, remove the file when the token is off. The session's
-    /// token IS the file's token.
-    fn sync_token(&self, s: Settings) -> Option<Token> {
-        let path = self.paths.web_token();
-        if !s.token() {
-            if let Err(e) = self.sys.remove(&path) {
-                log::warn!("failed to remove web-token: {e}");
-            }
-            return None;
-        }
-        if let Some(t) = self
-            .sys
-            .read(&path)
-            .ok()
-            .flatten()
-            .and_then(|s| Token::parse(&s))
-        {
-            return Some(t);
-        }
-        let token = Token::generate(&self.sys);
-        if let Err(e) = self.sys.write_private(&path, token.as_str()) {
-            log::warn!("failed to write web-token: {e}");
-        }
-        Some(token)
+        )
     }
 
     /// One short-lived sidecar command. Err = (command, output) for the
@@ -565,27 +509,14 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     // REPLACE (design auto-replace §4.3) — also Action::ReinstallService
     // -------------------------------------------------------------------
 
-    /// User-confirmed replace (dialog "Replace" / tray ReinstallService,
-    /// #377 semantics): the SAVED settings apply, and the token file is
-    /// synced to them.
+    /// Replace the installed service with the bundled build (dialog
+    /// "Replace", tray ReinstallService, or a silent AutoReplace). A5:
+    /// the binary copy runs FIRST, so a failed copy leaves the service
+    /// and the old binary intact. `enable --now` doesn't restart a
+    /// running unit, so the uninstall + install pair is still what
+    /// restarts the service on the new binary. The install is bare: the
+    /// unit reads `general.web` (spec §8.4).
     fn replace_service(&mut self) {
-        let s = self.settings();
-        self.sync_token(s);
-        self.swap_binary_and_reinstall();
-    }
-
-    /// `LaunchPlan::AutoReplace` — silent: never calls `sync_token`, so
-    /// the `web-token` file is untouched and the `service install` argv
-    /// carries no `--token` (I7).
-    fn auto_replace_service(&mut self) {
-        self.swap_binary_and_reinstall();
-    }
-
-    /// The shared replace sequence (A5): the binary copy runs FIRST, so
-    /// a failed copy leaves the service and the old binary intact.
-    /// `enable --now` doesn't restart a running unit, so the uninstall +
-    /// install pair is still what restarts the service on the new binary.
-    fn swap_binary_and_reinstall(&mut self) {
         self.set_phase(Phase::Starting(StartStep::InstallingService));
         if let Err((command, output)) = self.run_sidecar_cmd(&service::install_args()) {
             return self.fail(StartError::ServiceCommandFailed { command, output });
@@ -629,8 +560,12 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             self.ui.message(&service::finish_setup_dialog());
             return;
         }
-        if !self.sys.port_is_free(SERVICE_PORT) {
-            self.ui.message(&service::port_busy_dialog());
+        // The service will bind general.web.bind. Our own session holds
+        // that port right now and is stopped below, so only check it when
+        // there is no session.
+        let bind = self.read_web_target().bind;
+        if self.session.is_none() && !self.sys.port_is_free(bind.port()) {
+            self.ui.message(&service::port_busy_dialog(bind));
             return;
         }
         if !self.ui.confirm(&service::enable_dialog()) {
@@ -642,8 +577,6 @@ impl<S: Sys, U: Ui> Controller<S, U> {
 
         // REPLACE steps minus the uninstall.
         self.set_phase(Phase::Starting(StartStep::InstallingService));
-        let s = self.settings();
-        self.sync_token(s);
         let args = service::service_install_args();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         if let Err((command, output)) = self
@@ -689,68 +622,23 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     }
 
     // -------------------------------------------------------------------
-    // Action::SaveSettings (design #377b §4.4)
+    // Action::Restart (spec §8.4)
     // -------------------------------------------------------------------
 
-    /// Write-then-apply: the token file FIRST (it is the single source of
-    /// the token), then the settings file, then the existing relaunch /
-    /// reconfigure path — `sync_token` re-reads the file, so the new
-    /// value goes live. A failed write leaves everything else untouched
-    /// (no rollback machinery, T7). `reconfigure_service` IS the restart
-    /// for a token-only change in service mode (T-A5: no `service
-    /// restart` verb exists).
-    fn handle_save_settings(&mut self, req: SaveRequest) {
-        let new = req.settings();
-        let current = self.settings();
-        let tok_new = req
-            .new_token()
-            .filter(|t| Some(*t) != self.read_web_token().as_ref())
-            .cloned();
-        if new == current && tok_new.is_none() {
-            return; // nothing to apply; no dialog
-        }
-        let service_mode = matches!(self.service, Some(ServiceState::Installed(_)));
-        let dialog = if service_mode {
-            service::settings_reinstall_dialog()
-        } else {
-            service::settings_relaunch_dialog()
-        };
-        if !self.ui.confirm(&dialog) {
-            return; // nothing written, nothing stopped
-        }
-        if let Some(t) = tok_new {
-            let path = self.paths.web_token();
-            if let Err(e) = self.sys.write_private(&path, t.as_str()) {
-                self.ui
-                    .message(&service::save_failed_dialog(&path, &e.to_string()));
-                return; // nothing else written
-            }
-        }
-        if new != current {
-            let path = self.paths.settings_file();
-            if let Err(e) = self
-                .sys
-                .write_private(&path, &settings::render_settings_file(new))
-            {
-                self.ui
-                    .message(&service::save_failed_dialog(&path, &e.to_string()));
-                return;
-            }
-        }
-        if service_mode {
+    /// Service mode: `reconfigure_service` — there is no `service
+    /// restart` verb, the reinstall IS the restart. Otherwise (session
+    /// mode, or a failed start with no service): the full start path,
+    /// which stops the child, re-reads `general.web` and relaunches.
+    fn handle_restart(&mut self) {
+        if matches!(self.service, Some(ServiceState::Installed(_))) {
             self.reconfigure_service();
         } else {
-            // The fully-tested stop → version → status → plan → launch
-            // path, with the new settings (design §6 T5).
             self.handle_start();
         }
     }
 
-    /// Reconfigure the installed service with the saved settings. The
-    /// binary is NOT replaced (design §6 T6). Ordering matters:
-    /// `sync_token` runs before `service install` (a remote plan needs
-    /// the file; token off must remove it before the restarted service
-    /// reads it).
+    /// Reinstall the installed unit so the restarted service reads the
+    /// current config. The binary is NOT replaced (design §6 T6).
     fn reconfigure_service(&mut self) {
         self.set_phase(Phase::Starting(StartStep::RemovingService));
         // Non-zero tolerated: the unit may not be loaded.
@@ -759,8 +647,6 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             .run(&self.paths.sidecar, &service::service_uninstall_args());
 
         self.set_phase(Phase::Starting(StartStep::InstallingService));
-        let s = self.settings();
-        self.sync_token(s);
         let args = service::service_install_args();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         if let Err((command, output)) = self.run_sidecar_cmd(&args) {
@@ -801,7 +687,8 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         }
     }
 
-    /// Stale pidfile reaper: identity-checked (cmdline) SIGINT → poll up
+    /// Stale pidfile reaper: identity-checked (cmdline contains the
+    /// recorded sidecar path) SIGINT → poll up
     /// to STOP_GRACE → SIGKILL; the pidfile is always removed. The fresh
     /// session then writes its own pidfile (DESIGN §3.8: pidfile exists
     /// ⇔ a session child was spawned and not yet confirmed exited).
@@ -867,15 +754,15 @@ pub fn run_loop<S: Sys, U: Ui>(mut ctrl: Controller<S, U>, rx: Receiver<Action>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consts::{PORT_ATTEMPTS, READY_TIMEOUT, SERVICE_PORT, SESSION_PREFERRED_PORT};
+    use crate::consts::READY_TIMEOUT;
     use crate::paths::DesktopPaths;
     use crate::phase::{Mode, Phase, Platform, StartError, StartStep};
     use crate::service::ReplacePolicy;
     use crate::session::PidRecord;
-    use crate::settings::{Protocol, SaveRequest, Settings, SettingsWire, render_settings_file};
     use crate::sys::{Probe, RunOutput, Signal};
     use crate::testing::{ChildMode, Effect, FakeSys, FakeUi};
     use crate::version::{DeclinedReplace, InstalledVersion};
+    use crate::web_target::WebTarget;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -1075,11 +962,13 @@ mod tests {
         }
     }
 
-    // §9.1 case 40 (updated for #377: the session's token IS the
-    // web-token file's token — design T1).
+    // §9.1 case 40 (0.24, spec §8.4: the session's bind + token come
+    // from config.yaml general.web; the child gets no web flags and no
+    // token in its env).
     #[test]
     fn t40_happy_session() {
-        // (a) A valid web-token file: the session reuses it; no new token.
+        // (a) general.web with a token: the URL carries it; the child
+        // reads the same file itself.
         let sys = FakeSys::new();
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
         sys.set_run(
@@ -1089,36 +978,37 @@ mod tests {
         );
         sys.set_default_probe(vec![Probe::Status(200)]);
         sys.queue_child(crate::testing::FakeChildSpec::alive());
-        sys.seed_file(WEB_TOKEN, "seeded-token\n");
+        sys.seed_file(
+            CONFIG_YAML,
+            web_yaml("127.0.0.1:7823", Some("seeded-token")),
+        );
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui.clone());
 
         assert!(
             matches!(
                 ctrl.phase(),
-                Phase::Ready(Mode::Session {
-                    port,
-                    protocol,
-                    token
-                }) if *port == SESSION_PREFERRED_PORT
-                    && *protocol == Protocol::Http
+                Phase::Ready(Mode::Session(WebTarget { bind, tls, token }))
+                    if bind.port() == 7823
+                    && !*tls
                     && token.as_ref().map(|t| t.as_str()) == Some("seeded-token")
             ),
-            "the session token is the file's token; got {:?}",
+            "the session target is general.web; got {:?}",
             ctrl.phase()
+        );
+        assert_eq!(
+            ready_url(&ctrl).as_deref(),
+            Some("http://127.0.0.1:7823/?token=seeded-token")
         );
         let spawns = sys.spawned_specs();
         assert_eq!(spawns.len(), 1, "exactly one spawn");
-        assert_eq!(
-            spawns[0].args,
-            vec!["--bind".to_string(), "127.0.0.1:7824".to_string()]
-        );
+        assert!(spawns[0].args.is_empty(), "no --bind/--tls/--token");
         assert!(
             spawns[0]
                 .extra_env
                 .iter()
-                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == "seeded-token"),
-            "spawn env must carry the file's token; got {:?}",
+                .all(|(k, _)| k != "PEAKBOT_WEB_TOKEN"),
+            "the child env carries no token; got {:?}",
             spawns[0].extra_env
         );
         assert!(
@@ -1129,26 +1019,20 @@ mod tests {
             "spawn env must carry PEAKBOT_NO_OPEN=1; got {:?}",
             spawns[0].extra_env
         );
-        assert!(
-            sys.events()
-                .iter()
-                .all(|e| !matches!(e, Effect::RandomToken)),
-            "no RandomToken when the file holds a valid token; events: {:?}",
-            sys.events()
-        );
         assert_eq!(
-            sys.file(Path::new(WEB_TOKEN)).as_deref(),
-            Some("seeded-token\n"),
-            "the file is untouched"
+            sys.file(Path::new(CONFIG_YAML)),
+            Some(web_yaml("127.0.0.1:7823", Some("seeded-token"))),
+            "config.yaml is read, never written"
         );
 
-        // Pidfile: pid/port.
+        // Pidfile: pid + the sidecar path.
         let pidfile = sys.file(Path::new(PIDFILE)).expect("pidfile written");
         let rec = PidRecord::parse(&pidfile).expect("pidfile parses");
-        assert_eq!(rec.port, SESSION_PREFERRED_PORT);
+        assert_eq!(rec.pid, sys.spawned_pids()[0]);
+        assert_eq!(rec.exe, PathBuf::from(SIDECAR));
 
-        // (b) No file: a token is generated + written 0600, and the env
-        // carries it.
+        // (b) No config.yaml: the defaults (127.0.0.1:7823, http, no
+        // token) — nothing is generated or written.
         let sys = FakeSys::new();
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
         sys.set_run(
@@ -1161,36 +1045,16 @@ mod tests {
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui.clone());
 
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Session { port, .. }) if *port == SESSION_PREFERRED_PORT
-            ),
-            "got {:?}",
+        assert_eq!(
+            ready_url(&ctrl).as_deref(),
+            Some("http://127.0.0.1:7823/"),
+            "defaults without config.yaml; got {:?}",
             ctrl.phase()
         );
-        let spawns = sys.spawned_specs();
-        let token = sys
-            .tokens_generated()
-            .first()
-            .cloned()
-            .expect("a session token was generated");
-        assert!(
-            spawns[0]
-                .extra_env
-                .iter()
-                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == &token),
-            "spawn env must carry the generated token; got {:?}",
-            spawns[0].extra_env
-        );
         assert_eq!(
-            sys.file(Path::new(WEB_TOKEN)).as_deref(),
-            Some(token.as_str()),
-            "the generated token is exactly the file's contents"
-        );
-        assert!(
-            sys.private_written().contains(Path::new(WEB_TOKEN)),
-            "the generated web-token must be written 0600"
+            sys.private_written().into_iter().collect::<Vec<_>>(),
+            vec![PathBuf::from(PIDFILE)],
+            "only the pidfile is written"
         );
 
         // Phases emitted in order.
@@ -1215,9 +1079,11 @@ mod tests {
         );
     }
 
-    // §9.1 case 41.
+    // Spec §8.4 (replaces t41/t42, the deleted port fallback): a busy
+    // bind is not retried on another port — the child exits and the
+    // status page shows the failure with the log tail.
     #[test]
-    fn t41_busy_preferred_port_falls_back_to_free_port() {
+    fn busy_bind_fails_with_log_tail_without_fallback() {
         let sys = FakeSys::new();
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
         sys.set_run(
@@ -1225,89 +1091,24 @@ mod tests {
             &["service", "status"],
             run_out(Some(0), NOT_INSTALLED, ""),
         );
-        sys.set_port_free(SESSION_PREFERRED_PORT, false);
-        sys.set_free_port(7999);
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        let ui = FakeUi::new();
-        let ctrl = started(sys.clone(), ui);
-
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { port, .. }) if *port == 7999),
-            "got {:?}",
-            ctrl.phase()
-        );
-        let spawns = sys.spawned_specs();
-        assert_eq!(
-            spawns[0].args,
-            vec!["--bind".to_string(), "127.0.0.1:7999".to_string()]
-        );
-        assert!(
-            sys.events().iter().any(|e| matches!(e, Effect::FreePort)),
-            "free_port() must be consulted"
-        );
-    }
-
-    // §9.1 case 42.
-    #[test]
-    fn t42_port_taken_retries_then_gives_up() {
-        let port_taken_child = || crate::testing::FakeChildSpec {
+        sys.set_port_free(7823, false);
+        sys.queue_child(crate::testing::FakeChildSpec {
             mode: ChildMode::ExitsAfter(1),
             exit: Some(1),
-            log_write: Some("127.0.0.1:7824 is already in use".to_string()),
+            log_write: Some("127.0.0.1:7823 is already in use".to_string()),
             ..Default::default()
-        };
-
-        // Scenario A: first attempt hits a taken port; the second succeeds.
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            run_out(Some(0), NOT_INSTALLED, ""),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.set_free_port(7999);
-        sys.queue_child(port_taken_child());
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
+        });
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { port, .. }) if *port == 7999),
-            "second attempt must use the free port; got {:?}",
-            ctrl.phase()
-        );
-        let spawns = sys.spawned_specs();
-        assert_eq!(spawns.len(), 2, "two attempts");
-        assert_eq!(
-            spawns[0].args,
-            vec!["--bind".to_string(), "127.0.0.1:7824".to_string()]
-        );
-        assert_eq!(
-            spawns[1].args,
-            vec!["--bind".to_string(), "127.0.0.1:7999".to_string()]
-        );
-
-        // Scenario B: PORT_ATTEMPTS taken-port exits ⇒ PortUnavailable.
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            run_out(Some(0), NOT_INSTALLED, ""),
-        );
-        sys.set_free_port(7999);
-        for _ in 0..PORT_ATTEMPTS {
-            sys.queue_child(port_taken_child());
+        match ctrl.phase() {
+            Phase::Failed(StartError::SessionExited { code, log_tail }) => {
+                assert_eq!(*code, Some(1));
+                assert!(log_tail.contains("already in use"), "{log_tail:?}");
+            }
+            other => panic!("expected SessionExited, got {other:?}"),
         }
-        let ui = FakeUi::new();
-        let ctrl = started(sys.clone(), ui);
-        assert!(
-            matches!(ctrl.phase(), Phase::Failed(StartError::PortUnavailable)),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert_eq!(sys.spawned_specs().len(), PORT_ATTEMPTS as usize);
+        assert_eq!(sys.spawned_specs().len(), 1, "no retry on another port");
+        assert!(!sys.has_file(Path::new(PIDFILE)), "pidfile removed");
     }
 
     // §9.1 case 43.
@@ -1398,7 +1199,7 @@ mod tests {
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui.clone());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -1416,7 +1217,7 @@ mod tests {
             &["service", "status"],
             installed_status("running"),
         );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -1424,11 +1225,11 @@ mod tests {
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         match ctrl.phase() {
-            Phase::Ready(Mode::Service { token, .. }) => {
+            Phase::Ready(Mode::Service(WebTarget { token, .. })) => {
                 assert_eq!(
                     token.as_ref().map(|t| t.as_str()),
                     Some("svc-token"),
-                    "the token is exactly what the web-token file holds"
+                    "the token is exactly general.web.token"
                 );
             }
             other => panic!("expected Ready(Service), got {other:?}"),
@@ -1439,14 +1240,9 @@ mod tests {
         );
         let runs = sys.run_args();
         assert!(
-            !runs.iter().any(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "127.0.0.1:7823".to_string(),
-                ]
-            }),
+            !runs
+                .iter()
+                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
             "a running same-version service must not be re-installed; runs: {runs:?}"
         );
     }
@@ -1461,10 +1257,10 @@ mod tests {
             &["service", "status"],
             installed_status("stopped"),
         );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
+            &["service", "install"],
             run_out(Some(0), "ok\n", ""),
         );
         sys.set_probe(
@@ -1474,27 +1270,21 @@ mod tests {
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
         let runs = sys.run_args();
         assert!(
-            runs.iter().any(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "127.0.0.1:7823".to_string(),
-                ]
-            }),
-            "`service install --bind 127.0.0.1:7823` must run; runs: {runs:?}"
+            runs.iter()
+                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
+            "bare `service install` must run; runs: {runs:?}"
         );
     }
 
     // §9.1 case 48.
     #[test]
-    fn t48_installed_tokenless_service_ready_without_token_file() {
+    fn t48_installed_tokenless_service_ready_without_general_web_token() {
         let sys = FakeSys::new();
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
         sys.set_run(
@@ -1502,19 +1292,23 @@ mod tests {
             &["service", "status"],
             installed_status("running"),
         );
-        // No web-token file.
+        // No general.web.token.
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", None));
         sys.set_probe("http://127.0.0.1:7823/commands", vec![Probe::Status(200)]);
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         match ctrl.phase() {
-            Phase::Ready(Mode::Service { token, .. }) => {
-                assert!(token.is_none(), "absent web-token ⇒ Service with no token");
+            Phase::Ready(Mode::Service(WebTarget { token, .. })) => {
+                assert!(
+                    token.is_none(),
+                    "no general.web.token ⇒ Service with no token"
+                );
             }
             other => panic!("expected Ready(Service), got {other:?}"),
         }
         assert!(
-            !sys.has_file(Path::new(WEB_TOKEN)),
-            "the token file must NOT be created in CONNECT (it would not match the running service)"
+            sys.private_written().is_empty(),
+            "CONNECT writes nothing (a token is never minted by the desktop)"
         );
     }
 
@@ -1541,9 +1335,10 @@ mod tests {
         sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
+            &["service", "install"],
             run_out(Some(0), "ok\n", ""),
         );
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("cfg-token")));
         // CONNECT after a successful install is proven by the probe
         // (DESIGN §4.3) — script a 200, never rely on the install command.
         sys.set_default_probe(vec![Probe::Status(200)]);
@@ -1551,26 +1346,21 @@ mod tests {
         ui.answer_confirm(true); // Replace
         let ctrl = started(sys.clone(), ui);
 
-        let tok = sys
-            .tokens_generated()
-            .first()
-            .cloned()
-            .expect("ensure_token generated a token");
         match ctrl.phase() {
-            Phase::Ready(Mode::Service { token, .. }) => {
+            Phase::Ready(Mode::Service(WebTarget { token, .. })) => {
                 assert_eq!(
                     token.as_ref().map(|t| t.as_str()),
-                    Some(tok.as_str()),
-                    "Ready with the generated token"
+                    Some("cfg-token"),
+                    "Ready with general.web.token"
                 );
             }
             other => panic!("expected Ready(Service), got {other:?}"),
         }
         assert!(
-            sys.events()
-                .iter()
-                .any(|e| { matches!(e, Effect::Probe { url } if url.to_string().contains(&tok)) }),
-            "the readiness probe must use the generated token"
+            sys.events().iter().any(|e| {
+                matches!(e, Effect::Probe { url } if url.to_string().contains("cfg-token"))
+            }),
+            "the readiness probe must use general.web.token"
         );
 
         // Command order (invariant A5, design auto-replace §4.3): the
@@ -1578,11 +1368,13 @@ mod tests {
         // untouched: install → service uninstall → service install.
         assert_order_ok(&sys.run_args());
 
-        // ensure_token: the absent web-token was written 0600.
-        assert!(sys.has_file(Path::new(WEB_TOKEN)), "web-token created");
+        // The install is bare: the unit reads general.web itself.
         assert!(
-            sys.private_written().contains(Path::new(WEB_TOKEN)),
-            "web-token must be written private (0600)"
+            sys.run_args()
+                .iter()
+                .all(|r| r.first().map(String::as_str) != Some("service") || r.len() == 2),
+            "no web flags on any service verb; runs: {:?}",
+            sys.run_args()
         );
         // The stale declined file is removed.
         assert!(!sys.has_file(Path::new(DECLINED)), "declined file removed");
@@ -1601,7 +1393,7 @@ mod tests {
             installed_status_at(INSTALLED_EXE, "running"),
         );
         sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -1610,7 +1402,7 @@ mod tests {
         ui.answer_confirm(false); // Keep
         let mut ctrl = started(sys.clone(), ui.clone());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -1627,21 +1419,16 @@ mod tests {
             "the exact (installed, bundled) pair must be recorded; bundled = the sidecar's --version"
         );
         assert!(
-            !sys.run_args().iter().any(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "127.0.0.1:7823".to_string(),
-                ]
-            }),
+            !sys.run_args()
+                .iter()
+                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
             "Keep must not (re)install the service"
         );
 
         // Next Start: no dialog.
         let _ = ctrl.handle(Action::Start);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -1666,7 +1453,7 @@ mod tests {
         sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
         // Declined for an OLDER bundled version — the pair no longer matches.
         sys.seed_file(DECLINED, "installed=0.22.0\nbundled=0.21.0\n");
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -1675,7 +1462,7 @@ mod tests {
         ui.answer_confirm(false);
         let ctrl = started(sys.clone(), ui.clone());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -1697,7 +1484,7 @@ mod tests {
             &["service", "status"],
             installed_status("running"),
         );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(401)],
@@ -1719,7 +1506,7 @@ mod tests {
             &["service", "status"],
             installed_status("running"),
         );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         // No probe script ⇒ Unreachable.
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
@@ -1755,7 +1542,7 @@ mod tests {
         sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
+            &["service", "install"],
             run_out(Some(0), "ok\n", ""),
         );
         // No probe script ⇒ every probe Unreachable.
@@ -1791,7 +1578,7 @@ mod tests {
         sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
+            &["service", "install"],
             run_out(Some(1), "", "unit failed to start\n"),
         );
         let ui = FakeUi::new();
@@ -1827,14 +1614,14 @@ mod tests {
         let ui = FakeUi::new();
         let mut ctrl = started(sys.clone(), ui.clone());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "precondition; got {:?}",
             ctrl.phase()
         );
         // config.yaml absent.
         let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "phase must be unchanged; got {:?}",
             ctrl.phase()
         );
@@ -1853,7 +1640,9 @@ mod tests {
         assert_eq!(sys.spawned_specs().len(), 1, "no new session spawn");
     }
 
-    // §9.1 case 55.
+    // §9.1 case 55 (0.24: the service binds general.web.bind, the same
+    // port our session uses — so the check only applies when no session
+    // of ours holds it, e.g. after the session failed on a busy bind).
     #[test]
     fn t55_enable_with_busy_port_shows_port_busy() {
         let sys = FakeSys::new();
@@ -1863,16 +1652,31 @@ mod tests {
             &["service", "status"],
             run_out(Some(0), NOT_INSTALLED, ""),
         );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
+        sys.queue_child(crate::testing::FakeChildSpec {
+            mode: ChildMode::ExitsAfter(1),
+            exit: Some(1),
+            log_write: Some("127.0.0.1:7823 is already in use".to_string()),
+            ..Default::default()
+        });
         sys.seed_file(CONFIG_YAML, "provider:\n  type: openrouter\n");
-        sys.set_port_free(SERVICE_PORT, false);
+        sys.set_port_free(7823, false);
         let ui = FakeUi::new();
         let mut ctrl = started(sys.clone(), ui.clone());
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Failed(StartError::SessionExited { .. })
+            ),
+            "precondition: the session failed on the busy bind; got {:?}",
+            ctrl.phase()
+        );
         let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
-            "got {:?}",
+            matches!(
+                ctrl.phase(),
+                Phase::Failed(StartError::SessionExited { .. })
+            ),
+            "phase unchanged; got {:?}",
             ctrl.phase()
         );
         assert!(
@@ -1884,11 +1688,26 @@ mod tests {
             !sys.run_args().iter().any(|r| r == &["install".to_string()]),
             "no install may run"
         );
-        assert_eq!(
-            sys.spawned_specs().len(),
-            1,
-            "the running session is untouched"
+        assert_eq!(sys.spawned_specs().len(), 1, "no new session spawn");
+    }
+
+    // §9.1 case 55 (0.24 companion): our own running session holds
+    // general.web.bind — that is not "busy"; the enable proceeds.
+    #[test]
+    fn t55b_enable_from_session_ignores_its_own_port() {
+        let sys = FakeSys::new();
+        sys.set_port_free(7823, false); // held by our session
+        sys.seed_file(CONFIG_YAML, "provider:\n  type: openrouter\n");
+        let ui = FakeUi::new();
+        ui.answer_confirm(false); // stop at the confirm: the check passed
+        let mut ctrl = ready_session(sys.clone(), ui.clone());
+        let _ = ctrl.handle(Action::ToggleBackground);
+        assert!(
+            ui.messages().is_empty(),
+            "no port-busy dialog; got {:?}",
+            ui.messages()
         );
+        assert_eq!(ui.confirms().len(), 1, "the enable confirm was reached");
     }
 
     // §9.1 case 56.
@@ -1909,7 +1728,7 @@ mod tests {
         let mut ctrl = started(sys.clone(), ui.clone());
         let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -1923,8 +1742,8 @@ mod tests {
         assert_eq!(sys.spawned_specs().len(), 1, "no stop, no new spawn");
     }
 
-    // §9.1 case 57 (updated for #377: enable reuses the web-token file —
-    // the session already used it, so no `preferred` token is passed).
+    // §9.1 case 57 (0.24: the enable installs a bare unit; the service
+    // reads general.web — the desktop passes and writes no token).
     #[test]
     fn t57_enable_happy_path() {
         let sys = FakeSys::new();
@@ -1944,11 +1763,11 @@ mod tests {
             exit: Some(0),
             ..Default::default()
         });
-        sys.seed_file(CONFIG_YAML, "provider:\n  type: openrouter\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("cfg-token")));
         sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
+            &["service", "install"],
             run_out(Some(0), "ok\n", ""),
         );
         let ui = FakeUi::new();
@@ -1956,39 +1775,18 @@ mod tests {
         let mut ctrl = started(sys.clone(), ui.clone());
         let session_pid = sys.spawned_pids()[0];
 
-        // The session launch already created the web-token (default
-        // settings: token on) — the session's token IS the file's token.
-        let session_file = sys
-            .file(Path::new(WEB_TOKEN))
-            .expect("web-token created at launch");
-        assert_eq!(
-            session_file.trim(),
-            sys.tokens_generated()[0].as_str(),
-            "the session token is the generated file token"
-        );
-
         let _ = ctrl.handle(Action::ToggleBackground);
 
         match ctrl.phase() {
-            Phase::Ready(Mode::Service { token, .. }) => {
-                let file = sys.file(Path::new(WEB_TOKEN)).expect("web-token written");
-                let file_tok = Token::parse(&file).expect("web-token parses");
+            Phase::Ready(Mode::Service(WebTarget { token, .. })) => {
                 assert_eq!(
-                    token.as_ref(),
-                    Some(&file_tok),
-                    "Ready's service token must equal the web-token file's contents"
+                    token.as_ref().map(|t| t.as_str()),
+                    Some("cfg-token"),
+                    "Ready's service token is general.web.token"
                 );
             }
             other => panic!("expected Ready(Service), got {other:?}"),
         }
-        // Exactly one token was generated for the whole flow: the enable
-        // reused the file (no `preferred`, no regeneration).
-        assert_eq!(
-            sys.tokens_generated().len(),
-            1,
-            "the file token must be reused by the enable; generated {:?}",
-            sys.tokens_generated()
-        );
         // The session child was interrupted BEFORE `install` ran.
         let evts = sys.events();
         let i_int = evts
@@ -2003,11 +1801,6 @@ mod tests {
             i_int < i_install,
             "the session must be stopped BEFORE installing (no two backends on one config); events: {evts:?}"
         );
-        // The token file was written 0600 (at the session launch).
-        assert!(
-            sys.private_written().contains(Path::new(WEB_TOKEN)),
-            "the web-token was written 0600"
-        );
         // The pidfile is gone; no new sidecar spawn; tray checked.
         assert!(!sys.has_file(Path::new(PIDFILE)), "pidfile removed");
         assert_eq!(
@@ -2016,17 +1809,12 @@ mod tests {
             "no new sidecar spawn in service mode"
         );
         assert!(ui.last_tray().background_checked, "tray checkbox checked");
-        // Default settings ⇒ the service install has no --tls.
+        // The install is bare: no --bind, no --tls, no --token.
         assert!(
-            sys.run_args().iter().any(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "127.0.0.1:7823".to_string(),
-                ]
-            }),
-            "default settings install loopback without --tls; runs: {:?}",
+            sys.run_args()
+                .iter()
+                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
+            "bare service install; runs: {:?}",
             sys.run_args()
         );
     }
@@ -2055,7 +1843,7 @@ mod tests {
         sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
+            &["service", "install"],
             run_out(Some(1), "", "enable --now failed\n"),
         );
         sys.set_run(
@@ -2069,7 +1857,7 @@ mod tests {
         let _ = ctrl.handle(Action::ToggleBackground);
 
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "the user must be back in session mode; got {:?}",
             ctrl.phase()
         );
@@ -2104,7 +1892,7 @@ mod tests {
                 run_out(Some(0), NOT_INSTALLED, ""),
             ],
         );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -2120,13 +1908,13 @@ mod tests {
         ui.answer_confirm(true);
         let mut ctrl = started(sys.clone(), ui.clone());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "precondition; got {:?}",
             ctrl.phase()
         );
         let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -2150,7 +1938,7 @@ mod tests {
             &["service", "status"],
             installed_status("running"),
         );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -2160,7 +1948,7 @@ mod tests {
         let mut ctrl = started(sys.clone(), ui.clone());
         let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -2183,7 +1971,7 @@ mod tests {
             &["service", "status"],
             vec![installed_status("running"), installed_status("running")],
         );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -2198,7 +1986,7 @@ mod tests {
         let mut ctrl = started(sys.clone(), ui.clone());
         let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "unchanged mode; got {:?}",
             ctrl.phase()
         );
@@ -2263,7 +2051,7 @@ mod tests {
         let ui = FakeUi::new();
         let mut ctrl = started(sys.clone(), ui.clone());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "precondition; got {:?}",
             ctrl.phase()
         );
@@ -2285,7 +2073,7 @@ mod tests {
             &["service", "status"],
             installed_status("running"),
         );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -2293,7 +2081,7 @@ mod tests {
         let ui = FakeUi::new();
         let mut ctrl = started(sys.clone(), ui.clone());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "precondition; got {:?}",
             ctrl.phase()
         );
@@ -2396,19 +2184,23 @@ mod tests {
                 "pidfile names the new session's pid"
             );
             assert_eq!(
-                rec.port, SESSION_PREFERRED_PORT,
-                "pidfile names the new session's port"
+                rec.exe,
+                PathBuf::from(SIDECAR),
+                "pidfile names the new session's executable"
             );
         }
 
-        // (a) Matching cmdline → Interrupt, then Kill (stays "alive"); pidfile removed.
+        // (a) cmdline matches the RECORDED exe → Interrupt, then Kill
+        // (stays "alive"); pidfile removed. The record is from an older
+        // AppImage mount (not today's SIDECAR path): identity is the
+        // recorded path, so a crash-orphaned child is still reaped.
         let sys = base_sys();
-        sys.seed_file(PIDFILE, "pid=1234\nport=7824\n");
-        sys.set_cmdline(1234, "/tmp/.mount_x/usr/bin/peakbot --bind 127.0.0.1:7824");
+        sys.seed_file(PIDFILE, "pid=1234\nexe=/tmp/.mount_old/usr/bin/peakbot\n");
+        sys.set_cmdline(1234, "/tmp/.mount_old/usr/bin/peakbot");
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -2441,15 +2233,16 @@ mod tests {
         // The stale record is reaped, but the fresh session replaces it.
         fresh_pidfile(&sys);
 
-        // (b) Mismatched cmdline (PID reuse) → no signal; the fresh
+        // (b) Mismatched cmdline (PID reuse by another program) → no
+        // signal; the fresh
         // session rewrites the pidfile.
         let sys = base_sys();
-        sys.seed_file(PIDFILE, "pid=1234\nport=7824\n");
-        sys.set_cmdline(1234, "/usr/bin/vim --bind 127.0.0.1:7824");
+        sys.seed_file(PIDFILE, "pid=1234\nexe=/tmp/.mount_old/usr/bin/peakbot\n");
+        sys.set_cmdline(1234, "/usr/bin/vim");
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -2465,11 +2258,14 @@ mod tests {
         // (c) Garbage pidfile → removed, no signal; the fresh session
         // rewrites the pidfile.
         let sys = base_sys();
-        sys.seed_file(PIDFILE, "pid=notanumber\nport=7824\n");
+        sys.seed_file(
+            PIDFILE,
+            "pid=notanumber\nexe=/tmp/.mount_old/usr/bin/peakbot\n",
+        );
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -2502,7 +2298,7 @@ mod tests {
         let ui = FakeUi::new();
         let mut ctrl = started(sys.clone(), ui);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "precondition; got {:?}",
             ctrl.phase()
         );
@@ -2512,7 +2308,7 @@ mod tests {
         // pids[1] the fresh one it spawned.
         let (old_pid, new_pid) = (sys.spawned_pids()[0], sys.spawned_pids()[1]);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -2533,16 +2329,17 @@ mod tests {
         let rec = PidRecord::parse(&sys.file(Path::new(PIDFILE)).expect("pidfile rewritten"))
             .expect("pidfile parses");
         assert_eq!(rec.pid, new_pid, "pidfile names the new session's pid");
-        assert_eq!(rec.port, SESSION_PREFERRED_PORT);
+        assert_eq!(rec.exe, PathBuf::from(SIDECAR));
     }
 
     // -------------------------------------------------------------------
-    // Design #377 — controller plumbing (task 7) and SaveSettings
-    // (task 8)
+    // Design #377 — controller plumbing (task 7); TLS from general.web
+    // or the unit's `TLS:` line (0.24)
     // -------------------------------------------------------------------
 
-    /// A fresh session-mode controller, Ready, with a default settings
-    /// (no file) launch. The session child exits on SIGINT.
+    /// A fresh session-mode controller, Ready, on whatever config.yaml the
+    /// test seeded (none ⇒ the general.web defaults). The session child
+    /// exits on SIGINT.
     fn ready_session(sys: FakeSys, ui: FakeUi) -> Controller<FakeSys, FakeUi> {
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
         sys.set_run(
@@ -2559,8 +2356,9 @@ mod tests {
         started(sys, ui)
     }
 
-    // Design #377 t84 (invariant I3): the service protocol comes from
-    // the `TLS:` status line, never from settings.json.
+    // Design #377 t84 (0.24): a unit with `--tls` baked in (`TLS: on`)
+    // serves https even when general.web.tls is false — the server's
+    // rule is `--tls || general.web.tls`.
     #[test]
     fn t84_start_with_tls_service_probes_https_and_ready_https() {
         let sys = FakeSys::new();
@@ -2570,24 +2368,21 @@ mod tests {
             &["service", "status"],
             installed_status_tls("running", "on"),
         );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_default_probe(vec![Probe::Status(200)]);
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         match ctrl.phase() {
-            Phase::Ready(Mode::Service {
-                protocol, token, ..
-            }) => {
-                assert_eq!(
-                    *protocol,
-                    Protocol::Https,
+            Phase::Ready(Mode::Service(WebTarget { tls, token, .. })) => {
+                assert!(
+                    *tls,
                     "the protocol comes from the TLS: line; got {:?}",
                     ctrl.phase()
                 );
                 assert_eq!(
                     token.as_ref().map(|t| t.as_str()),
                     Some("svc-token"),
-                    "the token is the file's token"
+                    "the token is general.web.token"
                 );
             }
             other => panic!("expected Ready(Service), got {other:?}"),
@@ -2601,101 +2396,28 @@ mod tests {
         );
     }
 
-    // Design #377 t85: enabling background with a Remote settings file
-    // installs the remote service.
+    // Design #377 t86 (0.24): Replace with `general.web.tls: true` — the
+    // binary IS replaced (unlike reconfigure), the unit is installed
+    // bare (it reads general.web itself) and the desktop connects https.
     #[test]
-    fn t85_enable_with_remote_file_installs_remote_service() {
+    fn t86_replace_with_tls_config_installs_bare_and_connects_https() {
         let sys = FakeSys::new();
-        sys.seed_file(SETTINGS_FILE, render_settings_file(Settings::Remote));
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        // Start sees NotInstalled; the post-enable refresh sees Installed.
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![
-                run_out(Some(0), NOT_INSTALLED, ""),
-                installed_status_tls("running", "on"),
-            ],
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec {
-            mode: ChildMode::ExitsOnInterrupt,
-            exit: Some(0),
-            ..Default::default()
-        });
-        sys.seed_file(CONFIG_YAML, "provider:\n  type: openrouter\n");
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "install", "--bind", "0.0.0.0:7823", "--tls"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(true);
-        let mut ctrl = started(sys.clone(), ui.clone());
-
-        // The session itself runs with the remote settings (invariant I4).
-        assert_eq!(
-            sys.spawned_specs()[0].args,
-            vec![
-                "--bind".to_string(),
-                "0.0.0.0:7824".to_string(),
-                "--tls".to_string()
-            ],
-            "the session bind/flags come from settings.json"
-        );
-
-        let _ = ctrl.handle(Action::ToggleBackground);
-        assert!(
-            sys.run_args().iter().any(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "0.0.0.0:7823".to_string(),
-                    "--tls".to_string(),
-                ]
-            }),
-            "enable must install the remote service; runs: {:?}",
-            sys.run_args()
-        );
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Service { protocol, token, .. })
-                    if *protocol == Protocol::Https && token.is_some()
-            ),
-            "got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // Design #377 t86: Replace with an https settings file — the binary
-    // IS replaced (unlike reconfigure) and the service install gets
-    // --tls.
-    #[test]
-    fn t86_replace_with_https_file_installs_tls_and_binary() {
-        let sys = FakeSys::new();
-        sys.seed_file(
-            SETTINGS_FILE,
-            render_settings_file(Settings::Loopback {
-                protocol: Protocol::Https,
-                token: true,
-            }),
-        );
         sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
-        // Start sees the OLD installed service (no TLS line); the
-        // post-replace refresh sees the reinstalled one (TLS on).
+        // Start sees the OLD installed service; the post-replace refresh
+        // sees the bare unit (no TLS line).
         sys.set_run_seq(
             "peakbot",
             &["service", "status"],
             vec![
                 installed_status_at(INSTALLED_EXE, "running"),
-                installed_status_tls("running", "on"),
+                installed_status("running"),
             ],
         );
         sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(
+            CONFIG_YAML,
+            "general:\n  web:\n    tls: true\n    token: svc-token\n",
+        );
         sys.set_run(
             "peakbot",
             &["service", "uninstall"],
@@ -2704,7 +2426,7 @@ mod tests {
         sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823", "--tls"],
+            &["service", "install"],
             run_out(Some(0), "ok\n", ""),
         );
         sys.set_default_probe(vec![Probe::Status(200)]);
@@ -2716,1207 +2438,18 @@ mod tests {
         // install → service uninstall → service install.
         assert_order_ok(&sys.run_args());
         assert!(
-            sys.run_args().iter().any(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "127.0.0.1:7823".to_string(),
-                    "--tls".to_string(),
-                ]
-            }),
-            "the https settings file must reach `service install --tls`; runs: {:?}",
+            sys.run_args()
+                .iter()
+                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
+            "a bare `service install`; runs: {:?}",
             sys.run_args()
         );
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Service { protocol, .. })
-                    if *protocol == Protocol::Https
-            ),
-            "got {:?}",
+        assert_eq!(
+            ready_url(&ctrl).as_deref(),
+            Some("https://127.0.0.1:7823/?token=svc-token"),
+            "general.web.tls ⇒ https; got {:?}",
             ctrl.phase()
         );
-    }
-
-    // Design #377 t87 (criterion 9): a corrupt settings.json at Start
-    // loads as defaults; load never rewrites the file.
-    #[test]
-    fn t87_corrupt_settings_file_at_start_loads_defaults_without_rewrite() {
-        let sys = FakeSys::new();
-        sys.seed_file(SETTINGS_FILE, "not json");
-        let ui = FakeUi::new();
-        let ctrl = ready_session(sys.clone(), ui.clone());
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Session { protocol, .. })
-                    if *protocol == Protocol::Http
-            ),
-            "a corrupt file loads as the default (http); got {:?}",
-            ctrl.phase()
-        );
-        assert_eq!(
-            sys.spawned_specs()[0].args,
-            vec!["--bind".to_string(), "127.0.0.1:7824".to_string()],
-            "default session: no --tls"
-        );
-        assert!(
-            !sys.private_written().contains(Path::new(SETTINGS_FILE)),
-            "load must never write the settings file"
-        );
-        assert_eq!(
-            sys.file(Path::new(SETTINGS_FILE)).as_deref(),
-            Some("not json"),
-            "the corrupt file is left as-is"
-        );
-        assert!(
-            sys.private_written().contains(Path::new(WEB_TOKEN)),
-            "default token-on ⇒ the web-token is written 0600"
-        );
-    }
-
-    // Design #377 t76 (criterion 3): session mode, saving https — the
-    // session is relaunched with --tls and the webview URL is https.
-    #[test]
-    fn t76_save_settings_session_https() {
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        let old_pid = sys.spawned_pids()[0];
-        // The relaunch (handle_start) spawns a new session child.
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        ui.answer_confirm(true);
-
-        let _ = ctrl.handle(Action::SaveSettings(
-            Settings::Loopback {
-                protocol: Protocol::Https,
-                token: true,
-            }
-            .into(),
-        ));
-
-        // The file holds the new settings, byte-exact.
-        assert_eq!(
-            sys.file(Path::new(SETTINGS_FILE)).as_deref(),
-            Some("{\"v\":1,\"protocol\":\"https\",\"token\":true,\"remote\":false}\n"),
-            "settings.json must hold the rendered new settings"
-        );
-        // The old child was interrupted.
-        let evts = sys.events();
-        assert!(
-            evts.iter()
-                .any(|e| matches!(e, Effect::ChildInterrupt { pid } if *pid == old_pid)),
-            "the old session must be interrupted; events: {evts:?}"
-        );
-        // The new spawn's args end with --tls.
-        let spawns = sys.spawned_specs();
-        assert_eq!(spawns.len(), 2, "one relaunch");
-        assert_eq!(
-            spawns[1].args,
-            vec![
-                "--bind".to_string(),
-                "127.0.0.1:7824".to_string(),
-                "--tls".to_string()
-            ],
-            "the relaunched session must carry --tls"
-        );
-        // Ready(Session{Https}) and the URL is https with the token.
-        let mode = match ctrl.phase() {
-            Phase::Ready(m) => m.clone(),
-            other => panic!("expected Ready, got {other:?}"),
-        };
-        assert!(
-            matches!(
-                mode,
-                Mode::Session {
-                    protocol: Protocol::Https,
-                    token: Some(_),
-                    ..
-                }
-            ),
-            "got {mode:?}"
-        );
-        assert!(
-            mode.url()
-                .to_string()
-                .starts_with("https://127.0.0.1:7824/?token="),
-            "the webview URL must be https with the token; got {:?}",
-            mode.url()
-        );
-    }
-
-    // Design #377 t77 (criterion 4): session mode, saving token off —
-    // the web-token file is removed before the relaunch and the new
-    // session has no PEAKBOT_WEB_TOKEN and no ?token= URL.
-    #[test]
-    fn t77_save_settings_session_token_off() {
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        // The default launch created the web-token file.
-        assert!(sys.has_file(Path::new(WEB_TOKEN)), "precondition");
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        ui.answer_confirm(true);
-
-        let _ = ctrl.handle(Action::SaveSettings(
-            Settings::Loopback {
-                protocol: Protocol::Http,
-                token: false,
-            }
-            .into(),
-        ));
-
-        // The token file was removed BEFORE the new spawn.
-        let evts = sys.events();
-        let i_rm = evts
-            .iter()
-            .position(|e| matches!(e, Effect::Remove { path } if path == Path::new(WEB_TOKEN)))
-            .expect("the web-token file must be removed");
-        let new_pid = sys.spawned_pids()[1];
-        let i_spawn = evts
-            .iter()
-            .position(|e| matches!(e, Effect::Spawn { pid, .. } if *pid == new_pid))
-            .expect("the relaunched session");
-        assert!(
-            i_rm < i_spawn,
-            "the token file must be removed before the relaunched session reads it; events: {evts:?}"
-        );
-        // The new spawn has no PEAKBOT_WEB_TOKEN.
-        let spawns = sys.spawned_specs();
-        assert!(
-            !spawns[1]
-                .extra_env
-                .iter()
-                .any(|(k, _)| k == "PEAKBOT_WEB_TOKEN"),
-            "no PEAKBOT_WEB_TOKEN when the token is off; got {:?}",
-            spawns[1].extra_env
-        );
-        assert!(
-            spawns[1]
-                .extra_env
-                .iter()
-                .any(|(k, v)| k == "PEAKBOT_NO_OPEN" && v == "1"),
-            "PEAKBOT_NO_OPEN=1 stays; got {:?}",
-            spawns[1].extra_env
-        );
-        // Ready(Session{Http, None}) and the URL has no query.
-        let mode = match ctrl.phase() {
-            Phase::Ready(m) => m.clone(),
-            other => panic!("expected Ready, got {other:?}"),
-        };
-        assert!(
-            matches!(
-                mode,
-                Mode::Session {
-                    protocol: Protocol::Http,
-                    token: None,
-                    ..
-                }
-            ),
-            "got {mode:?}"
-        );
-        assert_eq!(
-            mode.url().to_string(),
-            "http://127.0.0.1:7824/",
-            "no ?token= without a token"
-        );
-        assert!(
-            !sys.has_file(Path::new(WEB_TOKEN)),
-            "the token file is gone"
-        );
-    }
-
-    // Design #377 t78 (criterion 10): cancelling the confirm changes
-    // nothing.
-    #[test]
-    fn t78_save_settings_confirm_cancel_changes_nothing() {
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        let evts_before = sys.events().len();
-        ui.answer_confirm(false);
-
-        let _ = ctrl.handle(Action::SaveSettings(
-            Settings::Loopback {
-                protocol: Protocol::Https,
-                token: true,
-            }
-            .into(),
-        ));
-
-        assert!(
-            ui.confirms().len() == 1,
-            "the confirm dialog was shown; got {:?}",
-            ui.confirms()
-        );
-        assert_eq!(
-            sys.events().len(),
-            evts_before,
-            "no side effects after a cancel; events: {:?}",
-            sys.events()
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "no relaunch");
-        assert!(
-            !sys.has_file(Path::new(SETTINGS_FILE)),
-            "nothing was written"
-        );
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Session { protocol, .. })
-                    if *protocol == Protocol::Http
-            ),
-            "the phase is unchanged; got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // Design #377 t79: saving the same settings is a no-op — no dialog,
-    // no effects.
-    #[test]
-    fn t79_save_settings_unchanged_is_a_noop() {
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        let evts_before = sys.events().len();
-
-        let _ = ctrl.handle(Action::SaveSettings(Settings::default().into()));
-
-        assert!(ui.confirms().is_empty(), "no dialog for an unchanged save");
-        assert_eq!(
-            sys.events().len(),
-            evts_before,
-            "no side effects for an unchanged save; events: {:?}",
-            sys.events()
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "no relaunch");
-        assert!(!sys.has_file(Path::new(SETTINGS_FILE)), "no file write");
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
-            "got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // Design #377 t80 (criterion 5): service mode, saving Remote —
-    // uninstall + `service install --bind 0.0.0.0:7823 --tls`, NO
-    // `install`, web-token written 0600 before the install.
-    #[test]
-    fn t80_save_settings_service_remote_reconfigures() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        // Start: TLS off; the post-reconfigure refresh: TLS on.
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![
-                installed_status_tls("running", "off"),
-                installed_status_tls("running", "on"),
-            ],
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "install", "--bind", "0.0.0.0:7823", "--tls"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        let ui = FakeUi::new();
-        let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Service { protocol, token, .. })
-                    if *protocol == Protocol::Http && token.is_none()
-            ),
-            "precondition: http tokenless service; got {:?}",
-            ctrl.phase()
-        );
-        ui.answer_confirm(true);
-
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Remote.into()));
-
-        // Command order: service uninstall → service install (remote).
-        let runs = sys.run_args();
-        let i_uninstall = runs
-            .iter()
-            .position(|r| r == &["service".to_string(), "uninstall".to_string()])
-            .expect("service uninstall ran");
-        let i_svc = runs
-            .iter()
-            .position(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "0.0.0.0:7823".to_string(),
-                    "--tls".to_string(),
-                ]
-            })
-            .expect("service install --bind 0.0.0.0:7823 --tls ran");
-        assert!(
-            i_uninstall < i_svc,
-            "uninstall before install; runs: {runs:?}"
-        );
-        assert!(
-            !runs.iter().any(|r| r == &["install".to_string()]),
-            "reconfigure must NOT run `install` (no binary swap); runs: {runs:?}"
-        );
-        // The web-token was written 0600 BEFORE the service install ran.
-        let evts = sys.events();
-        let i_tok = evts
-            .iter()
-            .position(
-                |e| matches!(e, Effect::WritePrivate { path } if path == Path::new(WEB_TOKEN)),
-            )
-            .expect("the web-token was written");
-        let i_install = evts
-            .iter()
-            .position(|e| {
-                matches!(
-                    e,
-                    Effect::Run { args, .. }
-                        if args == &["service".to_string(), "install".to_string(), "--bind".to_string(), "0.0.0.0:7823".to_string(), "--tls".to_string()]
-                )
-            })
-            .expect("the service install ran");
-        assert!(
-            i_tok < i_install,
-            "the token file must exist before the restarted service reads it; events: {evts:?}"
-        );
-        assert!(
-            sys.private_written().contains(Path::new(WEB_TOKEN)),
-            "the web-token was written 0600"
-        );
-        // The file holds the new settings.
-        assert_eq!(
-            sys.file(Path::new(SETTINGS_FILE)).as_deref(),
-            Some("{\"v\":1,\"protocol\":\"https\",\"token\":true,\"remote\":true}\n")
-        );
-        // Ready(Service{Https, Some(file token)}).
-        let tok = sys
-            .tokens_generated()
-            .first()
-            .cloned()
-            .expect("a token was generated for the remote service");
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service {
-                protocol, token, ..
-            }) => {
-                assert_eq!(*protocol, Protocol::Https, "status seq off→on");
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some(tok.as_str()),
-                    "Ready with the file token"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-    }
-
-    // Design #377 t81 (criterion 6): service mode, saving loopback
-    // token-off from a Remote file — the web-token is removed before the
-    // loopback reinstall.
-    #[test]
-    fn t81_save_settings_service_token_off_removes_token() {
-        let sys = FakeSys::new();
-        sys.seed_file(SETTINGS_FILE, render_settings_file(Settings::Remote));
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        // Start: TLS on (the remote service); the post-reconfigure
-        // refresh: TLS off.
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![
-                installed_status_tls("running", "on"),
-                installed_status_tls("running", "off"),
-            ],
-        );
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        let ui = FakeUi::new();
-        let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Service { protocol, .. })
-                    if *protocol == Protocol::Https
-            ),
-            "precondition: https service; got {:?}",
-            ctrl.phase()
-        );
-        ui.answer_confirm(true);
-
-        let _ = ctrl.handle(Action::SaveSettings(
-            Settings::Loopback {
-                protocol: Protocol::Http,
-                token: false,
-            }
-            .into(),
-        ));
-
-        // The web-token was removed BEFORE the service install ran.
-        let evts = sys.events();
-        let i_rm = evts
-            .iter()
-            .position(|e| matches!(e, Effect::Remove { path } if path == Path::new(WEB_TOKEN)))
-            .expect("the web-token file must be removed");
-        let i_install = evts
-            .iter()
-            .position(|e| {
-                matches!(
-                    e,
-                    Effect::Run { args, .. }
-                        if args == &["service".to_string(), "install".to_string(), "--bind".to_string(), "127.0.0.1:7823".to_string()]
-                )
-            })
-            .expect("service install --bind 127.0.0.1:7823 (no --tls) ran");
-        assert!(
-            i_rm < i_install,
-            "the token file must be removed before the restarted service reads it; events: {evts:?}"
-        );
-        let runs = sys.run_args();
-        assert!(
-            runs.iter()
-                .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
-            "the service was uninstalled first; runs: {runs:?}"
-        );
-        assert!(
-            !runs.iter().any(|r| r == &["install".to_string()]),
-            "no binary swap; runs: {runs:?}"
-        );
-        assert!(
-            !sys.private_written().contains(Path::new(WEB_TOKEN)),
-            "token off ⇒ no web-token write"
-        );
-        assert!(
-            !sys.has_file(Path::new(WEB_TOKEN)),
-            "the token file is gone"
-        );
-        assert_eq!(
-            sys.file(Path::new(SETTINGS_FILE)).as_deref(),
-            Some("{\"v\":1,\"protocol\":\"http\",\"token\":false,\"remote\":false}\n")
-        );
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service {
-                protocol, token, ..
-            }) => {
-                assert_eq!(*protocol, Protocol::Http, "status seq on→off");
-                assert!(token.is_none(), "no token");
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-    }
-
-    // Design #377 t82: a failing reconfigure install →
-    // Failed(ServiceCommandFailed); the file keeps the new settings
-    // (write-then-apply).
-    #[test]
-    fn t82_save_settings_reconfigure_install_failure() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_tls("running", "off"),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "install", "--bind", "0.0.0.0:7823", "--tls"],
-            run_out(Some(1), "", "reinstall failed\n"),
-        );
-        let ui = FakeUi::new();
-        let mut ctrl = started(sys.clone(), ui.clone());
-        ui.answer_confirm(true);
-
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Remote.into()));
-
-        match ctrl.phase() {
-            Phase::Failed(StartError::ServiceCommandFailed { command, output }) => {
-                assert!(
-                    command.contains("service install"),
-                    "command must name the failing verb; {command:?}"
-                );
-                assert!(
-                    output.contains("reinstall failed"),
-                    "output must carry the child's stderr; {output:?}"
-                );
-            }
-            other => panic!("expected ServiceCommandFailed, got {other:?}"),
-        }
-        assert_eq!(
-            sys.file(Path::new(SETTINGS_FILE)).as_deref(),
-            Some(render_settings_file(Settings::Remote).as_str()),
-            "write-then-apply: the file keeps the new settings"
-        );
-    }
-
-    // Design #377 t83: a failing settings write → the save-failed
-    // dialog; the session/service is untouched.
-    #[test]
-    fn t83_save_settings_write_failure_shows_dialog_and_changes_nothing() {
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        sys.fail_write(PathBuf::from(SETTINGS_FILE));
-        ui.answer_confirm(true);
-        let evts_before = sys.events().len();
-
-        let _ = ctrl.handle(Action::SaveSettings(
-            Settings::Loopback {
-                protocol: Protocol::Https,
-                token: true,
-            }
-            .into(),
-        ));
-
-        assert!(
-            ui.messages()
-                .iter()
-                .any(|d| { d.title == "Couldn't save settings" && d.body.contains(SETTINGS_FILE) }),
-            "the save-failed info dialog must show; got {:?}",
-            ui.messages()
-        );
-        assert_eq!(
-            sys.events().len(),
-            evts_before,
-            "no side effects after a failed write; events: {:?}",
-            sys.events()
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "the session is untouched");
-        assert!(
-            !sys.has_file(Path::new(SETTINGS_FILE)),
-            "nothing was written"
-        );
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Session { protocol, .. })
-                    if *protocol == Protocol::Http
-            ),
-            "the phase is unchanged; got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // Design #377 t89: SaveSettings while Starting is ignored, like its
-    // siblings.
-    #[test]
-    fn t89_save_settings_while_starting_is_ignored() {
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = Controller::new(
-            sys.clone(),
-            ui.clone(),
-            paths(),
-            Arc::new(AtomicBool::new(false)),
-            ReplacePolicy::Ask,
-            Platform::Unix,
-        );
-        let _ = ctrl.handle(Action::SaveSettings(Settings::Remote.into()));
-        assert!(
-            matches!(ctrl.phase(), Phase::Starting(StartStep::CheckingBundled)),
-            "phase must be untouched; got {:?}",
-            ctrl.phase()
-        );
-        assert!(sys.run_args().is_empty(), "no commands may run");
-        assert!(sys.spawned_specs().is_empty());
-        assert!(ui.confirms().is_empty());
-        assert!(ui.messages().is_empty());
-        assert!(sys.events().is_empty(), "no side effects at all");
-    }
-
-    // Design #377b t94: session mode, same settings + a new token — the
-    // web-token is written 0600 BEFORE the relaunch, settings.json is
-    // NOT written, and the new session runs with the user's token
-    // (nothing generated).
-    #[test]
-    fn t94_save_settings_session_token_only_relaunches() {
-        let new_tok = "new-user-token-123456";
-        let sys = FakeSys::new();
-        // Seed the file token so the INITIAL launch generates nothing —
-        // the "no RandomToken" assertion below checks the whole log.
-        sys.seed_file(WEB_TOKEN, "old-session-token-123456\n");
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        let old_pid = sys.spawned_pids()[0];
-        // The relaunch (handle_start) spawns a new session child.
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        ui.answer_confirm(true);
-
-        let req = SaveRequest::parse(
-            SettingsWire {
-                protocol: Protocol::Http,
-                token: true,
-                remote: false,
-            },
-            new_tok,
-        )
-        .expect("a valid token parses");
-        let _ = ctrl.handle(Action::SaveSettings(req));
-
-        // One relaunch dialog.
-        assert_eq!(ui.confirms().len(), 1, "one save ⇒ one dialog");
-        assert_eq!(ui.confirms()[0].title, "Apply settings?");
-        assert_eq!(ui.confirms()[0].ok, "Restart");
-
-        // The web-token was written 0600 BEFORE the old child was
-        // interrupted and the new one spawned.
-        let evts = sys.events();
-        let i_tok = evts
-            .iter()
-            .position(
-                |e| matches!(e, Effect::WritePrivate { path } if path == Path::new(WEB_TOKEN)),
-            )
-            .expect("the web-token was written");
-        let i_intr = evts
-            .iter()
-            .position(|e| matches!(e, Effect::ChildInterrupt { pid } if *pid == old_pid))
-            .expect("the old child was interrupted");
-        let new_pid = sys.spawned_pids()[1];
-        let i_spawn = evts
-            .iter()
-            .position(|e| matches!(e, Effect::Spawn { pid, .. } if *pid == new_pid))
-            .expect("the relaunched session");
-        assert!(
-            i_tok < i_intr,
-            "the token file must be written before the relaunch; events: {evts:?}"
-        );
-        assert!(
-            i_tok < i_spawn,
-            "the token file must be written before the new session reads it; events: {evts:?}"
-        );
-        assert!(
-            sys.private_written().contains(Path::new(WEB_TOKEN)),
-            "the web-token was written 0600"
-        );
-        assert_eq!(sys.file(Path::new(WEB_TOKEN)).as_deref(), Some(new_tok));
-
-        // settings.json is NOT written (the settings are unchanged).
-        assert!(
-            !sys.has_file(Path::new(SETTINGS_FILE)),
-            "a token-only change must not touch settings.json"
-        );
-
-        // The new session runs with the user's token; nothing generated.
-        let spawns = sys.spawned_specs();
-        assert_eq!(spawns.len(), 2, "one relaunch");
-        assert!(
-            spawns[1]
-                .extra_env
-                .iter()
-                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == new_tok),
-            "the spawn env carries the user's token; got {:?}",
-            spawns[1].extra_env
-        );
-        assert!(
-            evts.iter().all(|e| !matches!(e, Effect::RandomToken)),
-            "no token generation; events: {evts:?}"
-        );
-
-        // Ready with the new token in the URL.
-        let mode = match ctrl.phase() {
-            Phase::Ready(m) => m.clone(),
-            other => panic!("expected Ready, got {other:?}"),
-        };
-        assert!(
-            matches!(
-                mode,
-                Mode::Session {
-                    token: Some(ref t),
-                    ..
-                } if t.as_str() == new_tok
-            ),
-            "got {mode:?}"
-        );
-        assert!(
-            mode.url()
-                .to_string()
-                .ends_with(&format!("?token={new_tok}")),
-            "the webview URL carries the new token; got {:?}",
-            mode.url()
-        );
-    }
-
-    // Design #377b t95: service mode, a token-only change — the
-    // reinstall dialog, the web-token is written 0600 BEFORE
-    // `service uninstall`, the token never reaches any argv, and
-    // Ready(Service{…, Some(new)}).
-    #[test]
-    fn t95_save_settings_service_token_only_reconfigures() {
-        let new_tok = "svc-user-token-12345678";
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_tls("running", "off"),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        let ui = FakeUi::new();
-        let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Service { protocol, token, .. })
-                    if *protocol == Protocol::Http && token.is_none()
-            ),
-            "precondition: a tokenless http service; got {:?}",
-            ctrl.phase()
-        );
-        assert!(!sys.has_file(Path::new(WEB_TOKEN)), "precondition: no file");
-        ui.answer_confirm(true);
-
-        let req = SaveRequest::parse(
-            SettingsWire {
-                protocol: Protocol::Http,
-                token: true,
-                remote: false,
-            },
-            new_tok,
-        )
-        .expect("a valid token parses");
-        let _ = ctrl.handle(Action::SaveSettings(req));
-
-        // The reinstall dialog (no `service restart` verb exists;
-        // the reinstall IS the restart).
-        assert_eq!(ui.confirms().len(), 1, "one save ⇒ one dialog");
-        assert_eq!(ui.confirms()[0].title, "Apply settings?");
-        assert_eq!(ui.confirms()[0].ok, "Reinstall");
-
-        // The web-token was written 0600 BEFORE the service uninstall.
-        let evts = sys.events();
-        let i_tok = evts
-            .iter()
-            .position(
-                |e| matches!(e, Effect::WritePrivate { path } if path == Path::new(WEB_TOKEN)),
-            )
-            .expect("the web-token was written");
-        let i_uninst = evts
-            .iter()
-            .position(|e| {
-                matches!(
-                    e,
-                    Effect::Run { args, .. }
-                        if args == &["service".to_string(), "uninstall".to_string()]
-                )
-            })
-            .expect("service uninstall ran");
-        assert!(
-            i_tok < i_uninst,
-            "the token file must exist before the restarted service reads it; events: {evts:?}"
-        );
-        assert!(
-            sys.private_written().contains(Path::new(WEB_TOKEN)),
-            "the web-token was written 0600"
-        );
-        assert_eq!(sys.file(Path::new(WEB_TOKEN)).as_deref(), Some(new_tok));
-
-        // No settings.json write; the token never reaches any argv.
-        assert!(
-            !sys.has_file(Path::new(SETTINGS_FILE)),
-            "a token-only change must not touch settings.json"
-        );
-        for run in sys.run_args() {
-            assert!(
-                run.iter().all(|a| a != new_tok),
-                "the token must not appear in any argv; run: {run:?}"
-            );
-        }
-        assert!(
-            sys.spawned_specs().is_empty(),
-            "no session spawn in service mode"
-        );
-        assert!(
-            evts.iter().all(|e| !matches!(e, Effect::RandomToken)),
-            "the user's token is kept, nothing generated; events: {evts:?}"
-        );
-
-        // Ready(Service{Http, Some(new)}).
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service {
-                protocol, token, ..
-            }) => {
-                assert_eq!(*protocol, Protocol::Http);
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some(new_tok),
-                    "Ready with the user's token"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-    }
-
-    // Design #377b t96: the same settings with a token equal to the
-    // file's token is a no-op — no dialog, no effects.
-    #[test]
-    fn t96_save_settings_same_settings_same_token_is_a_noop() {
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        let file_tok = sys
-            .file(Path::new(WEB_TOKEN))
-            .expect("the launch created the web-token")
-            .trim()
-            .to_string();
-        let evts_before = sys.events().len();
-
-        let req = SaveRequest::parse(
-            SettingsWire {
-                protocol: Protocol::Http,
-                token: true,
-                remote: false,
-            },
-            &file_tok,
-        )
-        .expect("a valid token parses");
-        let _ = ctrl.handle(Action::SaveSettings(req));
-
-        assert!(
-            ui.confirms().is_empty(),
-            "no dialog for the same settings + the same token"
-        );
-        assert_eq!(
-            sys.events().len(),
-            evts_before,
-            "no side effects; events: {:?}",
-            sys.events()
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "no relaunch");
-        assert!(!sys.has_file(Path::new(SETTINGS_FILE)), "no file write");
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
-            "got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // Design #377b t97: cancelling the confirm leaves the web-token
-    // and the settings file untouched, and nothing is spawned.
-    #[test]
-    fn t97_save_settings_cancel_writes_nothing() {
-        let new_tok = "cancel-me-token-123456789";
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        let token_before = sys
-            .file(Path::new(WEB_TOKEN))
-            .expect("the launch created the web-token");
-        let evts_before = sys.events().len();
-        ui.answer_confirm(false);
-
-        let req = SaveRequest::parse(
-            SettingsWire {
-                protocol: Protocol::Https,
-                token: true,
-                remote: false,
-            },
-            new_tok,
-        )
-        .expect("a valid token parses");
-        let _ = ctrl.handle(Action::SaveSettings(req));
-
-        assert_eq!(ui.confirms().len(), 1, "the confirm dialog was shown");
-        assert_eq!(
-            sys.file(Path::new(WEB_TOKEN)),
-            Some(token_before),
-            "the web-token is untouched"
-        );
-        assert!(
-            !sys.has_file(Path::new(SETTINGS_FILE)),
-            "nothing was written"
-        );
-        assert_eq!(
-            sys.events().len(),
-            evts_before,
-            "no side effects after a cancel; events: {:?}",
-            sys.events()
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "no relaunch");
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Session { protocol, .. }) if *protocol == Protocol::Http
-            ),
-            "the phase is unchanged; got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // Design #377b t98: Http→Https + a new token in ONE save — one
-    // dialog, the token write BEFORE the settings write, one relaunch
-    // with --tls carrying the user's token.
-    #[test]
-    fn t98_save_settings_protocol_and_token_together() {
-        let new_tok = "https-user-token-1234567";
-        let sys = FakeSys::new();
-        // Seed the file token so the INITIAL launch generates nothing —
-        // the "no RandomToken" assertion below checks the whole log.
-        sys.seed_file(WEB_TOKEN, "old-session-token-123456\n");
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        ui.answer_confirm(true);
-
-        let req = SaveRequest::parse(
-            SettingsWire {
-                protocol: Protocol::Https,
-                token: true,
-                remote: false,
-            },
-            new_tok,
-        )
-        .expect("a valid token parses");
-        let _ = ctrl.handle(Action::SaveSettings(req));
-
-        assert_eq!(ui.confirms().len(), 1, "one save ⇒ one dialog");
-
-        // The token write comes first, the settings write second.
-        let evts = sys.events();
-        let i_tok = evts
-            .iter()
-            .position(
-                |e| matches!(e, Effect::WritePrivate { path } if path == Path::new(WEB_TOKEN)),
-            )
-            .expect("the web-token was written");
-        let i_file = evts
-            .iter()
-            .position(
-                |e| matches!(e, Effect::WritePrivate { path } if path == Path::new(SETTINGS_FILE)),
-            )
-            .expect("settings.json was written");
-        assert!(
-            i_tok < i_file,
-            "the token file must be written before the settings file; events: {evts:?}"
-        );
-        assert_eq!(sys.file(Path::new(WEB_TOKEN)).as_deref(), Some(new_tok));
-        assert_eq!(
-            sys.file(Path::new(SETTINGS_FILE)).as_deref(),
-            Some("{\"v\":1,\"protocol\":\"https\",\"token\":true,\"remote\":false}\n")
-        );
-
-        // One relaunch, with --tls and the user's token.
-        let spawns = sys.spawned_specs();
-        assert_eq!(spawns.len(), 2, "one relaunch");
-        assert_eq!(
-            spawns[1].args,
-            vec![
-                "--bind".to_string(),
-                "127.0.0.1:7824".to_string(),
-                "--tls".to_string()
-            ],
-            "the relaunched session must carry --tls"
-        );
-        assert!(
-            spawns[1]
-                .extra_env
-                .iter()
-                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == new_tok),
-            "the spawn env carries the user's token; got {:?}",
-            spawns[1].extra_env
-        );
-        assert!(
-            evts.iter().all(|e| !matches!(e, Effect::RandomToken)),
-            "the user's token is kept, nothing generated; events: {evts:?}"
-        );
-
-        let mode = match ctrl.phase() {
-            Phase::Ready(m) => m.clone(),
-            other => panic!("expected Ready, got {other:?}"),
-        };
-        assert!(
-            matches!(
-                mode,
-                Mode::Session {
-                    protocol: Protocol::Https,
-                    token: Some(ref t),
-                    ..
-                } if t.as_str() == new_tok
-            ),
-            "got {mode:?}"
-        );
-    }
-
-    // Design #377b t99: a failing web-token write → the save-failed
-    // dialog naming the web-token path; nothing else is written,
-    // nothing restarts.
-    #[test]
-    fn t99_save_settings_token_write_failure_changes_nothing() {
-        let new_tok = "fail-write-token-1234567";
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        sys.fail_write(PathBuf::from(WEB_TOKEN));
-        ui.answer_confirm(true);
-        let evts_before = sys.events().len();
-
-        let req = SaveRequest::parse(
-            SettingsWire {
-                protocol: Protocol::Https,
-                token: true,
-                remote: false,
-            },
-            new_tok,
-        )
-        .expect("a valid token parses");
-        let _ = ctrl.handle(Action::SaveSettings(req));
-
-        assert!(
-            ui.messages()
-                .iter()
-                .any(|d| d.title == "Couldn't save settings" && d.body.contains(WEB_TOKEN)),
-            "the save-failed dialog must name the web-token path; got {:?}",
-            ui.messages()
-        );
-        assert!(
-            !sys.has_file(Path::new(SETTINGS_FILE)),
-            "settings.json must not be written after a failed token write"
-        );
-        assert_eq!(
-            sys.events().len(),
-            evts_before,
-            "no side effects after the failed write; events: {:?}",
-            sys.events()
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "no relaunch");
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Session { protocol, .. }) if *protocol == Protocol::Http
-            ),
-            "the phase is unchanged; got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // Design #377b t100: token off→on with a value — the file holds
-    // the user's value, and no token is generated (the empty→generate
-    // path stays locked by t40).
-    #[test]
-    fn t100_save_settings_token_off_to_on_with_value() {
-        let new_tok = "off-to-on-token-123456789";
-        let sys = FakeSys::new();
-        sys.seed_file(
-            SETTINGS_FILE,
-            render_settings_file(Settings::Loopback {
-                protocol: Protocol::Http,
-                token: false,
-            }),
-        );
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            run_out(Some(0), NOT_INSTALLED, ""),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec {
-            mode: ChildMode::ExitsOnInterrupt,
-            exit: Some(0),
-            ..Default::default()
-        });
-        let ui = FakeUi::new();
-        let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Session { protocol, token, .. })
-                    if *protocol == Protocol::Http && token.is_none()
-            ),
-            "precondition: a tokenless session; got {:?}",
-            ctrl.phase()
-        );
-        assert!(!sys.has_file(Path::new(WEB_TOKEN)), "token off ⇒ no file");
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        ui.answer_confirm(true);
-
-        let req = SaveRequest::parse(
-            SettingsWire {
-                protocol: Protocol::Http,
-                token: true,
-                remote: false,
-            },
-            new_tok,
-        )
-        .expect("a valid token parses");
-        let _ = ctrl.handle(Action::SaveSettings(req));
-
-        assert_eq!(
-            sys.file(Path::new(WEB_TOKEN)).as_deref(),
-            Some(new_tok),
-            "the file holds the user's value"
-        );
-        assert!(
-            sys.private_written().contains(Path::new(WEB_TOKEN)),
-            "the web-token was written 0600"
-        );
-        assert_eq!(
-            sys.file(Path::new(SETTINGS_FILE)).as_deref(),
-            Some(
-                render_settings_file(Settings::Loopback {
-                    protocol: Protocol::Http,
-                    token: true,
-                })
-                .as_str()
-            )
-        );
-        let evts = sys.events();
-        assert!(
-            evts.iter().all(|e| !matches!(e, Effect::RandomToken)),
-            "the user's token is kept, nothing generated; events: {evts:?}"
-        );
-        let spawns = sys.spawned_specs();
-        assert_eq!(spawns.len(), 2, "one relaunch");
-        assert!(
-            spawns[1]
-                .extra_env
-                .iter()
-                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == new_tok),
-            "the spawn env carries the user's token; got {:?}",
-            spawns[1].extra_env
-        );
-        match ctrl.phase() {
-            Phase::Ready(Mode::Session { token, .. }) => {
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some(new_tok),
-                    "Ready with the user's token"
-                );
-            }
-            other => panic!("expected Ready(Session), got {other:?}"),
-        }
     }
 
     // -------------------------------------------------------------------
@@ -3926,7 +2459,7 @@ mod tests {
     // installed exe's file contents are seeded with `sys.seed_file`.
     // "build-A" vs "build-B" ⇒ the builds differ; both "build-A" ⇒
     // identical. "Replace scripts" = `install`, `service uninstall` and
-    // `service install --bind 127.0.0.1:7823 [--tls]` scripted ok, plus
+    // the bare `service install` scripted ok, plus
     // `service status` as a [pre, post] sequence where post =
     // `installed_status_tls("running", …)` (Exec = SIDECAR).
     // -------------------------------------------------------------------
@@ -3941,7 +2474,7 @@ mod tests {
         );
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
+            &["service", "install"],
             run_out(Some(0), "ok\n", ""),
         );
     }
@@ -3984,7 +2517,7 @@ mod tests {
         );
         sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
         seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.seed_file(DECLINED, "installed=0.20.0\nbundled=0.21.0\n"); // stale; must be removed
         script_replace_http(&sys);
         sys.set_probe(
@@ -4023,14 +2556,12 @@ mod tests {
             "identity is checked before the version; events: {evts:?}"
         );
         match ctrl.phase() {
-            Phase::Ready(Mode::Service {
-                protocol, token, ..
-            }) => {
-                assert_eq!(*protocol, Protocol::Http, "http service (no TLS line)");
+            Phase::Ready(Mode::Service(WebTarget { tls, token, .. })) => {
+                assert!(!*tls, "http service (no TLS line)");
                 assert_eq!(
                     token.as_ref().map(|t| t.as_str()),
                     Some("svc-token"),
-                    "the token is the web-token file's"
+                    "the token is general.web.token"
                 );
             }
             other => panic!("expected Ready(Service), got {other:?}"),
@@ -4051,7 +2582,7 @@ mod tests {
             installed_status_at(INSTALLED_SAME, "running"),
         );
         seed_builds_identical(&sys, INSTALLED_SAME);
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -4059,7 +2590,7 @@ mod tests {
         let ui = FakeUi::new();
         let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4094,10 +2625,10 @@ mod tests {
             installed_status_at(INSTALLED_SAME, "stopped"),
         );
         seed_builds_identical(&sys, INSTALLED_SAME);
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
+            &["service", "install"],
             run_out(Some(0), "ok\n", ""),
         );
         sys.set_probe(
@@ -4107,21 +2638,14 @@ mod tests {
         let ui = FakeUi::new();
         let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
         let runs = sys.run_args();
         assert_eq!(
             runs.iter()
-                .filter(|r| {
-                    *r == &[
-                        "service".to_string(),
-                        "install".to_string(),
-                        "--bind".to_string(),
-                        "127.0.0.1:7823".to_string(),
-                    ]
-                })
+                .filter(|r| { *r == &["service".to_string(), "install".to_string(),] })
                 .count(),
             1,
             "a stopped identical service is (re)started once; runs: {runs:?}"
@@ -4166,7 +2690,7 @@ mod tests {
         );
         assert_order_ok(&sys.run_args());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4201,7 +2725,7 @@ mod tests {
         );
         assert_order_ok(&sys.run_args());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4220,7 +2744,7 @@ mod tests {
         );
         sys.set_run("peakbot-0.24.0", &["--version"], versioned("0.24.0"));
         seed_builds_differ(&sys, INSTALLED_NEWER);
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -4229,7 +2753,7 @@ mod tests {
         ui.answer_confirm(false); // Keep
         let mut ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4254,7 +2778,7 @@ mod tests {
         // Next Start: no dialog, connects.
         let _ = ctrl.handle(Action::Start);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4296,7 +2820,7 @@ mod tests {
         );
         assert_order_ok(&sys.run_args());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4314,7 +2838,7 @@ mod tests {
             installed_status_at(INSTALLED_GARBAGE, "running"),
         );
         seed_builds_identical(&sys, INSTALLED_GARBAGE);
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -4323,7 +2847,7 @@ mod tests {
         let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
 
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4336,14 +2860,11 @@ mod tests {
         assert!(ui.confirms().is_empty(), "no dialog");
     }
 
-    // Design auto-replace t114 (SC6/A4): the silent replace reproduces
-    // the RUNNING service — protocol from the TLS line, token from the
-    // web-token file, which is never touched.
+    // Design auto-replace t114 (SC6/A4, 0.24): the silent replace
+    // installs a bare unit and the desktop writes nothing — the token is
+    // general.web.token; https follows the unit's `TLS:` line.
     #[test]
-    fn t114_auto_replace_preserves_tls_and_token() {
-        // (a) No settings file at all, service runs with TLS: the
-        // reinstall gets `--tls`, the token file is untouched, and no
-        // token is minted.
+    fn t114_auto_replace_installs_bare_and_writes_nothing() {
         let sys = FakeSys::new();
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
         let pre = run_out(
@@ -4360,180 +2881,51 @@ mod tests {
         );
         sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
         seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823", "--tls"],
-            run_out(Some(0), "ok\n", ""),
-        );
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
+        script_replace_http(&sys);
         sys.set_probe(
             "https://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Listening],
-        );
-        let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-
-        assert!(
-            sys.run_args().iter().any(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "127.0.0.1:7823".to_string(),
-                    "--tls".to_string(),
-                ]
-            }),
-            "the TLS line must reach `service install --tls`; runs: {:?}",
-            sys.run_args()
-        );
-        assert_eq!(
-            sys.file(Path::new(WEB_TOKEN)).as_deref(),
-            Some("svc-token\n"),
-            "the web-token file is untouched"
-        );
-        let evts = sys.events();
-        assert!(
-            evts.iter().all(|e| {
-                !matches!(e, Effect::WritePrivate { path } if path == Path::new(WEB_TOKEN))
-                    && !matches!(e, Effect::Remove { path } if path == Path::new(WEB_TOKEN))
-            }),
-            "no WritePrivate/Remove on the web-token; events: {evts:?}"
-        );
-        assert!(
-            evts.iter().all(|e| !matches!(e, Effect::RandomToken)),
-            "no token may be minted; events: {evts:?}"
-        );
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service {
-                protocol, token, ..
-            }) => {
-                assert_eq!(*protocol, Protocol::Https, "the TLS line ⇒ https");
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some("svc-token"),
-                    "the token is the file's"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-
-        // (b) Settings with token OFF + a TLS-off service: the reinstall
-        // has no `--tls`, and the web-token file is NOT removed (the
-        // silent path never syncs the token).
-        let sys = FakeSys::new();
-        sys.seed_file(
-            SETTINGS_FILE,
-            render_settings_file(Settings::Loopback {
-                protocol: Protocol::Http,
-                token: false,
-            }),
-        );
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        let pre = installed_status_at(INSTALLED_SAME, "running");
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![pre, installed_status_tls("running", "off")],
-        );
-        sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
-        seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
-        script_replace_http(&sys);
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
         );
         let ui = FakeUi::new();
         let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
 
         let runs = sys.run_args();
         assert!(
-            runs.iter().any(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "127.0.0.1:7823".to_string(),
-                ]
-            }),
-            "a TLS-off service is reinstalled without --tls; runs: {runs:?}"
+            runs.iter()
+                .any(|r| r == &["service".to_string(), "install".to_string()]),
+            "a bare `service install`; runs: {runs:?}"
         );
         assert!(
-            runs.iter().all(|r| !r.iter().any(|a| a == "--tls")),
-            "no --tls anywhere; runs: {runs:?}"
+            runs.iter().all(|r| !r
+                .iter()
+                .any(|a| ["--bind", "--tls", "--token"].contains(&a.as_str()))),
+            "no --bind/--tls/--token on any command; runs: {runs:?}"
         );
+        let writes: Vec<PathBuf> = sys
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                Effect::WritePrivate { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
         assert!(
-            sys.has_file(Path::new(WEB_TOKEN)),
-            "the silent path must NOT remove the web-token (token off in settings.json is not applied)"
+            writes.is_empty(),
+            "the silent path writes no file; wrote {writes:?}"
         );
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
-            "got {:?}",
-            ctrl.phase()
-        );
+        match ctrl.phase() {
+            Phase::Ready(Mode::Service(WebTarget { tls, token, .. })) => {
+                assert!(*tls, "the TLS line ⇒ https");
+                assert_eq!(
+                    token.as_ref().map(|t| t.as_str()),
+                    Some("svc-token"),
+                    "the token is general.web.token"
+                );
+            }
+            other => panic!("expected Ready(Service), got {other:?}"),
+        }
         assert!(ui.confirms().is_empty(), "no dialog");
-
-        // (c) Saved settings Remote + TLS on: bind 0.0.0.0 with --tls.
-        let sys = FakeSys::new();
-        sys.seed_file(SETTINGS_FILE, render_settings_file(Settings::Remote));
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        let pre = run_out(
-            Some(0),
-            &format!(
-                "Installed: true\nExec:      {INSTALLED_SAME}\nState:     running\nTLS:       on\n"
-            ),
-            "",
-        );
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![pre, installed_status_tls("running", "on")],
-        );
-        sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
-        seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "install", "--bind", "0.0.0.0:7823", "--tls"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_probe(
-            "https://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Listening],
-        );
-        let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-
-        assert!(
-            sys.run_args().iter().any(|r| {
-                r == &[
-                    "service".to_string(),
-                    "install".to_string(),
-                    "--bind".to_string(),
-                    "0.0.0.0:7823".to_string(),
-                    "--tls".to_string(),
-                ]
-            }),
-            "Remote + TLS ⇒ 0.0.0.0 with --tls; runs: {:?}",
-            sys.run_args()
-        );
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
-            "got {:?}",
-            ctrl.phase()
-        );
     }
 
     // Design auto-replace t115 (SC7): a STOPPED service is replaced —
@@ -4581,7 +2973,7 @@ mod tests {
             "service install runs exactly once (it (re)starts the unit); runs: {runs:?}"
         );
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4666,7 +3058,7 @@ mod tests {
         );
         sys.set_run(
             "peakbot",
-            &["service", "install", "--bind", "127.0.0.1:7823"],
+            &["service", "install"],
             run_out(Some(1), "", "unit failed to start\n"),
         );
         let ui = FakeUi::new();
@@ -4715,7 +3107,7 @@ mod tests {
         assert!(ui.confirms().is_empty(), "no dialog");
         assert_order_ok(&sys.run_args());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4734,12 +3126,15 @@ mod tests {
         );
         sys.set_default_probe(vec![Probe::Status(200)]);
         sys.queue_child(crate::testing::FakeChildSpec::alive());
-        sys.seed_file(WEB_TOKEN, "seeded-token\n");
+        sys.seed_file(
+            CONFIG_YAML,
+            web_yaml("127.0.0.1:7823", Some("seeded-token")),
+        );
         let ui = FakeUi::new();
         let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
 
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4775,7 +3170,7 @@ mod tests {
         );
         sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
         seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.seed_file(WEB_TOKEN, "svc-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
         sys.set_probe(
             "http://127.0.0.1:7823/commands?token=svc-token",
             vec![Probe::Status(200)],
@@ -4805,7 +3200,7 @@ mod tests {
             sys.run_args()
         );
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service { .. })),
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
             "got {:?}",
             ctrl.phase()
         );
@@ -4844,7 +3239,7 @@ mod tests {
             seed_builds_identical(&sys, INSTALLED_SAME);
             sys.set_default_probe(vec![Probe::Status(200)]);
             sys.queue_child(crate::testing::FakeChildSpec::alive());
-            sys.seed_file(WEB_TOKEN, "win-token\n");
+            sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("win-token")));
             let ui = FakeUi::new();
             let ctrl = started_on(
                 sys.clone(),
@@ -4857,8 +3252,7 @@ mod tests {
             assert!(
                 matches!(
                     ctrl.phase(),
-                    Phase::Ready(Mode::Session { port, .. })
-                        if *port == SESSION_PREFERRED_PORT
+                    Phase::Ready(Mode::Session(t)) if t.bind.port() == 7823
                 ),
                 "Windows start must land Ready(Session) even with an installed service (state {state:?}); got {:?}",
                 ctrl.phase()
@@ -4867,16 +3261,21 @@ mod tests {
             assert_eq!(spawns.len(), 1, "the session sidecar was spawned once");
             assert_eq!(
                 spawns[0].args,
-                vec!["--bind".to_string(), "127.0.0.1:7824".to_string()],
+                Vec::<String>::new(),
                 "the spawn is exactly the session path's (state {state:?}); got {:?}",
                 spawns[0].args
+            );
+            assert_eq!(
+                ready_url(&ctrl).as_deref(),
+                Some("http://127.0.0.1:7823/?token=win-token"),
+                "the session target is general.web (state {state:?})"
             );
             assert!(
                 spawns[0]
                     .extra_env
                     .iter()
-                    .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == "win-token"),
-                "the session token plumbing is unchanged (state {state:?}); got {:?}",
+                    .all(|(k, _)| k != "PEAKBOT_WEB_TOKEN"),
+                "no token in the child env (state {state:?}); got {:?}",
                 spawns[0].extra_env
             );
 
@@ -4955,7 +3354,7 @@ mod tests {
         // (like t116) — the session path must not need them.
         sys.set_default_probe(vec![Probe::Status(200)]);
         sys.queue_child(crate::testing::FakeChildSpec::alive());
-        sys.seed_file(WEB_TOKEN, "win-token\n");
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("win-token")));
         let ui = FakeUi::new();
         let ctrl = started_on(
             sys.clone(),
@@ -4967,8 +3366,7 @@ mod tests {
         assert!(
             matches!(
                 ctrl.phase(),
-                Phase::Ready(Mode::Session { port, .. })
-                    if *port == SESSION_PREFERRED_PORT
+                Phase::Ready(Mode::Session(t)) if t.bind.port() == 7823
             ),
             "the session path must be taken; got {:?}",
             ctrl.phase()
@@ -4977,7 +3375,7 @@ mod tests {
         assert_eq!(spawns.len(), 1, "the session sidecar was spawned");
         assert_eq!(
             spawns[0].args,
-            vec!["--bind".to_string(), "127.0.0.1:7824".to_string()],
+            Vec::<String>::new(),
             "the spawn is exactly the session path's; got {:?}",
             spawns[0].args
         );
@@ -5026,5 +3424,304 @@ mod tests {
             "no replace dialog; got {:?}",
             ui.confirms()
         );
+    }
+
+    // -------------------------------------------------------------------
+    // T15b (0.24 config, spec §8.4/§11.6) — general.web is the desktop's
+    // only web config: read on every (re)start and again on Ready;
+    // Action::Restart restarts only the server; no settings.json or
+    // web-token file I/O anywhere.
+    // -------------------------------------------------------------------
+
+    /// A config.yaml whose `general.web` carries `bind` and an optional
+    /// token (the rest of the file is irrelevant to the desktop).
+    fn web_yaml(bind: &str, token: Option<&str>) -> String {
+        let mut s = format!("providers: {{}}\ngeneral:\n  web:\n    bind: \"{bind}\"\n");
+        if let Some(t) = token {
+            s.push_str(&format!("    token: {t}\n"));
+        }
+        s
+    }
+
+    // Spec §11.6: session-mode Restart stops the child, re-reads
+    // general.web (a changed bind ⇒ a new URL) and relaunches; no dialog,
+    // the app keeps running.
+    #[test]
+    fn restart_session_rereads_bind() {
+        let sys = FakeSys::new();
+        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", None));
+        let ui = FakeUi::new();
+        let mut ctrl = ready_session(sys.clone(), ui.clone());
+        assert_eq!(
+            ready_url(&ctrl).as_deref(),
+            Some("http://127.0.0.1:7823/"),
+            "precondition: Ready on the configured bind"
+        );
+        let old_pid = sys.spawned_pids()[0];
+
+        // The user edits general.web in Settings, then clicks Restart now.
+        sys.seed_file(
+            CONFIG_YAML,
+            web_yaml("127.0.0.1:9100", Some("restart-token-0001")),
+        );
+        sys.queue_child(crate::testing::FakeChildSpec::alive());
+        let flow = ctrl.handle(Action::Restart);
+        assert_eq!(flow, ControlFlow::Continue(()), "the app never exits");
+
+        assert!(
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            "got {:?}",
+            ctrl.phase()
+        );
+        assert_eq!(
+            ready_url(&ctrl).as_deref(),
+            Some("http://127.0.0.1:9100/?token=restart-token-0001"),
+            "the relaunch re-reads general.web"
+        );
+        let pids = sys.spawned_pids();
+        assert_eq!(pids.len(), 2, "exactly one relaunch");
+        let evts = sys.events();
+        let i_stop = evts
+            .iter()
+            .position(|e| matches!(e, Effect::ChildInterrupt { pid } if *pid == old_pid))
+            .expect("the old child was stopped");
+        let i_spawn = evts
+            .iter()
+            .position(|e| matches!(e, Effect::Spawn { pid, .. } if *pid == pids[1]))
+            .expect("the new child was spawned");
+        assert!(i_stop < i_spawn, "stop before relaunch; events: {evts:?}");
+        assert!(
+            sys.spawned_specs()[1].args.is_empty(),
+            "the relaunch passes no web flags"
+        );
+        assert!(ui.confirms().is_empty(), "Restart asks nothing");
+    }
+
+    // Spec §11.6: service-mode Restart runs the reinstall path
+    // (`reconfigure_service`: uninstall + bare install, NO binary copy),
+    // then reconnects on the re-read general.web.
+    #[test]
+    fn restart_service_reinstalls() {
+        let sys = FakeSys::new();
+        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
+        sys.set_run(
+            "peakbot",
+            &["service", "status"],
+            installed_status("running"),
+        );
+        sys.seed_file(
+            CONFIG_YAML,
+            web_yaml("127.0.0.1:7823", Some("svc-token-000001")),
+        );
+        sys.set_run(
+            "peakbot",
+            &["service", "uninstall"],
+            run_out(Some(0), "ok\n", ""),
+        );
+        sys.set_run(
+            "peakbot",
+            &["service", "install"],
+            run_out(Some(0), "ok\n", ""),
+        );
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        let ui = FakeUi::new();
+        let mut ctrl = started(sys.clone(), ui.clone());
+        assert!(
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
+            "precondition; got {:?}",
+            ctrl.phase()
+        );
+        let before = sys.run_args().len();
+
+        sys.seed_file(
+            CONFIG_YAML,
+            web_yaml("127.0.0.1:7900", Some("svc-token-000001")),
+        );
+        let flow = ctrl.handle(Action::Restart);
+        assert_eq!(flow, ControlFlow::Continue(()), "the app never exits");
+
+        let runs = sys.run_args()[before..].to_vec();
+        let i_uninstall = runs
+            .iter()
+            .position(|r| r == &["service".to_string(), "uninstall".to_string()])
+            .expect("service uninstall ran");
+        let i_install = runs
+            .iter()
+            .position(|r| r == &["service".to_string(), "install".to_string()])
+            .expect("bare service install ran");
+        assert!(
+            i_uninstall < i_install,
+            "uninstall → install; runs: {runs:?}"
+        );
+        assert!(
+            !runs.iter().any(|r| r == &["install".to_string()]),
+            "Restart reinstalls the unit, it never replaces the binary; runs: {runs:?}"
+        );
+        assert_eq!(
+            ready_url(&ctrl).as_deref(),
+            Some("http://127.0.0.1:7900/?token=svc-token-000001"),
+            "reconnects on the re-read general.web; got {:?}",
+            ctrl.phase()
+        );
+        assert!(
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
+            "got {:?}",
+            ctrl.phase()
+        );
+        assert!(sys.spawned_specs().is_empty(), "no session spawn");
+        assert!(ui.confirms().is_empty(), "Restart asks nothing");
+    }
+
+    // Spec §8.4/§11.6: the child's first boot auto-migrates a legacy
+    // config, moving the web-token into general.web.token. The pre-launch
+    // read saw no token; the re-read when the child answers picks it up,
+    // so the URL the bridge navigates to carries it.
+    #[test]
+    fn ready_reread_picks_migrated_token() {
+        let sys = FakeSys::new();
+        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
+        sys.set_run(
+            "peakbot",
+            &["service", "status"],
+            run_out(Some(0), NOT_INSTALLED, ""),
+        );
+        // Legacy 0.23 layout: no general.web yet.
+        sys.seed_file(CONFIG_YAML, "default_model: gpt\n");
+        sys.queue_child(crate::testing::FakeChildSpec {
+            boot_write: Some((
+                PathBuf::from(CONFIG_YAML),
+                web_yaml("127.0.0.1:7823", Some("migrated-token-01")),
+            )),
+            ..crate::testing::FakeChildSpec::alive()
+        });
+        // The migrated server rejects the tokenless probe.
+        sys.set_probe("http://127.0.0.1:7823/commands", vec![Probe::Status(401)]);
+        sys.set_probe(
+            "http://127.0.0.1:7823/commands?token=migrated-token-01",
+            vec![Probe::Status(200)],
+        );
+        let ui = FakeUi::new();
+        let ctrl = started(sys.clone(), ui.clone());
+        assert_eq!(
+            ready_url(&ctrl).as_deref(),
+            Some("http://127.0.0.1:7823/?token=migrated-token-01"),
+            "the Ready URL comes from the fresh read; got {:?}",
+            ctrl.phase()
+        );
+        assert!(matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))));
+        assert_eq!(sys.spawned_specs().len(), 1, "no relaunch needed");
+    }
+
+    // Spec §11.6: no code path reads or writes settings.json or
+    // web-token — across start, session restart, enable, service
+    // restart and disable. The token never appears in any argv/env.
+    #[test]
+    fn no_settings_json_or_web_token_io() {
+        let sys = FakeSys::new();
+        sys.seed_file(
+            CONFIG_YAML,
+            web_yaml("127.0.0.1:7823", Some("file-token-000001")),
+        );
+        sys.seed_file(
+            SETTINGS_FILE,
+            "{\"v\":1,\"protocol\":\"https\",\"token\":true,\"remote\":true}\n",
+        );
+        sys.seed_file(
+            CONFIG_YAML,
+            web_yaml("127.0.0.1:7823", Some("cfg-token-0000001")),
+        );
+        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
+        sys.set_run_seq(
+            "peakbot",
+            &["service", "status"],
+            vec![
+                run_out(Some(0), NOT_INSTALLED, ""), // start
+                run_out(Some(0), NOT_INSTALLED, ""), // session restart
+                installed_status("running"),         // after enable
+                installed_status("running"),         // after service restart
+                run_out(Some(0), NOT_INSTALLED, ""), // after disable
+            ],
+        );
+        for args in [
+            &["install"][..],
+            &["service", "install"][..],
+            &["service", "uninstall"][..],
+        ] {
+            sys.set_run("peakbot", args, run_out(Some(0), "ok\n", ""));
+        }
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        for _ in 0..3 {
+            sys.queue_child(crate::testing::FakeChildSpec {
+                mode: ChildMode::ExitsOnInterrupt,
+                exit: Some(0),
+                ..Default::default()
+            });
+        }
+        let ui = FakeUi::new();
+        ui.answer_confirm(true); // enable
+        ui.answer_confirm(true); // disable
+        let mut ctrl = started(sys.clone(), ui.clone());
+        assert!(matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))));
+        let _ = ctrl.handle(Action::Restart);
+        assert!(matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))));
+        let _ = ctrl.handle(Action::ToggleBackground);
+        assert!(
+            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
+            "enabled; got {:?}",
+            ctrl.phase()
+        );
+        let _ = ctrl.handle(Action::Restart);
+        assert!(matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))));
+        let _ = ctrl.handle(Action::ToggleBackground);
+        assert!(
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            "disabled; got {:?}",
+            ctrl.phase()
+        );
+        assert_eq!(
+            ready_url(&ctrl).as_deref(),
+            Some("http://127.0.0.1:7823/?token=cfg-token-0000001"),
+            "the token is general.web.token, never the web-token file's"
+        );
+
+        for path in [WEB_TOKEN, SETTINGS_FILE] {
+            assert!(
+                !sys.read_paths().iter().any(|p| p == Path::new(path)),
+                "{path} must never be read; reads: {:?}",
+                sys.read_paths()
+            );
+            assert!(
+                sys.events().iter().all(|e| {
+                    !matches!(e, Effect::WritePrivate { path: p } | Effect::Remove { path: p }
+                        if p == Path::new(path))
+                }),
+                "{path} must never be written or removed; events: {:?}",
+                sys.events()
+            );
+        }
+        for spec in sys.spawned_specs() {
+            assert!(spec.args.is_empty(), "no web flags; got {:?}", spec.args);
+            assert!(
+                spec.extra_env.iter().all(|(k, v)| k != "PEAKBOT_WEB_TOKEN"
+                    && !v.contains("cfg-token")
+                    && !v.contains("file-token")),
+                "no token in the child env; got {:?}",
+                spec.extra_env
+            );
+        }
+        for r in sys.run_args() {
+            assert!(
+                r.iter().all(|a| !a.contains("token")),
+                "no token in any argv (I7); got {r:?}"
+            );
+        }
+    }
+
+    /// The URL the bridge would navigate to (`None` unless Ready).
+    fn ready_url(ctrl: &Controller<FakeSys, FakeUi>) -> Option<String> {
+        match ctrl.phase() {
+            Phase::Ready(mode) => Some(mode.url().to_string()),
+            _ => None,
+        }
     }
 }

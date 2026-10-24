@@ -9,81 +9,50 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::service::ServiceState;
-use crate::settings::Protocol;
-use crate::token::Token;
+use crate::web_target::WebTarget;
 
-/// Where the webview points. The protocol + optional token come from
-/// `settings.json` (session) / the `TLS:` status line (service) —
-/// `token: None` ⇔ web-token file absent.
+/// Where the webview points. Both modes carry the `WebTarget` read from
+/// config.yaml `general.web` (spec §8.4) — the desktop's only web config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    Session {
-        port: u16,
-        protocol: Protocol,
-        token: Option<Token>,
-    },
-    /// `token: None` ⇔ web-token file absent (tokenless loopback service).
-    Service {
-        protocol: Protocol,
-        token: Option<Token>,
-    },
+    /// The session child this app spawned.
+    Session(WebTarget),
+    /// The installed background service.
+    Service(WebTarget),
 }
 
 impl Mode {
-    /// `Service ⇒ SERVICE_PORT`.
+    pub fn target(&self) -> &WebTarget {
+        match self {
+            Mode::Session(t) | Mode::Service(t) => t,
+        }
+    }
+
     pub fn port(&self) -> u16 {
-        match self {
-            Mode::Session { port, .. } => *port,
-            Mode::Service { .. } => crate::consts::SERVICE_PORT,
-        }
+        self.target().bind.port()
     }
 
-    pub fn protocol(&self) -> Protocol {
-        match self {
-            Mode::Session { protocol, .. } => *protocol,
-            Mode::Service { protocol, .. } => *protocol,
-        }
-    }
-
-    /// `{scheme}://127.0.0.1:<port>/` [+ `?token=<percent-encoded>`].
-    /// Always 127.0.0.1, even when remote (0.0.0.0 accepts loopback).
+    /// `{url_base}/` [+ `?token=<percent-encoded>`].
     pub fn url(&self) -> Url {
-        let mut u = Url::parse(&format!(
-            "{}://127.0.0.1:{}/",
-            self.protocol().scheme(),
-            self.port()
-        ))
-        .expect("static host is a valid URL");
-        if let Some(tok) = self.token() {
-            u.query_pairs_mut().append_pair("token", tok.as_str());
-        }
-        u
+        self.with_token(&format!("{}/", self.origin()))
     }
 
-    /// `{scheme}://127.0.0.1:<port>/commands` [+ `?token=…`].
+    /// `{url_base}/commands` [+ `?token=…`].
     pub fn probe_url(&self) -> Url {
-        let mut u = Url::parse(&format!(
-            "{}://127.0.0.1:{}/commands",
-            self.protocol().scheme(),
-            self.port()
-        ))
-        .expect("static host is a valid URL");
-        if let Some(tok) = self.token() {
+        self.with_token(&format!("{}/commands", self.origin()))
+    }
+
+    /// `WebTarget::url_base` — `"{scheme}://{host}:{port}"`.
+    pub fn origin(&self) -> String {
+        self.target().url_base()
+    }
+
+    fn with_token(&self, base: &str) -> Url {
+        let mut u = Url::parse(base).expect("url_base is always a valid URL");
+        if let Some(tok) = &self.target().token {
             u.query_pairs_mut().append_pair("token", tok.as_str());
         }
         u
-    }
-
-    /// `"{scheme}://127.0.0.1:<port>"`.
-    pub fn origin(&self) -> String {
-        format!("{}://127.0.0.1:{}", self.protocol().scheme(), self.port())
-    }
-
-    fn token(&self) -> Option<&Token> {
-        match self {
-            Mode::Session { token, .. } => token.as_ref(),
-            Mode::Service { token, .. } => token.as_ref(),
-        }
     }
 }
 
@@ -108,8 +77,6 @@ pub enum StartError {
     SidecarBroken {
         detail: String,
     },
-    /// PORT_ATTEMPTS exhausted.
-    PortUnavailable,
     /// Died during startup OR while Ready.
     SessionExited {
         code: Option<i32>,
@@ -125,6 +92,8 @@ pub enum StartError {
     },
     ServiceUnreachable {
         waited: Duration,
+        /// `host:port` the desktop probed (from `general.web`).
+        addr: String,
     },
     ServiceCommandFailed {
         command: String,
@@ -213,12 +182,6 @@ fn failed_view(err: &StartError) -> StatusView {
             detail: None,
             actions: retry_logs_quit,
         },
-        StartError::PortUnavailable => StatusView {
-            kind: "failed",
-            title: "Couldn't find a free local port".into(),
-            detail: None,
-            actions: vec![UiAction::Retry, UiAction::Quit],
-        },
         StartError::SessionExited { code, log_tail } => {
             let head = match code {
                 Some(n) => format!("exit code {n}"),
@@ -249,12 +212,9 @@ fn failed_view(err: &StartError) -> StatusView {
             detail: Some(crate::service::service_log_hint().to_string()),
             actions: retry_reinstall_quit,
         },
-        StartError::ServiceUnreachable { .. } => StatusView {
+        StartError::ServiceUnreachable { addr, .. } => StatusView {
             kind: "failed",
-            title: format!(
-                "The background PeakBot service isn't responding on 127.0.0.1:{}",
-                crate::consts::SERVICE_PORT
-            ),
+            title: format!("The background PeakBot service isn't responding on {addr}"),
             detail: Some(crate::service::service_log_hint().to_string()),
             actions: retry_reinstall_quit,
         },
@@ -327,10 +287,10 @@ pub fn tray_model(
         .unwrap_or_else(|| "?".to_string());
     let status = match phase {
         Phase::Starting(_) => format!("PeakBot {v} · starting…"),
-        Phase::Ready(Mode::Session { port, .. }) => {
-            format!("PeakBot {v} · running (port {port})")
+        Phase::Ready(mode @ Mode::Session(_)) => {
+            format!("PeakBot {v} · running (port {})", mode.port())
         }
-        Phase::Ready(Mode::Service { .. }) => format!("PeakBot {v} · running in background"),
+        Phase::Ready(Mode::Service(_)) => format!("PeakBot {v} · running in background"),
         Phase::Failed(_) => format!("PeakBot {v} · error"),
     };
     let background_label = match service {
@@ -367,18 +327,22 @@ pub struct Dialog {
 mod tests {
     use super::*;
     use crate::service::{InstalledService, RunState};
-    use crate::settings::Protocol;
+    use crate::token::Token;
+
+    fn target(bind: &str, tls: bool, token: Option<Token>) -> WebTarget {
+        WebTarget {
+            bind: bind.parse().expect("test bind parses"),
+            tls,
+            token,
+        }
+    }
 
     // §9.1 case 28 (updated for #377: `Mode` carries the protocol; the
     // session token is optional).
     #[test]
     fn t28_mode_session_url_and_probe_url() {
         let tok = Token::parse("tok+en&1").expect("token with + & parses");
-        let m = Mode::Session {
-            port: 7824,
-            protocol: Protocol::Http,
-            token: Some(tok),
-        };
+        let m = Mode::Session(target("127.0.0.1:7824", false, Some(tok)));
         assert_eq!(m.port(), 7824);
         let url = m.url();
         assert_eq!(
@@ -400,11 +364,7 @@ mod tests {
         let tok = Token::parse("tok+en&1").expect("token with + & parses");
 
         // https session.
-        let m = Mode::Session {
-            port: 7824,
-            protocol: Protocol::Https,
-            token: Some(tok.clone()),
-        };
+        let m = Mode::Session(target("127.0.0.1:7824", true, Some(tok.clone())));
         assert_eq!(
             m.url().to_string(),
             "https://127.0.0.1:7824/?token=tok%2Ben%261"
@@ -416,20 +376,13 @@ mod tests {
         assert_eq!(m.origin(), "https://127.0.0.1:7824");
 
         // Tokenless session: no `?token=` anywhere.
-        let m = Mode::Session {
-            port: 7824,
-            protocol: Protocol::Http,
-            token: None,
-        };
+        let m = Mode::Session(target("127.0.0.1:7824", false, None));
         assert_eq!(m.url().to_string(), "http://127.0.0.1:7824/");
         assert_eq!(m.probe_url().to_string(), "http://127.0.0.1:7824/commands");
         assert_eq!(m.origin(), "http://127.0.0.1:7824");
 
         // https service, tokened and tokenless.
-        let m = Mode::Service {
-            protocol: Protocol::Https,
-            token: Some(tok),
-        };
+        let m = Mode::Service(target("127.0.0.1:7823", true, Some(tok)));
         assert_eq!(m.port(), 7823);
         assert_eq!(
             m.url().to_string(),
@@ -440,10 +393,7 @@ mod tests {
             "https://127.0.0.1:7823/commands?token=tok%2Ben%261"
         );
         assert_eq!(m.origin(), "https://127.0.0.1:7823");
-        let m = Mode::Service {
-            protocol: Protocol::Https,
-            token: None,
-        };
+        let m = Mode::Service(target("127.0.0.1:7823", true, None));
         assert_eq!(m.url().to_string(), "https://127.0.0.1:7823/");
         assert_eq!(m.probe_url().to_string(), "https://127.0.0.1:7823/commands");
     }
@@ -451,13 +401,21 @@ mod tests {
     // §9.1 case 29 (updated for #377: `Mode` carries the protocol).
     #[test]
     fn t29_mode_service_url_and_origin() {
-        let m = Mode::Service {
-            protocol: Protocol::Http,
-            token: None,
-        };
+        let m = Mode::Service(target("127.0.0.1:7823", false, None));
         assert_eq!(m.port(), 7823);
         assert_eq!(m.url().to_string(), "http://127.0.0.1:7823/");
         assert_eq!(m.origin(), "http://127.0.0.1:7823");
+
+        // 0.24 (spec §8.4): the host follows general.web.bind —
+        // unspecified ⇒ 127.0.0.1, a concrete LAN IP ⇒ that IP.
+        let m = Mode::Session(target("0.0.0.0:9000", false, None));
+        assert_eq!(m.url().to_string(), "http://127.0.0.1:9000/");
+        let m = Mode::Service(target("192.168.1.5:9000", true, None));
+        assert_eq!(
+            m.probe_url().to_string(),
+            "https://192.168.1.5:9000/commands"
+        );
+        assert_eq!(m.origin(), "https://192.168.1.5:9000");
     }
 
     // §9.1 case 30 — one case per row of the §3.5 locked table.
@@ -499,18 +457,19 @@ mod tests {
 
         // Ready.
         let tok = Token::parse("t").expect("parses");
-        let sv = status_view(&Phase::Ready(Mode::Session {
-            port: 7824,
-            protocol: Protocol::Http,
-            token: Some(tok),
-        }));
+        let sv = status_view(&Phase::Ready(Mode::Session(target(
+            "127.0.0.1:7824",
+            false,
+            Some(tok),
+        ))));
         assert_eq!(sv.kind, "ready");
         assert_eq!(sv.title, "Opening PeakBot…");
         assert!(sv.actions.is_empty());
-        let sv = status_view(&Phase::Ready(Mode::Service {
-            protocol: Protocol::Http,
-            token: None,
-        }));
+        let sv = status_view(&Phase::Ready(Mode::Service(target(
+            "127.0.0.1:7823",
+            false,
+            None,
+        ))));
         assert_eq!(sv.kind, "ready");
         assert_eq!(sv.title, "Opening PeakBot…");
         assert!(sv.actions.is_empty());
@@ -538,10 +497,6 @@ mod tests {
             sv.actions,
             vec![UiAction::Retry, UiAction::OpenLogs, UiAction::Quit]
         );
-
-        let sv = failed(StartError::PortUnavailable);
-        assert_eq!(sv.title, "Couldn't find a free local port");
-        assert_eq!(sv.actions, vec![UiAction::Retry, UiAction::Quit]);
 
         let sv = failed(StartError::SessionExited {
             code: Some(1),
@@ -598,6 +553,7 @@ mod tests {
 
         let sv = failed(StartError::ServiceUnreachable {
             waited: Duration::from_secs(30),
+            addr: "127.0.0.1:7823".into(),
         });
         assert_eq!(
             sv.title,
@@ -640,15 +596,8 @@ mod tests {
     fn t31_tray_model() {
         let v = Version::parse("0.23.0").unwrap();
         let tok = Token::parse("t").expect("parses");
-        let ready_session = Phase::Ready(Mode::Session {
-            port: 7824,
-            protocol: Protocol::Http,
-            token: Some(tok),
-        });
-        let ready_service = Phase::Ready(Mode::Service {
-            protocol: Protocol::Http,
-            token: None,
-        });
+        let ready_session = Phase::Ready(Mode::Session(target("127.0.0.1:7824", false, Some(tok))));
+        let ready_service = Phase::Ready(Mode::Service(target("127.0.0.1:7823", false, None)));
         let installed = ServiceState::Installed(InstalledService {
             exe: None,
             run: RunState::Running,
@@ -686,7 +635,9 @@ mod tests {
 
         // Failed + Installed → checked, enabled.
         let t = tray_model(
-            &Phase::Failed(StartError::PortUnavailable),
+            &Phase::Failed(StartError::NotReady {
+                waited: Duration::from_secs(30),
+            }),
             Some(&installed),
             Some(&v),
             Platform::Unix,

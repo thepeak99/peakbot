@@ -296,6 +296,8 @@ macOS `X.app/Contents/MacOS/peakbot`; dev `desktop/target/debug/peakbot` (tauri-
 10. (**I5**) Only the controller thread writes `settings.json` and `web-token`; writes are atomic (`write_private`).
 
 ### 3.9 Settings (`core::settings`) — amendment #377
+> **Superseded by §11 (0.24 config).** `settings.json`, `SaveRequest`, the web-token file and `Action::SaveSettings` are gone.
+
 ```rust
 pub const SETTINGS_VERSION: u32 = 1;
 
@@ -484,6 +486,8 @@ README's manual-removal section (§5.8), (c) by design the service runs from the
 vanished `/tmp/.mount_*` or `.app` path.
 
 ### 4.6 Shutdown and orphans
+> **0.24 (§11):** the reaper's identity check is the recorded sidecar path (pidfile `pid=…\nexe=…`), not `--bind`.
+
 
 `stop_session()` (used by Shutdown, Start-restart, Enable):
 `child.interrupt()` (SIGINT to the pid) → poll `try_wait` every `POLL_INTERVAL` up to `STOP_GRACE`
@@ -545,6 +549,8 @@ unset → set it to `1` (`unsafe { std::env::set_var }`, edition 2024). Decision
 `core::env::webkit_dmabuf_default(existing: Option<&OsStr>) -> Option<(&'static str, &'static str)>`.
 
 ### 4.11 Saving settings (`Action::SaveSettings`) — amendment #377
+> **Superseded by §11 (0.24 config).** `settings.json`, `SaveRequest`, the web-token file and `Action::SaveSettings` are gone.
+
 
 **`SaveSettings(new)`** (controller thread; ignored while `Starting`, like its siblings):
 ```
@@ -1519,3 +1525,32 @@ platform-parameterized function — `phase::Platform { Windows, Unix }` + `phase
 a `background_visible` flag derived from it; the glue (tray + settings view) hides the item/row when it is
 `false`. Unix behaviour is byte-identical (existing `t31`/`t74` tests pin it). Follow-up ticket: make it
 work (hidden window + `/Run`).
+
+## 11. AMENDMENT (0.24 config) — `general.web` is the desktop's web config (2026-10-24)
+
+Spec: `make-config-great-again.md` §8.4/§11.6. Supersedes §3.9, §4.11 and the token/port parts of §3.1,
+§3.6, §3.8 (I2/I4), §4.3, §4.6.
+
+- **Source of truth.** `<config_dir>/config.yaml` `general.web.{bind, tls, token}`, read leniently by
+  `web_target::read_web_target` (missing/legacy/unparsable ⇒ `127.0.0.1:7823`, http, no token). The desktop
+  owns no token file and no `settings.json`; it never generates, writes or removes a token.
+- **`Mode`** = `Session(WebTarget)` | `Service(WebTarget)`; URL host is `127.0.0.1` for loopback/unspecified
+  binds, else the bind IP; scheme `https` iff `tls`. Service mode ORs in the unit's `TLS: on` line (a unit
+  installed by hand with `--tls`), matching the server's `--tls || general.web.tls`.
+- **When read.** On every start/restart, and again once the backend answers (200 or 401): the child's first
+  boot may auto-migrate a legacy config and move the web-token into `general.web.token`. If the fresh read
+  differs, the controller probes once more with it and goes Ready on the fresh target (`await_backend`).
+- **Session launch.** argv `[]`; env = parent env minus `PEAKBOT_WEB_TOKEN`, plus `PEAKBOT_NO_OPEN=1`. No port
+  fallback: a busy bind ⇒ the child exits ⇒ `Failed(SessionExited)` with the log tail. `PortUnavailable`,
+  `Sys::free_port`, `Sys::random_token` and the 7824/`PORT_ATTEMPTS` constants are deleted.
+- **Pidfile** `pid=<u32>\nexe=<sidecar path>`; the reaper signals only if `cmdline_of(pid)` contains the
+  recorded path (works across AppImage remounts; never matches the service or a hand-started `peakbot`).
+- **Service install** is always bare `service install` (the unit reads `general.web` at start). Enable's
+  port-busy check uses `general.web.bind`, and is skipped while our own session holds that port.
+- **`Action::Restart`** (sentinel `peakbot-desktop:restart`, wired by the glue in T16): service installed ⇒
+  `reconfigure_service` (uninstall + bare install; binary not replaced — the reinstall is the restart);
+  otherwise ⇒ the full start path (stop child, re-read, relaunch). No dialog; the app never restarts.
+- **`SettingsView`** = `{cert_warning, background_visible, background, background_enabled, busy}` (the
+  spec's list plus `background_visible`, kept for the §10.5 Windows rule). `settings_set` is gone.
+- Tests: `restart_session_rereads_bind`, `restart_service_reinstalls`, `ready_reread_picks_migrated_token`,
+  `no_settings_json_or_web_token_io`, `busy_bind_fails_with_log_tail_without_fallback`, `t55b_*`.

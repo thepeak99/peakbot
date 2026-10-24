@@ -2536,7 +2536,6 @@ name = "peakbot-desktop-core"
 version = "0.23.0"
 dependencies = [
  "directories-next",
- "getrandom 0.3.4",
  "libc",
  "log",
  "semver",

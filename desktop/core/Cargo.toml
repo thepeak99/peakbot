@@ -7,11 +7,8 @@ publish = false
 semver = "1.0.28"
 url = "2.5"
 ureq = { version = "3.4.2", default-features = false }
-getrandom = "0.3.4"
 directories-next = "2"      # same crate as peakbot's get_config_dir
 serde = { version = "1", features = ["derive"] }
-# The settings file (design #377 §3.1) is parsed in production code.
-serde_json = "1"
 # Lenient general.web read (0.24 config, spec §8.4) — same version as the
 # root crate.
 serde_yaml = "0.9"
@@ -19,4 +16,5 @@ log = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3.27"
