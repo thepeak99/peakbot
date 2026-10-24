@@ -1065,9 +1065,11 @@ async fn validate_422_segment_paths() {
         path[3].is_u64() && path[3].as_u64() == Some(0),
         "list indices are JSON numbers; got: {path:?}"
     );
-    assert!(
-        path[4] == "name" || path.iter().any(|s| s.as_str() == Some("bogus")),
-        "the unknown-field error sits at the model entry; got: {path:?}"
+    assert_eq!(
+        path.len(),
+        4,
+        "P2: the unknown-field error sits at the model entry (the parent \
+         mapping), not at the rejected key; got: {path:?}"
     );
     assert!(
         errs[0]["message"].as_str().unwrap().contains("bogus"),
@@ -1495,12 +1497,28 @@ async fn w1_lan_without_token() {
     .await;
     assert_eq!(resp.status(), 200, "loopback needs no token");
 
-    // W1 applies to PUT as well.
+    // W1 applies to PUT as well. The global file exists, so the PUT must
+    // carry its sha256 (a null base over an existing file is the §8.2
+    // step-2 409, which would mask W1). A refused PUT leaves the file
+    // untouched, so the same base is still current for the second PUT.
+    let base = sha256_hex(GLOBAL_BOOT.as_bytes());
     let draft = w1_draft("0.0.0.0:7823", None);
-    let resp = put_json(addr, "/api/config", None, &put_body("global", &draft, None)).await;
+    let resp = put_json(
+        addr,
+        "/api/config",
+        None,
+        &put_body("global", &draft, Some(&base)),
+    )
+    .await;
     assert_eq!(resp.status(), 422, "W1 is enforced on PUT too");
     let draft = w1_draft("0.0.0.0:7823", Some("t0ken"));
-    let resp = put_json(addr, "/api/config", None, &put_body("global", &draft, None)).await;
+    let resp = put_json(
+        addr,
+        "/api/config",
+        None,
+        &put_body("global", &draft, Some(&base)),
+    )
+    .await;
     assert_eq!(resp.status(), 200, "a token clears W1 on PUT");
 }
 

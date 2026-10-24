@@ -639,8 +639,7 @@ fn migrate_one(
         token_file,
     } = convert(&old)?;
 
-    let pre = sibling(path, PRE_024_SUFFIX);
-    let kept = keep_original(&pre, &original)?;
+    let kept = keep_pre024(path, &original)?;
     let header = header(&kept, &notes);
     let dir = path.parent().unwrap_or(Path::new(""));
     save_config_at(dir, &format!("{header}{body}"))
@@ -746,8 +745,14 @@ fn to_yaml(config: &Value) -> Result<String, AutoMigrateFailure> {
     serde_yaml::to_string(config).map_err(|e| AutoMigrateFailure::Invalid(e.to_string()))
 }
 
-/// Step 5: create-only, so the first process to get here keeps the true
-/// original and later runs never overwrite it.
+/// Step 5 for `path`: keep `original` as `<path>.pre-0.24`. Also used by
+/// the Settings PUT before it replaces a legacy file (spec §8.2 step 4).
+pub(crate) fn keep_pre024(path: &Path, original: &[u8]) -> Result<Original, AutoMigrateFailure> {
+    keep_original(&sibling(path, PRE_024_SUFFIX), original)
+}
+
+/// Create-only, so the first process to get here keeps the true original
+/// and later runs never overwrite it.
 fn keep_original(pre: &Path, original: &[u8]) -> Result<Original, AutoMigrateFailure> {
     use std::io::Write;
 

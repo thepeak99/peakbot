@@ -375,7 +375,7 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
 /// (~128 bytes) and clippy's `result_large_err` would otherwise warn every
 /// call site. The box is one indirection on the slow path; the success
 /// path is `()`.
-fn require_json_content_type(req: &Request<Body>) -> Result<(), Box<Response>> {
+pub(super) fn require_json_content_type(req: &Request<Body>) -> Result<(), Box<Response>> {
     let reject = |msg: &str| -> Box<Response> {
         Box::new(ApiError::simple(StatusCode::UNSUPPORTED_MEDIA_TYPE, msg))
     };
