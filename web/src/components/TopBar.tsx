@@ -5,12 +5,9 @@ import type {
   ModelInfo,
 } from "../state";
 import type { CatalogProfile, Selection, SubAgentRun } from "../types";
-import { ModelSwitcher } from "./ModelSwitcher";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
 import { SelectionChip } from "./SelectionChip";
-import { AgentsChip } from "./AgentsChip";
-import { boundAgentOf } from "../adapt";
 import { NotifyToggle } from "./NotifyToggle";
 import { FocusToggle } from "./FocusToggle";
 import { ThemeToggle } from "./ThemeToggle";
@@ -33,7 +30,6 @@ export function TopBar({
   conversations,
   conversationsError,
   send,
-  onSwitchModel,
   onLoadConversation,
   notifyEnabled,
   notifyPermission,
@@ -62,7 +58,6 @@ export function TopBar({
   conversations: ConversationSummary[];
   conversationsError: string | null;
   send: (msg: InboundMessage) => void;
-  onSwitchModel: (alias: string) => void;
   onLoadConversation: (id: string) => void;
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
@@ -73,8 +68,8 @@ export function TopBar({
    * App passes it iff `settings_available` and the profile's `visible_tabs`
    * include `settings`. */
   onOpenSettings?: () => void;
-  // T32 chat chips (optional — absent ⇒ no chips, as on older servers):
-  // the profiles/agents catalog and this conversation's (profile, agent)
+  // T32 chat chip (optional — absent ⇒ no chip, as on older servers): the
+  // profiles/agents catalog and this conversation's (profile, agent)
   // selection. Both render null on their own when absent.
   catalog?: CatalogProfile[];
   selection?: Selection | null;
@@ -83,10 +78,9 @@ export function TopBar({
   selectionLocked?: boolean;
   /** `AppState.profile_pinned` — a --profile pin freezes the profile. */
   profilePinned?: boolean;
-  /** Toast sink for `Next conversation: …` (agent pick). */
+  /** Toast sink for `Next conversation: …`. */
   onToast?(message: string): void;
 }) {
-  const boundAgent = boundAgentOf(catalog, selection);
   return (
 
     // `backdrop-blur` makes this header a stacking context, which traps the
@@ -98,12 +92,15 @@ export function TopBar({
         <span className="font-semibold text-zinc-100">Shifu</span>
       </div>
 
-      {/* Sessions trio — conversations + model + cwd. On mobile they move
-          to the BottomBar to de-crowd the header, so hide them here below lg. */}
+      {/* Sessions trio — selection + conversations + cwd. The selection chip
+          owns profile, agent AND team-model setup (model/agents chips are
+          gone). On mobile they move to the BottomBar, so hide below lg. */}
       <div className="hidden items-center gap-3 lg:flex">
         <SelectionChip
           catalog={catalog ?? []}
           selection={selection ?? null}
+          models={models}
+          activeAlias={activeAlias}
           locked={selectionLocked}
           pinned={profilePinned}
           send={send}
@@ -116,18 +113,6 @@ export function TopBar({
           onOpen={() => send({ type: "request_conversations" })}
           onLoad={onLoadConversation}
           onKill={(id) => send({ type: "kill_session", convo: id })}
-        />
-
-       <ModelSwitcher
-          models={models}
-          activeAlias={activeAlias}
-          hasTranscript={hasTranscript}
-          onSwitch={onSwitchModel}
-        />
-        <AgentsChip
-          profile={selection?.profile ?? null}
-          agent={boundAgent}
-          activeModel={activeAlias}
         />
 
         {cwd && (

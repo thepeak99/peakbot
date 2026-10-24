@@ -5,16 +5,13 @@ import type {
   ModelInfo,
 } from "../state";
 import type { CatalogProfile, Selection } from "../types";
-import { ModelSwitcher } from "./ModelSwitcher";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
 import { SelectionChip } from "./SelectionChip";
-import { AgentsChip } from "./AgentsChip";
-import { boundAgentOf } from "../adapt";
 
-// Bottom status bar — mobile-only (hidden on lg+). Houses the selection chip,
-// conversations picker, model switcher, agents chip, and cwd picker so all
-// session-affecting controls are reachable without opening a drawer.
+// Bottom status bar — mobile-only (hidden on lg+). Houses the selection chip
+// (profile, agent and team-model setup), conversations picker, and cwd picker
+// so all session-affecting controls are reachable without opening a drawer.
 // Menus open upward (`dropUp`) so they don't clip off the bottom of the
 // viewport.
 export function BottomBar({
@@ -27,7 +24,6 @@ export function BottomBar({
   dirListing,
   recentDirs,
   send,
-  onSwitchModel,
   onLoadConversation,
   catalog,
   selection,
@@ -44,9 +40,8 @@ export function BottomBar({
   dirListing: DirListing | null;
   recentDirs: string[];
   send: (msg: InboundMessage) => void;
-  onSwitchModel: (alias: string) => void;
   onLoadConversation: (id: string) => void;
-  // T32 chat chips (optional — absent ⇒ no chips, as on older servers).
+  // T32 chat chip (optional — absent ⇒ no chip, as on older servers).
   catalog?: CatalogProfile[];
   selection?: Selection | null;
   /** The conversation has a user/agent turn (`conversationHasTurns`) — the
@@ -54,12 +49,11 @@ export function BottomBar({
   selectionLocked?: boolean;
   /** `AppState.profile_pinned` — a --profile pin freezes the profile. */
   profilePinned?: boolean;
-  /** Toast sink for `Next conversation: …` (agent pick). */
+  /** Toast sink for `Next conversation: …`. */
   onToast?(message: string): void;
 }) {
-  const boundAgent = boundAgentOf(catalog, selection);
   return (
-    // flex-wrap (T34b): at ≤800 px the five chips must not overflow the bar
+    // flex-wrap (T34b): at ≤800 px the chips must not overflow the bar
     // horizontally — they wrap to a second row instead.
     <footer
       data-testid="bottom-bar"
@@ -68,6 +62,8 @@ export function BottomBar({
       <SelectionChip
         catalog={catalog ?? []}
         selection={selection ?? null}
+        models={models}
+        activeAlias={activeAlias}
         locked={selectionLocked}
         pinned={profilePinned}
         send={send}
@@ -81,19 +77,6 @@ export function BottomBar({
         onOpen={() => send({ type: "request_conversations" })}
         onLoad={onLoadConversation}
         onKill={(id) => send({ type: "kill_session", convo: id })}
-        dropUp
-      />
-     <ModelSwitcher
-        models={models}
-        activeAlias={activeAlias}
-        hasTranscript={hasTranscript}
-        onSwitch={onSwitchModel}
-        dropUp
-      />
-      <AgentsChip
-        profile={selection?.profile ?? null}
-        agent={boundAgent}
-        activeModel={activeAlias}
         dropUp
       />
 

@@ -837,7 +837,9 @@ describe("model picks (selection-models plan §9.2/18–26)", () => {
     expect(has("selection-model-reset"), "nothing to reset by default").toBe(false);
 
     // With an override, the member's Model pane offers the reset.
-    rerender(<SelectionChip {...chipProps({ selection: selOf({ tester: "opus" }) }).props} />);
+    rerender(
+      <SelectionChip {...chipProps({ selection: selOf({ tester: "opus" }), send, onToast }).props} />,
+    );
     expect(pane()).toBe("model");
     expect(text("selection-model-reset")).toContain("Reset to default");
 
@@ -877,11 +879,13 @@ describe("model picks (selection-models plan §9.2/18–26)", () => {
     expect(has("selection-team-reset")).toBe(false);
 
     // A subagent override → button.
-    rerender(<SelectionChip {...chipProps({ selection: selOf({ tester: "opus" }) }).props} />);
+    rerender(
+      <SelectionChip {...chipProps({ selection: selOf({ tester: "opus" }), send, onToast }).props} />,
+    );
     expect(text("selection-team-reset")).toContain("Reset all to defaults");
 
     // An orchestrator-only override ALSO counts (anyOverride).
-    rerender(<SelectionChip {...chipProps({ activeAlias: "opus" }).props} />);
+    rerender(<SelectionChip {...chipProps({ activeAlias: "opus", send, onToast }).props} />);
     expect(has("selection-team-reset")).toBe(true);
 
     click(q("selection-team-reset"));
