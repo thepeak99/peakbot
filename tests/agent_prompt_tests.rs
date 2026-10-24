@@ -39,9 +39,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use peakbot::config::resolve::{Config, Head, ParseCtx, ResolvedAgent, ResolvedProfile, Source};
 use peakbot::skills::SkillRegistry;
+use peakbot::tools::env::{McpSource, ToolEnv, main_agent_tool_names, sub_agent_tool_names};
 use peakbot::{ShellKind, build_agent_prompt};
 
 const GLOBAL_PATH: &str = "/home/u/.config/peakbot/config.yaml";
@@ -590,6 +592,136 @@ fn a1_prompt_equivalence() {
                 actual, expected_old,
                 "{}: an unchanged pair must be byte-identical to the old snapshot",
                 pair.file
+            );
+        }
+    }
+}
+
+// ---------- A1 equivalence: the tool-list half ----------
+//
+// The snapshots also captured the OLD main agent's `BUILT-IN TOOLS (sorted)`
+// list. The 0.24 build registers the same built-ins (plus `delegate` and the
+// profile's MCP tools); subagents get the SAME list minus `delegate` — the
+// only allowed diff of the cutover (subagents now get the MCP tools too).
+
+/// The snapshot's `BUILT-IN TOOLS (sorted)` section, as a sorted list.
+fn tools_part(snapshot: &str) -> Vec<String> {
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| *l == "=== BUILT-IN TOOLS (sorted) ===")
+        .expect("tools marker");
+    let end = lines
+        .iter()
+        .position(|l| *l == "=== MCP SERVERS (filtered names) ===")
+        .expect("mcp marker");
+    lines[start + 1..end]
+        .iter()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// The `ToolEnv` for `profile` with ONE fake MCP tool per server the
+/// profile's `mcps` filter allows — standing in for the live handles the
+/// old capture could not list (the snapshot recorded server NAMES only).
+fn env_with_fake_mcp(cfg: &Config, profile: &peakbot::config::resolve::ResolvedProfile) -> ToolEnv {
+    let mut env = ToolEnv::for_profile(cfg, profile, &Arc::new(Vec::new()));
+    let groups: Vec<(String, Vec<String>)> = cfg
+        .mcps
+        .iter()
+        .filter(|server| profile.mcps.allows(&server.name))
+        .map(|server| {
+            (
+                server.name.clone(),
+                vec![format!("{}_fake_tool", server.name)],
+            )
+        })
+        .collect();
+    let fake_names: Vec<String> = groups
+        .iter()
+        .flat_map(|(_, tools)| tools.iter().cloned())
+        .collect();
+    env.mcp = McpSource::for_test(&groups, profile.mcps.clone());
+    assert!(
+        env.mcp.tool_names() == fake_names,
+        "the fake MCP tools project through the profile filter"
+    );
+    env
+}
+
+/// The §11.2 behaviour-equivalence check, tool-list half: the new main
+/// agent's built-ins equal the OLD snapshot's list exactly; the subagents'
+/// list is the main list minus `delegate` (and carries the same MCP tools —
+/// the only allowed diff of the cutover).
+#[test]
+fn a1_tool_list_equivalence() {
+    let pairs = a1_pairs();
+    assert_eq!(pairs.len(), 6, "the six committed A1 snapshots");
+    let mut configs: HashMap<String, Config> = HashMap::new();
+
+    for pair in &pairs {
+        let cfg = configs
+            .entry(pair.fixture.clone())
+            .or_insert_with(|| parse_fixture_out(&pair.fixture));
+
+        let profile_name = if pair.old_profile == "none" {
+            "default"
+        } else {
+            pair.old_profile.as_str()
+        };
+        let profile: &ResolvedProfile = cfg
+            .catalog
+            .profile(profile_name)
+            .unwrap_or_else(|| panic!("{}: profile '{profile_name}'", pair.file));
+        let agent: &ResolvedAgent = if pair.old_pipeline == "none" {
+            &profile.agents[0]
+        } else {
+            profile
+                .agents
+                .iter()
+                .find(|a| a.main.name == pair.old_pipeline)
+                .unwrap_or_else(|| panic!("{}: agent '{}'", pair.file, pair.old_pipeline))
+        };
+
+        let expected_old = tools_part(&pair.snapshot);
+        let env = env_with_fake_mcp(cfg, profile);
+        let main = main_agent_tool_names(&env, agent);
+        let fake_mcp: Vec<String> = env.mcp.tool_names();
+
+        // Strip the (new) MCP tools and sort: the built-ins must be exactly
+        // the old snapshot's list — including `delegate` iff the old pair
+        // had a pipeline (subagents).
+        let builtins: Vec<String> = main
+            .iter()
+            .filter(|name| !fake_mcp.contains(name))
+            .cloned()
+            .collect();
+        let mut builtins_sorted = builtins.clone();
+        builtins_sorted.sort();
+        assert_eq!(
+            builtins_sorted, expected_old,
+            "{}: the main agent's built-ins must equal the old snapshot's list",
+            pair.file
+        );
+
+        // The allowed diff: every subagent gets the SAME built-ins and the
+        // SAME MCP tools — never `delegate` (no nesting).
+        for sub in &agent.subagents {
+            let sub_names = sub_agent_tool_names(&env, sub);
+            let expected_sub: Vec<String> = main
+                .iter()
+                .filter(|name| *name != "delegate")
+                .cloned()
+                .collect();
+            let mut sub_sorted = sub_names.clone();
+            sub_sorted.sort();
+            let mut expected_sub_sorted = expected_sub;
+            expected_sub_sorted.sort();
+            assert_eq!(
+                sub_sorted, expected_sub_sorted,
+                "{}: subagent '{}' must get the main tool list minus delegate (MCP tools included)",
+                pair.file, sub.member.name
             );
         }
     }

@@ -486,7 +486,7 @@ never silently.
 
 ## Multi-agent pipeline (orchestrator + sub-agents)
 
-Declare one or more named teams under `pipelines:`. Each team owns its full cast: an `orchestrator:` (the agent you talk to) and an `agents:` map of sub-agent roles. Selection is per-conversation, persisted, and locked after the first turn. Runnable example: `examples/pipeline-team/`.
+Declare one or more named teams under `pipelines:`. Each team owns its full cast: an `orchestrator:` (the agent you talk to) and an `agents:` map of sub-agent roles. Selection is per-conversation, persisted, and locked after the first turn. Runnable example: `examples/agent-team/`.
 
 ### Config shape
 

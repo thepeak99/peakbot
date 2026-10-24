@@ -1,10 +1,9 @@
-# Orchestrator prompt — Software-Team Pipeline
+# Lead prompt — Software-Team Profile
 
-> **Where this goes.** The orchestrator is your top-level `default_model` agent
-> — its persona is NOT set in the `pipeline:` block (that only defines
-> sub-agents). To install this prompt, put it in the project's `AGENTS.md`
-> (its content is injected into the system prompt), or append it to your base
-> system prompt. Then `/subagents on` before the first turn.
+> **Where this goes.** This is the `prompt:` of the `lead` agent in
+> `profiles.software-team.agents.lead` (rendered as its `# Instructions`
+> section). To install it another way, put it in the project's `AGENTS.md`
+> (its content is injected into the system prompt) instead — pick one, not both.
 
 ---
 

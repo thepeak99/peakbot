@@ -1,322 +1,278 @@
-//! P2 — `build_system_prompt` persona replacement tests (plan §A-Q7, amended
-//! by multi-pipeline amendment 1).
+//! 0.24 port of the old P2 `build_system_prompt` persona tests onto
+//! `build_agent_prompt` (spec §6.1).
 //!
-//! The `head: Option<&PromptHead>` parameter carries the resolved static head
-//! — a pipeline's `orchestrator.persona` when set, else the global `persona:`.
-//! These tests cover the `PromptHead::Persona` variant; the locked semantics:
+//! The old `PromptHead` / `resolve_prompt_head` seam is gone: the head is
+//! resolved at PARSE time into `agent.head` (`Head::BuiltIn` / `Persona` /
+//! `Whole`), so these tests drive the real builder through `Config::parse`
+//! and pin the same locked semantics:
 //!
-//! - `Some(p)` ⇒ prompt begins with `p` and **does not** contain the built-in
-//!   "CODE CRUSADER" content
-//! - `None` / whitespace-only ⇒ prompt contains the built-in crusader text
-//! - Orchestrator mode (`subagents_active = true`) ⇒ a **configured** persona
-//!   leads the prompt (multi-pipeline amendment 1: a pipeline's
-//!   `orchestrator.persona` replaces the global one; omitted, the global
-//!   persona applies unchanged), while an absent one yields **no** persona at
-//!   all — the built-in crusader is never the orchestrator's default
-//! - The byte boundary between persona and `# Working Principles` is
-//!   identical for both branches (a single `'\n'` join)
+//! - `Head::Persona` ⇒ prompt begins with the trimmed persona and **does
+//!   not** contain the built-in "CODE CRUSADER" content; the core follows
+//! - `Head::BuiltIn` ⇒ the built-in crusader text leads (for single agents
+//!   AND subagent-bearing agents — the orchestrator special case is gone)
+//! - `Head::Whole` (`core_guidance: false`) ⇒ the persona is the whole
+//!   static head: no core, no shell section, no built-in persona; every
+//!   dynamic section (memory, skills, env, agents.md, `# Instructions`)
+//!   still follows
+//! - The byte boundary between persona and `# Working Principles` is a
+//!   single `'\n'` join in both the `BuiltIn` and `Persona` branches
 //!
-//! The `PromptHead::Full` variant (config `system_prompt:`) replaces the
-//! persona AND the core tool guidance — `SYSTEM_PROMPT_CORE` is mostly
-//! tool-specific coaching (bash section, "NEVER Use Bash/sed/awk", head/tail
-//! rules) that lies to a model whose deployment disables those tools. The
-//! locked semantics:
-//!
-//! - `Some(Full(s))` non-blank ⇒ prompt starts with `s.trim()` + `'\n'`,
-//!   NO core, NO built-in persona — in agentless AND orchestrator mode
-//! - Everything after the head (memory, skills, env block, agents.md,
-//!   `# Orchestrator Instructions`) is identical in all cases
-//! - Blank `Full` is absent: built-in persona (agentless) + core
-//!
-//! `resolve_prompt_head` precedence is pinned here too (config `Full` wins
-//! outright; else the pipeline persona; else the config head).
-//!
-//! The dedicated sub-agent-preamble test (plan §A-Q7 row 3 — persona MUST
-//! NOT leak into a role preamble) lives next to the helper itself in
-//! `src/pipeline/delegate_tool.rs::tests`; it is a GREEN guard today.
+//! The old `resolve_prompt_head` precedence table is deleted with the
+//! function: in 0.24 there is exactly one head per agent, decided by the
+//! parse (see `tests/persona_round_trip_tests.rs` for the head resolution
+//! and its blank-persona errors).
 
+use std::path::Path;
+
+use peakbot::config::resolve::{Config, Head, ParseCtx, ResolvedAgent, ResolvedProfile, Source};
 use peakbot::skills::SkillRegistry;
-use peakbot::{PromptHead, ShellKind, build_system_prompt, resolve_prompt_head};
+use peakbot::{ShellKind, build_agent_prompt};
 
-fn cwd() -> std::path::PathBuf {
-    std::env::temp_dir()
+const GLOBAL_PATH: &str = "/home/u/.config/peakbot/config.yaml";
+/// Non-existent cwd: no agents.md, deterministic env block.
+const FIXED_CWD: &str = "/opt/peakbot-prompt-cwd";
+
+const BUILTIN_PERSONA: &str = include_str!("../src/system_prompt_persona.txt");
+/// The first line of `src/system_prompt_core.txt` — the core's identity.
+const CORE_HEAD: &str = "# Working Principles";
+
+const PROVIDERS: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n";
+
+/// Profile `p` (the providers const above) with the given indented body.
+fn cfg_with(profile_body: &str) -> Config {
+    Config::parse(
+        Source {
+            path: Path::new(GLOBAL_PATH),
+            text: &format!("{PROVIDERS}profiles:\n  p:\n{profile_body}"),
+        },
+        None,
+        &ParseCtx { known_skills: &[] },
+    )
+    .unwrap_or_else(|e| panic!("config must parse: {e:?}"))
+}
+
+fn prompt_for<'a>(
+    cfg: &'a Config,
+    agent: &str,
+    shell: Option<ShellKind>,
+    cwd: &Path,
+) -> (String, &'a ResolvedAgent, &'a ResolvedProfile) {
+    let profile: &ResolvedProfile = cfg
+        .catalog
+        .profile("p")
+        .unwrap_or_else(|| panic!("profile 'p' in catalog"));
+    let agent: &ResolvedAgent = profile
+        .agents
+        .iter()
+        .find(|a| a.main.name == agent)
+        .unwrap_or_else(|| panic!("agent '{agent}' in profile 'p'"));
+    (
+        build_agent_prompt(agent, profile, &SkillRegistry::new(), shell, cwd),
+        agent,
+        profile,
+    )
+}
+
+fn bash() -> Option<ShellKind> {
+    Some(ShellKind::Bash {
+        path: "/bin/sh".to_string(),
+    })
 }
 
 #[test]
-fn agentless_prompt_with_some_persona_replaces_crusader() {
-    let skills = SkillRegistry::new();
-    let custom = "SENTINEL-CUSTOM-PERSONA — neutral, no character.";
-    let prompt = build_system_prompt(
-        &skills,
-        None,
-        &cwd(),
-        /* memory_enabled */ false,
-        /* agents_md_enabled */ true,
-        /* subagents_active */ false,
-        /* orchestrator_prompt */ None,
-        /* head */ Some(&PromptHead::Persona(custom.to_string())),
+fn persona_head_replaces_crusader_and_keeps_core() {
+    // `Head::Persona` replaces ONLY the persona — the core tool guidance
+    // still follows (the old `agentless_prompt_with_some_persona_*` +
+    // `persona_head_still_keeps_core`).
+    let cfg = cfg_with(
+        "    agents:\n      main:\n        model: a\n        persona: \"  SENTINEL-CUSTOM-PERSONA — neutral, no character.  \"\n",
+    );
+    let (prompt, agent, _) = prompt_for(&cfg, "main", bash(), Path::new(FIXED_CWD));
+    assert!(
+        matches!(agent.head, Head::Persona(_)),
+        "fixture sanity: the agent carries a Persona head"
     );
     assert!(
-        prompt.contains(custom),
-        "agentless prompt must carry the configured persona"
+        prompt.contains("SENTINEL-CUSTOM-PERSONA — neutral, no character."),
+        "the prompt must carry the configured (trimmed) persona"
     );
     assert!(
         !prompt.contains("CODE CRUSADER"),
-        "agentless prompt must NOT carry the built-in crusader persona when a custom one is set"
+        "the prompt must NOT carry the built-in crusader persona when a custom one is set"
+    );
+    assert!(
+        prompt.contains(CORE_HEAD),
+        "the Persona head must keep the core tool guidance"
+    );
+    assert!(
+        prompt.contains("# Shell Tool Usage"),
+        "the Persona head must keep the rendered shell section (a shell is present)"
     );
 }
 
 #[test]
-fn agentless_prompt_with_none_persona_keeps_crusader() {
-    // Plan §A-Q7: "None / whitespace-only → built-in persona present." This
-    // is the GREEN guard against an over-aggressive impl that defaults to
-    // empty-string instead of falling back.
-    let skills = SkillRegistry::new();
-    let prompt = build_system_prompt(
-        &skills,
-        None,
-        &cwd(),
-        false,
-        /* agents_md_enabled */ true,
-        false,
-        None,
-        /* persona */ None,
+fn builtin_head_keeps_crusader_and_core() {
+    // No persona configured ⇒ the built-in crusader leads, the core follows.
+    let cfg = cfg_with("    agents:\n      main:\n        model: a\n");
+    let (prompt, agent, _) = prompt_for(&cfg, "main", None, Path::new(FIXED_CWD));
+    assert!(
+        matches!(agent.head, Head::BuiltIn),
+        "fixture sanity: absent persona resolves to BuiltIn"
     );
     assert!(
-        prompt.contains("CODE CRUSADER"),
-        "agentless prompt with no configured persona must keep the built-in crusader"
+        prompt.starts_with(BUILTIN_PERSONA),
+        "the prompt with no configured persona must keep the built-in crusader"
+    );
+    assert!(
+        prompt.contains(CORE_HEAD),
+        "the core follows the built-in persona"
     );
 }
 
 #[test]
-fn agentless_prompt_with_whitespace_only_persona_keeps_crusader() {
-    // §A-Q7: "trim, empty → None" applies at both the accessor AND the
-    // prompt builder (mirroring `orchestrator_prompt`'s discipline).
-    let skills = SkillRegistry::new();
-    let prompt = build_system_prompt(
-        &skills,
-        None,
-        &cwd(),
-        false,
-        /* agents_md_enabled */ true,
-        false,
-        None,
-        Some(&PromptHead::Persona("   \n  \t  \n".to_string())),
+fn subagent_bearing_agent_with_persona_carries_the_persona() {
+    // The old "orchestrator carries the configured persona": an agent WITH
+    // subagents and a Persona head leads with that persona — the built-in
+    // crusader is never mixed in, and the core still follows.
+    let cfg = cfg_with(
+        "    agents:\n      team:\n        model: a\n        persona: SENTINEL-CUSTOM-PERSONA\n        subagents:\n          s:\n            prompt: do it\n",
+    );
+    let (prompt, agent, _) = prompt_for(&cfg, "team", None, Path::new(FIXED_CWD));
+    assert!(
+        !agent.subagents.is_empty(),
+        "fixture sanity: team has a subagent"
     );
     assert!(
-        prompt.contains("CODE CRUSADER"),
-        "whitespace-only persona must be treated as absent and fall back to the built-in"
-    );
-    assert!(
-        !prompt.contains("   \n  \t  \n"),
-        "the whitespace payload itself must not appear in the prompt"
-    );
-}
-
-#[test]
-fn orchestrator_prompt_carries_configured_persona() {
-    // Multi-pipeline amendment 1: an orchestrator's persona — a pipeline's own
-    // `orchestrator.persona`, or the global `persona:` when the pipeline omits
-    // one — REPLACES the global persona and reaches the orchestrator recipe.
-    // Only the built-in crusader stays agentless-only.
-    let skills = SkillRegistry::new();
-    let custom = "SENTINEL-CUSTOM-PERSONA";
-    let prompt = build_system_prompt(
-        &skills,
-        None,
-        &cwd(),
-        false,
-        /* agents_md_enabled */ true,
-        /* subagents_active */ true,
-        /* orchestrator_prompt */ None,
-        Some(&PromptHead::Persona(custom.to_string())),
-    );
-    assert!(
-        prompt.contains(custom),
-        "orchestrator prompt must carry the configured persona"
+        prompt.contains("SENTINEL-CUSTOM-PERSONA"),
+        "the subagent-bearing agent must carry the configured persona"
     );
     assert!(
         !prompt.contains("CODE CRUSADER"),
-        "orchestrator prompt must NOT carry the built-in crusader"
+        "the configured persona replaces the built-in crusader"
     );
     assert!(
-        prompt.contains("# Working Principles"),
-        "orchestrator prompt must still carry the core tool guidance"
+        prompt.contains(CORE_HEAD),
+        "the core tool guidance still follows"
     );
 }
 
 #[test]
-fn orchestrator_prompt_without_persona_carries_none_at_all() {
-    // The other half of amendment 1: nothing configured (no pipeline persona,
-    // no global persona) ⇒ the orchestrator leads with the core guidance. The
-    // crusader is NOT an orchestrator fallback.
-    let skills = SkillRegistry::new();
-    let prompt = build_system_prompt(
-        &skills,
-        None,
-        &cwd(),
-        false,
-        /* agents_md_enabled */ true,
-        /* subagents_active */ true,
-        None,
-        /* persona */ None,
+fn subagent_bearing_agent_without_persona_gets_the_built_in() {
+    // The documented 0.24 delta (spec §6.1 change 1): the old orchestrator
+    // got NO persona at all — in 0.24 a subagent-bearing `Head::BuiltIn`
+    // agent leads with the built-in persona, same as a single agent.
+    let cfg = cfg_with(
+        "    agents:\n      team:\n        model: a\n        subagents:\n          s:\n            prompt: do it\n",
+    );
+    let (prompt, agent, _) = prompt_for(&cfg, "team", None, Path::new(FIXED_CWD));
+    assert!(
+        !agent.subagents.is_empty() && matches!(agent.head, Head::BuiltIn),
+        "fixture sanity: a subagent-bearing BuiltIn agent"
     );
     assert!(
-        !prompt.contains("CODE CRUSADER"),
-        "orchestrator prompt with no configured persona must carry no persona"
+        prompt.starts_with(BUILTIN_PERSONA),
+        "the built-in persona now leads a subagent-bearing agent (the orchestrator special case is gone)"
     );
-    assert!(
-        prompt.starts_with("# Working Principles"),
-        "with no persona the orchestrator prompt must open on the core guidance; got: {:?}",
-        &prompt[..prompt.len().min(80)]
-    );
+    assert!(prompt.contains(CORE_HEAD), "…and the core follows");
 }
 
 #[test]
-fn orchestrator_prompt_with_addendum_keeps_orchestrator_prompt_and_persona() {
-    let skills = SkillRegistry::new();
-    let custom = "SENTINEL-CUSTOM-PERSONA";
-    let extra = "SENTINEL-ORCH-EXTRA";
-    let prompt = build_system_prompt(
-        &skills,
-        None,
-        &cwd(),
-        false,
-        /* agents_md_enabled */ true,
-        true,
-        Some(extra),
-        Some(&PromptHead::Persona(custom.to_string())),
+fn persona_and_instructions_are_independent() {
+    // The old "orchestrator addendum keeps persona + addendum": the
+    // `# Instructions` section (`agent.prompt`) and the head are
+    // independent — both appear, the instructions last.
+    let cfg = cfg_with(
+        "    agents:\n      team:\n        model: a\n        persona: SENTINEL-CUSTOM-PERSONA\n        prompt: SENTINEL-ORCH-EXTRA\n        subagents:\n          s:\n            prompt: do it\n",
+    );
+    let (prompt, _, _) = prompt_for(&cfg, "team", None, Path::new(FIXED_CWD));
+    assert!(
+        prompt.contains("SENTINEL-CUSTOM-PERSONA"),
+        "the configured persona appears"
     );
     assert!(
-        prompt.contains(extra),
-        "orchestrator prompt addendum must still appear"
+        prompt.contains("\n# Instructions\n\nSENTINEL-ORCH-EXTRA\n"),
+        "the instructions appear under the 0.24 heading"
     );
     assert!(
-        prompt.contains(custom),
-        "the configured persona and the addendum are independent — both appear"
+        prompt.rfind("# Instructions").unwrap()
+            > prompt.rfind("# Environment Information").unwrap(),
+        "the instructions section is the last piece of the prompt"
     );
 }
 
 #[test]
 fn persona_to_core_join_is_a_single_newline_for_both_branches() {
-    // §A-Q7: "system_prompt_persona.txt ends with exactly one \n and
-    // system_prompt_core.txt starts with `# Working Principles` (no leading
-    // newline). The lone `push('\n')` is not decoration: reproducing that
-    // single newline makes a custom persona byte-compatible with the
-    // built-in join."
-    //
-    // We test the simpler invariant: both prompts end their persona with
-    // exactly one '\n' immediately before `# Working Principles`. The join
-    // is `\n`, not `\n\n`.
-    let skills = SkillRegistry::new();
-    let custom = "MY CUSTOM PERSONA";
-    let head = Some(PromptHead::Persona(custom.to_string()));
-    let configured = build_system_prompt(
-        &skills,
-        None,
-        &cwd(),
-        false,
-        true,
-        false,
-        None,
-        head.as_ref(),
+    // The lone `push('\n')` is not decoration: a configured persona is
+    // byte-compatible with the built-in join — exactly one `'\n'` before
+    // `# Working Principles` in both branches.
+    let configured = cfg_with(
+        "    agents:\n      main:\n        model: a\n        persona: MY CUSTOM PERSONA\n",
     );
-    let builtin = build_system_prompt(&skills, None, &cwd(), false, true, false, None, None);
+    let builtin = cfg_with("    agents:\n      main:\n        model: a\n");
+    let (prompt_c, _, _) = prompt_for(&configured, "main", None, Path::new(FIXED_CWD));
+    let (prompt_b, _, _) = prompt_for(&builtin, "main", None, Path::new(FIXED_CWD));
 
-    let core_idx_configured = configured
-        .find("# Working Principles")
+    let core_idx_c = prompt_c
+        .find(CORE_HEAD)
         .expect("core marker must be present");
-    let core_idx_builtin = builtin
-        .find("# Working Principles")
+    let core_idx_b = prompt_b
+        .find(CORE_HEAD)
         .expect("core marker must be present");
 
     assert_eq!(
-        configured.as_bytes()[core_idx_configured - 1],
+        prompt_c.as_bytes()[core_idx_c - 1],
         b'\n',
         "configured persona must end in a single \\n before the core"
     );
     assert_eq!(
-        builtin.as_bytes()[core_idx_builtin - 1],
+        prompt_b.as_bytes()[core_idx_b - 1],
         b'\n',
         "built-in persona must end in a single \\n before the core"
     );
+    assert!(
+        !prompt_c.contains("MY CUSTOM PERSONA\n\n# Working Principles"),
+        "the join is \\n, not \\n\\n"
+    );
 }
 
-// ---------------------------------------------------------------------------
-// `PromptHead::Full` (config `system_prompt:`) — replaces the persona AND
-// the core tool guidance, and nothing beyond the head.
-//
-// Distinctive strings asserted on (taken verbatim from the fixture files):
-//   src/system_prompt_core.txt:24  `### NEVER Use Bash/sed/awk For:`
-//   src/system_prompt_core.txt:49  `# Bash Tool Usage`
-//   src/system_prompt_core.txt:50  `- Do NOT use `| head` or `| tail` in commands`
-//   src/system_prompt_core.txt:1   `# Working Principles`
-//   src/system_prompt_persona.txt:6 `CODE CRUSADER`
-//   src/system_prompt_memory.txt   `# Memory.md` / `memory.md in the root of the project`
-//   src/lib.rs env_block           `# Environment Information`
-//   src/lib.rs agents_md_section   `# Agents.md Content`
-//   src/lib.rs orchestrator block  `# Orchestrator Instructions`
-// ---------------------------------------------------------------------------
-
 #[test]
-fn full_head_replaces_persona_and_core() {
-    // `Full` owns the entire static head: the built-in persona AND the core
-    // tool guidance (including the shell section — PR3 moved the bash
-    // coaching into `# Shell Tool Usage`, which is part of the core
-    // guidance) are all suppressed. A deployment that disables
-    // bash/think/todo must not ship coaching for tools the model cannot
-    // call. The padded input also pins the `trim()` — the prompt must open
-    // on the trimmed text, not the raw payload.
-    //
-    // PR3: driven WITH a shell (previously `None`, which made the
-    // shell-section assertions pass vacuously after the `# Bash Tool
-    // Usage` rename): with a Bash shell present, a Full head must still
-    // suppress `# Shell Tool Usage` — the section follows the core, and
-    // the core is what a Full head replaces.
-    let skills = SkillRegistry::new();
-    let bash = ShellKind::Bash {
-        path: "/bin/sh".to_string(),
-    };
-    let full = "RESEARCH ONLY — read files and cite sources, never edit.";
-    let cwd = tempfile::tempdir().expect("isolated cwd");
-    let prompt = build_system_prompt(
-        &skills,
-        Some(&bash),
-        cwd.path(),
-        /* memory_enabled */ false,
-        /* agents_md_enabled */ true,
-        /* subagents_active */ false,
-        /* orchestrator_prompt */ None,
-        /* head */ Some(&PromptHead::Full(format!("  \n{full}\n  "))),
+fn whole_head_replaces_persona_and_core() {
+    // `Head::Whole` (`core_guidance: false`) owns the entire static head:
+    // the built-in persona AND the core tool guidance (including the shell
+    // section) are all suppressed. The padded input pins the `trim()` — the
+    // prompt opens on the trimmed text.
+    let cfg = cfg_with(
+        "    agents:\n      main:\n        model: a\n        core_guidance: false\n        persona: \"  \\nRESEARCH ONLY — read files and cite sources, never edit.\\n  \"\n",
+    );
+    let (prompt, agent, _) = prompt_for(&cfg, "main", bash(), Path::new(FIXED_CWD));
+    assert!(
+        matches!(agent.head, Head::Whole(_)),
+        "fixture sanity: core_guidance: false resolves to Whole"
     );
     assert!(
-        prompt.starts_with(full),
-        "agentless prompt must START with the trimmed full head; got: {:?}",
+        prompt.starts_with("RESEARCH ONLY — read files and cite sources, never edit."),
+        "the prompt must START with the trimmed whole head; got: {:?}",
         &prompt[..prompt.len().min(80)]
     );
     assert!(
-        !prompt.contains("# Working Principles"),
-        "a Full head must suppress the core guidance (system_prompt_core.txt:1)"
+        !prompt.contains(CORE_HEAD),
+        "a Whole head must suppress the core guidance"
     );
     assert!(
         !prompt.contains("# Shell Tool Usage"),
-        "a Full head must suppress the `# Shell Tool Usage` section even with a shell present"
-    );
-    assert!(
-        !prompt.contains("- Do NOT use `| head` or `| tail` in commands"),
-        "a Full head must suppress the shell head/tail coaching (now in the shell section)"
+        "a Whole head must suppress the shell section even with a shell present"
     );
     assert!(
         !prompt.contains("CODE CRUSADER"),
-        "a Full head must suppress the built-in crusader persona (system_prompt_persona.txt:6)"
+        "a Whole head must suppress the built-in crusader persona"
     );
 }
 
 #[test]
-fn full_head_keeps_every_dynamic_section() {
+fn whole_head_keeps_every_dynamic_section() {
     // The override replaces the HEAD, not the whole prompt: the memory
     // section, the skills section, the env block and the agents.md content
-    // all still follow a `Full` head.
+    // all still follow a `Whole` head.
     let cwd = tempfile::tempdir().expect("isolated cwd");
     std::fs::write(
         cwd.path().join("agents.md"),
@@ -324,9 +280,8 @@ fn full_head_keeps_every_dynamic_section() {
     )
     .expect("agents.md written");
 
-    // Non-empty registry via the public loader: one valid skill folder.
-    let skills_root = tempfile::tempdir().expect("skills root");
-    let skill_dir = skills_root.path().join("sentinel-test-skill");
+    // One valid skill folder, discovered the way boot discovers skills.
+    let skill_dir = cwd.path().join("sentinel-test-skill");
     std::fs::create_dir_all(&skill_dir).expect("skill dir");
     std::fs::write(
         skill_dir.join("SKILL.md"),
@@ -335,36 +290,27 @@ fn full_head_keeps_every_dynamic_section() {
     .expect("SKILL.md written");
     let mut skills = SkillRegistry::new();
     let mut warnings = Vec::new();
-    skills.load_from_directory(skills_root.path(), &mut warnings);
+    skills.load_from_directory(cwd.path(), &mut warnings);
     assert_eq!(skills.len(), 1, "fixture skill must load");
 
-    let full = "RESEARCH ONLY — read files and cite sources, never edit.";
-    let prompt = build_system_prompt(
-        &skills,
-        None,
-        cwd.path(),
-        /* memory_enabled */ true,
-        /* agents_md_enabled */ true,
-        /* subagents_active */ false,
-        /* orchestrator_prompt */ None,
-        /* head */ Some(&PromptHead::Full(full.to_string())),
+    let cfg = cfg_with(
+        "    agents:\n      main:\n        model: a\n        core_guidance: false\n        persona: RESEARCH ONLY — read files and cite sources, never edit.\n",
     );
+    let profile = cfg.catalog.profile("p").expect("profile p");
+    let agent = &profile.agents[0];
+    let prompt = build_agent_prompt(agent, profile, &skills, None, cwd.path());
     assert!(
-        prompt.starts_with(full),
-        "the full head must still lead the prompt; got: {:?}",
+        prompt.starts_with("RESEARCH ONLY — read files and cite sources, never edit."),
+        "the whole head must still lead the prompt; got: {:?}",
         &prompt[..prompt.len().min(80)]
     );
     assert!(
         prompt.contains("# Memory.md"),
-        "the memory section must follow the Full head (memory_enabled=true)"
-    );
-    assert!(
-        prompt.contains("memory.md in the root of the project"),
-        "the memory section body must follow the Full head"
+        "the memory section must follow the Whole head (memory on by default)"
     );
     assert!(
         prompt.contains("# Skills"),
-        "the skills section must follow the Full head"
+        "the skills section must follow the Whole head"
     );
     assert!(
         prompt.contains("sentinel-test-skill"),
@@ -372,11 +318,11 @@ fn full_head_keeps_every_dynamic_section() {
     );
     assert!(
         prompt.contains("# Environment Information"),
-        "the env block must follow the Full head"
+        "the env block must follow the Whole head"
     );
     assert!(
         prompt.contains("# Agents.md Content"),
-        "the agents.md section must follow the Full head"
+        "the agents.md section must follow the Whole head (main agent default on)"
     );
     assert!(
         prompt.contains("SENTINEL-AGENTS-MD"),
@@ -385,163 +331,37 @@ fn full_head_keeps_every_dynamic_section() {
 }
 
 #[test]
-fn full_head_in_orchestrator_mode_keeps_orchestrator_instructions() {
-    // The override is UNCONDITIONAL: in orchestrator mode the `# Orchestrator
-    // Instructions` block still follows the Full head, and the crusader and
-    // the core are still absent — the same head semantics in both recipes.
-    //
-    // PR3: driven WITH a shell so the `# Shell Tool Usage` suppression is
-    // not vacuous (a Full head replaces the core guidance, which carries
-    // the shell section when a shell exists).
-    let skills = SkillRegistry::new();
-    let bash = ShellKind::Bash {
-        path: "/bin/sh".to_string(),
-    };
-    let full = "RESEARCH ONLY — read files and cite sources, never edit.";
-    let extra = "SENTINEL-ORCH-EXTRA: delegate to the team.";
-    let cwd = tempfile::tempdir().expect("isolated cwd");
-    let prompt = build_system_prompt(
-        &skills,
-        Some(&bash),
-        cwd.path(),
-        /* memory_enabled */ false,
-        /* agents_md_enabled */ true,
-        /* subagents_active */ true,
-        /* orchestrator_prompt */ Some(extra),
-        /* head */ Some(&PromptHead::Full(full.to_string())),
+fn whole_head_in_subagent_agent_keeps_instructions() {
+    // The override is UNCONDITIONAL: for a subagent-bearing agent the
+    // `# Instructions` block still follows the Whole head, and the crusader
+    // and the core are still absent — the same head semantics everywhere.
+    let cfg = cfg_with(
+        "    agents:\n      team:\n        model: a\n        core_guidance: false\n        persona: RESEARCH ONLY — read files and cite sources, never edit.\n        prompt: \"SENTINEL-ORCH-EXTRA: delegate to the team.\"\n        subagents:\n          s:\n            prompt: do it\n",
+    );
+    let (prompt, agent, _) = prompt_for(&cfg, "team", bash(), Path::new(FIXED_CWD));
+    assert!(
+        !agent.subagents.is_empty() && matches!(agent.head, Head::Whole(_)),
+        "fixture sanity: a subagent-bearing Whole agent"
     );
     assert!(
-        prompt.starts_with(full),
-        "orchestrator prompt must START with the full head; got: {:?}",
+        prompt.starts_with("RESEARCH ONLY — read files and cite sources, never edit."),
+        "the prompt must START with the whole head; got: {:?}",
         &prompt[..prompt.len().min(80)]
     );
     assert!(
-        prompt.contains("# Orchestrator Instructions"),
-        "the orchestrator instructions block must follow the Full head"
-    );
-    assert!(
-        prompt.contains(extra),
-        "the orchestrator prompt text must appear after the Full head"
+        prompt.contains("\n# Instructions\n\nSENTINEL-ORCH-EXTRA: delegate to the team.\n"),
+        "the instructions block must follow the Whole head"
     );
     assert!(
         !prompt.contains("CODE CRUSADER"),
-        "the built-in crusader must stay absent in orchestrator mode"
+        "the built-in crusader must stay absent"
     );
     assert!(
-        !prompt.contains("# Working Principles"),
-        "the core guidance must stay absent in orchestrator mode (Full head)"
+        !prompt.contains(CORE_HEAD),
+        "the core guidance must stay absent (Whole head)"
     );
     assert!(
         !prompt.contains("# Shell Tool Usage"),
-        "the `# Shell Tool Usage` section must stay absent in orchestrator mode (Full head)"
-    );
-}
-
-#[test]
-fn persona_head_still_keeps_core() {
-    // Contrast pin: `Persona` replaces ONLY the persona — the core tool
-    // guidance still follows. This is what stops anyone "simplifying"
-    // Persona and Full into one arm. (The existing join test also fails if
-    // the core disappears here, via its `expect("core marker must be
-    // present")` precondition — this names the invariant directly.)
-    //
-    // PR3: driven WITH a Bash shell — the core guidance carries the
-    // `# Shell Tool Usage` section, so a Persona head must keep BOTH the
-    // neutral core and the rendered shell section (whereas a Full head
-    // suppresses both, pinned in `full_head_replaces_persona_and_core`).
-    let skills = SkillRegistry::new();
-    let bash = ShellKind::Bash {
-        path: "/bin/sh".to_string(),
-    };
-    let custom = "SENTINEL-CUSTOM-PERSONA";
-    let cwd = tempfile::tempdir().expect("isolated cwd");
-    let prompt = build_system_prompt(
-        &skills,
-        Some(&bash),
-        cwd.path(),
-        /* memory_enabled */ false,
-        /* agents_md_enabled */ true,
-        /* subagents_active */ false,
-        /* orchestrator_prompt */ None,
-        /* head */ Some(&PromptHead::Persona(custom.to_string())),
-    );
-    assert!(
-        prompt.contains(custom),
-        "agentless prompt must carry the configured persona"
-    );
-    assert!(
-        prompt.contains("# Working Principles"),
-        "the Persona head must keep the core guidance (system_prompt_core.txt:1)"
-    );
-    assert!(
-        prompt.contains("# Shell Tool Usage"),
-        "the Persona head must keep the rendered `# Shell Tool Usage` section (a shell is present)"
-    );
-    assert!(
-        !prompt.contains("CODE CRUSADER"),
-        "the built-in crusader must be replaced by the configured persona"
-    );
-}
-
-#[test]
-fn resolve_prompt_head_precedence() {
-    // Table over the documented precedence:
-    //   1. a config `Full` outranks a pipeline persona (deployment ceiling)
-    //   2. else the pipeline's `orchestrator.persona` wins (amendment 1)
-    //   3. else the config's own head, or `None` for the built-in
-    let full = PromptHead::Full("FULL-HEAD".to_string());
-    let cfg_persona = PromptHead::Persona("CFG-PERSONA".to_string());
-
-    assert_eq!(
-        resolve_prompt_head(Some(&full), Some("PIPE-PERSONA")),
-        Some(PromptHead::Full("FULL-HEAD".to_string())),
-        "config Full + pipeline persona ⇒ Full (config wins)"
-    );
-    assert_eq!(
-        resolve_prompt_head(None, Some("PIPE-PERSONA")),
-        Some(PromptHead::Persona("PIPE-PERSONA".to_string())),
-        "config None + pipeline persona ⇒ Persona(pipeline)"
-    );
-    assert_eq!(
-        resolve_prompt_head(Some(&cfg_persona), Some("PIPE-PERSONA")),
-        Some(PromptHead::Persona("PIPE-PERSONA".to_string())),
-        "config Persona + pipeline persona ⇒ Persona(pipeline)"
-    );
-    assert_eq!(
-        resolve_prompt_head(Some(&cfg_persona), None),
-        Some(PromptHead::Persona("CFG-PERSONA".to_string())),
-        "config Persona + no pipeline ⇒ Persona(config)"
-    );
-    assert_eq!(resolve_prompt_head(None, None), None, "neither ⇒ None");
-}
-
-#[test]
-fn blank_full_head_falls_back_to_built_in() {
-    // Mirrors the whitespace-persona discipline: a whitespace-only `Full`
-    // is ABSENT, not an empty head — the built-in persona (agentless) and
-    // the core apply, and the payload itself never reaches the prompt.
-    let skills = SkillRegistry::new();
-    let cwd = tempfile::tempdir().expect("isolated cwd");
-    let prompt = build_system_prompt(
-        &skills,
-        None,
-        cwd.path(),
-        /* memory_enabled */ false,
-        /* agents_md_enabled */ true,
-        /* subagents_active */ false,
-        /* orchestrator_prompt */ None,
-        /* head */ Some(&PromptHead::Full("   \n\t ".to_string())),
-    );
-    assert!(
-        prompt.contains("CODE CRUSADER"),
-        "a whitespace-only Full head must fall back to the built-in crusader (agentless)"
-    );
-    assert!(
-        prompt.contains("# Working Principles"),
-        "a whitespace-only Full head must fall back to the core guidance"
-    );
-    assert!(
-        !prompt.contains("   \n\t "),
-        "the whitespace payload itself must not appear in the prompt"
+        "the shell section must stay absent (Whole head)"
     );
 }

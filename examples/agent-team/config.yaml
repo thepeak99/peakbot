@@ -1,0 +1,106 @@
+# PeakBot 0.24 — sample "software team" + "research" profiles
+#
+# Config layout: `providers` → `profiles` → ordered `agents` → `subagents`.
+# A profile is a named working setup; each profile lists the agents you can
+# talk to (the first agent is the default) and an agent may declare
+# `subagents:` — the specialists its `delegate` tool can hand ONE task at a
+# time. `delegate` exists exactly when an agent has subagents; subagents get
+# the same tools as the agent minus `delegate` (no nesting).
+#
+# The first profile is the default for a fresh conversation. Pick another with
+# `/profile <name>` and an agent with `/agent <name>` (or the Agents tab in the
+# web UI). Both choices lock after the first turn.
+#
+# Usage: copy to your config.yaml, drop in your API key, run `peakbot`.
+
+# =============================================================================
+# PROVIDERS — the models every agent and subagent draws from
+# =============================================================================
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: YOUR_API_KEY_HERE        # or set OPENROUTER_API_KEY
+    models:
+      - name: anthropic/claude-3.7-sonnet
+        alias: sonnet
+        max_tokens: 8192
+      - name: anthropic/claude-3.5-sonnet
+        alias: sonnet-3.5
+      - name: google/gemini-2.0-flash-001
+        alias: flash
+
+# =============================================================================
+# PROFILES — named setups (ordered; declaration order is UI order)
+# =============================================================================
+profiles:
+
+  # --- Profile 1: full software team ---
+  software-team:
+    agents:
+      lead:
+        model: sonnet
+        prompt: |                     # optional `# Instructions` section of the system prompt
+          You lead a small software team. Delegate research, review, and
+          implementation to your subagents. Keep the main thread focused on
+          planning and coordination.
+        # persona: |                  # optional — replaces the built-in persona for this
+        #   You are a technical lead. # agent only. Omit to keep the built-in persona.
+        subagents:
+          pm:
+            model: sonnet-3.5
+            prompt: |
+              You are the Product Manager. Turn a request into a tight product spec:
+              problem statement, core user stories, in-scope vs out-of-scope, and
+              success criteria. Be decisive; say "out of scope" when it is.
+
+          architect:
+            model: sonnet
+            prompt: |
+              You are the Software Architect. Given a spec, design the simplest
+              system that solves it: components, data flow, interfaces, and the key
+              tradeoffs. "Perfection is when there is nothing left to take away."
+
+          developer:
+            model: sonnet
+            prompt: |
+              You are the Developer. Implement the design as clean, boring,
+              maintainable code. Explain WHY on non-obvious choices, handle errors
+              gracefully, avoid premature abstraction and clever one-liners.
+
+          tester:
+            model: flash
+            prompt: |
+              You are the QA Engineer. Write tests that try to make the code fail:
+              happy path AND edge cases (empty, max, null, error paths). Name each
+              test by what it verifies. Report any bugs you spot with repro steps.
+            env:
+              # Per-subagent env is overlaid on the profile env for THIS subagent's
+              # bash tool only — it never leaks into the lead or other subagents.
+              RUN_INTEGRATION_TESTS: "1"
+
+  # --- Profile 2: lightweight research + review ---
+  research:
+    agents:
+      lead:
+        model: sonnet-3.5
+        persona: |
+          You are a research lead — thorough, sceptical, and concise.
+          You prioritise accuracy over speed and flag uncertainty.
+        prompt: |
+          You coordinate a research team. Delegate fact-checking and source
+          critique to your subagents. Synthesise their findings into a concise
+          brief for the user.
+        subagents:
+          researcher:
+            model: flash
+            prompt: |
+              You research codebases, documentation, and the web. Return a tight,
+              well-sourced brief: key facts, relevant links, and any gaps.
+            skills:
+              only: [web_search, github]
+
+          reviewer:
+            model: sonnet
+            prompt: |
+              You critique sources and findings. Check for logical gaps,
+              unsupported claims, and missing context. Be constructive but direct.

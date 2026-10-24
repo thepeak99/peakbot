@@ -1516,3 +1516,43 @@ fn e2_missing_profiles_field() {
         "declare at least one profile — the first one is the default"
     );
 }
+
+// ---------- shipped examples ----------
+
+/// The runnable examples under `examples/` are 0.24 configs: they must go
+/// through THE boundary (`Config::parse`) cleanly, so a layout change can
+/// never leave a sample that PeakBot refuses to boot.
+#[test]
+fn shipped_examples_parse() {
+    for (dir, first_profile, agent_with_team) in [
+        ("agent-team", "software-team", "lead"),
+        ("agent-dev-team", "software-team", "lead"),
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(dir)
+            .join("config.yaml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let cfg = Config::parse(
+            Source {
+                path: &path,
+                text: &text,
+            },
+            None,
+            &ctx(),
+        )
+        .unwrap_or_else(|e| panic!("example {dir} must parse: {e:?}"));
+        let bound = cfg.catalog.default_bound();
+        assert_eq!(bound.profile.name, first_profile, "{dir}: default profile");
+        assert_eq!(
+            bound.agent().main.name,
+            agent_with_team,
+            "{dir}: default agent"
+        );
+        assert!(
+            !bound.agent().subagents.is_empty(),
+            "{dir}: the default agent leads a team (delegate is on)"
+        );
+    }
+}

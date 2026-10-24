@@ -1,13 +1,13 @@
-# PeakBot Six-Role Software-Team Pipeline
+# PeakBot Six-Role Software-Team Profile
 
-A fuller multi-agent team than the basic `pipeline-team` example. You talk to
-**one** orchestrator; it delegates to six specialised sub-agents that mirror a
+A fuller multi-agent team than the basic `agent-team` example. You talk to
+**one** agent (`lead`); it delegates to six specialised subagents that mirror a
 real software team.
 
 ## The team
 
-The orchestrator is your top-level `default_model` agent — **not** a role below.
-These are the sub-agents it can `delegate` to:
+The `lead` agent of the `software-team` profile is the one you chat with — **not**
+a role below. These are the subagents it can `delegate` to:
 
 | Role | Alias | Model (Jul 2026) | Does | Aborts / hands back when… |
 |------|-------|------------------|------|----------------------------|
@@ -26,7 +26,7 @@ Fable 5 / Mythos 5, and MiniMax M3.
 
 ## Why the prompts are written the way they are
 
-Every sub-agent runs on a **fresh context**, returns **one string**, **can't
+Every subagent runs on a **fresh context**, returns **one string**, **can't
 talk to the human**, and has **no `delegate` tool**. The prompts are built
 around those facts:
 
@@ -60,18 +60,17 @@ Junior for mechanical tasks the Architect flagged junior-safe; Senior for the
 rest. The orchestrator relays the PM's blocking questions to you before letting
 the build start.
 
-## The orchestrator prompt
+## The lead's prompt
 
-The orchestrator is your top-level `default_model` agent — its persona is **not**
-a role under `pipeline.agents`. This example ships a tailored orchestrator prompt
-**already wired into `config.yaml`** via `pipeline.orchestrator_prompt` — the
-config field whose content PeakBot appends to the orchestrator's system prompt
-whenever sub-agents are active. So the moment you `/subagents on`, the
-orchestrator already knows how to lead this team: **delegate everything** (it
-never codes, tests, or builds itself), research before acting when it isn't sure,
-pack full context into each fresh-context delegation, relay the PM's blocking
-questions to you, and route the Senior's `DEEP RESEARCH NEEDED` signals to the
-Researcher.
+The `lead` agent's `prompt:` is rendered as the `# Instructions` section of its
+system prompt (after the built-in persona, core guidance, env block and
+agents.md). This example ships a tailored prompt **already wired into
+`config.yaml`** under `profiles.software-team.agents.lead.prompt`, so the moment
+you start a conversation the lead already knows how to run this team: **delegate
+everything** (it never codes, tests, or builds itself), research before acting
+when it isn't sure, pack full context into each fresh-context delegation, relay
+the PM's blocking questions to you, and route the Senior's `DEEP RESEARCH
+NEEDED` signals to the Researcher.
 
 The same text also lives standalone in
 [`orchestrator-prompt.md`](orchestrator-prompt.md) — use that copy if you'd
@@ -83,14 +82,13 @@ in sync; pick one, not both.
 
 1. Copy the config into your PeakBot config directory:
    ```bash
-   cp examples/pipeline-dev-team/config.yaml ~/.config/peakbot/config.yaml
+   cp examples/agent-dev-team/config.yaml ~/.config/peakbot/config.yaml
    ```
    (macOS: `~/Library/Application Support/com.peakbot.peakbot/config.yaml`; Windows: `%APPDATA%\peakbot\peakbot\config\config.yaml`)
 2. Add your API key (or set `OPENROUTER_API_KEY`).
-3. Run PeakBot, enable sub-agents for this conversation (opt-in, before turn 1),
-   then describe what you want:
+3. Run PeakBot and describe what you want — `software-team › lead` is the
+   default, so the team is already on:
    ```
-   /subagents on
    I want a CLI tool that converts markdown to HTML with a --watch mode
    ```
 
@@ -104,7 +102,9 @@ in sync; pick one, not both.
   (cost ~halved, modest quality drop). Downgrade `senior` to `kimi` for a
   coding-tier swap (DeepSWE 67.5 vs Opus 5's 68.8 — within the margin).
   See the `MODEL TIER RATIONALE` block in `config.yaml` for full tradeoffs.
-- **`pipeline:` is boot-only** — edit and restart to apply (it's in the
-  "restart to apply" set of the live-reload rules).
-- Keep the orchestrator in `default_model`; put only sub-agents under
-  `pipeline.agents`. Never add an `orchestrator` role.
+- **Profiles reload on `/new`, `/cd` and `/load`** — edit `config.yaml` and the
+  next fresh conversation picks the change up (no restart; only the boot-only
+  `general.web` / `mcps` / `general.http` / `general.uploads` /
+  `general.conversation` blocks need one).
+- Keep the lead as the profile's first agent; put only specialists under its
+  `subagents:`. Never add the lead as one of its own subagents.
