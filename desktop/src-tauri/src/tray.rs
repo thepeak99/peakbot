@@ -116,7 +116,7 @@ pub fn apply(state: &Arc<UiState>, model: &TrayModel) {
 pub fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         "open" => window::focus_main(app),
-        "settings" => window::request_settings(app),
+        "settings" => window::request_settings_page(app),
         "background" => {
             // muda auto-toggles a check item on click, before we get
             // here — re-apply the last model, then act (the controller

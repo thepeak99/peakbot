@@ -26,9 +26,15 @@ pub fn status(state: State<'_, Arc<UiState>>) -> StatusView {
     state.snapshot.lock().expect("snapshot poisoned").clone()
 }
 
-/// A status-page button press (DESIGN §4.2/§5.4).
+/// A local-page button press (DESIGN §4.2/§5.4): status-page actions
+/// and the settings page's `← Back to PeakBot` (0.24, spec §9.10).
 #[tauri::command]
-pub fn act(action: UiAction, app: AppHandle, tx: State<'_, ActionTx>) -> Result<(), String> {
+pub fn act(
+    action: UiAction,
+    app: AppHandle,
+    tx: State<'_, ActionTx>,
+    ui: State<'_, Arc<UiState>>,
+) -> Result<(), String> {
     match action {
         UiAction::Retry => tx.0.send(Action::Start).map_err(|e| e.to_string()),
         UiAction::ReinstallService => {
@@ -47,11 +53,25 @@ pub fn act(action: UiAction, app: AppHandle, tx: State<'_, ActionTx>) -> Result<
             app.exit(0);
             Ok(())
         }
-        // The settings window's background row (design #377 §5.2); the
+        // The settings page's background row (design #377 §5.2); the
         // status page never emits it.
         UiAction::ToggleBackground => {
             tx.0.send(Action::ToggleBackground)
                 .map_err(|e| e.to_string())
+        }
+        // The settings page's `← Back to PeakBot` (0.24, spec §9.10):
+        // the main window goes back to the live backend URL, or the
+        // status page if the backend is not Ready.
+        UiAction::Back => {
+            let backend = ui.backend_url.lock().expect("backend_url poisoned").clone();
+            let target = match backend {
+                Some(url) => url.parse::<tauri::Url>().map_err(|e| e.to_string())?,
+                None => crate::bridge::local_page_url(),
+            };
+            let Some(win) = app.get_webview_window(crate::window::MAIN_LABEL) else {
+                return Err("main window not found".into());
+            };
+            win.navigate(target).map_err(|e| e.to_string())
         }
     }
 }

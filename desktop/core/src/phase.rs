@@ -121,6 +121,10 @@ pub enum UiAction {
     /// The settings page's background row (design #377 §4.2); `status_view`
     /// never emits it.
     ToggleBackground,
+    /// The settings page's `← Back to PeakBot` (0.24, spec §9.10): the
+    /// main window goes back to the chat (or the status page).
+    /// `status_view` never emits it.
+    Back,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -671,7 +675,8 @@ mod tests {
         assert_eq!(t.status, "PeakBot ? · starting…");
     }
 
-    // §9.1 case 32 (updated for #377: + `toggle_background`).
+    // §9.1 case 32 (updated for #377: + `toggle_background`; 0.24: +
+    // `back`).
     #[test]
     fn t32_ui_action_serde_wire_names() {
         for (wire, action) in [
@@ -680,6 +685,7 @@ mod tests {
             ("reinstall_service", UiAction::ReinstallService),
             ("quit", UiAction::Quit),
             ("toggle_background", UiAction::ToggleBackground),
+            ("back", UiAction::Back),
         ] {
             let d: UiAction = serde_json::from_str(&format!("\"{wire}\""))
                 .unwrap_or_else(|e| panic!("{wire}: {e}"));
