@@ -22,15 +22,10 @@ use super::model_registry::canonical_alias;
 use super::named::{NamedFailure, named_failure};
 use super::{
     BUILTIN_TOOL_NAMES, EmbeddingsConfig, FetchUrlConfig, McpServerConfig, MemoryConfig,
-    ModelRegistry, NameFilter, ProviderEntry, RegistryError, ResolvedModel, get_config_file_path,
+    ModelRegistry, NameFilter, ProviderEntry, RegistryError, ResolvedModel, TAB_NAMES,
+    get_config_file_path,
 };
 use crate::vector::normalize_lexical;
-
-/// The Web tabs a profile's `ui.tabs` may name, in canonical order. The old
-/// `profile` tab is gone and `settings` is new (spec §3.3).
-const TAB_NAMES: [&str; 7] = [
-    "session", "todo", "files", "tasks", "bash", "agents", "settings",
-];
 
 const L1_MESSAGE: &str = "config.yaml uses the pre-0.24 layout — restart PeakBot to migrate it automatically (the original is kept as config.yaml.pre-0.24)";
 const RP2_MESSAGE: &str = "this repo config uses the pre-0.24 layout — PeakBot migrates it automatically on the next start or /cd into this directory";
@@ -268,7 +263,7 @@ pub struct VectorSpec {
 
 impl VectorSpec {
     /// temporary shim, removed in the 0.24 cutover
-    pub fn from_legacy(legacy: &crate::config::VectorDbConfig) -> Self {
+    pub fn from_legacy(legacy: &VectorDbConfig) -> Self {
         // Relative (incl. `~`) stays `SessionRelative` — the shim must
         // reproduce 0.23's per-cwd resolution byte-identically; `~` only
         // becomes `Fixed` at `Config::parse`.
@@ -629,18 +624,17 @@ fn bare_message(err: &serde_yaml::Error, path: &[PathSeg]) -> String {
     }
 }
 
-/// E1, else the registry with the first declared alias as its (soon removed)
-/// default; R1 errors are located at the offending alias.
+/// E1, else the registry; R1 errors are located at the offending alias.
 fn build_registry(
     providers: &[ProviderEntry],
     declared: &[String],
     sink: &mut Sink,
 ) -> Option<ModelRegistry> {
-    let Some(first) = declared.first() else {
+    if declared.is_empty() {
         sink.push(vec![key("providers")], E1_MESSAGE);
         return None;
-    };
-    match ModelRegistry::build(providers, Some(first)) {
+    }
+    match ModelRegistry::build(providers) {
         Ok(registry) => Some(registry),
         Err(err) => {
             sink.push(registry_error_path(providers, &err), err.to_string());
@@ -778,16 +772,15 @@ impl Resolver<'_> {
         let base = vec![key("profiles"), key(name)];
         let before = sink.errors.len();
 
-        let filterable = filterable_tools();
         check_filter(sink, &at(&base, &["tools"]), &def.tools, |tool| {
             if tool == "delegate" {
                 Some("'delegate' is not a filterable tool — it is on automatically when an agent has subagents".to_string())
-            } else if filterable.contains(&tool) {
+            } else if BUILTIN_TOOL_NAMES.contains(&tool) {
                 None
             } else {
                 Some(format!(
                     "unknown tool '{tool}'. Known tools: {}.",
-                    filterable.join(", ")
+                    BUILTIN_TOOL_NAMES.join(", ")
                 ))
             }
         });
@@ -1075,15 +1068,6 @@ fn check_filter(
         }
     }
     true
-}
-
-/// `delegate` is on iff an agent has subagents, so it is not filterable.
-fn filterable_tools() -> Vec<&'static str> {
-    BUILTIN_TOOL_NAMES
-        .iter()
-        .copied()
-        .filter(|tool| *tool != "delegate")
-        .collect()
 }
 
 /// V1, then the `DbPathSpec`. `None` = an error was reported.
