@@ -46,6 +46,11 @@ pub struct AppState {
     #[serde(default)]
     pub is_running: bool,
 
+    /// A graceful (first-press) Stop is pending: the in-flight tool call
+    /// finishes, then the turn ends. Cleared by `set_running`.
+    #[serde(default)]
+    pub stop_pending: bool,
+
     /// Whether the agent is currently loading (alias for is_running, kept for compatibility)
     #[serde(default)]
     #[doc(hidden)]

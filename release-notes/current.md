@@ -4,6 +4,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
+- Stop is now two-stage: the first press finishes the running tool call and then stops; press Stop (or Esc) again to stop immediately.
 - ruvector-core upgraded to 2.4.0 — default HNSW index no longer uses hnsw_rs (no upfront capacity reservation), redb connection-pool lock-race fixes; existing vector DBs open unchanged.
 - Vector store: no longer pre-reserves ~35 GiB per open (hnsw_rs 0.3.5 fix + HNSW capacity hint capped at 100k), which could crash PeakBot during doc_index/doc_search.
 - Dev tooling: `make clean` now removes ALL build artifacts — root and desktop cargo targets, `web/dist` + `web/node_modules`, the desktop sidecar binaries, `gen/` and fetched emoji fonts, `output/`, and `.release-version` — while restoring the tracked `.gitkeep` placeholders.

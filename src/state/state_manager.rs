@@ -44,6 +44,17 @@ pub struct StopTally {
     pub shell: bool,
 }
 
+/// What one press of Stop did — see [`StateManager::request_stop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopStep {
+    /// Idle, or the turn is already cancelled: nothing happened.
+    Noop,
+    /// First press: finish the in-flight tool call, then end the turn.
+    Graceful,
+    /// Second press (or graceful impossible): abort now.
+    Immediate(StopTally),
+}
+
 /// RAII guard for a running sub-agent, returned by
 /// [`StateManager::begin_sub_agent`].
 ///
@@ -991,6 +1002,8 @@ impl StateManager {
         {
             let mut state = self.state.write().unwrap();
             state.is_running = running;
+            // A graceful stop belongs to one turn; never carry it into the next.
+            state.stop_pending = false;
             state.run_started_at = if running {
                 Some(std::time::Instant::now())
             } else {
@@ -3110,6 +3123,44 @@ impl StateManager {
         self.clear_bash_stdin_tx();
         self.reset_bash_panel();
         StopTally { shell }
+    }
+
+    /// One press of Stop. Idle or already-aborted → `Noop`; the first press
+    /// arms `stop_pending` (`Graceful`); a second press — or a first press no
+    /// hook would honour — aborts via [`Self::stop_turn_processes`]. The abort
+    /// runs after the state lock drops (it takes the lock itself), so callers
+    /// serialise presses — the controller's `pending_stop` cell does.
+    pub fn request_stop(&self) -> StopStep {
+        {
+            let mut state = self.state.write().unwrap();
+            // Lock order state → turn_cancel; nothing nests them the other way.
+            if !state.is_running || self.turn_cancel.read().unwrap().is_cancelled() {
+                return StopStep::Noop;
+            }
+            let graceful = !state.stop_pending && Self::graceful_possible(&state);
+            state.stop_pending = graceful;
+            self.notify_update(&state);
+            if graceful {
+                return StopStep::Graceful;
+            }
+        }
+        StopStep::Immediate(self.stop_turn_processes())
+    }
+
+    /// Whether a graceful stop has been requested for the running turn.
+    pub fn stop_pending(&self) -> bool {
+        self.state.read().unwrap().stop_pending
+    }
+
+    /// Whether a hook will see `stop_pending` at its next boundary. Ollama is
+    /// hookless (`DynAgent::Ollama` carries `()`), and a Pausing/Paused
+    /// sub-agent parks before the orchestrator hook runs again.
+    fn graceful_possible(state: &AppState) -> bool {
+        state.stats.provider_name != "ollama"
+            && state
+                .sub_agent
+                .as_ref()
+                .is_none_or(|r| r.pause == crate::ui::app_state::PauseState::Running)
     }
 
     /// Clear all per-process bg cooldowns so the next drain flushes every
@@ -10065,5 +10116,288 @@ mod tests {
             !convo_dir.exists(),
             "delete_conversation must remove <root>/<id> (best-effort store cleanup)"
         );
+    }
+}
+
+// ─── Two-stage Stop (TDD: written before the implementation) ────────────────
+//
+// Contract under test (design):
+//   * 1st press while running  → `StopStep::Graceful`: sets `stop_pending`,
+//     does NOT cancel the turn token, kills nothing.
+//   * 2nd press                → `StopStep::Immediate(tally)`: today's abort
+//     (`stop_turn_processes`), clears `stop_pending`.
+//   * further presses / idle   → `StopStep::Noop`.
+//   * Ollama (hookless) or a sub-agent that is Pausing/Paused → the first
+//     press is already Immediate (no hook will ever honour the flag).
+//   * `set_running(_)` (true AND false) clears `stop_pending`.
+//   * `AppState.stop_pending` mirrors the flag so UIs can render it.
+#[cfg(test)]
+mod two_stage_stop_tests {
+    use super::*;
+
+    /// A manager with a running turn and nothing else — graceful is possible.
+    fn running_sm() -> Arc<StateManager> {
+        let sm = StateManager::new_arc();
+        sm.set_running(true);
+        sm
+    }
+
+    #[test]
+    fn request_stop_idle_is_noop() {
+        let sm = StateManager::new_arc();
+        assert_eq!(sm.request_stop(), StopStep::Noop);
+        assert!(!sm.stop_pending(), "an idle press must not arm a stop");
+        assert!(!sm.get_state().stop_pending);
+        assert!(
+            !sm.turn_cancel_token().is_cancelled(),
+            "an idle press must not cancel (and so poison) anything"
+        );
+    }
+
+    #[test]
+    fn request_stop_after_turn_ended_is_noop() {
+        let sm = running_sm();
+        sm.set_running(false);
+        assert_eq!(sm.request_stop(), StopStep::Noop);
+        assert!(!sm.stop_pending());
+    }
+
+    #[test]
+    fn request_stop_first_press_is_graceful_and_does_not_cancel() {
+        let sm = running_sm();
+        let token = sm.turn_cancel_token();
+
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+
+        assert!(sm.stop_pending(), "a graceful press arms stop_pending");
+        assert!(
+            sm.get_state().stop_pending,
+            "the AppState snapshot must mirror stop_pending for the UIs"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "graceful must NOT cancel the turn token (the in-flight tool keeps running)"
+        );
+        assert!(
+            sm.is_running(),
+            "graceful leaves the turn running until the hook ends it"
+        );
+    }
+
+    #[test]
+    fn request_stop_graceful_does_not_kill_the_foreground_shell() {
+        let sm = running_sm();
+        sm.start_bash_panel("sleep 30".into(), 4242);
+        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        sm.set_bash_stdin_tx(stdin_tx);
+
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+
+        assert!(
+            !sm.get_state().bash_panel.is_idle(),
+            "graceful must leave the running shell alone so it records its REAL result"
+        );
+        assert!(sm.has_active_bash_stdin());
+    }
+
+    #[test]
+    fn request_stop_second_press_escalates_to_immediate() {
+        let sm = running_sm();
+        let token = sm.turn_cancel_token();
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+
+        let step = sm.request_stop();
+
+        assert_eq!(
+            step,
+            StopStep::Immediate(StopTally::default()),
+            "second press = today's abort; nothing was running in a shell"
+        );
+        assert!(token.is_cancelled(), "immediate cancels the turn token");
+        assert!(
+            !sm.stop_pending(),
+            "escalation consumes the pending flag (it is now an abort)"
+        );
+        assert!(!sm.get_state().stop_pending);
+    }
+
+    #[test]
+    fn request_stop_second_press_reports_the_killed_shell_in_the_tally() {
+        let sm = running_sm();
+        sm.start_bash_panel("sleep 30".into(), 4242);
+        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        sm.set_bash_stdin_tx(stdin_tx);
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+
+        assert_eq!(
+            sm.request_stop(),
+            StopStep::Immediate(StopTally { shell: true })
+        );
+        assert!(
+            sm.get_state().bash_panel.is_idle(),
+            "immediate kills the shell"
+        );
+        assert!(!sm.has_active_bash_stdin());
+    }
+
+    #[test]
+    fn request_stop_third_press_is_noop() {
+        let sm = running_sm();
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+        assert!(matches!(sm.request_stop(), StopStep::Immediate(_)));
+
+        assert_eq!(
+            sm.request_stop(),
+            StopStep::Noop,
+            "the token is already cancelled — further presses do nothing"
+        );
+        assert_eq!(sm.request_stop(), StopStep::Noop);
+        assert!(!sm.stop_pending(), "a no-op press must not re-arm the flag");
+    }
+
+    #[test]
+    fn request_stop_after_plain_stop_turn_processes_is_noop() {
+        // The old path (stop_turn_processes called directly) must also make
+        // later presses no-ops: the token is already cancelled.
+        let sm = running_sm();
+        sm.stop_turn_processes();
+        assert_eq!(sm.request_stop(), StopStep::Noop);
+        assert!(!sm.stop_pending());
+    }
+
+    #[test]
+    fn request_stop_ollama_degrades_to_immediate() {
+        let sm = running_sm();
+        sm.set_provider_name("ollama".into());
+        let token = sm.turn_cancel_token();
+
+        assert!(
+            matches!(sm.request_stop(), StopStep::Immediate(_)),
+            "Ollama is hookless: no hook would ever honour a graceful flag"
+        );
+        assert!(token.is_cancelled());
+        assert!(!sm.stop_pending(), "no pending flag may be left behind");
+    }
+
+    #[test]
+    fn request_stop_hooked_provider_is_graceful() {
+        // Regression guard for the Ollama special case: any other provider
+        // name keeps the two-stage behaviour.
+        let sm = running_sm();
+        sm.set_provider_name("openrouter".into());
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+    }
+
+    #[test]
+    fn request_stop_with_running_subagent_is_graceful() {
+        // `delegate` counts as ONE orchestrator tool call: a sub-agent that
+        // is actively Running is waited for.
+        let sm = running_sm();
+        let _guard = sm.begin_sub_agent("reviewer", true);
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+        assert!(sm.stop_pending());
+    }
+
+    #[test]
+    fn request_stop_with_pausing_subagent_is_immediate() {
+        let sm = running_sm();
+        let _guard = sm.begin_sub_agent("reviewer", true);
+        sm.request_pause();
+        assert_eq!(
+            sm.get_state().sub_agent.as_ref().map(|r| r.pause),
+            Some(crate::ui::app_state::PauseState::Pausing),
+            "sanity: the sub-agent is Pausing"
+        );
+
+        assert!(
+            matches!(sm.request_stop(), StopStep::Immediate(_)),
+            "a pausing sub-agent parks before its next boundary; the flag would never be seen"
+        );
+        assert!(!sm.stop_pending());
+    }
+
+    #[test]
+    fn request_stop_with_parked_subagent_is_immediate() {
+        let sm = running_sm();
+        let _guard = sm.begin_sub_agent("reviewer", true);
+        sm.request_pause();
+        sm.set_sub_agent_pause(true); // the park watcher's transition
+        assert_eq!(
+            sm.get_state().sub_agent.as_ref().map(|r| r.pause),
+            Some(crate::ui::app_state::PauseState::Paused),
+            "sanity: the sub-agent is Paused"
+        );
+
+        let token = sm.turn_cancel_token();
+        assert!(matches!(sm.request_stop(), StopStep::Immediate(_)));
+        assert!(token.is_cancelled());
+        assert!(!sm.stop_pending());
+    }
+
+    #[test]
+    fn stop_pending_resets_on_set_running_false() {
+        let sm = running_sm();
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+        assert!(sm.stop_pending());
+
+        sm.set_running(false);
+
+        assert!(!sm.stop_pending(), "turn end clears the flag");
+        assert!(!sm.get_state().stop_pending);
+    }
+
+    #[test]
+    fn stop_pending_resets_on_set_running_true() {
+        // A pending flag must never leak into the NEXT turn, even if the
+        // turn end was never observed (e.g. the loop restarted a turn).
+        let sm = running_sm();
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+
+        sm.set_running(true);
+
+        assert!(
+            !sm.stop_pending(),
+            "a fresh turn starts with no pending stop"
+        );
+        assert!(!sm.get_state().stop_pending);
+        assert!(!sm.turn_cancel_token().is_cancelled());
+    }
+
+    #[test]
+    fn next_turn_after_graceful_stop_can_be_stopped_again_gracefully() {
+        let sm = running_sm();
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+        sm.set_running(false);
+        sm.set_running(true);
+
+        assert_eq!(
+            sm.request_stop(),
+            StopStep::Graceful,
+            "the second turn's first press is graceful again"
+        );
+    }
+
+    #[test]
+    fn next_turn_after_immediate_stop_can_be_stopped_gracefully() {
+        let sm = running_sm();
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+        assert!(matches!(sm.request_stop(), StopStep::Immediate(_)));
+        sm.set_running(false);
+        sm.set_running(true);
+
+        assert_eq!(sm.request_stop(), StopStep::Graceful);
+    }
+
+    #[test]
+    fn stop_turn_processes_is_unchanged_by_two_stage_stop() {
+        // Byte-for-byte contract: the abort primitive itself neither reads nor
+        // writes the pending flag's semantics — it still cancels and tallies.
+        let sm = running_sm();
+        sm.start_bash_panel("sleep 30".into(), 4242);
+        let token = sm.turn_cancel_token();
+
+        assert_eq!(sm.stop_turn_processes(), StopTally { shell: true });
+        assert!(token.is_cancelled());
+        assert_eq!(sm.stop_turn_processes(), StopTally::default(), "idempotent");
     }
 }
