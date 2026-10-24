@@ -12,15 +12,18 @@
 
 pub mod retry;
 
+use crate::config::resolve::{Member, Subagent};
 use crate::config::{
-    AnthropicCaching, AnthropicConfig, BashConfig, FetchUrlConfig, LlamaCppConfig, OllamaConfig,
-    OpenAIConfig, OpenRouterConfig, ProviderConfig, RetryConfig, SearXngConfig, TimeoutsConfig,
+    AnthropicCaching, AnthropicConfig, Env, LlamaCppConfig, OllamaConfig, OpenAIConfig,
+    OpenRouterConfig, ProviderConfig, ResolvedModel, TimeoutsConfig,
 };
 use crate::hooks::SessionHook;
 use crate::hooks::events::SourcedEvent;
 #[cfg(feature = "mock")]
 use crate::mock::MockCompletionModel;
+use crate::pipeline::SubAgentDeps;
 use crate::state::StateManager;
+use crate::tools::env::{ToolEnv, builtin_tool_names};
 use crate::tools::{
     BashTool, FetchPageTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool,
     FileStrReplaceTool, ListDirectoryTool, PdfReadTool, PowerShellTool, SearchTool, ShellBgTool,
@@ -37,6 +40,7 @@ use rig_core::providers::ollama;
 use rig_core::providers::openai;
 use rig_core::providers::openrouter;
 use rig_core::tool::ToolDyn;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -47,8 +51,6 @@ pub struct ProviderInfo {
     pub name: String,
     /// Model name
     pub model: String,
-    /// Whether this provider supports pricing/cost tracking
-    pub supports_pricing: bool,
     /// Whether this provider+model can accept image input.
     ///
     /// Set via [`supports_vision_for`]. Used by the dispatcher to block
@@ -212,56 +214,45 @@ impl DynAgent {
     }
 }
 
-/// Create a provider client and agent from the configuration
+/// Build the main agent for `model` with `system_prompt` as its preamble.
 ///
-/// If mcp_tools is provided, they will be added to the agent along with built-in tools.
-/// The system_prompt is used as the agent's preamble.
+/// Tools come from `tool_env` (the profile's built-ins, MCP servers, and
+/// timeouts) with the bash env `tool_env.bash_env(member)`. `delegate` is
+/// registered iff `delegate` is `Some` — callers pass it iff
+/// `tools::env::delegate_enabled(agent)`; its `event_sink` is replaced by
+/// this build's own channel. The delegation retry policy travels in
+/// `SubAgentDeps.retry`. `model` is passed separately from `member` because
+/// `/model` may run the agent on a model other than its configured one.
+///
 /// Returns the agent, provider info, event receiver, and shared session hook.
 /// Stats are managed by the provided StateManager.
 pub fn create_provider(
-    config: &ProviderConfig,
-    mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
+    model: &ResolvedModel,
     system_prompt: &str,
-    searxng_config: Option<&SearXngConfig>,
-    max_turns: usize,
+    tool_env: &ToolEnv,
+    member: &Member,
+    delegate: Option<Arc<SubAgentDeps>>,
     todo_tool: Option<TodoTool>,
-    bash_config: &BashConfig,
-    tools_filter: &crate::config::NameFilter,
-    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
-    vector_store: Option<&crate::vector::VectorStore>,
-    skills: &crate::skills::SkillRegistry,
-    retry: &RetryConfig,
-    timeouts: &TimeoutsConfig,
-    agents_md: bool,
-    fetch_url: &FetchUrlConfig,
 ) -> Result<(
     DynAgent,
     ProviderInfo,
     Option<mpsc::UnboundedReceiver<SourcedEvent>>,
     Arc<SessionHook>,
 )> {
-    match config {
+    let bash_env = tool_env.bash_env(member);
+    match &model.provider_config {
         ProviderConfig::OpenRouter(c) => {
             let (agent, info, receiver, hook) = create_openrouter_agent(
                 c,
-                mcp_tools,
                 system_prompt,
-                searxng_config,
-                max_turns,
+                tool_env,
+                bash_env,
+                delegate,
                 todo_tool,
-                bash_config,
-                tools_filter,
-                pipeline_registry,
                 state_manager,
                 shell_kind,
-                vector_store,
-                skills,
-                retry,
-                timeouts,
-                agents_md,
-                fetch_url,
             )?;
             Ok((
                 DynAgent::OpenRouter(agent),
@@ -273,22 +264,13 @@ pub fn create_provider(
         ProviderConfig::OpenAI(c) => {
             let (agent, info, receiver, hook) = create_openai_agent(
                 c,
-                mcp_tools,
                 system_prompt,
-                searxng_config,
-                max_turns,
+                tool_env,
+                bash_env,
+                delegate,
                 todo_tool,
-                bash_config,
-                tools_filter,
-                pipeline_registry,
                 state_manager,
                 shell_kind,
-                vector_store,
-                skills,
-                retry,
-                timeouts,
-                agents_md,
-                fetch_url,
             )?;
             Ok((
                 DynAgent::OpenAI(agent),
@@ -300,22 +282,13 @@ pub fn create_provider(
         ProviderConfig::Anthropic(c) => {
             let (agent, info, receiver, hook) = create_anthropic_agent(
                 c,
-                mcp_tools,
                 system_prompt,
-                searxng_config,
-                max_turns,
+                tool_env,
+                bash_env,
+                delegate,
                 todo_tool,
-                bash_config,
-                tools_filter,
-                pipeline_registry,
                 state_manager,
                 shell_kind,
-                vector_store,
-                skills,
-                retry,
-                timeouts,
-                agents_md,
-                fetch_url,
             )?;
             Ok((
                 DynAgent::Anthropic(agent),
@@ -327,22 +300,13 @@ pub fn create_provider(
         ProviderConfig::LlamaCpp(c) => {
             let (agent, info, receiver, hook) = create_llamacpp_agent(
                 c,
-                mcp_tools,
                 system_prompt,
-                searxng_config,
-                max_turns,
+                tool_env,
+                bash_env,
+                delegate,
                 todo_tool,
-                bash_config,
-                tools_filter,
-                pipeline_registry,
                 state_manager,
                 shell_kind,
-                vector_store,
-                skills,
-                retry,
-                timeouts,
-                agents_md,
-                fetch_url,
             )?;
             Ok((
                 DynAgent::LlamaCpp(agent),
@@ -354,22 +318,13 @@ pub fn create_provider(
         ProviderConfig::Ollama(c) => {
             let (agent, info) = create_ollama_agent(
                 c,
-                mcp_tools,
                 system_prompt,
-                searxng_config,
-                max_turns,
+                tool_env,
+                bash_env,
+                delegate,
                 todo_tool,
-                bash_config,
-                tools_filter,
-                pipeline_registry,
                 state_manager,
                 shell_kind,
-                vector_store,
-                skills,
-                retry,
-                timeouts,
-                agents_md,
-                fetch_url,
             )?;
             Ok((
                 DynAgent::Ollama(agent),
@@ -478,50 +433,32 @@ pub fn create_mock_compaction_model() -> (CompactionModel, MockCompletionModel) 
     (CompactionModel::Mock(agent), model_clone)
 }
 
-/// Get built-in tools for PeakBot (excluding SearchTool which requires config)
-/// If todo_tool is provided, uses it; otherwise creates a new one.
+/// Register an agent's tools on `builder`: the built-ins
+/// [`builtin_tool_names`] plans (constructed here, by name — so the plan is
+/// the single source of truth), then `delegate` iff `delegate` is `Some`
+/// (never filterable), then the profile's MCP tools. Main agents and
+/// subagents both come through here, so they get the same built-ins and
+/// the same MCP tools by construction (spec §6.2).
 ///
-/// `shell_kind` determines which shell tool is exposed to the model:
-/// - `ShellKind::Bash` → registers `bash` tool
-/// - `ShellKind::PowerShell` → registers `powershell` tool
-///
-/// The bg tool (`bash_bg` / `powershell_bg`) is registered in the same arm
-/// and always spawns with the same `ShellKind` — no shell ⇒ no shell tool
-/// AND no bg tool.
+/// `shell_kind` picks the ONE shell tool and its bg tool (`bash` +
+/// `bash_bg` or `powershell` + `powershell_bg`); no shell ⇒ neither.
+/// `view_image` is `Some` only for providers whose tool-result channel
+/// carries images. `todo_tool` defaults to a fresh standalone list.
 fn add_builtin_tools<M, P>(
     builder: rig_core::agent::AgentBuilder<M, P, rig_core::agent::NoToolConfig>,
-    searxng_config: Option<&SearXngConfig>,
+    tool_env: &ToolEnv,
+    bash_env: Env,
     todo_tool: Option<TodoTool>,
-    bash_config: &BashConfig,
-    tools_filter: &crate::config::NameFilter,
-    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
+    delegate: Option<Arc<SubAgentDeps>>,
     state_manager: Option<Arc<StateManager>>,
     shell_kind: Option<&ShellKind>,
-    vector_store: Option<&crate::vector::VectorStore>,
     view_image: Option<ViewImageTool>,
     wire_bash_panel: bool,
-    sub_agent_wiring: Option<SubAgentWiring>,
-    timeouts: &TimeoutsConfig,
-    agents_md: bool,
-    fetch_url: &FetchUrlConfig,
 ) -> rig_core::agent::AgentBuilder<M, P, rig_core::agent::WithBuilderTools>
 where
     M: rig_core::completion::CompletionModel,
     P: rig_core::agent::PromptHook<M>,
 {
-    // Use provided tool or create a new one (with optional StateManager)
-    let todo = todo_tool.unwrap_or_default();
-
-    // Keep a clone for the delegate tool (built at the end) — `state_manager`
-    // is moved into the bg tool below.
-    let sm_for_delegate = state_manager.clone();
-
-    // The delegate tool's outer TimeBudget must not expire while the
-    // sub-agent is parked — it awaits the same session gate as the hook and
-    // the inner loop. `None` here (no state manager) means no delegate tool
-    // is registered at all, so nothing can park.
-    let delegate_pause = sm_for_delegate.as_ref().map(|sm| sm.pause_gate());
-
     // Path + shell tools resolve/spawn against the session cwd, owned by the
     // state manager (single source of truth). Without one (tests), fall back to
     // the process cwd — unchanged behaviour.
@@ -529,132 +466,135 @@ where
         Some(sm) => sm.session_cwd(),
         None => std::env::current_dir().unwrap_or_default(),
     };
+    let shell_env = shell_env(&bash_env);
 
-    // Register exactly ONE shell tool and its bg tool in the same
-    // arm: the bg tool always spawns with the shell the model sees. If no
-    // shell is detected (e.g. Windows with nothing installed), neither is
-    // registered.
-    let (shell_tool, bg_tool) = match shell_kind {
-        Some(kind) => {
-            // No state manager (test paths) ⇒ the tool still registers but
-            // answers every call with the `NoStateManager` coach message.
-            let bg_tool =
-                ShellBgTool::new(kind.clone(), state_manager.clone(), bash_config.env.clone());
-            let shell_tool = match kind {
-                ShellKind::PowerShell { path } => EitherTool::PowerShell(
-                    PowerShellTool::new(path.clone(), bash_config.env.clone())
-                        .with_session_cwd(session_cwd.clone()),
-                ),
-                ShellKind::Bash { path } => {
-                    // Wire the live panel (slice 3 of make-term-great-again.md)
-                    // when a state manager is available AND this agent owns
-                    // the panel. Sub-agents (`wire_bash_panel = false`) skip
-                    // the panel so their shell output never bleeds into the
-                    // orchestrator's bash panel — they still run PTY-backed
-                    // against `session_cwd`.
-                    let bash = BashTool::new(path.clone(), bash_config.env.clone())
-                        .with_session_cwd(session_cwd.clone());
-                    EitherTool::Bash(wire_bash_tool(bash, wire_bash_panel, state_manager.clone()))
-                }
-            };
-            (Some(shell_tool), Some(bg_tool))
-        }
-        None => (None, None),
-    };
+    // The delegate tool's outer TimeBudget must not expire while the
+    // sub-agent is parked — it awaits the same session gate as the hook and
+    // the inner loop.
+    let delegate_pause = delegate.as_ref().map(|d| d.state_manager.pause_gate());
 
-    let mut tools: Vec<Box<dyn ToolDyn>> = vec![
-        gate(Box::new(FileCreateTool::new(session_cwd.clone()))),
-        gate(Box::new(FileStrReplaceTool::new(session_cwd.clone()))),
-        gate(Box::new(FileInsertTool::new(session_cwd.clone()))),
-        gate(Box::new(FileReadTool::new(session_cwd.clone()))),
-        gate(Box::new(PdfReadTool::new(session_cwd.clone()))),
-        gate(Box::new(ListDirectoryTool::new(session_cwd.clone()))),
-        gate(Box::new(FetchUrlTool::new(fetch_url))),
-        gate(Box::new(FetchPageTool)),
-        // `todo` is ungated: the task text already carries the plan, so a
-        // `thought` field is redundant — and some models (e.g. MiniMax)
-        // structurally refuse it, tripping the gate's nudge on every call.
-        Box::new(todo),
-        // `think` is ungated: its `thought` IS the payload it echoes back,
-        // not metadata — gating would strip the very thing it returns.
-        Box::new(ThinkTool),
-    ];
-
-    // The bg tool rides on the detected shell (registered in the arm above);
-    // keep it ahead of the shell tool in registration order.
-    if let Some(tool) = bg_tool {
-        tools.push(gate(Box::new(tool)));
-    }
-
-    // Add the single shell tool (bash OR powershell, never both, or none)
-    if let Some(tool) = shell_tool {
-        tools.push(match tool {
-            EitherTool::Bash(t) => gate(Box::new(t)),
-            EitherTool::PowerShell(t) => gate(Box::new(t)),
-        });
-    }
-
-    // Conditionally add search tool if SearXNG is configured
-    if let Some(config) = searxng_config {
-        tools.push(gate(Box::new(SearchTool::new(config))));
-    }
-    // Conditionally add the vector tools when a store is configured.
-    if let Some(store) = vector_store {
-        tools.push(gate(Box::new(
-            crate::tools::DocIndexTool::new(store.clone()).with_session_cwd(session_cwd.clone()),
-        )));
-        tools.push(gate(Box::new(
-            crate::tools::DocSearchTool::new(store.clone()).with_session_cwd(session_cwd.clone()),
-        )));
-    }
-
-    // `view_image` needs a tool-result channel that carries images — only
-    // Anthropic. Other providers swap/err/drop the image, so registration is
-    // gated by the caller passing `None`; `Some` implies both "registered"
-    // and "configured" (§A6 — the ceiling can no longer go missing).
-    if let Some(t) = view_image {
-        tools.push(gate(Box::new(t)));
-    }
-
-    // Add DelegateTool if pipeline is enabled. It needs the same build
-    // context the orchestrator had (to spawn fresh sub-agents), captured here
-    // where that context is in scope. `sub_agent_wiring` carries the extra
-    // pieces (event sink, max_turns) not already passed; the rest are cloned
-    // from this call's args. Requires a `state_manager` (sub-agents need
-    // session cwd + bg registry) — without one the delegate tool is simply
-    // not registered.
-    if let (Some(registry), Some(wiring), Some(sm)) =
-        (pipeline_registry, sub_agent_wiring, sm_for_delegate)
-    {
-        let deps = crate::pipeline::SubAgentDeps {
-            registry: Arc::new(registry.clone()),
-            searxng: searxng_config.cloned(),
-            bash_config: bash_config.clone(),
-            tools_filter: tools_filter.clone(),
-            state_manager: sm,
-            shell_kind: shell_kind.cloned(),
-            vector_store: vector_store.cloned(),
-            max_turns: wiring.max_turns,
-            skills: wiring.skills,
-            event_sink: wiring.event_sink,
-            retry: wiring.retry,
-            timeouts: timeouts.clone(),
-            // The profile's `agents_md:` ceiling — the caller passes the
-            // per-session (profile-applied) value, so a runtime `/profile`
-            // switch changes the next delegation's preamble.
-            agents_md_ceiling: agents_md,
-            fetch_url: fetch_url.clone(),
+    let mut todo_tool = Some(todo_tool.unwrap_or_default());
+    let mut view_image = view_image;
+    let planned = builtin_tool_names(tool_env, shell_kind, view_image.is_some());
+    let mut tools: Vec<Box<dyn ToolDyn>> = Vec::with_capacity(planned.len() + 1);
+    for name in planned {
+        let tool: Box<dyn ToolDyn> = match name {
+            "file_create" => gate(Box::new(FileCreateTool::new(session_cwd.clone()))),
+            "file_str_replace" => gate(Box::new(FileStrReplaceTool::new(session_cwd.clone()))),
+            "file_insert" => gate(Box::new(FileInsertTool::new(session_cwd.clone()))),
+            "file_read" => gate(Box::new(FileReadTool::new(session_cwd.clone()))),
+            "pdf_read" => gate(Box::new(PdfReadTool::new(session_cwd.clone()))),
+            "list_directory" => gate(Box::new(ListDirectoryTool::new(session_cwd.clone()))),
+            "fetch_url" => gate(Box::new(FetchUrlTool::new(&tool_env.fetch_url))),
+            "fetch_page" => gate(Box::new(FetchPageTool)),
+            // `todo` is ungated: the task text already carries the plan, so a
+            // `thought` field is redundant — and some models (e.g. MiniMax)
+            // structurally refuse it, tripping the gate's nudge on every call.
+            "todo" => Box::new(todo_tool.take().unwrap_or_default()),
+            // `think` is ungated: its `thought` IS the payload it echoes back,
+            // not metadata — gating would strip the very thing it returns.
+            "think" => Box::new(ThinkTool),
+            // The bg tool always spawns with the shell the model sees. No
+            // state manager (test paths) ⇒ it still registers but answers
+            // every call with the `NoStateManager` coach message.
+            "bash_bg" | "powershell_bg" => gate(Box::new(ShellBgTool::new(
+                planned_shell(shell_kind).clone(),
+                state_manager.clone(),
+                shell_env.clone(),
+            ))),
+            "bash" => {
+                // Sub-agents (`wire_bash_panel = false`) skip the live panel
+                // so their shell output never bleeds into the main agent's
+                // bash panel — they still run PTY-backed against
+                // `session_cwd`.
+                let bash = BashTool::new(
+                    planned_shell(shell_kind).executable().to_string(),
+                    shell_env.clone(),
+                )
+                .with_session_cwd(session_cwd.clone());
+                gate(Box::new(wire_bash_tool(
+                    bash,
+                    wire_bash_panel,
+                    state_manager.clone(),
+                )))
+            }
+            "powershell" => gate(Box::new(
+                PowerShellTool::new(
+                    planned_shell(shell_kind).executable().to_string(),
+                    shell_env.clone(),
+                )
+                .with_session_cwd(session_cwd.clone()),
+            )),
+            "web_search" => {
+                let search = tool_env
+                    .search
+                    .as_ref()
+                    .expect("web_search is planned only when general.search is set");
+                gate(Box::new(SearchTool::new(search)))
+            }
+            "doc_index" => gate(Box::new(
+                crate::tools::DocIndexTool::new(planned_vector(tool_env).clone())
+                    .with_session_cwd(session_cwd.clone()),
+            )),
+            "doc_search" => gate(Box::new(
+                crate::tools::DocSearchTool::new(planned_vector(tool_env).clone())
+                    .with_session_cwd(session_cwd.clone()),
+            )),
+            "view_image" => {
+                gate(Box::new(view_image.take().expect(
+                    "view_image is planned only when the caller passed the tool",
+                )))
+            }
+            other => unreachable!("builtin_tool_names planned an unknown tool: {other}"),
         };
-        let delegate_tool = crate::pipeline::DelegateTool::new(Arc::new(deps));
-        tools.push(gate(Box::new(delegate_tool)));
+        tools.push(tool);
     }
 
-    // Single filter seam: drop any built-in the `tools:` config excludes.
-    // Keyed on the gated tool's name (the gate delegates `name()` to the
-    // inner tool), so blocklist/allowlist address tools by their wire name.
-    tools.retain(|t| tools_filter.allows(&t.name()));
+    if let Some(deps) = delegate {
+        tools.push(gate(Box::new(crate::pipeline::DelegateTool::new(deps))));
+    }
 
-    builder.tools(budget_all(tools, timeouts, delegate_pause))
+    builder
+        .tools(budget_all(tools, &tool_env.timeouts, delegate_pause))
+        .tools(prepare_mcp_tools(tool_env.mcp.tools(), &tool_env.timeouts))
+}
+
+/// The shell a planned `bash`/`powershell`/bg tool runs on. The plan only
+/// names a shell tool when `shell_kind` is `Some`.
+fn planned_shell(shell_kind: Option<&ShellKind>) -> &ShellKind {
+    shell_kind.expect("shell tools are planned only when a shell is detected")
+}
+
+/// The store a planned `doc_*` tool uses. The plan only names them when the
+/// profile has a vector store.
+fn planned_vector(tool_env: &ToolEnv) -> &crate::vector::VectorStore {
+    tool_env
+        .vector
+        .as_ref()
+        .expect("doc tools are planned only when the profile has a vector store")
+}
+
+/// The shell tools' env shape. An empty overlay is `None` — the shell then
+/// runs with the inherited process env, exactly as with no `env:` at all.
+fn shell_env(env: &Env) -> Option<HashMap<String, String>> {
+    (!env.is_empty()).then(|| env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+
+/// The `view_image` image budget for a provider whose tool-result channel
+/// carries images and whose model can see — only Anthropic. `None` ⇒ no
+/// `view_image` tool. One decision for the real build and the name
+/// projections (`tools::env::main_agent_tool_names`).
+pub(crate) fn view_image_budget(config: &ProviderConfig) -> Option<usize> {
+    match config {
+        ProviderConfig::Anthropic(c) => anthropic_view_image_budget(c),
+        _ => None,
+    }
+}
+
+/// [`view_image_budget`] for an Anthropic config: the same vision decision
+/// that drives `[img:…]` acceptance.
+fn anthropic_view_image_budget(c: &AnthropicConfig) -> Option<usize> {
+    resolve_supports_vision(c.vision, "anthropic", &c.model).then_some(c.max_image_base64_bytes)
 }
 
 /// Attach the live bash panel iff this agent owns one. The orchestrator wires
@@ -670,27 +610,6 @@ fn wire_bash_tool(
         (true, Some(sm)) => bash.with_state_manager(sm),
         _ => bash,
     }
-}
-
-/// The extra sub-agent build context threaded into [`add_builtin_tools`] that
-/// it doesn't already receive as direct args: the orchestrator's event sink
-/// (sub-agent events TEE here tagged `SubAgent`), `max_turns`, and the retry
-/// policy.
-pub(crate) struct SubAgentWiring {
-    pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
-    pub max_turns: usize,
-    /// The discovered skills — each delegation renders this through the
-    /// role's filter into the sub-agent preamble.
-    pub skills: crate::skills::SkillRegistry,
-    /// Retry policy for a delegation's own wire calls — the same one the main
-    /// run loop uses, so a sub-agent survives the blips a top-level turn does.
-    pub retry: RetryConfig,
-}
-
-/// Internal enum to hold either a Bash or PowerShell tool for registration.
-enum EitherTool {
-    Bash(BashTool),
-    PowerShell(PowerShellTool),
 }
 
 /// Wrap a tool in [`ThoughtGate`] so it gains the cross-cutting `thought`
@@ -728,9 +647,8 @@ fn budget_all(
         .collect()
 }
 
-/// Provider name + model for a sub-agent's sniff records. The five arms are
-/// the same mapping `Config::provider_name`/`Config::model` make, but a
-/// sub-agent is handed a bare `ProviderConfig`, not the whole `Config`.
+/// Provider name + model for a sub-agent's sniff records, from its bare
+/// `ProviderConfig`.
 fn wire_label_of(config: &ProviderConfig) -> (String, String) {
     match config {
         ProviderConfig::OpenRouter(c) => ("openrouter".to_string(), c.model.clone()),
@@ -755,22 +673,13 @@ pub(crate) fn prepare_mcp_tools(
 /// Create OpenRouter agent and info
 fn create_openrouter_agent(
     config: &OpenRouterConfig,
-    mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
-    searxng_config: Option<&SearXngConfig>,
-    max_turns: usize,
+    tool_env: &ToolEnv,
+    bash_env: Env,
+    delegate: Option<Arc<SubAgentDeps>>,
     todo_tool: Option<TodoTool>,
-    bash_config: &BashConfig,
-    tools_filter: &crate::config::NameFilter,
-    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
-    vector_store: Option<&crate::vector::VectorStore>,
-    skills: &crate::skills::SkillRegistry,
-    retry: &RetryConfig,
-    timeouts: &TimeoutsConfig,
-    agents_md: bool,
-    fetch_url: &FetchUrlConfig,
 ) -> Result<(
     Agent<<openrouter::Client as CompletionClient>::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -811,46 +720,27 @@ fn create_openrouter_agent(
         .agent(&model)
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
-        .default_max_turns(max_turns)
+        .default_max_turns(tool_env.max_turns)
         .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let agent_builder = add_builtin_tools(
+    let delegate = delegate.map(|d| Arc::new(d.with_event_sink(Some(sender))));
+    let agent = add_builtin_tools(
         agent_builder,
-        searxng_config,
+        tool_env,
+        bash_env,
         todo_tool,
-        bash_config,
-        tools_filter,
-        pipeline_registry,
+        delegate,
         Some(state_manager.clone()),
         shell_kind,
-        vector_store,
         None,
         true,
-        Some(SubAgentWiring {
-            event_sink: Some(sender),
-            retry: retry.clone(),
-            max_turns,
-            skills: skills.clone(),
-        }),
-        timeouts,
-        agents_md,
-        fetch_url,
-    );
-
-    // Add MCP tools and build
-    let agent = if let Some(tools) = mcp_tools {
-        agent_builder
-            .tools(prepare_mcp_tools(tools, timeouts))
-            .build()
-    } else {
-        agent_builder.build()
-    };
+    )
+    .build();
 
     let info = ProviderInfo {
         name: "openrouter".to_string(),
         model: model.clone(),
-        supports_pricing: true,
         supports_vision: resolve_supports_vision(config.vision, "openrouter", &model),
         preserve_reasoning: false,
         display_reasoning: false,
@@ -880,22 +770,13 @@ pub fn build_anthropic_session_hook(
 /// the tool-result channel carries images, hence `view_image` is here.
 fn create_anthropic_agent(
     config: &AnthropicConfig,
-    mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
-    searxng_config: Option<&SearXngConfig>,
-    max_turns: usize,
+    tool_env: &ToolEnv,
+    bash_env: Env,
+    delegate: Option<Arc<SubAgentDeps>>,
     todo_tool: Option<TodoTool>,
-    bash_config: &BashConfig,
-    tools_filter: &crate::config::NameFilter,
-    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
-    vector_store: Option<&crate::vector::VectorStore>,
-    skills: &crate::skills::SkillRegistry,
-    retry: &RetryConfig,
-    timeouts: &TimeoutsConfig,
-    agents_md: bool,
-    fetch_url: &FetchUrlConfig,
 ) -> Result<(
     Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -950,44 +831,26 @@ fn create_anthropic_agent(
     let agent_builder = AgentBuilder::new(completion_model)
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
-        .default_max_turns(max_turns)
+        .default_max_turns(tool_env.max_turns)
         .hook(hook.clone());
 
-    let agent_builder = add_builtin_tools(
+    let delegate = delegate.map(|d| Arc::new(d.with_event_sink(Some(sender))));
+    let agent = add_builtin_tools(
         agent_builder,
-        searxng_config,
+        tool_env,
+        bash_env,
         todo_tool,
-        bash_config,
-        tools_filter,
-        pipeline_registry,
+        delegate,
         Some(state_manager.clone()),
         shell_kind,
-        vector_store,
-        supports_vision.then(|| ViewImageTool::new(config.max_image_base64_bytes)),
+        anthropic_view_image_budget(config).map(ViewImageTool::new),
         true,
-        Some(SubAgentWiring {
-            event_sink: Some(sender),
-            retry: retry.clone(),
-            max_turns,
-            skills: skills.clone(),
-        }),
-        timeouts,
-        agents_md,
-        fetch_url,
-    );
-
-    let agent = if let Some(tools) = mcp_tools {
-        agent_builder
-            .tools(prepare_mcp_tools(tools, timeouts))
-            .build()
-    } else {
-        agent_builder.build()
-    };
+    )
+    .build();
 
     let info = ProviderInfo {
         name: "anthropic".to_string(),
         model: model.clone(),
-        supports_pricing: false,
         supports_vision,
         // `build_provider_config` already resolved the model vs provider
         // overrides into `AnthropicConfig.preserve_reasoning`. Reuse the
@@ -1003,22 +866,13 @@ fn create_anthropic_agent(
 /// Create Ollama agent and info (no cost tracking for local models)
 fn create_ollama_agent(
     config: &OllamaConfig,
-    mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
-    searxng_config: Option<&SearXngConfig>,
-    max_turns: usize,
+    tool_env: &ToolEnv,
+    bash_env: Env,
+    delegate: Option<Arc<SubAgentDeps>>,
     todo_tool: Option<TodoTool>,
-    bash_config: &BashConfig,
-    tools_filter: &crate::config::NameFilter,
-    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
-    vector_store: Option<&crate::vector::VectorStore>,
-    skills: &crate::skills::SkillRegistry,
-    retry: &RetryConfig,
-    timeouts: &TimeoutsConfig,
-    agents_md: bool,
-    fetch_url: &FetchUrlConfig,
 ) -> Result<(
     Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>,
     ProviderInfo,
@@ -1044,7 +898,7 @@ fn create_ollama_agent(
     let mut agent_builder = client
         .agent(&model)
         .preamble(system_prompt)
-        .default_max_turns(max_turns);
+        .default_max_turns(tool_env.max_turns);
 
     if let Some(temp) = config.temperature {
         agent_builder = agent_builder.temperature(temp as f64);
@@ -1053,42 +907,23 @@ fn create_ollama_agent(
     // Add built-in tools (including optional SearchTool and TodoTool).
     // Ollama has no event channel, so delegated sub-agents can't TEE their
     // events here — `event_sink` is `None`.
-    let agent_builder = add_builtin_tools(
+    let delegate = delegate.map(|d| Arc::new(d.with_event_sink(None)));
+    let agent = add_builtin_tools(
         agent_builder,
-        searxng_config,
+        tool_env,
+        bash_env,
         todo_tool,
-        bash_config,
-        tools_filter,
-        pipeline_registry,
+        delegate,
         Some(state_manager.clone()),
         shell_kind,
-        vector_store,
         None,
         true,
-        Some(SubAgentWiring {
-            event_sink: None,
-            retry: retry.clone(),
-            max_turns,
-            skills: skills.clone(),
-        }),
-        timeouts,
-        agents_md,
-        fetch_url,
-    );
-
-    // Add MCP tools and build
-    let agent = if let Some(tools) = mcp_tools {
-        agent_builder
-            .tools(prepare_mcp_tools(tools, timeouts))
-            .build()
-    } else {
-        agent_builder.build()
-    };
+    )
+    .build();
 
     let info = ProviderInfo {
         name: "ollama".to_string(),
         model: model.clone(),
-        supports_pricing: false,
         supports_vision: resolve_supports_vision(config.vision, "ollama", &model),
         // Non-Anthropic provider: no Anthropic-style thinking blocks flow
         // through the wire. The StateManager provider gate is what keeps a
@@ -1104,22 +939,13 @@ fn create_ollama_agent(
 /// Create OpenAI agent and info
 fn create_openai_agent(
     config: &OpenAIConfig,
-    mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
-    searxng_config: Option<&SearXngConfig>,
-    max_turns: usize,
+    tool_env: &ToolEnv,
+    bash_env: Env,
+    delegate: Option<Arc<SubAgentDeps>>,
     todo_tool: Option<TodoTool>,
-    bash_config: &BashConfig,
-    tools_filter: &crate::config::NameFilter,
-    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
-    vector_store: Option<&crate::vector::VectorStore>,
-    skills: &crate::skills::SkillRegistry,
-    retry: &RetryConfig,
-    timeouts: &TimeoutsConfig,
-    agents_md: bool,
-    fetch_url: &FetchUrlConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, SessionHook>,
     ProviderInfo,
@@ -1162,46 +988,27 @@ fn create_openai_agent(
         .agent(&model)
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
-        .default_max_turns(max_turns)
+        .default_max_turns(tool_env.max_turns)
         .hook(hook.clone());
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let agent_builder = add_builtin_tools(
+    let delegate = delegate.map(|d| Arc::new(d.with_event_sink(Some(sender))));
+    let agent = add_builtin_tools(
         agent_builder,
-        searxng_config,
+        tool_env,
+        bash_env,
         todo_tool,
-        bash_config,
-        tools_filter,
-        pipeline_registry,
+        delegate,
         Some(state_manager.clone()),
         shell_kind,
-        vector_store,
         None,
         true,
-        Some(SubAgentWiring {
-            event_sink: Some(sender),
-            retry: retry.clone(),
-            max_turns,
-            skills: skills.clone(),
-        }),
-        timeouts,
-        agents_md,
-        fetch_url,
-    );
-
-    // Add MCP tools and build
-    let agent = if let Some(tools) = mcp_tools {
-        agent_builder
-            .tools(prepare_mcp_tools(tools, timeouts))
-            .build()
-    } else {
-        agent_builder.build()
-    };
+    )
+    .build();
 
     let info = ProviderInfo {
         name: "openai".to_string(),
         model: model.clone(),
-        supports_pricing: true,
         supports_vision: resolve_supports_vision(config.vision, "openai", &model),
         preserve_reasoning: false,
         display_reasoning: false,
@@ -1213,22 +1020,13 @@ fn create_openai_agent(
 /// Create LlamaCpp agent and info (uses completions API for compatibility)
 fn create_llamacpp_agent(
     config: &LlamaCppConfig,
-    mcp_tools: Option<Vec<Box<dyn ToolDyn>>>,
     system_prompt: &str,
-    searxng_config: Option<&SearXngConfig>,
-    max_turns: usize,
+    tool_env: &ToolEnv,
+    bash_env: Env,
+    delegate: Option<Arc<SubAgentDeps>>,
     todo_tool: Option<TodoTool>,
-    bash_config: &BashConfig,
-    tools_filter: &crate::config::NameFilter,
-    pipeline_registry: Option<&crate::pipeline::SubAgentRegistry>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
-    vector_store: Option<&crate::vector::VectorStore>,
-    skills: &crate::skills::SkillRegistry,
-    retry: &RetryConfig,
-    timeouts: &TimeoutsConfig,
-    agents_md: bool,
-    fetch_url: &FetchUrlConfig,
 ) -> Result<(
     Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>,
     ProviderInfo,
@@ -1267,7 +1065,7 @@ fn create_llamacpp_agent(
         .agent(&model)
         .preamble(system_prompt)
         .max_tokens(config.max_tokens)
-        .default_max_turns(max_turns)
+        .default_max_turns(tool_env.max_turns)
         .hook(hook.clone());
 
     // Merge user-supplied extra params (e.g. {"no-log": true} for LiteLLM
@@ -1278,42 +1076,23 @@ fn create_llamacpp_agent(
     }
 
     // Add built-in tools (including optional SearchTool and TodoTool)
-    let agent_builder = add_builtin_tools(
+    let delegate = delegate.map(|d| Arc::new(d.with_event_sink(Some(sender))));
+    let agent = add_builtin_tools(
         agent_builder,
-        searxng_config,
+        tool_env,
+        bash_env,
         todo_tool,
-        bash_config,
-        tools_filter,
-        pipeline_registry,
+        delegate,
         Some(state_manager.clone()),
         shell_kind,
-        vector_store,
         None,
         true,
-        Some(SubAgentWiring {
-            event_sink: Some(sender),
-            retry: retry.clone(),
-            max_turns,
-            skills: skills.clone(),
-        }),
-        timeouts,
-        agents_md,
-        fetch_url,
-    );
-
-    // Add MCP tools and build
-    let agent = if let Some(tools) = mcp_tools {
-        agent_builder
-            .tools(prepare_mcp_tools(tools, timeouts))
-            .build()
-    } else {
-        agent_builder.build()
-    };
+    )
+    .build();
 
     let info = ProviderInfo {
         name: "llamacpp".to_string(),
         model: model.clone(),
-        supports_pricing: true,
         supports_vision: resolve_supports_vision(config.vision, "llamacpp", &model),
         preserve_reasoning: false,
         display_reasoning: false,
@@ -1354,7 +1133,7 @@ pub fn create_mock_agent(
     let agent_builder = AgentBuilder::new(mock_model)
         .preamble(system_prompt)
         .max_tokens(1024)
-        .default_max_turns(max_turns)
+        .default_max_turns(tool_env.max_turns)
         .hook(hook.clone());
 
     // Add built-in tools (simplified for testing)
@@ -1377,7 +1156,6 @@ pub fn create_mock_agent(
     let info = ProviderInfo {
         name: "mock".to_string(),
         model: "mock-model".to_string(),
-        supports_pricing: true,
         // Mock is used by integration tests — keep vision enabled so those
         // tests can exercise both code paths.
         supports_vision: true,
@@ -1398,10 +1176,12 @@ pub fn create_mock_agent(
 
 /// Build a fresh sub-agent [`DynAgent`] for a delegation.
 ///
-/// Shares [`add_builtin_tools`] with the orchestrator path — a sub-agent gets
-/// the **full built-in toolset** (session-cwd + bg registry come from the
-/// shared `state_manager`), *minus* `delegate` itself (`pipeline_registry` is
-/// always `None` — no nested delegation in v1).
+/// Shares [`add_builtin_tools`] with the main agent's build — a subagent
+/// gets the **same built-ins and the same MCP tools** from the profile's
+/// `tool_env` (session-cwd + bg registry come from the shared
+/// `state_manager`), *minus* `delegate` itself (no nested delegation), with
+/// the bash env `profile.env ⊕ sub.member.env`. MCP servers are shared with
+/// the main agent: stateful servers carry their state across a delegation.
 ///
 /// The hook is **events-only** (`SessionHook::new(sink).with_source(...)`) —
 /// no `with_context_tracking`/`with_state_manager`, so it neither tracks the
@@ -1421,21 +1201,17 @@ pub fn create_mock_agent(
 /// the error itself carries history (`MaxTurnsError`, `PromptCancelled`);
 /// a bare `CompletionError` yields a header-only handoff.
 pub(crate) fn build_sub_agent(
-    config: &ProviderConfig,
+    tool_env: &ToolEnv,
+    sub: &Subagent,
     preamble: &str,
     sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
-    role: &str,
-    searxng_config: Option<&SearXngConfig>,
-    max_turns: usize,
-    bash_config: &BashConfig,
-    tools_filter: &crate::config::NameFilter,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
-    vector_store: Option<&crate::vector::VectorStore>,
     context_budget: Option<usize>,
-    timeouts: &TimeoutsConfig,
-    fetch_url: &FetchUrlConfig,
 ) -> Result<(DynAgent, Arc<SessionHook>)> {
+    let config = &sub.member.model.provider_config;
+    let role = sub.member.name.as_str();
+    let max_turns = tool_env.max_turns;
     // Events-only lane-tagged hook. No compaction gate (fresh context) — the
     // sub-agent gate terminates instead of compacting. The pause gate is the
     // session's single one (owned by the StateManager): the hook's
@@ -1451,12 +1227,11 @@ pub(crate) fn build_sub_agent(
         .with_sub_agent_gate(context_budget)
         .with_pause(state_manager.pause_gate());
 
-    // A sub-agent never sees `delegate` (no nested delegation). It reaches the
-    // `todo` tool via `add_builtin_tools`'s `todo_tool.unwrap_or_default()`,
-    // and `TodoTool::default()` is now a working *standalone* backend with its
-    // own isolated list — so each sub-agent gets a fresh, functional todo that
-    // drives no panel (the visible panel is an orchestrator-only affordance).
-    let no_pipeline: Option<&crate::pipeline::SubAgentRegistry> = None;
+    // A subagent never sees `delegate` (no nested delegation). Its `todo`
+    // is `TodoTool::default()` — a working *standalone* backend with its
+    // own isolated list that drives no panel (the visible panel is a
+    // main-agent affordance).
+    let bash_env = tool_env.bash_env(&sub.member);
 
     match config {
         ProviderConfig::OpenRouter(c) => {
@@ -1477,20 +1252,14 @@ pub(crate) fn build_sub_agent(
                 .hook(hook.clone());
             let builder = add_builtin_tools(
                 builder,
-                searxng_config,
+                tool_env,
+                bash_env,
                 None,
-                bash_config,
-                tools_filter,
-                no_pipeline,
+                None,
                 Some(state_manager),
                 shell_kind,
-                vector_store,
                 None,
                 false,
-                None,
-                timeouts,
-                true, // no `delegate` here; ceiling applied in DelegateTool::call
-                fetch_url,
             );
             Ok((DynAgent::OpenRouter(builder.build()), Arc::new(hook)))
         }
@@ -1513,20 +1282,14 @@ pub(crate) fn build_sub_agent(
                 .hook(hook.clone());
             let builder = add_builtin_tools(
                 builder,
-                searxng_config,
+                tool_env,
+                bash_env,
                 None,
-                bash_config,
-                tools_filter,
-                no_pipeline,
+                None,
                 Some(state_manager),
                 shell_kind,
-                vector_store,
                 None,
                 false,
-                None,
-                timeouts,
-                true, // no `delegate` here; ceiling applied in DelegateTool::call
-                fetch_url,
             );
             Ok((DynAgent::OpenAI(builder.build()), Arc::new(hook)))
         }
@@ -1538,7 +1301,6 @@ pub(crate) fn build_sub_agent(
                 .base_url(&c.base_url)
                 .build()
                 .context("Failed to create Anthropic client for sub-agent")?;
-            let supports_vision = resolve_supports_vision(c.vision, "anthropic", &c.model);
             let completion_model = client.completion_model(&c.model);
             let completion_model = match c.prompt_caching {
                 AnthropicCaching::Off => completion_model,
@@ -1553,20 +1315,14 @@ pub(crate) fn build_sub_agent(
                 .hook(hook.clone());
             let builder = add_builtin_tools(
                 builder,
-                searxng_config,
+                tool_env,
+                bash_env,
                 None,
-                bash_config,
-                tools_filter,
-                no_pipeline,
+                None,
                 Some(state_manager),
                 shell_kind,
-                vector_store,
-                supports_vision.then(|| ViewImageTool::new(c.max_image_base64_bytes)),
+                anthropic_view_image_budget(c).map(ViewImageTool::new),
                 false,
-                None,
-                timeouts,
-                true, // no `delegate` here; ceiling applied in DelegateTool::call
-                fetch_url,
             );
             Ok((DynAgent::Anthropic(builder.build()), Arc::new(hook)))
         }
@@ -1590,20 +1346,14 @@ pub(crate) fn build_sub_agent(
             }
             let builder = add_builtin_tools(
                 builder,
-                searxng_config,
+                tool_env,
+                bash_env,
                 None,
-                bash_config,
-                tools_filter,
-                no_pipeline,
+                None,
                 Some(state_manager),
                 shell_kind,
-                vector_store,
                 None,
                 false,
-                None,
-                timeouts,
-                true, // no `delegate` here; ceiling applied in DelegateTool::call
-                fetch_url,
             );
             Ok((DynAgent::LlamaCpp(builder.build()), Arc::new(hook)))
         }
@@ -1626,20 +1376,14 @@ pub(crate) fn build_sub_agent(
             }
             let builder = add_builtin_tools(
                 builder,
-                searxng_config,
+                tool_env,
+                bash_env,
                 None,
-                bash_config,
-                tools_filter,
-                no_pipeline,
+                None,
                 Some(state_manager),
                 shell_kind,
-                vector_store,
                 None,
                 false,
-                None,
-                timeouts,
-                true, // no `delegate` here; ceiling applied in DelegateTool::call
-                fetch_url,
             );
             Ok((DynAgent::Ollama(builder.build()), Arc::new(hook)))
         }
@@ -1678,7 +1422,6 @@ mod tests {
         let vision_ok = ProviderInfo {
             name: "openrouter".into(),
             model: "anthropic/claude-3.5-sonnet".into(),
-            supports_pricing: true,
             supports_vision: crate::vision::model_supports_vision("anthropic/claude-3.5-sonnet"),
             preserve_reasoning: false,
             display_reasoning: false,
@@ -1686,7 +1429,6 @@ mod tests {
         let vision_no = ProviderInfo {
             name: "openrouter".into(),
             model: "qwen/qwq-32b".into(),
-            supports_pricing: true,
             supports_vision: crate::vision::model_supports_vision("qwen/qwq-32b"),
             preserve_reasoning: false,
             display_reasoning: false,
@@ -2252,6 +1994,50 @@ mod tests {
     // master-switch short-circuit, the allowlist, and the blocklist each
     // reach the real seam.
 
+    /// A `ToolEnv` whose built-in filter is `filter` and which has no
+    /// optional extras (no search, no vector store, no MCP servers).
+    #[cfg(feature = "mock")]
+    fn tool_env_with(filter: &crate::config::NameFilter) -> ToolEnv {
+        ToolEnv {
+            tools: filter.clone(),
+            fetch_url: crate::config::FetchUrlConfig::default(),
+            search: None,
+            vector: None,
+            mcp: crate::tools::env::McpSource::for_test(&[], crate::config::NameFilter::default()),
+            base_env: Env::new(),
+            timeouts: TimeoutsConfig::default(),
+            max_turns: 0,
+        }
+    }
+
+    /// The real build registers exactly what `builtin_tool_names` plans —
+    /// the single source of truth `main_agent_tool_names` projects.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn add_builtin_tools_registers_exactly_the_planned_names() {
+        let filter = crate::config::NameFilter {
+            disabled: vec!["think".into()],
+            ..Default::default()
+        };
+        for shell in [
+            None,
+            Some(ShellKind::Bash {
+                path: "/bin/sh".to_string(),
+            }),
+            Some(ShellKind::PowerShell {
+                path: "pwsh.exe".to_string(),
+            }),
+        ] {
+            let planned: Vec<String> =
+                builtin_tool_names(&tool_env_with(&filter), shell.as_ref(), false)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+            let built = builtin_tool_names_under(&filter, shell).await;
+            assert_eq!(built, planned, "the build must register exactly the plan");
+        }
+    }
+
     /// Drive the real `add_builtin_tools` filter seam with `filter` and
     /// `shell_kind` and return the wire names of the tools that survive,
     /// in registration order. No optional extras — the built-in core set
@@ -2271,20 +2057,14 @@ mod tests {
         let model = MockCompletionModel::new();
         let agent = add_builtin_tools(
             AgentBuilder::new(model),
-            None, // searxng
+            &tool_env_with(filter),
+            Env::new(),
             None, // todo
-            &BashConfig::default(),
-            filter,
-            None, // pipeline registry
+            None, // delegate
             None, // state manager
             shell_kind.as_ref(),
-            None,  // vector store
             None,  // view_image
             false, // wire bash panel
-            None,  // sub-agent wiring
-            &TimeoutsConfig::default(),
-            true, // agents_md ceiling (no `delegate` registered here)
-            &FetchUrlConfig::default(),
         )
         .build();
         let defs = agent
@@ -2309,20 +2089,14 @@ mod tests {
         let model = MockCompletionModel::new();
         let agent = add_builtin_tools(
             AgentBuilder::new(model),
-            None, // searxng
+            &tool_env_with(filter),
+            Env::new(),
             None, // todo
-            &BashConfig::default(),
-            filter,
-            None, // pipeline registry
+            None, // delegate
             None, // state manager
             shell_kind.as_ref(),
-            None,  // vector store
             None,  // view_image
             false, // wire bash panel
-            None,  // sub-agent wiring
-            &TimeoutsConfig::default(),
-            true, // agents_md ceiling (no `delegate` registered here)
-            &FetchUrlConfig::default(),
         )
         .build();
         let defs = agent

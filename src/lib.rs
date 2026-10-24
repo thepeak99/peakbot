@@ -35,7 +35,7 @@ pub mod state;
 pub mod storage;
 pub mod test_runner;
 mod tool_use_validator;
-mod tools;
+pub mod tools;
 pub mod ui;
 pub mod utils;
 pub mod vector;
@@ -57,9 +57,7 @@ pub use hooks::{
     AgentEvent, ModelPricing, SessionHook, SessionStats, SourcedEvent, TokenUsage,
     fetch_model_pricing,
 };
-pub use pipeline::{
-    DelegateTool, PipelineInfo, PipelineSet, PipelineSetError, ResolvedPipeline, SubAgentRegistry,
-};
+pub use pipeline::{DelegateTool, SubAgentDeps};
 #[cfg(feature = "mock")]
 pub use providers::create_mock_agent;
 pub use providers::{

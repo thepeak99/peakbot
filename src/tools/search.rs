@@ -1,4 +1,4 @@
-use crate::SearXngConfig;
+use crate::config::SearchConfig;
 use crate::utils::strings::truncate_to_char_boundary;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
@@ -132,7 +132,7 @@ pub struct SearchTool {
 }
 
 impl SearchTool {
-    pub fn new(config: &SearXngConfig) -> Self {
+    pub fn new(config: &SearchConfig) -> Self {
         Self {
             base_url: config.base_url.clone(),
             timeout_seconds: config.timeout_seconds,

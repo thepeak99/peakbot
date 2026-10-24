@@ -155,9 +155,10 @@ impl VectorStore {
     /// Test accessor over the process-wide `DB_HANDLES` registry: the
     /// handle for this store's spec resolved against `session_cwd`,
     /// materializing the redb file on first access (the same lazy-open rule
-    /// as the production write path).
-    #[cfg(test)]
-    pub(crate) async fn handle_for_test(
+    /// as the production write path). `pub` + hidden so integration tests
+    /// can prove handle sharing across rebuilt stores.
+    #[doc(hidden)]
+    pub async fn handle_for_test(
         &self,
         session_cwd: &Path,
     ) -> Result<Arc<VectorDB>, VectorStoreError> {

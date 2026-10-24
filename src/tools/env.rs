@@ -17,35 +17,28 @@
 //! `bash_env` is exactly `profile.env ⊕ member.env` (member wins, spec §6.2)
 //! — never a superset of the parent process env.
 //!
-//! **MCP test seam (stated, minimal).** `McpServerHandle` has no public
-//! constructor (private `name`/`tools`/`service` fields plus a live service
-//! connection), so a real server cannot be faked cheaply. The filter is
-//! therefore tested at the tool-*name* level, through two `#[cfg(test)]`
-//! seams that mirror the group shape `tools()` derives from the handles —
-//! `(server name, tool names in per-server order)`:
+//! **MCP test seam.** `McpServerHandle` has no public constructor (private
+//! fields plus a live service connection), so a real server cannot be faked
+//! cheaply. `McpSource::for_test` stands in for the handles with the group
+//! shape `tools()` derives from them — `(server name, tool names in
+//! per-server order)` — and `McpSource::tool_names` projects either shape
+//! through the same filter. Both are `pub` so integration tests can reach
+//! them.
 //!
-//! ```text
-//! #[cfg(test)]
-//! impl McpSource {
-//!     /// Test-only constructor: no live handles, just the groups
-//!     /// `tools()` would see, plus the filter to apply.
-//!     pub fn for_test(groups: &[(String, Vec<String>)], filter: NameFilter) -> McpSource;
-//!     /// Test-only projection: the tool names `tools()` would produce.
-//!     pub fn tool_names(&self) -> Vec<String>;
-//! }
-//! ```
-
-// No production caller yet: ToolEnv is wired into the providers in T7,
-// so the module is dead code by design until then.
-#![allow(dead_code)]
+//! **Tool names (spec §6.2).** `builtin_tool_names` is the single source of
+//! truth for which built-ins a build registers: `add_builtin_tools`
+//! constructs exactly that list, and `main_agent_tool_names` /
+//! `sub_agent_tool_names` report it (plus MCP and `delegate`) without
+//! building anything.
 
 use std::sync::Arc;
 
 use rig_core::tool::ToolDyn;
 
 use crate::config::file::{Env, SearchConfig};
-use crate::config::resolve::{Config, Member, ResolvedProfile};
-use crate::config::{FetchUrlConfig, NameFilter, TimeoutsConfig};
+use crate::config::resolve::{Config, Member, ResolvedAgent, ResolvedProfile, Subagent};
+use crate::config::{FetchUrlConfig, NameFilter, ResolvedModel, TimeoutsConfig};
+use crate::tools::ShellKind;
 use crate::vector::VectorStore;
 use crate::{McpServerHandle, mcp_tools_for_profile};
 
@@ -121,8 +114,8 @@ impl ToolEnv {
 pub struct McpSource {
     handles: Arc<Vec<McpServerHandle>>,
     filter: NameFilter,
-    /// Test stand-in for live handles: `(server, tool names)` groups.
-    #[cfg(test)]
+    /// Test stand-in for live handles: `(server, tool names)` groups. Always
+    /// `None` outside `for_test`.
     test_groups: Option<Vec<(String, Vec<String>)>>,
 }
 
@@ -131,7 +124,6 @@ impl McpSource {
         Self {
             handles,
             filter,
-            #[cfg(test)]
             test_groups: None,
         }
     }
@@ -156,12 +148,11 @@ impl McpSource {
             .collect();
         mcp_tools_for_profile(groups, Some(&self.filter))
     }
-}
 
-#[cfg(test)]
-impl McpSource {
-    /// Test-only constructor: no live handles, just the groups `tools()`
-    /// would see, plus the filter to apply.
+    /// Test constructor: no live handles, just the groups `tools()` would
+    /// see, plus the filter to apply. `tools()` on such a source is empty
+    /// (names cannot become live tools); `tool_names()` reports the groups.
+    #[doc(hidden)]
     pub fn for_test(groups: &[(String, Vec<String>)], filter: NameFilter) -> McpSource {
         McpSource {
             handles: Arc::new(Vec::new()),
@@ -170,8 +161,8 @@ impl McpSource {
         }
     }
 
-    /// Test-only projection: the tool names `tools()` would produce — the
-    /// same `NameFilter::allows` gate `mcp_tools_for_profile` applies.
+    /// The tool names `tools()` would produce — the same
+    /// `NameFilter::allows` gate `mcp_tools_for_profile` applies.
     pub fn tool_names(&self) -> Vec<String> {
         let groups = self.test_groups.clone().unwrap_or_else(|| {
             self.handles
@@ -190,6 +181,106 @@ impl McpSource {
             .flat_map(|(_, tools)| tools)
             .collect()
     }
+}
+
+/// The built-ins a build registers, in registration order (spec §6.2):
+/// the core set, the detected shell's bg + shell tool, then the
+/// provider-gated tools (`web_search` iff `general.search`, `doc_*` iff the
+/// profile has a vector store, `view_image` iff the caller's model can take
+/// images in tool results), all `∩ profile.tools.allows`. `delegate` is never
+/// here: it is not a filterable built-in.
+///
+/// `add_builtin_tools` constructs exactly this list — the single source of
+/// truth for both the real build and the name projections below.
+pub(crate) fn builtin_tool_names(
+    env: &ToolEnv,
+    shell: Option<&ShellKind>,
+    view_image: bool,
+) -> Vec<&'static str> {
+    let mut names = vec![
+        "file_create",
+        "file_str_replace",
+        "file_insert",
+        "file_read",
+        "pdf_read",
+        "list_directory",
+        "fetch_url",
+        "fetch_page",
+        "todo",
+        "think",
+    ];
+    // One shell tool and its bg tool, or neither (no shell detected). The
+    // bg tool goes first — the long-standing registration order.
+    if let Some(kind) = shell {
+        names.push(kind.bg_tool_name());
+        names.push(match kind {
+            ShellKind::Bash { .. } => "bash",
+            ShellKind::PowerShell { .. } => "powershell",
+        });
+    }
+    if env.search.is_some() {
+        names.push("web_search");
+    }
+    if env.vector.is_some() {
+        names.push("doc_index");
+        names.push("doc_search");
+    }
+    if view_image {
+        names.push("view_image");
+    }
+    names.retain(|name| env.tools.allows(name));
+    names
+}
+
+/// `delegate` is registered iff the agent has subagents — never filterable
+/// (spec §6.2, F3). Callers decide whether to pass `SubAgentDeps` with this.
+pub fn delegate_enabled(agent: &ResolvedAgent) -> bool {
+    !agent.subagents.is_empty()
+}
+
+/// The shell the name projections assume. They are pure (no shell
+/// detection), so they report a POSIX host; the real build uses the
+/// detected shell, which only changes `bash`/`bash_bg` into
+/// `powershell`/`powershell_bg` (or drops both when there is none).
+fn projected_shell() -> ShellKind {
+    ShellKind::Bash {
+        path: String::new(),
+    }
+}
+
+fn takes_view_image(model: &ResolvedModel) -> bool {
+    crate::providers::view_image_budget(&model.provider_config).is_some()
+}
+
+/// The tool names the main agent's build registers, in registration order:
+/// built-ins + `delegate` iff the agent has subagents + the profile's MCP
+/// tools. Pure.
+pub fn main_agent_tool_names(env: &ToolEnv, agent: &ResolvedAgent) -> Vec<String> {
+    let shell = projected_shell();
+    let mut names: Vec<String> =
+        builtin_tool_names(env, Some(&shell), takes_view_image(&agent.main.model))
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    if delegate_enabled(agent) {
+        names.push("delegate".to_string());
+    }
+    names.extend(env.mcp.tool_names());
+    names
+}
+
+/// The tool names a subagent's build registers: the SAME built-ins (same
+/// `profile.tools`) and the SAME MCP tools as the main agent, never
+/// `delegate` (no nesting). Pure.
+pub fn sub_agent_tool_names(env: &ToolEnv, sub: &Subagent) -> Vec<String> {
+    let shell = projected_shell();
+    let mut names: Vec<String> =
+        builtin_tool_names(env, Some(&shell), takes_view_image(&sub.member.model))
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    names.extend(env.mcp.tool_names());
+    names
 }
 
 #[cfg(test)]
