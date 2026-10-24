@@ -1,11 +1,14 @@
 //! Vector store: a thin, `Send + Sync` wrapper around ruvector's `VectorDB`
 //! plus the embeddings client, shared by the `doc_index` / `doc_search` tools.
 //!
-//! One lazily-opened DB per resolved path — the store owns a map keyed by
-//! absolute `DbPath`. Relative `db_path` config resolves against the session
-//! cwd at tool-call time; an absolute config path stays global. Each DB is
-//! created on first write (first `index_file` that inserts chunks). Reads
-//! (`search`) and the re-index skip-check are pure no-ops when no DB exists.
+//! Open redb handles live in the process-wide `DB_HANDLES` registry, keyed
+//! by resolved `DbPath`: every `VectorStore` (profile, session, reload
+//! rebuild) pointing at the same resolved path shares one handle, because
+//! two handles over one redb file would diverge. A `SessionRelative` spec
+//! resolves against the session cwd at tool-call time; a `Fixed` spec is
+//! fully resolved at parse time. Each DB is created on first write (first
+//! `index_file` that inserts chunks). Reads (`search`) and the re-index
+//! skip-check are pure no-ops when no DB exists.
 //!
 //! ## Idempotent re-index
 //! Each chunk's id is a stable hash of `(source_path, chunk_index)`, so
@@ -22,7 +25,7 @@ mod parse;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use ruvector_core::types::{DbOptions, DistanceMetric, HnswConfig, SearchQuery, VectorEntry};
 use ruvector_core::vector_db::VectorDB;
@@ -30,7 +33,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::OnceCell;
 
-use crate::config::VectorDbConfig;
+use crate::config::resolve::{DbPathSpec, VectorSpec};
 
 pub use embeddings::{EmbeddingsClient, EmbeddingsError};
 pub use parse::{ParseError, extension_of, is_supported};
@@ -116,31 +119,49 @@ pub struct VectorStore {
     inner: Arc<StoreInner>,
 }
 
+/// A lazily-opened redb handle: the per-path `OnceCell` collapses
+/// concurrent first-opens of the same path into one `Arc<VectorDB>`.
+type DbHandle = Arc<OnceCell<Arc<VectorDB>>>;
+
+/// Every open redb handle in the process, keyed by resolved path. The
+/// `Mutex` guards only the map lookup and is **never** held across an await;
+/// the per-path `OnceCell` collapses concurrent first-opens of the *same*
+/// path into one handle. Handles are never closed (process lifetime).
+static DB_HANDLES: LazyLock<Mutex<HashMap<DbPath, DbHandle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 struct StoreInner {
-    /// Lazily opened DB per resolved path. The outer `Mutex` guards only the
-    /// map lookup/insert and is **never** held across an await; the inner
-    /// `OnceCell` makes concurrent first-opens of the *same* path collapse
-    /// into one handle (two handles over one redb file would diverge).
-    dbs: std::sync::Mutex<HashMap<DbPath, Arc<OnceCell<Arc<VectorDB>>>>>,
-    /// The *configured* path template, verbatim from config. Never handed to
-    /// ruvector directly — always run through `db_path_for` first.
-    configured_db_path: String,
+    /// The resolved spec. `db_path_for` turns `spec.db_path` into the
+    /// concrete `DbPath` for a session cwd.
+    spec: VectorSpec,
     embeddings: EmbeddingsClient,
 }
 
 impl VectorStore {
-    /// Build the store. Touches no disk: only constructs the embeddings client
-    /// and records where the DB *will* live. The redb file is created on the
-    /// first write (see [`VectorStore::db`]).
-    pub fn open(config: &VectorDbConfig) -> Result<Self, VectorStoreError> {
-        let embeddings = EmbeddingsClient::new(&config.embeddings);
+    /// Build the store. Touches no disk: only constructs the embeddings
+    /// client. The redb file is created on the first write (see
+    /// [`VectorStore::db`]), with the handle shared process-wide via
+    /// `DB_HANDLES`.
+    pub fn open(spec: &VectorSpec) -> Result<Self, VectorStoreError> {
+        let embeddings = EmbeddingsClient::new(&spec.embeddings);
         Ok(Self {
             inner: Arc::new(StoreInner {
-                dbs: std::sync::Mutex::new(HashMap::new()),
-                configured_db_path: config.db_path.clone(),
+                spec: spec.clone(),
                 embeddings,
             }),
         })
+    }
+
+    /// Test accessor over the process-wide `DB_HANDLES` registry: the
+    /// handle for this store's spec resolved against `session_cwd`,
+    /// materializing the redb file on first access (the same lazy-open rule
+    /// as the production write path).
+    #[cfg(test)]
+    pub(crate) async fn handle_for_test(
+        &self,
+        session_cwd: &Path,
+    ) -> Result<Arc<VectorDB>, VectorStoreError> {
+        self.db(&self.db_path_for(session_cwd)).await
     }
 
     /// The DB handle for `db_path`, creating the redb file (and parent dir) on
@@ -153,12 +174,12 @@ impl VectorStore {
     /// from an existing DB surfaces as a clear error on insert, never as silent
     /// corruption.
     async fn db(&self, db_path: &DbPath) -> Result<Arc<VectorDB>, VectorStoreError> {
-        // Take the cell out of the map and drop the guard *before* awaiting:
-        // a std `MutexGuard` must never span an await point. Opening then
-        // happens under the per-path `OnceCell`, so the map stays unlocked
-        // for other paths while one path is being opened.
+        // Take the cell out of the registry and drop the guard *before*
+        // awaiting: a std `MutexGuard` must never span an await point.
+        // Opening then happens under the per-path `OnceCell`, so the map
+        // stays unlocked for other paths while one path is being opened.
         let cell = {
-            let mut dbs = self.inner.dbs.lock().expect("vector db map lock poisoned");
+            let mut dbs = DB_HANDLES.lock().expect("vector db map lock poisoned");
             Arc::clone(dbs.entry(db_path.clone()).or_default())
         };
 
@@ -190,20 +211,23 @@ impl VectorStore {
         self.db(db_path).await.map(Some)
     }
 
-    /// Resolve the configured `db_path` against a session cwd. Pure except for
-    /// one `canonicalize` on the (existing) base dir. Call once per tool call.
+    /// Resolve the spec's `db_path` for a session cwd. `Fixed` was fully
+    /// resolved at parse time — it ignores the cwd, even an empty one.
+    /// `SessionRelative` keeps today's per-cwd rule. Pure except for one
+    /// `canonicalize` on the (existing) base dir. Call once per tool call.
     pub fn db_path_for(&self, session_cwd: &Path) -> DbPath {
-        let p = Path::new(&self.inner.configured_db_path);
-        if p.is_absolute() {
-            return DbPath(normalize_lexical(p));
+        match &self.inner.spec.db_path {
+            DbPathSpec::Fixed(p) => DbPath(normalize_lexical(p)),
+            DbPathSpec::SessionRelative(p) => {
+                let base = if session_cwd.as_os_str().is_empty() {
+                    std::env::current_dir().unwrap_or_else(|_| session_cwd.to_path_buf())
+                } else {
+                    session_cwd.to_path_buf()
+                };
+                let base = base.canonicalize().unwrap_or(base);
+                DbPath(normalize_lexical(&base.join(p)))
+            }
         }
-        let base = if session_cwd.as_os_str().is_empty() {
-            std::env::current_dir().unwrap_or_else(|_| session_cwd.to_path_buf())
-        } else {
-            session_cwd.to_path_buf()
-        };
-        let base = base.canonicalize().unwrap_or(base);
-        DbPath(normalize_lexical(&base.join(p)))
     }
 
     /// Index a single file: parse → chunk → embed → upsert. Returns the number
@@ -539,7 +563,8 @@ pub enum IndexOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::EmbeddingsConfig;
+    use crate::config::resolve::VectorSpec;
+    use crate::config::{EmbeddingsConfig, VectorDbConfig};
 
     #[test]
     fn chunk_id_is_stable_and_index_sensitive() {
@@ -630,7 +655,7 @@ mod tests {
                 dimensions: 3,
             },
         };
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         // Config path is absolute, so the session cwd is irrelevant here.
         let db_path = store.db_path_for(Path::new(""));
         // Materialize the DB so we can seed it directly.
@@ -703,7 +728,7 @@ mod tests {
     async fn reindex_orphans_absent_from_search() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         // Config path is absolute, so the session cwd is irrelevant here.
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
@@ -759,7 +784,7 @@ mod tests {
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
 
         {
-            let store = VectorStore::open(&config).unwrap();
+            let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
             let db_path = store.db_path_for(Path::new(""));
             let db = store.db(&db_path).await.unwrap();
             db.insert_batch(&[
@@ -775,12 +800,12 @@ mod tests {
                 },
             ])
             .unwrap();
-            // `db` and `store` (its OnceCell-cached Arc<VectorDB>) drop here,
-            // so the reopen below starts with no live handles.
+            // `db` and `store` drop here; the registry keeps the handle, but
+            // the assertions below only rely on the on-disk data.
         }
 
-        // Fresh store → fresh per-path cache → true reopen of the file.
-        let store = VectorStore::open(&config).unwrap();
+        // Fresh store over the same path must see the same data.
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
 
@@ -801,7 +826,7 @@ mod tests {
     async fn delete_then_get_none_and_absent_from_search() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
 
@@ -843,7 +868,7 @@ mod tests {
     async fn reinsert_deleted_id_returns_new_vector() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
 
@@ -888,7 +913,7 @@ mod tests {
     async fn cosine_score_is_distance() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
 
@@ -962,7 +987,7 @@ mod tests {
             },
         };
 
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         let resolved = store.db_path_for(Path::new(""));
         assert!(!db_path.exists(), "open() must not create the DB file");
 
@@ -997,7 +1022,10 @@ mod tests {
     fn db_path_resolves_relative_against_session_cwd() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&test_config("./.peakbot/vectors.db")).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
+            "./.peakbot/vectors.db",
+        )))
+        .unwrap();
         let first_base = first.path().canonicalize().unwrap();
         let second_base = second.path().canonicalize().unwrap();
 
@@ -1019,7 +1047,10 @@ mod tests {
         let db = tempfile::tempdir().unwrap().path().join("vectors.db");
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&test_config(db.display().to_string())).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
+            db.display().to_string(),
+        )))
+        .unwrap();
 
         assert_eq!(
             store.db_path_for(first.path()),
@@ -1046,7 +1077,10 @@ mod tests {
     #[tokio::test]
     async fn first_write_lands_under_session_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&test_config("./.peakbot/vectors.db")).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
+            "./.peakbot/vectors.db",
+        )))
+        .unwrap();
         let path = store.db_path_for(dir.path());
         let _db = store.db(&path).await.unwrap();
 
@@ -1063,7 +1097,10 @@ mod tests {
         use ruvector_core::types::VectorEntry;
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&test_config("./.peakbot/vectors.db")).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
+            "./.peakbot/vectors.db",
+        )))
+        .unwrap();
         let path_a = store.db_path_for(a.path());
         let path_b = store.db_path_for(b.path());
         let id = "synthetic-id";
@@ -1086,7 +1123,10 @@ mod tests {
     #[tokio::test]
     async fn same_session_cwd_shares_one_handle() {
         let dir = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&test_config("./.peakbot/vectors.db")).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
+            "./.peakbot/vectors.db",
+        )))
+        .unwrap();
         let path = store.db_path_for(dir.path());
         let first = store.db(&path).await.unwrap();
         let second = store.db(&path).await.unwrap();
@@ -1098,11 +1138,11 @@ mod tests {
         let indexed = tempfile::tempdir().unwrap();
         let unindexed = tempfile::tempdir().unwrap();
         let config = test_config("./.peakbot/vectors.db");
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         let indexed_path = store.db_path_for(indexed.path());
         store.db(&indexed_path).await.unwrap();
 
-        let fresh = VectorStore::open(&config).unwrap();
+        let fresh = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         assert!(
             fresh
                 .db_if_exists(&fresh.db_path_for(indexed.path()))
@@ -1124,5 +1164,258 @@ mod tests {
         assert_eq!(string_field(&md, "missing"), "");
         // Non-string value → empty, not a panic.
         assert_eq!(string_field(&md, "chunk_index"), "");
+    }
+}
+
+// ── T2: process-wide vector handle registry (RED — written before the code) ──
+//
+// Spec §6.4 / plan M1-T2: the per-store `StoreInner.dbs` map moves to a
+// process-wide `static DB_HANDLES:
+// LazyLock<Mutex<HashMap<DbPath, Arc<OnceCell<Arc<VectorDB>>>>>>`,
+// `VectorStore::open` takes a `&VectorSpec`, and `db_path_for` honours
+// `DbPathSpec::Fixed` (ignore cwd) vs `SessionRelative` (today's per-cwd
+// rule). Until the cutover, `main.rs` still gets a `VectorSpec` through the
+// temporary `VectorSpec::from_legacy(&VectorDbConfig)` shim (deleted in T9a).
+//
+// API the tests assume (exact signatures):
+//
+// ```rust
+// use std::path::{Path, PathBuf};
+// use std::sync::Arc;
+// use ruvector_core::vector_db::VectorDB;
+//
+// impl VectorStore {
+//     /// T2: takes a resolved spec instead of the legacy `VectorDbConfig`.
+//     pub fn open(spec: &crate::config::resolve::VectorSpec)
+//         -> Result<Self, VectorStoreError>;
+//
+//     /// Test accessor over the process-wide `DB_HANDLES` registry: the
+//     /// handle for this store's spec resolved against `session_cwd`,
+//     /// materializing the redb file on first access (same lazy-open rule as
+//     /// the production write path). `#[cfg(test)]` / `pub(crate)`.
+//     pub(crate) async fn handle_for_test(
+//         &self,
+//         session_cwd: &Path,
+//     ) -> Result<Arc<VectorDB>, VectorStoreError>;
+// }
+//
+// impl crate::config::resolve::VectorSpec {
+//     /// Temp shim for `main.rs` (deleted in T9a): the legacy 0.23
+//     /// `VectorDbConfig` has no origin, so a relative path is
+//     /// `SessionRelative` (today's behaviour) and an absolute one is
+//     /// `Fixed`.
+//     pub fn from_legacy(legacy: &crate::config::VectorDbConfig) -> Self;
+// }
+//
+// `VectorSpec` / `DbPathSpec` already exist in `crate::config::resolve`
+// (Phase A); `VectorSpec { db_path, embeddings }` and `DbPathSpec::Fixed /
+// SessionRelative(PathBuf)` have `pub` fields.
+//
+// No network: the embeddings client is built with a dummy URL and `embed` is
+// never called; a real redb file is only ever created under a `tempdir`.
+#[cfg(test)]
+mod t2_tests {
+    use super::*;
+    use crate::config::EmbeddingsConfig;
+    use crate::config::resolve::{DbPathSpec, VectorSpec};
+
+    /// A `VectorSpec` with a dummy embeddings endpoint (never called) and a
+    /// `Fixed` DB path. Dimensions 3 keep the synthetic DBs tiny.
+    fn fixed_spec(path: impl Into<PathBuf>) -> VectorSpec {
+        VectorSpec {
+            db_path: DbPathSpec::Fixed(path.into()),
+            embeddings: EmbeddingsConfig {
+                base_url: "http://unused.invalid/v1".into(),
+                api_key: None,
+                model: "test".into(),
+                dimensions: 3,
+            },
+        }
+    }
+
+    fn session_relative_spec(path: impl Into<PathBuf>) -> VectorSpec {
+        VectorSpec {
+            db_path: DbPathSpec::SessionRelative(path.into()),
+            embeddings: EmbeddingsConfig {
+                base_url: "http://unused.invalid/v1".into(),
+                api_key: None,
+                model: "test".into(),
+                dimensions: 3,
+            },
+        }
+    }
+
+    /// Spec §11.3 item 8: two `VectorStore`s (e.g. two profiles, two
+    /// sessions, a reload rebuild) pointing at the same resolved `Fixed`
+    /// path must share ONE process-wide handle — `Arc::ptr_eq` through the
+    /// `handle_for_test` accessor. Two handles over one redb file would
+    /// diverge, so this is load-bearing, not a style preference.
+    #[tokio::test]
+    async fn two_stores_same_fixed_path_share_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("shared.db");
+
+        let a = VectorStore::open(&fixed_spec(db.clone())).unwrap();
+        let b = VectorStore::open(&fixed_spec(db.clone())).unwrap();
+        let cwd = dir.path();
+
+        let ha = a.handle_for_test(cwd).await.unwrap();
+        let hb = b.handle_for_test(cwd).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&ha, &hb),
+            "two stores over the same Fixed path must share one process-wide handle"
+        );
+
+        // The registry is keyed by resolved path, not by store identity: a
+        // different path must yield a DIFFERENT handle (guards against a
+        // degenerate registry that hands out one handle for everything).
+        let other = dir.path().join("other.db");
+        let c = VectorStore::open(&fixed_spec(other.clone())).unwrap();
+        let hc = c.handle_for_test(cwd).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&ha, &hc),
+            "a different resolved path must get its own handle"
+        );
+        assert!(
+            other.exists(),
+            "materializing the other path creates its own file"
+        );
+    }
+
+    /// A `Fixed` path is fully resolved at parse time: `db_path_for` must
+    /// return the exact path for ANY session cwd (including the empty one),
+    /// and both stores resolve it to the same process-wide handle.
+    #[tokio::test]
+    async fn fixed_path_ignores_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fixed.db");
+        let cwd_a = tempfile::tempdir().unwrap();
+        let cwd_b = tempfile::tempdir().unwrap();
+
+        let store = VectorStore::open(&fixed_spec(db.clone())).unwrap();
+        assert_eq!(
+            store.db_path_for(cwd_a.path()).as_path(),
+            db.as_path(),
+            "Fixed must resolve to exactly the parsed path, cwd-independent"
+        );
+        assert_eq!(
+            store.db_path_for(cwd_b.path()),
+            store.db_path_for(cwd_a.path()),
+            "Fixed must ignore the session cwd"
+        );
+        assert_eq!(
+            store.db_path_for(Path::new("")).as_path(),
+            db.as_path(),
+            "an empty session cwd must not fall back to the process cwd"
+        );
+        // Resolution must not touch the disk: only the handle materializes.
+        assert!(!db.exists(), "db_path_for must not create the DB file");
+
+        // Same Fixed path opened from two different cwds → one handle.
+        let s_a = VectorStore::open(&fixed_spec(db.clone())).unwrap();
+        let s_b = VectorStore::open(&fixed_spec(db.clone())).unwrap();
+        let ha = s_a.handle_for_test(cwd_a.path()).await.unwrap();
+        let hb = s_b.handle_for_test(cwd_b.path()).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&ha, &hb),
+            "stores at the same Fixed path must share one handle across cwds"
+        );
+        assert!(
+            db.exists(),
+            "the handle materializes the DB at the fixed path"
+        );
+    }
+
+    /// A `SessionRelative` path (a relative `db_path` in a GLOBAL profile)
+    /// keeps today's behaviour: it resolves against the session cwd, so two
+    /// cwds get two distinct paths — and two distinct process-wide handles.
+    #[tokio::test]
+    async fn session_relative_resolves_per_cwd() {
+        let cwd_a = tempfile::tempdir().unwrap();
+        let cwd_b = tempfile::tempdir().unwrap();
+        let rel = PathBuf::from("./.peakbot/vectors.db");
+
+        let store = VectorStore::open(&session_relative_spec(rel.clone())).unwrap();
+        let pa = store.db_path_for(cwd_a.path());
+        let pb = store.db_path_for(cwd_b.path());
+
+        assert_eq!(
+            pa.as_path(),
+            cwd_a
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join(".peakbot/vectors.db")
+                .as_path(),
+            "SessionRelative must resolve against session cwd A"
+        );
+        assert_eq!(
+            pb.as_path(),
+            cwd_b
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join(".peakbot/vectors.db")
+                .as_path(),
+            "SessionRelative must resolve against session cwd B"
+        );
+        assert_ne!(pa, pb, "different cwds must give different resolved paths");
+        assert!(!pa.as_path().exists(), "resolution must not create the DB");
+        assert!(!pb.as_path().exists(), "resolution must not create the DB");
+
+        // The registry is keyed by the RESOLVED path: per-cwd paths must get
+        // per-cwd handles, and one store must hand out both consistently.
+        let ha = store.handle_for_test(cwd_a.path()).await.unwrap();
+        let hb = store.handle_for_test(cwd_b.path()).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&ha, &hb),
+            "SessionRelative cwds resolve to different paths → different handles"
+        );
+        assert!(
+            pa.as_path().exists(),
+            "handle A materializes the DB under cwd A"
+        );
+        assert!(
+            pb.as_path().exists(),
+            "handle B materializes the DB under cwd B"
+        );
+        assert!(
+            Arc::ptr_eq(&ha, &store.handle_for_test(cwd_a.path()).await.unwrap()),
+            "the same resolved path must keep returning the same handle"
+        );
+    }
+
+    /// The temp shim for `main.rs` (deleted in T9a) has no profile origin, so
+    /// it must keep today's behaviour: absolute → `Fixed`, relative →
+    /// `SessionRelative`. `~` stays as written (parse-time expansion is not
+    /// the shim's job).
+    #[test]
+    fn from_legacy_maps_absolute_to_fixed_relative_to_session_relative() {
+        let abs = tempfile::tempdir().unwrap().path().join("v.db");
+        let legacy_abs = crate::config::VectorDbConfig {
+            enabled: true,
+            db_path: abs.display().to_string(),
+            embeddings: EmbeddingsConfig {
+                base_url: "http://unused.invalid/v1".into(),
+                api_key: None,
+                model: "test".into(),
+                dimensions: 3,
+            },
+        };
+        let spec = VectorSpec::from_legacy(&legacy_abs);
+        assert_eq!(
+            spec.db_path,
+            DbPathSpec::Fixed(abs.clone()),
+            "absolute legacy db_path must become Fixed"
+        );
+
+        let mut legacy_rel = legacy_abs.clone();
+        legacy_rel.db_path = "./.peakbot/vectors.db".into();
+        let spec = VectorSpec::from_legacy(&legacy_rel);
+        assert_eq!(
+            spec.db_path,
+            DbPathSpec::SessionRelative(PathBuf::from("./.peakbot/vectors.db")),
+            "relative legacy db_path must stay session-relative (today's behaviour)"
+        );
     }
 }

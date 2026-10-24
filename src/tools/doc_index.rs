@@ -206,6 +206,7 @@ mod tests {
     // embeddings endpoint (no network) — the resolution is what's under test.
     #[tokio::test]
     async fn resolves_relative_against_session_cwd() {
+        use crate::config::resolve::VectorSpec;
         use crate::config::{EmbeddingsConfig, VectorDbConfig};
 
         let db_dir = tempfile::tempdir().unwrap();
@@ -223,7 +224,7 @@ mod tests {
                 dimensions: 3,
             },
         };
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         let tool = DocIndexTool::new(store).with_session_cwd(session_dir.path().to_path_buf());
 
         // Relative path — must resolve under session_dir and be found.
@@ -251,6 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn doc_index_reports_session_scoped_db_path() {
+        use crate::config::resolve::VectorSpec;
         use crate::config::{EmbeddingsConfig, VectorDbConfig};
 
         let session_dir = tempfile::tempdir().unwrap();
@@ -266,7 +268,7 @@ mod tests {
                 dimensions: 3,
             },
         };
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
         let tool = DocIndexTool::new(store).with_session_cwd(session_dir.path().to_path_buf());
         let args: DocIndexArgs = serde_json::from_value(serde_json::json!({
             "path": "probe.unsupported"

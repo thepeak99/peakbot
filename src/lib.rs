@@ -27,6 +27,7 @@ pub mod pipeline;
 mod providers;
 pub mod pty_runner;
 pub mod reasoning;
+pub mod selection;
 pub mod session;
 pub mod skills;
 pub mod sniff;
@@ -732,6 +733,69 @@ pub fn build_system_prompt(
         && let Some(extra) = orchestrator_prompt.map(str::trim).filter(|s| !s.is_empty())
     {
         prompt.push_str(&format!("\n# Orchestrator Instructions\n\n{extra}\n"));
+    }
+
+    debug!("System prompt:\n {}", prompt);
+
+    prompt
+}
+
+/// Build the main agent's system prompt from a resolved `(profile, agent)`
+/// (spec §6.1). Sections in output order: static head, core guidance (unless
+/// [`Head::Whole`]), memory.md workflow, skills, env block, agents.md,
+/// `# Instructions`.
+///
+/// Unlike [`build_system_prompt`] there is no orchestrator special case: a
+/// [`Head::BuiltIn`] agent leads with the built-in persona whether or not it
+/// has subagents, and `agent.prompt` renders as `# Instructions` for single
+/// agents too. The main agent's skills are filtered by `agent.main.skills`.
+///
+/// [`Head::Whole`]: crate::config::resolve::Head::Whole
+/// [`Head::BuiltIn`]: crate::config::resolve::Head::BuiltIn
+pub fn build_agent_prompt(
+    agent: &crate::config::resolve::ResolvedAgent,
+    profile: &crate::config::resolve::ResolvedProfile,
+    skills: &SkillRegistry,
+    shell: Option<ShellKind>,
+    cwd: &std::path::Path,
+) -> String {
+    use crate::config::resolve::Head;
+
+    let shell = shell.as_ref();
+    let mut prompt = String::new();
+
+    // `Config::parse` already trimmed the persona (I4). The built-in persona
+    // file ends with its own single `\n`, which a configured persona mirrors so
+    // the core starts at the same byte boundary.
+    match &agent.head {
+        Head::BuiltIn => {
+            prompt.push_str(SYSTEM_PROMPT_PERSONA);
+            prompt.push_str(&core_guidance(shell));
+        }
+        Head::Persona(persona) => {
+            prompt.push_str(persona);
+            prompt.push('\n');
+            prompt.push_str(&core_guidance(shell));
+        }
+        Head::Whole(persona) => {
+            prompt.push_str(persona);
+            prompt.push('\n');
+        }
+    }
+
+    if profile.memory.enabled {
+        prompt.push_str(MEMORY_PROMPT_SECTION);
+    }
+    prompt.push_str(&skills.to_system_prompt_section_filtered(&agent.main.skills));
+    prompt.push_str(&env_block(shell, cwd));
+    if agent.main.agents_md {
+        prompt.push_str(&agents_md_section(cwd));
+    }
+
+    // Parse guarantees non-blank but not trimmed; trim like the old builder
+    // so the section's byte layout is unchanged.
+    if let Some(instructions) = &agent.prompt {
+        prompt.push_str(&format!("\n# Instructions\n\n{}\n", instructions.trim()));
     }
 
     debug!("System prompt:\n {}", prompt);

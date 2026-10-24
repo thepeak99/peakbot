@@ -584,24 +584,27 @@ async fn main() -> Result<()> {
     // A failure to open is non-fatal — we warn and continue without the tools,
     // matching how a missing shell degrades gracefully.
     let vector_store = match config.vector_db.as_ref() {
-        Some(vc) if vc.enabled => match peakbot::vector::VectorStore::open(vc) {
-            Ok(store) => {
-                tracing::info!(
-                    "Vector store enabled; DB resolved per session cwd from: {}",
-                    vc.db_path
-                );
+        Some(vc) if vc.enabled => {
+            let spec = peakbot::config::resolve::VectorSpec::from_legacy(vc);
+            match peakbot::vector::VectorStore::open(&spec) {
+                Ok(store) => {
+                    tracing::info!(
+                        "Vector store enabled; DB resolved per session cwd from: {}",
+                        vc.db_path
+                    );
 
-                Some(store)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to open vector store at {}: {e}. \
+                    Some(store)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to open vector store at {}: {e}. \
                      Continuing without doc_index/doc_search.",
-                    vc.db_path
-                );
-                None
+                        vc.db_path
+                    );
+                    None
+                }
             }
-        },
+        }
         _ => None,
     };
 

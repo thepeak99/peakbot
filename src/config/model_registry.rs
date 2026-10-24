@@ -211,6 +211,9 @@ pub enum RegistryError {
 pub struct ModelRegistry {
     by_alias: HashMap<String, ResolvedModel>,
     default_alias: String,
+    /// Aliases in declaration order (providers, then models) — the order
+    /// `build` walked them, so `aliases_in_order` is not a sort.
+    order: Vec<String>,
 }
 
 impl ModelRegistry {
@@ -230,6 +233,7 @@ impl ModelRegistry {
         let mut by_alias: HashMap<String, ResolvedModel> = HashMap::new();
         // Track first-seen origin for nicer duplicate error messages.
         let mut origins: HashMap<String, (String, String)> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
 
         for prov in providers {
             for model in &prov.models {
@@ -265,6 +269,7 @@ impl ModelRegistry {
                     });
                 }
                 origins.insert(alias.clone(), (prov.name.clone(), model.name.clone()));
+                order.push(alias.clone());
 
                 let provider_config = build_provider_config(prov, model);
                 let context_size = model.context_size.unwrap_or_else(|| {
@@ -307,6 +312,7 @@ impl ModelRegistry {
         Ok(Self {
             by_alias,
             default_alias,
+            order,
         })
     }
 
@@ -400,6 +406,13 @@ impl ModelRegistry {
         let mut v: Vec<String> = self.by_alias.keys().cloned().collect();
         v.sort_unstable();
         v
+    }
+
+    /// All declared aliases in declaration order (providers, then models)
+    /// — for the M2 messages and the UI, where config order is the
+    /// user's order.
+    pub fn aliases_in_order(&self) -> Vec<&str> {
+        self.order.iter().map(String::as_str).collect()
     }
 
     /// Iterate all (alias, ResolvedModel) pairs in alphabetical alias
@@ -1202,6 +1215,74 @@ models:
         assert!(
             boot.unavailable.is_none(),
             "pre-v5 files must not raise an availability warning"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T1 RED tests (plan "T1 core API finish"): `aliases_in_order`. Written
+// BEFORE the method exists, against spec §10 (model_registry row): declaration
+// order (providers, then models), not sorted.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod t1_tests {
+    use super::*;
+
+    fn provider(name: &str, kind: ProviderType, models: Vec<ModelEntry>) -> ProviderEntry {
+        ProviderEntry {
+            name: name.into(),
+            kind,
+            api_key: Some("sk-test".into()),
+            base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
+            models,
+        }
+    }
+
+    fn model(name: &str, alias: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            name: name.into(),
+            alias: alias.map(str::to_string),
+            max_tokens: None,
+            temperature: None,
+            extra_params: None,
+            prompt_caching: None,
+            vision: None,
+            context_size: None,
+            preserve_reasoning: true,
+            display_reasoning: false,
+        }
+    }
+
+    /// Declaration order (providers, then models), with unaliased models under
+    /// their qualified `<provider>/<name>` handle — deliberately unsorted so a
+    /// `sort()` implementation cannot pass.
+    #[test]
+    fn aliases_in_order_is_declaration_order() {
+        let providers = vec![
+            provider(
+                "patchnotes",
+                ProviderType::OpenAI,
+                vec![
+                    model("anthropic/claude-sonnet-4.5", Some("sonnet")),
+                    model("anthropic/claude-opus-4.1", Some("opus")),
+                ],
+            ),
+            provider(
+                "local",
+                ProviderType::Ollama,
+                vec![
+                    model("llama3.1:8b", Some("llama")),
+                    model("qwen2.5-coder", None),
+                ],
+            ),
+        ];
+        let registry = ModelRegistry::build(&providers, Some("sonnet")).expect("registry builds");
+        assert_eq!(
+            registry.aliases_in_order(),
+            vec!["sonnet", "opus", "llama", "local/qwen2.5-coder"],
+            "providers in order, then models in order (not sorted)"
         );
     }
 }

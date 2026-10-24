@@ -4,9 +4,11 @@
 //! [`Config::parse`], so their invariants hold by construction and nothing
 //! downstream re-checks them.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_path_to_error::Segment;
 use serde_yaml::Value;
@@ -20,7 +22,7 @@ use super::model_registry::canonical_alias;
 use super::named::{NamedFailure, named_failure};
 use super::{
     BUILTIN_TOOL_NAMES, EmbeddingsConfig, FetchUrlConfig, McpServerConfig, MemoryConfig,
-    ModelRegistry, NameFilter, ProviderEntry, RegistryError, ResolvedModel,
+    ModelRegistry, NameFilter, ProviderEntry, RegistryError, ResolvedModel, get_config_file_path,
 };
 use crate::vector::normalize_lexical;
 
@@ -44,6 +46,33 @@ pub struct Source<'a> {
 /// Facts the caller discovered; only used for F6 warnings.
 pub struct ParseCtx<'a> {
     pub known_skills: &'a [String],
+}
+
+/// Which config files [`Config::load`] reads. Never stored: the caller
+/// derives it (a `--profile` pin forces `Ignore` — repo files never load
+/// under a pin, spec §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoMode {
+    /// Read `<cwd>/.peakbot/config.yaml` when it exists.
+    Include,
+    /// Skip the repo file.
+    Ignore,
+}
+
+/// Why [`Config::load`] failed. `parse` itself stays IO-free; only the
+/// file reads and the legacy pre-check live in `load`.
+#[derive(Debug)]
+pub enum LoadError {
+    /// The global config file does not exist. The repo file never
+    /// replaces it.
+    Missing(PathBuf),
+    /// The global file uses the pre-0.24 layout. Boot auto-migrates
+    /// before this is reachable; reload and Settings surface it.
+    Legacy(PathBuf),
+    /// The files parsed but violate the §4.3 rules.
+    Invalid(ConfigErrors),
+    /// A config file could not be read.
+    Io(PathBuf, io::Error),
 }
 
 /// The one trusted configuration value.
@@ -81,6 +110,57 @@ impl Catalog {
     pub fn iter(&self) -> impl Iterator<Item = &Arc<ResolvedProfile>> {
         self.profiles.iter()
     }
+
+    /// The `(profile, agent)` both names must name — `None` otherwise,
+    /// never a silent default (§5.3).
+    pub fn resolve(&self, sel: &Selection) -> Option<Bound> {
+        let profile = self.profile(&sel.profile)?;
+        let agent_index = profile
+            .agents
+            .iter()
+            .position(|a| a.main.name == sel.agent)?;
+        Some(Bound {
+            profile: Arc::clone(profile),
+            agent_index,
+        })
+    }
+
+    /// The session's starting `Bound`: the pinned profile's first agent
+    /// when pinned, else the default (first profile, first agent). A pin
+    /// names only GLOBAL profiles — repo files are ignored under a pin,
+    /// so a repo-origin profile is unknown and not listed (§4.3 PIN).
+    pub fn start_bound(&self, pin: Option<&str>) -> Result<Bound, String> {
+        let Some(pin) = pin else {
+            return Ok(self.default_bound());
+        };
+        let profile = self
+            .profiles
+            .iter()
+            .find(|p| p.name == pin && matches!(p.origin, Origin::Global))
+            .cloned();
+        let Some(profile) = profile else {
+            let configured: Vec<&str> = self
+                .profiles
+                .iter()
+                .filter(|p| matches!(p.origin, Origin::Global))
+                .map(|p| p.name.as_str())
+                .collect();
+            return Err(format!(
+                "--profile '{pin}': unknown profile. Configured profiles: {}",
+                configured.join(", ")
+            ));
+        };
+        Ok(Bound {
+            profile,
+            agent_index: 0,
+        })
+    }
+
+    /// The wire projection for Settings and AppState (§8.7), in catalog
+    /// order (repo first). `inherited` is derived, not stored (Z4).
+    pub fn infos(&self) -> Vec<ProfileInfo> {
+        self.profiles.iter().map(|p| profile_info(p)).collect()
+    }
 }
 
 /// A fully resolved profile. I1: `agents` is non-empty and `[0]` is the
@@ -106,6 +186,37 @@ pub struct ResolvedProfile {
 pub enum Origin {
     Global,
     Repo { overrides_global: bool },
+}
+
+/// The wire projection of a profile for Settings and AppState (§8.7).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileInfo {
+    pub name: String,
+    /// `"repo"` or `"global"`.
+    pub origin: &'static str,
+    /// A repo profile shadowing a same-named global one.
+    pub overrides_global: bool,
+    pub agents: Vec<AgentInfo>,
+}
+
+/// The wire projection of an agent (§8.7).
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentInfo {
+    pub name: String,
+    /// The agent's model alias.
+    pub model: String,
+    pub subagents: Vec<SubagentInfo>,
+}
+
+/// The wire projection of a subagent (§8.7).
+#[derive(Debug, Clone, Serialize)]
+pub struct SubagentInfo {
+    pub name: String,
+    /// The subagent's model alias (the agent's when `inherited`).
+    pub model: String,
+    /// Derived, never stored: the subagent's model alias equals the
+    /// agent's (Z4).
+    pub inherited: bool,
 }
 
 /// One agent and its subagents. I3: the `delegate` tool exists iff
@@ -149,10 +260,28 @@ pub struct Subagent {
     pub prompt: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VectorSpec {
     pub db_path: DbPathSpec,
     pub embeddings: EmbeddingsConfig,
+}
+
+impl VectorSpec {
+    /// temporary shim, removed in the 0.24 cutover
+    pub fn from_legacy(legacy: &crate::config::VectorDbConfig) -> Self {
+        // Relative (incl. `~`) stays `SessionRelative` — the shim must
+        // reproduce 0.23's per-cwd resolution byte-identically; `~` only
+        // becomes `Fixed` at `Config::parse`.
+        let db_path = if Path::new(&legacy.db_path).is_absolute() {
+            DbPathSpec::Fixed(PathBuf::from(legacy.db_path.as_str()))
+        } else {
+            DbPathSpec::SessionRelative(PathBuf::from(legacy.db_path.as_str()))
+        };
+        Self {
+            db_path,
+            embeddings: legacy.embeddings.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +435,48 @@ impl Config {
             },
             warnings,
         })
+    }
+
+    /// IO wrapper used by boot and reload (§5.4): reads the global file
+    /// and — when `repo == RepoMode::Include` — `<cwd>/.peakbot/config.yaml`,
+    /// then calls [`Self::parse`]. A missing global file is
+    /// `LoadError::Missing`; the repo file never replaces it.
+    pub fn load(cwd: &Path, repo: RepoMode, ctx: &ParseCtx<'_>) -> Result<Config, LoadError> {
+        let Some(global_path) = get_config_file_path() else {
+            // No platform config dir (no HOME) — the path is unknown, so
+            // report the cwd the caller asked to load from.
+            return Err(LoadError::Missing(cwd.to_path_buf()));
+        };
+        if !global_path.exists() {
+            return Err(LoadError::Missing(global_path));
+        }
+        let text = std::fs::read_to_string(&global_path)
+            .map_err(|e| LoadError::Io(global_path.clone(), e))?;
+        // The same check as `parse` step 2, run here so a legacy file maps
+        // to `Legacy` (auto-migration territory) instead of `Invalid`.
+        if serde_yaml::from_str::<Value>(&text).is_ok_and(|doc| is_legacy(&doc)) {
+            return Err(LoadError::Legacy(global_path));
+        }
+        let repo_path = cwd.join(".peakbot").join("config.yaml");
+        let repo_text = match repo {
+            RepoMode::Include if repo_path.exists() => Some(
+                std::fs::read_to_string(&repo_path)
+                    .map_err(|e| LoadError::Io(repo_path.clone(), e))?,
+            ),
+            _ => None,
+        };
+        let global = Source {
+            path: &global_path,
+            text: &text,
+        };
+        let repo_src = repo_text.as_ref().map(|t| Source {
+            path: &repo_path,
+            text: t,
+        });
+        match Self::parse(global, repo_src, ctx) {
+            Ok(cfg) => Ok(cfg),
+            Err(errors) => Err(LoadError::Invalid(errors)),
+        }
     }
 }
 
@@ -963,6 +1134,40 @@ fn expand_home(raw: &str) -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(rest))
 }
 
+fn profile_info(p: &ResolvedProfile) -> ProfileInfo {
+    ProfileInfo {
+        name: p.name.clone(),
+        origin: match p.origin {
+            Origin::Global => "global",
+            Origin::Repo { .. } => "repo",
+        },
+        overrides_global: matches!(
+            p.origin,
+            Origin::Repo {
+                overrides_global: true
+            }
+        ),
+        agents: p.agents.iter().map(agent_info).collect(),
+    }
+}
+
+fn agent_info(a: &ResolvedAgent) -> AgentInfo {
+    let model = a.main.model.alias.clone();
+    AgentInfo {
+        name: a.main.name.clone(),
+        model: model.clone(),
+        subagents: a
+            .subagents
+            .iter()
+            .map(|s| SubagentInfo {
+                name: s.member.name.clone(),
+                model: s.member.model.alias.clone(),
+                inherited: s.member.model.alias == a.main.model.alias,
+            })
+            .collect(),
+    }
+}
+
 fn key(k: &str) -> PathSeg {
     PathSeg::Key(k.to_string())
 }
@@ -998,6 +1203,406 @@ mod tests {
                 && !e.message.contains(" at line "),
             "got: {}",
             e.message
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T1 RED tests (plan "T1 core API finish"). Written BEFORE the items exist,
+// against the locked spec: §4.3 (PIN message), §5.3 (Catalog/Selection/Bound),
+// §5.4 (Config::load, RepoMode, LoadError), §8.7 (ProfileInfo wire shape),
+// plus Z4 (derived `inherited`). They must fail to compile until T1 lands.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod t1_tests {
+    use super::super::get_config_file_path;
+    use super::*;
+
+    /// A valid 0.24 global config (spec §3.1, trimmed): two profiles, `dev`
+    /// first; `dev` has two agents (`team` first) and four subagents covering
+    /// every `inherited` case.
+    const GLOBAL_YAML: &str = r#"
+providers:
+  - name: patchnotes
+    type: openai
+    base_url: https://ai.patchnotes.com/v1
+    api_key: pn-test
+    models:
+      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }
+      - { name: anthropic/claude-opus-4.1, alias: opus, max_tokens: 8192 }
+      - { name: qwen3-coder, alias: qwen, max_tokens: 32768 }
+profiles:
+  dev:
+    agents:
+      team:
+        model: sonnet
+        subagents:
+          researcher:
+            model: qwen
+            prompt: Gather background, cite sources, hand back a brief.
+          senior:
+            model: opus
+            prompt: Review the design and the code.
+          tester:
+            prompt: Write the failing tests first.
+          mirror:
+            model: sonnet
+            prompt: Second pair of eyes on the same model.
+      solo:
+        model: sonnet
+  research:
+    agents:
+      scholar:
+        model: opus
+"#;
+
+    /// A valid repo config (spec §3.2, trimmed): one new profile plus one
+    /// that shadows the global `dev` (replace, never merge — spec §2).
+    const REPO_YAML: &str = r#"
+profiles:
+  peakbot-dev:
+    agents:
+      team:
+        model: sonnet
+        subagents:
+          mid: { model: qwen, prompt: Implement the well-scoped piece you are given. }
+  dev:
+    agents:
+      solo: { model: qwen }
+"#;
+
+    /// A 0.23-shaped global file: top-level `provider:`/`default_model:` are
+    /// legacy signs with no new-only marker (spec §7.1) → `Legacy`, not a
+    /// parse failure.
+    const LEGACY_GLOBAL_YAML: &str = r#"
+provider:
+  name: patchnotes
+  type: openai
+  base_url: https://ai.patchnotes.com/v1
+  api_key: pn-test
+default_model: patchnotes/anthropic/claude-sonnet-4.5
+"#;
+
+    fn ctx() -> ParseCtx<'static> {
+        ParseCtx { known_skills: &[] }
+    }
+
+    /// `Config::parse` over the fixtures; the paths only anchor the repo.
+    fn parse(repo: Option<&str>) -> Config {
+        Config::parse(
+            Source {
+                path: Path::new("/global/config.yaml"),
+                text: GLOBAL_YAML,
+            },
+            repo.map(|text| Source {
+                path: Path::new("/repo/.peakbot/config.yaml"),
+                text,
+            }),
+            &ctx(),
+        )
+        .expect("fixture config must parse")
+    }
+
+    fn catalog(repo: Option<&str>) -> Catalog {
+        parse(repo).catalog
+    }
+
+    /// Restores `XDG_CONFIG_HOME` on drop, so a panic cannot leak env state.
+    struct XdgGuard(Option<String>);
+
+    impl XdgGuard {
+        fn new(dir: &Path) -> Self {
+            let original = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", dir) };
+            Self(original)
+        }
+    }
+
+    impl Drop for XdgGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            }
+        }
+    }
+
+    /// `XDG_CONFIG_HOME` pointed at a fresh tempdir (the global config is
+    /// written when `Some`); the second return value is the session cwd.
+    /// Held under the crate-wide env lock, like the legacy config tests.
+    struct TempHome {
+        // Field order is drop order: restore the env, delete the dir, and only
+        // then release the lock.
+        _guard: XdgGuard,
+        _xdg: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TempHome {
+        fn new(global: Option<&str>) -> (Self, tempfile::TempDir) {
+            // A failing test must not poison the lock for the others.
+            let _lock = super::super::CONFIG_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _xdg = tempfile::tempdir().expect("XDG tempdir");
+            let _guard = XdgGuard::new(_xdg.path());
+            if let Some(text) = global {
+                let config_dir =
+                    super::super::get_config_dir().expect("config dir under XDG_CONFIG_HOME");
+                std::fs::create_dir_all(&config_dir).expect("config dir");
+                std::fs::write(config_dir.join("config.yaml"), text).expect("write global config");
+            }
+            let cwd = tempfile::tempdir().expect("cwd tempdir");
+            (
+                Self {
+                    _guard,
+                    _xdg,
+                    _lock,
+                },
+                cwd,
+            )
+        }
+
+        fn write_repo(&self, cwd: &Path, text: &str) {
+            let repo_dir = cwd.join(".peakbot");
+            std::fs::create_dir_all(&repo_dir).expect(".peakbot dir");
+            std::fs::write(repo_dir.join("config.yaml"), text).expect("write repo config");
+        }
+    }
+
+    /// §5.4: a missing global file is `LoadError::Missing(<global path>)` —
+    /// even under `RepoMode::Include`, the repo file never replaces it.
+    #[test]
+    fn load_missing_global_is_missing() {
+        let (_home, cwd) = TempHome::new(None);
+        let err = Config::load(cwd.path(), RepoMode::Include, &ctx()).expect_err("no global file");
+        let expected = get_config_file_path().expect("path under XDG_CONFIG_HOME");
+        assert!(
+            matches!(err, LoadError::Missing(p) if p == expected),
+            "expected LoadError::Missing({})",
+            expected.display()
+        );
+    }
+
+    /// §5.4: `RepoMode::Include` reads `<cwd>/.peakbot/config.yaml`; the repo
+    /// profiles lead the catalog (I1) and the shadowed global drops out (I7).
+    #[test]
+    fn load_include_reads_repo_file() {
+        let (home, cwd) = TempHome::new(Some(GLOBAL_YAML));
+        home.write_repo(cwd.path(), REPO_YAML);
+        let cfg = Config::load(cwd.path(), RepoMode::Include, &ctx()).expect("include loads");
+        let names: Vec<&str> = cfg.catalog.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["peakbot-dev", "dev", "research"]);
+        let peakbot_dev = cfg
+            .catalog
+            .profile("peakbot-dev")
+            .expect("repo profile loaded");
+        assert!(
+            matches!(
+                peakbot_dev.origin,
+                Origin::Repo {
+                    overrides_global: false
+                }
+            ),
+            "a repo profile without a same-named global is Repo without override"
+        );
+    }
+
+    /// §2/§5.4: `RepoMode::Ignore` (the `--profile` pin) never reads the repo
+    /// file — the catalog is the global one, untouched.
+    #[test]
+    fn load_ignore_skips_repo_file() {
+        let (home, cwd) = TempHome::new(Some(GLOBAL_YAML));
+        home.write_repo(cwd.path(), REPO_YAML);
+        let cfg = Config::load(cwd.path(), RepoMode::Ignore, &ctx()).expect("ignore loads");
+        let names: Vec<&str> = cfg.catalog.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["dev", "research"]);
+        assert!(
+            cfg.catalog
+                .iter()
+                .all(|p| matches!(p.origin, Origin::Global)),
+            "no repo profile may survive RepoMode::Ignore"
+        );
+    }
+
+    /// §5.4/§7.1: a legacy global file is `LoadError::Legacy(<path>)` — not
+    /// `Invalid` (boot auto-migrates first; this is the reload/Settings path).
+    #[test]
+    fn load_legacy_global_is_legacy() {
+        let (_home, cwd) = TempHome::new(Some(LEGACY_GLOBAL_YAML));
+        let err = Config::load(cwd.path(), RepoMode::Include, &ctx()).expect_err("legacy file");
+        let expected = get_config_file_path().expect("path under XDG_CONFIG_HOME");
+        assert!(
+            matches!(err, LoadError::Legacy(p) if p == expected),
+            "expected LoadError::Legacy({})",
+            expected.display()
+        );
+    }
+
+    /// §5.4: an unreadable global (a directory at the path) is
+    /// `LoadError::Io` with the global path — not `Missing`, not
+    /// `Invalid`.
+    #[test]
+    fn load_unreadable_global_is_io() {
+        let (_home, cwd) = TempHome::new(None);
+        let path = get_config_file_path().expect("path under XDG_CONFIG_HOME");
+        std::fs::create_dir_all(&path).expect("directory at the config path");
+        let err =
+            Config::load(cwd.path(), RepoMode::Include, &ctx()).expect_err("unreadable global");
+        assert!(
+            matches!(err, LoadError::Io(p, _) if p == path),
+            "expected LoadError::Io({})",
+            path.display()
+        );
+    }
+
+    /// §5.4: a new-layout file that violates the §4.3 rules (here E1 +
+    /// E2) is `LoadError::Invalid` carrying the collected errors — not
+    /// `Legacy` (no legacy signs) and not `Missing`.
+    #[test]
+    fn load_invalid_global_is_invalid() {
+        let (_home, cwd) = TempHome::new(Some("providers: []\nprofiles: {}\n"));
+        let err = Config::load(cwd.path(), RepoMode::Include, &ctx()).expect_err("invalid file");
+        match err {
+            LoadError::Invalid(errors) => assert!(!errors.0.is_empty()),
+            other => panic!("expected LoadError::Invalid, got {other:?}"),
+        }
+    }
+
+    /// §4.3 PIN, verbatim: an unknown pin lists the global profile names in
+    /// declaration order.
+    #[test]
+    fn start_bound_pin_unknown_message() {
+        let catalog = catalog(None);
+        let msg = catalog.start_bound(Some("nope")).expect_err("unknown pin");
+        assert_eq!(
+            msg,
+            "--profile 'nope': unknown profile. Configured profiles: dev, research"
+        );
+    }
+
+    /// §4.3 PIN: the pin names a GLOBAL profile. A repo-origin profile (repo
+    /// files are ignored under a pin) is unknown, and is not offered as a
+    /// configured one.
+    #[test]
+    fn start_bound_pin_rejects_repo_origin_profile() {
+        let catalog = catalog(Some(REPO_YAML));
+        let msg = catalog
+            .start_bound(Some("peakbot-dev"))
+            .expect_err("a repo profile cannot be pinned");
+        let prefix = "--profile 'peakbot-dev': unknown profile. Configured profiles: ";
+        let listed = msg.strip_prefix(prefix).unwrap_or_else(|| {
+            panic!("message must start with the PIN text, got: {msg}");
+        });
+        assert!(
+            !listed.split(", ").any(|name| name == "peakbot-dev"),
+            "repo profiles are not 'configured' globally, got: {msg}"
+        );
+    }
+
+    /// "First = default" (§1.3): no pin → first profile's first agent; a
+    /// valid pin → that global profile's first agent.
+    #[test]
+    fn start_bound_pin_picks_first_agent() {
+        let catalog = catalog(None);
+        let bound = catalog.start_bound(None).expect("no pin binds the default");
+        assert_eq!(
+            bound.selection(),
+            Selection {
+                profile: "dev".into(),
+                agent: "team".into()
+            }
+        );
+        let bound = catalog
+            .start_bound(Some("research"))
+            .expect("known pin binds the pin");
+        assert_eq!(
+            bound.selection(),
+            Selection {
+                profile: "research".into(),
+                agent: "scholar".into()
+            }
+        );
+    }
+
+    /// §5.3: `resolve` needs BOTH names — a known profile with an unknown
+    /// agent (and vice versa) is `None`, never a silent default.
+    #[test]
+    fn catalog_resolve_requires_both_names() {
+        let catalog = catalog(None);
+        let ok = catalog
+            .resolve(&Selection {
+                profile: "dev".into(),
+                agent: "team".into(),
+            })
+            .expect("both names exist");
+        assert_eq!(
+            ok.selection(),
+            Selection {
+                profile: "dev".into(),
+                agent: "team".into()
+            }
+        );
+        let sel = |profile: &str, agent: &str| Selection {
+            profile: profile.into(),
+            agent: agent.into(),
+        };
+        assert!(
+            catalog.resolve(&sel("dev", "ghost")).is_none(),
+            "unknown agent"
+        );
+        assert!(
+            catalog.resolve(&sel("ghost", "team")).is_none(),
+            "unknown profile"
+        );
+        assert!(
+            catalog.resolve(&sel("ghost", "ghost")).is_none(),
+            "both unknown"
+        );
+    }
+
+    /// §8.7/I1/I7: `infos()` is the wire projection in catalog order — repo
+    /// first, `origin` as "repo"/"global", `overrides_global` on the shadow.
+    #[test]
+    fn infos_repo_first_with_override_flag() {
+        let infos = catalog(Some(REPO_YAML)).infos();
+        assert_eq!(infos.len(), 3, "repo profiles plus the unshadowed globals");
+        assert_eq!(infos[0].name, "peakbot-dev");
+        assert_eq!(infos[0].origin, "repo");
+        assert!(!infos[0].overrides_global);
+        assert_eq!(infos[1].name, "dev");
+        assert_eq!(infos[1].origin, "repo");
+        assert!(infos[1].overrides_global, "repo `dev` shadows global `dev`");
+        assert_eq!(
+            infos[1].agents.len(),
+            1,
+            "replace, never merge: only the repo agent"
+        );
+        assert_eq!(infos[1].agents[0].name, "solo");
+        assert_eq!(infos[2].name, "research");
+        assert_eq!(infos[2].origin, "global");
+        assert!(!infos[2].overrides_global);
+    }
+
+    /// Z4: `inherited` is DERIVED as "subagent model == agent model" — true
+    /// for an absent model AND for an explicit-but-equal one, false otherwise.
+    #[test]
+    fn infos_inherited_when_model_equal() {
+        let infos = catalog(None).infos();
+        let team = &infos[0].agents[0];
+        assert_eq!(team.name, "team");
+        assert_eq!(team.model, "sonnet");
+        assert_eq!(team.subagents.len(), 4);
+        let subs = &team.subagents;
+        let names: Vec<&str> = subs.iter().map(|s| s.name.as_str()).collect();
+        let models: Vec<&str> = subs.iter().map(|s| s.model.as_str()).collect();
+        let inherited: Vec<bool> = subs.iter().map(|s| s.inherited).collect();
+        assert_eq!(names, ["researcher", "senior", "tester", "mirror"]);
+        assert_eq!(models, ["qwen", "opus", "sonnet", "sonnet"]);
+        assert_eq!(
+            inherited,
+            [false, false, true, true],
+            "absent model and explicit-equal model are both inherited"
         );
     }
 }
