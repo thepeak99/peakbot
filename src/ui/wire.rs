@@ -102,11 +102,9 @@ pub(crate) enum InboundMessage {
         /// The requested orchestrator model alias; absent = the agent's
         /// configured model.
         #[serde(default)]
-        #[allow(dead_code)] // RED STUB (T1): forwarded by T4's dispatchers; drop then.
         model: Option<String>,
         /// Subagent → model alias overrides (overridden subagents only).
         #[serde(default)]
-        #[allow(dead_code)] // RED STUB (T1): forwarded by T4's dispatchers; drop then.
         subagent_models: std::collections::BTreeMap<String, String>,
     },
     /// End an active session for *everyone* attached to it (dropdown "kill").

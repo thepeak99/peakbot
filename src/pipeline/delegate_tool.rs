@@ -74,16 +74,10 @@ impl SubAgentDeps {
         &self.bound.agent().subagents
     }
 
-    /// The model a delegation to `sub` runs on: `bound.subagent_model(sub,
-    /// &self.orchestrator_model)` (I10).
-    ///
-    /// RED stub (T1): signature only — T5 lands the implementation and makes
-    /// `DelegateTool::call` use it for `pausable`, the handoff provider
-    /// config and `build_sub_agent`. (`pub` only so the unused stub does not
-    /// trip `dead_code`; T5 may narrow it to `pub(crate)`.)
-    pub fn model_for<'a>(&'a self, sub: &'a Subagent) -> &'a ResolvedModel {
-        let _ = sub;
-        todo!("T5: SubAgentDeps::model_for")
+    /// The model a delegation to `sub` runs on (I10): the bound's override,
+    /// else the inherited orchestrator model, else the configured one.
+    pub(crate) fn model_for<'a>(&'a self, sub: &'a Subagent) -> &'a ResolvedModel {
+        self.bound.subagent_model(sub, &self.orchestrator_model)
     }
 }
 
@@ -332,7 +326,8 @@ impl Tool for DelegateTool {
 
         // Ollama is hookless by type — its sub-agent never reaches a
         // checkpoint, so it is not pausable (the UI hides the button).
-        let provider_config = &sub.member.model.provider_config;
+        let model = deps.model_for(sub);
+        let provider_config = &model.provider_config;
         let pausable = !matches!(provider_config, crate::config::ProviderConfig::Ollama(_));
 
         // The guard owns the sub-agent slot for the whole call — success,
@@ -364,21 +359,14 @@ impl Tool for DelegateTool {
             sub.member.agents_md,
         );
 
-        // Size the gate against THIS subagent's model, not the main agent's:
-        // subagents routinely run on smaller-context models.
-        let context_budget = deps
-            .state_manager
-            .compaction_threshold()
-            .map(|fraction| (fraction * sub.member.model.context_size as f64) as usize);
-
         let (agent, hook) = crate::providers::build_sub_agent(
             &deps.tool_env,
             sub,
+            model,
             &preamble,
             deps.event_sink.clone(),
             deps.state_manager.clone(),
             deps.shell_kind.as_ref(),
-            context_budget,
         )
         .map_err(|e| DelegateError::Build {
             role: args.role.clone(),

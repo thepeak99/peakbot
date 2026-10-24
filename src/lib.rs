@@ -258,8 +258,6 @@ enum SelectRequest {
     /// configured model); the selection carries the subagent overrides.
     Pair {
         selection: crate::config::resolve::Selection,
-        // RED STUB (T1): read by T4's `handle_select`; drop the allow then.
-        #[allow(dead_code)]
         model: Option<String>,
     },
 }
@@ -589,10 +587,11 @@ enum Rebind<'a> {
     /// conversation has turns, re-resolve it while it has none.
     Session,
     /// `/load`: a new binding from the loaded conversation's saved names
-    /// (§6.6 `resolve_saved_selection`).
+    /// (§6.6 `resolve_saved_selection`), including its saved overrides.
     Saved {
         profile: Option<&'a str>,
         agent: Option<&'a str>,
+        subagent_models: &'a std::collections::BTreeMap<String, String>,
     },
 }
 
@@ -674,15 +673,17 @@ fn reload_config(
     let catalog = &ctx.config.catalog;
     let pin = ctx.profile_pin.as_deref();
     match rebind {
-        Rebind::Saved { profile, agent } => {
+        Rebind::Saved {
+            profile,
+            agent,
+            subagent_models,
+        } => {
             let (bound, warnings) = crate::selection::resolve_saved_selection(
                 catalog,
                 &ctx.config.registry,
                 profile,
                 agent,
-                // RED (T1): T4 threads the conversation's saved overrides
-                // through `Rebind::Saved`.
-                &std::collections::BTreeMap::new(),
+                subagent_models,
                 pin,
             );
             ctx.bound = bound;
@@ -701,7 +702,18 @@ fn reload_config(
         }
         Rebind::Session => {
             match catalog.resolve(&ctx.bound.profile.name, &ctx.bound.agent().main.name) {
-                Some(bound) => ctx.bound = bound,
+                Some(bound) => {
+                    // The pair re-resolved: re-validate the overrides
+                    // leniently — a vanished entry drops with its ⚠ and the
+                    // sub keeps its default (plan §4.4).
+                    let wanted = ctx.bound.selection().subagent_models;
+                    let (bound, rejected) =
+                        bound.with_subagent_models(&ctx.config.registry, &wanted);
+                    for rej in rejected {
+                        messages.push(crate::selection::override_warning(&rej, bound.agent()));
+                    }
+                    ctx.bound = bound;
+                }
                 None => {
                     // Under a pin the fallback stays inside the pinned profile.
                     let bound = catalog
@@ -1984,17 +1996,17 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// `/profile`, `/agent` and the picker's `Select` (spec §6.5–§6.6).
+    /// `/profile`, `/agent` and the picker's `Select` (spec §6.5–§6.6,
+    /// plan §4.2). The request is the FULL desired setup: the pair, the
+    /// orchestrator model (absent = the agent's configured one) and the
+    /// subagent overrides. Refusal order: exact no-op (pair frames only) >
+    /// lock > pin > unknown pair > unknown alias > unknown override — a
+    /// refusal changes nothing.
     ///
-    /// Bare forms render the live lists. A selection is decided by the pure
-    /// `crate::selection::resolve_selection_choice` (locked > pin > unknown >
-    /// apply); a picker pair is a profile step (when the profile changes)
-    /// followed by an agent step, so it obeys exactly the same rules.
-    ///
-    /// Applying swaps `ctx.bound`, rebuilds the agent on the bound agent's
-    /// configured model and only then persists the selection — a failed
-    /// rebuild leaves the previous agent running, so the bound rolls back
-    /// with it and `sm.selection()` was never touched.
+    /// Bare forms render the live lists. Applying swaps `ctx.bound`,
+    /// rebuilds the agent on the requested model and only then persists the
+    /// selection — a failed rebuild rolls the bound back and
+    /// `sm.selection()` was never touched.
     ///
     /// No conversation reset, unlike `/model` and `/cd`: selection is only
     /// possible before the first turn, and minting a new id would break the
@@ -2008,8 +2020,8 @@ impl AgentRunner {
         rebuild_ctx: Option<&mut RebuildContext>,
     ) {
         use crate::selection::{
-            SelectChoice, SelectSubmission, render_agent_list, render_profile_list,
-            resolve_selection_choice,
+            SelectChoice, SelectSubmission, override_refusal, render_agent_list,
+            render_profile_list, resolve_selection_choice,
         };
 
         let Some(sm) = state_manager.clone() else {
@@ -2023,8 +2035,45 @@ impl AgentRunner {
             return;
         };
         let pin = ctx.profile_pin.clone();
+        let has_turns = sm.conversation_has_turns();
 
-        let steps = match request {
+        // A typed command always re-applies a name (no model, no overrides);
+        // only a pair frame can be the exact current setup.
+        let pair_changed = match &request {
+            SelectRequest::Pair { selection, .. } => {
+                (selection.profile.as_str(), selection.agent.as_str())
+                    != (
+                        ctx.bound.profile.name.as_str(),
+                        ctx.bound.agent().main.name.as_str(),
+                    )
+            }
+            SelectRequest::Command(_) => true,
+        };
+        // The picker re-sends the current setup on redraws; answering that
+        // with a rebuild (or a lock refusal) would be noise.
+        if let SelectRequest::Pair { selection, model } = &request
+            && !pair_changed
+        {
+            if selection.subagent_models == ctx.bound.selection().subagent_models
+                && model
+                    .as_deref()
+                    .unwrap_or(ctx.bound.agent().main.model.alias.as_str())
+                    == sm.get_model_alias()
+            {
+                return;
+            }
+            if has_turns {
+                sm.add_system_message(
+                    "❌ /agent: models are locked once the conversation has started — /new for a fresh one."
+                        .to_string(),
+                );
+                return;
+            }
+        }
+
+        // A same-pair request has no steps: it is a models-only change on a
+        // fresh `Bound`, which clears the old overrides structurally.
+        let (steps, req_model, req_overrides) = match request {
             SelectRequest::Command(SelectSubmission::ListProfiles) => {
                 sm.add_system_message(render_profile_list(
                     &ctx.config.catalog,
@@ -2037,32 +2086,34 @@ impl AgentRunner {
                 sm.add_system_message(render_agent_list(&ctx.bound));
                 return;
             }
-            SelectRequest::Command(step) => vec![step],
-            // RED (T1): the `model` leg is carried but not consumed yet —
-            // T4 rewrites this arm per plan §4.2 (model + overrides +
-            // the exact no-op guard).
-            SelectRequest::Pair { selection, .. } => {
-                // The picker re-sends the current pair on redraws; answering
-                // that with a rebuild (or a lock refusal) would be noise.
-                if selection == ctx.bound.selection() {
-                    return;
-                }
+            SelectRequest::Command(step) => (vec![step], None, std::collections::BTreeMap::new()),
+            SelectRequest::Pair { selection, model } => {
                 let mut steps = Vec::with_capacity(2);
-                if selection.profile != ctx.bound.profile.name {
-                    steps.push(SelectSubmission::Profile(selection.profile));
+                if pair_changed {
+                    if selection.profile != ctx.bound.profile.name {
+                        steps.push(SelectSubmission::Profile(selection.profile));
+                    }
+                    steps.push(SelectSubmission::Agent(selection.agent));
                 }
-                steps.push(SelectSubmission::Agent(selection.agent));
-                steps
+                (steps, model, selection.subagent_models)
             }
         };
-
         let profile_changed = steps
             .iter()
             .any(|s| matches!(s, SelectSubmission::Profile(_)));
-        let has_turns = sm.conversation_has_turns();
-        let mut next = ctx.bound.clone();
+        let (command, label) = match (profile_changed, steps.is_empty()) {
+            (true, _) => ("/profile", "Profile"),
+            (false, false) => ("/agent", "Agent"),
+            (false, true) => ("/agent", "Models"),
+        };
+
+        let mut next = if steps.is_empty() {
+            Bound::new(Arc::clone(&ctx.bound.profile), ctx.bound.agent_index)
+        } else {
+            ctx.bound.clone()
+        };
         for step in steps {
-            let command = match step {
+            let step_command = match step {
                 SelectSubmission::Profile(_) => "/profile",
                 _ => "/agent",
             };
@@ -2075,19 +2126,38 @@ impl AgentRunner {
             ) {
                 SelectChoice::Apply(bound) => next = bound,
                 SelectChoice::Refuse(msg) => {
-                    sm.add_system_message(format!("❌ {command}: {msg}"));
+                    sm.add_system_message(format!("❌ {step_command}: {msg}"));
                     return;
                 }
             }
         }
 
-        let command = if profile_changed {
-            "/profile"
-        } else {
-            "/agent"
+        let model = match req_model {
+            Some(alias) => match ctx.config.registry.resolve(&alias) {
+                Some(model) => model.clone(),
+                None => {
+                    sm.add_system_message(format!(
+                        "❌ {command}: unknown alias `{alias}`. Available: {}",
+                        ctx.config.registry.aliases_sorted().join(", ")
+                    ));
+                    return;
+                }
+            },
+            None => next.agent().main.model.clone(),
         };
+
+        // Strict on the user frame: the first bad override refuses the
+        // whole request (rebinds are the lenient path).
+        let (next, rejected) = next.with_subagent_models(&ctx.config.registry, &req_overrides);
+        if let Some(rej) = rejected.first() {
+            sm.add_system_message(format!(
+                "❌ {command}: {}",
+                override_refusal(rej, next.agent(), &ctx.config.registry)
+            ));
+            return;
+        }
+
         let previous = std::mem::replace(&mut ctx.bound, next);
-        let model = ctx.bound.agent().main.model.clone();
         if let Err(e) = Self::rebuild_agent(
             &model,
             agent_slot,
@@ -2109,16 +2179,24 @@ impl AgentRunner {
         sm.set_provider_name(model.provider_name.clone());
         sm.set_model_alias(model.alias.clone());
         // Keep the persisted re-activation key truthful: the conversation
-        // keeps its id but now runs on the agent's model.
+        // keeps its id but now runs on the requested model.
         sm.set_conversation_wire_id(model.provider_name.clone(), model.model_name.clone());
 
-        let label = if profile_changed { "Profile" } else { "Agent" };
-        sm.add_system_message(format!(
+        let mut line = format!(
             "{label}: {} › {} — model {}.",
             ctx.bound.profile.name,
             ctx.bound.agent().main.name,
             model.alias
-        ));
+        );
+        let overrides = ctx.bound.selection().subagent_models;
+        if !overrides.is_empty() {
+            let parts: Vec<String> = overrides
+                .iter()
+                .map(|(subagent, alias)| format!("{subagent} → {alias}"))
+                .collect();
+            line.push_str(&format!(" Subagent models: {}.", parts.join(", ")));
+        }
+        sm.add_system_message(line);
     }
 
     /// Change the working directory and rebuild on a fresh conversation.
@@ -2397,6 +2475,7 @@ impl AgentRunner {
         let rebind = Rebind::Saved {
             profile: conv.profile.as_deref(),
             agent: conv.agent.as_deref(),
+            subagent_models: &conv.subagent_models,
         };
         for warning in reload_config(ctx, sm, &reload_cwd, rebind) {
             sm.add_system_message(warning);

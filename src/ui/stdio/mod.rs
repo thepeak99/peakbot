@@ -221,16 +221,19 @@ fn dispatch_stdin_line(
         Ok(InboundMessage::SwitchCwd { path }) => {
             action_sender.send(UiAction::ChangeCwd(path)).is_ok()
         }
-        // RED (T1): the new `model` / `subagent_models` legs are parsed by the
-        // frame but NOT forwarded yet — T4 forwards them (plan §5.1).
-        Ok(InboundMessage::Select { profile, agent, .. }) => action_sender
+        Ok(InboundMessage::Select {
+            profile,
+            agent,
+            model,
+            subagent_models,
+        }) => action_sender
             .send(UiAction::Select {
                 selection: crate::config::resolve::Selection {
                     profile,
                     agent,
-                    ..Default::default()
+                    subagent_models,
                 },
-                model: None,
+                model,
             })
             .is_ok(),
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),

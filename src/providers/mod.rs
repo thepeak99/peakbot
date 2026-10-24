@@ -1174,7 +1174,9 @@ pub fn create_mock_agent(
     ))
 }
 
-/// Build a fresh sub-agent [`DynAgent`] for a delegation.
+/// Build a fresh sub-agent [`DynAgent`] for a delegation on `model` — the
+/// delegation's EFFECTIVE model (`SubAgentDeps::model_for`), which may differ
+/// from `sub.member.model` (an override, or an inherited orchestrator model).
 ///
 /// Shares [`add_builtin_tools`] with the main agent's build — a subagent
 /// gets the **same built-ins and the same MCP tools** from the profile's
@@ -1203,15 +1205,20 @@ pub fn create_mock_agent(
 pub(crate) fn build_sub_agent(
     tool_env: &ToolEnv,
     sub: &Subagent,
+    model: &ResolvedModel,
     preamble: &str,
     sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
-    context_budget: Option<usize>,
 ) -> Result<(DynAgent, Arc<SessionHook>)> {
-    let config = &sub.member.model.provider_config;
+    let config = &model.provider_config;
     let role = sub.member.name.as_str();
     let max_turns = tool_env.max_turns;
+    // Sized against THIS model, not the main agent's: subagents routinely
+    // run on smaller-context models.
+    let context_budget = state_manager
+        .compaction_threshold()
+        .map(|fraction| (fraction * model.context_size as f64) as usize);
     // Events-only lane-tagged hook. No compaction gate (fresh context) — the
     // sub-agent gate terminates instead of compacting. The pause gate is the
     // session's single one (owned by the StateManager): the hook's
