@@ -75,16 +75,18 @@ export function TabbedDrawer({
         />
       )}
       <aside
-        className="fixed right-0 top-14 bottom-14 z-40 flex items-start transition-transform duration-300 ease-out lg:bottom-0"
+        className="pointer-events-none fixed right-0 top-14 bottom-14 z-40 flex items-start transition-transform duration-300 ease-out lg:bottom-0"
         style={{
           ["--drawer-w" as string]: `min(${width}px, 94vw)`,
           transform: open ? "translateX(0)" : "translateX(var(--drawer-w))",
         }}
         aria-label="Side panels"
       >
-      {/* Handle rail — first flex child, so it sits left of the body and stays
-          flush to the viewport edge when the body is pushed off-screen. */}
-      <div role="tablist" className="flex flex-col gap-1.5 pt-1">
+      {/* The aside box is click-through: its closed body still spans the
+          viewport edge over the composer. Only the handle rail and body opt
+          back in. Handle rail — first flex child, so it sits left of the body
+          and stays flush to the viewport edge when the body is pushed off. */}
+      <div role="tablist" className="pointer-events-auto flex flex-col gap-1.5 pt-1">
         {tabs.map((t) => {
           const isActive = active === t.id;
           return (
@@ -121,7 +123,7 @@ export function TabbedDrawer({
       <div
         role="tabpanel"
         aria-hidden={!open}
-        className={`flex h-full flex-col gap-5 overflow-y-auto border-l border-zinc-800 bg-zinc-950/95 p-4 ${
+        className={`pointer-events-auto flex h-full flex-col gap-5 overflow-y-auto border-l border-zinc-800 bg-zinc-950/95 p-4 ${
           open ? "" : "invisible"
         }`}
         style={{ width: "var(--drawer-w)" }}

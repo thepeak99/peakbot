@@ -41,7 +41,7 @@ export function BottomBar({
   onLoadConversation: (id: string) => void;
 }) {
   return (
-    <footer className="flex min-h-14 items-center gap-2 border-t border-zinc-800 bg-zinc-950/80 px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] backdrop-blur lg:hidden">
+    <footer className="flex min-h-14 items-center gap-2 border-t border-zinc-800 bg-zinc-950/80 pl-3 pr-12 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] backdrop-blur lg:hidden">
       <ConversationsPicker
         conversations={conversations}
         error={conversationsError}
