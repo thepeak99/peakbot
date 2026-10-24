@@ -182,10 +182,6 @@ enum SubmitKind {
     /// not an LLM turn.
     Select(crate::selection::SelectSubmission),
     /// `/model <alias>` — switch the orchestrator model (new conversation).
-    /// RED STUB (T1): data only so the T6 classify tests compile;
-    /// `classify_submission` does not produce it and the event loop has no
-    /// arm for it yet. T6 removes the `#[allow]`.
-    #[allow(dead_code)]
     SwitchModel(String),
 }
 
@@ -206,6 +202,15 @@ fn classify_submission(msg: &str) -> SubmitKind {
     // `/profile` and `/agent` are per-conversation selections, not LLM turns.
     if let Some(sub) = crate::selection::classify_select(trimmed) {
         return SubmitKind::Select(sub);
+    }
+    // `/model <alias>` switches the model (web/stdio parity with the TUI,
+    // which intercepts it before sending). Bare `/model` and `/models` stay
+    // commands.
+    if let Some(rest) = trimmed.strip_prefix("/model")
+        && rest.starts_with(char::is_whitespace)
+        && !rest.trim().is_empty()
+    {
+        return SubmitKind::SwitchModel(rest.trim().to_string());
     }
     // Preserve whitespace on commands — leading whitespace in "/ quit"
     // should not be stripped before the command handler sees it.
@@ -1379,10 +1384,14 @@ impl AgentRunner {
                             }
                             // Do not enqueue — the model is never called.
                         }
-                        // RED STUB (T1): `classify_submission` never yields
-                        // this yet; T6 replaces the arm with the real one
-                        // (`increment_pending_input` + `QueueMessage::SwitchModel`).
-                        SubmitKind::SwitchModel(_) => {}
+                        SubmitKind::SwitchModel(alias) => {
+                            // Same as `UiAction::SwitchModel`: the agent loop
+                            // owns the agent handle and validates the alias.
+                            if let Some(ref sm) = state_manager {
+                                sm.increment_pending_input();
+                            }
+                            msg_tx.send(QueueMessage::SwitchModel(alias)).await.ok();
+                        }
                         SubmitKind::Select(sub) => {
                             // Forward to the agent loop: it owns the bound,
                             // the catalog, the pin and the agent handle (a
@@ -3461,9 +3470,10 @@ impl AgentRunner {
                 }
             }
             // `/model` — list available models (with the active one
-            // marked). Switching is intercepted in the View *before*
-            // this point: see `ReplUi::try_intercept_model_command`.
-            // This handler runs for the bare `/model` (no arg) case,
+            // marked). `/model <alias>` never reaches here: the TUI
+            // intercepts it in the View and `classify_submission` routes it
+            // to `SubmitKind::SwitchModel` for web/stdio. This handler runs
+            // for the bare `/model` (no arg) case,
             // which includes `/model` followed only by trailing
             // whitespace — the slash-command popup completes `/model`
             // to `/model ` (trailing space, since the command is
@@ -3496,21 +3506,6 @@ impl AgentRunner {
                 }
                 msg.push_str("\nUse /model <alias> to switch (starts a new conversation).");
                 sm.add_system_message(msg);
-            }
-            _ if cmd_lower.starts_with("/model ") => {
-                // The View should have intercepted this before it
-                // reached us (the TUI and the web UI both switch models
-                // through `UiAction::SwitchModel`). Reaching here means
-                // a frontend with no model switcher (stdio) — emit a
-                // helpful diagnostic instead of silent inertness.
-                if let Some(sm) = state_manager {
-                    sm.add_system_message(
-                        "❌ /model: switching models isn't supported in this \
-                         frontend — use the terminal UI (`peakbot --tui`) or \
-                         the web UI's model selector."
-                            .to_string(),
-                    );
-                }
             }
             _ if cmd_lower.trim_end() == "/cd" => {
                 // Bare /cd — print the session's working directory for
