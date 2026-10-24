@@ -625,10 +625,7 @@ mod tests {
             max_turns: 0,
         };
         SubAgentDeps {
-            bound: Bound {
-                profile: Arc::new(profile),
-                agent_index: 0,
-            },
+            bound: Bound::new(Arc::new(profile), 0),
             orchestrator_model: model.clone(),
             tool_env: Arc::new(tool_env),
             state_manager: sm,

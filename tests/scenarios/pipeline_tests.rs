@@ -185,10 +185,7 @@ fn delegate_tool_for_agent(cfg: &Config, agent_name: &str) -> DelegateTool {
         .iter()
         .position(|a| a.main.name == agent_name)
         .unwrap_or_else(|| panic!("agent '{agent_name}' in the fixture"));
-    let bound = peakbot::config::resolve::Bound {
-        profile: Arc::clone(profile),
-        agent_index,
-    };
+    let bound = peakbot::config::resolve::Bound::new(Arc::clone(profile), agent_index);
     let deps = SubAgentDeps {
         bound,
         orchestrator_model: cfg
@@ -341,10 +338,7 @@ async fn bound_without_subagents_yields_an_empty_delegate_role_enum() {
 
     // …and even built directly, it exposes an empty role enum.
     let profile = cfg.catalog.profile("dev").unwrap();
-    let bound = peakbot::config::resolve::Bound {
-        profile: Arc::clone(profile),
-        agent_index: 0,
-    };
+    let bound = peakbot::config::resolve::Bound::new(Arc::clone(profile), 0);
     let deps = SubAgentDeps {
         bound,
         orchestrator_model: cfg

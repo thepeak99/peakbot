@@ -611,10 +611,7 @@ fn model_switch_not_refused_for_subagent_agent() {
     );
 
     // A subagent-free agent is free too.
-    let solo = Bound {
-        profile: Arc::clone(&bound.profile),
-        agent_index: 1,
-    };
+    let solo = Bound::new(Arc::clone(&bound.profile), 1);
     assert!(
         solo.agent().subagents.is_empty(),
         "fixture sanity: solo has no subagents"

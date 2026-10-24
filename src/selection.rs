@@ -72,15 +72,15 @@ pub fn classify_select(line: &str) -> Option<SelectSubmission> {
 /// warning before agent warning). An unknown pin is a boot error
 /// (`Catalog::start_bound`) and never reaches here.
 ///
-/// RED (T1): the `registry` + `subagent_models` legs are the plan §5.1
-/// signature; T2 applies the saved overrides leniently (drop +
-/// `override_warning`) after the profile/agent resolution.
+/// The saved overrides apply leniently (drop + ⚠ per bad entry) only when
+/// the saved agent resolved EXACTLY — a fallback agent starts without
+/// them, its ⚠ already explaining the switch.
 pub fn resolve_saved_selection(
     cat: &Catalog,
-    _registry: &ModelRegistry,
+    registry: &ModelRegistry,
     profile: Option<&str>,
     agent: Option<&str>,
-    _subagent_models: &BTreeMap<String, String>,
+    subagent_models: &BTreeMap<String, String>,
     pin: Option<&str>,
 ) -> (Bound, Vec<String>) {
     let mut warnings = Vec::new();
@@ -105,47 +105,72 @@ pub fn resolve_saved_selection(
         },
     };
     let first_agent = profile.agents[0].main.name.clone();
-    let agent_index = match agent {
-        None => 0,
+    let (agent_index, agent_exact) = match agent {
+        None => (0, false),
         Some(name) => match profile.agents.iter().position(|a| a.main.name == name) {
-            Some(index) => index,
+            Some(index) => (index, true),
             None => {
                 warnings.push(format!(
                     "⚠ Agent '{name}' is not in profile '{}'; using '{first_agent}'.",
                     profile.name
                 ));
-                0
+                (0, false)
             }
         },
     };
-    (
-        Bound {
-            profile,
-            agent_index,
-        },
-        warnings,
-    )
+    let mut bound = Bound::new(Arc::clone(&profile), agent_index);
+    if agent_exact {
+        let (applied, rejected) = bound.with_subagent_models(registry, subagent_models);
+        for rej in rejected {
+            warnings.push(override_warning(&rej, applied.agent()));
+        }
+        bound = applied;
+    }
+    (bound, warnings)
 }
 
 /// The exact refusal line for a subagent override that a user frame asked
 /// for and the registry/roster refused (plan §5.2).
-///
-/// RED stub (T1): signature only — T2 lands the implementation.
 pub fn override_refusal(
     rej: &OverrideRejection,
     agent: &ResolvedAgent,
     registry: &ModelRegistry,
 ) -> String {
-    let _ = (rej, agent, registry);
-    todo!("T2: override_refusal")
+    match rej {
+        OverrideRejection::UnknownSubagent { subagent } => {
+            let roster = if agent.subagents.is_empty() {
+                "none".to_string()
+            } else {
+                agent
+                    .subagents
+                    .iter()
+                    .map(|s| s.member.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "agent '{}' has no subagent '{}'. Subagents: {roster}",
+                agent.main.name, subagent
+            )
+        }
+        OverrideRejection::UnknownAlias { subagent, alias } => format!(
+            "unknown alias `{alias}` for subagent '{subagent}'. Available: {}",
+            registry.aliases_sorted().join(", ")
+        ),
+    }
 }
 
 /// The exact ⚠ line for a saved override that a rebind dropped (plan §5.2).
-///
-/// RED stub (T1): signature only — T2 lands the implementation.
 pub fn override_warning(rej: &OverrideRejection, agent: &ResolvedAgent) -> String {
-    let _ = (rej, agent);
-    todo!("T2: override_warning")
+    match rej {
+        OverrideRejection::UnknownAlias { subagent, alias } => format!(
+            "⚠ Model '{alias}' for subagent '{subagent}' is no longer configured; using its default."
+        ),
+        OverrideRejection::UnknownSubagent { subagent } => format!(
+            "⚠ Subagent '{subagent}' is not in agent '{}'; its model override was dropped.",
+            agent.main.name
+        ),
+    }
 }
 
 /// One `/profile <name>` | `/agent <name>` decision (spec §6.6).
@@ -192,10 +217,7 @@ pub fn resolve_selection_choice(
                     available.join(", ")
                 ));
             };
-            SelectChoice::Apply(Bound {
-                profile,
-                agent_index: 0,
-            })
+            SelectChoice::Apply(Bound::new(profile, 0))
         }
         SelectSubmission::Agent(name) => {
             if has_turns {
@@ -218,10 +240,7 @@ pub fn resolve_selection_choice(
                     available.join(", ")
                 ));
             };
-            SelectChoice::Apply(Bound {
-                profile: Arc::clone(profile),
-                agent_index,
-            })
+            SelectChoice::Apply(Bound::new(Arc::clone(profile), agent_index))
         }
         // Bare forms are rendered by the handler, never "chosen".
         SelectSubmission::ListProfiles | SelectSubmission::ListAgents => {

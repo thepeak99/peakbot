@@ -94,10 +94,7 @@ pub struct Catalog {
 impl Catalog {
     /// The first agent of the first profile.
     pub fn default_bound(&self) -> Bound {
-        Bound {
-            profile: Arc::clone(&self.profiles[0]),
-            agent_index: 0,
-        }
+        Bound::new(Arc::clone(&self.profiles[0]), 0)
     }
 
     pub fn profile(&self, name: &str) -> Option<&Arc<ResolvedProfile>> {
@@ -113,10 +110,7 @@ impl Catalog {
     pub fn resolve(&self, profile: &str, agent: &str) -> Option<Bound> {
         let profile = self.profile(profile)?;
         let agent_index = profile.agents.iter().position(|a| a.main.name == agent)?;
-        Some(Bound {
-            profile: Arc::clone(profile),
-            agent_index,
-        })
+        Some(Bound::new(Arc::clone(profile), agent_index))
     }
 
     /// The session's starting `Bound`: the pinned profile's first agent
@@ -144,10 +138,7 @@ impl Catalog {
                 configured.join(", ")
             ));
         };
-        Ok(Bound {
-            profile,
-            agent_index: 0,
-        })
+        Ok(Bound::new(profile, 0))
     }
 
     /// The wire projection for Settings and AppState (§8.7), in catalog
@@ -288,11 +279,16 @@ pub struct Selection {
     pub subagent_models: BTreeMap<String, String>,
 }
 
-/// A conversation's `(profile, agent)`. I2: a session holds exactly one.
+/// A conversation's `(profile, agent)` plus its subagent model overrides.
+/// I2: a session holds exactly one.
+/// I9: every key of `subagent_models` names a subagent of `agent()`; only
+/// `with_subagent_models` writes the map (the field is private, so no
+/// struct literal outside this module can break I9).
 #[derive(Debug, Clone)]
 pub struct Bound {
     pub profile: Arc<ResolvedProfile>,
     pub agent_index: usize,
+    subagent_models: BTreeMap<String, ResolvedModel>,
 }
 
 /// Why a subagent model override could not apply (plan §5.1).
@@ -309,47 +305,87 @@ impl Bound {
         &self.profile.agents[self.agent_index]
     }
 
+    /// The wire projection, with the override map as aliases.
     pub fn selection(&self) -> Selection {
         Selection {
             profile: self.profile.name.clone(),
             agent: self.agent().main.name.clone(),
-            subagent_models: BTreeMap::new(),
+            subagent_models: self
+                .subagent_models
+                .iter()
+                .map(|(subagent, model)| (subagent.clone(), model.alias.clone()))
+                .collect(),
         }
     }
 
-    /// A `Bound` with NO overrides (plan §5.1).
-    ///
-    /// RED stub (T1): signature only — T2 lands the implementation.
+    /// A `Bound` with NO overrides: an agent pick is a fresh setup, so the
+    /// clearing is structural, not a rule (I12).
     pub fn new(profile: Arc<ResolvedProfile>, agent_index: usize) -> Bound {
-        let _ = (profile, agent_index);
-        todo!("T2: Bound::new")
+        Bound {
+            profile,
+            agent_index,
+            subagent_models: BTreeMap::new(),
+        }
     }
 
     /// REPLACES (never merges) the override map. Valid entries apply even
     /// when others are rejected; rejections come back in subagent-name
     /// order (plan §5.1).
-    ///
-    /// RED stub (T1): signature only — T2 lands the implementation.
     pub fn with_subagent_models(
         self,
         registry: &ModelRegistry,
         wanted: &BTreeMap<String, String>,
     ) -> (Bound, Vec<OverrideRejection>) {
-        let _ = (self, registry, wanted);
-        todo!("T2: Bound::with_subagent_models")
+        let mut subagent_models = BTreeMap::new();
+        let mut rejected = Vec::new();
+        for (subagent, alias) in wanted {
+            match self
+                .agent()
+                .subagents
+                .iter()
+                .find(|s| &s.member.name == subagent)
+            {
+                None => rejected.push(OverrideRejection::UnknownSubagent {
+                    subagent: subagent.clone(),
+                }),
+                Some(_) => match registry.resolve(alias) {
+                    None => rejected.push(OverrideRejection::UnknownAlias {
+                        subagent: subagent.clone(),
+                        alias: alias.clone(),
+                    }),
+                    Some(model) => {
+                        subagent_models.insert(subagent.clone(), model.clone());
+                    }
+                },
+            }
+        }
+        (
+            Bound {
+                subagent_models,
+                ..self
+            },
+            rejected,
+        )
     }
 
-    /// I10 — the effective subagent model. `sub` must be one of
-    /// `self.agent().subagents` (plan §5.1).
-    ///
-    /// RED stub (T1): signature only — T2 lands the implementation.
+    /// I10 — the effective subagent model, the ONE rule delegation uses:
+    /// override, else the orchestrator's effective model when the sub is
+    /// *inherited* (alias == the agent's, explicit-equal included, Z4),
+    /// else the sub's configured model. `sub` must be one of
+    /// `self.agent().subagents`.
     pub fn subagent_model<'a>(
         &'a self,
         sub: &'a Subagent,
         orchestrator: &'a ResolvedModel,
     ) -> &'a ResolvedModel {
-        let _ = (self, sub, orchestrator);
-        todo!("T2: Bound::subagent_model (I10)")
+        if let Some(model) = self.subagent_models.get(&sub.member.name) {
+            return model;
+        }
+        if sub.member.model.alias == self.agent().main.model.alias {
+            orchestrator
+        } else {
+            &sub.member.model
+        }
     }
 }
 
@@ -1611,11 +1647,9 @@ default_model: patchnotes/anthropic/claude-sonnet-4.5
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RED tests (selection-models plan §9.1, items 1–9): per-member subagent model
-// overrides live INSIDE `Bound` (I9, private map + validating constructor) and
-// the effective-model rule is the one place that decides what a delegation
-// runs on (I10). Written against the §5.1 signatures; `Bound::new`,
-// `with_subagent_models` and `subagent_model` are `todo!()` stubs until T2.
+// Per-member subagent model overrides live INSIDE `Bound` (I9, private map +
+// validating constructor) and the effective-model rule is the one place that
+// decides what a delegation runs on (I10).
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod subagent_model_tests {
