@@ -1464,6 +1464,15 @@ impl StateManager {
         self.notify_update(&state);
     }
 
+    /// Stamp whether this session runs under a boot `--profile` pin. The
+    /// pin is fixed for the process lifetime, so session build is the only
+    /// caller; the wire derives `settings_available = !profile_pinned`.
+    pub fn set_profile_pinned(&self, pinned: bool) {
+        let mut state = self.state.write().unwrap();
+        state.profile_pinned = pinned;
+        self.notify_update(&state);
+    }
+
     /// Re-stamp the current conversation's wire identity `(provider_name,
     /// model)`. Used when a pipeline selection swaps the orchestrator's model
     /// in place: the conversation keeps its id (sticky `?convo=`) but its

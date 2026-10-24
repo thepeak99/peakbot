@@ -160,6 +160,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     );
     ctx.bound = bound;
     messages.extend(warnings);
+    state_manager.set_profile_pinned(deps.profile_pin.is_some());
     state_manager.set_selection(ctx.bound.selection());
     state_manager.set_visible_tabs(
         ctx.bound
@@ -475,5 +476,21 @@ mod tests {
             std::env::current_dir().unwrap(),
             "missing saved cwd must fall back to the boot cwd"
         );
+    }
+
+    /// A boot `--profile` pin reaches the wire: `profile_pinned` is set and
+    /// so `settings_available` is false (spec §8.7). Without a pin both flip.
+    #[tokio::test]
+    async fn create_session_stamps_profile_pin() {
+        let mut deps = test_deps(Some(Arc::new(InMemoryStorage::default())));
+        deps.profile_pin = Some("dev".to_string());
+        let session = create_session(&deps, None).expect("create_session");
+        let wire = serde_json::to_value(session.state_manager.get_state()).unwrap();
+        assert_eq!(wire["profile_pinned"], true);
+        assert_eq!(wire["settings_available"], false);
+
+        let unpinned = test_deps(Some(Arc::new(InMemoryStorage::default())));
+        let session = create_session(&unpinned, None).expect("create_session");
+        assert!(!session.state_manager.get_state().profile_pinned);
     }
 }
