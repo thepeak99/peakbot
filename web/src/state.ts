@@ -250,6 +250,9 @@ export interface WireProfileInfo {
 export interface WireSelection {
   profile: string;
   agent: string;
+  /** Subagent → model alias, overridden subagents only. Omitted from JSON
+   * when empty (Rust `skip_serializing_if`); absent reads as "none". */
+  subagent_models?: Record<string, string>;
 }
 
 // ── Protocol envelopes (src/ui/wire.rs) ───────────────────────────────
@@ -330,8 +333,16 @@ export type InboundMessage =
   /** Bind this conversation to a (profile, agent) pair — the single
    * selection frame that replaces `select_pipeline` / `select_profile`
    * (0.24 cutover, src/ui/wire.rs `Select`). The backend enforces the
-   * pre-first-turn lock. */
-  | { type: "select"; profile: string; agent: string }
+   * pre-first-turn lock. `model` (orchestrator alias) and
+   * `subagent_models` (subagent → alias) are the full desired team setup;
+   * both are omitted when unset. */
+  | {
+      type: "select";
+      profile: string;
+      agent: string;
+      model?: string;
+      subagent_models?: Record<string, string>;
+    }
   | { type: "list_dir"; path: string }
   | { type: "request_recent_dirs" }
   | { type: "request_conversations" }
@@ -340,7 +351,25 @@ export type InboundMessage =
 
 /** Build a `select` inbound frame — the single selection frame (0.24
  * cutover, src/ui/wire.rs `Select`). Exists as a named export so the call
- * site is unit testable without mounting the socket. */
-export function select(profile: string, agent: string): InboundMessage {
-  return { type: "select", profile, agent };
+ * site is unit testable without mounting the socket. Emits `model` only
+ * when given and `subagent_models` only when non-empty, so
+ * `select("dev", "team")` is exactly `{type:"select",profile:"dev",agent:"team"}`.
+ * The map is copied, never aliased from the caller. */
+export function select(
+  profile: string,
+  agent: string,
+  models: { model?: string; subagentModels?: Record<string, string> } = {},
+): InboundMessage {
+  const frame: {
+    type: "select";
+    profile: string;
+    agent: string;
+    model?: string;
+    subagent_models?: Record<string, string>;
+  } = { type: "select", profile, agent };
+  if (models.model) frame.model = models.model;
+  if (models.subagentModels && Object.keys(models.subagentModels).length > 0) {
+    frame.subagent_models = { ...models.subagentModels };
+  }
+  return frame;
 }

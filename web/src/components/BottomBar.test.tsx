@@ -40,7 +40,7 @@ const CATALOG: CatalogProfile[] = [
     agents: [{ name: "main", model: "sonnet", subagents: [] }],
   },
 ];
-const SELECTION: Selection = { profile: "dev", agent: "main" };
+const SELECTION: Selection = { profile: "dev", agent: "main", subagentModels: {} };
 const MODELS: ModelInfo[] = [
   { alias: "sonnet", provider_name: "openrouter", model_name: "anthropic/claude-sonnet-4.5", context_size: 200000 },
 ];

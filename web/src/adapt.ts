@@ -184,10 +184,16 @@ export function adaptCatalog(s: AppState): CatalogProfile[] {
 }
 
 /** The (profile, agent) this conversation is bound to, or null when the wire
- * field is absent (old snapshot) — one shape for callers, like adaptSubAgent. */
+ * field is absent (old snapshot) — one shape for callers, like adaptSubAgent.
+ * `subagent_models` normalises absent to `{}` and copies a present map, so
+ * view code never sees undefined overrides. */
 export function adaptSelection(s: AppState): Selection | null {
   return s.selection
-    ? { profile: s.selection.profile, agent: s.selection.agent }
+    ? {
+        profile: s.selection.profile,
+        agent: s.selection.agent,
+        subagentModels: { ...s.selection.subagent_models },
+      }
     : null;
 }
 
