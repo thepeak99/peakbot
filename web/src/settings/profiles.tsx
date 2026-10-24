@@ -11,10 +11,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useSettingsCtx } from "./context";
 import { get, type Doc } from "./yamlDoc";
-import { parseFilter, serializeFilter } from "./filter";
+import { parseFilter, serializeFilter, type FilterState } from "./filter";
 import { duplicateInsertIndex, duplicateName, makeDefault } from "./profileOps";
 import { useToast } from "./Toast";
-import { Badge } from "./widgets";
+import { Badge, Field, FilterBlock, KvRows, SecretInput, Toggle, type KvRow } from "./widgets";
 import type { Seg } from "./types";
 
 // ── shared derivations ───────────────────────────────────────────────────
@@ -106,6 +106,67 @@ function insertAfter(
   });
   if (index > names.length) out[newName] = def;
   return out;
+}
+
+/** The declared `mcps` names in the draft (the MCP access card universe). */
+function mcpNamesOfDoc(doc: Doc): string[] {
+  const raw = get(doc, ["mcps"]);
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const e of raw) {
+    const n = asRecord(e).name;
+    if (typeof n === "string" && n !== "") out.push(n);
+  }
+  return out;
+}
+
+/** A map value (env) → editable key/value rows. */
+function toRows(v: unknown): KvRow[] {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return [];
+  return Object.entries(v as Record<string, unknown>).map(([k, val]) => ({
+    key: k,
+    value: typeof val === "string" ? val : String(val),
+  }));
+}
+
+/** Rows → a string map to write (blank keys dropped; no rows left = `undefined`). */
+function toMap(rows: KvRow[]): Record<string, string> | undefined {
+  const kept = rows.filter((r) => r.key.trim() !== "");
+  if (kept.length === 0) return undefined;
+  const out: Record<string, string> = {};
+  for (const r of kept) out[r.key] = r.value;
+  return out;
+}
+
+// ── filter-state seam for the Tools / MCP access cards ───────────────────
+// The shell mutates the draft IN PLACE on every edit (same Doc identity), so
+// the FilterBlock value is the pane's own state: it is (re-)adopted from the
+// doc only when the doc identity changes (discard / raw reparse / scope
+// switch) or the profile changes (rename / nav). Between edits the doc alone
+// cannot say which tri-state the user chose — e.g. {disabled, []} and "all"
+// both omit the key — so the pane keeps the state FilterBlock last emitted
+// (`emit` records it, then writes the serialized value to the draft).
+function useFilterValue(
+  doc: Doc,
+  profile: string,
+  path: Seg[],
+  onEmit: (s: FilterState) => void,
+): { value: FilterState; emit: (s: FilterState) => void } {
+  const parsed = parseFilter(get(doc, path));
+  const ref = useRef<{ doc: Doc; profile: string; value: FilterState } | null>(null);
+  if (
+    ref.current === null ||
+    ref.current.doc !== doc ||
+    ref.current.profile !== profile
+  ) {
+    ref.current = { doc, profile, value: parsed };
+  }
+  const value = ref.current.value;
+  const emit = (s: FilterState) => {
+    ref.current = { doc: ref.current!.doc, profile, value: s };
+    onEmit(s);
+  };
+  return { value, emit };
 }
 
 const GHOST_BTN =
@@ -247,6 +308,11 @@ export interface ProfilePageProps {
   onOpenAgent?(profile: string, agent: string): void;
   /** Profile names of the OTHER scope's draft: the shadow/override badges. */
   otherScopeNames?: string[];
+  /** Universe for the MCP access card, supplied by the shell from the GLOBAL
+   *  draft (contract T27b): in repo scope the repo draft has no `mcps`, so
+   *  the chips must come from the global names. When omitted the pane falls
+   *  back to the names of get(doc, ["mcps"]). */
+  globalMcpNames?: string[];
 }
 
 export function ProfilePage({
@@ -256,6 +322,7 @@ export function ProfilePage({
   onOpenProfile,
   onOpenAgent,
   otherScopeNames,
+  globalMcpNames,
 }: ProfilePageProps) {
   const { scope, meta, doc, edit } = useSettingsCtx();
   const { toast } = useToast();
@@ -318,6 +385,56 @@ export function ProfilePage({
     const firstAlias = firstAliasOf(doc);
     edit(["profiles", profile, "agents"], { ...agents, [name]: { model: firstAlias ?? "" } });
   }
+
+  // ── Tools / MCP access cards (NameFilters over the draft) ──────────────
+  const toolsPath: Seg[] = ["profiles", profile, "tools"];
+  const mcpsPath: Seg[] = ["profiles", profile, "mcps"];
+  const tools = useFilterValue(doc, profile, toolsPath, (s) => edit(toolsPath, serializeFilter(s)));
+  const mcps = useFilterValue(doc, profile, mcpsPath, (s) => edit(mcpsPath, serializeFilter(s)));
+  // Repo scope: the repo draft has no `mcps` — the shell supplies the
+  // universe from the global draft (contract T27b); global scope falls back
+  // to the draft's own declared names.
+  const mcpUniverse = globalMcpNames ?? mcpNamesOfDoc(doc);
+  const allowPost = asRecord(get(doc, ["profiles", profile, "fetch_url"])).allow_post === true;
+
+  // ── Environment card (string map; the rows are pane state so a just-added
+  // blank row survives the doc round trip — the doc drops blank keys) ─────
+  const envPath: Seg[] = ["profiles", profile, "env"];
+  const envRowsFromDoc = (d: Doc) => toRows(get(d, envPath));
+  const [envRows, setEnvRows] = useState<KvRow[]>(() => envRowsFromDoc(doc));
+  const lastEnvDoc = useRef(doc);
+  useEffect(() => {
+    if (lastEnvDoc.current !== doc) {
+      lastEnvDoc.current = doc;
+      setEnvRows(envRowsFromDoc(doc));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- adopt on doc identity only
+  }, [doc]);
+
+  // ── Memory card (absent block reads as enabled=true) ───────────────────
+  const memory = asRecord(get(doc, ["profiles", profile, "memory"]));
+  const memoryEnabled = memory.enabled !== false;
+  const memoryThreshold =
+    typeof memory.threshold_bytes === "number" ? memory.threshold_bytes : undefined;
+
+  // ── Knowledge card (vector_db; presence = on) ──────────────────────────
+  const vdbPath: Seg[] = ["profiles", profile, "vector_db"];
+  const vdb = asRecord(get(doc, vdbPath));
+  const vdbOn = get(doc, vdbPath) !== undefined;
+  const vdbEmb = asRecord(vdb.embeddings);
+  const vdbDbPath = typeof vdb.db_path === "string" && vdb.db_path !== "" ? vdb.db_path : undefined;
+  const vdbBaseUrl =
+    typeof vdbEmb.base_url === "string" && vdbEmb.base_url !== "" ? vdbEmb.base_url : undefined;
+  const vdbApiKey =
+    typeof vdbEmb.api_key === "string" && vdbEmb.api_key !== "" ? vdbEmb.api_key : undefined;
+  const vdbModel =
+    typeof vdbEmb.model === "string" && vdbEmb.model !== "" ? vdbEmb.model : undefined;
+  const vdbDimensions =
+    typeof vdbEmb.dimensions === "number" ? vdbEmb.dimensions : undefined;
+  const vdbDbHint =
+    scope === "repo"
+      ? "Relative paths resolve against this repo."
+      : "Relative paths resolve against each session's working directory.";
 
   // ── Interface card (ui.tabs — checked = visible) ───────────────────────
   const tabNames: string[] = meta?.tab_names ?? [];
@@ -475,6 +592,166 @@ export function ProfilePage({
         >
           + Add agent
         </button>
+      </div>
+
+      {/* Tools card (NameFilter over meta.builtin_tools — never hard-coded) */}
+      <div data-testid="profile-tools-card" className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+        <div className="mb-2 flex items-baseline justify-between gap-2">
+          <h3 className="text-sm font-semibold">Tools</h3>
+          <span className="text-[10px] text-zinc-500">built-in tools</span>
+        </div>
+        <FilterBlock
+          testid="profile-tools"
+          label="Built-in tools"
+          universe={meta?.builtin_tools ?? []}
+          value={tools.value}
+          onChange={tools.emit}
+          emptyHint="No built-in tools — the agent can only talk (and use MCP tools)."
+        />
+        <span
+          data-testid="profile-tools-footnote"
+          className="mt-2 block text-[10px] text-zinc-500"
+        >
+          delegate is on automatically when the agent has subagents — it is not in this list.
+        </span>
+        <div className="mt-3">
+          <Toggle
+            testid="profile-tools-allowpost"
+            label="Let fetch_url send POST requests"
+            checked={allowPost}
+            onChange={(c) => edit(["profiles", profile, "fetch_url", "allow_post"], c)}
+            hint="Not a security boundary while bash is enabled."
+          />
+        </div>
+      </div>
+
+      {/* MCP access card (NameFilter over the global mcps names) */}
+      <div data-testid="profile-mcps-card" className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+        <div className="mb-2 flex items-baseline justify-between gap-2">
+          <h3 className="text-sm font-semibold">MCP access</h3>
+          <span className="text-[10px] text-zinc-500">over the global mcps servers</span>
+        </div>
+        {mcpUniverse.length === 0 ? (
+          <div data-testid="profile-mcps">
+            <span data-testid="profile-mcps-empty" className="text-xs text-zinc-500">
+              No MCP servers declared globally.
+            </span>
+          </div>
+        ) : (
+          <FilterBlock
+            testid="profile-mcps"
+            label="MCP servers"
+            universe={mcpUniverse}
+            value={mcps.value}
+            onChange={mcps.emit}
+            emptyHint="only [] — no MCP tools at all"
+          />
+        )}
+      </div>
+
+      {/* Environment card (base bash env; NOT MCP-launched tools) */}
+      <div data-testid="profile-env-card" className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+        <div className="mb-2 flex items-baseline justify-between gap-2">
+          <h3 className="text-sm font-semibold">Environment</h3>
+          <span className="text-[10px] text-zinc-500">base bash env</span>
+        </div>
+        <p className="mb-2 text-[11px] text-zinc-500">
+          Base bash env, exported to bash for the agent and its subagents. MCP servers get their
+          own env from mcps[].env.
+        </p>
+        <KvRows
+          testid="profile-env"
+          label="env (KEY=value)"
+          rows={envRows}
+          onChange={(rows) => {
+            setEnvRows(rows);
+            edit(envPath, toMap(rows));
+          }}
+        />
+      </div>
+
+      {/* Memory card */}
+      <div data-testid="profile-memory-card" className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+        <div className="mb-2 flex items-baseline justify-between gap-2">
+          <h3 className="text-sm font-semibold">Memory</h3>
+        </div>
+        <div className="space-y-3">
+          <Toggle
+            testid="profile-memory-enabled"
+            label="Memory"
+            checked={memoryEnabled}
+            onChange={(c) => edit(["profiles", profile, "memory", "enabled"], c)}
+            hint="Injects memory.md and auto-compacts an oversized one."
+          />
+          <Field
+            testid="profile-memory-threshold"
+            label="threshold_bytes"
+            type="number"
+            value={memoryThreshold}
+            onChange={(v) => edit(["profiles", profile, "memory", "threshold_bytes"], v)}
+            hint="bytes — empty = default"
+          />
+        </div>
+      </div>
+
+      {/* Knowledge card (vector_db; presence = on) */}
+      <div data-testid="profile-vdb-card" className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+        <div className="mb-2 flex items-baseline justify-between gap-2">
+          <h3 className="text-sm font-semibold">Knowledge</h3>
+          <Badge tone="green">reload-safe</Badge>
+        </div>
+        <Toggle
+          testid="profile-vdb-toggle"
+          label="Enable Knowledge (vector_db)"
+          checked={vdbOn}
+          onChange={(c) =>
+            edit(vdbPath, c ? { embeddings: {} } : undefined)
+          }
+          hint="Absent = off: the doc_index / doc_search tools are skipped for this profile."
+        />
+        {vdbOn && (
+          <div className="mt-3 space-y-3">
+            <Field
+              testid="profile-vdb-dbpath"
+              label="db_path"
+              value={vdbDbPath}
+              onChange={(v) => edit([...vdbPath, "db_path"], v)}
+              hint={vdbDbHint}
+            />
+            <Field
+              testid="profile-vdb-baseurl"
+              label="embeddings.base_url"
+              value={vdbBaseUrl}
+              onChange={(v) => edit([...vdbPath, "embeddings", "base_url"], v)}
+            />
+            <SecretInput
+              testid="profile-vdb-apikey"
+              label="embeddings.api_key"
+              value={vdbApiKey}
+              onChange={(v) => edit([...vdbPath, "embeddings", "api_key"], v)}
+              hint="Optional for local servers."
+            />
+            <Field
+              testid="profile-vdb-model"
+              label="embeddings.model"
+              value={vdbModel}
+              onChange={(v) => edit([...vdbPath, "embeddings", "model"], v)}
+              hint="e.g. bge-m3, text-embedding-3-small, nomic-embed-text"
+            />
+            <Field
+              testid="profile-vdb-dimensions"
+              label="embeddings.dimensions"
+              type="number"
+              value={vdbDimensions}
+              onChange={(v) => edit([...vdbPath, "embeddings", "dimensions"], v)}
+              hint="dims"
+            />
+            <p className="text-[10px] text-amber-400/80">
+              Must match the model and any existing DB at db_path — a mismatch fails when the
+              conversation starts.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Interface card (ui.tabs) */}

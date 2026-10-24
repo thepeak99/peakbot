@@ -104,9 +104,10 @@ export interface ToggleProps {
   onChange(checked: boolean): void;
   hint?: string;
   invalid?: string;
+  disabled?: boolean;
 }
 
-export function Toggle({ testid, label, checked, onChange, hint, invalid }: ToggleProps) {
+export function Toggle({ testid, label, checked, onChange, hint, invalid, disabled }: ToggleProps) {
   return (
     <div data-testid={testid} className="flex min-w-0 items-start justify-between gap-3">
       <span className="min-w-0">
@@ -119,7 +120,8 @@ export function Toggle({ testid, label, checked, onChange, hint, invalid }: Togg
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
-        className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-emerald-600"
+        disabled={disabled}
+        className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-emerald-600 disabled:cursor-default disabled:opacity-60"
       />
     </div>
   );
@@ -403,9 +405,21 @@ export interface SecretInputProps {
   onChange(value: string | undefined): void; // undefined = key removed
   hint?: string;
   invalid?: string;
+  disabled?: boolean;
+  /** Shown in the REVEALED input only (never in the masked DOM text). */
+  placeholder?: string;
 }
 
-export function SecretInput({ testid, label, value, onChange, hint, invalid }: SecretInputProps) {
+export function SecretInput({
+  testid,
+  label,
+  value,
+  onChange,
+  hint,
+  invalid,
+  disabled,
+  placeholder,
+}: SecretInputProps) {
   const [revealed, setRevealed] = useState(false);
   return (
     <div data-testid={testid} className="min-w-0">
@@ -416,7 +430,9 @@ export function SecretInput({ testid, label, value, onChange, hint, invalid }: S
             data-testid="value"
             type="text"
             value={value ?? ""}
+            placeholder={placeholder}
             onChange={(e) => onChange(e.target.value === "" ? undefined : e.target.value)}
+            disabled={disabled}
             className={INPUT_CLS + " flex-1 font-mono"}
           />
         ) : (
@@ -429,6 +445,7 @@ export function SecretInput({ testid, label, value, onChange, hint, invalid }: S
           data-testid="reveal"
           type="button"
           onClick={() => setRevealed((r) => !r)}
+          disabled={disabled}
           className={GHOST_BTN_CLS}
         >
           {revealed ? "Hide" : "Reveal"}

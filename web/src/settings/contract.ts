@@ -495,3 +495,112 @@ export interface BadgeProps {
 //   (textarea), `agent-sub-remove-<i>`.
 //   `agent-sub-add` — + Add subagent.
 // No persona field on subagents (spec §9.4).
+
+// ── ./profiles — remaining cards (T27b) ────────────────────────────────
+// Extra card testids INSIDE <ProfilePage/> (spec §9.3). Every write is by
+// segment array under ["profiles", <profile>, …]; the pane re-reads the
+// draft doc after each edit (the shell mutates it in place). Additional
+// optional prop:
+//   globalMcpNames?: string[]   — the universe for the MCP access card when
+//     the page is shown in REPO scope (the repo draft has no `mcps`); when
+//     omitted the universe = names of get(doc, ["mcps"]).
+//
+// Tools card
+//   `profile-tools`            — the FilterBlock container (inner `mode-all`
+//                                 / `mode-only` / `mode-disabled`,
+//                                 `chip-<name>`). Universe = meta.builtin_tools
+//                                 verbatim (NEVER hard-coded, no `delegate`).
+//                                 Writes serializeFilter(state) to
+//                                 …<p>.tools (undefined = key omitted).
+//   `profile-tools-footnote`   — text contains "delegate is on automatically".
+//   `profile-tools-allowpost`  — Toggle (inner `input`) → …<p>.fetch_url
+//                                 .allow_post (bool; absent reads false).
+// MCP access card
+//   `profile-mcps`             — FilterBlock container (same inner testids),
+//                                 universe = declared `mcps` names, writes
+//                                 …<p>.mcps.
+//   `profile-mcps-empty`       — shown INSTEAD of the chips when the universe
+//                                 is empty: "No MCP servers declared globally."
+// Environment card
+//   `profile-env`              — KvRows (inner `add`, `row-<i>-key`,
+//                                 `row-<i>-value`, `row-<i>-remove`) →
+//                                 …<p>.env as a string map. Rows with a blank
+//                                 key are dropped; no rows left = the `env`
+//                                 key is REMOVED (undefined, not `{}`).
+// Memory card
+//   `profile-memory-enabled`   — Toggle → …<p>.memory.enabled (bool). An
+//                                 absent memory block reads as enabled=true.
+//   `profile-memory-threshold` — number Field → …<p>.memory.threshold_bytes
+//                                 (a NUMBER; empty = key removed).
+// Knowledge card (vector_db; presence = on)
+//   `profile-vdb-toggle`       — Toggle; checked = vector_db block present.
+//                                 On  → edit(…<p>.vector_db, <plain object
+//                                 holding an `embeddings` object>); Off →
+//                                 edit(…<p>.vector_db, undefined) (whole block
+//                                 removed).
+//   Only while ON (absent from the DOM otherwise):
+//   `profile-vdb-dbpath` (hint: global scope contains "working directory",
+//   repo scope contains "this repo"), `profile-vdb-baseurl`,
+//   `profile-vdb-apikey` (SecretInput — secret text not in the DOM),
+//   `profile-vdb-model`, `profile-vdb-dimensions` (number) →
+//   …<p>.vector_db.db_path / .embeddings.base_url / .embeddings.api_key /
+//   .embeddings.model / .embeddings.dimensions.
+
+// ── ./general (T29) ────────────────────────────────────────────────────
+// Pure helpers (module ./general):
+//   type AccessMode = "local" | "lan"
+//   accessModeOf(bind: string | undefined): AccessMode
+//     loopback host (127.x.x.x, localhost, [::1]) or absent → "local";
+//     anything else (0.0.0.0, [::], 192.168.x.x …) → "lan".
+//   bindForAccess(bind: string | undefined, mode: AccessMode): string
+//     "local" → `127.0.0.1:<port>`, "lan" → `0.0.0.0:<port>`, KEEPING the
+//     port of `bind`; absent / unparseable bind → port 7823.
+//   generateToken(): string
+//     32 lowercase hex chars from 16 bytes of crypto.getRandomValues.
+//   launchCommand(o: { bind: string; tls: boolean; hasToken: boolean }): string
+//     "peakbot --bind <bind>" + (" --tls" if tls) + (" --token ••••" if token).
+//
+// <GeneralPane/> (module ./general, file general.tsx) — D6 (spec §9.7).
+// Reads the draft via useSettingsCtx(); writes by segment array under
+// ["general", …] (flat: retry / timeouts / http / uploads — NEVER
+// general.network). Numbers are written as numbers; empty = key removed.
+// Repo scope: read-only (`general-readonly` banner, every control disabled,
+// no edits).
+// data-testids:
+//   `general-pane`; `general-readonly` (repo scope only)
+//   Web server: `general-access-local` / `general-access-lan` (radio
+//     INPUTS; checked derived from web.bind via accessModeOf; clicking
+//     writes web.bind = bindForAccess(bind, mode)), `general-bind` (Field →
+//     web.bind), `general-token` (SecretInput → web.token),
+//     `general-token-generate` (button → web.token = generateToken()),
+//     `general-token-copy` (button → navigator.clipboard.writeText(token)),
+//     `general-token-note` (ONLY when meta.boot.token_source is env|cli;
+//     text "Currently overridden by PEAKBOT_WEB_TOKEN." / "… by --token."),
+//     `general-tls` (Toggle → web.tls bool), `general-ttl`
+//     (web.session_ttl_secs), `general-reaper` (web.reaper_tick_secs),
+//     `general-launch` (textContent = launchCommand(…)).
+//   Restart badges: `general-badge-restart-web|http|uploads|conversation`
+//     (and none on Search / Context).
+//   Search: `general-search-toggle` (Toggle; checked = block present; on →
+//     edit(["general","search"], <plain object>), off → edit(…, undefined)),
+//     and only while on: `general-search-baseurl`, `general-search-bearer`
+//     (SecretInput), `general-search-timeout`, `general-search-maxresults`
+//     → search.base_url / bearer_token / timeout_seconds / max_results.
+//   Context: `general-context-enabled`, `general-context-threshold`,
+//     `general-context-keep`, `general-context-model` (select; first option
+//     value "" = omit) → context.enabled / threshold / keep_recent /
+//     compaction_model.
+//   Conversations: `general-conv-autosave`, `general-conv-dir` →
+//     conversation.auto_save / storage_dir.
+//   Network: `general-retry-max` (max_retries), `general-retry-initial`
+//     (initial_delay_ms), `general-retry-maxdelay` (max_delay_ms),
+//     `general-retry-backoff` (backoff_factor) → general.retry.*;
+//     `general-timeout-tool`, `general-timeout-delegate` →
+//     general.timeouts.tool_secs / delegate_secs; `general-http-connect`,
+//     `general-http-read` → general.http.connect_timeout_secs /
+//     read_timeout_secs.
+//   Uploads: `general-uploads-maxfile`, `general-uploads-maxfiles` →
+//     general.uploads.max_file_mb / max_files.
+//   `general-max-turns` → general.agent_max_turns; `general-cost-tracking`
+//     (Toggle → general.cost_tracking; absent reads true).
+// Only the ones named in general.test.tsx are pinned by a test.

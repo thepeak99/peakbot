@@ -7,11 +7,11 @@
 //   defaultPrevented Esc is left to the modal/popover).
 //
 // The section CONTENT panes land across M5 tasks: Providers & Models
-// (T25, ./providers), MCP servers (T26, ./mcp) and the Profiles
-// master-detail (T27, ./profiles + T28 ./agent: list → profile page →
-// agent page with breadcrumbs) are real; the remaining sections render a
-// neutral empty state so the shell stays navigable. The shell wires the
-// full save flow: debounced validate → PUT with base_sha256 → 409 stale
+// (T25, ./providers), MCP servers (T26, ./mcp), the Profiles master-detail
+// (T27/T27b, ./profiles + T28 ./agent: list → profile page → agent page with
+// breadcrumbs) and General (T29, ./general) are real; the remaining sections
+// render a neutral empty state so the shell stays navigable. The shell wires
+// the full save flow: debounced validate → PUT with base_sha256 → 409 stale
 // banner / 422 error panel / 200 toast + restart banner.
 
 import { useCallback, useEffect, useReducer, useState } from "react";
@@ -29,6 +29,7 @@ import { ProvidersPane } from "./providers";
 import { McpsPane } from "./mcp";
 import { ProfilesPane, ProfilePage } from "./profiles";
 import { AgentPage } from "./agent";
+import { GeneralPane } from "./general";
 import { copyToRepoName } from "./profileOps";
 import { Crumbs } from "./widgets";
 import { ToastProvider, useToast } from "./Toast";
@@ -346,6 +347,23 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
     return Object.keys(m);
   }
   const otherScopeNames = profileNamesOf(scope === "global" ? "repo" : "global");
+  // Declared `mcps` names of a scope's draft — the profile page's MCP access
+  // card universe (contract T27b): in repo scope the repo draft has no
+  // `mcps`, so the shell supplies the GLOBAL draft's names.
+  function mcpNamesOf(s: Scope): string[] {
+    const prev = store.current;
+    store.setScope(s);
+    const raw = get(store.state().draftDoc, ["mcps"]);
+    store.setScope(prev);
+    const list = Array.isArray(raw) ? raw : [];
+    const out: string[] = [];
+    for (const e of list) {
+      const n = e !== null && typeof e === "object" ? (e as Record<string, unknown>).name : undefined;
+      if (typeof n === "string" && n !== "") out.push(n);
+    }
+    return out;
+  }
+  const globalMcpNames = mcpNamesOf("global");
   const crumbItems =
     openProfile !== null && openAgent !== null
       ? ["Profiles", openProfile, openAgent]
@@ -606,10 +624,10 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
             )}
           </div>
 
-          {/* Section panes. Providers (T25), MCP servers (T26) and the
-              Profiles master-detail (T27/T28) are the real content; the
-              remaining sections keep a neutral empty state until their M5
-              tasks land. */}
+          {/* Section panes. Providers (T25), MCP servers (T26), the Profiles
+              master-detail (T27/T27b/T28) and General (T29) are the real
+              content; the remaining sections keep a neutral empty state
+              until their M5 tasks land. */}
           {active === "providers" ? (
             <ProvidersPane />
           ) : active === "mcps" ? (
@@ -622,6 +640,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
                 profile={openProfile}
                 activeProfile={activeProfile}
                 otherScopeNames={otherScopeNames}
+                globalMcpNames={globalMcpNames}
                 onCopyToRepo={copyProfileToRepo}
                 onOpenProfile={(n) => setProfileSel({ profile: n, agent: null })}
                 onOpenAgent={(p, a) => setProfileSel({ profile: p, agent: a })}
@@ -632,6 +651,8 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
                 onOpenProfile={(n) => setProfileSel({ profile: n, agent: null })}
               />
             )
+          ) : active === "general" ? (
+            <GeneralPane />
           ) : (
             <>
               <p className="max-w-2xl text-xs text-zinc-500">{SECTIONS[active].desc}</p>
