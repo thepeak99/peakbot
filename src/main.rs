@@ -496,15 +496,29 @@ async fn main() -> Result<()> {
 
     // Step 0 (spec §6.9), every mode, before anything reads the config:
     // migrate a pre-0.24 global (and, unpinned, the boot cwd's repo file).
-    let boot_notices = match auto_migrate(
+    // Only a windowed web session may boot into needs_setup on a failed
+    // GLOBAL migration (spec §6.9); every other mode exits.
+    let windowed_web = mode == Mode::Web && peakbot::ui::web::windowed_session();
+    let (boot_notices, migrate_error) = match auto_migrate(
         &config_dir,
         cli.profile.is_none().then_some(boot_cwd.as_path()),
     ) {
-        Ok(outcome) => outcome.notices(),
+        Ok(outcome) => (outcome.notices(), None),
+        Err(e) if windowed_web && e.file == ConfigFileKind::Global => {
+            eprintln!("{e}");
+            (Vec::new(), Some(e.to_string()))
+        }
         Err(e) => exit_with(&[e.to_string(), CANNOT_START_WITH_FILE.to_string()]),
     };
     for notice in &boot_notices {
         eprintln!("{notice}");
+    }
+
+    // A failed global migration in a windowed web session: there is no
+    // Config to load — boot the needs_setup server (spec §6.9) and let the
+    // SPA show the reason (there is no migrate endpoint).
+    if let Some(migrate_error) = migrate_error {
+        return run_needs_setup_web(&cli, &config_dir, &boot_cwd, Some(migrate_error)).await;
     }
 
     // Load skills relative to the boot cwd (an allowed mint-site read of the
@@ -528,6 +542,11 @@ async fn main() -> Result<()> {
     let config = match Config::load(&boot_cwd, repo_mode, &parse_ctx) {
         Ok(config) => config,
         Err(LoadError::Missing(path)) => {
+            // §6.9: a windowed web session with no global file boots the
+            // settings server (needs_setup) — there is no Config yet.
+            if windowed_web {
+                return run_needs_setup_web(&cli, &config_dir, &boot_cwd, None).await;
+            }
             print_config_not_found_message(&path);
             anyhow::bail!("No config file found. See instructions above.");
         }
@@ -643,16 +662,29 @@ async fn main() -> Result<()> {
         }
 
         let tls = cli.tls || web.tls;
-        // The first-run `needs_setup` flow returns with C6 (spec §6.9);
-        // until then a missing config is refused above in every mode.
+        // The settings surface's boot facts (spec §8.2 `boot` block): the
+        // token source mirrors `resolve_token`'s chain. A failed global
+        // migration already returned the needs_setup server above, so
+        // `migrate_error` is None here.
+        let settings = peakbot::ui::web::settings::SettingsBoot {
+            config_dir: config_dir.clone(),
+            boot_cwd: boot_cwd.clone(),
+            migrate_error: None,
+            token_source: peakbot::ui::web::settings::TokenSource::resolve(
+                cli.token.as_deref(),
+                env_token.as_deref(),
+                web.token.as_deref(),
+            ),
+        };
         let mut ui = WebUi::new(
             addr,
-            session_deps.clone(),
+            Some(session_deps.clone()),
             build_models_snapshot(&registry),
             active_alias,
             token,
             tls,
             cli.tls_name.clone(),
+            settings,
         );
         ui.init().await?;
         ui.run().await?;
@@ -693,6 +725,58 @@ async fn main() -> Result<()> {
     // PTY children — the clean teardown path (see session::Session).
     drop(session);
 
+    Ok(())
+}
+
+/// §6.9 needs_setup server: the web UI without session deps — the SPA,
+/// `/api/settings`, `/api/config*` and `/api/system/*`, with `/ws` the 503
+/// setup guard. Reached from a windowed web session whose global file is
+/// missing, or whose boot auto-migration failed (`migrate_error` carries
+/// the reason verbatim). Bind/token/TLS resolve without a config: CLI
+/// flags and env only, the same non-loopback refusal as normal boot.
+async fn run_needs_setup_web(
+    cli: &Cli,
+    config_dir: &Path,
+    boot_cwd: &Path,
+    migrate_error: Option<String>,
+) -> Result<()> {
+    let addr = cli.bind.unwrap_or_else(|| {
+        peakbot::ui::DEFAULT_WEB_ADDR
+            .parse()
+            .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal")
+    });
+    let env_token = std::env::var("PEAKBOT_WEB_TOKEN").ok();
+    let token = resolve_token(cli.token.as_deref(), env_token.as_deref(), None);
+    if !addr.ip().is_loopback() && token.is_none() {
+        anyhow::bail!(
+            "refusing to bind the web UI to non-loopback {addr} without a token — \
+             set --token, PEAKBOT_WEB_TOKEN, or general.web.token"
+        );
+    }
+    let tls = cli.tls;
+    let settings = peakbot::ui::web::settings::SettingsBoot {
+        config_dir: config_dir.to_path_buf(),
+        boot_cwd: boot_cwd.to_path_buf(),
+        migrate_error,
+        token_source: peakbot::ui::web::settings::TokenSource::resolve(
+            cli.token.as_deref(),
+            env_token.as_deref(),
+            None,
+        ),
+    };
+    let mut ui = peakbot::ui::WebUi::new(
+        addr,
+        None,
+        Vec::new(),
+        String::new(),
+        token,
+        tls,
+        cli.tls_name.clone(),
+        settings,
+    );
+    ui.init().await?;
+    ui.run().await?;
+    ui.shutdown().await?;
     Ok(())
 }
 

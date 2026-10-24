@@ -84,7 +84,8 @@ use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 mod images;
-mod registry;
+pub mod registry;
+pub mod settings;
 pub mod system;
 pub mod tls;
 pub mod uploads;
@@ -145,7 +146,10 @@ struct Assets;
 /// snapshot. `deps` lives inside the registry.
 #[derive(Clone)]
 struct WsState {
-    registry: SessionRegistry,
+    /// `None` in needs_setup mode (spec §6.9): the `/ws` route is the 503
+    /// setup guard, so `handle_socket` (and with it the registry) is only
+    /// reachable when this is `Some`.
+    registry: Option<SessionRegistry>,
     models: Arc<Vec<ModelInfo>>,
     active_alias: Arc<str>,
     /// Idle-session TTL for the reaper (from `config.web`).
@@ -160,6 +164,12 @@ struct WsState {
 /// `token` is set, every route is gated by [`require_token`].
 pub struct WebUi {
     addr: SocketAddr,
+    /// The session deps — `None` ⇔ needs_setup mode (spec §6.9): the
+    /// server boots without a `Config` (missing global file, or a failed
+    /// global auto-migration in a windowed web session) and serves the SPA,
+    /// settings and system routes only. Fixed at boot; never filled in
+    /// later (no late deps build).
+    deps: Option<Arc<SessionDeps>>,
     ws_state: WsState,
     /// Shared secret guarding every route. `None` = open (loopback default).
     token: Option<Arc<str>>,
@@ -170,26 +180,46 @@ pub struct WebUi {
     extra_sans: Vec<String>,
     /// How often the reaper scans for expired sessions.
     reaper_tick: Duration,
+    /// Boot-time facts for the settings surface (spec §6.9/§8.2).
+    settings: settings::SettingsBoot,
 }
 
 impl WebUi {
+    #[allow(clippy::too_many_arguments)] // boot constructor: each arg is a distinct boot fact
     pub fn new(
         addr: SocketAddr,
-        deps: Arc<SessionDeps>,
+        deps: Option<Arc<SessionDeps>>,
         models: Vec<ModelInfo>,
         active_alias: String,
         token: Option<String>,
         tls: bool,
         extra_sans: Vec<String>,
+        settings: settings::SettingsBoot,
     ) -> Self {
-        let web = deps.config.general.web.clone();
+        // needs_setup mode has no config: the `general.web` reaper/TTL
+        // fields fall back to their defaults (the reaper never runs then —
+        // there are no sessions to reap).
+        let web = deps
+            .as_ref()
+            .map(|d| d.config.general.web.clone())
+            .unwrap_or_default();
         // `SessionRegistry::new` consumes `deps`, so clone the store out
         // first (it is `Clone`-cheap: a PathBuf + a Copy config).
-        let uploads = deps.uploads.clone();
+        let uploads = match deps.as_ref() {
+            Some(d) => d.uploads.clone(),
+            None => crate::attachments::UploadStore::new(
+                crate::attachments::UploadStore::default_root(),
+                crate::config::UploadsConfig::default(),
+            ),
+        };
+        // `SessionRegistry::new` takes an `Arc<SessionDeps>`, so build the
+        // registry from a clone before `deps` moves into the struct.
+        let registry = deps.as_ref().map(|d| SessionRegistry::new(d.clone()));
         Self {
             addr,
+            deps,
             ws_state: WsState {
-                registry: SessionRegistry::new(deps),
+                registry,
                 models: Arc::new(models),
                 active_alias: active_alias.into(),
                 session_ttl: Duration::from_secs(web.session_ttl_secs),
@@ -199,6 +229,7 @@ impl WebUi {
             tls,
             extra_sans,
             reaper_tick: Duration::from_secs(web.reaper_tick_secs),
+            settings,
         }
     }
 
@@ -238,7 +269,6 @@ impl Ui for WebUi {
 
     async fn run(&mut self) -> Result<()> {
         let mut app: Router = Router::new()
-            .route("/ws", get(ws_handler))
             .route("/commands", get(commands_handler))
             // Registered before `.fallback` (the SPA catch-all) and before
             // the token layer below, so it is routed AND token-gated — the
@@ -246,6 +276,16 @@ impl Ui for WebUi {
             .route("/images/{id}", get(images::image_handler))
             .with_state(self.ws_state.clone())
             .fallback(static_handler);
+
+        // `/ws`: the real WebSocket upgrade — or, in needs_setup mode
+        // (deps None, spec §6.9), the 503 setup guard in its place. The SPA
+        // reads `GET /api/settings` first and never opens the socket then.
+        app = app.merge(match &self.deps {
+            Some(_) => Router::new()
+                .route("/ws", get(ws_handler))
+                .with_state(self.ws_state.clone()),
+            None => Router::new().route("/ws", get(ws_setup_guard)),
+        });
 
         // Mount the system routes (spec §8.2): the setup wizard's
         // install/service surface, moved verbatim to `/api/system/*`. The
@@ -263,6 +303,25 @@ impl Ui for WebUi {
         // The old `/api/setup*` surface is gone: tombstone 404s where the
         // SPA fallback would otherwise serve index.html.
         app = app.merge(system::setup_removed());
+
+        // The settings surface (spec §8.2): merged BEFORE the token layer
+        // like the system routes, so every `/api/settings` / `/api/config*`
+        // route is gated by the same `require_token`. The router carries its
+        // own `/api/*` catch-all, so unknown /api routes answer 404 JSON and
+        // never reach the SPA fallback (T14 follow-up).
+        let settings_state = settings::SettingsState {
+            deps: self.deps.clone(),
+            registry: self.ws_state.registry.clone(),
+            config_dir: self.settings.config_dir.clone(),
+            boot_cwd: self.settings.boot_cwd.clone(),
+            migrate_error: self.settings.migrate_error.clone(),
+            boot_web: settings::BootWeb {
+                bind: self.addr,
+                token_source: self.settings.token_source,
+                tls: self.tls,
+            },
+        };
+        app = app.merge(settings::router(settings_state));
 
         // Upload routes (file-uploads design §5.2). Merged BEFORE the
         // token layer, so both `/api/uploads` routes are gated by the same
@@ -285,17 +344,19 @@ impl Ui for WebUi {
 
         // Reaper: periodically expire sessions idle (no sockets) past the TTL.
         // A detached task tied to the process lifetime — the registry it holds
-        // is the same one every connection shares.
-        let reaper_registry = self.ws_state.registry.clone();
-        let ttl = self.ws_state.session_ttl;
-        let tick = self.reaper_tick;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tick);
-            loop {
-                interval.tick().await;
-                reaper_registry.reap(ttl);
-            }
-        });
+        // is the same one every connection shares. needs_setup mode has no
+        // registry (no sessions), so no reaper.
+        if let Some(registry) = self.ws_state.registry.clone() {
+            let ttl = self.ws_state.session_ttl;
+            let tick = self.reaper_tick;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tick);
+                loop {
+                    interval.tick().await;
+                    registry.reap(ttl);
+                }
+            });
+        }
 
         if self.tls {
             self.serve_tls(app).await
@@ -469,6 +530,19 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// The `/ws` route while `WebUi.deps` is None (spec §6.9, T19): the
+/// needs_setup server has no sessions to attach to, so the upgrade is
+/// refused with 503 and the exact JSON body `{"error":"setup required"}`.
+/// The SPA reads `GET /api/settings` first and never opens the socket.
+pub async fn ws_setup_guard() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "error": "setup required" }).to_string(),
+    )
+        .into_response()
+}
+
 /// `GET /ws` — upgrade to a WebSocket, then run one independent session
 /// for the connection's lifetime.
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsState>) -> Response {
@@ -626,7 +700,13 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     };
 
     // Bind to a session. On failure, send one error frame and drop the socket.
-    let registered = match state.registry.attach(want) {
+    // The `/ws` upgrade is only mounted when deps exist (needs_setup mode
+    // replaces it with the 503 guard), so the registry is always present here.
+    let registry = state
+        .registry
+        .clone()
+        .expect("ws_handler is mounted only with deps; the needs_setup guard replaces it");
+    let registered = match registry.attach(want) {
         Ok(r) => r,
         Err(e) => {
             let _ = out_tx.send(OutboundMessage::Error {
@@ -661,7 +741,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
 
     let action_sender = registered.session.action_sender.clone();
     let sm_for_reader = registered.session.state_manager.clone();
-    let registry_for_reader = state.registry.clone();
+    let registry_for_reader = registry.clone();
     let reader_tx = out_tx.clone();
 
     // Process a non-attach handshake frame before the reader loop starts.
@@ -726,7 +806,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     if !matches!(_exit, ForwardExit::WriterGone) {
         let _ = writer_task.await;
     }
-    state.registry.detach(session_key);
+    registry.detach(session_key);
 }
 
 /// Await the first text frame of a connection, skipping non-text control

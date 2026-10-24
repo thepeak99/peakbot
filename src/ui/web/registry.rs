@@ -28,6 +28,7 @@ use crate::session::SessionDeps;
 use crate::{Session, UiAction, create_session};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,7 +37,7 @@ use uuid::Uuid;
 /// Result of [`SessionRegistry::kill`].
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KillOutcome {
+pub enum KillOutcome {
     /// Session removed and signalled to exit.
     Killed,
     /// A turn is running; the session is untouched.
@@ -119,7 +120,7 @@ impl AttachState {
 
 /// A live session plus the registry bookkeeping (attached-socket count and
 /// idle clock) that decides when it expires.
-pub(crate) struct RegisteredSession {
+pub struct RegisteredSession {
     /// Stable internal handle for the session's whole life. The session's
     /// *conversation* id can change under it (`/model`, `/load`, `/new` mint a
     /// new one), so the map is keyed by this, not by the mutable convo id.
@@ -173,9 +174,11 @@ impl RegisteredSession {
 }
 
 /// Registry of active sessions. Cloned (cheaply, via `Arc` internally) into
-/// every connection handler and the reaper task.
+/// every connection handler and the reaper task. `pub` so the settings
+/// surface (spec §8.1) can resolve a `?convo=` to a cwd through
+/// [`cwd_of`](SessionRegistry::cwd_of) — the ONLY way a convo becomes a cwd.
 #[derive(Clone)]
-pub(crate) struct SessionRegistry {
+pub struct SessionRegistry {
     inner: Arc<Inner>,
 }
 
@@ -193,6 +196,20 @@ impl SessionRegistry {
                 map: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// The cwd of the session currently live on `convo`, if any (spec §8.1)
+    /// — the ONLY way a `?convo=` becomes a cwd. A live session's cwd is its
+    /// `StateManager::session_cwd()`; an unknown id gives `None` and the
+    /// caller falls back to the boot cwd.
+    pub fn cwd_of(&self, convo: Uuid) -> Option<PathBuf> {
+        self.inner
+            .map
+            .lock()
+            .unwrap()
+            .values()
+            .find(|r| r.live_convo() == Some(convo))
+            .map(|r| r.session.state_manager.session_cwd())
     }
 
     /// Attach a socket to a session. `want` is the `?convo=` id from the URL:
