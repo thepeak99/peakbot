@@ -42,10 +42,10 @@ pub mod vector;
 pub mod vision;
 
 pub use config::{
-    AgentDefinition, AnthropicConfig, BashConfig, Config, ContextConfig, ConversationConfig,
-    LoadedConfig, McpServerConfig, McpTransportType, ModelEntry, ModelRegistry, OllamaConfig,
-    OpenRouterConfig, PipelineConfig, PromptHead, ProviderConfig, ProviderEntry, ProviderType,
-    RegistryError, ResolvedModel, RetryConfig, SearXngConfig, VectorDbConfig, get_config_file_path,
+    AnthropicConfig, Bound, Config, ContextConfig, ConversationConfig, McpServerConfig,
+    McpTransportType, ModelEntry, ModelRegistry, OllamaConfig, OpenRouterConfig, ProviderConfig,
+    ProviderEntry, ProviderType, RegistryError, RepoMode, ResolvedModel, RetryConfig, SearchConfig,
+    VectorDbConfig, get_config_file_path,
 };
 use context_manager::ContextManager;
 pub use context_manager::{CompactionResult, auto_detect_context_size};
@@ -279,17 +279,6 @@ fn classify_submission(msg: &str) -> SubmitKind {
         },
         Err(e) => SubmitKind::InvalidAttachment(e),
     }
-}
-
-/// The single producer of the `/model` refusal text. Every surface (REPL
-/// intercept, stdio, web, the controller) funnels through it so the wording —
-/// and the `fixed by pipeline` signal the user learns to recognise — stays
-/// identical.
-pub fn model_locked_message(pipeline: &str) -> String {
-    format!(
-        "the orchestrator's model is fixed by pipeline '{pipeline}'. \
-         Switch teams with /pipeline <name>, or /pipeline none to unlock /model."
-    )
 }
 
 /// Render a [`crate::state::StopTally`] into the system-message string the
@@ -585,7 +574,8 @@ fn shell_section(shell: &ShellKind) -> String {
 }
 
 /// The core tool guidance, plus the shell section when a shell was detected.
-/// A `PromptHead::Full` skips both (it replaces the whole static head).
+/// A `Head::Whole` agent skips both (its persona replaces the whole static
+/// head).
 fn core_guidance(shell: Option<&ShellKind>) -> String {
     let mut out = String::from(SYSTEM_PROMPT_CORE);
     if let Some(shell) = shell {
@@ -642,111 +632,15 @@ pub(crate) fn agents_md_section(cwd: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
-/// Build the system prompt dynamically with environment information.
-///
-/// `shell_kind` is the shell detected at startup; its presence appends a
-/// `**Shell**:` line to the environment block so the model uses the right
-/// syntax and the right shell tool names; the `# Shell Tool Usage` section
-/// (see [`core_guidance`]) is rendered for the same shell.
-///
-/// `memory_enabled` gates the `memory.md` instructions: when false the
-/// section is omitted so the model is never told to read/update memory.md.
-///
-/// `agents_md_enabled` gates the repo's `agents.md` section: when false the
-/// section is omitted (the profile's `agents_md: false` ceiling).
-///
-/// `subagents_active` selects the recipe: when true (orchestrator)
-/// `orchestrator_prompt` (if set) is appended as extra framing. Memory,
-/// skills, env block and (when enabled) agents.md are shared by both
-/// recipes, as is the core tool guidance unless `head` replaces it (see
-/// below).
-///
-/// `head` fills the static head of the prompt and leads **either** recipe:
-///
-/// - [`PromptHead::Persona`] replaces the built-in persona, the core tool
-///   guidance still follows (multi-pipeline amendment 1: a pipeline's
-///   `orchestrator.persona` replaces the global one; omitted, the global
-///   `persona:` applies to the orchestrator unchanged).
-/// - [`PromptHead::Full`] (config `system_prompt:`) replaces the persona AND
-///   the core guidance — a deployment that disables `bash`/`think`/`todo`
-///   would otherwise ship built-in coaching for tools the model cannot call.
-///
-/// `None` / whitespace-only counts as absent, and only then does
-/// `subagents_active` matter: the agentless recipe falls back to the built-in
-/// crusader persona, while the orchestrator leads with the core guidance — the
-/// crusader would confuse an agent whose job is to coordinate a team.
-#[allow(clippy::too_many_arguments)] // agents_md_enabled is the new profile ceiling; callers pass the resolved value
-pub fn build_system_prompt(
-    skills: &SkillRegistry,
-    shell_kind: Option<&ShellKind>,
-    cwd: &std::path::Path,
-    memory_enabled: bool,
-    agents_md_enabled: bool,
-    subagents_active: bool,
-    orchestrator_prompt: Option<&str>,
-    head: Option<&PromptHead>,
-) -> String {
-    let mut prompt = String::new();
-
-    // The trim-and-filter guards repeat `Config::prompt_head`'s discipline
-    // because a pipeline's `orchestrator.persona` reaches this parameter
-    // unvalidated: whitespace-only is absent, at the accessor AND here.
-    match head {
-        // A full head owns everything down to the dynamic sections: no
-        // built-in persona, and deliberately no core guidance (shell section included).
-        Some(PromptHead::Full(s)) if !s.trim().is_empty() => {
-            prompt.push_str(s.trim());
-            prompt.push('\n');
-        }
-        Some(PromptHead::Persona(s)) if !s.trim().is_empty() => {
-            prompt.push_str(s.trim());
-            // Mirrors the built-in persona's trailing single `\n` so every
-            // branch produces the same byte boundary before
-            // the core guidance.
-            prompt.push('\n');
-            prompt.push_str(&core_guidance(shell_kind));
-        }
-        // The built-in crusader is the *agentless* default only. An
-        // orchestrator with no configured head leads with the core
-        // guidance, exactly as it did before pipelines gained a `persona:`.
-        _ => {
-            if !subagents_active {
-                prompt.push_str(SYSTEM_PROMPT_PERSONA);
-            }
-            prompt.push_str(&core_guidance(shell_kind));
-        }
-    }
-
-    if memory_enabled {
-        prompt.push_str(MEMORY_PROMPT_SECTION);
-    }
-
-    prompt.push_str(&skills.to_system_prompt_section());
-    prompt.push_str(&env_block(shell_kind, cwd));
-    if agents_md_enabled {
-        prompt.push_str(&agents_md_section(cwd));
-    }
-
-    if subagents_active
-        && let Some(extra) = orchestrator_prompt.map(str::trim).filter(|s| !s.is_empty())
-    {
-        prompt.push_str(&format!("\n# Orchestrator Instructions\n\n{extra}\n"));
-    }
-
-    debug!("System prompt:\n {}", prompt);
-
-    prompt
-}
-
 /// Build the main agent's system prompt from a resolved `(profile, agent)`
 /// (spec §6.1). Sections in output order: static head, core guidance (unless
 /// [`Head::Whole`]), memory.md workflow, skills, env block, agents.md,
 /// `# Instructions`.
 ///
-/// Unlike [`build_system_prompt`] there is no orchestrator special case: a
-/// [`Head::BuiltIn`] agent leads with the built-in persona whether or not it
-/// has subagents, and `agent.prompt` renders as `# Instructions` for single
-/// agents too. The main agent's skills are filtered by `agent.main.skills`.
+/// There is no orchestrator special case: a [`Head::BuiltIn`] agent leads
+/// with the built-in persona whether or not it has subagents, and
+/// `agent.prompt` renders as `# Instructions` for single agents too. The main
+/// agent's skills are filtered by `agent.main.skills`.
 ///
 /// [`Head::Whole`]: crate::config::resolve::Head::Whole
 /// [`Head::BuiltIn`]: crate::config::resolve::Head::BuiltIn
@@ -801,35 +695,36 @@ pub fn build_agent_prompt(
     prompt
 }
 
-/// Resolve the static prompt head from the two sources that can supply one:
-/// the config (`system_prompt:` / `persona:`, already collapsed into a single
-/// slot by [`Config::prompt_head`]) and the selected pipeline's
-/// `orchestrator.persona`.
+/// The prompt half of the agent rebuild seam that every session verb
+/// (`/model`, `/cd`, `/new`, `/load`, a selection) funnels through.
 ///
-/// Precedence:
-///
-/// 1. A config [`PromptHead::Full`] outranks a pipeline persona — a full
-///    `system_prompt:` is a deployment ceiling, and a profile that sets it has
-///    already been announced by the boot banner.
-/// 2. Otherwise the selected pipeline's `orchestrator.persona` replaces the
-///    global one (multi-pipeline amendment 1).
-/// 3. Otherwise the config's own head, or `None` for the built-in.
-///
-/// Lives here, next to [`build_system_prompt`], because it is prompt-
-/// composition policy over a pipeline value the config layer knows nothing
-/// about — and because both production call sites (session boot and the
-/// `/model` rebuild seam) must derive it identically or they drift.
-pub fn resolve_prompt_head(
-    config_head: Option<&PromptHead>,
-    pipeline_persona: Option<&str>,
-) -> Option<PromptHead> {
-    match config_head {
-        Some(full @ PromptHead::Full(_)) => Some(full.clone()),
-        _ => match pipeline_persona {
-            Some(p) => Some(PromptHead::Persona(p.to_string())),
-            None => config_head.cloned(),
-        },
-    }
+/// `model` is the model the agent is being rebuilt on — it may differ from
+/// `bound.agent().main.model` after a `/model` switch. The model is free
+/// (spec §6.5): no `(profile, agent)` ever refuses a switch, a
+/// subagent-bearing one included, so this never fails for selection reasons.
+/// The prompt itself is model-agnostic: it is exactly [`build_agent_prompt`]
+/// for the bound. `Result` keeps the seam's error channel, which the provider
+/// half ([`AgentRunner`]'s rebuild) uses for build failures.
+pub fn rebuild_agent_for_resolved(
+    model: &ResolvedModel,
+    bound: &Bound,
+    skills: &SkillRegistry,
+    shell: Option<ShellKind>,
+    cwd: &std::path::Path,
+) -> Result<String, String> {
+    debug!(
+        "rebuilding agent prompt for {} › {} on model {}",
+        bound.profile.name,
+        bound.agent().main.name,
+        model.alias
+    );
+    Ok(build_agent_prompt(
+        bound.agent(),
+        &bound.profile,
+        skills,
+        shell,
+        cwd,
+    ))
 }
 
 /// The `**Shell**:` env-block line, derived from the detected shell. It
@@ -912,71 +807,40 @@ pub fn convert_conversation_to_rig_messages(conv: &Conversation) -> Vec<Message>
     messages
 }
 
-/// Bundle of construction deps the agent loop needs to rebuild
-/// `DynAgent` on a `/model` switch. All fields are model-agnostic and
-/// stay alive for the entire process lifetime — only the agent itself
-/// is replaced. `mcp_handles` is kept around explicitly so MCP
-/// subprocesses survive a switch (rebuilt tool list, same processes).
+/// Everything the agent loop needs to rebuild `DynAgent` on a session verb
+/// (`/model`, `/cd`, `/new`, `/load`, a selection). Only the agent itself is
+/// replaced; `mcp_handles` is kept explicitly so MCP subprocesses survive a
+/// rebuild (fresh tool list, same processes).
 ///
-/// `None` for any field means "don't try to switch models" (the
-/// `/model` command will be inert because no registry is attached, or
-/// agent-loop will surface an error if the user somehow gets a
-/// `SwitchModel` action through). Production boot in `main.rs` always
-/// populates this.
+/// `config` and `bound` are the session's live truth: a reload swaps
+/// `config` for the fresh parse and re-binds `bound` (spec §6.7); every
+/// rebuild derives prompt, tools and roster from them. Production boot
+/// always attaches one; without it, the rebuild verbs are inert.
 pub struct RebuildContext {
-    pub registry: Arc<crate::config::ModelRegistry>,
-    pub system_prompt: String,
+    pub config: Arc<Config>,
+    /// The session's ONE `(profile, agent)` (I2).
+    pub bound: Bound,
     pub mcp_handles: Arc<Vec<McpServerHandle>>,
-    pub searxng_config: Option<crate::config::SearXngConfig>,
-    pub max_turns: usize,
-    pub todo_tool: Option<crate::tools::TodoTool>,
-    pub bash_config: crate::config::BashConfig,
-    /// Every named team this install declares, resolved once at boot. The
-    /// rebuild seam looks the *selected* one up here to derive the
-    /// orchestrator's model, its prompt framing, and the delegate roster.
-    pub pipelines: Arc<crate::pipeline::PipelineSet>,
-    /// Detected shell kind — OS-level, so it persists across `/model` switches.
-    pub shell_kind: Option<crate::tools::ShellKind>,
-    /// Skill registry — needed to rebuild the system prompt when `/cd`
-    /// changes the working directory (the prompt embeds both the cwd and
-    /// the skills section). Persists across switches like `shell_kind`.
-    pub skills: crate::skills::SkillRegistry,
-    /// Shared vector store (doc_index / doc_search), if configured. Cheap to
-    /// clone (Arc-backed); persists across `/model` switches like the MCP
-    /// handles, since the DB handle is provider-independent.
-    pub vector_store: Option<crate::vector::VectorStore>,
-    /// Whether the memory.md feature is on — gates the memory prompt section
-    /// (and, at the compaction call site, the auto-compaction). Refreshed on
-    /// config reload like `skills`.
-    pub memory_enabled: bool,
-    /// Whether the repo's `agents.md` is injected into the system prompt —
-    /// the profile's `agents_md:` ceiling, applied at the last reload.
-    /// Refreshed on config reload like `memory_enabled`.
-    pub agents_md_enabled: bool,
-    /// Built-in tool filter (blocklist/allowlist). Refreshed on config reload;
-    /// consumed by `add_builtin_tools` when the agent is rebuilt.
-    pub tools_filter: crate::config::NameFilter,
-    /// The configured static prompt head (`system_prompt:` or `persona:`,
-    /// collapsed to one slot by `Config::prompt_head`). A selected pipeline's
-    /// `orchestrator.persona` overrides a `Persona` head for that team
-    /// (amendment 1); a `Full` head outranks even that. Live-reloadable via
-    /// `/new`, `/model`, `/cd`, `/load` — the rebuild seam recomputes the
-    /// prompt with this value, and a head has no live handles behind it (just
-    /// a string).
-    pub prompt_head: Option<crate::config::PromptHead>,
-    /// The boot `--profile` pin, if any. Set once at session build; while it
-    /// is set, runtime profile selection is refused and every reload applies
-    /// it.
+    /// Detected shell kind — OS-level, so it persists across rebuilds.
+    pub shell_kind: Option<ShellKind>,
+    /// Skill registry — rescanned on reload; the prompt embeds a filtered
+    /// skills section.
+    pub skills: SkillRegistry,
+    pub todo_tool: Option<TodoTool>,
+    /// The boot `--profile` pin, if any. While set, runtime profile selection
+    /// is refused and the repo file is ignored on every reload.
     pub profile_pin: Option<String>,
 }
 
 impl RebuildContext {
-    /// The profile every reload for this session must apply — derived from
-    /// the pin and the conversation's selection, never cached.
-    fn effective_profile(&self, sm: &StateManager) -> Option<String> {
-        let selected = sm.selected_profile();
-        crate::config::effective_profile(self.profile_pin.as_deref(), selected.as_deref())
-            .map(str::to_string)
+    /// How a reload reads the repo file: a pinned profile is a global profile,
+    /// so the repo file is ignored entirely under a pin (spec §6.5).
+    pub fn repo_mode(&self) -> RepoMode {
+        if self.profile_pin.is_some() {
+            RepoMode::Ignore
+        } else {
+            RepoMode::Include
+        }
     }
 }
 
@@ -987,13 +851,36 @@ impl RebuildContext {
 /// inner Arc immediately so the guard never spans an await point.
 pub type SharedSessionHook = Arc<std::sync::RwLock<Arc<SessionHook>>>;
 
+/// The tool-free compaction (and title) model for `model` — same provider
+/// config, so the same credentials as the main model. With compaction
+/// enabled a construction failure is an error the caller must surface; with
+/// it disabled the model is best-effort (it still powers conversation
+/// titles) and a failure just means `None`.
+fn compaction_model_for(
+    model: &ResolvedModel,
+    context: &ContextConfig,
+) -> Result<Option<Arc<CompactionModel>>> {
+    let built = crate::providers::create_compaction_model(
+        &model.provider_config,
+        context.compaction_model.as_deref(),
+    );
+    if context.enabled {
+        Ok(Some(Arc::new(built?)))
+    } else {
+        Ok(built.ok().map(Arc::new))
+    }
+}
+
 /// AgentRunner — the Controller in MVC.
 ///
 /// Receives input (UiAction) from Views, calls the agent, writes results to
 /// StateManager (Model). Never reads stdin or prints directly.
 pub struct AgentRunner {
     agent: Arc<DynAgent>,
-    config: Config,
+    config: Arc<Config>,
+    /// Alias of the model the runner was built on — the boot conversation
+    /// is stamped with it.
+    model_alias: String,
     #[allow(unused)]
     skills: SkillRegistry,
     state_manager: Option<Arc<StateManager>>,
@@ -1008,51 +895,37 @@ pub struct AgentRunner {
     /// Tool-free compaction model shared with ContextManager.
     /// Kept for historical/API reasons; memory compaction now fetches
     /// the live model from StateManager via get_title_model() so it sees
-    /// updates on `/model` and `/pipeline` switches.
+    /// updates on every agent rebuild.
     #[allow(dead_code)]
     compaction_model: Option<Arc<CompactionModel>>,
 }
 
 impl AgentRunner {
-    /// `context_size` drives ContextManager compaction thresholds and must
-    /// come from the resolved model (config `context_size:` or auto-detect).
-    #[allow(clippy::too_many_arguments)] // context_size is the new mandatory parameter; callers supply resolved value
+    /// `model` is the model `agent` was built on: its provider config feeds
+    /// the compaction model and its context size the compaction thresholds.
+    #[allow(clippy::too_many_arguments)] // mirrors the provider build's outputs; callers pass them straight through
     pub fn new(
         agent: DynAgent,
-        config: Config,
+        config: Arc<Config>,
         provider_info: ProviderInfo,
         skills: SkillRegistry,
         event_receiver: Option<mpsc::UnboundedReceiver<SourcedEvent>>,
         state_manager: Option<Arc<StateManager>>,
         session_hook: Arc<SessionHook>,
-        context_size: usize,
+        model: &ResolvedModel,
     ) -> anyhow::Result<Self> {
         let agent = Arc::new(agent);
 
-        // Create a tool-free compaction model from the same provider.
         // When compaction is enabled, a construction failure is fatal —
         // refuse to boot rather than silently degrade into the death
         // spiral.  See unfuck-compact.md Layer 1.
-        let compaction_model = if config.context.enabled {
-            let model = crate::providers::create_compaction_model(
-                &config.provider,
-                config.context.compaction_model.as_deref(),
-            )
-            .with_context(|| {
+        let compaction_model =
+            compaction_model_for(model, &config.general.context).with_context(|| {
                 "Failed to construct compaction model for the active provider. \
                  The active provider config is what's read for compaction (same \
                  credentials as the main model). To boot without compaction, set \
-                 `context.enabled: false` in config.yaml."
+                 `general.context.enabled: false` in config.yaml."
             })?;
-            Some(Arc::new(model))
-        } else {
-            crate::providers::create_compaction_model(
-                &config.provider,
-                config.context.compaction_model.as_deref(),
-            )
-            .ok()
-            .map(Arc::new)
-        };
 
         // Initialize ContextManager inside StateManager (StateManager owns it)
         if let Some(ref sm) = state_manager {
@@ -1060,8 +933,8 @@ impl AgentRunner {
             // callers that build the runner directly (test harnesses).
             sm.set_supports_vision(provider_info.supports_vision);
             let cm = ContextManager::new(
-                config.context.clone(),
-                context_size,
+                config.general.context.clone(),
+                model.context_size,
                 compaction_model.clone(),
             );
             sm.init_context_manager(cm);
@@ -1074,6 +947,7 @@ impl AgentRunner {
         Ok(Self {
             agent,
             config,
+            model_alias: model.alias.clone(),
             skills,
             state_manager,
             session_hook,
@@ -1174,10 +1048,10 @@ impl AgentRunner {
 
         // Extract fields we need to pass to spawned loops
         let state_manager = self.state_manager.clone();
-        let config_model = self.config.model().to_string();
+        let config_model = self.model_alias.clone();
         let agent = self.agent.clone();
         let state_manager_for_agent = self.state_manager.clone();
-        let config_for_agent = self.config.clone();
+        let config_for_agent = Arc::clone(&self.config);
         let event_receiver = self.event_receiver.take();
         // Shared cell for state that swaps on `/model` rebuild. The event
         // loop reads through it so `/stop` always cancels the active
@@ -1563,7 +1437,7 @@ impl AgentRunner {
     /// — i.e. never compacted at all.
     ///
     /// The compaction model is read live from `StateManager` so it reflects
-    /// `/model` and `/pipeline` rebuilds. Failures are logged, never fatal.
+    /// every agent rebuild. Failures are logged, never fatal.
     async fn maybe_compact_memory(sm: &StateManager, threshold_bytes: usize) {
         let path = sm.session_cwd().join("memory.md");
         let Some(content) = crate::memory_compaction::read_if_oversized(&path, threshold_bytes)
@@ -1630,7 +1504,7 @@ impl AgentRunner {
         completion_tx: tokio::sync::broadcast::Sender<CompletionResult>,
         state_manager: Option<Arc<StateManager>>,
         initial_agent: Arc<DynAgent>,
-        mut config: Config,
+        mut config: Arc<Config>,
         drain_requested: Arc<std::sync::atomic::AtomicBool>,
         initial_event_receiver: Option<mpsc::UnboundedReceiver<SourcedEvent>>,
         session_hook_cell: SharedSessionHook,
@@ -1747,11 +1621,17 @@ impl AgentRunner {
                         // message, so startup stays instant and the spinner gives
                         // visual feedback while we work. The compaction model is
                         // read live from StateManager inside the helper, so it
-                        // sees `/model` and `/pipeline` rebuilds.
-                        if !memory_compaction_done && config.memory.enabled {
+                        // sees `/model` and selection rebuilds. memory.md is a
+                        // profile setting, so it follows the session's Bound.
+                        let memory_threshold = rebuild_ctx
+                            .as_ref()
+                            .map(|ctx| &ctx.bound.profile.memory)
+                            .filter(|memory| memory.enabled)
+                            .map(|memory| memory.threshold_bytes);
+                        if !memory_compaction_done && let Some(threshold) = memory_threshold {
                             memory_compaction_done = true;
                             if let Some(sm) = state_manager.as_ref() {
-                                Self::maybe_compact_memory(sm, config.memory.threshold_bytes).await;
+                                Self::maybe_compact_memory(sm, threshold).await;
                             }
                         }
 
@@ -1823,11 +1703,10 @@ impl AgentRunner {
                         if let Some(ref sm) = state_manager {
                             sm.set_running(true);
                         }
-                        // The pipeline the *current* conversation is on. `/load`
+                        // The selection the *current* conversation is on. `/load`
                         // swaps the conversation (and with it the selection), so the
                         // rebuild below needs the before-value to spot the change.
-                        let selection_before =
-                            state_manager.as_ref().and_then(|sm| sm.selected_pipeline());
+                        let selection_before = state_manager.as_ref().map(|sm| sm.selection());
                         Self::process_command_internal(&cmd, &state_manager, &config).await;
 
                         // `/load <arg>` may have just swapped the active
@@ -1841,7 +1720,6 @@ impl AgentRunner {
                             Self::maybe_rebuild_after_load(
                                 selection_before,
                                 &mut agent,
-                                &mut config,
                                 &state_manager,
                                 &session_hook_cell,
                                 &mut event_processor,
@@ -1855,7 +1733,6 @@ impl AgentRunner {
                             // does not switch to `default_model`.
                             Self::refresh_agent_after_new(
                                 &mut agent,
-                                &mut config,
                                 &state_manager,
                                 &session_hook_cell,
                                 &mut event_processor,
@@ -1893,7 +1770,6 @@ impl AgentRunner {
                         let outcome = Self::handle_switch_model(
                             &alias,
                             &mut agent,
-                            &mut config,
                             &state_manager,
                             &session_hook_cell,
                             &mut event_processor,
@@ -1929,7 +1805,6 @@ impl AgentRunner {
                         let outcome = Self::handle_change_cwd(
                             &path,
                             &mut agent,
-                            &mut config,
                             &state_manager,
                             &session_hook_cell,
                             &mut event_processor,
@@ -2026,6 +1901,13 @@ impl AgentRunner {
                 }
                 completion_tx.send(CompletionResult::Error).ok();
             }
+
+            // A session verb may have reloaded the config into the rebuild
+            // context (spec §6.7 step 5); the context is the authority, this
+            // loop's copy only follows it.
+            if let Some(ctx) = rebuild_ctx.as_ref() {
+                config = Arc::clone(&ctx.config);
+            }
         }
     }
 
@@ -2039,59 +1921,42 @@ impl AgentRunner {
     /// On error (unknown alias, build failure), returns a string
     /// describing the failure for the caller to surface as a system
     /// message; the previous agent is left intact.
-    #[allow(clippy::too_many_arguments)]
     async fn handle_switch_model(
         alias: &str,
         agent_slot: &mut Arc<DynAgent>,
-        config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
     ) -> Result<(), String> {
         let Some(ctx) = rebuild_ctx else {
-            return Err(
-                "model registry not configured (legacy single-provider boot — restart with a \
-                 `providers:` block to enable model switching)"
-                    .to_string(),
-            );
+            return Err("model switching is not available in this session".to_string());
         };
         let sm_for_provider = state_manager
             .clone()
             .ok_or_else(|| "state manager required for /model".to_string())?;
 
-        // The authority for the refusal (covers stdio + web, which never see
-        // the REPL's intercept): a selected pipeline owns its orchestrator's
-        // model, so there is nothing for /model to switch.
-        if let Some(pipeline) = sm_for_provider.selected_pipeline() {
-            return Err(model_locked_message(&pipeline));
-        }
-
+        // No selection ever refuses a model switch (spec §6.5): the model is
+        // free with or without subagents.
+        //
         // Re-read config + skills first so a newly-added alias resolves and
-        // a new system prompt / registry is in play before we switch.
-        // Warnings are surfaced *after* the conversation reset below so
+        // a fresh prompt / registry is in play before we switch. Warnings are
+        // surfaced *after* the conversation reset below so
         // `reset_conversation_state()` can't wipe them from the chat.
-        let profile = ctx.effective_profile(&sm_for_provider);
-        let reload_warnings = Self::reload_session_config(
-            config,
-            ctx,
-            &sm_for_provider,
-            &sm_for_provider.session_cwd(),
-            profile.as_deref(),
-        );
+        let reload_warnings =
+            Self::reload_session_config(ctx, &sm_for_provider, &sm_for_provider.session_cwd());
 
-        let Some(resolved) = ctx.registry.resolve(alias) else {
-            let available = ctx.registry.aliases_sorted().join(", ");
+        let Some(resolved) = ctx.config.registry.resolve(alias) else {
+            let available = ctx.config.registry.aliases_sorted().join(", ");
             return Err(format!("unknown alias `{alias}`. Available: {available}"));
         };
         let resolved = resolved.clone();
 
         // Rebuild the agent + publish new provider info — shared with
         // `/load` (which re-activates a saved wire identity).
-        Self::rebuild_agent_for_resolved(
+        Self::rebuild_agent(
             &resolved,
             agent_slot,
-            config,
             &sm_for_provider,
             session_hook_cell,
             event_processor,
@@ -2103,8 +1968,9 @@ impl AgentRunner {
         // Reset conversation-scoped state — same path as /new. Stamps
         // the new wire identity (provider_name + model) on the
         // metadata so /load on the freshly-reset convo (after the next
-        // prompt) restores the right model. The alias is *also* set on
-        // AppState for status-bar display, but is NOT persisted.
+        // prompt) restores the right model. The new conversation keeps the
+        // current `(profile, agent)`. The alias is *also* set on AppState for
+        // status-bar display, but is NOT persisted.
         sm_for_provider.reset_conversation_state();
         let convo_name = format!(
             "Conversation {}",
@@ -2127,16 +1993,6 @@ impl AgentRunner {
             "🔁 New conversation on {} ({} · {})",
             resolved.alias, resolved.provider_name, resolved.model_name
         ));
-
-        // Reconcile the live pipeline selection against the fresh set.
-        // Same shape as /cd: the new conversation is freshly minted
-        // (zero turns), so the `set_selected_pipeline(None)` write
-        // targets persisted truth for THAT conversation, not the
-        // outgoing one (invariant I-3 / hazard #3).
-        let mut reload_warnings = reload_warnings;
-        if let Some(warning) = reconcile_pipeline_selection(ctx, &sm_for_provider) {
-            reload_warnings.push(warning);
-        }
 
         // Surface reload/skill warnings now — after the reset — so they
         // persist in the fresh conversation instead of being cleared.
@@ -2415,22 +2271,16 @@ impl AgentRunner {
     ///
     /// The View pre-validated `path`; we re-validate defensively (config
     /// or the filesystem may have changed under us).
-    #[allow(clippy::too_many_arguments)]
     async fn handle_change_cwd(
         path: &str,
         agent_slot: &mut Arc<DynAgent>,
-        config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
     ) -> Result<(), String> {
         let Some(ctx) = rebuild_ctx else {
-            return Err(
-                "model registry not configured (legacy single-provider boot — restart with a \
-                 `providers:` block to enable /cd)"
-                    .to_string(),
-            );
+            return Err("/cd is not available in this session".to_string());
         };
         // Re-validate: the path must still be an existing directory.
         let target = std::path::Path::new(path);
@@ -2450,15 +2300,15 @@ impl AgentRunner {
         // because process cwd never moves (no `set_current_dir`), so the
         // per-repo config and the skill re-scan must read the NEW tree.
         // Warnings are surfaced after the conversation reset below.
-        let profile = ctx.effective_profile(&sm);
-        let mut reload_warnings =
-            Self::reload_session_config(config, ctx, &sm, target, profile.as_deref());
+        let reload_warnings = Self::reload_session_config(ctx, &sm, target);
 
         let resolved = ctx
+            .config
             .registry
             .resolve(&sm.get_model_alias())
             .or_else(|| {
-                ctx.registry
+                ctx.config
+                    .registry
                     .find_by_wire_id(&sm.get_provider_name(), &sm.get_model())
             })
             .ok_or_else(|| "current model not found in registry".to_string())?
@@ -2480,10 +2330,9 @@ impl AgentRunner {
         // reflect the new directory (welcome was stamped once at boot).
         sm.update_welcome_cwd(target.to_path_buf());
 
-        Self::rebuild_agent_for_resolved(
+        Self::rebuild_agent(
             &resolved,
             agent_slot,
-            config,
             &sm,
             session_hook_cell,
             event_processor,
@@ -2513,17 +2362,6 @@ impl AgentRunner {
         sm.set_model_alias(resolved.alias.clone());
 
         sm.add_system_message(format!("📁 New conversation in {path}"));
-
-        // Reconcile the live pipeline selection against the fresh set.
-        // Safe here, not inside the reload: by step 7 the current
-        // conversation is the freshly minted one (zero turns), so the
-        // `set_selected_pipeline(None)` write targets persisted truth
-        // for THIS conversation (invariant I-3 / hazard #3). The
-        // catalogue message is already in `reload_warnings` from the
-        // reload seam above.
-        if let Some(warning) = reconcile_pipeline_selection(ctx, &sm) {
-            reload_warnings.push(warning);
-        }
 
         // Surface reload/skill warnings after the reset so they persist.
         for warning in reload_warnings {
@@ -2581,11 +2419,9 @@ impl AgentRunner {
     /// following `reset_conversation_state()` (as `/model` and `/cd` do)
     /// can't wipe them from the chat.
     fn reload_session_config(
-        config: &mut Config,
         ctx: &mut RebuildContext,
         sm: &Arc<StateManager>,
         session_cwd: &std::path::Path,
-        profile: Option<&str>,
     ) -> Vec<String> {
         let mut warnings = Vec::new();
         // Boundary parse — keep previous config on any failure.
@@ -2715,17 +2551,18 @@ impl AgentRunner {
         warnings
     }
 
-    /// Rebuild the live `DynAgent` against a `ResolvedModel` — the
-    /// **shared seam** between `/model <alias>`, `/cd`, `/load`, `/new` and
-    /// `/pipeline`. Builds the agent, publishes the new `ProviderInfo` +
-    /// `SessionHook` through their shared cells, swaps the active config
-    /// provider, re-inits the context manager, and restarts the
-    /// event-processor task on the new receiver.
+    /// Rebuild the live `DynAgent` on `model` for the context's `Bound` —
+    /// the **shared seam** between `/model <alias>`, `/cd`, `/load`, `/new`
+    /// and a selection. Recipe: prompt ([`rebuild_agent_for_resolved`]) →
+    /// [`ToolEnv::for_profile`](crate::tools::env::ToolEnv::for_profile) →
+    /// the delegate roster iff the agent has subagents → `create_provider`.
+    /// Publishes the new `ProviderInfo` + `SessionHook` through their shared
+    /// cells, re-inits the context manager, and restarts the event-processor
+    /// task on the new receiver.
     ///
-    /// `requested` is the model the *caller* asked for. When a pipeline is
-    /// selected it is overridden by that team's orchestrator: the team owns its
-    /// orchestrator, enforced here at the single point every path funnels
-    /// through, so no caller has to remember the rule.
+    /// `model` may differ from the agent's configured model (a `/model`
+    /// switch); the agent's member settings (skills, env, agents.md) still
+    /// come from the bound.
     ///
     /// Does NOT reset the conversation (chat/stats/todos) and does NOT
     /// emit a system banner — those are caller-specific:
@@ -2733,150 +2570,81 @@ impl AgentRunner {
     ///   chat) and emits `🔁 New conversation on ...`.
     /// - `/load` calls `load_conversation(...)` afterwards (restore
     ///   saved chat) and emits `Loaded conversation: '...'`.
-    ///
-    /// *(simplicity is the key — switching models is one operation
-    /// regardless of trigger)*
-    #[allow(clippy::too_many_arguments)]
-    async fn rebuild_agent_for_resolved(
-        requested: &ResolvedModel,
+    async fn rebuild_agent(
+        model: &ResolvedModel,
         agent_slot: &mut Arc<DynAgent>,
-        config: &mut Config,
         sm_for_provider: &Arc<StateManager>,
         session_hook_cell: &SharedSessionHook,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         state_manager: &Option<Arc<StateManager>>,
-        ctx: &mut RebuildContext,
+        ctx: &RebuildContext,
     ) -> Result<(), String> {
-        // The conversation's selection decides everything downstream: which
-        // model the orchestrator runs on, which roster `delegate` exposes, and
-        // which prompt recipe applies. Cloned (cheap — Arc'd registry) because
-        // `ctx` is mutated below.
-        let active: Option<crate::pipeline::ResolvedPipeline> = sm_for_provider
-            .selected_pipeline()
-            .and_then(|name| ctx.pipelines.get(&name).cloned());
-        let resolved = match &active {
-            Some(pipeline) => &pipeline.orchestrator,
-            None => requested,
-        };
+        use crate::tools::env::{ToolEnv, delegate_enabled};
 
-        // Validate compaction model *before* mutating any state. When
-        // compaction is enabled, a construction failure is fatal for the
-        // switch — bail early with an honest error rather than silently
-        // degrading.  See unfuck-compact.md Layer 1.
-        let context_size = resolved.context_size;
-        let compaction_model = if config.context.enabled {
-            let model = crate::providers::create_compaction_model(
-                &resolved.provider_config,
-                config.context.compaction_model.as_deref(),
+        let general = &ctx.config.general;
+
+        // Validate the compaction model *before* mutating any state, so a
+        // failure leaves the previous agent fully intact. See
+        // unfuck-compact.md Layer 1.
+        let compaction_model = compaction_model_for(model, &general.context).map_err(|e| {
+            format!(
+                "compaction model unavailable for `{}`: {e} — \
+                 set general.context.enabled=false to switch without compaction",
+                model.alias
             )
-            .map_err(|e| {
-                format!(
-                    "compaction model unavailable for `{}`: {e} — \
-                     set context.enabled=false to switch without compaction",
-                    resolved.alias
-                )
-            })?;
-            Some(Arc::new(model))
-        } else {
-            crate::providers::create_compaction_model(
-                &resolved.provider_config,
-                config.context.compaction_model.as_deref(),
-            )
-            .ok()
-            .map(Arc::new)
-        };
+        })?;
 
-        // Rebuild MCP tool list from the long-lived handles. McpTool
-        // implements Clone (rig 0.33), so we get a fresh Vec without
-        // restarting any subprocess. See agents.md / multi-model.md.
-        // Grouped per server so the active profile's `mcp_servers:` gate
-        // can filter by server name — a runtime `/profile` switch changes
-        // the rebuilt agent's MCP toolset (boot does the same).
-        let mcp_tools: Option<Vec<Box<dyn rig_core::tool::ToolDyn>>> = if ctx.mcp_handles.is_empty()
-        {
-            None
-        } else {
-            let groups: Vec<(String, Vec<Box<dyn rig_core::tool::ToolDyn>>)> = ctx
-                .mcp_handles
-                .iter()
-                .map(|h| {
-                    (
-                        h.name().to_string(),
-                        h.tools()
-                            .iter()
-                            .cloned()
-                            .map(|t| Box::new(t) as Box<dyn rig_core::tool::ToolDyn>)
-                            .collect(),
-                    )
-                })
-                .collect();
-            Some(mcp_tools_for_profile(
-                groups,
-                config.active_mcp_server_filter(),
-            ))
-        };
-
-        // `delegate` is registered iff a pipeline is selected, and it exposes
-        // exactly that team's roster. Gating here — the single rebuild seam —
-        // keeps every path (`/model`, `/cd`, `/load`, `/new`, `/pipeline`)
-        // honouring the selection without duplicating the rule.
-        let boot_registry = active.as_ref().map(|p| p.registry.as_ref());
-
-        // Recompute the prompt here — the single seam — so the orchestrator
-        // framing always tracks the current selection and cwd. A team's own
-        // `orchestrator.persona` replaces the global persona for it
-        // (amendment 1), unless the config pins a full `system_prompt:`.
-        let head = resolve_prompt_head(
-            ctx.prompt_head.as_ref(),
-            active
-                .as_ref()
-                .and_then(|p| p.orchestrator_persona.as_deref()),
-        );
-        ctx.system_prompt = build_system_prompt(
+        let system_prompt = rebuild_agent_for_resolved(
+            model,
+            &ctx.bound,
             &ctx.skills,
-            ctx.shell_kind.as_ref(),
+            ctx.shell_kind.clone(),
             &sm_for_provider.session_cwd(),
-            ctx.memory_enabled,
-            ctx.agents_md_enabled,
-            active.is_some(),
-            active
-                .as_ref()
-                .and_then(|p| p.orchestrator_prompt.as_deref()),
-            head.as_ref(),
-        );
+        )?;
+
+        // Rebuilt per call from the long-lived MCP handles (no subprocess
+        // restarts); the vector store reuses the process-wide DB handle.
+        let tool_env = Arc::new(ToolEnv::for_profile(
+            &ctx.config,
+            &ctx.bound.profile,
+            &ctx.mcp_handles,
+        ));
+        let agent = ctx.bound.agent();
+        let delegate = delegate_enabled(agent).then(|| {
+            Arc::new(SubAgentDeps {
+                bound: ctx.bound.clone(),
+                tool_env: Arc::clone(&tool_env),
+                state_manager: Arc::clone(sm_for_provider),
+                shell_kind: ctx.shell_kind.clone(),
+                skills: ctx.skills.clone(),
+                event_sink: None,
+                retry: general.retry.clone(),
+            })
+        });
 
         let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
-            &resolved.provider_config,
-            mcp_tools,
-            &ctx.system_prompt,
-            ctx.searxng_config.as_ref(),
-            ctx.max_turns,
+            model,
+            &system_prompt,
+            &tool_env,
+            &agent.main,
+            delegate,
             ctx.todo_tool.clone(),
-            &ctx.bash_config,
-            &ctx.tools_filter,
-            boot_registry,
-            sm_for_provider.clone(),
+            Arc::clone(sm_for_provider),
             ctx.shell_kind.as_ref(),
-            ctx.vector_store.as_ref(),
-            &ctx.skills,
-            config.retry(),
-            config.timeouts(),
-            ctx.agents_md_enabled,
-            config.fetch_url(),
         )
-        .map_err(|e| format!("failed to build agent for `{}`: {e}", resolved.alias))?;
+        .map_err(|e| format!("failed to build agent for `{}`: {e}", model.alias))?;
 
         // Thread the resolved reasoning gates into the shared StateManager
-        // (single seam for `/model`, `/cd`, `/load`, `/new`, `/pipeline`).
-        // The wire gate is provider-name AND preserve_reasoning: a Claude
-        // transcript must stop replaying `Reasoning` the moment a foreign
-        // provider owns the wire. The display gate mirrors the resolved
-        // provider/model `display_reasoning` override.
+        // (single seam for every rebuild verb). The wire gate is
+        // provider-name AND preserve_reasoning: a Claude transcript must stop
+        // replaying `Reasoning` the moment a foreign provider owns the wire.
+        // The display gate mirrors the resolved provider/model
+        // `display_reasoning` override.
         //
-        // Sub-agents share this StateManager but never touch these gates
+        // Subagents share this StateManager but never touch these gates
         // (`build_sub_agent` produces no `ProviderInfo`): the gates describe
-        // the *orchestrator's* wire, which is the only history rebuilt from
-        // this state — a sub-agent runs on a fresh, lane-filtered history.
+        // the *main agent's* wire, which is the only history rebuilt from
+        // this state — a subagent runs on a fresh, lane-filtered history.
         sm_for_provider
             .set_wire_reasoning(new_info.name == "anthropic" && new_info.preserve_reasoning);
         sm_for_provider.set_display_reasoning(new_info.display_reasoning);
@@ -2890,31 +2658,27 @@ impl AgentRunner {
         }
         *agent_slot = Arc::new(new_agent);
 
-        // Update Config so subsequent reads of provider/model see the
-        // new values. We swap the active provider; everything else
-        // (mcp_servers, searxng, context, retry, …) stays put.
-        config.provider = resolved.provider_config.clone();
-
         // Keep the welcome banner's model-scoped fields in sync so live
         // Views (web banner) show the model just switched to, not the
         // boot model. TUI's banner is a static string — unaffected.
         sm_for_provider.update_welcome_for_model(
-            resolved.provider_name.clone(),
-            resolved.model_name.clone(),
-            config.max_tokens() as usize,
+            model.provider_name.clone(),
+            model.model_name.clone(),
+            model.provider_config.max_tokens() as usize,
+            crate::config::cost_tracking_enabled(general.cost_tracking, model),
         );
 
         // Re-init the context manager with the pre-validated compaction
         // model so compaction thresholds match the new context window.
         let cm = ContextManager::new(
-            config.context.clone(),
-            context_size,
+            general.context.clone(),
+            model.context_size,
             compaction_model.clone(),
         );
         sm_for_provider.init_context_manager(cm);
         // The title model is the same as the compaction model — reuse the Arc
-        if let Some(model) = compaction_model {
-            sm_for_provider.init_title_model(model);
+        if let Some(compaction) = compaction_model {
+            sm_for_provider.init_title_model(compaction);
         }
 
         // Restart the event-processor task on the new receiver. The
@@ -2955,9 +2719,8 @@ impl AgentRunner {
     /// and a no-op rebuild is the silent normal case.
     #[allow(clippy::too_many_arguments)]
     async fn maybe_rebuild_after_load(
-        selection_before: Option<String>,
+        selection_before: Option<crate::config::Selection>,
         agent_slot: &mut Arc<DynAgent>,
-        config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
@@ -3080,7 +2843,11 @@ impl AgentRunner {
         // conversation's saved wire id is the target.
         let resolved = match active_orchestrator {
             Some(orchestrator) => orchestrator,
-            None => match ctx.registry.find_by_wire_id(&saved_provider, &saved_model) {
+            None => match ctx
+                .config
+                .registry
+                .find_by_wire_id(&saved_provider, &saved_model)
+            {
                 Some(rm) => rm.clone(),
                 // /load already emitted the unavailability error — and yet
                 // somehow the slot got swapped. Defensive: do nothing.
@@ -3088,10 +2855,9 @@ impl AgentRunner {
             },
         };
         let sm_for_provider = sm.clone();
-        if let Err(e) = Self::rebuild_agent_for_resolved(
+        if let Err(e) = Self::rebuild_agent(
             &resolved,
             agent_slot,
-            config,
             &sm_for_provider,
             session_hook_cell,
             event_processor,
@@ -3118,10 +2884,8 @@ impl AgentRunner {
     /// No-op when the registry/state manager isn't available. If the
     /// active alias was removed from config, the rebuild is skipped and
     /// the session keeps running on the previous agent.
-    #[allow(clippy::too_many_arguments)]
     async fn refresh_agent_after_new(
         agent_slot: &mut Arc<DynAgent>,
-        config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
@@ -3132,23 +2896,10 @@ impl AgentRunner {
         let sm_arc = sm.clone();
 
         // `/new` already reset to a fresh conversation before this runs, so
-        // reload/skill warnings are safe to surface immediately. The
-        // reconciler runs right after the reload — the fresh conversation
-        // is zero-turn, so the `set_selected_pipeline(None)` write targets
-        // it (invariant I-3) — and the rebuild then sees the cleared
-        // selection.
-        // `create_conversation` carried the profile over, like the pipeline.
-        let profile = ctx.effective_profile(sm);
-        let mut reload_warnings = Self::reload_session_config(
-            config,
-            ctx,
-            &sm_arc,
-            &sm.session_cwd(),
-            profile.as_deref(),
-        );
-        if let Some(warning) = reconcile_pipeline_selection(ctx, sm) {
-            reload_warnings.push(warning);
-        }
+        // reload/skill warnings are safe to surface immediately. The fresh
+        // conversation is zero-turn, so the reload re-resolves the carried
+        // `(profile, agent)` in the fresh catalog (spec §6.7 step 6).
+        let reload_warnings = Self::reload_session_config(ctx, &sm_arc, &sm.session_cwd());
         for warning in reload_warnings {
             sm.add_system_message(warning);
         }
@@ -3157,10 +2908,12 @@ impl AgentRunner {
         // the active alias; fall back to the wire id. A removed alias
         // means the model vanished from config — keep the old agent.
         let Some(resolved) = ctx
+            .config
             .registry
             .resolve(&sm.get_model_alias())
             .or_else(|| {
-                ctx.registry
+                ctx.config
+                    .registry
                     .find_by_wire_id(&sm.get_provider_name(), &sm.get_model())
             })
             .cloned()
@@ -3168,10 +2921,9 @@ impl AgentRunner {
             return;
         };
 
-        if let Err(e) = Self::rebuild_agent_for_resolved(
+        if let Err(e) = Self::rebuild_agent(
             &resolved,
             agent_slot,
-            config,
             &sm_arc,
             session_hook_cell,
             event_processor,
@@ -3440,22 +3192,23 @@ impl AgentRunner {
                         }
                         return CompletionResult::Error;
                     }
-                    if retry_count >= config.retry().max_retries {
+                    if retry_count >= config.general.retry.max_retries {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
                             sm.add_system_message(format!(
                                 "❌ LLM request failed after {} retries: {}",
-                                config.retry().max_retries,
+                                config.general.retry.max_retries,
                                 crate::ui::app_state::truncate_str(&e.to_string(), 2000)
                             ));
                         }
                         return CompletionResult::Error;
                     }
-                    let delay = crate::providers::retry::backoff_delay(retry_count, config.retry());
+                    let delay =
+                        crate::providers::retry::backoff_delay(retry_count, &config.general.retry);
                     tracing::warn!(
                         target: "peakbot",
                         attempt = retry_count + 1,
-                        max_retries = config.retry().max_retries,
+                        max_retries = config.general.retry.max_retries,
                         backoff_ms = delay.as_millis(),
                         error = %e,
                         "LLM request failed transiently; backing off before retry"
@@ -3464,7 +3217,7 @@ impl AgentRunner {
                         sm.set_status(Some(format!(
                             "Retrying (attempt {}/{}) after {:.1}s…",
                             retry_count + 1,
-                            config.retry().max_retries,
+                            config.general.retry.max_retries,
                             delay.as_secs_f64()
                         )));
                     }
@@ -3724,14 +3477,6 @@ impl AgentRunner {
                         Some(mut list) => {
                             list.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
                             let current_id = sm.get_current_conversation_id();
-                            // Build the registry once for the whole listing
-                            // so each row's availability tag is a cheap
-                            // hash lookup. If no providers list is
-                            // declared, registry is empty and *every*
-                            // saved alias is treated as unknown — which
-                            // is correct: legacy single-provider boot
-                            // can't reactivate any specific saved model.
-                            let registry = config.build_model_registry().ok();
                             let mut msg = format!("Saved conversations ({}):\n", list.len());
                             for (idx, c) in list.iter().enumerate() {
                                 let n = idx + 1;
@@ -3745,11 +3490,10 @@ impl AgentRunner {
                                 // — the stable persistence key.
                                 // Aliases are NOT consulted (they're
                                 // mutable user handles).
-                                let resolved = registry
-                                    .as_ref()
-                                    .and_then(|r| r.find_by_wire_id(&c.provider_name, &c.model));
-                                let model_tag = match (resolved, &registry) {
-                                    (Some(r), _) => {
+                                let resolved =
+                                    config.registry.find_by_wire_id(&c.provider_name, &c.model);
+                                let model_tag = match resolved {
+                                    Some(r) => {
                                         // Show the current alias as a
                                         // hint next to the wire id —
                                         // helps the user spot which
@@ -3757,7 +3501,7 @@ impl AgentRunner {
                                         // re-activate.
                                         format!("{} · {}/{}", r.alias, c.provider_name, c.model)
                                     }
-                                    (None, Some(_)) => {
+                                    None => {
                                         let display_id = if c.provider_name.is_empty() {
                                             // Pre-v5 file with no
                                             // provider_name on disk.
@@ -3766,17 +3510,6 @@ impl AgentRunner {
                                             format!("{}/{}", c.provider_name, c.model)
                                         };
                                         format!("{display_id} ⚠ unavailable")
-                                    }
-                                    (None, None) => {
-                                        // No registry attached at all
-                                        // (legacy single-provider
-                                        // boot). Show the wire id as
-                                        // the only honest handle.
-                                        if c.provider_name.is_empty() {
-                                            c.model.clone()
-                                        } else {
-                                            format!("{}/{}", c.provider_name, c.model)
-                                        }
                                     }
                                 };
                                 msg.push_str(&format!(
@@ -3897,19 +3630,10 @@ impl AgentRunner {
                         chrono::Local::now().format("%Y-%m-%d %H:%M")
                     );
                     // Read the active wire identity from AppState — set
-                    // at boot and refreshed on every `/model` switch, so
-                    // it always matches the running agent. Falls back to
-                    // the config wire id with empty provider for legacy
-                    // single-provider boots that never stamped state.
+                    // at boot and refreshed on every rebuild, so it always
+                    // matches the running agent.
                     let provider_name = sm.get_provider_name();
-                    let model = {
-                        let m = sm.get_model();
-                        if m.is_empty() {
-                            config.model().to_string()
-                        } else {
-                            m
-                        }
-                    };
+                    let model = sm.get_model();
                     sm.create_conversation(
                         name,
                         provider_name,
@@ -3961,10 +3685,9 @@ impl AgentRunner {
                             return;
                         }
                     };
-                    let registry = config.build_model_registry().ok();
-                    let resolved = registry
-                        .as_ref()
-                        .and_then(|r| r.find_by_wire_id(&saved_provider, &saved_model))
+                    let resolved = config
+                        .registry
+                        .find_by_wire_id(&saved_provider, &saved_model)
                         .cloned();
                     // We only consult `resolved` as an availability
                     // check here — the actual stamping of display
@@ -4101,15 +3824,7 @@ impl AgentRunner {
                     tracing::warn!("State manager not available for /model command");
                     return;
                 };
-                let registry = match config.build_model_registry() {
-                    Ok(reg) => reg,
-                    Err(e) => {
-                        sm.add_system_message(format!(
-                            "❌ /model: model registry not configured: {e}"
-                        ));
-                        return;
-                    }
-                };
+                let registry = &config.registry;
                 let aliases = registry.aliases_sorted();
                 if aliases.is_empty() {
                     sm.add_system_message(
@@ -4119,34 +3834,17 @@ impl AgentRunner {
                     return;
                 }
                 let current = sm.get_model_alias();
-                // A selected pipeline owns the orchestrator's model, so mark
-                // the fixed alias and swap the "how to switch" footer for the
-                // reason it can't be switched.
-                let locked_by = sm.selected_pipeline();
                 let mut msg = String::from("Available models:\n");
                 for alias in &aliases {
                     let arrow = if &current == alias { "→ " } else { "  " };
                     if let Some(resolved) = registry.resolve(alias) {
-                        let marker = match &locked_by {
-                            Some(pipeline) if &current == alias => {
-                                format!("  [fixed by pipeline '{pipeline}']")
-                            }
-                            _ => String::new(),
-                        };
                         msg.push_str(&format!(
-                            "{arrow}{alias}  ({} · {}){marker}\n",
+                            "{arrow}{alias}  ({} · {})\n",
                             resolved.provider_name, resolved.model_name
                         ));
                     }
                 }
-                match locked_by {
-                    Some(pipeline) => {
-                        msg.push_str(&format!("\n{}", model_locked_message(&pipeline)))
-                    }
-                    None => {
-                        msg.push_str("\nUse /model <alias> to switch (starts a new conversation).")
-                    }
-                }
+                msg.push_str("\nUse /model <alias> to switch (starts a new conversation).");
                 sm.add_system_message(msg);
             }
             _ if cmd_lower.starts_with("/model ") => {
@@ -4156,17 +3854,11 @@ impl AgentRunner {
                 // test harness) — emit a helpful diagnostic instead
                 // of silent inertness.
                 if let Some(sm) = state_manager {
-                    match sm.selected_pipeline() {
-                        Some(pipeline) => sm.add_system_message(format!(
-                            "❌ /model: {}",
-                            model_locked_message(&pipeline)
-                        )),
-                        None => sm.add_system_message(
-                            "❌ /model: not available in this build. Configure a `providers:` \
-                             block in config.yaml and restart. See `multi-model.md`."
-                                .to_string(),
-                        ),
-                    }
+                    sm.add_system_message(
+                        "❌ /model: not available in this build. Configure a `providers:` \
+                         block in config.yaml and restart. See `multi-model.md`."
+                            .to_string(),
+                    );
                 }
             }
             _ if cmd_lower.trim_end() == "/pipeline" => {
@@ -4645,13 +4337,11 @@ async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
 pub async fn load_mcp_servers(config: &Config) -> Result<Vec<McpServerHandle>> {
     let mut handles = Vec::new();
 
-    let servers = match &config.mcp_servers {
-        Some(servers) => servers,
-        None => {
-            tracing::info!("No MCP servers configured");
-            return Ok(Vec::new());
-        }
-    };
+    let servers = &config.mcps;
+    if servers.is_empty() {
+        tracing::info!("No MCP servers configured");
+        return Ok(Vec::new());
+    }
 
     for server_config in servers {
         if !server_config.enabled {

@@ -888,21 +888,23 @@ impl StateManager {
     }
 
     /// Refresh the welcome banner's model-scoped fields after a `/model`
-    /// switch or `/load` rebuild. Only provider/model/max_tokens change
-    /// across a model swap — the rest (tool counts, skills) is
-    /// session-wide. Broadcasts so live Views (web banner) re-render;
-    /// no-op if the welcome banner was never set.
+    /// switch or `/load` rebuild. Only provider/model/max_tokens and cost
+    /// tracking (OpenRouter-only) change across a model swap — the rest
+    /// (tool counts, skills) is session-wide. Broadcasts so live Views (web
+    /// banner) re-render; no-op if the welcome banner was never set.
     pub fn update_welcome_for_model(
         &self,
         provider_name: String,
         model: String,
         max_tokens: usize,
+        cost_tracking_enabled: bool,
     ) {
         let mut state = self.state.write().unwrap();
         if let Some(w) = state.welcome.as_mut() {
             w.provider_name = provider_name;
             w.model = model;
             w.max_tokens = max_tokens;
+            w.cost_tracking_enabled = cost_tracking_enabled;
             self.notify_update(&state);
         }
     }
@@ -3541,12 +3543,14 @@ mod tests {
             "openrouter".to_string(),
             "anthropic/claude-opus-4".to_string(),
             16384,
+            false,
         );
 
         let w = sm.get_state().welcome.expect("welcome set");
         // Model-scoped fields reflect the switch.
         assert_eq!(w.model, "anthropic/claude-opus-4");
         assert_eq!(w.max_tokens, 16384);
+        assert!(!w.cost_tracking_enabled);
         // Session-wide fields are preserved.
         assert_eq!(w.skills_count, 5);
         assert_eq!(w.mcp_tools_count, 2);
@@ -3556,7 +3560,7 @@ mod tests {
     fn test_update_welcome_for_model_noop_when_unset() {
         let sm = StateManager::new();
         // No welcome set yet — must not panic and must stay None.
-        sm.update_welcome_for_model("p".to_string(), "m".to_string(), 1);
+        sm.update_welcome_for_model("p".to_string(), "m".to_string(), 1, false);
         assert!(sm.get_state().welcome.is_none());
     }
 

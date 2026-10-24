@@ -34,7 +34,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time;
 
 use crate::PEAKBOT_VERSION;
-use crate::model_locked_message;
 use crate::state::StateManager;
 use crate::ui::ChatMessage;
 use crate::ui::app_state::{AppState, ChatState, PauseState, SubAgentRun};
@@ -1428,16 +1427,6 @@ impl ReplUi {
         let alias = rest.trim();
         if alias.is_empty() {
             return false; // treat as bare `/model`
-        }
-        // The bound agent owns the conversation's model — refuse before the
-        // confirm dialog, so the user isn't asked to approve a reset that the
-        // controller would then reject anyway. (Temporary: the model lock is
-        // deleted in T8a with `model_locked_message`.)
-        let sel = self.state_manager.selection();
-        if !sel.agent.is_empty() {
-            self.state_manager
-                .add_system_message(format!("❌ /model: {}", model_locked_message(&sel.agent)));
-            return true;
         }
         let Some(registry) = self.model_registry.clone() else {
             // No registry attached — let the controller handle it.

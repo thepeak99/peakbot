@@ -260,6 +260,20 @@ impl Default for ProviderConfig {
     }
 }
 
+impl ProviderConfig {
+    /// The completion token cap shown in the welcome banner. Ollama has no
+    /// equivalent setting, so it reports the 0.23 fixed value.
+    pub fn max_tokens(&self) -> u64 {
+        match self {
+            ProviderConfig::OpenRouter(c) => c.max_tokens,
+            ProviderConfig::OpenAI(c) => c.max_tokens,
+            ProviderConfig::Anthropic(c) => c.max_tokens,
+            ProviderConfig::LlamaCpp(c) => c.max_tokens,
+            ProviderConfig::Ollama(_) => 4096,
+        }
+    }
+}
+
 impl Default for OpenRouterConfig {
     fn default() -> Self {
         Self {
