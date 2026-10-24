@@ -604,3 +604,126 @@ export interface BadgeProps {
 //   `general-max-turns` → general.agent_max_turns; `general-cost-tracking`
 //     (Toggle → general.cost_tracking; absent reads true).
 // Only the ones named in general.test.tsx are pinned by a test.
+
+// ── ./system (T30) + desktop link (D8) ──────────────────────────────────
+// <SystemPane/> (module ./system, file system.tsx) — D7 (spec §9.10).
+// No props: reads `meta` via useSettingsCtx() (facts, global_path,
+// repo_path) and talks to /api/system/* with plain `fetch` (tests stub
+// globalThis.fetch; URL relative, JSON bodies carry
+// `content-type: application/json` — the server rejects anything else).
+//
+// facts.install is typed `unknown` in types.ts; the server's shape
+// (src/ui/web/settings.rs `install_info`) is
+//   { target: string, state: "current"|"other"|"absent",
+//     path: {status:"on_path"} | {status:"shadowed", by:string}
+//         | {status:"absent", hint:string} }
+// and it may be `null`/missing — the pane must not crash on that.
+//
+// Wire (src/ui/web/system.rs):
+//   GET    /api/system/service        → ServiceReport
+//   POST   /api/system/service  {op:"install"}   → ServiceReport
+//   DELETE /api/system/service        → ServiceReport
+//   POST   /api/system/install  {}               → InstallReport
+//   ServiceReport = { manager:"systemd-user"|"launchd-agent"|"windows-task"|
+//     "unsupported", name, artifact:string|null, installed:boolean,
+//     exe:string|null, run_state:"running"|"stopped"|"unknown", tls:boolean,
+//     survives_logout:boolean, commands:string[], notes:string[] }
+//   InstallReport = { source, target, action:"already_current"|"installed"|
+//     "replaced", path:{status:…}, notes:string[] }
+//   non-2xx → JSON {error:string} (e.g. 422 / 500); the pane shows it.
+// The pane GETs the service status once on mount. After a POST/DELETE it
+// shows the ServiceReport returned by that call (no extra GET required).
+// data-testids:
+//   `system-pane`
+//   `system-version`        — textContent contains facts.version
+//   `system-path-config`    — contains meta.global_path
+//   `system-path-repo`      — contains meta.repo_path
+//   `system-path-data`      — contains facts.data_dir
+//   `system-path-binary`    — contains facts.exe_path
+//   `system-path-install`   — contains facts.install.target (when present)
+//   `system-path-pill`      — /on PATH/i for on_path; /not on PATH/i for
+//                             absent (and shadowed → contains "shadow")
+//   `system-install`        — button "Install / Update binary" →
+//                             POST /api/system/install ({}); result lands in
+//   `system-install-result` — contains the report's `action` words
+//                             (e.g. "installed") and `target`
+//   `system-service-kind`   — contains ServiceReport.manager
+//   `system-service-installed` — /not installed/i when !installed, else
+//                             /installed/i without "not"
+//   `system-service-state`  — contains run_state ("running"/"stopped"/…)
+//   `system-service-enable` — "Enable at login"  → POST op:"install"
+//   `system-service-disable`— "Disable"          → DELETE
+//   `system-service-refresh`— "Refresh"          → GET
+//   `system-error`          — the `{error}` text of a failed call; absent
+//                             otherwise
+// NOT built: "Check for updates" (spec: omit in v1) — no such text anywhere.
+//
+// Desktop link (D8) lives in the Settings shell nav (Settings.tsx), not in a
+// pane: testid `nav-desktop-link`, text "Desktop app settings ↗", present
+// ONLY when isDesktop() (globalThis.isTauri === true), as the last MACHINE
+// item. Click → `window.location.href = "peakbot-desktop:settings"` (a
+// click HANDLER assignment — the shell's existing plain <a href> must be
+// replaced; tests observe the assignment, jsdom cannot navigate). It does
+// NOT change the active pane.
+// Nav buttons also get `nav-<section>` testids: nav-providers, nav-mcps,
+// nav-profiles, nav-general, nav-system, nav-raw.
+
+// ── ./raw (T31) + store additions (D9) ──────────────────────────────────
+// Store (store.ts) additions, per scope (ScopeState gains two fields):
+export interface RawError {
+  /** 1-based, from `yaml`'s error linePos. */
+  line: number;
+  col: number;
+  message: string;
+}
+export interface ScopeStateRawExt {
+  /** Last Raw edit failed to parse; null when it parsed (or no raw edit). */
+  rawError: RawError | null;
+  /**
+   * The comment-loss banner flag. Set by setDraft(scope, …) when the
+   * previous rawText was non-null (form edit AFTER a raw edit) OR the
+   * savedText of the scope contains YAML comments (first form edit on a
+   * commented file). Cleared by setSaved and discard. NOT cleared by
+   * further form edits. A raw edit alone never sets it.
+   */
+  rewriteWarning: boolean;
+}
+// store.setRaw(scope, text: string | null) now ALSO parses back:
+//   - text parses  → draftDoc = parse(text), rawText = text, rawError = null
+//   - syntax error → rawText = text, rawError = {line,col,message} (first
+//     error of the yaml Document), draftDoc UNCHANGED (last good parse)
+//   - null         → rawText = null, rawError = null (draftDoc kept)
+// store.setDraft clears rawText AND rawError. setSaved/discard reset
+// rawError = null, rewriteWarning = false. isDirty formula is unchanged.
+//
+// <RawPane/> (module ./raw, file raw.tsx) — controlled, props only:
+export interface RawPaneProps {
+  scope: Scope;
+  /** What the textarea shows. The shell computes it: rawText ?? (dirty ?
+   *  stringify(draftDoc) : savedText). Verbatim — no trimming. */
+  text: string;
+  error: RawError | null;
+  /** Every keystroke (textarea input event) → shell calls store.setRaw. */
+  onChange(text: string): void;
+  /** Textarea blur → shell validates (spec §9.6 "Raw YAML blur"). */
+  onBlur?(): void;
+}
+// data-testids:
+//   `raw-pane`
+//   `raw-banner`  — "Advanced: unknown keys are rejected at boot…" (repo
+//                   scope text additionally contains "only contain profiles:")
+//   `raw-text`    — the <textarea>; .value === props.text
+//   `raw-error`   — ONLY while error != null; text is exactly
+//                   `line ${line}, col ${col}: ${message}`
+// Shell (Settings.tsx) wiring pinned by raw.test.tsx:
+//   - nav `nav-raw` shows RawPane with the scope's text (see RawPaneProps.text).
+//   - rawError != null ⇒ the SaveBar Save button is DISABLED
+//     (`saveBlocked` prop below), clicking it never PUTs, and the shell does
+//     not call validate with the broken text.
+//   - rewriteWarning ⇒ a `rewrite-banner` element, shown above every FORM
+//     pane (not on Raw / System), with EXACTLY (spec §9.0):
+//       "Form edits rewrite the file in normalized YAML — comments and anchors are lost."
+//     (NB: the task brief paraphrased this as "form edits rewrite the file
+//     and may drop comments"; the spec text above is the contract.)
+// SaveBar gains: saveBlocked?: boolean — when true `savebar-save` has the
+// `disabled` attribute and onSave is never called.

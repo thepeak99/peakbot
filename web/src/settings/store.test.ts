@@ -55,8 +55,13 @@ describe("store", () => {
     store.setRaw("global", GLOBAL_TEXT + "\ngeneral:\n  cost_tracking: false\n");
     expect(store.isDirty("global")).toBe(true);
 
-    // Clearing the raw text falls back to the doc comparison (clean).
+    // Clearing the raw text falls back to the doc comparison. Since T31 a
+    // valid Raw edit parsed back into the draft (contract: null keeps
+    // draftDoc), so the draft still differs from saved = dirty ...
     store.setRaw("global", null);
+    expect(store.isDirty("global")).toBe(true);
+    // ... and discard returns to clean.
+    store.discard("global");
     expect(store.isDirty("global")).toBe(false);
   });
 

@@ -30,6 +30,8 @@ import { McpsPane } from "./mcp";
 import { ProfilesPane, ProfilePage } from "./profiles";
 import { AgentPage } from "./agent";
 import { GeneralPane } from "./general";
+import { SystemPane } from "./system";
+import { RawPane } from "./raw";
 import { copyToRepoName } from "./profileOps";
 import { Crumbs } from "./widgets";
 import { ToastProvider, useToast } from "./Toast";
@@ -192,6 +194,8 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   async function validate() {
     if (!store.isDirty(scope)) return;
     const st = store.state();
+    // Never send broken Raw text; the inline syntax error is the feedback.
+    if (st.rawError) return;
     const text = st.rawText ?? stringify(st.draftDoc);
     try {
       const res = await validateConfig(scope, text, convo ?? undefined);
@@ -209,6 +213,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
 
   async function save() {
     const st = store.state();
+    if (st.rawError) return;
     const text = st.rawText ?? stringify(st.draftDoc);
     setSaving(true);
     setStaleMsg(null);
@@ -243,6 +248,14 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
     const doc = store.state().draftDoc;
     set(doc, path, value);
     store.setDraft(scope, doc);
+    setDraftVersion((v) => v + 1);
+    bump();
+  }
+
+  // Raw YAML keystroke: store.setRaw parses it back into the draft (or sets
+  // rawError and keeps the last good draft) and re-arms the validate debounce.
+  function editRaw(text: string) {
+    store.setRaw(scope, text);
     setDraftVersion((v) => v + 1);
     bump();
   }
@@ -314,6 +327,8 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const st = store.state();
   const dirty = store.isDirty(scope);
   const validateRes = st.validate;
+  // Raw pane text (contract): rawText ?? (dirty ? stringify(draft) : savedText).
+  const rawShown = st.rawText ?? (dirty ? stringify(st.draftDoc) : st.savedText);
   const allErrors: ConfigErr[] = validateRes && "errors" in validateRes ? validateRes.errors : [];
   const restartRequired: string[] =
     validateRes && "ok" in validateRes ? validateRes.restart_required : [];
@@ -408,6 +423,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
     return (
       <button
         key={item.id}
+        data-testid={`nav-${item.id}`}
         onClick={() => {
           setActive(item.id);
           if (item.id === "profiles") setProfileSel({ profile: null, agent: null });
@@ -546,12 +562,15 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
                   </div>
                 ))}
                 {g.group === "MACHINE" && desktop && (
-                  <a
-                    href="peakbot-desktop:settings"
-                    className="flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-xs text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
+                  <button
+                    data-testid="nav-desktop-link"
+                    onClick={() => {
+                      window.location.href = "peakbot-desktop:settings";
+                    }}
+                    className="flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
                   >
                     Desktop app settings ↗
-                  </a>
+                  </button>
                 )}
               </div>
             </div>
@@ -624,6 +643,16 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
             )}
           </div>
 
+          {/* Comment-loss banner (spec §9.0): above every FORM pane. */}
+          {st.rewriteWarning && active !== "raw" && active !== "system" && (
+            <div
+              data-testid="rewrite-banner"
+              className="mb-4 max-w-2xl rounded border border-amber-800/60 bg-amber-950/40 px-3 py-2 text-xs text-amber-300"
+            >
+              Form edits rewrite the file in normalized YAML — comments and anchors are lost.
+            </div>
+          )}
+
           {/* Section panes. Providers (T25), MCP servers (T26), the Profiles
               master-detail (T27/T27b/T28) and General (T29) are the real
               content; the remaining sections keep a neutral empty state
@@ -653,17 +682,16 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
             )
           ) : active === "general" ? (
             <GeneralPane />
+          ) : active === "system" ? (
+            <SystemPane />
           ) : (
-            <>
-              <p className="max-w-2xl text-xs text-zinc-500">{SECTIONS[active].desc}</p>
-              {active === "raw" && (
-                <p className="mt-2 max-w-2xl text-xs text-zinc-500">
-                  ⚠ Advanced: unknown keys are rejected at boot. Edits here replace the generated
-                  file on save.
-                  {scope === "repo" && " The repo file may only contain profiles:."}
-                </p>
-              )}
-            </>
+            <RawPane
+              scope={scope}
+              text={rawShown}
+              error={st.rawError}
+              onChange={editRaw}
+              onBlur={() => void validate()}
+            />
           )}
 
           {/* Validation errors for sections without a full set of red fields
@@ -712,6 +740,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           draftVersion={draftVersion}
           restartRequired={restartRequired}
           saving={saving}
+          saveBlocked={st.rawError !== null}
           stale={staleMsg !== null}
           staleMessage={staleMsg}
           onValidate={validate}

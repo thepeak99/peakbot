@@ -25,6 +25,8 @@ export interface SaveBarProps {
   /** Server-computed from the last validate; the client keeps no boot-only list. */
   restartRequired: string[];
   saving: boolean;
+  /** Raw YAML has a syntax error: Save is disabled (spec §9.11). */
+  saveBlocked?: boolean;
   /** 409 from the last PUT. */
   stale: boolean;
   staleMessage: string | null;
@@ -43,6 +45,7 @@ export function SaveBar({
   draftVersion,
   restartRequired,
   saving,
+  saveBlocked = false,
   stale,
   staleMessage,
   onValidate,
@@ -126,7 +129,8 @@ export function SaveBar({
           <button
             data-testid="savebar-save"
             onClick={onSave}
-            disabled={saving}
+            disabled={saving || saveBlocked}
+            title={saveBlocked ? "Fix the YAML syntax error first" : undefined}
             className="cursor-pointer rounded bg-emerald-700 px-4 py-1 text-xs font-medium text-white hover:bg-emerald-600 disabled:cursor-default disabled:opacity-60"
           >
             {saving ? "Saving…" : "Save"}
