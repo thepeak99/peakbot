@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use semver::Version;
 
-use crate::consts::SERVICE_PORT;
 use crate::phase::Dialog;
 use crate::settings::{Protocol, Settings};
 use crate::sys::RunOutput;
@@ -69,19 +68,11 @@ pub fn status_args() -> [&'static str; 2] {
     ["service", "status"]
 }
 
-/// `["service","install","--bind","{host}:7823"]` + `["--tls"]` when
-/// https. The token never appears in argv (I7).
-pub fn service_install_args(s: Settings) -> Vec<String> {
-    let mut args = vec![
-        "service".to_string(),
-        "install".to_string(),
-        "--bind".to_string(),
-        format!("{}:{}", s.bind_host(), SERVICE_PORT),
-    ];
-    if s.protocol() == Protocol::Https {
-        args.push("--tls".to_string());
-    }
-    args
+/// `["service","install"]` — bare, no `--bind`, no `--tls` (spec §8.4:
+/// the unit reads `general.web` at every start, so a Settings edit plus
+/// a restart applies). The token never appears in argv (I7).
+pub fn service_install_args() -> Vec<String> {
+    vec!["service".to_string(), "install".to_string()]
 }
 
 pub fn service_uninstall_args() -> [&'static str; 2] {
@@ -992,47 +983,8 @@ mod tests {
                 "saved {saved:?}, tls {tls}"
             );
         }
-        // And the `service install` argv of each result (SC6): the
-        // protocol flag follows the TLS line, the bind per A4, and the
-        // token never appears in argv (I7).
-        assert_eq!(
-            service_install_args(cases[0].2),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string(),
-                "--tls".to_string(),
-            ]
-        );
-        assert_eq!(
-            service_install_args(cases[1].2),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string(),
-            ]
-        );
-        assert_eq!(
-            service_install_args(cases[2].2),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "0.0.0.0:7823".to_string(),
-                "--tls".to_string(),
-            ]
-        );
-        assert_eq!(
-            service_install_args(cases[3].2),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string(),
-            ]
-        );
+        // (T15a: the `service_install_args` argv assertions moved to
+        // `service_install_args_bare` — the install is now bare.)
     }
 
     // §9.1 case 15.
@@ -1070,46 +1022,28 @@ mod tests {
         assert_eq!(d.cancel.as_deref(), Some("Keep current"));
     }
 
-    // §9.1 case 16 (updated for #377: `service_install_args` takes the
-    // settings — 3 exact variants).
+    // §9.1 case 16 (T15a: `service_install_args` is now bare — see
+    // `service_install_args_bare`).
     #[test]
     fn t16_arg_builders_are_exact() {
-        use crate::settings::{Protocol, Settings};
         assert_eq!(status_args(), ["service", "status"]);
-        assert_eq!(
-            service_install_args(Settings::default()),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string()
-            ]
-        );
-        assert_eq!(
-            service_install_args(Settings::Loopback {
-                protocol: Protocol::Https,
-                token: true
-            }),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string(),
-                "--tls".to_string()
-            ]
-        );
-        assert_eq!(
-            service_install_args(Settings::Remote),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "0.0.0.0:7823".to_string(),
-                "--tls".to_string()
-            ]
-        );
         assert_eq!(service_uninstall_args(), ["service", "uninstall"]);
         assert_eq!(install_args(), ["install"]);
+    }
+
+    // T15a (0.24 config, spec §8.4): `service install` with NO web flags —
+    // no `--bind`, no `--tls`. The unit reads `general.web` at every start,
+    // so a Settings edit plus a restart applies. The token never appears in
+    // argv (I7). ASSUMED new signature:
+    // `pub fn service_install_args() -> Vec<String>` (the old `Settings`
+    // form is deleted by T15b).
+    #[test]
+    fn service_install_args_bare() {
+        assert_eq!(
+            service_install_args(),
+            vec!["service".to_string(), "install".to_string()],
+            "bare `service install`; no --bind/--tls, token never in argv"
+        );
     }
 
     // Design #377 t71: the `TLS:` status line (added by #375) is the

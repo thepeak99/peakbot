@@ -1,26 +1,23 @@
 //! Session sidecar helpers (DESIGN §5.2).
 
-use crate::settings::{Protocol, Settings};
-use crate::token::Token;
-
-/// `["--bind", "{bind_host}:{port}"]` + `["--tls"]` when https. The
-/// bind host comes from the settings (remote ⇒ 0.0.0.0).
-pub fn session_args(port: u16, s: Settings) -> Vec<String> {
-    let mut args = vec!["--bind".to_string(), format!("{}:{}", s.bind_host(), port)];
-    if s.protocol() == Protocol::Https {
-        args.push("--tls".to_string());
-    }
-    args
+/// The session child's argv (spec §8.4): empty — no `--bind`, no
+/// `--tls`, no `--token`. The child reads `general.web` from
+/// config.yaml itself (single source of truth).
+pub fn session_args() -> Vec<String> {
+    Vec::new()
 }
 
-/// `[("PEAKBOT_WEB_TOKEN", tok)]?` + `("PEAKBOT_NO_OPEN", "1")` — exactly
-/// these (on top of the sanitized base env). No token ⇒ no
-/// `PEAKBOT_WEB_TOKEN` at all.
-pub fn session_env(token: Option<&Token>) -> Vec<(String, String)> {
-    let mut env = Vec::new();
-    if let Some(t) = token {
-        env.push(("PEAKBOT_WEB_TOKEN".to_string(), t.as_str().to_string()));
-    }
+/// The session child's env: the parent env with any inherited
+/// `PEAKBOT_WEB_TOKEN` REMOVED and `PEAKBOT_NO_OPEN=1` (spec §8.4) —
+/// so the server and the desktop read the same token from config.yaml.
+/// A pre-existing `PEAKBOT_NO_OPEN` is normalized to exactly `1`, once.
+pub fn session_env(parent_env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env = parent_env
+        .iter()
+        .filter(|(k, _)| k != "PEAKBOT_WEB_TOKEN")
+        .cloned()
+        .collect::<Vec<_>>();
+    env.retain(|(k, _)| k != "PEAKBOT_NO_OPEN");
     env.push(("PEAKBOT_NO_OPEN".to_string(), "1".to_string()));
     env
 }
@@ -102,46 +99,53 @@ pub fn tail_lines(text: &str, n: usize) -> String {
 mod tests {
     use super::*;
 
-    // §9.1 case 17 (updated for #377: args take `Settings` — bind host
-    // and `--tls` derive from it; env takes an optional token).
+    // T15a (0.24 config, spec §8.4): the session child is launched with
+    // NO web flags — no `--bind`, no `--tls`, no `--token`. The child
+    // reads `general.web` from config.yaml itself (single source of
+    // truth). ASSUMED new signature: `pub fn session_args() -> Vec<String>`
+    // (the old `(port, Settings)` form is deleted by T15b).
     #[test]
-    fn t17_session_args_and_env() {
-        use crate::settings::{Protocol, Settings};
+    fn session_argv_has_no_web_flags() {
         assert_eq!(
-            session_args(7824, Settings::default()),
-            vec!["--bind".to_string(), "127.0.0.1:7824".to_string()]
+            session_args(),
+            Vec::<String>::new(),
+            "no --bind/--tls/--token in argv; general.web is the source"
         );
-        assert_eq!(
-            session_args(
-                7824,
-                Settings::Loopback {
-                    protocol: Protocol::Https,
-                    token: true
-                }
+    }
+
+    // T15a (spec §8.4): the child env is the parent env with an inherited
+    // `PEAKBOT_WEB_TOKEN` REMOVED and `PEAKBOT_NO_OPEN=1` — so the server
+    // and the desktop read the same token from config.yaml. ASSUMED new
+    // signature: `pub fn session_env(parent_env: &[(String, String)])
+    // -> Vec<(String, String)>` (the old `Option<&Token>` form is deleted
+    // by T15b).
+    #[test]
+    fn env_strips_inherited_token() {
+        let parent = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            (
+                "PEAKBOT_WEB_TOKEN".to_string(),
+                "inherited-secret".to_string(),
             ),
-            vec![
-                "--bind".to_string(),
-                "127.0.0.1:7824".to_string(),
-                "--tls".to_string()
-            ],
-            "https ⇒ --tls after the bind"
+        ];
+        let env = session_env(&parent);
+        assert!(
+            !env.iter().any(|(k, _)| k == "PEAKBOT_WEB_TOKEN"),
+            "inherited PEAKBOT_WEB_TOKEN must be removed; got {env:?}"
         );
-        assert_eq!(
-            session_args(7824, Settings::Remote),
-            vec![
-                "--bind".to_string(),
-                "0.0.0.0:7824".to_string(),
-                "--tls".to_string()
-            ],
-            "remote ⇒ 0.0.0.0 bind + --tls"
+        assert!(
+            env.iter().any(|(k, v)| k == "PEAKBOT_NO_OPEN" && v == "1"),
+            "PEAKBOT_NO_OPEN=1 must be present; got {env:?}"
+        );
+        assert!(
+            env.iter().any(|(k, v)| k == "PATH" && v == "/usr/bin"),
+            "unrelated parent vars are kept; got {env:?}"
         );
 
-        let tok = Token::parse("s3cret").expect("parses");
-        let env = session_env(Some(&tok));
-        assert_eq!(env.len(), 2, "exactly the two vars; got {env:?}");
+        // No inherited token: PEAKBOT_NO_OPEN=1 on top of the parent.
+        let env = session_env(&[("PATH".to_string(), "/usr/bin".to_string())]);
         assert!(
-            env.iter()
-                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == "s3cret"),
+            !env.iter().any(|(k, _)| k == "PEAKBOT_WEB_TOKEN"),
             "got {env:?}"
         );
         assert!(
@@ -149,10 +153,20 @@ mod tests {
             "got {env:?}"
         );
 
-        // Token off: only PEAKBOT_NO_OPEN — no PEAKBOT_WEB_TOKEN at all.
+        // A pre-existing PEAKBOT_NO_OPEN is normalized to exactly "1"
+        // (once, no duplicates).
+        let env = session_env(&[("PEAKBOT_NO_OPEN".to_string(), "0".to_string())]);
         assert_eq!(
-            session_env(None),
-            vec![("PEAKBOT_NO_OPEN".to_string(), "1".to_string())]
+            env,
+            vec![("PEAKBOT_NO_OPEN".to_string(), "1".to_string())],
+            "PEAKBOT_NO_OPEN must be exactly 1, once; got {env:?}"
+        );
+
+        // Empty parent env.
+        assert_eq!(
+            session_env(&[]),
+            vec![("PEAKBOT_NO_OPEN".to_string(), "1".to_string())],
+            "empty parent ⇒ just PEAKBOT_NO_OPEN=1"
         );
     }
 

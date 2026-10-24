@@ -379,8 +379,8 @@ impl<S: Sys, U: Ui> Controller<S, U> {
 
             let spec = SpawnSpec {
                 program: self.paths.sidecar.clone(),
-                args: session::session_args(port, s),
-                extra_env: session::session_env(token.as_ref()),
+                args: session::session_args(),
+                extra_env: session::session_env(&std::env::vars().collect::<Vec<_>>()),
                 log: self.paths.session_log(),
             };
             let child = match self.sys.spawn(spec) {
@@ -467,10 +467,9 @@ impl<S: Sys, U: Ui> Controller<S, U> {
 
     fn connect_service(&mut self, start_first: bool) {
         self.set_phase(Phase::Starting(StartStep::ConnectingService));
-        let s = self.settings();
         let token = self.read_web_token();
         if start_first {
-            let args = service::service_install_args(s);
+            let args = service::service_install_args();
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             if let Err((command, output)) = self.run_sidecar_cmd(&args) {
                 return self.fail(StartError::ServiceCommandFailed { command, output });
@@ -572,23 +571,21 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     fn replace_service(&mut self) {
         let s = self.settings();
         self.sync_token(s);
-        self.swap_binary_and_reinstall(s);
+        self.swap_binary_and_reinstall();
     }
 
-    /// `LaunchPlan::AutoReplace` — silent: it reproduces the RUNNING
-    /// service (protocol from the `TLS:` line, A4) and never calls
-    /// `sync_token`, so the `web-token` file is untouched and the
-    /// `service install` argv carries no `--token` (I7).
+    /// `LaunchPlan::AutoReplace` — silent: never calls `sync_token`, so
+    /// the `web-token` file is untouched and the `service install` argv
+    /// carries no `--token` (I7).
     fn auto_replace_service(&mut self) {
-        let s = service::running_settings(self.settings(), self.installed_tls());
-        self.swap_binary_and_reinstall(s);
+        self.swap_binary_and_reinstall();
     }
 
     /// The shared replace sequence (A5): the binary copy runs FIRST, so
     /// a failed copy leaves the service and the old binary intact.
     /// `enable --now` doesn't restart a running unit, so the uninstall +
     /// install pair is still what restarts the service on the new binary.
-    fn swap_binary_and_reinstall(&mut self, s: Settings) {
+    fn swap_binary_and_reinstall(&mut self) {
         self.set_phase(Phase::Starting(StartStep::InstallingService));
         if let Err((command, output)) = self.run_sidecar_cmd(&service::install_args()) {
             return self.fail(StartError::ServiceCommandFailed { command, output });
@@ -601,7 +598,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             .run(&self.paths.sidecar, &service::service_uninstall_args());
 
         self.set_phase(Phase::Starting(StartStep::InstallingService));
-        let args = service::service_install_args(s);
+        let args = service::service_install_args();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         if let Err((command, output)) = self.run_sidecar_cmd(&args) {
             return self.fail(StartError::ServiceCommandFailed { command, output });
@@ -647,7 +644,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         self.set_phase(Phase::Starting(StartStep::InstallingService));
         let s = self.settings();
         self.sync_token(s);
-        let args = service::service_install_args(s);
+        let args = service::service_install_args();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         if let Err((command, output)) = self
             .run_sidecar_cmd(&service::install_args())
@@ -764,7 +761,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         self.set_phase(Phase::Starting(StartStep::InstallingService));
         let s = self.settings();
         self.sync_token(s);
-        let args = service::service_install_args(s);
+        let args = service::service_install_args();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         if let Err((command, output)) = self.run_sidecar_cmd(&args) {
             return self.fail(StartError::ServiceCommandFailed { command, output });
