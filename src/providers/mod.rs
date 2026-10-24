@@ -1982,8 +1982,8 @@ mod tests {
 
     // ── the consistency pin, tools surface ─────────────────────────────────
     //
-    // Companion to `config::tests::name_filter_semantics_are_identical_for_
-    // tools_skills_and_pipelines`. The tools surface consumes `NameFilter`
+    // Companion to the `tools_filter_*` / `skill_filter_*` tests in
+    // `config::tests`. The tools surface consumes `NameFilter`
     // through `add_builtin_tools`'s single filter seam:
     // `tools.retain(|t| tools_filter.allows(&t.name()))`. That function is
     // private to this module, so the pin's per-seam proof lives here: the

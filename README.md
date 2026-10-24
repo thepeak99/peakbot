@@ -55,7 +55,9 @@ make build-linux  # Linux x86_64 only
 ### Configuration
 
 Create `config.yaml` in your platform config directory
-(`~/.config/peakbot/` on Linux, `~/Library/Application Support/peakbot/` on macOS):
+(`~/.config/peakbot/` on Linux, `~/Library/Application Support/peakbot/` on
+macOS). It has **exactly four top-level blocks** — `providers`, `mcps`,
+`profiles`, `general` (unknown keys anywhere are a load error):
 
 ```yaml
 providers:
@@ -77,140 +79,88 @@ providers:
         alias: local
         temperature: 0.4
 
-default_model: sonnet
+profiles:
+  default:
+    agents:
+      main:
+        model: sonnet        # every agent names its own starting model — no default_model
+
+# mcps: [ … ]               # optional — MCP servers (boot-only)
+# general: { web: …, search: …, context: …, … }   # optional — all defaulted
 ```
 
-Or set the provider via environment variable:
+There is no `default_model`: the **first** profile is the default, the
+**first** agent in a profile is the default, and each agent's `model:` is its
+starting model (`/model` may switch it per conversation). Old 0.23 files are
+**auto-migrated on first start** — the original is kept as
+`config.yaml.pre-0.24`. The web UI's Settings screen (⚙ gear / Ctrl+,) edits
+the same file; on the very first run a guided setup walks you through it.
 
-```bash
-export PROVIDER='{"type":"openrouter","api_key":"sk-or-v1-xxx","model":"anthropic/claude-3.7-sonnet"}'
-```
+### Profiles & agents
 
-### Profiles
+A **profile** is a named working setup declared in the `profiles:` map (an
+ordered map — **the first entry is the default**): the tools, MCP access, env,
+memory and knowledge (vector DB) that its agents get. Each profile declares an
+ordered `agents:` map (again **first = default**); an **agent** is what you
+talk to — a starting `model:`, an optional `persona:`/`prompt:`, and optional
+`subagents:` (an agent without subagents is a plain single-agent setup).
 
-A **profile** is a named config overlay declared in the master config's
-`profiles:` map. It is applied **last** — after the per-repo
-`.peakbot/config.yaml` merge — and re-applied on every session-verb reload
-(`/cd`, `/new`, `/model`, `/load`), so it is a ceiling a checked-out repo
-cannot void. Profiles are master-config only; a `profiles:` block in a
-per-repo config is ignored with a boot warning.
+Selection is per conversation: `/profile <name>` and `/agent <name>` (web: the
+📁 chip in the composer). Both lock once the conversation has started; `/new`
+keeps the selection, and a fresh session starts at the first profile's first
+agent. Booting with `--profile <name>` **pins** a global profile — every
+conversation runs under it, `/profile` is refused, and repo files are ignored.
 
-A profile is chosen per conversation with `/profile <name>` (`/profile` lists
-them, `/profile none` returns to the base config). Like `/pipeline`, the
-choice is locked once the conversation has started, carried over by `/new`,
-and restored by `/load` (a profile that is no longer configured is dropped
-with a warning). Booting with `--profile <name>` **pins** it instead: every
-conversation runs under that profile and `/profile <name>` is refused. That
-pin is the only lockdown that holds: the web UI lists profiles as a radio list
-the user can pick from, so a runtime `/profile` choice is a convenience
-**preset, not a security boundary** — to lock a web deployment to one profile,
-always boot with `--profile <name>` (the picker then empties and the Profile
-tab hides).
+A per-repo `.peakbot/config.yaml` may contain **only** `profiles:`. Repo
+profiles are listed first for that repo, and a repo profile with the same name
+as a global one **replaces** it entirely (no merge) — a checked-out repo can
+ship its own setup without touching the global file.
 
-A profile can override seven keys: `tools:`, `memory:`, `pipelines:`,
-`mcp_servers:`, `agents_md:`, `system_prompt:`, and `ui:`. The first three
-each use the shared filter documented in
-[Tool, Skill & Pipeline Filters](#tool-skill--pipeline-filters);
-`system_prompt:` is documented in [System Prompt](#system-prompt) below; `ui:`
-covers the web tabs in the paragraph after this.
-
-`mcp_servers:` is that same name filter applied to the master config's
-`mcp_servers:` list: only the surviving servers' tools reach the agent
-(`only:` allowlist, `disabled:` blocklist, `enabled: false` for none), and a
-name the master never declares is a boot error. `agents_md:` is a plain bool
-— `false` omits the repo's `agents.md` section from the system prompt and
-caps every sub-agent to the same ceiling.
-
-`ui:` controls which web tabs a profile shows, using the same filter semantics
-as the other keys: a `tabs:` block with `only:` / `disabled:` (XOR, as in
-`tools:`/`skills:`/`pipelines:`) or `enabled: false` for none. Tab names come
-from a closed set — `session`, `todo`, `files`, `tasks`, `bash`, `agents`,
-`profile` — and an unknown name is a boot error. With no `ui:` (or no `tabs:`)
-every tab shows. The web UI renders a **Profile** tab (a radio list: "None
-(base config)" plus one row per configured profile) exactly when profiles are
-selectable — some configured and no `--profile` pin active — and hides it
-otherwise; hiding is cosmetic, `/profile <name>` keeps working from the
-terminal.
+A profile's blocks: `tools:` / `mcps:` / `skills:` / `ui.tabs:` name filters,
+`fetch_url:`, `env:` (base bash env), `memory:`, `vector_db:` (presence = on),
+and `agents:`. See [agents.md](agents.md#agents-and-subagents) for the full
+reference. Runnable multi-agent examples:
+[examples/agent-team/](examples/agent-team/) (a team with subagents) and
+[examples/agent-dev-team/](examples/agent-dev-team/).
 
 ```yaml
 profiles:
   locked:
     tools:
       disabled: [bash]
-    pipelines:
-      enabled: false
+    mcps:
+      enabled: false          # no MCP tools at all
     ui:
       tabs:
         disabled: [files, tasks, bash, agents]
+    agents:
+      solo:
+        model: sonnet
 ```
 
-The `pipelines:` gate names pipelines from the **master config's** `pipelines:`
-list — a gate can only name teams the master declares, and an unknown name is a
-boot error listing the known ones. The gate caps the *effective* list, so a
-per-repo config's own pipelines are still capped, and `enabled: false` blocks
-every team regardless of where it was declared. If the gate leaves you with no
-pipelines, PeakBot runs single-agent; a conversation whose selected pipeline
-was gated away continues without one. Invalid filters are fatal at boot (on a
-session-verb reload PeakBot warns and keeps the previous config). When a
-profile is active, boot prints one line to stderr:
+### Personas & instructions
 
-```
-ℹ profile 'web' active — overrides: tools, memory, pipelines.
-```
+Each agent's system prompt is built from, in order: a **persona** (the agent's
+`persona:`, or the built-in persona when absent — including agents with
+subagents), the built-in **core tool guidance** (unless
+`core_guidance: false`, which makes the persona the *whole* static head), the
+memory section (when the profile has `memory:` enabled), skills, the
+environment block, the repo's `agents.md`, and the agent's `prompt:` rendered
+as an `# Instructions` section.
 
-### System Prompt
+Reach for `core_guidance: false` + `persona:` when your deployment's toolset
+makes the built-in guidance wrong — roughly 69% of the built-in core prompt is
+coaching for `bash`, `think`, and `todo`, so a research-only profile that
+disables those tools shouldn't ship advice for using them. Use `prompt:` for
+workflow instructions, not voice — the persona carries the voice, and it
+stays current as PeakBot's tools evolve. Sub-agents have no persona: their
+`prompt:` **is** their whole persona.
 
-The built-in system prompt has two parts: a short **persona** paragraph (voice
-and tone) followed by **core tool guidance** on how to use the built-in tools.
-Two keys — valid at the top level of a config file and inside a profile —
-replace one or the other:
+### Name filters (`tools:`, `mcps:`, `skills:`, `ui.tabs:`)
 
-- `persona:` replaces only the persona; the built-in tool guidance still
-  follows it.
-- `system_prompt:` replaces the persona **and** the tool guidance — the
-  entire static head of the prompt. Everything dynamic still follows it: the
-  memory section (when enabled), skills, the environment block, `agents.md`,
-  and, for an orchestrator, `# Orchestrator Instructions` from the pipeline's
-  own prompt.
-
-Reach for `system_prompt:` when your deployment's toolset makes the built-in
-guidance wrong — roughly 69% of the built-in core prompt is coaching for
-`bash`, `think`, and `todo`, so a research-only or web-only profile that
-disables those tools shouldn't ship advice for using them. If you only want a
-different voice, use `persona:` instead — it keeps the built-in guidance
-current as PeakBot's tools evolve across releases.
-
-`persona:` and `system_prompt:` fill the **same slot** and are mutually
-exclusive: whichever key a source sets takes the slot and clears its sibling,
-so a per-repo `persona:` overrides a master `system_prompt:` and vice versa;
-a profile is applied last, so its choice is the ceiling. Setting both keys in
-the same file is a config error naming the file, as is a blank or
-whitespace-only `system_prompt:` — remove the key to get the built-in prompt.
-
-A `system_prompt:` also outranks a multi-agent pipeline's own orchestrator
-persona — the deployment's choice is a ceiling the team cannot override —
-while the pipeline's own `orchestrator.prompt` still appends afterward as
-`# Orchestrator Instructions`. Sub-agents are unaffected: a role's `prompt:`
-is already its entire preamble.
-
-```yaml
-profiles:
-  research:
-    system_prompt: |
-      You are a research assistant. You search the web and summarise findings
-      with citations. You do not write or execute code.
-    tools:
-      only: [think, todo, web_search, fetch_page, fetch_url]
-    memory:
-      enabled: false
-    pipelines:
-      enabled: false
-```
-
-### Tool, Skill & Pipeline Filters
-
-`tools:` in the config, a role's `skills:`, and a profile's `pipelines:` all
-share one filter with one meaning:
+One filter shape with one meaning — a profile's `tools:` (built-in tools),
+`mcps:` (the top-level MCP servers), an agent's `skills:`, and `ui.tabs:`
+(web tabs):
 
 - `only:` — allowlist. Only the named entries survive.
 - `disabled:` — blocklist. The named entries are removed.
@@ -218,11 +168,12 @@ share one filter with one meaning:
 - An empty list, or no filter at all, means **no filtering** — everything is
   allowed. An empty `only:` never means "none"; use `enabled: false` for that.
 - `enabled: false` means **nothing is allowed** — the way to say "no built-in
-  tools" or "single-agent only, no pipelines".
+  tools" or "no MCP tools".
+- Unknown names are a config error (unknown **skills** are a warning — the
+  skill set depends on the directory).
 
-`tools:` newly accepts `enabled:` (it previously had no way to say "no tools"
-short of listing every tool in `disabled:`). Existing `tools:` and `skills:`
-configs behave exactly as before.
+`delegate` is not a filterable tool: it is registered exactly when the agent
+declares non-empty `subagents:`.
 
 ### Run
 
@@ -230,16 +181,15 @@ configs behave exactly as before.
 cargo run --release
 ```
 
-On the very first run with **no** config (and no provider key in the env), PeakBot
-decides based on the surface it's launched on:
+On the very first run with **no** config, the web UI shows a **guided setup**
+(Welcome → Provider → Agent → Web → Review → Finish) that writes the config —
+`/setup` is the same screen for old bookmarks. In the desktop app the PeakBot
+server restarts automatically after finishing; in a browser you see
+"Restart PeakBot to start chatting."
 
-- **Desktop session, web UI (default):** opens the browser at `/setup` — a guided
-  wizard that writes the config, installs the binary to your per-user app dir,
-  and (optionally) registers a start-at-login service. You do not edit YAML by
-  hand.
-- **Headless / SSH, no TTY, or `--stdio`:** refuses to start and prints the
-  commands to set a provider key or run the wizard from a desktop session.
-- **`peakbot --tui`:** starts the terminal UI directly — no wizard. Use this
+- **Headless / SSH, no TTY, or `--stdio`:** refuses to start and prints what
+  to configure.
+- **`peakbot --tui`:** starts the terminal UI directly — no setup. Use this
   when you already have a config and just want a session.
 
 ---
@@ -265,6 +215,8 @@ peakbot> run `cargo test` and tell me what failed
 |---------|-------------|
 | `/model` | List available models |
 | `/model <alias>` | Switch to a different model (starts new conversation) |
+| `/profile <name>` | Pick a profile (before the first turn) |
+| `/agent <name>` | Pick an agent within the profile (before the first turn) |
 | `/stats` | Show session token usage and cost |
 | `/context` | Show context window usage |
 | `/compact` | Force context compaction |
@@ -318,8 +270,9 @@ server, no interactive prompt). The exact mechanism is per-platform:
 
 `peakbot service install` accepts `--bind <addr>` and `--token <secret>` so the
 service is self-contained; pass `--token` once and it is written to
-`<config_dir>/web-token` (`0600`). The token file is the source for subsequent
-runs — you do not need to export `PEAKBOT_WEB_TOKEN` to your shell.
+`general.web.token` in `config.yaml`. Subsequent runs read it from there —
+you do not need to export `PEAKBOT_WEB_TOKEN` to your shell (the env var and
+`--token` outrank it when set).
 
 Pass `--tls` to run the service over HTTPS with the built-in CA (the same
 machinery as the foreground `--tls`); `--tls-name <NAME>` (repeatable) adds
@@ -330,7 +283,7 @@ while the service is stopped.
 Non-loopback binds **require** a token; the loopback/token invariant is
 enforced at plan-build time, not as a runtime check.
 
-Note: `web.tls: true` in `config.yaml` switches the service to HTTPS at
+Note: `general.web.tls: true` in `config.yaml` switches the service to HTTPS at
 runtime independently of `--tls` — `service status` reports what the
 *artifact* says, not what the config overrides.
 

@@ -1429,7 +1429,7 @@ impl AgentRunner {
     /// Extracted from `agent_loop` so the path resolution is testable: the
     /// path is joined onto `sm.session_cwd()`, **not** the process cwd. The
     /// process cwd is frozen at startup (see
-    /// `tests/scenarios/no_set_current_dir.rs`); in web and pipeline mode the
+    /// `tests/scenarios/no_set_current_dir.rs`); in web mode the
     /// session lives in a project directory that is not where the binary was
     /// launched from. Resolving relatively silently compacted the wrong file
     /// — i.e. never compacted at all.
@@ -1722,8 +1722,9 @@ impl AgentRunner {
                         } else if lcmd == "/new" {
                             // `/new` reset to a fresh conversation on the
                             // active model; rebuild the agent so config/skill
-                            // edits take effect. Keeps the current model — it
-                            // does not switch to `default_model`.
+                            // edits take effect. Keeps the current model —
+                            // it does not switch to the agent's configured
+                            // model.
                             Self::refresh_agent_after_new(
                                 &mut agent,
                                 &state_manager,
@@ -2416,7 +2417,7 @@ impl AgentRunner {
     /// model, re-read config + skills and rebuild the agent on that same
     /// model, so YAML/skill edits take effect on the new conversation
     /// without a restart. `/new` deliberately keeps your current model
-    /// (it does not bounce you to `default_model`).
+    /// (it does not bounce you to the agent's configured model).
     ///
     /// No-op when the registry/state manager isn't available. If the
     /// active alias was removed from config, the rebuild is skipped and
@@ -3365,8 +3366,7 @@ impl AgentRunner {
                 let aliases = registry.aliases_sorted();
                 if aliases.is_empty() {
                     sm.add_system_message(
-                        "No models declared. Add a `providers:` block to config.yaml. See `multi-model.md`."
-                            .to_string(),
+                        "No models declared. Add a `providers:` block to config.yaml.".to_string(),
                     );
                     return;
                 }
@@ -3386,14 +3386,15 @@ impl AgentRunner {
             }
             _ if cmd_lower.starts_with("/model ") => {
                 // The View should have intercepted this before it
-                // reached us. If we get here, the View has no
-                // registry attached (legacy single-provider boot or
-                // test harness) — emit a helpful diagnostic instead
-                // of silent inertness.
+                // reached us (the TUI and the web UI both switch models
+                // through `UiAction::SwitchModel`). Reaching here means
+                // a frontend with no model switcher (stdio) — emit a
+                // helpful diagnostic instead of silent inertness.
                 if let Some(sm) = state_manager {
                     sm.add_system_message(
-                        "❌ /model: not available in this build. Configure a `providers:` \
-                         block in config.yaml and restart. See `multi-model.md`."
+                        "❌ /model: switching models isn't supported in this \
+                         frontend — use the terminal UI (`peakbot --tui`) or \
+                         the web UI's model selector."
                             .to_string(),
                     );
                 }
@@ -3409,14 +3410,14 @@ impl AgentRunner {
             }
             _ if cmd_lower.starts_with("/cd ") => {
                 // The View should have intercepted `/cd <path>` (validate
-                // + confirm + emit ChangeCwd). Reaching here means no
-                // registry is attached (legacy single-provider boot or a
-                // non-REPL View) — emit a helpful diagnostic rather than a
-                // silent no-op.
+                // + confirm + emit ChangeCwd). Reaching here means a
+                // frontend with no cwd dialog (stdio) — emit a helpful
+                // diagnostic rather than a silent no-op.
                 if let Some(sm) = state_manager {
                     sm.add_system_message(
-                        "❌ /cd: not available in this build. Configure a `providers:` \
-                         block in config.yaml and restart."
+                        "❌ /cd: changing the session directory isn't \
+                         supported in this frontend — use the terminal UI \
+                         (`peakbot --tui`) to change it."
                             .to_string(),
                     );
                 }
@@ -3539,7 +3540,7 @@ impl Drop for McpServerHandle {
 }
 
 impl McpServerHandle {
-    /// The server's configured name — the key a profile's `mcp_servers:`
+    /// The server's configured name — the key a profile's `mcps:`
     /// gate addresses.
     pub fn name(&self) -> &str {
         &self.name
@@ -3587,7 +3588,7 @@ impl McpServerHandle {
 }
 
 /// Flatten per-server MCP tool groups into the flat tool list an agent
-/// receives, honouring a profile's `mcp_servers:` gate. Servers keep their
+/// receives, honouring a profile's `mcps:` gate. Servers keep their
 /// input order, tools keep their per-server order; `None` = no gate
 /// (every server's tools — today's behaviour), `enabled: false` = none.
 /// The servers themselves keep running either way — this only decides

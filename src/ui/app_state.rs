@@ -1043,7 +1043,7 @@ pub enum MessageSource {
     /// `get_agent_history` can filter it out of the orchestrator's wire
     /// context (see `is_orchestrator_lane`).
     SubAgent {
-        /// The pipeline role that produced this turn.
+        /// The subagent role that produced this turn.
         role: String,
     },
 }
@@ -1369,9 +1369,9 @@ pub struct LaneStat {
     pub output_tokens: u64,
     /// API calls made on this lane.
     pub api_calls: u64,
-    /// Model alias this lane runs on (orchestrator: the active alias; a role:
-    /// its member entry in the selected pipeline). Empty when unknown — old
-    /// wire snapshots and lanes with no configured role.
+    /// Model alias this lane runs on (main agent: the active alias; a role:
+    /// its entry under the selected agent's subagents). Empty when unknown —
+    /// old wire snapshots and lanes with no configured role.
     #[serde(default)]
     pub model: String,
     /// Accumulated cost (USD) on this lane.

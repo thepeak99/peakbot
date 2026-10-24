@@ -10,7 +10,7 @@ const MAX_RESULTS_LIMIT: u32 = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
-    #[error("SearXNG is not configured. Set SEARXNG_BASE_URL in config.")]
+    #[error("SearXNG is not configured. Add a `general.search:` block to config.yaml.")]
     NotConfigured,
 
     #[error("SearXNG is disabled in configuration.")]

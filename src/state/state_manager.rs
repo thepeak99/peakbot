@@ -1474,9 +1474,10 @@ impl StateManager {
     }
 
     /// Re-stamp the current conversation's wire identity `(provider_name,
-    /// model)`. Used when a pipeline selection swaps the orchestrator's model
-    /// in place: the conversation keeps its id (sticky `?convo=`) but its
-    /// persisted re-activation key must follow the model it actually runs on.
+    /// model)`. Used when a profile/agent selection swaps the
+    /// conversation's model in place: the conversation keeps its id
+    /// (sticky `?convo=`) but its persisted re-activation key must
+    /// follow the model it actually runs on.
     pub fn set_conversation_wire_id(&self, provider_name: String, model: String) {
         if let Some(conv) = self.current_conversation.lock().unwrap().as_mut() {
             conv.provider_name = provider_name;

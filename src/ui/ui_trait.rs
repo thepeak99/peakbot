@@ -54,7 +54,7 @@ pub enum UiAction {
     /// agent loop dequeues this action between turns, tears down the
     /// existing `DynAgent`, runs the same reset semantics as `/new`,
     /// and rebuilds with the chosen alias's `ProviderConfig`. See
-    /// `multi-model.md` and `process_command_internal::"/model"`.
+    /// `process_command_internal::"/model"`.
     SwitchModel(String),
 
     /// Change the working directory and start a fresh conversation. Sent

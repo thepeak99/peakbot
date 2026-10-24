@@ -1,8 +1,7 @@
 //! Multi-model registry — providers list, models with aliases, and a
 //! resolver that maps a user-typed alias to a fully-formed
 //! [`ProviderConfig`] the existing `create_provider` already understands.
-//!
-//! See `multi-model.md` for the locked design. Highlights:
+//! Highlights:
 //! - `providers:` is a YAML *list*, each entry owns its `models:` list.
 //! - Provider `name` is informational only (no cross-references).
 //! - Model `alias` is optional; falls back to `name`.
