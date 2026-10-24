@@ -1392,13 +1392,14 @@ impl StateManager {
         // Snapshot the selection under the state lock and release it *before*
         // locking the conversation — never hold both guards together (plan §4).
         // `/new` mints on the current selection: the `(profile, agent)` pair
-        // survives persistence/reload (I-3: the live mirror must keep
-        // agreeing with the current conversation, or the rebuild seam loses
-        // the bound).
+        // and its subagent overrides survive persistence/reload (I-3: the
+        // live mirror must keep agreeing with the current conversation, or
+        // the rebuild seam loses the bound).
         let selection = self.state.read().unwrap().selection.clone();
         let mut conv = Conversation::new(name, provider_name, model, cwd);
         conv.agent = (!selection.agent.is_empty()).then(|| selection.agent.clone());
         conv.profile = (!selection.profile.is_empty()).then(|| selection.profile.clone());
+        conv.subagent_models = selection.subagent_models.clone();
         *self.current_conversation.lock().unwrap() = Some(conv);
         self.mirror_conversation_to_state();
     }
@@ -1447,6 +1448,7 @@ impl StateManager {
         if let Some(conv) = self.current_conversation.lock().unwrap().as_mut() {
             conv.agent = Some(selection.agent.clone());
             conv.profile = Some(selection.profile.clone());
+            conv.subagent_models = selection.subagent_models.clone();
         }
         let mut state = self.state.write().unwrap();
         state.selection = selection;
@@ -1564,7 +1566,7 @@ impl StateManager {
                 .map(|c| crate::config::resolve::Selection {
                     agent: c.agent.clone().unwrap_or_default(),
                     profile: c.profile.clone().unwrap_or_default(),
-                    ..Default::default()
+                    subagent_models: c.subagent_models.clone(),
                 })
                 .unwrap_or_default();
             {
@@ -1627,7 +1629,7 @@ impl StateManager {
             (agent, profile) => Ok(Some(crate::config::resolve::Selection {
                 agent: agent.unwrap_or_default(),
                 profile: profile.unwrap_or_default(),
-                ..Default::default()
+                subagent_models: conv.subagent_models,
             })),
         }
     }
