@@ -91,7 +91,6 @@ interface TopBarFixtureProps {
   // (D7), mirroring what App.tsx will pass once the hook exists.
   focusMode: boolean;
   onToggleFocus: () => void;
-  lockedReason?: string | null;
 }
 
 const baseProps: TopBarFixtureProps = {

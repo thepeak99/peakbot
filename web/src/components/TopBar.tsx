@@ -37,7 +37,6 @@ export function TopBar({
   onToggleNotify,
   focusMode,
   onToggleFocus,
-  lockedReason = null,
 }: {
   isRunning: boolean;
   connected: boolean;
@@ -61,7 +60,6 @@ export function TopBar({
   onToggleNotify: () => void;
   focusMode: boolean;
   onToggleFocus: () => void;
-  lockedReason?: string | null;
 }) {
   return (
 
@@ -91,7 +89,6 @@ export function TopBar({
           activeAlias={activeAlias}
           hasTranscript={hasTranscript}
           onSwitch={onSwitchModel}
-          lockedReason={lockedReason}
         />
  
 

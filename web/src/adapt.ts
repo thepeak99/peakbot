@@ -12,11 +12,13 @@ import type {
 import type {
   BashPanel,
   BgProcess,
+  CatalogProfile,
   ChatMessage,
   ContextUsage,
   FileEdit,
   LaneStat,
   MessageRole,
+  Selection,
   SessionStats,
   SubAgentRun,
   TodoItem,
@@ -158,6 +160,34 @@ export function adaptBg(s: AppState): BgProcess[] {
  * `#[serde(default)]`) to null so callers get one shape. */
 export function adaptSubAgent(s: AppState): SubAgentRun | null {
   return s.sub_agent ?? null;
+}
+
+/** The catalog (profiles → agents → sub-agents) this install declares,
+ * mapped from the wire's snake_case to the view's camelCase. An absent
+ * field (old snapshot) normalises to `[]`, the safe default. */
+export function adaptCatalog(s: AppState): CatalogProfile[] {
+  return (s.catalog ?? []).map((p) => ({
+    name: p.name,
+    origin: p.origin,
+    overridesGlobal: p.overrides_global,
+    agents: p.agents.map((a) => ({
+      name: a.name,
+      model: a.model,
+      subagents: a.subagents.map((sa) => ({
+        name: sa.name,
+        model: sa.model,
+        inherited: sa.inherited,
+      })),
+    })),
+  }));
+}
+
+/** The (profile, agent) this conversation is bound to, or null when the wire
+ * field is absent (old snapshot) — one shape for callers, like adaptSubAgent. */
+export function adaptSelection(s: AppState): Selection | null {
+  return s.selection
+    ? { profile: s.selection.profile, agent: s.selection.agent }
+    : null;
 }
 
 // File tools whose `path` arg we surface in the Files tab. Writes (create /

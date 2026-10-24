@@ -25,7 +25,6 @@ export function BottomBar({
   send,
   onSwitchModel,
   onLoadConversation,
-  lockedReason = null,
 }: {
   conversations: ConversationSummary[];
   conversationsError: string | null;
@@ -37,7 +36,6 @@ export function BottomBar({
   recentDirs: string[];
   send: (msg: InboundMessage) => void;
   onSwitchModel: (alias: string) => void;
-  lockedReason?: string | null;
   onLoadConversation: (id: string) => void;
 }) {
   return (
@@ -57,7 +55,6 @@ export function BottomBar({
         hasTranscript={hasTranscript}
         onSwitch={onSwitchModel}
         dropUp
-        lockedReason={lockedReason}
       />
  
 

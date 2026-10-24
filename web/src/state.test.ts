@@ -1,150 +1,121 @@
-// Wire-contract tests for the profiles feature (Layer E, E1).
+// Wire-contract tests for the 0.24 cutover: the single `select` frame
+// (replacing `select_profile` / `select_pipeline`) and the catalog/selection
+// fields on `AppState` (src/ui/app_state.rs + src/config/resolve.rs).
 //
-// state.ts is a hand-typed mirror of the Rust `AppState` (src/ui/app_state.rs)
-// and the `InboundMessage`/`OutboundMessage` wire envelopes (src/ui/wire.rs).
-// The backend now carries three new AppState fields and one new inbound
-// message; state.ts has no runtime behaviour of its own for the AppState
-// fields (TypeScript types vanish at compile time), so these tests exercise
-// them at the type level (assignability) PLUS one real runtime sender,
-// `selectProfile`, modeled 1:1 on how `select_pipeline` is built and used at
-// the App.tsx call site (App.tsx:210:
-//   onSelectPipeline={(name) => send({ type: "select_pipeline", name })}
-// ).
+// The Rust side is the source of truth:
+//   - `InboundMessage::Select { profile, agent }` (src/ui/wire.rs) —
+//     `{"type":"select","profile":..,"agent":..}`.
+//   - `AppState` carries `catalog: Vec<ProfileInfo>`, `selection: Selection`,
+//     `profile_pinned: bool`, and the DERIVED `settings_available =
+//     !profile_pinned` (all `#[serde(default)]`, so optional on the TS mirror
+//     so old wire snapshots parse).
 //
-// New wire surface under test:
-//   - `AppState.profiles: string[]` — selectable profile names, sorted;
-//     empty when none are defined OR a `--profile` pin is active. Optional
-//     on the TS side so an older server's snapshot (field absent) still
-//     type-checks; the safe default is `[]` (adaptProfiles below, or
-//     equivalent call-site `?? []`), NOT `undefined`.
-//   - `AppState.active_profile: string | null` — optional the same way;
-//     the safe default for an absent field is `null`.
-//   - `AppState.visible_tabs: string[]` — optional the same way; the safe
-//     default for an ABSENT field is ALL legacy tab ids (an older server
-//     doesn't know about tab visibility yet, so nothing should hide) —
-//     this defaulting rule is exercised in `tabs.test.ts` via
-//     `filterTabs(tabs, undefined)`, not repeated here.
-//   - `InboundMessage` gains `{ type: "select_profile"; name: string | null }`.
-//   - A `selectProfile(name: string | null): InboundMessage` builder,
-//     mirroring the inline arrow function pipelines use today. Nothing in
-//     the existing codebase requires this to be a named export (pipelines
-//     builds its frame inline in App.tsx), but the task brief asks for a
-//     `selectProfile` sender we can unit test directly, so it is specified
-//     as a new named export of state.ts.
-//
-// `selectProfile` does not exist yet — this file is expected to fail at
-// import time ("does not provide an export named 'selectProfile'"), which
-// is the correct RED reason (feature absent, not a typo here).
+// `select` is a named export so the call site is unit-testable without
+// mounting the socket (the same reason `selectProfile` was a named export).
 
 import { describe, it, expect } from "vitest";
-import { selectProfile } from "./state";
-import type { AppState, InboundMessage } from "./state";
+import { select, type AppState, type InboundMessage } from "./state";
 
-describe("selectProfile — inbound frame builder (mirrors select_pipeline)", () => {
-  it("builds exactly {type:'select_profile', name} for a real profile name", () => {
-    expect(selectProfile("web")).toEqual({
-      type: "select_profile",
-      name: "web",
+describe("select — inbound frame builder (replaces select_profile/select_pipeline)", () => {
+  it("builds exactly {type:'select', profile, agent} for a real pair", () => {
+    expect(select("dev", "team")).toEqual({
+      type: "select",
+      profile: "dev",
+      agent: "team",
     });
   });
 
-  it("builds {type:'select_profile', name: null} for 'None (base config)'", () => {
-    expect(selectProfile(null)).toEqual({
-      type: "select_profile",
-      name: null,
+  it("passes unicode profile/agent names through verbatim", () => {
+    expect(select("生産チーム", "レビュー")).toEqual({
+      type: "select",
+      profile: "生産チーム",
+      agent: "レビュー",
     });
   });
 
-  it("produces an object with EXACTLY the two keys type/name (no stray fields)", () => {
-    const frame = selectProfile("web");
-    expect(Object.keys(frame).sort()).toEqual(["name", "type"]);
+  it("passes an empty string through verbatim (no trimming/rejection at this layer)", () => {
+    // Whether "" is a valid profile/agent is a server-side concern; the
+    // client's job is to ship exactly what the caller asked for.
+    expect(select("", "")).toEqual({ type: "select", profile: "", agent: "" });
   });
 
-  it("round-trips through JSON exactly like a hand-built select_pipeline frame would", () => {
-    // Same shape family as `{ type: "select_pipeline", name }` (state.ts:269)
-    // — JSON.stringify must not reorder/drop keys or coerce null away.
-    const json = JSON.stringify(selectProfile(null));
-    expect(JSON.parse(json)).toEqual({ type: "select_profile", name: null });
-  });
-
-  it("passes an empty-string profile name through verbatim (no trimming/rejection at this layer)", () => {
-    // Whether "" is a valid profile name is a server-side concern; the
-    // builder is a dumb frame constructor and must not special-case it.
-    expect(selectProfile("")).toEqual({ type: "select_profile", name: "" });
-  });
-
-  it("passes a unicode profile name through verbatim", () => {
-    expect(selectProfile("生産チーム")).toEqual({
-      type: "select_profile",
-      name: "生産チーム",
+  it("round-trips through JSON exactly like a hand-built select frame would", () => {
+    const json = JSON.stringify(select("dev", "team"));
+    expect(JSON.parse(json)).toEqual({
+      type: "select",
+      profile: "dev",
+      agent: "team",
     });
   });
 
-  it("is assignable to InboundMessage (the frame belongs to the wire union)", () => {
-    const frame: InboundMessage = selectProfile("web");
-    expect(frame.type).toBe("select_profile");
+  it("satisfies the InboundMessage union", () => {
+    const frame: InboundMessage = select("dev", "team");
+    expect(frame.type).toBe("select");
   });
 });
 
-describe("AppState — profiles/active_profile/visible_tabs are optional wire fields", () => {
-  // These are compile-time assertions: if `profiles`/`active_profile`/
-  // `visible_tabs` are missing from the `AppState` interface entirely, this
-  // file fails to typecheck. Vitest's esbuild transform does not run a full
-  // type-check, so we ALSO assert a runtime shape below to give the suite a
-  // real RED signal (not just a silently-erased type). `tsc --noEmit` is the
-  // authoritative check for the type-level half of this contract.
-
-  it("a full new-server snapshot (with all three fields) satisfies AppState", () => {
+describe("AppState — catalog/selection/profile_pinned/settings_available are optional wire fields", () => {
+  // These are compile-time assertions: if any of the new fields is removed
+  // from AppState, the `Pick` below stops type-checking. At runtime they
+  // must all be *optional* (absent on old wire snapshots).
+  it("a full 0.24 snapshot carries all four fields", () => {
     const full: Pick<
       AppState,
-      "profiles" | "active_profile" | "visible_tabs"
+      "catalog" | "selection" | "profile_pinned" | "settings_available"
     > = {
-      profiles: ["web", "cli"],
-      active_profile: "web",
-      visible_tabs: ["session", "agents", "profile"],
+      catalog: [
+        {
+          name: "dev",
+          origin: "repo",
+          overrides_global: true,
+          agents: [
+            {
+              name: "team",
+              model: "sonnet",
+              subagents: [
+                { name: "junior", model: "haiku", inherited: false },
+              ],
+            },
+          ],
+        },
+      ],
+      selection: { profile: "dev", agent: "team" },
+      profile_pinned: false,
+      settings_available: true,
     };
-    expect(full.profiles).toEqual(["web", "cli"]);
-    expect(full.active_profile).toBe("web");
-    expect(full.visible_tabs).toEqual(["session", "agents", "profile"]);
+    expect(full.catalog).toHaveLength(1);
+    expect(full.selection).toEqual({ profile: "dev", agent: "team" });
+    expect(full.profile_pinned).toBe(false);
+    expect(full.settings_available).toBe(true);
   });
 
-  it("an old-server snapshot with all three fields OMITTED still satisfies AppState (optional)", () => {
-    // If any of the three were required (non-optional), this object literal
-    // would fail `tsc` with a missing-property error. Kept as a same-file
-    // compile-time proof alongside the runtime one above.
+  it("an old snapshot (none of the fields present) still parses", () => {
     const legacy: Pick<
       AppState,
-      "profiles" | "active_profile" | "visible_tabs"
+      "catalog" | "selection" | "profile_pinned" | "settings_available"
     > = {};
-    expect(legacy.profiles).toBeUndefined();
-    expect(legacy.active_profile).toBeUndefined();
-    expect(legacy.visible_tabs).toBeUndefined();
+    expect(legacy.catalog).toBeUndefined();
+    expect(legacy.selection).toBeUndefined();
+    expect(legacy.profile_pinned).toBeUndefined();
+    expect(legacy.settings_available).toBeUndefined();
   });
 
-  it("active_profile accepts an explicit null (no selectable profile pinned)", () => {
-    const withNull: Pick<AppState, "active_profile"> = { active_profile: null };
-    expect(withNull.active_profile).toBeNull();
+  it("catalog accepts an empty array (no profiles configured)", () => {
+    const empty: Pick<AppState, "catalog"> = { catalog: [] };
+    expect(empty.catalog).toEqual([]);
   });
 
-  it("profiles accepts an empty array (no profiles configured, or a --profile pin is active)", () => {
-    const empty: Pick<AppState, "profiles"> = { profiles: [] };
-    expect(empty.profiles).toEqual([]);
-  });
-
-  it("visible_tabs accepts an empty array (server computed zero visible tabs)", () => {
-    const empty: Pick<AppState, "visible_tabs"> = { visible_tabs: [] };
-    expect(empty.visible_tabs).toEqual([]);
+  it("selection accepts the (profile, agent) pair", () => {
+    const s: Pick<AppState, "selection"> = {
+      selection: { profile: "dev", agent: "team" },
+    };
+    expect(s.selection).toEqual({ profile: "dev", agent: "team" });
   });
 });
 
-describe("InboundMessage — select_profile is part of the union", () => {
-  it("a hand-built select_profile frame satisfies InboundMessage", () => {
-    const frame: InboundMessage = { type: "select_profile", name: "web" };
-    expect(frame).toEqual({ type: "select_profile", name: "web" });
-  });
-
-  it("a hand-built select_profile frame with null name satisfies InboundMessage", () => {
-    const frame: InboundMessage = { type: "select_profile", name: null };
-    expect(frame).toEqual({ type: "select_profile", name: null });
+describe("InboundMessage — select is part of the union, old frames are gone", () => {
+  it("a hand-built select frame satisfies InboundMessage", () => {
+    const frame: InboundMessage = { type: "select", profile: "dev", agent: "team" };
+    expect(frame).toEqual({ type: "select", profile: "dev", agent: "team" });
   });
 });

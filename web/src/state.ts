@@ -188,27 +188,27 @@ export interface AppState {
   exit_requested: boolean;
   bg: WireBg;
   bash_panel: WireBashPanel;
-  /** The pipelines configured at boot, in declaration order (the UI's order).
-   * Empty / absent means no `pipelines:` block — selection isn't offered.
-   * Optional so old wire snapshots parse. */
-  pipelines?: WirePipelineInfo[];
-  /** The pipeline THIS conversation is bound to, or null for single-agent
-   * mode. Mutable only before the first turn; everything downstream
-   * (orchestrator model, delegate roster, `/model` lock) derives from it. */
-  selected_pipeline?: string | null;
+  /** The profiles this install declares, in catalog order (repo first) —
+   * the §8.7 wire projection (src/config/resolve.rs `ProfileInfo`). An empty
+   * catalogue means no profiles are configured. Optional so old wire
+   * snapshots parse; the safe default is `[]`. */
+  catalog?: WireProfileInfo[];
+  /** The (profile, agent) this conversation is bound to. Mutable only
+   * before the first turn; everything downstream derives from it. Optional
+   * so old wire snapshots parse; absent reads as "no selection" (the
+   * adapter normalises it to null). */
+  selection?: WireSelection;
+  /** True under a boot `--profile` pin — the profile is frozen for the life
+   * of the session. Optional so old wire snapshots parse; absent is
+   * unpinned. */
+  profile_pinned?: boolean;
+  /** Derived server-side: `!profile_pinned` (§8.7). Optional so old wire
+   * snapshots parse; absent is treated as "settings available". */
+  settings_available?: boolean;
   /** The currently-running sub-agent, if any, and its pause status. Absent
    * (`#[serde(default)]` on the Rust side) in pre-pause-subagents snapshots —
    * the adapter normalises absent to null (adapt.ts `adaptSubAgent`). */
   sub_agent?: WireSubAgentRun | null;
-  /** Profile names the client may pick (the Profile tab's picker), sorted.
-   * Absent/empty means no profiles are defined OR a `--profile` pin is
-   * active — the tab has nothing to offer either way. Optional so old wire
-   * snapshots parse; the safe default is `[]`. */
-  profiles?: string[];
-  /** The config profile this conversation is bound to, or `null` for the
-   * base config. Optional so old wire snapshots parse; the safe default is
-   * `null`. */
-  active_profile?: string | null;
   /** Server-computed subset of the canonical drawer-tab order the client
    * should render. Optional so old wire snapshots parse; an absent field
    * means "no rule yet" — show every tab (see `tabs.ts` filterTabs). */
@@ -220,15 +220,36 @@ export interface AppState {
   upload_limits?: UploadLimits;
 }
 
-/** One configured pipeline — the wire projection of `PipelineInfo`
- * (src/pipeline/set.rs), carried on `AppState.pipelines`. */
-export interface WirePipelineInfo {
+/** A sub-agent of a catalog agent (src/config/resolve.rs `SubagentInfo`).
+ * `inherited` is derived server-side: the sub-agent's model alias equals
+ * the agent's. */
+export interface WireSubagentInfo {
   name: string;
-  /** Model alias the orchestrator is pinned to (config, not live state). */
-  orchestrator_model: string;
-  /** `[role, model alias]` pairs, sorted by role. TUPLES on the wire: serde
-   * serialises the Rust `Vec<(String, String)>` as arrays of two strings. */
-  members: [string, string][];
+  model: string;
+  inherited: boolean;
+}
+
+/** An agent of a catalog profile (src/config/resolve.rs `AgentInfo`). */
+export interface WireAgentInfo {
+  name: string;
+  model: string;
+  subagents: WireSubagentInfo[];
+}
+
+/** A profile in the catalog (src/config/resolve.rs `ProfileInfo`) — the §8.7
+ * wire projection of a config profile, carried on `AppState.catalog`. */
+export interface WireProfileInfo {
+  name: string;
+  origin: "repo" | "global";
+  overrides_global: boolean;
+  agents: WireAgentInfo[];
+}
+
+/** The (profile, agent) a conversation is bound to (src/config/resolve.rs
+ * `Selection`), carried on `AppState.selection`. */
+export interface WireSelection {
+  profile: string;
+  agent: string;
 }
 
 // ── Protocol envelopes (src/ui/wire.rs) ───────────────────────────────
@@ -306,23 +327,20 @@ export type InboundMessage =
   | { type: "resume" }
   | { type: "switch_model"; alias: string }
   | { type: "switch_cwd"; path: string }
-  /** Bind this conversation to a named pipeline; `null` clears the binding
-   * (single-agent mode). The backend enforces the pre-first-turn lock. */
-  | { type: "select_pipeline"; name: string | null }
-  /** Bind this conversation to a named config profile; `null` clears the
-   * binding (base config). The backend enforces the pre-first-turn lock,
-   * same as `select_pipeline`. */
-  | { type: "select_profile"; name: string | null }
+  /** Bind this conversation to a (profile, agent) pair — the single
+   * selection frame that replaces `select_pipeline` / `select_profile`
+   * (0.24 cutover, src/ui/wire.rs `Select`). The backend enforces the
+   * pre-first-turn lock. */
+  | { type: "select"; profile: string; agent: string }
   | { type: "list_dir"; path: string }
   | { type: "request_recent_dirs" }
   | { type: "request_conversations" }
   | { type: "kill_session"; convo: string }
   | { type: "shutdown" };
 
-/** Build a `select_profile` inbound frame — mirrors how App.tsx builds
- * `select_pipeline` inline (`send({ type: "select_pipeline", name })`).
- * Exists as a named export so ProfilePanel's `onSelect` call site is unit
- * testable without mounting the socket. */
-export function selectProfile(name: string | null): InboundMessage {
-  return { type: "select_profile", name };
+/** Build a `select` inbound frame — the single selection frame (0.24
+ * cutover, src/ui/wire.rs `Select`). Exists as a named export so the call
+ * site is unit testable without mounting the socket. */
+export function select(profile: string, agent: string): InboundMessage {
+  return { type: "select", profile, agent };
 }

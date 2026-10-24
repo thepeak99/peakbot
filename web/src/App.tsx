@@ -24,7 +24,6 @@ import { TodoPanel } from "./components/TodoPanel";
 import { BgPanel } from "./components/BgPanel";
 import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
-import { ProfilePanel } from "./components/ProfilePanel";
 import { useAgent } from "./useAgent";
 import { useConvoTabs } from "./useConvoTabs";
 import type { TabsState } from "./convoTabs";
@@ -36,11 +35,13 @@ import { focusView } from "./focus";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
 import { filterTabs, resolveActiveTab } from "./tabs";
 import type { ViewFilter } from "./types";
-import { selectProfile, type UploadLimits } from "./state";
+import { type UploadLimits } from "./state";
 import {
   adaptBashPanel,
   adaptBg,
+  adaptCatalog,
   adaptContext,
+  adaptSelection,
   adaptStats,
   adaptSubAgent,
   adaptWelcome,
@@ -107,29 +108,20 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const [drawerTab, setDrawerTab] = useState<string | null>(null);
   const drawerOpen = drawerTab !== null;
 
-  // Pipelines. ONE fact drives everything: `selected_pipeline` — the team this
-  // conversation is bound to, or null for single agent. `pipelines` is the
-  // boot-time catalogue (what the user may pick). Sub-agents run iff a
-  // pipeline is selected, so that single value also decides whether the
-  // per-lane views mean anything. `view` scopes the transcript, todos, files
-  // and stats to one lane via the message `source`.
-  const pipelines = state?.pipelines ?? [];
-  const selectedPipeline = state?.selected_pipeline ?? null;
-  // Profiles. `profiles` is the selectable catalogue (sorted); `activeProfile`
-  // is what THIS conversation is bound to (null = base config). An empty
-  // catalogue means no profiles are defined OR a `--profile` pin is active —
-  // either way there is nothing to pick, so the Profile tab is hidden (below).
-  const profiles = state?.profiles ?? [];
-  const activeProfile = state?.active_profile ?? null;
-  const hasProfiles = profiles.length > 0;
- // When a pipeline is selected, the model selector is locked to the
-  // orchestrator's model — the chip stays visible but is disabled.
-  const modelLockedReason = selectedPipeline
-    ? `fixed by pipeline ${selectedPipeline}`
-    : null;
+  // Catalog and selection (0.24): `catalog` is the profiles/agents/sub-agents
+  // this install declares; `selection` is the (profile, agent) this
+  // conversation is bound to. `boundAgent` resolves the two — the roster the
+  // Agents panel renders. `view` scopes the transcript, todos, files and
+  // stats to one lane via the message `source`.
+  const catalog = state ? adaptCatalog(state) : [];
+  const selection = state ? adaptSelection(state) : null;
+  const boundAgent =
+    selection === null
+      ? null
+      : catalog
+          .find((p) => p.name === selection.profile)
+          ?.agents.find((a) => a.name === selection.agent) ?? null;
   const [view, setView] = useState<ViewFilter>("global");
-  // Sub-agent views only make sense once a pipeline is actually selected.
-  const effectiveView: ViewFilter = selectedPipeline ? view : "global";
   // Called once here (not in TopBar) so App can filter with the same value
   // the button renders — two useState copies would desync (plan §6.1).
   const focusMode = useFocusMode();
@@ -138,28 +130,22 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // per-call). Zero backend — derived from the transcript. A role delegated to
   // more than once yields several entries; the panel suffixes those "#n".
   const roster = state ? deriveSubAgentRoster(state.chat.messages) : [];
-  // The pipeline selection locks once the conversation has a real turn (any
-  // user or agent message). System banners don't count — mirrors the backend's
-  // `conversation_has_turns`.
-  const conversationStarted = state
-    ? state.chat.messages.some((m) => m.role === "user" || m.role === "agent")
-    : false;
   const multiCall = new Set(
     roster.filter((r) => r.n > 1).map((r) => r.role),
   );
   const scopeLabel =
-    effectiveView === "global"
+    view === "global"
       ? null
-      : viewLabel(effectiveView, multiCall.has(laneOf(effectiveView)));
+      : viewLabel(view, multiCall.has(laneOf(view)));
 
   const visibleMessages = state
-    ? filterMessagesByView(state.chat.messages, effectiveView)
+    ? filterMessagesByView(state.chat.messages, view)
     : [];
 
   // Focus is a transcript-rendering concern only — the side panels keep
   // deriving from the full message list (D12). Global-only: a scoped lane
   // view means "show me everything" (D11).
-  const focusing = focusMode.focus && effectiveView === "global";
+  const focusing = focusMode.focus && view === "global";
   const focused = focusing ? focusView(visibleMessages, isRunning) : null;
   const transcriptMessages = focused ? focused.visible : visibleMessages;
 
@@ -168,7 +154,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // invalidates every measured row height and every scroll position —
   // remounting is the whole reset story: fresh scroll element, fresh
   // virtualizer, fresh pin state.
-  const id = `${state?.conversation?.id ?? "none"}|${effectiveView}|${focusing ? "focus" : "all"}`;
+  const id = `${state?.conversation?.id ?? "none"}|${view}|${focusing ? "focus" : "all"}`;
   const [epoch, setEpoch] = useState<EpochState>({ id, count: 0, epoch: 0 });
   const next = nextEpoch(epoch, id, transcriptMessages.length);
   if (next !== epoch) setEpoch(next); // React's documented adjust-during-render
@@ -176,7 +162,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
 
   const stats = state ? adaptStats(state) : null;
   // Scope the Session panel to the watched view (Global keeps grand totals).
-  const scopedStats = stats ? scopeStatsToView(stats, effectiveView) : null;
+  const scopedStats = stats ? scopeStatsToView(stats, view) : null;
   const welcome = state ? adaptWelcome(state) : null;
   const bash = state ? adaptBashPanel(state.bash_panel) : null;
   // Todos & files derive from the transcript. In the global view todos form a
@@ -185,7 +171,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // view shows just that lane's flat, unlabeled list. Files stay global-mixed
   // by design.
   const todos =
-    state && effectiveView === "global"
+    state && view === "global"
       ? todoTree(state.chat.messages)
       : flatTree(todosFromMessages(visibleMessages));
   const bg = state ? adaptBg(state) : [];
@@ -255,10 +241,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       label: "Agents",
       content: (
         <AgentsPanel
-          pipelines={pipelines}
-          selected={selectedPipeline}
-          locked={conversationStarted}
-          onSelectPipeline={(name) => send({ type: "select_pipeline", name })}
+          boundAgent={boundAgent}
           active={view}
           onSelect={setView}
           roster={roster}
@@ -266,29 +249,8 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           laneMessages={laneMessages}
         />
       ),
-      badge: selectedPipeline ? roster.length : undefined,
+      badge: roster.length > 0 ? roster.length : undefined,
     },
-    // The Profile tab only exists when there is something to pick. An empty
-    // catalogue (no profiles, or a `--profile` pin) hides it entirely — the
-    // server omits it from `visible_tabs` too, but this guards the legacy
-    // `visible_tabs === undefined` case so it never flashes for profile-less
-    // users.
-    ...(hasProfiles
-      ? [
-          {
-            id: "profile",
-            label: "Profile",
-            content: (
-              <ProfilePanel
-                profiles={profiles}
-                active={activeProfile}
-                locked={conversationStarted}
-                onSelect={(name) => send(selectProfile(name))}
-              />
-            ),
-          },
-        ]
-      : []),
   ];
 
   // Narrow the canonical tab list to the server's `visible_tabs` (config/
@@ -298,10 +260,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const visibleTabIds = visibleTabs.map((t) => t.id);
 
   // Keep an open drawer pointed at a tab the server still shows. When the
-  // visible set changes (a profile pin can drop the "profile" tab out from
-  // under an open drawer), relocate the active tab to the first still-visible
-  // one. A closed drawer (null) stays closed — resolveActiveTab never reopens
-  // it.
+  // visible set changes (e.g. the bound profile's `tabs` drops a tab out
+  // from under an open drawer), relocate the active tab to the first
+  // still-visible one. A closed drawer (null) stays closed — resolveActiveTab
+  // never reopens it.
   useEffect(() => {
     if (drawerTab !== null && !visibleTabIds.includes(drawerTab)) {
       setDrawerTab(resolveActiveTab(drawerTab, visibleTabIds));
@@ -331,7 +293,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         onToggleNotify={notify.toggle}
         focusMode={focusMode.focus}
         onToggleFocus={focusMode.toggle}
-        lockedReason={modelLockedReason}
       />
       {convoTabs && (
         <ConvoTabBar
@@ -423,7 +384,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={loadConversation}
-        lockedReason={modelLockedReason}
       />
    
 
