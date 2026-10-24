@@ -832,7 +832,37 @@ describe("adapt_catalog_selection", () => {
       undefined,
       { profile: "dev", agent: "team" },
     );
-    expect(adaptSelection(state)).toEqual({ profile: "dev", agent: "team" });
+    expect(adaptSelection(state)).toEqual({
+      profile: "dev",
+      agent: "team",
+      subagentModels: {},
+    });
+  });
+
+  it("adaptSelection_normalizes_subagent_models", () => {
+    // Absent on the wire → `{}` (never undefined).
+    expect(
+      adaptSelection(stateWithCatalog(undefined, { profile: "dev", agent: "team" })),
+    ).toEqual({ profile: "dev", agent: "team", subagentModels: {} });
+
+    // Present → copied under its camelCase view name.
+    const wire = { tester: "opus", reviewer: "haiku" };
+    const adapted = adaptSelection(
+      stateWithCatalog(undefined, {
+        profile: "dev",
+        agent: "team",
+        subagent_models: wire,
+      }),
+    );
+    expect(adapted).toEqual({
+      profile: "dev",
+      agent: "team",
+      subagentModels: { tester: "opus", reviewer: "haiku" },
+    });
+    expect(adapted?.subagentModels, "a copy, not the wire object").not.toBe(wire);
+
+    // No selection at all → null.
+    expect(adaptSelection(stateWithCatalog(undefined, undefined))).toBeNull();
   });
 
   it("normalises an absent selection (old snapshot) to null", () => {

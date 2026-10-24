@@ -16,8 +16,8 @@
 import type { Document } from "yaml";
 import type { StructuredPatch, StructuredPatchHunk } from "diff";
 import type { Scope, Seg } from "./types";
-import type { CatalogAgent, CatalogProfile, Selection } from "../types";
-import type { InboundMessage } from "../state";
+import type { CatalogProfile, Selection } from "../types";
+import type { InboundMessage, ModelInfo } from "../state";
 
 /** The draft document: a `yaml` Document so comments/order survive edits. */
 export type Doc = Document;
@@ -736,69 +736,81 @@ export interface RawPaneProps {
 // ═════════════════════════════════════════════════════════════════════════
 
 
-// ── ../components/SelectionChip (T32, spec §9.1) ────────────────────────
+// ── ../components/SelectionChip (T32 → selection-models plan §5.3) ──────
 // export function SelectionChip(props: SelectionChipProps)
-// Renders NOTHING (null) when `selection` is null or `catalog` is empty
-// (old server / no wire fields).
+// The ONE place that sets up the NEXT conversation: Profile › Agent › Team ›
+// Model drill-down. Renders NOTHING (null) when `selection` is null or
+// `catalog` is empty (old server / no wire fields).
 export interface SelectionChipProps {
   catalog: CatalogProfile[];
-  /** The (profile, agent) this conversation is bound to (adaptSelection). */
+  /** The (profile, agent, subagent overrides) this conversation is bound to
+   *  (adaptSelection). The chip renders ONLY from server echoes. */
   selection: Selection | null;
-  /** hasTranscript — after the first message the chip is locked (§6.5). */
+  /** `models_available` rows, server order — the Model pane. */
+  models: ModelInfo[];
+  /** `stats.model_alias || models_available.active` — the orchestrator's
+   *  effective model. Overridden ⇔ it differs from the bound agent's model. */
+  activeAlias: string;
+  /** conversationHasTurns — after the first message the chip is locked (§6.5). */
   locked: boolean;
   /** AppState.profile_pinned — `--profile` pin: only the pinned profile is
    *  listed (caption `pinned`); agent switching still works. */
   pinned: boolean;
-  /** The only way the chip talks to the server: send(select(profile, agent)). */
+  /** The only way the chip talks to the server: send(select(profile, agent,
+   *  {model?, subagentModels?})) — the FULL desired setup. */
   send(msg: InboundMessage): void;
-  /** Called with `Next conversation: <p> › <a>` after an agent click. */
+  /** Called with `Next conversation: …` / `Overrides reset for …`. */
   onToast?(message: string): void;
   dropUp?: boolean;
 }
 // data-testids (the chip owns all of them):
-//   `selection-chip`      — the <button>. textContent = `[📁 ]<profile> › <agent> ▾`
-//                           (📁 only when the SELECTED profile is origin
-//                           "repo"). Locked: textContent starts `🔒`, no ▾,
-//                           `title` === "Locked after the first message",
-//                           `disabled`, click never opens the popover.
-//   `selection-popover`   — present only while open (never while locked).
+//   `selection-chip`        — the <button>. textContent =
+//                             `[📁 ]<profile> › <agent> › <model>[ +N] ▾`
+//                             (📁 only when the SELECTED profile is origin
+//                             "repo"). Locked: textContent starts `🔒`, no ▾,
+//                             `title` === "Locked after the first message",
+//                             `disabled`, click never opens the popover.
+//                             Unlocked title: "Switch profile / agent / team model".
+//   `selection-chip-model`  — the model span; text = activeAlias (fallback:
+//                             the bound agent's model); data-state="default"
+//                             when it equals the bound agent's model, else
+//                             "overridden".
+//   `selection-chip-overrides` — the `+N` badge (N = subagent overrides only),
+//                             title `1 subagent model changed` / `N subagent
+//                             models changed`; absent when N = 0; shown while
+//                             locked too.
+//   `selection-popover`     — present only while open (never while locked);
+//                             data-pane="profile"|"agent"|"team"|"model".
+//   `selection-back`        — `‹ Back` (mobile header); absent on the profile pane.
+//   `selection-title-{profile|agent|team|model}` — column titles
+//                             (Profile / Agent / Team / `Model · <member>`).
 //   `selection-profile-<name>` — one row per profile, catalog order (repo
-//                           first). Repo rows show 📁; row 0 shows caption
-//                           `default`. Attribute data-browsed="true" on the
-//                           BROWSED row (initially the selected profile).
-//                           Click = BROWSE ONLY: right column switches,
-//                           nothing selected, nothing sent.
-//   `selection-agents-title` — `AGENTS · <PROFILE>` (browsed profile; compared
-//                           case-insensitively).
-//   `selection-agent-<name>` — rows of the BROWSED profile only. Caption
-//                           `N subagents` (+ ` · default` on the first agent)
-//                           or `single`. Click = send(select(browsedProfile,
-//                           agent)) + close popover + onToast(...).
-// Esc while open closes the popover AND calls event.preventDefault() (so the
-// Settings view's Esc handler, which skips defaultPrevented events, stays
-// open: Esc order modal → popover → Settings). Esc while closed does NOT
-// preventDefault. mousedown outside closes.
-// Pinned (`pinned`): only the row for selection.profile is rendered, with
-// caption `pinned`; no other `selection-profile-*`.
+//                             first). 📁 on repo rows; row 0 caption `default`
+//                             (`pinned` under a pin). data-browsed="true" on
+//                             the BROWSED row. Click = BROWSE ONLY (nav → agent).
+//   `selection-agent-<name>` — rows of the BROWSED profile. Caption `N subagents`
+//                             (+ ` · default` on the first) or `single`.
+//                             Click = send(select(browsed, agent)) unless it is
+//                             already the bound pair; always nav → team.
+//   `selection-member-orchestrator` / `selection-member-sub-<name>` — Team rows;
+//                             each contains `selection-member-model`
+//                             (data-state="default"|"overridden"|"inherited";
+//                             text = alias, or `inherits <alias>`).
+//   `selection-model-<alias>` — Model-pane rows in `models` order; the effective
+//                             row has data-current="true" and `→ `; the default
+//                             row contains `selection-model-default-tag` (`default`).
+//                             Subline `{provider_name} · {model_name}`.
+//   `selection-model-reset` — only when the member is overridden.
+//   `selection-team-reset`  — only when the team has any override (orchestrator
+//                             included).
+// Esc: Model pane → back to Team (popover stays), otherwise closes; both
+// preventDefault() (Settings' Esc handler skips defaultPrevented events). Esc
+// while closed is NOT swallowed. mousedown outside closes.
 
-// ── ../components/AgentsChip (T32, spec §9.1 "Agents chip popover") ─────
-// export function AgentsChip(props: AgentsChipProps)  — null when `agent` is null.
-export interface AgentsChipProps {
-  profile: string | null;
-  /** The bound catalog agent (App resolves selection → catalog). */
-  agent: CatalogAgent | null;
-  /** The model alias currently active (after /model it can differ from agent.model). */
-  activeModel: string;
-  dropUp?: boolean;
-}
-// data-testids:
-//   `agents-chip`          — textContent `Agents · N ▾`, N = 1 + subagents.
-//   `agents-popover`       — only while open (click toggles; Esc closes+preventDefault).
-//   `agents-roster-title`  — `Roster · <profile> › <agent>`.
-//   `agents-roster-main`   — contains agent.name, tag `main`, activeModel.
-//   `agents-roster-sub-<name>` — contains `↳ <name>` and the sub's model, or
-//                           `inherits <agent.model>` when sub.inherited.
-//   `agents-roster-empty`  — "Single agent — no delegate tool." (no subagents).
+// ── ../teamModels (selection-models plan §5.3; pure, no React) ──────────
+// See the plan: teamMembers / boundTeamState / EMPTY_TEAM / teamView /
+// withModel / selectFrameFor / overrideCount / anyOverride / sameTeam.
+// Tests: src/teamModels.test.ts.
 
 // ── TopBar / BottomBar / Composer additions (T32) ───────────────────────
 // TopBar & BottomBar gain OPTIONAL props (all absent ⇒ no chips, as today):
@@ -809,9 +821,11 @@ export interface ChatChipProps {
   /** Toast sink for `Next conversation: …`. */
   onToast?(message: string): void;
 }
-// They render <SelectionChip locked={hasTranscript} send={send} …/> then (after
-// the model chip) <AgentsChip …/>. TopBar: selection-chip precedes agents-chip.
-// BottomBar renders both too (dropUp).
+// They render ONE chip — <SelectionChip locked={selectionLocked} send={send}
+// models={models} activeAlias={activeAlias} …/> — fed by the `models` and
+// `activeAlias` props they already take. The separate model chip
+// (ModelSwitcher) and "Agents · N" chip (AgentsChip) are GONE; `onSwitchModel`
+// is no longer a prop of either bar. BottomBar renders the chip with dropUp.
 // Composer gains `settingsEnabled?: boolean` (default true): a hint element
 // `composer-settings-hint` with text `Ctrl+, settings`, placed AFTER the
 // `/ for commands` hint; not rendered when settingsEnabled === false.

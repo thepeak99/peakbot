@@ -372,6 +372,7 @@ fn fresh_session_binds_first_profile_first_agent() {
         Selection {
             profile: "dev".to_string(),
             agent: "team".to_string(),
+            ..Default::default()
         },
         "the selection is derived from the bound"
     );
@@ -640,8 +641,10 @@ fn new_conversation_keeps_selection() {
     // `bound.selection()` — the same resume path `/new` runs.
     let (bound, warnings) = resolve_saved_selection(
         &cfg.catalog,
+        &cfg.registry,
         Some(sel.profile.as_str()),
         Some(sel.agent.as_str()),
+        &std::collections::BTreeMap::new(),
         None,
     );
     assert!(
@@ -649,6 +652,10 @@ fn new_conversation_keeps_selection() {
         "no fallback: the selection is configured: {warnings:?}"
     );
     assert_eq!(bound.selection(), sel, "/new keeps (profile, agent)");
+    assert!(
+        bound.selection().subagent_models.is_empty(),
+        "no saved overrides ⇒ none applied"
+    );
     assert_eq!(
         bound.agent().main.model.alias,
         "sonnet",
@@ -850,6 +857,7 @@ fn reload_without_turns_reresolves_selection() {
         Selection {
             profile: "dev".to_string(),
             agent: "main".to_string(),
+            ..Default::default()
         },
         "the same selection, re-resolved"
     );
@@ -877,6 +885,7 @@ fn reload_without_turns_reresolves_selection() {
         Selection {
             profile: "dev".to_string(),
             agent: "main".to_string(),
+            ..Default::default()
         },
         "the selection is stamped back onto the StateManager (step 7)"
     );
@@ -941,6 +950,7 @@ fn reload_dropped_profile_without_turns_uses_default() {
         Selection {
             profile: "research".to_string(),
             agent: "scholar".to_string(),
+            ..Default::default()
         },
         "the default here is the bound now"
     );
@@ -1281,24 +1291,197 @@ async fn vector_fixed_path_shares_one_handle_across_rebuilds() {
     );
 }
 
+// ── selection-models plan §9.1, items 43–45: overrides across a reload ──────
+
+/// The plan's shared fixture, as a file body: three aliases on one provider,
+/// `dev/team` (inherited `reviewer`, explicit `tester`, explicit-equal `twin`)
+/// and a subagent-free `solo`, plus `research/main`.
+const TEAM_MODELS_GLOBAL: &str = r#"providers:
+  - name: anthropic
+    type: anthropic
+    api_key: sk-ant-test
+    models:
+      - { name: claude-opus-5,   alias: opus,   context_size: 200000 }
+      - { name: claude-sonnet-5, alias: sonnet, context_size: 200000 }
+      - { name: claude-haiku-5,  alias: haiku,  context_size: 200000 }
+general: { context: { enabled: false } }
+profiles:
+  dev:
+    agents:
+      team:
+        model: sonnet
+        subagents:
+          reviewer: { prompt: "Review." }
+          tester:   { prompt: "Test.",  model: haiku }
+          twin:     { prompt: "Twin.",  model: sonnet }
+      solo: { model: opus }
+  research:
+    agents:
+      main: { model: haiku }
+"#;
+
+/// The same file with the `opus` alias removed (`team` stays valid; `solo` is
+/// moved to haiku so every agent still resolves).
+fn team_models_global_without_opus() -> String {
+    TEAM_MODELS_GLOBAL
+        .replace(
+            "      - { name: claude-opus-5,   alias: opus,   context_size: 200000 }\n",
+            "",
+        )
+        .replace(
+            "      solo: { model: opus }",
+            "      solo: { model: haiku }",
+        )
+}
+
+fn tester_opus() -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("tester".to_string(), "opus".to_string());
+    map
+}
+
+/// Boot a `RebuildContext` over `TEAM_MODELS_GLOBAL` whose bound already
+/// carries `{tester: opus}` (built through the validating constructor on the
+/// boot registry), with the matching selection published on a fresh `sm`.
+fn rebuild_ctx_with_tester_opus(home: &TempHome) -> (peakbot::RebuildContext, Arc<StateManager>) {
+    home.write_global(TEAM_MODELS_GLOBAL);
+    let boot = Config::load(home.cwd(), RepoMode::Include, &ctx()).expect("boot");
+    let base = boot.catalog.resolve("dev", "team").expect("dev/team");
+    let (bound, rejected) = base.with_subagent_models(&boot.registry, &tester_opus());
+    assert!(
+        rejected.is_empty(),
+        "the boot override is valid: {rejected:?}"
+    );
+    let rc = rebuild_ctx(boot, bound, None);
+    let sm = StateManager::new_arc();
+    sm.set_selection(rc.bound.selection());
+    (rc, sm)
+}
+
+/// §9.1/43: a zero-turn reload with an unchanged global keeps valid overrides
+/// — no warning, in the bound AND in the published selection.
+#[test]
+fn reload_without_turns_keeps_valid_subagent_models() {
+    let home = TempHome::new();
+    let (mut rc, sm) = rebuild_ctx_with_tester_opus(&home);
+
+    let warnings = peakbot::reload_session_config(&mut rc, &sm, home.cwd());
+    assert!(
+        warnings.is_empty(),
+        "a still-valid override is quiet: {warnings:?}"
+    );
+    assert_eq!(
+        rc.bound.selection().subagent_models,
+        tester_opus(),
+        "the bound"
+    );
+    assert_eq!(
+        sm.selection().subagent_models,
+        tester_opus(),
+        "the published selection"
+    );
+}
+
+/// §9.1/44: a zero-turn reload that removed the override's alias drops that
+/// entry with the exact ⚠ and keeps the (still valid) agent.
+#[test]
+fn reload_without_turns_drops_vanished_override_alias_with_warning() {
+    let home = TempHome::new();
+    let (mut rc, sm) = rebuild_ctx_with_tester_opus(&home);
+
+    home.write_global(&team_models_global_without_opus());
+
+    let warnings = peakbot::reload_session_config(&mut rc, &sm, home.cwd());
+    assert_eq!(
+        warnings,
+        vec!["⚠ Model 'opus' for subagent 'tester' is no longer configured; using its default."],
+        "exactly the override warning — the agent itself is still configured"
+    );
+    assert!(
+        rc.bound.selection().subagent_models.is_empty(),
+        "the bound dropped it"
+    );
+    assert!(
+        sm.selection().subagent_models.is_empty(),
+        "the published selection dropped it"
+    );
+    assert_eq!(rc.bound.agent().main.name, "team", "the agent is kept");
+}
+
+/// §9.1/45: with turns, a reload keeps the conversation's definitions — the
+/// overrides stay even though their alias vanished, with no override warning.
+#[test]
+fn reload_with_turns_keeps_overrides() {
+    let home = TempHome::new();
+    let (mut rc, sm) = rebuild_ctx_with_tester_opus(&home);
+    sm.add_user_message("hi".to_string());
+
+    home.write_global(&team_models_global_without_opus());
+
+    let warnings = peakbot::reload_session_config(&mut rc, &sm, home.cwd());
+    assert!(
+        warnings.iter().all(|w| !w.contains("subagent")),
+        "an in-flight conversation gets no override warning: {warnings:?}"
+    );
+    assert_eq!(
+        rc.bound.selection().subagent_models,
+        tester_opus(),
+        "in-flight conversations keep their definitions"
+    );
+}
+
 // ── plan T10: UI state / wire ───────────────────────────────────────────────
 
-/// T10: `UiAction::Select(Selection)` carries the selection; the wire shape
-/// round-trips. ASSUMED API: the `Select` variant (see header, #8).
+/// T10: `UiAction::Select { selection, model }` carries the selection (and
+/// the optional orchestrator model); the wire shape round-trips.
+/// ASSUMED API: the `Select` struct variant (see header, #8).
 #[test]
 fn ui_action_select_wire_roundtrip() {
-    let action = UiAction::Select(Selection {
-        profile: "dev".to_string(),
-        agent: "team".to_string(),
-    });
+    let action = UiAction::Select {
+        selection: Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+            ..Default::default()
+        },
+        model: None,
+    };
     let json = serde_json::to_value(&action).expect("serialize");
     assert_eq!(
         json,
-        serde_json::json!({ "Select": { "profile": "dev", "agent": "team" } }),
+        serde_json::json!({ "Select": { "selection": { "profile": "dev", "agent": "team" } } }),
         "the wire shape of UiAction::Select"
     );
     let back: UiAction = serde_json::from_value(json).expect("deserialize");
     assert_eq!(back, action, "the frame round-trips");
+
+    // With a model and an override map (selection-models plan §9.1/25).
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("tester".to_string(), "opus".to_string());
+    let action = UiAction::Select {
+        selection: Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+            subagent_models: map,
+        },
+        model: Some("opus".to_string()),
+    };
+    let json = serde_json::to_value(&action).expect("serialize");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "Select": {
+                "selection": {
+                    "profile": "dev",
+                    "agent": "team",
+                    "subagent_models": { "tester": "opus" }
+                },
+                "model": "opus"
+            }
+        }),
+        "the wire shape of UiAction::Select with a model and overrides"
+    );
+    let back: UiAction = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(back, action, "the extended frame round-trips");
 }
 
 /// T10: `AppState` carries the catalog, the selection and the pin — and the
@@ -1312,6 +1495,7 @@ fn appstate_settings_available_derived_from_pin() {
         selection: Selection {
             profile: "dev".to_string(),
             agent: "team".to_string(),
+            ..Default::default()
         },
         profile_pinned: true,
         ..AppState::default()

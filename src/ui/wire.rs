@@ -99,6 +99,15 @@ pub(crate) enum InboundMessage {
     Select {
         profile: String,
         agent: String,
+        /// The requested orchestrator model alias; absent = the agent's
+        /// configured model.
+        #[serde(default)]
+        #[allow(dead_code)] // RED STUB (T1): forwarded by T4's dispatchers; drop then.
+        model: Option<String>,
+        /// Subagent → model alias overrides (overridden subagents only).
+        #[serde(default)]
+        #[allow(dead_code)] // RED STUB (T1): forwarded by T4's dispatchers; drop then.
+        subagent_models: std::collections::BTreeMap<String, String>,
     },
     /// End an active session for *everyone* attached to it (dropdown "kill").
     KillSession {
@@ -985,6 +994,34 @@ mod tests {
         assert!(matches!(m, InboundMessage::Resume));
     }
 
+    /// T7 (selection-models plan §9.1/23): the extended select frame carries
+    /// the orchestrator model alias and the subagent override map.
+    #[test]
+    fn inbound_select_with_models_parses() {
+        let m: InboundMessage = serde_json::from_str(
+            r#"{"type":"select","profile":"dev","agent":"team","model":"opus","subagent_models":{"tester":"haiku"}}"#,
+        )
+        .expect("the extended select frame must parse");
+        match &m {
+            InboundMessage::Select {
+                profile,
+                agent,
+                model,
+                subagent_models,
+            } => {
+                assert_eq!(profile, "dev");
+                assert_eq!(agent, "team");
+                assert_eq!(model.as_deref(), Some("opus"), "the model leg parses");
+                assert_eq!(
+                    subagent_models.get("tester").map(String::as_str),
+                    Some("haiku"),
+                    "the override map parses"
+                );
+            }
+            other => panic!("expected InboundMessage::Select, got {other:?}"),
+        }
+    }
+
     // ── select wire protocol (0.24 cutover) ───────────────────────────────
     //
     // `{"type":"select","profile":…,"agent":…}` — the single selection
@@ -1000,9 +1037,19 @@ mod tests {
             serde_json::from_str(r#"{"type":"select","profile":"dev","agent":"team"}"#)
                 .expect("a well-formed select frame must parse");
         match &m {
-            InboundMessage::Select { profile, agent } => {
+            InboundMessage::Select {
+                profile,
+                agent,
+                model,
+                subagent_models,
+            } => {
                 assert_eq!(profile, "dev", "the profile leg must carry through");
                 assert_eq!(agent, "team", "the agent leg must carry through");
+                assert!(model.is_none(), "the 2-key frame has no model leg");
+                assert!(
+                    subagent_models.is_empty(),
+                    "the 2-key frame has no overrides"
+                );
             }
             other => panic!("expected InboundMessage::Select, got {other:?}"),
         }

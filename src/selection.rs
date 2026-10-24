@@ -10,9 +10,11 @@
 //! The types (`Catalog`, `Bound`, `Selection`, …) come from
 //! `crate::config::resolve` (T1).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::config::resolve::{Bound, Catalog, Origin};
+use crate::config::ModelRegistry;
+use crate::config::resolve::{Bound, Catalog, Origin, OverrideRejection, ResolvedAgent};
 
 /// One selection command line, classified.
 #[derive(Debug, PartialEq)]
@@ -69,10 +71,16 @@ pub fn classify_select(line: &str) -> Option<SelectSubmission> {
 /// silently; an unknown name falls back with the exact ⚠ warning (profile
 /// warning before agent warning). An unknown pin is a boot error
 /// (`Catalog::start_bound`) and never reaches here.
+///
+/// RED (T1): the `registry` + `subagent_models` legs are the plan §5.1
+/// signature; T2 applies the saved overrides leniently (drop +
+/// `override_warning`) after the profile/agent resolution.
 pub fn resolve_saved_selection(
     cat: &Catalog,
+    _registry: &ModelRegistry,
     profile: Option<&str>,
     agent: Option<&str>,
+    _subagent_models: &BTreeMap<String, String>,
     pin: Option<&str>,
 ) -> (Bound, Vec<String>) {
     let mut warnings = Vec::new();
@@ -117,6 +125,27 @@ pub fn resolve_saved_selection(
         },
         warnings,
     )
+}
+
+/// The exact refusal line for a subagent override that a user frame asked
+/// for and the registry/roster refused (plan §5.2).
+///
+/// RED stub (T1): signature only — T2 lands the implementation.
+pub fn override_refusal(
+    rej: &OverrideRejection,
+    agent: &ResolvedAgent,
+    registry: &ModelRegistry,
+) -> String {
+    let _ = (rej, agent, registry);
+    todo!("T2: override_refusal")
+}
+
+/// The exact ⚠ line for a saved override that a rebind dropped (plan §5.2).
+///
+/// RED stub (T1): signature only — T2 lands the implementation.
+pub fn override_warning(rej: &OverrideRejection, agent: &ResolvedAgent) -> String {
+    let _ = (rej, agent);
+    todo!("T2: override_warning")
 }
 
 /// One `/profile <name>` | `/agent <name>` decision (spec §6.6).
@@ -291,12 +320,14 @@ pub fn render_agent_list(cur: &Bound) -> String {
 mod t5_tests {
     use std::path::Path;
 
+    use crate::config::ModelRegistry;
     use crate::config::resolve::{Bound, Catalog, Config, ParseCtx, Selection, Source};
     // NB: no short import of `render_agent_list` — the test fn below owns
     // that name in this module and calls the production fn by full path.
+    use crate::config::resolve::OverrideRejection;
     use crate::selection::{
-        SelectChoice, SelectSubmission, classify_select, render_profile_list,
-        resolve_saved_selection, resolve_selection_choice,
+        SelectChoice, SelectSubmission, classify_select, override_refusal, override_warning,
+        render_profile_list, resolve_saved_selection, resolve_selection_choice,
     };
 
     /// A valid 0.24 global config: two profiles, `dev` first; `dev` has two
@@ -374,13 +405,16 @@ profiles:
         config(repo).catalog
     }
 
+    /// The registry behind the same fixtures (for the override legs of
+    /// `resolve_saved_selection`, plan §5.1).
+    fn registry(repo: Option<&str>) -> std::sync::Arc<ModelRegistry> {
+        config(repo).registry
+    }
+
     /// The exact `(profile, agent)` of a fixture catalog.
     fn bound(repo: Option<&str>, profile: &str, agent: &str) -> Bound {
         catalog(repo)
-            .resolve(&Selection {
-                profile: profile.into(),
-                agent: agent.into(),
-            })
+            .resolve(profile, agent)
             .unwrap_or_else(|| panic!("fixture bound {profile}/{agent} must exist"))
     }
 
@@ -502,12 +536,20 @@ profiles:
     #[test]
     fn saved_missing_is_silent() {
         let catalog = catalog(Some(REPO_YAML));
-        let (bound, warnings) = resolve_saved_selection(&catalog, None, None, None);
+        let (bound, warnings) = resolve_saved_selection(
+            &catalog,
+            &registry(None),
+            None,
+            None,
+            &std::collections::BTreeMap::new(),
+            None,
+        );
         assert_eq!(
             bound.selection(),
             Selection {
                 profile: "peakbot-dev".into(),
-                agent: "team".into()
+                agent: "team".into(),
+                ..Default::default()
             }
         );
         assert!(
@@ -521,12 +563,20 @@ profiles:
     #[test]
     fn saved_unknown_profile_warns() {
         let catalog = catalog(Some(REPO_YAML));
-        let (bound, warnings) = resolve_saved_selection(&catalog, Some("ghost"), None, None);
+        let (bound, warnings) = resolve_saved_selection(
+            &catalog,
+            &registry(Some(REPO_YAML)),
+            Some("ghost"),
+            None,
+            &std::collections::BTreeMap::new(),
+            None,
+        );
         assert_eq!(
             bound.selection(),
             Selection {
                 profile: "peakbot-dev".into(),
-                agent: "team".into()
+                agent: "team".into(),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -542,12 +592,20 @@ profiles:
     #[test]
     fn saved_unknown_agent_warns() {
         let catalog = catalog(None);
-        let (bound, warnings) = resolve_saved_selection(&catalog, Some("dev"), Some("ghost"), None);
+        let (bound, warnings) = resolve_saved_selection(
+            &catalog,
+            &registry(None),
+            Some("dev"),
+            Some("ghost"),
+            &std::collections::BTreeMap::new(),
+            None,
+        );
         assert_eq!(
             bound.selection(),
             Selection {
                 profile: "dev".into(),
-                agent: "team".into()
+                agent: "team".into(),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -561,13 +619,20 @@ profiles:
     #[test]
     fn saved_unknown_profile_and_agent_warn_in_order() {
         let catalog = catalog(None);
-        let (bound, warnings) =
-            resolve_saved_selection(&catalog, Some("ghost"), Some("phantom"), None);
+        let (bound, warnings) = resolve_saved_selection(
+            &catalog,
+            &registry(None),
+            Some("ghost"),
+            Some("phantom"),
+            &std::collections::BTreeMap::new(),
+            None,
+        );
         assert_eq!(
             bound.selection(),
             Selection {
                 profile: "dev".into(),
-                agent: "team".into()
+                agent: "team".into(),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -585,13 +650,20 @@ profiles:
     #[test]
     fn saved_pin_wins_over_saved_profile() {
         let catalog = catalog(None);
-        let (bound, warnings) =
-            resolve_saved_selection(&catalog, Some("dev"), Some("team"), Some("research"));
+        let (bound, warnings) = resolve_saved_selection(
+            &catalog,
+            &registry(None),
+            Some("dev"),
+            Some("team"),
+            &std::collections::BTreeMap::new(),
+            Some("research"),
+        );
         assert_eq!(
             bound.selection(),
             Selection {
                 profile: "research".into(),
-                agent: "scholar".into()
+                agent: "scholar".into(),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -605,13 +677,20 @@ profiles:
     #[test]
     fn saved_known_pair_is_quiet() {
         let catalog = catalog(Some(REPO_YAML));
-        let (bound, warnings) =
-            resolve_saved_selection(&catalog, Some("research"), Some("scholar"), None);
+        let (bound, warnings) = resolve_saved_selection(
+            &catalog,
+            &registry(Some(REPO_YAML)),
+            Some("research"),
+            Some("scholar"),
+            &std::collections::BTreeMap::new(),
+            None,
+        );
         assert_eq!(
             bound.selection(),
             Selection {
                 profile: "research".into(),
-                agent: "scholar".into()
+                agent: "scholar".into(),
+                ..Default::default()
             }
         );
         assert!(
@@ -641,7 +720,8 @@ profiles:
             bound.selection(),
             Selection {
                 profile: "research".into(),
-                agent: "scholar".into()
+                agent: "scholar".into(),
+                ..Default::default()
             }
         );
         assert_eq!(bound.agent().main.model.alias, "opus");
@@ -666,7 +746,8 @@ profiles:
             bound.selection(),
             Selection {
                 profile: "dev".into(),
-                agent: "solo".into()
+                agent: "solo".into(),
+                ..Default::default()
             }
         );
         assert_eq!(bound.agent().main.model.alias, "sonnet");
@@ -778,7 +859,8 @@ profiles:
             bound.selection(),
             Selection {
                 profile: "dev".into(),
-                agent: "team".into()
+                agent: "team".into(),
+                ..Default::default()
             }
         );
         assert_eq!(bound.agent().main.model.alias, "sonnet");
@@ -803,7 +885,8 @@ profiles:
             bound.selection(),
             Selection {
                 profile: "dev".into(),
-                agent: "solo".into()
+                agent: "solo".into(),
+                ..Default::default()
             }
         );
         assert_eq!(bound.agent().main.model.alias, "sonnet");
@@ -924,6 +1007,205 @@ profiles:
             r#"Agents in profile 'dev' (first = default):
   team  sonnet · 3 subagents (researcher, senior, tester)
 → solo  sonnet · single"#
+        );
+    }
+
+    // ── subagent model overrides (selection-models plan §9.1, items 10–14) ──
+    //
+    // The plan's SHARED fixture (all new Rust tests use it): an anthropic
+    // provider with the three aliases, `dev/team` with one inherited
+    // (`reviewer`), one explicit (`tester`), one explicit-equal (`twin`,
+    // Z4), a subagent-free `solo`, and `research/main`.
+
+    /// The plan's shared fixture (see the section comment above).
+    const TEAM_MODELS_YAML: &str = r#"
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key: sk-ant-test
+    models:
+      - { name: claude-opus-5,   alias: opus,   context_size: 200000 }
+      - { name: claude-sonnet-5, alias: sonnet, context_size: 200000 }
+      - { name: claude-haiku-5,  alias: haiku,  context_size: 200000 }
+general: { context: { enabled: false } }
+profiles:
+  dev:
+    agents:
+      team:
+        model: sonnet
+        subagents:
+          reviewer: { prompt: "Review." }
+          tester:   { prompt: "Test.",  model: haiku }
+          twin:     { prompt: "Twin.",  model: sonnet }
+      solo: { model: opus }
+  research:
+    agents:
+      main: { model: haiku }
+"#;
+
+    fn team_config() -> Config {
+        Config::parse(
+            Source {
+                path: Path::new("/global/config.yaml"),
+                text: TEAM_MODELS_YAML,
+            },
+            None,
+            &ctx(),
+        )
+        .expect("the shared team-models fixture parses")
+    }
+
+    fn team_bound(profile: &str, agent: &str) -> Bound {
+        let cfg = team_config();
+        cfg.catalog
+            .resolve(profile, agent)
+            .unwrap_or_else(|| panic!("fixture bound {profile}/{agent} must exist"))
+    }
+
+    /// Plan §5.2: the refusal copy for an unknown subagent names the roster
+    /// in declaration order (`none` for a subagent-free agent).
+    #[test]
+    fn override_refusal_strings_exact() {
+        let cfg = team_config();
+        let team = team_bound("dev", "team");
+        let solo = team_bound("dev", "solo");
+        assert_eq!(
+            override_refusal(
+                &OverrideRejection::UnknownSubagent {
+                    subagent: "ghost".into()
+                },
+                team.agent(),
+                &cfg.registry,
+            ),
+            "agent 'team' has no subagent 'ghost'. Subagents: reviewer, tester, twin"
+        );
+        assert_eq!(
+            override_refusal(
+                &OverrideRejection::UnknownSubagent {
+                    subagent: "ghost".into()
+                },
+                solo.agent(),
+                &cfg.registry,
+            ),
+            "agent 'solo' has no subagent 'ghost'. Subagents: none"
+        );
+        assert_eq!(
+            override_refusal(
+                &OverrideRejection::UnknownAlias {
+                    subagent: "tester".into(),
+                    alias: "nope".into(),
+                },
+                team.agent(),
+                &cfg.registry,
+            ),
+            "unknown alias `nope` for subagent 'tester'. Available: haiku, opus, sonnet"
+        );
+    }
+
+    /// Plan §5.2: the ⚠ copy for a dropped override on rebind.
+    #[test]
+    fn override_warning_strings_exact() {
+        let team = team_bound("dev", "team");
+        assert_eq!(
+            override_warning(
+                &OverrideRejection::UnknownAlias {
+                    subagent: "tester".into(),
+                    alias: "nope".into(),
+                },
+                team.agent(),
+            ),
+            "⚠ Model 'nope' for subagent 'tester' is no longer configured; using its default."
+        );
+        assert_eq!(
+            override_warning(
+                &OverrideRejection::UnknownSubagent {
+                    subagent: "ghost".into()
+                },
+                team.agent(),
+            ),
+            "⚠ Subagent 'ghost' is not in agent 'team'; its model override was dropped."
+        );
+    }
+
+    /// Plan §9.1/12: a saved pair that resolves exactly carries its saved
+    /// overrides with no warnings.
+    #[test]
+    fn resolve_saved_selection_applies_saved_subagent_models() {
+        let cfg = team_config();
+        let mut wanted = std::collections::BTreeMap::new();
+        wanted.insert("tester".to_string(), "opus".to_string());
+        let (bound, warnings) = resolve_saved_selection(
+            &cfg.catalog,
+            &cfg.registry,
+            Some("dev"),
+            Some("team"),
+            &wanted,
+            None,
+        );
+        assert!(
+            warnings.is_empty(),
+            "a saved pair that resolves exactly is quiet: {warnings:?}"
+        );
+        assert_eq!(
+            bound.selection().subagent_models,
+            wanted,
+            "the valid saved override survives"
+        );
+    }
+
+    /// Plan §9.1/13: unknown saved overrides are dropped in subagent-name
+    /// order, one ⚠ each, nothing applied.
+    #[test]
+    fn resolve_saved_selection_drops_unknown_override_with_warning() {
+        let cfg = team_config();
+        let mut wanted = std::collections::BTreeMap::new();
+        wanted.insert("tester".to_string(), "nope".to_string());
+        wanted.insert("ghost".to_string(), "opus".to_string());
+        let (bound, warnings) = resolve_saved_selection(
+            &cfg.catalog,
+            &cfg.registry,
+            Some("dev"),
+            Some("team"),
+            &wanted,
+            None,
+        );
+        assert_eq!(
+            warnings,
+            vec![
+                "⚠ Subagent 'ghost' is not in agent 'team'; its model override was dropped.",
+                "⚠ Model 'nope' for subagent 'tester' is no longer configured; using its default.",
+            ],
+            "one ⚠ per dropped override, in subagent-name order"
+        );
+        assert!(
+            bound.selection().subagent_models.is_empty(),
+            "nothing applies when every entry is bad"
+        );
+    }
+
+    /// Plan §9.1/14: when the saved AGENT fell back, its overrides are
+    /// dropped SILENTLY — the agent ⚠ already explains the fallback.
+    #[test]
+    fn resolve_saved_selection_drops_overrides_when_agent_falls_back() {
+        let cfg = team_config();
+        let mut wanted = std::collections::BTreeMap::new();
+        wanted.insert("tester".to_string(), "opus".to_string());
+        let (bound, warnings) = resolve_saved_selection(
+            &cfg.catalog,
+            &cfg.registry,
+            Some("dev"),
+            Some("gone"),
+            &wanted,
+            None,
+        );
+        assert_eq!(
+            warnings,
+            vec!["⚠ Agent 'gone' is not in profile 'dev'; using 'team'."],
+            "only the existing agent-fallback warning — no override noise"
+        );
+        assert!(
+            bound.selection().subagent_models.is_empty(),
+            "the fallback agent starts without the vanished agent's overrides"
         );
     }
 }

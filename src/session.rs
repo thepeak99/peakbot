@@ -154,8 +154,11 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     let saved_agent = saved.as_ref().and_then(|s| nonempty(&s.agent));
     let (bound, warnings) = crate::selection::resolve_saved_selection(
         &ctx.config.catalog,
+        &ctx.config.registry,
         saved_profile.as_deref(),
         saved_agent.as_deref(),
+        // RED (T1): T4 threads the peeked overrides through resume.
+        &std::collections::BTreeMap::new(),
         deps.profile_pin.as_deref(),
     );
     ctx.bound = bound;

@@ -1564,6 +1564,7 @@ impl StateManager {
                 .map(|c| crate::config::resolve::Selection {
                     agent: c.agent.clone().unwrap_or_default(),
                     profile: c.profile.clone().unwrap_or_default(),
+                    ..Default::default()
                 })
                 .unwrap_or_default();
             {
@@ -1626,6 +1627,7 @@ impl StateManager {
             (agent, profile) => Ok(Some(crate::config::resolve::Selection {
                 agent: agent.unwrap_or_default(),
                 profile: profile.unwrap_or_default(),
+                ..Default::default()
             })),
         }
     }
@@ -3740,6 +3742,7 @@ mod tests {
         sm.set_selection(Selection {
             profile: "dev".to_string(),
             agent: "team".to_string(),
+            ..Default::default()
         });
         sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
         let conv = sm.get_current_conversation().unwrap();
@@ -3762,6 +3765,7 @@ mod tests {
         let sel = Selection {
             profile: "dev".to_string(),
             agent: "team".to_string(),
+            ..Default::default()
         };
         let sm = StateManager::new();
         sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
@@ -3886,6 +3890,7 @@ mod tests {
         sm.set_selection(Selection {
             profile: "dev".to_string(),
             agent: "team".to_string(),
+            ..Default::default()
         });
 
         let junior = MessageSource::SubAgent {
@@ -8059,6 +8064,7 @@ mod tests {
         let sel = Selection {
             profile: "dev".to_string(),
             agent: "team".to_string(),
+            ..Default::default()
         };
         let sm = StateManager::new();
         // Seed a current conversation — the persisted mirror requires it.
@@ -8096,6 +8102,7 @@ mod tests {
         let sel2 = Selection {
             profile: "default".to_string(),
             agent: "main".to_string(),
+            ..Default::default()
         };
         sm.set_selection(sel2.clone());
         assert_eq!(sm.get_state().selection, sel2);
@@ -8128,12 +8135,14 @@ mod tests {
         sm.set_selection(Selection {
             profile: "dev".to_string(),
             agent: "team".to_string(),
+            ..Default::default()
         });
         assert_eq!(
             sm.selection(),
             Selection {
                 profile: "dev".to_string(),
-                agent: "team".to_string()
+                agent: "team".to_string(),
+                ..Default::default()
             }
         );
     }
@@ -8163,14 +8172,16 @@ mod tests {
             sm.selection(),
             Selection {
                 profile: "dev".to_string(),
-                agent: "team".to_string()
+                agent: "team".to_string(),
+                ..Default::default()
             }
         );
         assert_eq!(
             sm.get_state().selection,
             Selection {
                 profile: "dev".to_string(),
-                agent: "team".to_string()
+                agent: "team".to_string(),
+                ..Default::default()
             }
         );
     }
@@ -8206,7 +8217,8 @@ mod tests {
             peeked,
             Some(Selection {
                 profile: "dev".to_string(),
-                agent: "team".to_string()
+                agent: "team".to_string(),
+                ..Default::default()
             })
         );
 
@@ -8313,6 +8325,7 @@ mod tests {
                         "default".into()
                     },
                     agent: if toggle { "team".into() } else { "main".into() },
+                    ..Default::default()
                 });
                 toggle = !toggle;
                 count_a_t.fetch_add(1, Ordering::Relaxed);
@@ -10050,6 +10063,136 @@ mod tests {
         assert!(
             !convo_dir.exists(),
             "delete_conversation must remove <root>/<id> (best-effort store cleanup)"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RED tests (selection-models plan §9.1, items 19–22): the selection's
+// `subagent_models` must travel with the conversation — set, `/new`, `/load`
+// and the resume peek all carry the alias map.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod subagent_models_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use super::StateManager;
+    use crate::config::resolve::Selection;
+    use crate::conversation::Conversation;
+    use crate::storage::{ConversationStorage, InMemoryStorage};
+
+    fn selection_with_overrides(map: BTreeMap<String, String>) -> Selection {
+        Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+            subagent_models: map,
+        }
+    }
+
+    fn tester_opus() -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        map.insert("tester".to_string(), "opus".to_string());
+        map
+    }
+
+    /// `set_selection` writes the map onto the CURRENT conversation (persisted
+    /// on the next save) and into the live mirror.
+    #[test]
+    fn set_selection_persists_subagent_models_on_conversation() {
+        let sm = StateManager::new_arc();
+        sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
+
+        let sel = selection_with_overrides(tester_opus());
+        sm.set_selection(sel.clone());
+
+        let conv = sm
+            .get_current_conversation()
+            .expect("a current conversation");
+        assert_eq!(
+            conv.subagent_models,
+            tester_opus(),
+            "the conversation carries the overrides"
+        );
+        assert_eq!(sm.selection(), sel, "the live mirror agrees");
+    }
+
+    /// `/new` (`create_conversation`) copies the selection's map onto the
+    /// fresh conversation — "same team setup, fresh transcript".
+    #[test]
+    fn create_conversation_carries_subagent_models() {
+        let sm = StateManager::new_arc();
+        sm.set_selection(selection_with_overrides(tester_opus()));
+
+        sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
+        let conv = sm
+            .get_current_conversation()
+            .expect("the minted conversation");
+        assert_eq!(
+            conv.subagent_models,
+            tester_opus(),
+            "the mint carries the overrides"
+        );
+        assert_eq!(
+            sm.selection().subagent_models,
+            tester_opus(),
+            "the mirror still agrees after the mint"
+        );
+    }
+
+    /// `/load` restores the saved map into the live selection.
+    #[test]
+    fn load_conversation_restores_subagent_models_into_selection() {
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let mut conv =
+            Conversation::new("bound".into(), "prov".into(), "model".into(), String::new());
+        conv.agent = Some("team".into());
+        conv.profile = Some("dev".into());
+        conv.subagent_models = tester_opus();
+        let id = conv.id;
+        storage.save(&conv).unwrap();
+
+        sm.load_conversation(id).unwrap();
+        assert_eq!(
+            sm.selection().subagent_models,
+            tester_opus(),
+            "the loaded conversation's overrides resume in the selection"
+        );
+        assert_eq!(
+            sm.get_state().selection.subagent_models,
+            tester_opus(),
+            "the AppState mirror carries them too"
+        );
+    }
+
+    /// The resume peek includes the map (still `None` only when agent AND
+    /// profile are both absent).
+    #[test]
+    fn peek_conversation_selection_includes_subagent_models() {
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+
+        let mut conv = Conversation::new(
+            "peek-target".into(),
+            "prov".into(),
+            "model".into(),
+            String::new(),
+        );
+        conv.agent = Some("team".into());
+        conv.profile = Some("dev".into());
+        conv.subagent_models = tester_opus();
+        let id = conv.id;
+        storage.save(&conv).unwrap();
+
+        let peeked = sm
+            .peek_conversation_selection(id)
+            .expect("peek must succeed when storage is configured");
+        assert_eq!(
+            peeked,
+            Some(selection_with_overrides(tester_opus())),
+            "the peeked selection carries the saved overrides"
         );
     }
 }

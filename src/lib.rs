@@ -181,6 +181,12 @@ enum SubmitKind {
     /// `/profile [name]` or `/agent [name]` — a per-conversation selection,
     /// not an LLM turn.
     Select(crate::selection::SelectSubmission),
+    /// `/model <alias>` — switch the orchestrator model (new conversation).
+    /// RED STUB (T1): data only so the T6 classify tests compile;
+    /// `classify_submission` does not produce it and the event loop has no
+    /// arm for it yet. T6 removes the `#[allow]`.
+    #[allow(dead_code)]
+    SwitchModel(String),
 }
 
 fn classify_submission(msg: &str) -> SubmitKind {
@@ -248,7 +254,14 @@ enum SelectRequest {
     /// Typed `/profile [name]` or `/agent [name]` — bare forms list.
     Command(crate::selection::SelectSubmission),
     /// `UiAction::Select` from the Agents panel / `{"type":"select"}` frame.
-    Pair(crate::config::resolve::Selection),
+    /// `model` is the requested orchestrator alias (absent = the agent's
+    /// configured model); the selection carries the subagent overrides.
+    Pair {
+        selection: crate::config::resolve::Selection,
+        // RED STUB (T1): read by T4's `handle_select`; drop the allow then.
+        #[allow(dead_code)]
+        model: Option<String>,
+    },
 }
 
 /// Completion result sent from agent loop back to event loop
@@ -662,8 +675,16 @@ fn reload_config(
     let pin = ctx.profile_pin.as_deref();
     match rebind {
         Rebind::Saved { profile, agent } => {
-            let (bound, warnings) =
-                crate::selection::resolve_saved_selection(catalog, profile, agent, pin);
+            let (bound, warnings) = crate::selection::resolve_saved_selection(
+                catalog,
+                &ctx.config.registry,
+                profile,
+                agent,
+                // RED (T1): T4 threads the conversation's saved overrides
+                // through `Rebind::Saved`.
+                &std::collections::BTreeMap::new(),
+                pin,
+            );
             ctx.bound = bound;
             messages.extend(warnings);
         }
@@ -678,21 +699,23 @@ fn reload_config(
                 ));
             }
         }
-        Rebind::Session => match catalog.resolve(&ctx.bound.selection()) {
-            Some(bound) => ctx.bound = bound,
-            None => {
-                // Under a pin the fallback stays inside the pinned profile.
-                let bound = catalog
-                    .start_bound(pin)
-                    .expect("the pin was checked against the fresh catalog above");
-                let sel = bound.selection();
-                messages.push(format!(
-                    "ℹ Using {} › {} (default here).",
-                    sel.profile, sel.agent
-                ));
-                ctx.bound = bound;
+        Rebind::Session => {
+            match catalog.resolve(&ctx.bound.profile.name, &ctx.bound.agent().main.name) {
+                Some(bound) => ctx.bound = bound,
+                None => {
+                    // Under a pin the fallback stays inside the pinned profile.
+                    let bound = catalog
+                        .start_bound(pin)
+                        .expect("the pin was checked against the fresh catalog above");
+                    let sel = bound.selection();
+                    messages.push(format!(
+                        "ℹ Using {} › {} (default here).",
+                        sel.profile, sel.agent
+                    ));
+                    ctx.bound = bound;
+                }
             }
-        },
+        }
     }
 
     // 7. Publish what the session is bound to.
@@ -845,6 +868,7 @@ pub(crate) fn build_bound_agent(
     let delegate = delegate_enabled(agent).then(|| {
         Arc::new(SubAgentDeps {
             bound: ctx.bound.clone(),
+            orchestrator_model: model.clone(),
             tool_env: Arc::clone(&tool_env),
             state_manager: Arc::clone(sm),
             shell_kind: ctx.shell_kind.clone(),
@@ -1343,6 +1367,10 @@ impl AgentRunner {
                             }
                             // Do not enqueue — the model is never called.
                         }
+                        // RED STUB (T1): `classify_submission` never yields
+                        // this yet; T6 replaces the arm with the real one
+                        // (`increment_pending_input` + `QueueMessage::SwitchModel`).
+                        SubmitKind::SwitchModel(_) => {}
                         SubmitKind::Select(sub) => {
                             // Forward to the agent loop: it owns the bound,
                             // the catalog, the pin and the agent handle (a
@@ -1388,7 +1416,7 @@ impl AgentRunner {
                     msg_tx.send(QueueMessage::ChangeCwd(path)).await.ok();
                 }
 
-                UiAction::Select(selection) => {
+                UiAction::Select { selection, model } => {
                     // Forward to the agent loop (sole owner of the bound and
                     // the agent handle — the selection rebuilds it). Counts as
                     // pending input so the status bar shows activity until the
@@ -1397,7 +1425,10 @@ impl AgentRunner {
                         sm.increment_pending_input();
                     }
                     msg_tx
-                        .send(QueueMessage::Select(SelectRequest::Pair(selection)))
+                        .send(QueueMessage::Select(SelectRequest::Pair {
+                            selection,
+                            model,
+                        }))
                         .await
                         .ok();
                 }
@@ -2007,7 +2038,10 @@ impl AgentRunner {
                 return;
             }
             SelectRequest::Command(step) => vec![step],
-            SelectRequest::Pair(selection) => {
+            // RED (T1): the `model` leg is carried but not consumed yet —
+            // T4 rewrites this arm per plan §4.2 (model + overrides +
+            // the exact no-op guard).
+            SelectRequest::Pair { selection, .. } => {
                 // The picker re-sends the current pair on redraws; answering
                 // that with a rebuild (or a lock refusal) would be noise.
                 if selection == ctx.bound.selection() {
@@ -3942,7 +3976,7 @@ profiles:
 
     /// The `(profile, agent)` of the prompt fixture, for `build_agent_prompt`.
     fn prompt_bound(profile: &str, agent: &str) -> Bound {
-        use crate::config::resolve::{ParseCtx, Selection, Source};
+        use crate::config::resolve::{ParseCtx, Source};
         let cfg = Config::parse(
             Source {
                 path: std::path::Path::new("/global/config.yaml"),
@@ -3953,10 +3987,7 @@ profiles:
         )
         .expect("prompt fixture must parse");
         cfg.catalog
-            .resolve(&Selection {
-                profile: profile.to_string(),
-                agent: agent.to_string(),
-            })
+            .resolve(profile, agent)
             .expect("fixture bound resolves")
     }
 
@@ -5255,10 +5286,14 @@ profiles:
         let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
 
         AgentRunner::handle_select(
-            SelectRequest::Pair(Selection {
-                profile: "open".to_string(),
-                agent: "main".to_string(),
-            }),
+            SelectRequest::Pair {
+                selection: Selection {
+                    profile: "open".to_string(),
+                    agent: "main".to_string(),
+                    ..Default::default()
+                },
+                model: None,
+            },
             &mut agent_slot,
             &Some(sm.clone()),
             &hook_cell,
@@ -7723,5 +7758,481 @@ headers:
             .await
             .expect("run_loop must finish within 10s of the action channel closing")
             .expect("the run_loop task must not panic");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RED tests (selection-models plan §9.1, items 28–38): `handle_select` applies
+// the full desired setup `{profile, agent, model?, subagent_models}`, and
+// `classify_submission` routes `/model <alias>`.
+//
+// Harness = `select_profile_republishes_visible_tabs`: a mock agent, a
+// `RebuildContext` over the plan's shared fixture, and `handle_select` called
+// directly. Before every test the baseline is seeded the way a booted session
+// has it: `get_model_alias()` = the bound agent's model + a current
+// conversation stamped with that model's wire id, so the no-op guard and the
+// wire-id restamp have something real to compare against.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(all(test, feature = "mock"))]
+mod select_models_tests {
+    use super::*;
+    use crate::config::resolve::{ParseCtx, Selection, Source};
+    use crate::selection::SelectSubmission;
+    use crate::ui::app_state::MessageRole;
+    use std::collections::BTreeMap;
+
+    /// The plan's shared Rust fixture (§9).
+    const TEAM_MODELS_YAML: &str = r#"
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key: sk-ant-test
+    models:
+      - { name: claude-opus-5,   alias: opus,   context_size: 200000 }
+      - { name: claude-sonnet-5, alias: sonnet, context_size: 200000 }
+      - { name: claude-haiku-5,  alias: haiku,  context_size: 200000 }
+general: { context: { enabled: false } }
+profiles:
+  dev:
+    agents:
+      team:
+        model: sonnet
+        subagents:
+          reviewer: { prompt: "Review." }
+          tester:   { prompt: "Test.",  model: haiku }
+          twin:     { prompt: "Twin.",  model: sonnet }
+      solo: { model: opus }
+  research:
+    agents:
+      main: { model: haiku }
+"#;
+
+    const LOCKED_MODELS: &str =
+        "❌ /agent: models are locked once the conversation has started — /new for a fresh one.";
+    const LOCKED_AGENT: &str =
+        "❌ /agent: the agent is locked once the conversation has started — /new for a fresh one.";
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn pair(
+        profile: &str,
+        agent: &str,
+        models: &[(&str, &str)],
+        model: Option<&str>,
+    ) -> SelectRequest {
+        SelectRequest::Pair {
+            selection: Selection {
+                profile: profile.to_string(),
+                agent: agent.to_string(),
+                subagent_models: map(models),
+            },
+            model: model.map(str::to_string),
+        }
+    }
+
+    /// A booted-session stand-in over the shared fixture: `dev › team` bound,
+    /// alias `sonnet`, one current conversation stamped with sonnet's wire id.
+    struct Harness {
+        sm: Arc<StateManager>,
+        ctx: RebuildContext,
+        agent_slot: Arc<DynAgent>,
+        hook_cell: SharedSessionHook,
+        event_processor: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let config = Config::parse(
+                Source {
+                    path: std::path::Path::new("/global/config.yaml"),
+                    text: TEAM_MODELS_YAML,
+                },
+                None,
+                &ParseCtx { known_skills: &[] },
+            )
+            .expect("the shared team-models fixture parses");
+
+            let sm = StateManager::new_arc();
+            let ctx = RebuildContext {
+                bound: config.catalog.default_bound(),
+                config: Arc::new(config),
+                mcp_handles: Arc::new(Vec::new()),
+                shell_kind: None,
+                skills: crate::skills::SkillRegistry::default(),
+                todo_tool: None,
+                profile_pin: None,
+            };
+            // Seed the baseline: the model the bound agent is configured on.
+            sm.set_model("claude-sonnet-5".to_string());
+            sm.set_provider_name("anthropic".to_string());
+            sm.set_model_alias("sonnet".to_string());
+            sm.create_conversation(
+                "seed".to_string(),
+                "anthropic".to_string(),
+                "claude-sonnet-5".to_string(),
+                String::new(),
+            );
+            publish_bound(&sm, &ctx.bound);
+
+            let (mock_agent, _info, _rx, mock_hook, _model) =
+                crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                    .expect("mock agent builds");
+            Self {
+                sm,
+                ctx,
+                agent_slot: Arc::new(mock_agent),
+                hook_cell: Arc::new(std::sync::RwLock::new(mock_hook)),
+                event_processor: None,
+            }
+        }
+
+        async fn select(&mut self, request: SelectRequest) {
+            AgentRunner::handle_select(
+                request,
+                &mut self.agent_slot,
+                &Some(self.sm.clone()),
+                &self.hook_cell,
+                &mut self.event_processor,
+                Some(&mut self.ctx),
+            )
+            .await;
+        }
+
+        fn messages(&self) -> Vec<String> {
+            self.sm
+                .get_state()
+                .chat
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role, MessageRole::System))
+                .map(|m| m.content.clone())
+                .collect()
+        }
+
+        fn last_message(&self) -> Option<String> {
+            self.messages().pop()
+        }
+
+        fn conv(&self) -> crate::Conversation {
+            self.sm
+                .get_current_conversation()
+                .expect("the seeded conversation")
+        }
+    }
+
+    /// §9.1/28: a pair with overrides lands in the bound, the live mirror AND
+    /// the conversation, and the confirmation names the overrides.
+    #[tokio::test]
+    async fn select_pair_with_subagent_models_records_and_publishes() {
+        let mut h = Harness::new();
+        h.select(pair("dev", "team", &[("tester", "opus")], None))
+            .await;
+
+        let want = map(&[("tester", "opus")]);
+        assert_eq!(h.ctx.bound.selection().subagent_models, want, "the bound");
+        assert_eq!(h.sm.selection().subagent_models, want, "the live mirror");
+        assert_eq!(h.conv().subagent_models, want, "the conversation");
+        assert_eq!(
+            h.last_message().as_deref(),
+            Some("Models: dev › team — model sonnet. Subagent models: tester → opus.")
+        );
+    }
+
+    /// §9.1/29: an orchestrator model in the frame swaps the live model in
+    /// place — new alias, re-stamped wire id, SAME conversation id.
+    #[tokio::test]
+    async fn select_pair_with_orchestrator_model_rebuilds_in_place() {
+        let mut h = Harness::new();
+        let id_before = h.conv().id;
+        h.select(pair("dev", "team", &[], Some("opus"))).await;
+
+        assert_eq!(h.sm.get_model_alias(), "opus", "the active alias");
+        let conv = h.conv();
+        assert_eq!(
+            (conv.provider_name.as_str(), conv.model.as_str()),
+            ("anthropic", "claude-opus-5"),
+            "the conversation's wire id follows the model"
+        );
+        assert_eq!(conv.id, id_before, "no new conversation (sticky ?convo=)");
+    }
+
+    /// §9.1/30: the bound is already `dev/team`, but a request that only adds
+    /// overrides is a CHANGE — the no-op guard must not swallow it.
+    #[tokio::test]
+    async fn select_models_only_change_is_not_swallowed_by_noop_guard() {
+        let mut h = Harness::new();
+        let before = h.messages().len();
+        h.select(pair("dev", "team", &[("reviewer", "haiku")], None))
+            .await;
+
+        assert_eq!(
+            h.messages().len(),
+            before + 1,
+            "a confirmation line must appear"
+        );
+        assert_eq!(
+            h.last_message().as_deref(),
+            Some("Models: dev › team — model sonnet. Subagent models: reviewer → haiku.")
+        );
+    }
+
+    /// §9.1/31: the exact same setup again is silent — no message, no change.
+    #[tokio::test]
+    async fn select_exact_noop_is_silent() {
+        let mut h = Harness::new();
+
+        // Baseline: same pair, no overrides, no model.
+        let before = h.messages().len();
+        h.select(pair("dev", "team", &[], None)).await;
+        assert_eq!(h.messages().len(), before, "plain no-op is silent");
+
+        // An explicit model equal to the configured one is also a no-op.
+        h.select(pair("dev", "team", &[], Some("sonnet"))).await;
+        assert_eq!(
+            h.messages().len(),
+            before,
+            "configured-model no-op is silent"
+        );
+
+        // Once overrides are applied, re-sending them is a no-op too.
+        h.select(pair("dev", "team", &[("tester", "opus")], None))
+            .await;
+        assert_eq!(
+            h.ctx.bound.selection().subagent_models,
+            map(&[("tester", "opus")]),
+            "precondition: the overrides applied"
+        );
+        let after_apply = h.messages().len();
+        h.select(pair("dev", "team", &[("tester", "opus")], None))
+            .await;
+        assert_eq!(
+            h.messages().len(),
+            after_apply,
+            "repeat of the same setup is silent"
+        );
+        assert_eq!(
+            h.ctx.bound.selection().agent,
+            "team",
+            "the bound is unchanged"
+        );
+    }
+
+    /// §9.1/32: an override for a subagent the agent doesn't have is refused,
+    /// and NOTHING changes.
+    #[tokio::test]
+    async fn select_unknown_subagent_refused_nothing_changes() {
+        let mut h = Harness::new();
+        let sel_before = h.sm.selection();
+        let conv_before = h.conv();
+        h.select(pair("dev", "team", &[("ghost", "opus")], None))
+            .await;
+
+        assert_eq!(
+            h.last_message().as_deref(),
+            Some(
+                "❌ /agent: agent 'team' has no subagent 'ghost'. Subagents: reviewer, tester, twin"
+            )
+        );
+        assert_eq!(h.sm.selection(), sel_before, "selection untouched");
+        assert_eq!(h.sm.get_model_alias(), "sonnet", "alias untouched");
+        let conv = h.conv();
+        assert_eq!(
+            conv.subagent_models, conv_before.subagent_models,
+            "conversation untouched"
+        );
+        assert_eq!(conv.model, conv_before.model, "wire id untouched");
+    }
+
+    /// §9.1/33: an unknown alias — for the orchestrator or for a subagent —
+    /// is refused with the available list.
+    #[tokio::test]
+    async fn select_unknown_alias_refused() {
+        let mut h = Harness::new();
+        h.select(pair("dev", "team", &[], Some("nope"))).await;
+        assert_eq!(
+            h.last_message().as_deref(),
+            Some("❌ /agent: unknown alias `nope`. Available: haiku, opus, sonnet"),
+            "orchestrator alias"
+        );
+        assert_eq!(h.sm.get_model_alias(), "sonnet", "nothing changed");
+
+        h.select(pair("dev", "team", &[("tester", "nope")], None))
+            .await;
+        assert_eq!(
+            h.last_message().as_deref(),
+            Some(
+                "❌ /agent: unknown alias `nope` for subagent 'tester'. Available: haiku, opus, sonnet"
+            ),
+            "subagent alias"
+        );
+        assert!(
+            h.ctx.bound.selection().subagent_models.is_empty(),
+            "nothing changed"
+        );
+    }
+
+    /// §9.1/34: after the first turn the models are locked; a pair change gets
+    /// the EXISTING agent-locked copy.
+    #[tokio::test]
+    async fn select_models_refused_after_first_turn() {
+        let mut h = Harness::new();
+        h.sm.add_user_message("hi".to_string());
+
+        h.select(pair("dev", "team", &[("tester", "opus")], None))
+            .await;
+        assert_eq!(h.last_message().as_deref(), Some(LOCKED_MODELS));
+        assert!(
+            h.ctx.bound.selection().subagent_models.is_empty(),
+            "a refusal never changes the setup"
+        );
+
+        h.select(pair("dev", "solo", &[], None)).await;
+        assert_eq!(
+            h.last_message().as_deref(),
+            Some(LOCKED_AGENT),
+            "a pair change keeps the existing agent-lock string"
+        );
+        assert_eq!(h.ctx.bound.agent().main.name, "team", "still on team");
+    }
+
+    /// §9.1/35: picking another agent starts clean — overrides gone, model back
+    /// to the new agent's configured model.
+    #[tokio::test]
+    async fn select_agent_switch_clears_overrides_and_resets_model() {
+        let mut h = Harness::new();
+        h.select(pair("dev", "team", &[("tester", "opus")], Some("opus")))
+            .await;
+        assert_eq!(
+            h.ctx.bound.selection().subagent_models,
+            map(&[("tester", "opus")]),
+            "precondition: the overrides applied"
+        );
+        assert_eq!(
+            h.sm.get_model_alias(),
+            "opus",
+            "precondition: model applied"
+        );
+
+        h.select(pair("dev", "solo", &[], None)).await;
+        assert!(
+            h.ctx.bound.selection().subagent_models.is_empty(),
+            "bound cleared"
+        );
+        assert!(
+            h.sm.selection().subagent_models.is_empty(),
+            "mirror cleared"
+        );
+        assert!(h.conv().subagent_models.is_empty(), "conversation cleared");
+        assert_eq!(h.sm.get_model_alias(), "opus", "solo's configured model");
+        assert!(
+            h.last_message()
+                .is_some_and(|m| m.starts_with("Agent: dev › solo — model opus.")),
+            "got: {:?}",
+            h.last_message()
+        );
+    }
+
+    /// §9.1/36: a profile change and a model in one frame apply together.
+    #[tokio::test]
+    async fn select_profile_change_with_models_applies_both() {
+        let mut h = Harness::new();
+        h.select(pair("research", "main", &[], Some("sonnet")))
+            .await;
+
+        assert_eq!(h.ctx.bound.profile.name, "research");
+        assert_eq!(h.ctx.bound.agent().main.name, "main");
+        assert_eq!(
+            h.sm.get_model_alias(),
+            "sonnet",
+            "the requested model, not haiku"
+        );
+        assert!(
+            h.last_message()
+                .is_some_and(|m| m.starts_with("Profile: research › main — model sonnet.")),
+            "got: {:?}",
+            h.last_message()
+        );
+    }
+
+    /// §9.1/37: a typed `/agent` or `/profile` re-applies the agent fresh —
+    /// overrides cleared.
+    #[tokio::test]
+    async fn typed_profile_and_agent_commands_clear_overrides() {
+        let mut h = Harness::new();
+        h.select(pair("dev", "team", &[("tester", "opus")], None))
+            .await;
+        assert_eq!(
+            h.ctx.bound.selection().subagent_models,
+            map(&[("tester", "opus")]),
+            "precondition: the overrides applied"
+        );
+
+        h.select(SelectRequest::Command(SelectSubmission::Agent(
+            "team".to_string(),
+        )))
+        .await;
+        assert!(
+            h.ctx.bound.selection().subagent_models.is_empty(),
+            "/agent cleared the bound"
+        );
+        assert!(
+            h.sm.selection().subagent_models.is_empty(),
+            "/agent cleared the mirror"
+        );
+        assert!(
+            h.conv().subagent_models.is_empty(),
+            "/agent cleared the conversation"
+        );
+
+        // Same for `/profile`.
+        h.select(pair("dev", "team", &[("tester", "opus")], None))
+            .await;
+        assert_eq!(
+            h.ctx.bound.selection().subagent_models,
+            map(&[("tester", "opus")]),
+            "precondition: re-applied"
+        );
+        h.select(SelectRequest::Command(SelectSubmission::Profile(
+            "dev".to_string(),
+        )))
+        .await;
+        assert!(
+            h.ctx.bound.selection().subagent_models.is_empty(),
+            "/profile cleared the bound"
+        );
+    }
+
+    /// §9.1/38: `/model <alias>` is its own submission kind (web parity with
+    /// the TUI); bare `/model` and `/models` stay commands.
+    #[test]
+    fn classify_model_with_alias_is_switch_model() {
+        assert!(
+            matches!(classify_submission("/model opus"), SubmitKind::SwitchModel(a) if a == "opus"),
+            "plain form"
+        );
+        assert!(
+            matches!(
+                classify_submission("  /model   opus  "),
+                SubmitKind::SwitchModel(a) if a == "opus"
+            ),
+            "surrounding whitespace is trimmed"
+        );
+        assert!(
+            matches!(classify_submission("/model"), SubmitKind::Command(_)),
+            "bare /model lists"
+        );
+        assert!(
+            matches!(classify_submission("/model   "), SubmitKind::Command(_)),
+            "blank alias is the bare form"
+        );
+        assert!(
+            matches!(classify_submission("/models"), SubmitKind::Command(_)),
+            "a longer keyword is not /model"
+        );
     }
 }

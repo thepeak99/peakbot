@@ -191,6 +191,11 @@ fn delegate_tool_for_agent(cfg: &Config, agent_name: &str) -> DelegateTool {
     };
     let deps = SubAgentDeps {
         bound,
+        orchestrator_model: cfg
+            .registry
+            .resolve(&profile.agents[agent_index].main.model.alias)
+            .cloned()
+            .expect("the agent's model is in the registry"),
         tool_env: Arc::new(ToolEnv::for_profile(cfg, profile, &Arc::new(Vec::new()))),
         state_manager: StateManager::new_arc(),
         shell_kind: None,
@@ -342,6 +347,11 @@ async fn bound_without_subagents_yields_an_empty_delegate_role_enum() {
     };
     let deps = SubAgentDeps {
         bound,
+        orchestrator_model: cfg
+            .registry
+            .resolve(&profile.agents[0].main.model.alias)
+            .cloned()
+            .expect("the agent's model is in the registry"),
         tool_env: Arc::new(ToolEnv::for_profile(&cfg, profile, &Arc::new(Vec::new()))),
         state_manager: StateManager::new_arc(),
         shell_kind: None,

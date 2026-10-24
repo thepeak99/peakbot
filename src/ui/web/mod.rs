@@ -849,11 +849,17 @@ fn dispatch_inbound(
         Ok(InboundMessage::SwitchCwd { path }) => {
             action_sender.send(UiAction::ChangeCwd(path)).is_ok()
         }
-        Ok(InboundMessage::Select { profile, agent }) => action_sender
-            .send(UiAction::Select(crate::config::resolve::Selection {
-                profile,
-                agent,
-            }))
+        // RED (T1): the new `model` / `subagent_models` legs are parsed by the
+        // frame but NOT forwarded yet — T4 forwards them (plan §5.1).
+        Ok(InboundMessage::Select { profile, agent, .. }) => action_sender
+            .send(UiAction::Select {
+                selection: crate::config::resolve::Selection {
+                    profile,
+                    agent,
+                    ..Default::default()
+                },
+                model: None,
+            })
             .is_ok(),
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
@@ -1043,12 +1049,42 @@ mod tests {
         let action = rx.try_recv().expect("an action must be emitted");
         assert_eq!(
             action,
-            UiAction::Select(crate::config::resolve::Selection {
-                profile: "dev".to_string(),
-                agent: "team".to_string(),
-            }),
+            UiAction::Select {
+                selection: crate::config::resolve::Selection {
+                    profile: "dev".to_string(),
+                    agent: "team".to_string(),
+                    ..Default::default()
+                },
+                model: None,
+            },
             "a select frame must surface as UiAction::Select with both legs"
         );
+    }
+
+    /// Selection-models plan §9.1/26: the extended select frame must surface
+    /// with BOTH new legs on `UiAction::Select`.
+    #[test]
+    fn dispatch_select_frame_carries_models() {
+        let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
+        let kept = dispatch_inbound(
+            r#"{"type":"select","profile":"dev","agent":"team","model":"opus","subagent_models":{"tester":"haiku"}}"#,
+            &tx,
+            &out_tx,
+            &sm,
+            &registry,
+        );
+        assert!(kept, "select frame must keep the socket loop alive");
+        match rx.try_recv().expect("an action must be emitted") {
+            UiAction::Select { selection, model } => {
+                assert_eq!(model.as_deref(), Some("opus"), "the model leg is forwarded");
+                assert_eq!(
+                    selection.subagent_models.get("tester").map(String::as_str),
+                    Some("haiku"),
+                    "the override map is forwarded"
+                );
+            }
+            other => panic!("expected UiAction::Select, got {other:?}"),
+        }
     }
 
     // ── kill_session inbound (RED until the refusal lands) ─────────────────
