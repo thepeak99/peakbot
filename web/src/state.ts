@@ -177,6 +177,10 @@ export interface AppState {
   conversation: WireConversationMeta | null;
   is_running: boolean;
   is_loading: boolean;
+  /** Two-stage stop: a graceful (first-press) Stop is pending — the in-flight
+   * tool call finishes, then the turn ends. Drives the Composer's Stop
+   * label and the TopBar's pending sentence. Optional: old snapshots parse. */
+  stop_pending?: boolean;
   /** Messages typed during a busy turn, queued but not yet dequeued by the
    * agent loop. Drives the "⏳ N queued" hint (issue #123 — counter only;
    * per-message deletion needs a queue refactor still to come). */

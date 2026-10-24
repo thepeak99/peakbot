@@ -2832,6 +2832,73 @@ mod multiline_input_tests {
         );
     }
 
+    // ─── Two-stage Stop: working-title hint ───────────────────────────────
+    //
+    // While `stop_pending`, the working title's trailing hint changes from
+    // "· esc to stop" to "· stopping after tool · esc again to stop now"
+    // (the 2nd press escalates to the immediate abort).
+    //
+    // `build_input_paragraph` has no `stop_pending` parameter yet, so the
+    // escalation test cannot be expressed against today's signature: it is
+    // #[ignore]d (NOT silently green) and the implementer must thread the new
+    // argument through `render_input` below and remove the ignore. The
+    // not-pending test is a live regression guard on the default hint.
+    // (No insta snapshot: plain string assertions; the expected rendered title
+    // contains "Working · … · stopping after tool · esc again to stop now".)
+
+    fn render_input(input: &str, stop_pending: bool) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let started = std::time::Instant::now();
+        // NOTE: today this call has 9 args; the implementation adds
+        // `stop_pending` as the 10th (see the test module header).
+        let para = ReplUi::build_input_paragraph(
+            input,
+            0,
+            true,
+            Some(started),
+            Some("thinking"),
+            0,
+            0,
+            false,
+            None,
+        );
+        let _ = stop_pending; // threaded to the new parameter post-impl
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area().height)
+            .flat_map(|y| {
+                (0..buffer.area().width)
+                    .map(move |x| buffer[(x, y)].symbol().to_string())
+                    .chain(std::iter::once("\n".to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn working_title_hints_normal_stop_when_not_pending() {
+        let rendered = render_input("", false);
+        assert!(
+            rendered.contains("esc to stop"),
+            "the default hint must remain 'esc to stop'; rendered:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("stopping after tool"),
+            "no pending hint without a pending stop; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    #[ignore = "two-stage stop: enable after impl (thread `stop_pending` into build_input_paragraph / render_input)"]
+    fn working_title_hints_escalation_when_stop_pending() {
+        let rendered = render_input("", true);
+        assert!(
+            rendered.contains("stopping after tool · esc again to stop now"),
+            "a pending graceful stop must change the hint to ' · stopping after tool              · esc again to stop now '; rendered:\n{rendered}"
+        );
+    }
+
     // ─── Sub-agent title segment + Ctrl+P toggle decision ────────────────
 
     fn run(pausable: bool, pause: PauseState) -> SubAgentRun {

@@ -979,6 +979,35 @@ mod tests {
         );
     }
 
+    /// Two-stage stop: the SPA's Stop button label depends on
+    /// `state.stop_pending`, so the field must be part of the wire
+    /// snapshot.
+    #[test]
+    fn state_snapshot_serialises_stop_pending() {
+        let sm = StateManager::new_arc();
+        let value = serde_json::to_value(&OutboundMessage::State {
+            state: std::sync::Arc::new(sm.get_state()),
+        })
+        .expect("serialises");
+        assert_eq!(
+            value["state"]["stop_pending"],
+            serde_json::Value::Bool(false),
+            "stop_pending defaults to false and must be present on the wire"
+        );
+
+        sm.set_running(true);
+        sm.request_stop(); // first press: graceful
+        let value = serde_json::to_value(&OutboundMessage::State {
+            state: std::sync::Arc::new(sm.get_state()),
+        })
+        .expect("serialises");
+        assert_eq!(
+            value["state"]["stop_pending"],
+            serde_json::Value::Bool(true),
+            "a pending graceful stop must reach the client so the button can escalate"
+        );
+    }
+
     #[test]
     fn inbound_stop_still_maps_to_request_stop() {
         // Regression guard for the arm next door: the pause/resume arms

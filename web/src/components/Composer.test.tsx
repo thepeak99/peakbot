@@ -997,3 +997,69 @@ describe("Composer — attachments (T12)", () => {
     expect(warn ?? null).toBeNull();
   });
 });
+
+// ─── Two-stage stop: Stop button label by `stopPending` ──────────────────
+//
+// Composer gains an optional `stopPending: boolean` prop (mirrors the wire
+// `AppState.stop_pending`). While a graceful stop is pending the Stop
+// control's label/aria-label reads
+// "Stop now — stopping after the current tool call" (pressing again
+// escalates); normally it is the existing "Stop" / "Stop and discard …".
+//
+// RED today: the prop is not declared on Composer (and not read), so with
+// `stopPending: true` the label is still the plain "Stop" and the
+// escalation sentence is absent. The cast keeps the test running under
+// vitest (esbuild transform), exactly like the T12 block above.
+
+const PENDING_STOP_LABEL = "Stop now — stopping after the current tool call";
+
+function stopMount(props: ComposerProps, stopPending?: boolean): Promise<HTMLDivElement> {
+  return mount({ ...props, stopPending } as unknown as ComposerProps);
+}
+
+describe("Composer — Stop label by stopPending (two-stage stop)", () => {
+  it("normally (stopPending unset/false) the Stop label is 'Stop'", async () => {
+    for (const stopPending of [undefined, false]) {
+      const el = await stopMount(makeProps({ isRunning: true }), stopPending);
+      const stop = controlByName(el, "Stop");
+      expect(stop, "expected a Stop control while running").not.toBeNull();
+      expect(
+        accessibleName(stop!),
+        `expected the plain 'Stop' label when stopPending=${stopPending}`,
+      ).toBe("Stop");
+    }
+  });
+
+  it("stopPending=true: label and aria-label read the escalation sentence", async () => {
+    const el = await stopMount(makeProps({ isRunning: true }), true);
+    const stop = el.querySelector(`[aria-label="${PENDING_STOP_LABEL}"]`);
+    expect(
+      stop,
+      `expected the Stop control's label/aria-label to be "${PENDING_STOP_LABEL}" while pending`,
+    ).not.toBeNull();
+  });
+
+  it("stopPending=true with queued input: the escalation sentence (not the discard warning) is the label", async () => {
+    const el = await stopMount(makeProps({ isRunning: true, pendingInput: 2 }), true);
+    const stop = el.querySelector(`[aria-label="${PENDING_STOP_LABEL}"]`);
+    expect(stop, "pending stop must win over the discard warning").not.toBeNull();
+  });
+
+  it("clicking Stop while pending still sends exactly one {type:'stop'} frame (the backend escalates)", async () => {
+    const sent: InboundMessage[] = [];
+    const el = await stopMount(
+      makeProps({ isRunning: true, onStop: () => sent.push({ type: "stop" }) }),
+      true,
+    );
+    const stop = el.querySelector(`[aria-label="${PENDING_STOP_LABEL}"]`);
+    expect(stop, "the pending Stop control must exist").not.toBeNull();
+    await click(stop!);
+    expect(sent).toEqual([{ type: "stop" }]);
+  });
+
+  it("idle: no Stop control exists, so stopPending renders nothing", async () => {
+    const el = await stopMount(makeProps({ isRunning: false }), true);
+    expect(controlByName(el, "Stop")).toBeNull();
+    expect(el.textContent).not.toContain("Stop now");
+  });
+});
