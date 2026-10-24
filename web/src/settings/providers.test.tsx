@@ -57,10 +57,12 @@ function mountPane(yaml: string): Edit[] {
     scope: "global",
     meta: null,
     doc: parse(yaml),
+    globalDoc: parse(yaml),
     edit: (path, value) => {
       edits.push({ path, value });
     },
     errors: [],
+    switchToGlobal: () => {},
   };
   mount(
     <SettingsCtx.Provider value={ctx}>

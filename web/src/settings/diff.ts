@@ -14,11 +14,23 @@ export const NO_TEXTUAL_CHANGE_MESSAGE =
   "(no textual changes in the generated YAML — e.g. UI-only state)";
 
 /**
- * structuredPatch("a/" + path, "b/" + path, oldText, newText, "", "",
- * { context: 2 }).
+ * The `a/` / `b/` file-header display name. Absolute paths would render as
+ * `a//abs/path` (double slash) — so an absolute path shows just the file
+ * name (`a/config.yaml`); the full path stays in the modal's separate path
+ * tag. Relative paths (`.peakbot/config.yaml`) flow through unchanged.
+ */
+export function diffDisplayName(path: string): string {
+  if (!path.startsWith("/")) return path;
+  return path.split("/").pop() ?? path;
+}
+
+/**
+ * structuredPatch("a/" + name, "b/" + name, oldText, newText, "", "",
+ * { context: 2 }), name = diffDisplayName(path).
  */
 export function configDiff(oldText: string, newText: string, path: string): DiffPatch {
-  return structuredPatch("a/" + path, "b/" + path, oldText, newText, "", "", { context: 2 });
+  const name = diffDisplayName(path);
+  return structuredPatch("a/" + name, "b/" + name, oldText, newText, "", "", { context: 2 });
 }
 
 export function diffIsEmpty(patch: DiffPatch): boolean {

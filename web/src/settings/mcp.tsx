@@ -68,11 +68,13 @@ function authMap(v: unknown): Record<string, unknown> | undefined {
 }
 
 export function McpsPane() {
-  const { scope, doc, edit, errors, meta } = useSettingsCtx();
-  // mcps: is global-only — repo scope renders the pane read-only (🔒).
+  const { scope, doc, globalDoc, edit, errors, meta, switchToGlobal } = useSettingsCtx();
+  // mcps: is global-only — repo scope renders the GLOBAL draft's values
+  // read-only (🔒); the repo file may only contain `profiles:`.
   const readOnly = scope === "repo";
+  const paneDoc = readOnly ? globalDoc : doc;
 
-  const raw = get(doc, ["mcps"]);
+  const raw = get(paneDoc, ["mcps"]);
   const servers = (Array.isArray(raw) ? raw : []) as McpDraft[];
 
   function statusOf(name: string): "connected" | "failed" | "disabled" | undefined {
@@ -95,8 +97,19 @@ export function McpsPane() {
       </div>
 
       {readOnly && (
-        <div className="rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400">
-          🔒 MCP servers are machine-wide — read-only in this repo. Switch to Global to edit.
+        <div
+          data-testid="mcp-readonly"
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400"
+        >
+          <span>🔒 Machine-wide — edit in Global scope. This section is read-only here.</span>
+          <button
+            data-testid="switch-to-global"
+            type="button"
+            onClick={switchToGlobal}
+            className="cursor-pointer rounded border border-zinc-700 px-2 py-0.5 text-[11px] text-sky-400 hover:bg-zinc-800"
+          >
+            Switch to Global
+          </button>
         </div>
       )}
 

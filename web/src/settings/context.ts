@@ -13,10 +13,16 @@ export interface SettingsCtxValue {
   meta: SettingsMeta | null;
   /** The current scope's draft document. */
   doc: Doc;
+  /** The GLOBAL draft document. Global-only sections (Providers, MCP,
+   *  General) render IT read-only in repo scope — the repo file may only
+   *  contain `profiles:`, so the repo draft has no values for them. */
+  globalDoc: Doc;
   /** Set (or, with `undefined`, remove) the value at `path` in the draft. */
   edit(path: Seg[], value: unknown): void;
   /** Validation errors for the current scope (red fields match on `path`). */
   errors: ConfigErr[];
+  /** The lock banner's [Switch to Global] button (repo scope). */
+  switchToGlobal(): void;
 }
 
 export const SettingsCtx = createContext<SettingsCtxValue | null>(null);

@@ -20,7 +20,7 @@ import { isDesktop } from "../desktop";
 import { putConfig } from "./api";
 import { generateToken } from "./general";
 import { NEUTRAL_PERSONA, TERSE_PERSONA } from "./agent";
-import { BASE_URL_PRESETS } from "./providerTypes";
+import { BASE_URL_PRESETS, MODEL_PRESETS } from "./providerTypes";
 import type { FirstRunAnswers, FirstRunProviderType, SetupPhase } from "./contract";
 import type { ConfigText, PutOk, SettingsMeta } from "./types";
 
@@ -102,6 +102,22 @@ const STEPS: { name: StepName; title: string }[] = [
 // Hosted providers need an API key; the self-hosted ones (llama.cpp, Ollama)
 // don't.
 const HOSTED_TYPES: FirstRunProviderType[] = ["openrouter", "openai", "anthropic"];
+
+/**
+ * The Welcome step's PATH fact (spec §9.13: machine facts include PATH),
+ * from `facts.install.path` (`{status:"on_path"} | {status:"shadowed",by} |
+ * {status:"absent",hint}`). `null` = no install info — the line is omitted.
+ */
+function pathFact(install: unknown): string | null {
+  if (install === null || typeof install !== "object") return null;
+  const p = (install as { path?: unknown }).path;
+  if (p === null || typeof p !== "object") return null;
+  const s = p as { status?: string; by?: unknown; hint?: unknown };
+  if (s.status === "on_path") return "on PATH";
+  if (s.status === "shadowed") return `shadowed by ${String(s.by ?? "")}`;
+  if (s.status === "absent") return `not on PATH${s.hint ? ` — ${String(s.hint)}` : ""}`;
+  return null;
+}
 
 const PROVIDER_TYPES: { value: FirstRunProviderType; label: string }[] = [
   { value: "openrouter", label: "OpenRouter" },
@@ -224,14 +240,18 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
     [answers, modelValue],
   );
 
-  // Review preview: the EXACT text that will be PUT, with the API key masked
-  // VISUALLY only (the real key is what gets sent).
+  // Review preview: the EXACT text that will be PUT, with the secrets
+  // (API key AND the LAN web token) masked VISUALLY only (the real values
+  // are what get sent).
   const yamlText = useMemo(() => buildFirstRunYaml(effective), [effective]);
   const maskedYaml = useMemo(() => {
-    const key = (answers.provider.api_key ?? "").trim();
-    if (key === "") return yamlText;
-    return yamlText.split(key).join("••••••••");
-  }, [yamlText, answers.provider.api_key]);
+    let t = yamlText;
+    for (const secret of [answers.provider.api_key, answers.web.token]) {
+      const s = (secret ?? "").trim();
+      if (s !== "") t = t.split(s).join("••••••••");
+    }
+    return t;
+  }, [yamlText, answers.provider.api_key, answers.web.token]);
 
   async function finish() {
     setPutting(true);
@@ -262,8 +282,13 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
         <div className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-900 p-6">
           <div data-testid="firstrun-restart" className="space-y-3">
             <div className="text-lg font-semibold text-emerald-400">✓ Config written</div>
+            {/* "A backup was kept." only when the PUT response carries one
+                (T34b) — a fresh file has no backup. */}
             {finished && (
-              <p className="text-sm text-zinc-300">PeakBot wrote your config. A backup was kept.</p>
+              <p className="text-sm text-zinc-300">
+                PeakBot wrote your config.
+                {putOk.backup !== null && " A backup was kept."}
+              </p>
             )}
             <p className="text-sm text-zinc-300">Restart PeakBot to start chatting.</p>
             <div className="space-y-1 font-mono text-[11px] text-zinc-500">
@@ -378,6 +403,9 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                   <div>Config · {meta.global_path}</div>
                   <div>Data dir · {meta.facts.data_dir}</div>
                   <div>Version · {meta.facts.version}</div>
+                  {pathFact(meta.facts.install) !== null && (
+                    <div data-testid="firstrun-fact-path">PATH · {pathFact(meta.facts.install)}</div>
+                  )}
                 </div>
                 <button
                   data-testid="firstrun-start-fresh"
@@ -493,6 +521,30 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                   >
                     + Add model
                   </button>
+                  {/* Preset chips — the SAME single source as the Providers
+                      pane (providerTypes.MODEL_PRESETS), spec §9.8/§9.13. */}
+                  <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] text-zinc-600">presets:</span>
+                    {MODEL_PRESETS[pType].map(([name, alias], k) => (
+                      <button
+                        key={`${k}-${alias}`}
+                        data-testid={`fr-model-preset-${k}`}
+                        type="button"
+                        title={name}
+                        onClick={() =>
+                          setProvider({
+                            models: [
+                              ...answers.provider.models,
+                              { name, alias, max_tokens: MODEL_PRESETS[pType][k][2] },
+                            ],
+                          })
+                        }
+                        className="cursor-pointer rounded-full border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-[11px] text-zinc-300 hover:bg-zinc-800"
+                      >
+                        {alias}
+                      </button>
+                    ))}
+                  </div>
                 </div>
                 {stepErrors.length > 0 && (
                   <div data-testid="firstrun-step-errors" className="space-y-0.5 text-[11px] text-red-400">

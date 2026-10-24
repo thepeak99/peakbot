@@ -141,6 +141,10 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const [staleMsg, setStaleMsg] = useState<string | null>(null);
   const [restartKeys, setRestartKeys] = useState<string[] | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
+  // True iff the LAST save attempt failed with a 422 (T34b): the error
+  // panel's title keeps "Save failed" only then; live validation errors
+  // before any Save show the neutral "N problem(s)".
+  const [saveFailed, setSaveFailed] = useState(false);
   // Increments on every draft edit — re-arms the SaveBar's 400 ms validate.
   const [draftVersion, setDraftVersion] = useState(0);
   const [flash, setFlash] = useState<{ section: Section; pathKey: string } | null>(null);
@@ -182,11 +186,34 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
     };
   }, [scope, convo, loaded, store, toast, bump]);
 
+  // Repo scope + a global-only section (Providers / MCP / General) → the
+  // panes render the GLOBAL draft's values read-only (spec §9.5), so make
+  // sure the global file is loaded (it is not fetched until first needed).
+  useEffect(() => {
+    if (scope !== "repo" || loaded.global) return;
+    if (active !== "providers" && active !== "mcps" && active !== "general") return;
+    let live = true;
+    getConfig("global", convo ?? undefined)
+      .then((ct) => {
+        if (!live) return;
+        store.setSaved("global", ct.text, ct.sha256);
+        setLoaded((l) => ({ ...l, global: true }));
+        bump();
+      })
+      .catch((e: unknown) => {
+        toast(e instanceof Error ? e.message : "Failed to load the global config", "error");
+      });
+    return () => {
+      live = false;
+    };
+  }, [scope, active, loaded, convo, store, toast, bump]);
+
   // ── Actions ──────────────────────────────────────────────────────────
   function switchScope(s: Scope) {
     store.setScope(s);
     setScopeState(s);
     setFlash(null);
+    setSaveFailed(false);
     // The open profile/agent may not exist in the other scope's draft.
     setProfileSel({ profile: null, agent: null });
   }
@@ -208,6 +235,9 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
         });
       }
     }
+    // A fresh (pre-save) validation result: the "Save failed" title is no
+    // longer about this state (T34b).
+    setSaveFailed(false);
     bump();
   }
 
@@ -221,6 +251,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
       const res = await putConfig(scope, text, st.sha256, convo ?? undefined);
       store.setSaved(scope, text, res.sha256);
       setRestartKeys(res.restart_required.length > 0 ? res.restart_required : null);
+      setSaveFailed(false);
       toast(`Saved to ${res.path}`);
       if (res.backup) toast(`backup: ${res.backup.split("/").pop()}`);
     } catch (e) {
@@ -232,6 +263,8 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           error: e.body.error ?? "config is not valid",
           errors: errs,
         });
+        // The save attempt failed — the panel title may say "Save failed".
+        setSaveFailed(true);
         toast(`Save failed — ${errs.length} validation problem${errs.length === 1 ? "" : "s"}`, "error");
       } else {
         toast(e instanceof Error ? e.message : "Save failed", "error");
@@ -263,12 +296,14 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   function discard() {
     store.discard(scope);
     setStaleMsg(null);
+    setSaveFailed(false);
     toast("Changes discarded");
     bump();
   }
 
   async function reload() {
     setStaleMsg(null);
+    setSaveFailed(false);
     try {
       const ct = await getConfig(scope, convo ?? undefined);
       store.setSaved(scope, ct.text, ct.sha256);
@@ -281,7 +316,9 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   // Fix (spec §9.6): route on the segment array; a repo-file error while in
   // global scope switches scope first. profiles errors land on the owning
   // profile/agent page (paths.route carries profile/agent/subagent); the
-  // pane's matching error row flashes.
+  // pane's matching error row flashes. The flashed/red element is scrolled
+  // into view once the routed pane has rendered (jsdom has no
+  // scrollIntoView — the optional call is the guard).
   function fixError(err: ConfigErr) {
     const target = route(err.path);
     if (err.file !== scope) switchScope(err.file);
@@ -292,6 +329,12 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
     const pathKey = dotPath(err.path);
     setFlash({ section: target.section, pathKey });
     window.setTimeout(() => setFlash((f) => (f && f.pathKey === pathKey ? null : f)), 1600);
+    window.setTimeout(() => {
+      const el =
+        document.querySelector<HTMLElement>('[data-flash="true"]') ??
+        document.querySelector<HTMLElement>(".border-red-600");
+      el?.scrollIntoView?.({ block: "center" });
+    }, 0);
   }
 
   // "Copy to this repo" (spec §9.3): duplicate the profile into the REPO
@@ -403,6 +446,18 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const repoPath = meta?.repo_path ?? ".peakbot/config.yaml";
   const filePath = scope === "global" ? globalPath : repoPath;
 
+  // Global draft for the global-only panes (spec §9.5): in repo scope the
+  // Providers/MCP/General panes render the GLOBAL values read-only. The
+  // slot swap mirrors profileNamesOf/mcpNamesOf (the store is a plain
+  // object; `bump` drives the re-render).
+  const globalDoc = (() => {
+    const prev = store.current;
+    store.setScope("global");
+    const d = store.state().draftDoc;
+    store.setScope(prev);
+    return d;
+  })();
+
   const navGroups: { group: string; items: { id: Section; label: string; dot?: "amber" | "blue"; lockedInRepo?: boolean }[] }[] = [
     {
       group: "CONFIG.YAML",
@@ -513,7 +568,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
       )}
 
       {/* 422 error panel (spec §9.6) */}
-      <ErrorPanel errors={allErrors} scope={scope} onFix={fixError} />
+      <ErrorPanel errors={allErrors} scope={scope} saveFailed={saveFailed} onFix={fixError} />
 
       {/* Body: left nav (desktop) + pane */}
       <div className="flex min-h-0 flex-1">
@@ -578,7 +633,15 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
         </nav>
 
         <SettingsCtx.Provider
-          value={{ scope, meta, doc: st.draftDoc, edit, errors: allErrors.filter((e) => e.file === scope) }}
+          value={{
+            scope,
+            meta,
+            doc: st.draftDoc,
+            globalDoc,
+            edit,
+            errors: allErrors.filter((e) => e.file === scope),
+            switchToGlobal: () => switchScope("global"),
+          }}
         >
         <main className="min-w-0 flex-1 overflow-auto p-4 sm:p-6">
           {/* Mobile: the nav collapses into a select under the head */}
@@ -705,6 +768,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
                 return (
                   <li
                     key={`${pathKey}-${i}`}
+                    data-flash={flashing ? "true" : undefined}
                     className={`rounded border border-red-900/70 bg-red-950/30 px-3 py-2 text-xs text-red-300 ${
                       flashing ? "ring-2 ring-red-500" : ""
                     }`}

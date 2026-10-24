@@ -92,10 +92,12 @@ function mountPane(): Edit[] {
       // `legacy` has no status entry (not in the boot config) → no pill.
     ]),
     doc: parse(DOC),
+    globalDoc: parse(DOC),
     edit: (path, value) => {
       edits.push({ path, value });
     },
     errors: [],
+    switchToGlobal: () => {},
   };
   mount(
     <SettingsCtx.Provider value={ctx}>

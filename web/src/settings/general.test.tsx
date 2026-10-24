@@ -98,12 +98,14 @@ function Harness({
     scope,
     meta: meta(boot),
     doc,
+    globalDoc: doc,
     edit: (path, value) => {
       set(doc, path, value);
       edits.push({ path, value });
       bump((n) => n + 1);
     },
     errors: [],
+    switchToGlobal: () => {},
   };
   return (
     <ToastProvider>

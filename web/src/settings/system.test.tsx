@@ -166,8 +166,10 @@ function mountPane(m: SettingsMeta) {
     scope: "global",
     meta: m,
     doc: parse(""),
+    globalDoc: parse(""),
     edit: () => {},
     errors: [],
+    switchToGlobal: () => {},
   };
   act(() =>
     root!.render(

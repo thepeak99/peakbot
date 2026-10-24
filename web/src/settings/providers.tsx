@@ -17,29 +17,12 @@ import { get } from "./yamlDoc";
 import { errAt } from "./paths";
 import { Badge, Field, SecretInput, Tri, type VisionTri } from "./widgets";
 import type { ConfigErr, Seg } from "./types";
-import { BASE_URL_PRESETS, PROVIDER_TYPES as TYPES, type ProviderType } from "./providerTypes";
-
-/** `+ Add model` preset chips per type (mockup MODEL_PRESETS). */
-const MODEL_PRESETS: Record<ProviderType, [string, string, number][]> = {
-  openrouter: [
-    ["anthropic/claude-sonnet-4.5", "sonnet", 8192],
-    ["google/gemini-2.5-flash", "flash", 8192],
-    ["openai/gpt-5", "gpt5", 8192],
-  ],
-  openai: [
-    ["gpt-5", "gpt5", 8192],
-    ["gpt-4o-mini", "mini", 4096],
-  ],
-  anthropic: [
-    ["claude-sonnet-4-5", "sonnet", 8192],
-    ["claude-haiku-4-5", "haiku", 4096],
-  ],
-  llamacpp: [["local-model", "local", 4096]],
-  ollama: [
-    ["qwen2.5-coder:14b", "coder", 4096],
-    ["llama3.2:3b", "llama", 4096],
-  ],
-};
+import {
+  BASE_URL_PRESETS,
+  MODEL_PRESETS,
+  PROVIDER_TYPES as TYPES,
+  type ProviderType,
+} from "./providerTypes";
 
 const CACHING_MODES = ["auto", "auto_1h", "manual", "off"] as const;
 
@@ -67,12 +50,14 @@ interface ProviderDraft {
 }
 
 export function ProvidersPane() {
-  const { scope, doc, edit, errors } = useSettingsCtx();
-  // providers: is global-only — repo scope renders the pane read-only (🔒).
+  const { scope, doc, globalDoc, edit, errors, switchToGlobal } = useSettingsCtx();
+  // providers: is global-only — repo scope renders the GLOBAL draft's
+  // values read-only (🔒); the repo file may only contain `profiles:`.
   const readOnly = scope === "repo";
+  const paneDoc = readOnly ? globalDoc : doc;
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
 
-  const raw = get(doc, ["providers"]);
+  const raw = get(paneDoc, ["providers"]);
   const providers = (Array.isArray(raw) ? raw : []) as ProviderDraft[];
 
   function toggle(i: number, j: number) {
@@ -109,8 +94,19 @@ export function ProvidersPane() {
       </div>
 
       {readOnly && (
-        <div className="rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400">
-          🔒 Providers are machine-wide — read-only in this repo. Switch to Global to edit.
+        <div
+          data-testid="provider-readonly"
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400"
+        >
+          <span>🔒 Machine-wide — edit in Global scope. This section is read-only here.</span>
+          <button
+            data-testid="switch-to-global"
+            type="button"
+            onClick={switchToGlobal}
+            className="cursor-pointer rounded border border-zinc-700 px-2 py-0.5 text-[11px] text-sky-400 hover:bg-zinc-800"
+          >
+            Switch to Global
+          </button>
         </div>
       )}
 

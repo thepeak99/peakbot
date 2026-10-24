@@ -111,12 +111,14 @@ function Harness({
     scope: opts.scope ?? "global",
     meta: meta(opts.tools ?? ["bash", "read_file", "fetch_url"]),
     doc,
+    globalDoc: doc,
     edit: (path, value) => {
       set(doc, path, value);
       edits.push({ path, value });
       bump((n) => n + 1);
     },
     errors: [],
+    switchToGlobal: () => {},
   };
   return (
     <ToastProvider>

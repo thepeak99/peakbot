@@ -20,7 +20,7 @@
 // Expected RED: `./diff` does not exist yet → import error.
 
 import { describe, expect, it } from "vitest";
-import { NO_TEXTUAL_CHANGE_MESSAGE, configDiff, diffIsEmpty, hunkHeader } from "./diff";
+import { NO_TEXTUAL_CHANGE_MESSAGE, configDiff, diffDisplayName, diffIsEmpty, hunkHeader } from "./diff";
 
 describe("diff", () => {
   it("diff_headers_and_hunks", () => {
@@ -54,6 +54,23 @@ describe("diff", () => {
     const repo = configDiff("a: 1", "a: 2", ".peakbot/config.yaml");
     expect(repo.oldFileName).toBe("a/.peakbot/config.yaml");
     expect(repo.newFileName).toBe("b/.peakbot/config.yaml");
+  });
+
+  // T34b (QA): an ABSOLUTE config path used to render `a//abs/path` in the
+  // modal header (double slash). The header shows the file name; the full
+  // path stays in the modal's separate path tag.
+  it("absolute_paths_get_a_single_slash_file_name_header", () => {
+    const abs = configDiff("a: 1", "a: 2", "/home/u/.config/peakbot/config.yaml");
+    expect(abs.oldFileName).toBe("a/config.yaml");
+    expect(abs.newFileName).toBe("b/config.yaml");
+    expect(abs.oldFileName).not.toContain("//");
+    expect(abs.newFileName).not.toContain("//");
+
+    // A relative path is unchanged (covered above, pinned explicitly).
+    expect(diffDisplayName(".peakbot/config.yaml")).toBe(".peakbot/config.yaml");
+    expect(diffDisplayName("config.yaml")).toBe("config.yaml");
+    // Windows-style backslash paths are not absolute-unix: untouched.
+    expect(diffDisplayName("C:\\peakbot\\config.yaml")).toBe("C:\\peakbot\\config.yaml");
   });
 
   it("no_textual_change_message", () => {

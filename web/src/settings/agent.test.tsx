@@ -115,10 +115,12 @@ function mountAgent(yaml: string, errors: SettingsCtxValue["errors"] = []): Edit
     scope: "global",
     meta: meta(),
     doc: parse(yaml),
+    globalDoc: parse(yaml),
     edit: (path, value) => {
       edits.push({ path, value });
     },
     errors,
+    switchToGlobal: () => {},
   };
   mount(
     <ToastProvider>

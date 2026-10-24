@@ -273,6 +273,14 @@ function mountFirstRun(over: { m?: Partial<SettingsMeta>; g?: ConfigText; onClos
   mount(<FirstRun meta={meta(over.m)} global={over.g ?? MISSING_GLOBAL} onClose={over.onClose} />);
 }
 
+function unmountFirstRun() {
+  if (root) {
+    act(() => root!.unmount());
+    host.remove();
+    root = undefined;
+  }
+}
+
 // ═══ buildFirstRunYaml (pure) ═══════════════════════════════════════════
 
 describe("buildFirstRunYaml (spec §9.13 generated YAML)", () => {
@@ -482,6 +490,64 @@ describe("FirstRun — Welcome (spec §9.13 step 1)", () => {
     }
   });
 
+  // T34b (spec §9.13): the machine facts include PATH (facts.install.path).
+  it("welcome_shows_the_path_fact_from_facts_install", () => {
+    stubApi();
+    mountFirstRun({
+      m: {
+        facts: {
+          os: "linux",
+          arch: "amd64",
+          exe_path: "/opt/peakbot/bin/peakbot",
+          data_dir: "/home/u/.local/share/peakbot",
+          version: "0.24.0",
+          install: {
+            target: "/home/u/.local/bin/peakbot",
+            state: "current",
+            path: { status: "on_path" },
+          },
+        },
+      },
+    });
+    expect(text("firstrun-fact-path")).toBe("PATH · on PATH");
+  });
+
+  it("welcome_path_fact_shadows_and_absent_variants", () => {
+    stubApi();
+    const facts = {
+      os: "linux",
+      arch: "amd64",
+      exe_path: "/opt/peakbot/bin/peakbot",
+      data_dir: "/home/u/.local/share/peakbot",
+      version: "0.24.0",
+    };
+    mountFirstRun({
+      m: {
+        facts: {
+          ...facts,
+          install: { target: "/home/u/.local/bin/peakbot", state: "other", path: { status: "shadowed", by: "/usr/local/bin/peakbot" } },
+        },
+      },
+    });
+    expect(text("firstrun-fact-path")).toBe("PATH · shadowed by /usr/local/bin/peakbot");
+
+    unmountFirstRun();
+    mountFirstRun({
+      m: {
+        facts: {
+          ...facts,
+          install: { target: "", state: "absent", path: { status: "absent", hint: "install target missing" } },
+        },
+      },
+    });
+    expect(text("firstrun-fact-path")).toBe("PATH · not on PATH — install target missing");
+
+    // No install info → the line is omitted (the fixture meta uses null).
+    unmountFirstRun();
+    mountFirstRun();
+    expect(has("firstrun-fact-path")).toBe(false);
+  });
+
   it("start_fresh_goes_to_the_provider_step", () => {
     stubApi();
     mountFirstRun();
@@ -566,6 +632,33 @@ describe("FirstRun — step validation (spec §9.13 steps 2–4)", () => {
     expect(ctl("fr-provider-baseurl").value).toBe("");
   });
 
+  // T34b (spec §9.13): the Provider step offers the model preset chips —
+  // the SAME single source (providerTypes.MODEL_PRESETS) as the Providers pane.
+  it("provider_step_offers_model_preset_chips_from_the_single_source", () => {
+    stubApi();
+    mountFirstRun();
+    click(q("firstrun-start-fresh"));
+
+    // Default type is openrouter: its three presets are offered.
+    const chips = host.querySelectorAll('[data-testid^="fr-model-preset-"]');
+    expect(chips.length).toBe(3);
+    expect(Array.from(chips).map((c) => c.textContent)).toEqual(["sonnet", "flash", "gpt5"]);
+
+    // A preset click adds a FILLED model row (name/alias/max_tokens).
+    click(q("fr-model-preset-0"));
+    expect(ctl("fr-model-name-0").value).toBe("anthropic/claude-sonnet-4.5");
+    expect(ctl("fr-model-alias-0").value).toBe("sonnet");
+    expect(ctl("fr-model-maxtokens-0").value).toBe("8192");
+    // With the key too, the step is valid (openrouter is hosted).
+    typeInto(ctl("fr-provider-apikey"), KEY);
+    expect(ctl<HTMLButtonElement>("firstrun-next").disabled).toBe(false);
+
+    // The chips follow the type (ollama has its own two presets).
+    choose(ctl<HTMLSelectElement>("fr-provider-type"), "ollama");
+    const chips2 = host.querySelectorAll('[data-testid^="fr-model-preset-"]');
+    expect(Array.from(chips2).map((c) => c.textContent)).toEqual(["coder", "llama"]);
+  });
+
   it("agent_step_announces_generated_profile_agent_and_model", () => {
     stubApi();
     mountFirstRun();
@@ -622,6 +715,31 @@ describe("FirstRun — Review + Finish (spec §9.13 steps 5–6)", () => {
     expect(preview).not.toContain(KEY); // masked on screen…
     expect(text("firstrun-review-path")).toContain(GLOBAL_PATH);
     expect(has("firstrun-review-legacy-note")).toBe(false);
+  });
+
+  // T34b: the LAN web token is masked in the preview like the API key.
+  it("review_preview_masks_the_web_token_like_the_api_key", async () => {
+    const TOKEN = "web-token-abcdef123456";
+    const calls = stubApi();
+    mountFirstRun();
+    click(q("firstrun-start-fresh"));
+    fillProvider();
+    next(); // agent
+    next(); // web
+    click(ctl("fr-web-lan"));
+    typeInto(ctl("fr-web-token"), TOKEN);
+    next(); // review
+    const preview = text("firstrun-yaml");
+    expect(preview).toContain("bind: 0.0.0.0:7823");
+    expect(preview).toContain("token:");
+    expect(preview).not.toContain(TOKEN); // masked on screen
+    expect(preview).toContain("••••••••");
+
+    // …and the REAL token is what gets sent.
+    click(q("firstrun-finish"));
+    await flush();
+    const body = puts(calls)[0].body as { text: string };
+    expect(body.text).toContain(TOKEN);
   });
 
   it("finish_puts_global_with_null_sha", async () => {
@@ -716,7 +834,10 @@ describe("FirstRun — Review + Finish (spec §9.13 steps 5–6)", () => {
 
     const screen = text("firstrun-restart");
     expect(screen).toContain("Config written");
-    expect(screen).toContain("PeakBot wrote your config. A backup was kept.");
+    // T34b: "A backup was kept." only when the PUT response carries a
+    // backup — PutOk.backup is null here (a fresh file).
+    expect(screen).toContain("PeakBot wrote your config.");
+    expect(screen).not.toContain("A backup was kept.");
     expect(screen).toContain("Restart PeakBot to start chatting.");
     expect(screen).toContain(GLOBAL_PATH);
     expect(screen).toContain("0.24.0");
@@ -745,6 +866,8 @@ describe("FirstRun — Review + Finish (spec §9.13 steps 5–6)", () => {
     click(q("firstrun-finish"));
     await flush();
     expect(text("firstrun-restart-backup")).toContain(GLOBAL_PATH + ".bak");
+    // T34b: with a real backup, the "A backup was kept." copy is back.
+    expect(text("firstrun-restart")).toContain("PeakBot wrote your config. A backup was kept.");
   });
 
   it("failed_put_keeps_review_and_shows_the_error_without_restart_screen", async () => {

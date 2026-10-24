@@ -118,11 +118,13 @@ const GHOST_BTN =
 // ── pane ─────────────────────────────────────────────────────────────────
 
 export function GeneralPane() {
-  const { scope, meta, doc, edit, errors } = useSettingsCtx();
-  // general: is global-only — repo scope renders the pane read-only (🔒).
+  const { scope, meta, doc, globalDoc, edit, errors, switchToGlobal } = useSettingsCtx();
+  // general: is global-only — repo scope renders the GLOBAL draft's values
+  // read-only (🔒); the repo file may only contain `profiles:`.
   const readOnly = scope === "repo";
+  const paneDoc = readOnly ? globalDoc : doc;
 
-  const g = (rest: Seg[]) => get(doc, ["general", ...rest]);
+  const g = (rest: Seg[]) => get(paneDoc, ["general", ...rest]);
   const web = asRecord(g(["web"]));
   const bind = asString(web.bind);
   const mode = accessModeOf(bind);
@@ -147,7 +149,7 @@ export function GeneralPane() {
   const http = asRecord(g(["http"]));
   const uploads = asRecord(g(["uploads"]));
 
-  const options = modelOptionsOf(doc);
+  const options = modelOptionsOf(paneDoc);
   const compactionModel = asString(ctx.compaction_model);
   const maxTurns = asNumber(g(["agent_max_turns"]));
   const costTracking = g(["cost_tracking"]) !== false;
@@ -162,9 +164,17 @@ export function GeneralPane() {
       {readOnly && (
         <div
           data-testid="general-readonly"
-          className="rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400"
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400"
         >
-          🔒 General is machine-wide — read-only in this repo. Switch to Global to edit.
+          <span>🔒 Machine-wide — edit in Global scope. This section is read-only here.</span>
+          <button
+            data-testid="switch-to-global"
+            type="button"
+            onClick={switchToGlobal}
+            className="cursor-pointer rounded border border-zinc-700 px-2 py-0.5 text-[11px] text-sky-400 hover:bg-zinc-800"
+          >
+            Switch to Global
+          </button>
         </div>
       )}
 

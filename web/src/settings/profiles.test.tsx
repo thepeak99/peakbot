@@ -142,10 +142,12 @@ function mountList(yaml: string): Edit[] {
     scope: "global",
     meta: meta(),
     doc: parse(yaml),
+    globalDoc: parse(yaml),
     edit: (path, value) => {
       edits.push({ path, value });
     },
     errors: [],
+    switchToGlobal: () => {},
   };
   mount(
     <ToastProvider>
@@ -170,10 +172,12 @@ function mountPage(yaml: string, profile: string, opts: PageOpts = {}): Edit[] {
     scope: opts.scope ?? "global",
     meta: meta(),
     doc: parse(yaml),
+    globalDoc: parse(yaml),
     edit: (path, value) => {
       edits.push({ path, value });
     },
     errors: [],
+    switchToGlobal: () => {},
   };
   mount(
     <ToastProvider>
