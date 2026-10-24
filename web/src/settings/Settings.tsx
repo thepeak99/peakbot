@@ -7,11 +7,12 @@
 //   defaultPrevented Esc is left to the modal/popover).
 //
 // The section CONTENT panes land across M5 tasks: Providers & Models
-// (T25, ./providers) and MCP servers (T26, ./mcp) are real; the remaining
-// sections render a neutral empty state so the shell stays navigable. The
-// shell wires the full save flow: debounced validate → PUT with
-// base_sha256 → 409 stale banner / 422 error panel / 200 toast + restart
-// banner.
+// (T25, ./providers), MCP servers (T26, ./mcp) and the Profiles
+// master-detail (T27, ./profiles + T28 ./agent: list → profile page →
+// agent page with breadcrumbs) are real; the remaining sections render a
+// neutral empty state so the shell stays navigable. The shell wires the
+// full save flow: debounced validate → PUT with base_sha256 → 409 stale
+// banner / 422 error panel / 200 toast + restart banner.
 
 import { useCallback, useEffect, useReducer, useState } from "react";
 import { isDesktop } from "../desktop";
@@ -26,6 +27,10 @@ import { ErrorPanel } from "./ErrorPanel";
 import { DiffModal } from "./DiffModal";
 import { ProvidersPane } from "./providers";
 import { McpsPane } from "./mcp";
+import { ProfilesPane, ProfilePage } from "./profiles";
+import { AgentPage } from "./agent";
+import { copyToRepoName } from "./profileOps";
+import { Crumbs } from "./widgets";
 import { ToastProvider, useToast } from "./Toast";
 
 /**
@@ -61,6 +66,9 @@ export function useSettingsToggle(): { open: boolean; toggle(): void; close(): v
 export interface SettingsProps {
   /** The conversation id for ?convo= (repo scope resolves against its cwd); null = boot cwd. */
   convo: string | null;
+  /** The profile the current conversation uses (spec §9.3 Q8: hiding its
+   *  `settings` tab asks first). The App's selection (App.tsx). */
+  activeProfile?: string | null;
   /** "← Back to chat" — closes the view (chat stays mounted underneath). */
   onClose(): void;
 }
@@ -95,15 +103,22 @@ const SECTIONS: Record<Section, { label: string; desc: string }> = {
 const REPO_BANNER =
   "The repo file may only contain profiles:. Repo profiles are listed first and the first one is the default for conversations started here. A repo profile with the same name as a global one replaces it entirely (no merge).";
 
-export function Settings({ convo, onClose }: SettingsProps) {
+/** A config map value (profiles / agents) as a plain record. */
+function asMap(v: unknown): Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : {};
+}
+
+export function Settings({ convo, onClose, activeProfile }: SettingsProps) {
   return (
     <ToastProvider>
-      <SettingsInner convo={convo} onClose={onClose} />
+      <SettingsInner convo={convo} onClose={onClose} activeProfile={activeProfile} />
     </ToastProvider>
   );
 }
 
-function SettingsInner({ convo, onClose }: SettingsProps) {
+function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const { toast } = useToast();
   const [store] = useState(createStore);
   // The store is a plain object: a version counter is the re-render seam.
@@ -112,6 +127,12 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
   const [scope, setScopeState] = useState<Scope>("global");
   const [meta, setMeta] = useState<SettingsMeta | null>(null);
   const [active, setActive] = useState<Section>("profiles");
+  // Profiles master-detail (spec §9.0: list → profile page → agent page, not
+  // a tree): the open profile/agent inside the "profiles" section.
+  const [profileSel, setProfileSel] = useState<{ profile: string | null; agent: string | null }>({
+    profile: null,
+    agent: null,
+  });
   const [loaded, setLoaded] = useState<Record<Scope, boolean>>({ global: false, repo: false });
   const [saving, setSaving] = useState(false);
   const [staleMsg, setStaleMsg] = useState<string | null>(null);
@@ -163,6 +184,8 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
     store.setScope(s);
     setScopeState(s);
     setFlash(null);
+    // The open profile/agent may not exist in the other scope's draft.
+    setProfileSel({ profile: null, agent: null });
   }
 
   async function validate() {
@@ -242,14 +265,48 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
   }
 
   // Fix (spec §9.6): route on the segment array; a repo-file error while in
-  // global scope switches scope first. The pane's matching error row flashes.
+  // global scope switches scope first. profiles errors land on the owning
+  // profile/agent page (paths.route carries profile/agent/subagent); the
+  // pane's matching error row flashes.
   function fixError(err: ConfigErr) {
     const target = route(err.path);
     if (err.file !== scope) switchScope(err.file);
     setActive(target.section);
+    if (target.section === "profiles") {
+      setProfileSel({ profile: target.profile ?? null, agent: target.agent ?? null });
+    }
     const pathKey = dotPath(err.path);
     setFlash({ section: target.section, pathKey });
     window.setTimeout(() => setFlash((f) => (f && f.pathKey === pathKey ? null : f)), 1600);
+  }
+
+  // "Copy to this repo" (spec §9.3): duplicate the profile into the REPO
+  // draft (naming via profileOps.copyToRepoName), switch scope to repo, open
+  // the copy. The repo file may not be loaded yet — fetch it first so the
+  // loader does not clobber the copy.
+  async function copyProfileToRepo(name: string, def: Record<string, unknown>) {
+    if (!loaded.repo) {
+      try {
+        const ct = await getConfig("repo", convo ?? undefined);
+        setLoaded((l) => ({ ...l, repo: true }));
+        store.setSaved("repo", ct.text, ct.sha256);
+      } catch (e) {
+        toast(e instanceof Error ? e.message : "Failed to load the repo config", "error");
+        return;
+      }
+    }
+    store.setScope("repo");
+    const repoDoc = store.state().draftDoc;
+    const repoNames = Object.keys(asMap(get(repoDoc, ["profiles"])));
+    const target = copyToRepoName(name, repoNames);
+    set(repoDoc, ["profiles", target], def);
+    store.setDraft("repo", repoDoc);
+    setScopeState("repo");
+    setProfileSel({ profile: target, agent: null });
+    setDraftVersion((v) => v + 1);
+    toast(`Copied ${target} to this repo`);
+    toast(`Opened the repo copy — Save to write .peakbot/config.yaml`);
+    bump();
   }
 
   // ── Derivations ──────────────────────────────────────────────────────
@@ -265,9 +322,49 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
   const paneErrors = allErrors.filter(
     (e) => e.file === scope && route(e.path).section === active,
   );
-  const profiles = get(st.draftDoc, ["profiles"]);
-  const profileCount =
-    profiles && typeof profiles === "object" ? Object.keys(profiles).length : 0;
+  const profilesMap = asMap(get(st.draftDoc, ["profiles"]));
+  const profileCount = Object.keys(profilesMap).length;
+  // Master-detail: the open profile/agent must still exist in the CURRENT
+  // scope's draft (a deleted/renamed one falls back to the list).
+  const openProfile =
+    active === "profiles" && profileSel.profile !== null && profileSel.profile in profilesMap
+      ? profileSel.profile
+      : null;
+  const openProfileAgents =
+    openProfile !== null ? asMap(asMap(profilesMap[openProfile]).agents) : {};
+  const openAgent =
+    openProfile !== null && profileSel.agent !== null && profileSel.agent in openProfileAgents
+      ? profileSel.agent
+      : null;
+  // Profile names of the OTHER scope's draft — the shadow/override badges and
+  // the copy-to-repo naming (spec §9.2/§9.3).
+  function profileNamesOf(s: Scope): string[] {
+    const prev = store.current;
+    store.setScope(s);
+    const m = asMap(get(store.state().draftDoc, ["profiles"]));
+    store.setScope(prev);
+    return Object.keys(m);
+  }
+  const otherScopeNames = profileNamesOf(scope === "global" ? "repo" : "global");
+  const crumbItems =
+    openProfile !== null && openAgent !== null
+      ? ["Profiles", openProfile, openAgent]
+      : openProfile !== null
+        ? ["Profiles", openProfile]
+        : ["Profiles"];
+
+  // Profiles: list only the errors that belong to the open page (list =
+  // errors without a profile name, profile page = that profile's own,
+  // agent page = that agent's).
+  const listedErrors =
+    active !== "profiles"
+      ? paneErrors
+      : paneErrors.filter((e) => {
+          const t = route(e.path);
+          if (openProfile === null) return t.profile === undefined;
+          if (t.profile !== openProfile) return false;
+          return openAgent === null ? t.agent === undefined : t.agent === openAgent;
+        });
 
   const globalPath = meta?.global_path ?? "~/.config/peakbot/config.yaml";
   const repoPath = meta?.repo_path ?? ".peakbot/config.yaml";
@@ -293,7 +390,10 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
     return (
       <button
         key={item.id}
-        onClick={() => setActive(item.id)}
+        onClick={() => {
+          setActive(item.id);
+          if (item.id === "profiles") setProfileSel({ profile: null, agent: null });
+        }}
         title={locked ? "Machine-wide — read-only in repo scope" : undefined}
         className={`flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left text-xs ${
           active === item.id ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
@@ -390,7 +490,43 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
                 {g.group}
               </div>
               <div className="space-y-0.5">
-                {g.items.map(navButton)}
+                {g.items.map((item) => (
+                  <div key={item.id} className="contents">
+                    {navButton(item)}
+                    {/* Master-detail: the open profile / agent indent under
+                        Profiles (spec §9.0 — crumbs, not a tree). */}
+                    {item.id === "profiles" && openProfile && (
+                      <button
+                        onClick={() => {
+                          setActive("profiles");
+                          setProfileSel({ profile: openProfile, agent: null });
+                        }}
+                        className={`flex w-full cursor-pointer items-center rounded py-1.5 pl-6 pr-2 text-left text-xs ${
+                          active === "profiles" && openProfile && !openAgent
+                            ? "bg-zinc-800 text-zinc-100"
+                            : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
+                        }`}
+                      >
+                        {openProfile}
+                      </button>
+                    )}
+                    {item.id === "profiles" && openProfile && openAgent && (
+                      <button
+                        onClick={() => {
+                          setActive("profiles");
+                          setProfileSel({ profile: openProfile, agent: openAgent });
+                        }}
+                        className={`flex w-full cursor-pointer items-center rounded py-1.5 pl-9 pr-2 text-left text-xs ${
+                          active === "profiles" && openAgent
+                            ? "bg-zinc-800 text-zinc-100"
+                            : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
+                        }`}
+                      >
+                        {openAgent}
+                      </button>
+                    )}
+                  </div>
+                ))}
                 {g.group === "MACHINE" && desktop && (
                   <a
                     href="peakbot-desktop:settings"
@@ -410,8 +546,23 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
         <main className="min-w-0 flex-1 overflow-auto p-4 sm:p-6">
           {/* Mobile: the nav collapses into a select under the head */}
           <select
-            value={active}
-            onChange={(e) => setActive(e.target.value as Section)}
+            value={
+              active === "profiles"
+                ? `profiles${openProfile ? `|${openProfile}` : ""}${openAgent ? `|${openAgent}` : ""}`
+                : active
+            }
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v.startsWith("profiles|")) {
+                // Name rule §4.2 allows no "|", so the split is unambiguous.
+                const [, p, a] = v.split("|");
+                setActive("profiles");
+                setProfileSel({ profile: p ?? null, agent: a ?? null });
+              } else {
+                setActive(v as Section);
+                setProfileSel({ profile: null, agent: null });
+              }
+            }}
             aria-label="Section"
             className="mb-4 block w-full max-w-xs cursor-pointer rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-xs text-zinc-200 min-[801px]:hidden"
           >
@@ -421,7 +572,29 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
                 {scope === "repo" && item.lockedInRepo ? " 🔒" : ""}
               </option>
             ))}
+            {active === "profiles" && openProfile && (
+              <option value={`profiles|${openProfile}`}>Profiles › {openProfile}</option>
+            )}
+            {active === "profiles" && openProfile && openAgent && (
+              <option value={`profiles|${openProfile}|${openAgent}`}>
+                Profiles › {openProfile} › {openAgent}
+              </option>
+            )}
           </select>
+
+          {/* Breadcrumbs (spec §9.0: Profiles › <profile> › <agent>) */}
+          {active === "profiles" && (
+            <div className="mb-2">
+              <Crumbs
+                testid="profiles-crumbs"
+                items={crumbItems}
+                onNavigate={(i) => {
+                  if (i === 0) setProfileSel({ profile: null, agent: null });
+                  else if (i === 1 && openProfile) setProfileSel({ profile: openProfile, agent: null });
+                }}
+              />
+            </div>
+          )}
 
           {/* Section head */}
           <div className="mb-4 flex items-baseline gap-3">
@@ -433,13 +606,32 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
             )}
           </div>
 
-          {/* Section panes. Providers (T25) and MCP servers (T26) are the
-              real content; the remaining sections keep a neutral empty
-              state until their M5 tasks land. */}
+          {/* Section panes. Providers (T25), MCP servers (T26) and the
+              Profiles master-detail (T27/T28) are the real content; the
+              remaining sections keep a neutral empty state until their M5
+              tasks land. */}
           {active === "providers" ? (
             <ProvidersPane />
           ) : active === "mcps" ? (
             <McpsPane />
+          ) : active === "profiles" ? (
+            openProfile && openAgent ? (
+              <AgentPage profile={openProfile} agent={openAgent} />
+            ) : openProfile ? (
+              <ProfilePage
+                profile={openProfile}
+                activeProfile={activeProfile}
+                otherScopeNames={otherScopeNames}
+                onCopyToRepo={copyProfileToRepo}
+                onOpenProfile={(n) => setProfileSel({ profile: n, agent: null })}
+                onOpenAgent={(p, a) => setProfileSel({ profile: p, agent: a })}
+              />
+            ) : (
+              <ProfilesPane
+                otherScopeNames={otherScopeNames}
+                onOpenProfile={(n) => setProfileSel({ profile: n, agent: null })}
+              />
+            )
           ) : (
             <>
               <p className="max-w-2xl text-xs text-zinc-500">{SECTIONS[active].desc}</p>
@@ -453,11 +645,12 @@ function SettingsInner({ convo, onClose }: SettingsProps) {
             </>
           )}
 
-          {/* Validation errors for sections without a pane yet are listed
-              here; the providers/mcp panes render their own red fields. */}
-          {paneErrors.length > 0 && active !== "providers" && active !== "mcps" && (
+          {/* Validation errors for sections without a full set of red fields
+              are listed here; the providers/mcp panes render their own. In
+              Profiles only the errors owned by the open page are listed. */}
+          {listedErrors.length > 0 && active !== "providers" && active !== "mcps" && (
             <ul className="mt-4 max-w-2xl space-y-2">
-              {paneErrors.map((e, i) => {
+              {listedErrors.map((e, i) => {
                 const pathKey = dotPath(e.path);
                 const flashing = flash?.section === active && flash.pathKey === pathKey;
                 return (

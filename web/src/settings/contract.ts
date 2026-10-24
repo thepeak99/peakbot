@@ -1,6 +1,6 @@
 // ASSUMED MODULE APIS — types-only contract for the M5 RED tests.
 //
-// The tests in this directory (T20–T26) are written BEFORE the modules exist.
+// The tests in this directory (T20–T28) are written BEFORE the modules exist.
 // Each test file's header names the module it imports; the signatures, props
 // and data-testids below are what the builders implement against. Do not
 // re-shape these to fit an implementation — change the tests only with a
@@ -395,3 +395,103 @@ export interface BadgeProps {
 //   `mcp-auth-token-<i>`, `mcp-auth-clientid-<i>`, `mcp-auth-secret-<i>`,
 //   `mcp-auth-scopes-<i>`, `mcp-headers-<i>`, `mcp-authtoken-<i>` (read-only
 //   legacy display).
+
+// ── ./profileOps (T27) ─────────────────────────────────────────────────
+// Pure helpers for the profiles map — the panes route ALL ordering/naming
+// logic through here (unit-testable, no doc mutation). The profiles map is
+// a plain JS object: insertion order = YAML key order, so "move first" =
+// rebuild the object with the key first.
+//
+// makeDefault(profiles: Record<string, unknown>, name: string): Record<string, unknown>
+//   A NEW map with `name` moved to the front; relative order of the rest
+//   unchanged; the input is not mutated. Unknown `name` (or empty map) →
+//   throws Error("no such profile: <name>").
+//
+// duplicateName(name: string, taken: string[]): string
+//   `<name>-copy`; if that is in `taken`, `<name>-copy-2`,
+//   `<name>-copy-3`, … the first one not in `taken` (spec §9.3
+//   "`<name>-copy[-N]`").
+//
+// copyToRepoName(name: string, repoProfileNames: string[]): string
+//   `name` if the name is free in the repo draft, else `name + "-copy"`
+//   (further collisions are the server's validation problem, not this
+//   helper's — spec §9.3 "(-copy suffix if the name is taken there)").
+
+// ── ./profiles (T27) ───────────────────────────────────────────────────
+// <ProfilesPane/> — D4 "Profiles list" (spec §9.2). Reads the draft via
+// useSettingsCtx(); profiles = get(doc, ["profiles"]) (absent = {}). One
+// card per profile IN MAP ORDER; the first card carries the DEFAULT
+// badge; cards 1..n get a "Make default" button that reorders the map via
+// profileOps.makeDefault → edit(["profiles"], newMap).
+// data-testids: `profiles-pane`, `profile-card-<i>`, `profile-name-<i>`,
+// `profile-badge-default` (inside card 0 only), `profile-make-default-<i>`
+// (cards 1..n only — NOT on card 0), `profile-add`.
+//
+// <ProfilePage profile: string activeProfile?: string | null
+//   onCopyToRepo?(name: string, def: Record<string, unknown>): void
+//   onOpenProfile?(name: string): void /> — D4 profile page (spec §9.3).
+// Reads get(doc, ["profiles", profile]); writes via edit by segment array.
+//   `profile-page` — container.
+//   `profile-name` — editable name input.
+//   `profile-duplicate` — inserts a copy of the profile DIRECTLY AFTER the
+//   source, named with profileOps.duplicateName, writes the new profiles
+//   map, calls onOpenProfile(newName) (spec: the copy is opened) and
+//   toasts `Duplicated as <n>`.
+//   `profile-copy-repo` — GLOBAL scope only (absent in repo scope); calls
+//   onCopyToRepo(profile, def) with the full profile def — the shell does
+//   the cross-scope copy (naming via profileOps.copyToRepoName) + the
+//   scope switch.
+//   `profile-delete` — refused with the error toast `A config needs at
+//   least one profile` when it is the only profile (NO edit); otherwise
+//   writes the profiles map without the name and toasts `Deleted <n>`.
+//   `profile-tabs` — Interface card: one checkbox per meta.tab_names,
+//   `profile-tabs-chip-<name>` (testid on the INPUT, checked = visible).
+//   Writes edit(["profiles", p, "ui", "tabs"],
+//   serializeFilter({ mode: "disabled", names: hidden })) where
+//   hidden = the unchecked tabs IN meta.tab_names (universe) order —
+//   all checked → undefined (key omitted, not `enabled: true`).
+//   Unchecking `settings` on the profile the current conversation uses
+//   (activeProfile === profile) asks first (spec §9.3 Q8): dialog
+//   `profile-tabs-confirm` with the exact text `Hide Settings for '<p>'?
+//   This removes the ⚙ gear and Ctrl+, for the profile you are using. To
+//   get Settings back you will have to edit config.yaml by hand or switch
+//   profile.`, buttons `profile-tabs-confirm-hide` ("Hide Settings") and
+//   `profile-tabs-confirm-cancel` ("Cancel"). NO edit until "Hide
+//   Settings" is clicked; Cancel leaves the checkbox checked and no edit.
+//   A non-active profile hides `settings` immediately, no confirm.
+
+// ── ./agent (T28) ──────────────────────────────────────────────────────
+// <AgentPage profile: string agent: string /> — D5 agent page (spec
+// §9.4). Reads get(doc, ["profiles", profile, "agents", agent]); writes
+// via edit by segment array.
+// data-testids:
+//   `agent-page` — container.
+//   `agent-model` — ModelSelect; options built by the page from the
+//   DRAFT's providers[].models ({ alias, qualified = provider/name });
+//   inner `select`.
+//   `agent-persona` — persona textarea (testid on the textarea); while
+//   the key is absent its placeholder = the FIRST LINE of
+//   meta.builtin_persona (spec: "the first lines of builtin_persona").
+//   `agent-persona-chip-builtin` — the "Built-in (Code Crusader)" chip:
+//   writes persona: undefined (key omitted) — it NEVER writes a copy of
+//   the built-in text (spec §9.4 [changed, Q6]).
+//   `agent-persona-chip-neutral` / `agent-persona-chip-terse` — preset
+//   chips writing the mockup's preset texts (spec §9.4, mockup lines
+//   748–752).
+//   `agent-skills` — FilterBlock; universe = meta.skills (never
+//   hard-coded); writes serializeFilter(state) to
+//   …agents.<a>.skills.
+//   `agent-subs-toggle` — Toggle; checked is DERIVED = the subagents map
+//   is non-empty. Off → edit(…agents.<a>.subagents, undefined) + the
+//   previous map is stashed in the page's own state (editing session) +
+//   the `agent-subs-undo` affordance appears (a toast action or a banner
+//   button — the fixed testid is what the test drives). Undo →
+//   edit(…subagents, <the stashed map, verbatim>) and the stash is
+//   consumed (affordance gone). On with no stash → one blank `helper`.
+//   `agent-sub-<i>` — i-th subagent card, in map order; inner
+//   `agent-sub-name-<i>` (input), `agent-sub-model-<i>` (select — the
+//   FIRST option has value "" and text `inherits <agent model>`; choosing
+//   it writes model: undefined = key omitted), `agent-sub-prompt-<i>`
+//   (textarea), `agent-sub-remove-<i>`.
+//   `agent-sub-add` — + Add subagent.
+// No persona field on subagents (spec §9.4).

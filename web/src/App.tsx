@@ -409,7 +409,11 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       />
 
       {settingsView.open && settingsEnabled && (
-        <Settings convo={state?.conversation?.id ?? null} onClose={settingsView.close} />
+        <Settings
+          convo={state?.conversation?.id ?? null}
+          activeProfile={selection?.profile ?? null}
+          onClose={settingsView.close}
+        />
       )}
     </div>
   );
