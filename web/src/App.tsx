@@ -24,6 +24,7 @@ import { TodoPanel } from "./components/TodoPanel";
 import { BgPanel } from "./components/BgPanel";
 import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
+import { Settings, useSettingsToggle } from "./settings/Settings";
 import { useAgent } from "./useAgent";
 import { useConvoTabs } from "./useConvoTabs";
 import type { TabsState } from "./convoTabs";
@@ -107,6 +108,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const loadConversation = convoTabs ? convoTabs.open : switchConvo;
   const [drawerTab, setDrawerTab] = useState<string | null>(null);
   const drawerOpen = drawerTab !== null;
+  // Settings is an in-app VIEW (not a route): this state lives here so the
+  // chat and its WebSocket stay mounted underneath. Gear + Ctrl+, / ⌘+, +
+  // Esc are owned by the hook.
+  const settingsView = useSettingsToggle();
 
   // Catalog and selection (0.24): `catalog` is the profiles/agents/sub-agents
   // this install declares; `selection` is the (profile, agent) this
@@ -259,6 +264,15 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const visibleTabs = filterTabs(tabs, state?.visible_tabs);
   const visibleTabIds = visibleTabs.map((t) => t.id);
 
+  // The gear (and Ctrl+,) exist only when the server says Settings is
+  // available (`settings_available`, false under a --profile pin) AND the
+  // bound profile's `visible_tabs` still lists `settings` (§9.12). Both
+  // fields are absent on older servers / before the first state frame:
+  // absent settings_available = available; absent visible_tabs = no rule.
+  const settingsEnabled =
+    (state?.settings_available ?? true) &&
+    (state?.visible_tabs === undefined || state.visible_tabs.includes("settings"));
+
   // Keep an open drawer pointed at a tab the server still shows. When the
   // visible set changes (e.g. the bound profile's `tabs` drops a tab out
   // from under an open drawer), relocate the active tab to the first
@@ -293,6 +307,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         onToggleNotify={notify.toggle}
         focusMode={focusMode.focus}
         onToggleFocus={focusMode.toggle}
+        onOpenSettings={settingsEnabled ? settingsView.toggle : undefined}
       />
       {convoTabs && (
         <ConvoTabBar
@@ -392,6 +407,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         active={drawerTab}
         onActiveChange={setDrawerTab}
       />
+
+      {settingsView.open && settingsEnabled && (
+        <Settings convo={state?.conversation?.id ?? null} onClose={settingsView.close} />
+      )}
     </div>
   );
 }
