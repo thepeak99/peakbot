@@ -221,11 +221,13 @@ fn dispatch_stdin_line(
         Ok(InboundMessage::SwitchCwd { path }) => {
             action_sender.send(UiAction::ChangeCwd(path)).is_ok()
         }
-        Ok(InboundMessage::SelectPipeline { name }) => {
-            action_sender.send(UiAction::SelectPipeline(name)).is_ok()
-        }
-        Ok(InboundMessage::SelectProfile { name }) => {
-            action_sender.send(UiAction::SelectProfile(name)).is_ok()
+        Ok(InboundMessage::Select { profile, agent }) => {
+            action_sender
+                .send(UiAction::Select(crate::config::resolve::Selection {
+                    profile,
+                    agent,
+                }))
+                .is_ok()
         }
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {

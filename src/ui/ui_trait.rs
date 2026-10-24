@@ -14,6 +14,7 @@
 //!   View ──UiAction──► Controller ──writes──► Model ──broadcasts──► View
 
 use crate::TodoStatus;
+use crate::config::resolve::Selection;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -71,20 +72,15 @@ pub enum UiAction {
     /// stay race-free because nothing is mutated at the process level.
     ChangeCwd(String),
 
-    /// Bind the current conversation to a named pipeline, or clear the binding
-    /// with `None` — the Agents panel selector. Only meaningful before the
-    /// first turn; the agent loop rejects it once the conversation has turns
-    /// (the choice is locked for the life of the conversation) and otherwise
-    /// records it, persists it, and rebuilds the agent on that team's
-    /// orchestrator so model, prompt and `delegate` roster all match.
-    SelectPipeline(Option<String>),
-
-    /// Bind the current conversation to a config profile, or clear the
-    /// binding with `None` — the Profile tab picker. Same lock rule as
-    /// `SelectPipeline`, plus the boot `--profile` pin (refused outright
-    /// while pinned); the agent loop re-validates, reloads the config under
-    /// the profile and rebuilds the agent on the current model.
-    SelectProfile(Option<String>),
+    /// Select the `(profile, agent)` this conversation should run under —
+    /// the Agents panel picker and the `{"type":"select",…}` web frame.
+    /// Only meaningful before the first turn; the agent loop rejects it
+    /// once the conversation has turns (the choice is locked for the life
+    /// of the conversation), refuses profile changes under a boot
+    /// `--profile` pin, and otherwise records it, persists it, and
+    /// rebuilds the agent on the new bound (model, prompt, subagents).
+    /// Serializes as `{"Select":{"profile","agent"}}`.
+    Select(Selection),
 
     /// Request the currently-running (pausable) sub-agent pause at its
     /// next checkpoint. No-op if no sub-agent is running or it is not
@@ -154,13 +150,13 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand::new("rename", "Rename the current conversation", true),
         SlashCommand::new("model", "List models, or switch with /model <alias>", true),
         SlashCommand::new(
-            "pipeline",
-            "List pipelines, or bind this conversation with /pipeline <name>|none",
+            "profile",
+            "List profiles, or pick one with /profile <name>",
             true,
         ),
         SlashCommand::new(
-            "profile",
-            "List profiles, or run this conversation under /profile <name>|none",
+            "agent",
+            "List agents, or pick one with /agent <name>",
             true,
         ),
         SlashCommand::new(
@@ -377,8 +373,8 @@ mod tests {
                 "export",
                 "rename",
                 "model",
-                "pipeline",
                 "profile",
+                "agent",
                 "cd",
                 "bg",
                 "stop",
@@ -497,43 +493,25 @@ mod tests {
         assert!(popup.filtered_commands().is_empty());
     }
 
-    // ── UiAction::SelectProfile (Layer D, RED) ──────────────────────────────
+    // ── UiAction::Select (0.24 cutover) ──────────────────────────────────
     //
-    // D4: `UiAction::SelectProfile(Option<String>)` — the profile-axis twin
-    // of `UiAction::SelectPipeline`, carried on the same `Serialize +
-    // Deserialize + PartialEq` derive the enum already has (needed for the
-    // stdio wire's action round-trip). Compile-RED until the variant
-    // exists (E0599 on `UiAction::SelectProfile`).
+    // `UiAction::Select(Selection)` replaces `SelectPipeline` /
+    // `SelectProfile`, carried on the same `Serialize + Deserialize +
+    // PartialEq` derive the enum already has (needed for the stdio wire's
+    // action round-trip).
 
     #[test]
-    fn select_profile_action_round_trips_through_json() {
-        let action = UiAction::SelectProfile(Some("research".to_string()));
+    fn select_action_round_trips_through_json() {
+        let action = UiAction::Select(Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+        });
         let json = serde_json::to_string(&action).expect("serializes");
-        let back: UiAction = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(
-            action, back,
-            "SelectProfile must round-trip through JSON intact"
+            json, r#"{"Select":{"profile":"dev","agent":"team"}}"#,
+            "the wire shape of UiAction::Select"
         );
-    }
-
-    #[test]
-    fn select_profile_action_none_round_trips() {
-        let action = UiAction::SelectProfile(None);
-        let json = serde_json::to_string(&action).expect("serializes");
         let back: UiAction = serde_json::from_str(&json).expect("deserializes");
-        assert_eq!(action, back);
-    }
-
-    #[test]
-    fn select_profile_action_distinct_from_select_pipeline() {
-        // Same inner shape (`Option<String>`), different variant — a
-        // regression that collapsed the two into one enum arm would still
-        // compile and still round-trip; only cross-comparison catches it.
-        let profile = UiAction::SelectProfile(Some("x".to_string()));
-        let pipeline = UiAction::SelectPipeline(Some("x".to_string()));
-        assert_ne!(
-            profile, pipeline,
-            "SelectProfile and SelectPipeline must be distinct variants"
-        );
+        assert_eq!(action, back, "Select must round-trip through JSON intact");
     }
 }

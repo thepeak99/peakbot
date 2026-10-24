@@ -679,23 +679,29 @@ impl StateManager {
         state.stats.total_cost = cost;
         // Scoped so the borrows end before `state.stats.lanes` is assigned.
         // Both models are DERIVED: the orchestrator's from `model_alias` (kept
-        // current by every rebuild), a role's from the selected pipeline's
-        // member list. Nothing is stored twice.
+        // current by every rebuild), a subagent's from the bound agent's
+        // subagent roster in the catalogue. Nothing is stored twice.
         let rows: Vec<crate::ui::app_state::LaneStat> = {
             let active_alias = &state.stats.model_alias;
-            let members = state
-                .selected_pipeline
-                .as_deref()
-                .and_then(|name| state.pipelines.iter().find(|p| p.name == name))
-                .map(|p| p.members.as_slice())
-                .unwrap_or(&[]);
+            let subagents: Vec<(String, String)> = state
+                .catalog
+                .iter()
+                .find(|p| p.name == state.selection.profile)
+                .and_then(|p| p.agents.iter().find(|a| a.name == state.selection.agent))
+                .map(|a| {
+                    a.subagents
+                        .iter()
+                        .map(|s| (s.name.clone(), s.model.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
             lanes
                 .into_iter()
                 .map(|(lane, s)| crate::ui::app_state::LaneStat {
                     model: if lane == crate::ui::app_state::ORCHESTRATOR_LANE {
                         active_alias.clone()
                     } else {
-                        members
+                        subagents
                             .iter()
                             .find(|(role, _)| role == &lane)
                             .map(|(_, alias)| alias.clone())
@@ -1383,47 +1389,40 @@ impl StateManager {
     ) {
         // Snapshot the selection under the state lock and release it *before*
         // locking the conversation — never hold both guards together (plan §4).
-        // `/new` mints on the current pipeline (D2: the selection survives).
-        // I-3: we deliberately do NOT clear `AppState.selected_pipeline` here —
-        // the live mirror must keep agreeing with the current conversation's
-        // `pipeline`, or the rebuild seam drops `delegate` on a team the freshly
-        // persisted conversation still names (and `/load` resurrects it).
-        // Dropping a selection the fresh config no longer defines is the
-        // reconciler's job at the verb call sites, not the mint's.
-        let (selected, profile) = {
-            let state = self.state.read().unwrap();
-            (
-                state.selected_pipeline.clone(),
-                state.active_profile.clone(),
-            )
-        };
+        // `/new` mints on the current selection: the `(profile, agent)` pair
+        // survives persistence/reload (I-3: the live mirror must keep
+        // agreeing with the current conversation, or the rebuild seam loses
+        // the bound).
+        let selection = self.state.read().unwrap().selection.clone();
         let mut conv = Conversation::new(name, provider_name, model, cwd);
-        conv.pipeline = selected;
-        conv.profile = profile;
+        // The `pipeline` field carries the agent name until T9a renames it
+        // to `agent` (serde alias "pipeline" — old files keep reading).
+        conv.pipeline = (!selection.agent.is_empty()).then(|| selection.agent.clone());
+        conv.profile = (!selection.profile.is_empty()).then(|| selection.profile.clone());
         *self.current_conversation.lock().unwrap() = Some(conv);
         self.mirror_conversation_to_state();
     }
 
-    /// Publish the pipeline catalogue (the boot-built `PipelineSet` projected
-    /// into wire shape). Stamped once at session build; "no pipelines
-    /// configured" is an empty vec, never a separate flag.
-    pub fn set_pipelines(&self, pipelines: Vec<crate::pipeline::PipelineInfo>) {
+    /// Publish the profile catalogue (`Config::parse`'s `Catalog` projected
+    /// into the §8.7 wire shape, repo first). Stamped at session build and
+    /// after every reload; "no profiles configured" is an empty vec, never a
+    /// separate flag.
+    pub fn set_catalog(&self, catalog: Vec<crate::config::resolve::ProfileInfo>) {
         let mut state = self.state.write().unwrap();
-        state.pipelines = pipelines;
+        state.catalog = catalog;
         self.notify_update(&state);
     }
 
-    /// The pipeline this conversation is bound to, or `None` for single-agent
-    /// mode. Reads the live `AppState` mirror — the same value
-    /// [`Self::set_selected_pipeline`] writes.
-    pub fn selected_pipeline(&self) -> Option<String> {
-        self.state.read().unwrap().selected_pipeline.clone()
+    /// The `(profile, agent)` this conversation is bound to. Reads the live
+    /// `AppState` mirror — the same value [`Self::set_selection`] writes.
+    pub fn selection(&self) -> crate::config::resolve::Selection {
+        self.state.read().unwrap().selection.clone()
     }
 
     /// Whether the current conversation has had a real turn (any user or agent
     /// message). System banners don't count — a fresh session showing only a
     /// welcome/warning is still "not started". This is the lock signal for the
-    /// pipeline selection: mutable before the first turn, frozen after.
+    /// selection: mutable before the first turn, frozen after.
     pub fn conversation_has_turns(&self) -> bool {
         use crate::ui::app_state::MessageRole;
         self.state
@@ -1435,50 +1434,34 @@ impl StateManager {
             .any(|m| matches!(m.role, MessageRole::User | MessageRole::Agent))
     }
 
-    /// Record the pipeline selection: onto the current conversation (persisted
-    /// on the next save) and into the live `AppState`. The caller owns the
-    /// lock-after-first-turn rule and the agent rebuild — this only records
-    /// the fact.
+    /// Record the selection: onto the current conversation (persisted on the
+    /// next save) and into the live `AppState`. The caller owns the
+    /// lock-after-first-turn rule, the boot `--profile` pin and the agent
+    /// rebuild — this only records the fact.
     ///
     /// **Lock rule:** the conversation guard is taken and released before the
     /// state guard. Holding both would invert the `state → current_conversation`
     /// order the persist path uses and deadlock (see
-    /// `select_pipeline_and_persist_current_do_not_deadlock`).
-    pub fn set_selected_pipeline(&self, name: Option<String>) {
+    /// `set_selection_and_persist_current_do_not_deadlock`).
+    pub fn set_selection(&self, selection: crate::config::resolve::Selection) {
         if let Some(conv) = self.current_conversation.lock().unwrap().as_mut() {
-            conv.pipeline = name.clone();
+            // The `pipeline` field carries the agent name until T9a renames
+            // it to `agent` (serde alias "pipeline").
+            conv.pipeline = Some(selection.agent.clone());
+            conv.profile = Some(selection.profile.clone());
         }
         let mut state = self.state.write().unwrap();
-        state.selected_pipeline = name;
+        state.selection = selection;
         self.notify_update(&state);
     }
 
-    /// The config profile this conversation runs under. Reads the live
-    /// `AppState` mirror that [`Self::set_selected_profile`] writes.
-    pub fn selected_profile(&self) -> Option<String> {
-        self.state.read().unwrap().active_profile.clone()
-    }
-
-    /// Record the profile selection onto the current conversation and into
-    /// the live `AppState`. Records only — the caller owns the lock rule and
-    /// the config reload. Same guard order as [`Self::set_selected_pipeline`].
-    pub fn set_selected_profile(&self, name: Option<String>) {
-        if let Some(conv) = self.current_conversation.lock().unwrap().as_mut() {
-            conv.profile = name.clone();
-        }
+    /// Stamp the tabs the client should render under this session's active
+    /// profile (now the bound profile's `tabs`) into the live `AppState`.
+    /// Called at session build and after every successful config reload; a
+    /// call REPLACES the previous set wholesale (no merge), so a re-stamp
+    /// never leaves a stale profile's tab set behind.
+    pub fn set_visible_tabs(&self, visible_tabs: Vec<String>) {
         let mut state = self.state.write().unwrap();
-        state.active_profile = name;
-        self.notify_update(&state);
-    }
-
-    /// Stamp the server-computed profile view — the picker's names and the
-    /// tabs the client should render — into the live `AppState`. Called at
-    /// session build and after every successful config reload / profile
-    /// apply; a call REPLACES the previous view wholesale (no merge), so a
-    /// re-stamp never leaves a stale profile's tab set behind.
-    pub fn set_profile_view(&self, profiles: Vec<String>, visible_tabs: Vec<String>) {
-        let mut state = self.state.write().unwrap();
-        state.profiles = profiles;
         state.visible_tabs = visible_tabs;
         self.notify_update(&state);
     }
@@ -1561,23 +1544,25 @@ impl StateManager {
             let conv = storage.load(id)?;
             *self.current_conversation.lock().unwrap() = Some(conv);
             self.sync_from_conversation();
-            // Restore the saved pipeline selection so a resumed conversation
-            // rebuilds on its team's orchestrator and the Agents panel shows
-            // the right row. A name that is no longer configured is dropped by
-            // the caller (`PipelineSet::resolve_saved`), not here.
-            // The profile is restored the same way; `resolve_saved_profile`
-            // drops a vanished one at the caller.
-            let (restored, profile) = self
+            // Restore the saved selection so a resumed conversation rebuilds
+            // on its bound and the Agents panel shows the right row. A name
+            // that is no longer configured is dropped by the caller
+            // (`resolve_saved_selection`), not here.
+            let restored = self
                 .current_conversation
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map(|c| (c.pipeline.clone(), c.profile.clone()))
+                .map(|c| crate::config::resolve::Selection {
+                    // The `pipeline` field carries the agent name (T9a
+                    // renames it to `agent`, serde alias "pipeline").
+                    agent: c.pipeline.clone().unwrap_or_default(),
+                    profile: c.profile.clone().unwrap_or_default(),
+                })
                 .unwrap_or_default();
             {
                 let mut state = self.state.write().unwrap();
-                state.selected_pipeline = restored;
-                state.active_profile = profile;
+                state.selection = restored;
             }
             // Background processes are scoped to the conversation they
             // were spawned in. Loading a different conversation severs
@@ -1616,27 +1601,29 @@ impl StateManager {
         Ok((conv.provider_name, conv.model))
     }
 
-    /// Peek at a saved conversation's persisted pipeline selection without
-    /// loading it. Used by `create_session` on the resume path to build the
-    /// boot agent on the right orchestrator *before* the conversation is
-    /// loaded. Pre-field files return `None`.
-    pub fn peek_conversation_pipeline(&self, id: Uuid) -> anyhow::Result<Option<String>> {
+    /// Peek at a saved conversation's persisted selection `(profile, agent)`
+    /// without loading it. Used by `create_session` on the resume path to
+    /// build the boot agent on the right bound *before* the conversation is
+    /// loaded. Pre-selection files return `None`.
+    pub fn peek_conversation_selection(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::config::resolve::Selection>> {
         let storage = self
             .storage
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
-        Ok(storage.load(id)?.pipeline)
-    }
-
-    /// Peek at a saved conversation's persisted profile without loading it —
-    /// the resume path must build the session config under it before the
-    /// conversation is loaded.
-    pub fn peek_conversation_profile(&self, id: Uuid) -> anyhow::Result<Option<String>> {
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
-        Ok(storage.load(id)?.profile)
+        let conv = storage.load(id)?;
+        // The `pipeline` field carries the agent name (T9a renames it to
+        // `agent`, serde alias "pipeline").
+        let (agent, profile) = (conv.pipeline, conv.profile);
+        match (agent, profile) {
+            (None, None) => Ok(None),
+            (agent, profile) => Ok(Some(crate::config::resolve::Selection {
+                agent: agent.unwrap_or_default(),
+                profile: profile.unwrap_or_default(),
+            })),
+        }
     }
 
     /// Peek at a saved conversation's persisted `cwd` without loading
@@ -3729,56 +3716,66 @@ mod tests {
         assert_eq!(sm.peek_conversation_cwd(id).unwrap(), "");
     }
 
-    /// `create_conversation` stamps the session's pipeline selection onto every
-    /// conversation it mints, so the choice survives persistence/reload — and
-    /// `/new` keeps the current team (D2).
+    /// `create_conversation` stamps the session's selection onto every
+    /// conversation it mints, so the choice survives persistence/reload —
+    /// and `/new` keeps the current bound.
     #[test]
-    fn create_conversation_stamps_pipeline_selection() {
+    fn create_conversation_stamps_selection() {
+        use crate::config::resolve::Selection;
+
         let sm = StateManager::new();
 
-        // Default session: no pipeline.
+        // Default session: no selection.
         sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
         assert!(sm.get_current_conversation().unwrap().pipeline.is_none());
+        assert!(sm.get_current_conversation().unwrap().profile.is_none());
 
         // A session with a selection → the minted conversation carries it.
-        sm.set_selected_pipeline(Some("web-team".into()));
+        sm.set_selection(Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+        });
         sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
-        assert_eq!(
-            sm.get_current_conversation().unwrap().pipeline.as_deref(),
-            Some("web-team")
-        );
+        let conv = sm.get_current_conversation().unwrap();
+        assert_eq!(conv.pipeline.as_deref(), Some("team"));
+        assert_eq!(conv.profile.as_deref(), Some("dev"));
     }
 
-    /// **I-3 divergence pin.** `Conversation.pipeline` (persisted truth) and
-    /// `AppState.selected_pipeline` (live mirror) must agree for the CURRENT
-    /// conversation at every point a rebuild can observe them — the rebuild
-    /// seam derives the active team from the mirror
-    /// (`src/lib.rs`: `sm.selected_pipeline().and_then(|n| ctx.pipelines.get(n))`),
-    /// so a mint that stamps the conversation but clears the mirror leaves the
-    /// agent without `delegate` while the file still says "web-team", and
-    /// `/load` on that file resurrects a team the user thought they'd left.
+    /// **I-3 divergence pin.** `Conversation.{pipeline,profile}` (persisted
+    /// truth) and `AppState.selection` (live mirror) must agree for the
+    /// CURRENT conversation at every point a rebuild can observe them — the
+    /// rebuild seam derives the active bound from the mirror, so a mint that
+    /// stamps the conversation but clears the mirror strands the agent while
+    /// the file still names the bound, and `/load` on that file resurrects a
+    /// bound the user thought they'd left.
     /// Documented behaviour: agents.md — "`/new` keeps the current selection."
     #[test]
-    fn create_conversation_keeps_live_mirror_and_persisted_pipeline_in_sync() {
+    fn create_conversation_keeps_live_mirror_and_persisted_selection_in_sync() {
+        use crate::config::resolve::Selection;
+
+        let sel = Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+        };
         let sm = StateManager::new();
         sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
-        sm.set_selected_pipeline(Some("web-team".into()));
+        sm.set_selection(sel.clone());
 
         // The `/new` / `/cd` / `/model` mint.
         sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
 
         assert_eq!(
             sm.get_current_conversation().unwrap().pipeline.as_deref(),
-            Some("web-team"),
+            Some("team"),
             "persisted truth: the minted conversation carries the selection"
         );
         assert_eq!(
-            sm.selected_pipeline().as_deref(),
-            Some("web-team"),
-            "live mirror MUST agree with the current conversation's `pipeline` — \
-             clearing it here strands the rebuild seam on single-agent mode \
-             (no `delegate`, orchestrator model reverted) while the persisted \
-             conversation still names the team (I-3 divergence)"
+            sm.selection(),
+            sel,
+            "live mirror MUST agree with the current conversation's \
+             selection — clearing it here strands the rebuild seam (no \
+             subagents, prompt reverted) while the persisted conversation \
+             still names the bound (I-3 divergence)"
         );
     }
 
@@ -3860,17 +3857,30 @@ mod tests {
     /// per-request size, and no lane's tokens are a single request's count.
     #[test]
     fn fresh_session_lane_rows_are_cumulative_and_carry_the_model() {
-        use crate::pipeline::PipelineInfo;
+        use crate::config::resolve::{AgentInfo, ProfileInfo, Selection, SubagentInfo};
         use crate::ui::app_state::MessageSource;
         let sm = StateManager::new();
         sm.set_model_alias("opus-5".to_string());
-        // Role models are derived from the selected pipeline's catalogue entry.
-        sm.set_pipelines(vec![PipelineInfo {
-            name: "web-team".to_string(),
-            orchestrator_model: "opus-5".to_string(),
-            members: vec![("junior".to_string(), "qwen3.6-27B".to_string())],
+        // Subagent models are derived from the bound agent's roster in the
+        // catalogue.
+        sm.set_catalog(vec![ProfileInfo {
+            name: "dev".to_string(),
+            origin: "global".to_string(),
+            overrides_global: false,
+            agents: vec![AgentInfo {
+                name: "team".to_string(),
+                model: "opus-5".to_string(),
+                subagents: vec![SubagentInfo {
+                    name: "junior".to_string(),
+                    model: "qwen3.6-27B".to_string(),
+                    inherited: false,
+                }],
+            }],
         }]);
-        sm.set_selected_pipeline(Some("web-team".to_string()));
+        sm.set_selection(Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+        });
 
         let junior = MessageSource::SubAgent {
             role: "junior".into(),
@@ -8025,110 +8035,153 @@ mod tests {
              the fix must not hide the sub-agent's request from the UI"
         );
     }
-    // ── Stage 1.2: multi-pipeline selection state ─────────────────────────────
+    // ── 0.24 cutover: selection state (catalog / selection / pin) ──────────
     //
-    // These pin §7 / §4 of the multi-pipeline plan: the per-conversation
-    // selection state lives on `Conversation.pipeline` (persisted) and is
-    // mirrored into `AppState.selected_pipeline` for the live UI. The
-    // single boolean pair (`pipeline_available` + `subagents_enabled`)
-    // is replaced by one nullable string — the implementer may keep the
-    // booleans around for back-compat reads but they MUST NOT be the
-    // authority.
+    // These pin the cutover: the per-conversation selection state lives on
+    // `Conversation.{pipeline,profile}` (persisted; T9a renames `pipeline`
+    // to `agent`) and is mirrored into `AppState.selection` for the live UI.
+    // The old nullable-string pair (`selected_pipeline` + `active_profile`)
+    // is replaced by one concrete `Selection { profile, agent }` — a
+    // selection is always a pair, never "cleared" to `None`.
 
-    /// `set_selected_pipeline(Some(name))` mirrors the choice into the
-    /// current conversation's `pipeline` field AND into
-    /// `AppState.selected_pipeline`. The single string is the source of
-    /// truth for both surfaces — plan §3 "One nullable fact".
+    /// `set_selection(sel)` mirrors the choice into the current
+    /// conversation's persisted fields AND into `AppState.selection`. The
+    /// `Selection` is the single source of truth for both surfaces.
     #[test]
-    fn set_selected_pipeline_writes_conversation_and_app_state() {
+    fn set_selection_writes_conversation_and_app_state() {
+        use crate::config::resolve::Selection;
+
+        let sel = Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+        };
         let sm = StateManager::new();
         // Seed a current conversation — the persisted mirror requires it.
         sm.create_conversation(
-            "pipe-select".into(),
+            "select".into(),
             "test-prov".into(),
             "test-model".into(),
             String::new(),
         );
 
-        // Default = no pipeline.
-        assert_eq!(sm.get_state().selected_pipeline, None);
+        // Default = no selection.
+        assert_eq!(sm.get_state().selection, Selection::default());
 
-        // Set some — both surfaces must reflect.
-        sm.set_selected_pipeline(Some("web-team".into()));
-        assert_eq!(sm.get_state().selected_pipeline, Some("web-team".into()));
+        // Set — both surfaces must reflect.
+        sm.set_selection(sel.clone());
+        assert_eq!(sm.get_state().selection, sel);
         assert_eq!(
             sm.get_current_conversation()
                 .expect("current conversation")
                 .pipeline
                 .as_deref(),
-            Some("web-team"),
-            "the conversation's persisted `pipeline` field must mirror the choice"
+            Some("team"),
+            "the conversation's persisted `pipeline` field must mirror the agent"
         );
-
-        // Set None — both surfaces cleared.
-        sm.set_selected_pipeline(None);
-        assert_eq!(sm.get_state().selected_pipeline, None);
         assert_eq!(
             sm.get_current_conversation()
                 .expect("current conversation")
-                .pipeline,
-            None,
-            "the conversation's persisted `pipeline` field must be cleared too"
+                .profile
+                .as_deref(),
+            Some("dev"),
+            "the conversation's persisted `profile` field must mirror the profile"
+        );
+
+        // Replace — the new pair overwrites both surfaces wholesale.
+        let sel2 = Selection {
+            profile: "default".to_string(),
+            agent: "main".to_string(),
+        };
+        sm.set_selection(sel2.clone());
+        assert_eq!(sm.get_state().selection, sel2);
+        assert_eq!(
+            sm.get_current_conversation()
+                .expect("current conversation")
+                .pipeline
+                .as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            sm.get_current_conversation()
+                .expect("current conversation")
+                .profile
+                .as_deref(),
+            Some("default")
         );
     }
 
-    /// `selected_pipeline()` reads through `AppState.selected_pipeline` —
-    /// it's the getter half of the seam `set_selected_pipeline` writes.
-    /// Pinning it as a separate test catches an implementer who wires the
-    /// setter to one source and the getter to another.
+    /// `selection()` reads through `AppState.selection` — it's the getter
+    /// half of the seam `set_selection` writes. Pinning it as a separate
+    /// test catches an implementer who wires the setter to one source and
+    /// the getter to another.
     #[test]
-    fn selected_pipeline_getter_reads_app_state() {
+    fn selection_getter_reads_app_state() {
+        use crate::config::resolve::Selection;
+
         let sm = StateManager::new();
-        assert_eq!(sm.selected_pipeline().as_deref(), None);
-        sm.set_selected_pipeline(Some("research-crew".into()));
-        assert_eq!(sm.selected_pipeline().as_deref(), Some("research-crew"));
-        sm.set_selected_pipeline(None);
-        assert_eq!(sm.selected_pipeline().as_deref(), None);
+        assert_eq!(sm.selection(), Selection::default());
+        sm.set_selection(Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+        });
+        assert_eq!(
+            sm.selection(),
+            Selection {
+                profile: "dev".to_string(),
+                agent: "team".to_string()
+            }
+        );
     }
 
-    /// Resuming a conversation with `pipeline: Some(name)` stamps the
-    /// choice into `AppState.selected_pipeline` so the rebuilt agent
-    /// boots on the pipeline's orchestrator. Mirrors the
-    /// `load_conversation_restores_subagents_opt_in` test (the existing
-    /// subagents toggle) but for the new field.
+    /// Resuming a conversation with a saved selection stamps it into
+    /// `AppState.selection` so the rebuilt agent boots on its bound.
     #[test]
-    fn load_conversation_restores_selected_pipeline() {
+    fn load_conversation_restores_selection() {
+        use crate::config::resolve::Selection;
         use crate::conversation::Conversation;
         use crate::storage::InMemoryStorage;
         let storage = Arc::new(InMemoryStorage::default());
         let sm = StateManager::new_arc_with_storage(storage.clone());
 
         let mut conv = Conversation::new(
-            "opted-in".into(),
+            "bound".into(),
             "prov".into(),
             "model".into(),
             String::new(),
         );
-        conv.pipeline = Some("web-team".into());
+        conv.pipeline = Some("team".into());
+        conv.profile = Some("dev".into());
         let id = conv.id;
         storage.save(&conv).unwrap();
 
-        // Session default is no pipeline; loading the opted-in
-        // conversation flips it on.
-        assert_eq!(sm.selected_pipeline().as_deref(), None);
+        // Session default is no selection; loading the bound conversation
+        // restores the pair.
+        assert_eq!(sm.selection(), Selection::default());
         sm.load_conversation(id).unwrap();
-        assert_eq!(sm.selected_pipeline().as_deref(), Some("web-team"));
-        assert_eq!(sm.get_state().selected_pipeline, Some("web-team".into()));
+        assert_eq!(
+            sm.selection(),
+            Selection {
+                profile: "dev".to_string(),
+                agent: "team".to_string()
+            }
+        );
+        assert_eq!(
+            sm.get_state().selection,
+            Selection {
+                profile: "dev".to_string(),
+                agent: "team".to_string()
+            }
+        );
     }
 
-    /// `peek_conversation_pipeline(id)` returns the saved pipeline name
+    /// `peek_conversation_selection(id)` returns the saved selection
     /// WITHOUT loading the conversation into the current slot — the same
-    /// pre-flight pattern as `peek_conversation_wire_id` /
-    /// `peek_conversation_subagents_enabled`. Used by `create_session` on
-    /// the resume path so the agent can be built on the right orchestrator
-    /// before the conversation is loaded.
+    /// pre-flight pattern as `peek_conversation_wire_id`. Used by
+    /// `create_session` on the resume path so the agent can be built on
+    /// the right bound before the conversation is loaded.
     #[test]
-    fn peek_conversation_pipeline_returns_saved_name() {
+    fn peek_conversation_selection_returns_saved_pair() {
+        use crate::config::resolve::Selection;
         use crate::conversation::Conversation;
         use crate::storage::InMemoryStorage;
         let storage = Arc::new(InMemoryStorage::default());
@@ -8140,42 +8193,44 @@ mod tests {
             "model".into(),
             String::new(),
         );
-        conv.pipeline = Some("research-crew".into());
+        conv.pipeline = Some("team".into());
+        conv.profile = Some("dev".into());
         let id = conv.id;
         storage.save(&conv).unwrap();
 
         let peeked = sm
-            .peek_conversation_pipeline(id)
+            .peek_conversation_selection(id)
             .expect("peek must succeed when storage is configured");
-        assert_eq!(peeked.as_deref(), Some("research-crew"));
+        assert_eq!(
+            peeked,
+            Some(Selection {
+                profile: "dev".to_string(),
+                agent: "team".to_string()
+            })
+        );
 
         // Peek must NOT mutate current_conversation — the session can
-        // still load a *different* conversation after peeking. Re-load
-        // and assert the slot survives unchanged.
+        // still load a *different* conversation after peeking.
         assert!(
             !sm.has_current_conversation(),
             "peek must not touch the slot"
         );
     }
 
-    /// Amendment 5: a legacy conversation (one written before the
-    /// pipeline field existed) carries `subagents_enabled: true` but no
-    /// `pipeline` key. The selection resumes as `None` — there is NO
-    /// legacy-mapping code path. Pin: a loaded legacy conversation has
-    /// `selected_pipeline() == None`, and `peek_conversation_pipeline`
-    /// also returns `None`.
+    /// A legacy conversation (one written before the selection fields
+    /// existed) has no `pipeline`/`profile` keys. The selection resumes as
+    /// the default `Selection` — there is NO legacy-mapping code path.
+    /// Pin: a loaded legacy conversation has `selection() == default`, and
+    /// `peek_conversation_selection` returns `None`.
     #[test]
-    fn legacy_subagents_enabled_does_not_select_a_pipeline() {
+    fn legacy_conversation_without_selection_fields_defaults() {
         use crate::conversation::Conversation;
+        use crate::config::resolve::Selection;
         use crate::storage::InMemoryStorage;
         let storage = Arc::new(InMemoryStorage::default());
         let sm = StateManager::new_arc_with_storage(storage.clone());
 
-        // JSON-shape legacy: `subagents_enabled: true`, no `pipeline` key.
-        // `Conversation` has no `deny_unknown_fields`, so the unknown
-        // `subagents_enabled` key is silently dropped on load if the
-        // field is removed in Stage 1.2 (amendment 5). Either way, the
-        // selection must be None.
+        // JSON-shape legacy: neither `pipeline` nor `profile` keys.
         let legacy_json = r#"{
             "id": "00000000-0000-0000-0000-000000000000",
             "name": "old",
@@ -8188,20 +8243,20 @@ mod tests {
             "subagents_enabled": true
         }"#;
         let parsed: Conversation = serde_json::from_str(legacy_json)
-            .expect("legacy JSON must parse (unknown subagents_enabled key is dropped)");
+            .expect("legacy JSON must parse (unknown keys are dropped)");
         let id = parsed.id;
         storage.save(&parsed).unwrap();
 
         sm.load_conversation(id).unwrap();
 
         assert_eq!(
-            sm.selected_pipeline().as_deref(),
-            None,
-            "amendment 5: a legacy conversation resumes with selected_pipeline = None; \
-             the old subagents_enabled key does NOT auto-map to a 'default' pipeline"
+            sm.selection(),
+            Selection::default(),
+            "a legacy conversation resumes with the default selection; \
+             no legacy-mapping code path"
         );
         assert_eq!(
-            sm.peek_conversation_pipeline(id).unwrap(),
+            sm.peek_conversation_selection(id).unwrap(),
             None,
             "peek must report None for a legacy conversation"
         );
@@ -8210,7 +8265,7 @@ mod tests {
     /// Lock-order sibling of
     /// `add_request_and_persist_current_do_not_deadlock`. The new
     /// pipeline API touches `state` and `current_conversation` from
-    /// `set_selected_pipeline` (writes to both) — if any future caller
+    /// `set_selection` (writes to both) — if any future caller
     /// holds both guards simultaneously the same A→B vs B→A deadlock
     /// class appears. This test hammers create + select + persist from
     /// two threads and demands forward progress. With the lock rule
@@ -8218,7 +8273,7 @@ mod tests {
     /// producers run tens of thousands of iterations; without it they
     /// wedge.
     #[test]
-    fn select_pipeline_and_persist_current_do_not_deadlock() {
+    fn set_selection_and_persist_current_do_not_deadlock() {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::thread;
@@ -8241,8 +8296,8 @@ mod tests {
         let count_a = StdArc::new(AtomicU64::new(0));
         let count_b = StdArc::new(AtomicU64::new(0));
 
-        // Producer A: hammers `set_selected_pipeline`, alternating Some
-        // and None — the new API that touches both `state` and
+        // Producer A: hammers `set_selection`, alternating two pairs — the
+        // new API that touches both `state` and
         // `current_conversation`.
         let sm_a = sm.clone();
         let stop_a = stop.clone();
@@ -8250,11 +8305,10 @@ mod tests {
         let t_a = thread::spawn(move || {
             let mut toggle = false;
             while !stop_a.load(Ordering::Relaxed) {
-                if toggle {
-                    sm_a.set_selected_pipeline(Some("web-team".into()));
-                } else {
-                    sm_a.set_selected_pipeline(None);
-                }
+                sm_a.set_selection(crate::config::resolve::Selection {
+                    profile: if toggle { "dev".into() } else { "default".into() },
+                    agent: if toggle { "team".into() } else { "main".into() },
+                });
                 toggle = !toggle;
                 count_a_t.fetch_add(1, Ordering::Relaxed);
             }
@@ -8263,7 +8317,7 @@ mod tests {
         // Producer B: hammers the agent-loop path (add_assistant_message
         // → persist_current → sync_to_conversation, which takes
         // state.read → current_conversation.lock). If the new
-        // `set_selected_pipeline` holds both guards together, this is
+        // `set_selection` holds both guards together, this is
         // the inverse-order path that wedges.
         let sm_b = sm.clone();
         let stop_b = stop.clone();
@@ -8311,7 +8365,7 @@ mod tests {
 
         assert!(
             count_a.load(Ordering::Relaxed) > 0,
-            "producer A (set_selected_pipeline) made no progress"
+            "producer A (set_selection) made no progress"
         );
         assert!(
             count_b.load(Ordering::Relaxed) > 0,
@@ -9672,162 +9726,89 @@ mod tests {
         drop(guard);
     }
 
-    // ── Layer C: per-conversation profile selection state (RED) ─────────────
+    // ── 0.24 cutover: `set_visible_tabs` / `set_catalog` ──────────────────
     //
-    // Mirrors the Stage 1.2 pipeline-selection tests one axis over: the
-    // per-conversation profile lives on `Conversation.profile` (persisted
-    // truth) and is mirrored into `AppState.active_profile` (live). The
-    // setter writes both surfaces; the getter reads the mirror.
-    //
-    // Compile-RED until `StateManager::set_selected_profile`,
-    // `StateManager::selected_profile`, `AppState.active_profile` and
-    // `Conversation.profile` exist.
+    // The old profile-view pair (`profiles: Vec<String>` + `visible_tabs`)
+    // collapsed into the catalogue (`set_catalog`) plus the tabs stamp.
+    // `set_visible_tabs` writes `AppState.visible_tabs` in one lock
+    // acquisition — the bound profile's `tabs`, server-computed,
+    // replace-not-merge. (The profile axis of the old Layer C tests is now
+    // `Selection` — pinned by the cutover cluster above.)
 
-    /// `set_selected_profile(Some(name))` mirrors the choice into the
-    /// current conversation's `profile` field AND into
-    /// `AppState.active_profile`. One nullable fact, two surfaces — the
-    /// same invariant as `set_selected_pipeline` (I-3).
+    /// A fresh `StateManager` starts with the view fields empty — the
+    /// pre-session-build baseline ("empty is the no-profiles-configured
+    /// baseline").
     #[test]
-    fn set_selected_profile_writes_conversation_and_app_state() {
+    fn fresh_state_manager_has_empty_view() {
         let sm = StateManager::new();
-        // Seed a current conversation — the persisted mirror requires it.
-        sm.create_conversation(
-            "profile-select".into(),
-            "test-prov".into(),
-            "test-model".into(),
-            String::new(),
-        );
-
-        // Default = no profile.
-        assert_eq!(sm.get_state().active_profile, None);
-
-        // Set some — both surfaces must reflect.
-        sm.set_selected_profile(Some("web".into()));
-        assert_eq!(sm.get_state().active_profile, Some("web".into()));
         assert_eq!(
-            sm.get_current_conversation()
-                .expect("current conversation")
-                .profile
-                .as_deref(),
-            Some("web"),
-            "the conversation's persisted `profile` field must mirror the choice"
+            sm.get_state().catalog,
+            Vec::<crate::config::resolve::ProfileInfo>::new()
         );
-
-        // Set None — both surfaces cleared.
-        sm.set_selected_profile(None);
-        assert_eq!(sm.get_state().active_profile, None);
         assert_eq!(
-            sm.get_current_conversation()
-                .expect("current conversation")
-                .profile,
-            None,
-            "the conversation's persisted `profile` field must be cleared too"
+            sm.get_state().selection,
+            crate::config::resolve::Selection::default()
         );
-    }
-
-    /// `selected_profile()` reads through `AppState.active_profile` — the
-    /// getter half of the seam `set_selected_profile` writes. Pinning it as
-    /// a separate test catches an implementer who wires the setter to one
-    /// source and the getter to another.
-    #[test]
-    fn selected_profile_getter_reads_app_state() {
-        let sm = StateManager::new();
-        assert_eq!(sm.selected_profile().as_deref(), None);
-        sm.set_selected_profile(Some("web".into()));
-        assert_eq!(sm.selected_profile().as_deref(), Some("web"));
-        sm.set_selected_profile(None);
-        assert_eq!(sm.selected_profile().as_deref(), None);
-    }
-
-    // ── Layer D: `set_profile_view` keeps `AppState.profiles` and
-    // `AppState.visible_tabs` current (RED) ─────────────────────────────
-    //
-    // D3: a single setter, `StateManager::set_profile_view(profiles:
-    // Vec<String>, visible_tabs: Vec<String>)`, writes BOTH `AppState`
-    // fields in one lock acquisition — same shape as `set_selected_pipeline`
-    // (one nullable fact, one write path) and `set_pipelines` (a
-    // server-computed projection, not user input). The implementer calls
-    // it at session build and after every profile apply/reload; the tests
-    // here pin the setter/getter contract alone, independent of when it's
-    // called.
-    //
-    // ```ignore
-    // impl StateManager {
-    //     pub fn set_profile_view(&self, profiles: Vec<String>, visible_tabs: Vec<String>);
-    // }
-    // ```
-    //
-    // Compile-RED until the method exists (E0599) — `AppState.profiles` /
-    // `AppState.visible_tabs` are also new fields the method needs to write.
-
-    /// A fresh `StateManager` starts with both fields empty — the
-    /// pre-session-build baseline, mirroring `set_pipelines`'s "empty is
-    /// the no-pipelines-configured baseline" convention.
-    #[test]
-    fn fresh_state_manager_has_empty_profile_view() {
-        let sm = StateManager::new();
-        assert_eq!(sm.get_state().profiles, Vec::<String>::new());
+        assert!(!sm.get_state().profile_pinned);
         assert_eq!(sm.get_state().visible_tabs, Vec::<String>::new());
     }
 
-    /// `set_profile_view` writes BOTH fields in one call — the getter half
-    /// is `sm.get_state()`, mirroring how `set_pipelines`/`AppState.pipelines`
-    /// are read.
+    /// `set_visible_tabs` lands in `AppState.visible_tabs` verbatim and
+    /// publishes through the same `get_state()` read path as every other
+    /// view — no separate "commit" step.
     #[test]
-    fn set_profile_view_writes_both_app_state_fields() {
+    fn set_visible_tabs_writes_app_state() {
         let sm = StateManager::new();
-        sm.set_profile_view(
-            vec!["admin".to_string(), "web".to_string()],
-            vec!["session".to_string(), "todo".to_string()],
-        );
-        let state = sm.get_state();
+        sm.set_visible_tabs(vec!["session".to_string(), "todo".to_string()]);
         assert_eq!(
-            state.profiles,
-            vec!["admin".to_string(), "web".to_string()],
-            "profiles must land in AppState.profiles verbatim (the caller sorts)"
-        );
-        assert_eq!(
-            state.visible_tabs,
+            sm.get_state().visible_tabs,
             vec!["session".to_string(), "todo".to_string()],
             "visible_tabs must land in AppState.visible_tabs verbatim"
         );
     }
 
-    /// A later call REPLACES the previous view wholesale — no
-    /// accumulation, no merge. Exercises the case that matters most in
-    /// production: re-calling after a profile apply must not leave stale
-    /// names from the previous profile's tab set lying around.
+    /// A later call REPLACES the previous set wholesale — no accumulation,
+    /// no merge. Re-stamping after a reload must not leave a stale
+    /// profile's tab set behind.
     #[test]
-    fn set_profile_view_replaces_previous_view_wholesale() {
+    fn set_visible_tabs_replaces_previous_view_wholesale() {
         let sm = StateManager::new();
-        sm.set_profile_view(
-            vec!["web".to_string()],
-            vec!["session".to_string(), "bash".to_string()],
-        );
-        sm.set_profile_view(Vec::new(), vec!["session".to_string()]);
-        let state = sm.get_state();
+        sm.set_visible_tabs(vec!["session".to_string(), "bash".to_string()]);
+        sm.set_visible_tabs(vec!["session".to_string()]);
         assert_eq!(
-            state.profiles,
-            Vec::<String>::new(),
-            "the second call must replace, not merge with, the first"
-        );
-        assert_eq!(
-            state.visible_tabs,
+            sm.get_state().visible_tabs,
             vec!["session".to_string()],
-            "same replace-not-merge rule for visible_tabs"
+            "the second call must replace, not merge with, the first"
         );
     }
 
-    /// `set_profile_view` must publish through the same `AppState` read
-    /// path as every other view (`set_pipelines`, `set_selected_pipeline`)
-    /// — a call is visible via `get_state()` immediately, with no separate
-    /// "commit" step.
+    /// `set_catalog` lands in `AppState.catalog` verbatim (repo first — the
+    /// caller orders it) and is visible via `get_state()` immediately.
     #[test]
-    fn set_profile_view_is_visible_through_get_state_immediately() {
+    fn set_catalog_writes_app_state() {
+        use crate::config::resolve::ProfileInfo;
+
         let sm = StateManager::new();
-        assert_eq!(sm.get_state().profiles, Vec::<String>::new());
-        sm.set_profile_view(vec!["only-one".to_string()], vec!["session".to_string()]);
-        assert_eq!(sm.get_state().profiles, vec!["only-one".to_string()]);
+        sm.set_catalog(vec![
+            ProfileInfo {
+                name: "dev".to_string(),
+                origin: "repo".to_string(),
+                overrides_global: true,
+                agents: Vec::new(),
+            },
+            ProfileInfo {
+                name: "default".to_string(),
+                origin: "global".to_string(),
+                overrides_global: false,
+                agents: Vec::new(),
+            },
+        ]);
+        let state = sm.get_state();
+        assert_eq!(state.catalog.len(), 2);
+        assert_eq!(state.catalog[0].name, "dev");
+        assert_eq!(state.catalog[0].origin, "repo");
+        assert_eq!(state.catalog[1].name, "default");
+        assert_eq!(state.catalog[1].origin, "global");
     }
 
     // ── T6 — attachment turn building (file-uploads design §5.4 / §5.5) ────

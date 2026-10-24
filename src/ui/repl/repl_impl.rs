@@ -1045,11 +1045,18 @@ impl ReplUi {
         // The `⏳ N queued` hint lives in the working title of the input
         // block (see `build_input_paragraph`), not here — that's where the
         // user's eye is during a busy turn. Status bar stays for tokens /
-        // cost / model / context / cwd only.
+        // cost / model / selection / context / cwd only.
         let mut status_text = format!(
             "Tokens: {} │ Calls: {} │ Cost: ${} │ Context: {:.1}% │ Model: {}",
             tokens_str, stats.total_api_calls, cost_str, context_pct, stats.model,
         );
+        // The bound selection rides the status line as `profile › agent`
+        // (replaces the old pipeline name). Absent until the session's
+        // `Bound` is stamped — omit rather than guess.
+        let sel = &state.selection;
+        if !sel.profile.is_empty() && !sel.agent.is_empty() {
+            status_text.push_str(&format!(" │ {} › {}", sel.profile, sel.agent));
+        }
         // cwd lives on the welcome banner (stamped at boot, refreshed on
         // /cd). Absent only before the banner is set — omit rather than
         // guess.
@@ -1422,12 +1429,14 @@ impl ReplUi {
         if alias.is_empty() {
             return false; // treat as bare `/model`
         }
-        // A selected pipeline owns the orchestrator's model — refuse before the
+        // The bound agent owns the conversation's model — refuse before the
         // confirm dialog, so the user isn't asked to approve a reset that the
-        // controller would then reject anyway.
-        if let Some(pipeline) = self.state_manager.selected_pipeline() {
+        // controller would then reject anyway. (Temporary: the model lock is
+        // deleted in T8a with `model_locked_message`.)
+        let sel = self.state_manager.selection();
+        if !sel.agent.is_empty() {
             self.state_manager
-                .add_system_message(format!("❌ /model: {}", model_locked_message(&pipeline)));
+                .add_system_message(format!("❌ /model: {}", model_locked_message(&sel.agent)));
             return true;
         }
         let Some(registry) = self.model_registry.clone() else {
@@ -4340,6 +4349,52 @@ mod model_popup_tests {
         assert!(
             rendered.contains("peakbot-cwd-test"),
             "status bar must show the cwd; got:\n{rendered}"
+        );
+    }
+
+    /// The status line carries the bound selection as `profile › agent`
+    /// (0.24 cutover — replaces the old pipeline name).
+    #[test]
+    fn status_bar_shows_selection_as_profile_arrow_agent() {
+        use crate::ui::app_state::AppState;
+        use crate::config::resolve::Selection;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let state = AppState {
+            selection: Selection {
+                profile: "peakbot-dev".into(),
+                agent: "team".into(),
+            },
+            ..Default::default()
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                ReplUi::render_status_bar(f, area, &state);
+            })
+            .unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            rendered.contains("peakbot-dev › team"),
+            "status bar must show `profile › agent`; got:\n{rendered}"
+        );
+
+        // Unstamped selection (pre-boot) → no empty segment.
+        let empty = AppState::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                ReplUi::render_status_bar(f, area, &empty);
+            })
+            .unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            !rendered.contains("›"),
+            "no selection → no `›` segment; got:\n{rendered}"
         );
     }
 

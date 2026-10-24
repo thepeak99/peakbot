@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use serde_path_to_error::Segment;
 use serde_yaml::Value;
@@ -184,18 +184,19 @@ pub enum Origin {
 }
 
 /// The wire projection of a profile for Settings and AppState (§8.7).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileInfo {
     pub name: String,
-    /// `"repo"` or `"global"`.
-    pub origin: &'static str,
+    /// `"repo"` or `"global"`. Owned (not `&'static str`) so `ProfileInfo`
+    /// can derive `Deserialize<'de>` — `AppState`/`OutboundMessage` need it.
+    pub origin: String,
     /// A repo profile shadowing a same-named global one.
     pub overrides_global: bool,
     pub agents: Vec<AgentInfo>,
 }
 
 /// The wire projection of an agent (§8.7).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub name: String,
     /// The agent's model alias.
@@ -204,7 +205,7 @@ pub struct AgentInfo {
 }
 
 /// The wire projection of a subagent (§8.7).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentInfo {
     pub name: String,
     /// The subagent's model alias (the agent's when `inherited`).
@@ -296,7 +297,7 @@ impl DbPathSpec {
 }
 
 /// The wire/persistence projection of a [`Bound`]; never stored beside it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
     pub profile: String,
     pub agent: String,
@@ -1122,8 +1123,8 @@ fn profile_info(p: &ResolvedProfile) -> ProfileInfo {
     ProfileInfo {
         name: p.name.clone(),
         origin: match p.origin {
-            Origin::Global => "global",
-            Origin::Repo { .. } => "repo",
+            Origin::Global => "global".to_string(),
+            Origin::Repo { .. } => "repo".to_string(),
         },
         overrides_global: matches!(
             p.origin,

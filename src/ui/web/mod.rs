@@ -781,11 +781,13 @@ fn dispatch_inbound(
         Ok(InboundMessage::SwitchCwd { path }) => {
             action_sender.send(UiAction::ChangeCwd(path)).is_ok()
         }
-        Ok(InboundMessage::SelectPipeline { name }) => {
-            action_sender.send(UiAction::SelectPipeline(name)).is_ok()
-        }
-        Ok(InboundMessage::SelectProfile { name }) => {
-            action_sender.send(UiAction::SelectProfile(name)).is_ok()
+        Ok(InboundMessage::Select { profile, agent }) => {
+            action_sender
+                .send(UiAction::Select(crate::config::resolve::Selection {
+                    profile,
+                    agent,
+                }))
+                .is_ok()
         }
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
@@ -990,48 +992,31 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), UiAction::RequestStop));
     }
 
-    // ── select_profile inbound → UiAction (Layer D, RED) ────────────────────
+    // ── select inbound → UiAction (0.24 cutover) ──────────────────────────
     //
-    // D4: `{"type":"select_profile","name":...}` must surface as
-    // `UiAction::SelectProfile(name)` on the controller's action channel —
-    // the same dispatch shape `SelectPipeline` already has. Compile-RED
-    // until `InboundMessage::SelectProfile` and `UiAction::SelectProfile`
-    // both exist.
+    // `{"type":"select","profile":…,"agent":…}` must surface as
+    // `UiAction::Select(Selection)` on the controller's action channel —
+    // the single frame that replaces `select_pipeline` / `select_profile`.
 
     #[test]
-    fn inbound_select_profile_with_name_maps_to_select_profile_action() {
+    fn inbound_select_maps_to_select_action() {
         let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
         let kept = dispatch_inbound(
-            r#"{"type":"select_profile","name":"research"}"#,
+            r#"{"type":"select","profile":"dev","agent":"team"}"#,
             &tx,
             &out_tx,
             &sm,
             &registry,
         );
-        assert!(kept, "select_profile frame must keep the socket loop alive");
-        assert!(
-            matches!(
-                rx.try_recv().unwrap(),
-                UiAction::SelectProfile(Some(n)) if n == "research"
-            ),
-            "a named select_profile frame must surface as UiAction::SelectProfile(Some(name))"
-        );
-    }
-
-    #[test]
-    fn inbound_select_profile_with_null_maps_to_clear_action() {
-        let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
-        let kept = dispatch_inbound(
-            r#"{"type":"select_profile","name":null}"#,
-            &tx,
-            &out_tx,
-            &sm,
-            &registry,
-        );
-        assert!(kept);
-        assert!(
-            matches!(rx.try_recv().unwrap(), UiAction::SelectProfile(None)),
-            "a null-name select_profile frame must clear the binding"
+        assert!(kept, "select frame must keep the socket loop alive");
+        let action = rx.try_recv().expect("an action must be emitted");
+        assert_eq!(
+            action,
+            UiAction::Select(crate::config::resolve::Selection {
+                profile: "dev".to_string(),
+                agent: "team".to_string(),
+            }),
+            "a select frame must surface as UiAction::Select with both legs"
         );
     }
 

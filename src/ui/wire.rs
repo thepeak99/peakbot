@@ -18,7 +18,7 @@
 //! {"type":"list_dir","path":"~/proj"}      // browse for the cwd picker
 //! {"type":"request_conversations"}
 //! {"type":"request_recent_dirs"}
-//! {"type":"select_pipeline","name":"web-team"}  // null clears the binding
+//! {"type":"select","profile":"dev","agent":"team"}  // maps to UiAction::Select
 //! {"type":"kill_session","convo":"aabbcc-…"}
 //! {"type":"shutdown"}
 //! {"type":"pause"}
@@ -90,19 +90,15 @@ pub(crate) enum InboundMessage {
     RequestConversations,
     /// One-shot request for the cwd picker's "Recent" section.
     RequestRecentDirs,
-    /// Bind the current conversation to a named pipeline (the Agents panel
-    /// selector); `name: null` clears the binding. Maps to
-    /// [`crate::ui::ui_trait::UiAction::SelectPipeline`]. The backend enforces
-    /// the lock (rejected once the conversation has turns).
-    SelectPipeline {
-        name: Option<String>,
-    },
-    /// Bind the current conversation to a config profile (the Profile tab
-    /// picker); `name: null` — or an omitted `name` — clears the binding.
-    /// Maps to [`crate::ui::ui_trait::UiAction::SelectProfile`]. The backend
-    /// enforces the lock and the boot `--profile` pin.
-    SelectProfile {
-        name: Option<String>,
+    /// Select the `(profile, agent)` the conversation should run under —
+    /// the Agents panel picker (replaces `select_pipeline` /
+    /// `select_profile`). Maps to
+    /// [`crate::ui::ui_trait::UiAction::Select`]. The backend enforces the
+    /// lock (rejected once the conversation has turns) and the boot
+    /// `--profile` pin.
+    Select {
+        profile: String,
+        agent: String,
     },
     /// End an active session for *everyone* attached to it (dropdown "kill").
     KillSession {
@@ -989,46 +985,48 @@ mod tests {
         assert!(matches!(m, InboundMessage::Resume));
     }
 
-    // ── select_profile wire protocol (Layer D, RED) ─────────────────────────
+    // ── select wire protocol (0.24 cutover) ───────────────────────────────
     //
-    // D4: `InboundMessage::SelectProfile { name: Option<String> }` — the
-    // profile-axis twin of `SelectPipeline`. Wire shape:
-    //   {"type":"select_profile","name":"research"}  // bind
-    //   {"type":"select_profile","name":null}         // clear
-    //   {"type":"select_profile"}                     // name omitted → None
-    //
-    // Compile-RED until the variant exists (E0599 on `InboundMessage::SelectProfile`).
+    // `{"type":"select","profile":…,"agent":…}` — the single selection
+    // frame that replaces `select_pipeline` / `select_profile`. Wire
+    // shape per spec §8.7; maps to `UiAction::Select(Selection)`.
 
+    /// T10: the inbound `select` frame round-trips — both legs of the
+    /// selection survive the parse, and the frame is shaped exactly as
+    /// the SPA's `select(profile, agent)` sends it.
     #[test]
-    fn select_profile_with_name_parses() {
+    fn inbound_select_roundtrip() {
         let m: InboundMessage =
-            serde_json::from_str(r#"{"type":"select_profile","name":"research"}"#).unwrap();
-        assert!(
-            matches!(m, InboundMessage::SelectProfile { name: Some(n) } if n == "research"),
-            "a named select_profile frame must carry the name through"
-        );
-    }
+            serde_json::from_str(r#"{"type":"select","profile":"dev","agent":"team"}"#)
+                .expect("a well-formed select frame must parse");
+        match &m {
+            InboundMessage::Select { profile, agent } => {
+                assert_eq!(profile, "dev", "the profile leg must carry through");
+                assert_eq!(agent, "team", "the agent leg must carry through");
+            }
+            other => panic!("expected InboundMessage::Select, got {other:?}"),
+        }
 
-    #[test]
-    fn select_profile_with_null_name_clears() {
-        let m: InboundMessage =
-            serde_json::from_str(r#"{"type":"select_profile","name":null}"#).unwrap();
+        // The frame the SPA emits is the ONLY accepted shape: both keys
+        // required (no `name` legacy field, no null-clearing — a selection
+        // is always a concrete pair).
         assert!(
-            matches!(m, InboundMessage::SelectProfile { name: None }),
-            "an explicit null must clear the binding, same as select_pipeline"
+            serde_json::from_str::<InboundMessage>(r#"{"type":"select"}"#).is_err(),
+            "a select frame without both legs is malformed"
         );
-    }
-
-    /// `name` omitted entirely must also parse to `None` — a client that
-    /// only ever sends `null` on clear and never the bare key must not be
-    /// the only supported shape; both must work.
-    #[test]
-    fn select_profile_with_name_omitted_defaults_to_none() {
-        let m: InboundMessage = serde_json::from_str(r#"{"type":"select_profile"}"#)
-            .expect("an omitted `name` key must still parse");
         assert!(
-            matches!(m, InboundMessage::SelectProfile { name: None }),
-            "an omitted name field must default to None"
+            serde_json::from_str::<InboundMessage>(
+                r#"{"type":"select_pipeline","name":"web-team"}"#
+            )
+            .is_err(),
+            "the removed select_pipeline frame must no longer parse"
+        );
+        assert!(
+            serde_json::from_str::<InboundMessage>(
+                r#"{"type":"select_profile","name":"research"}"#
+            )
+            .is_err(),
+            "the removed select_profile frame must no longer parse"
         );
     }
 }
