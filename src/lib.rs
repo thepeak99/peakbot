@@ -129,20 +129,11 @@ enum QueueMessage {
     /// handled by `handle_change_cwd`. Same rebuild seam as SwitchModel,
     /// different axis. See ticket #124.
     ChangeCwd(String),
-    /// Bind the current conversation to a pipeline (`Some(name)`) or clear the
-    /// binding (`None`). Dequeued between turns and handled by
-    /// `handle_select_pipeline`: rejected once the conversation has turns
-    /// (locked), else recorded, persisted, and the agent rebuilt on that team's
-    /// orchestrator so the model, prompt and `delegate` roster all match.
-    SelectPipeline(Option<String>),
-    /// Run the current conversation under a config profile (`Some(name)`) or
-    /// the base config (`None`). Dequeued between turns and handled by
-    /// `handle_select_profile`: same lock rule as `SelectPipeline`, plus the
-    /// boot `--profile` pin.
-    SelectProfile(Option<String>),
-    /// Bare `/profile`: list the configured profiles. Answered by the agent
-    /// loop because it owns the live config and the pin.
-    ListProfiles,
+    /// `/profile`, `/agent` or a picker selection. Dequeued between turns and
+    /// handled by `handle_select`: lists are rendered, a selection is
+    /// refused once the conversation has turns (locked) or under a pin, else
+    /// the bound is swapped, the agent rebuilt and the selection persisted.
+    Select(SelectRequest),
     /// One or more `bash_bg` processes have output ready. Payload is
     /// empty — the agent loop drains every bg buffer in one pass.
     /// Multiple notifications coalesce naturally (the drain returns
@@ -187,48 +178,9 @@ enum SubmitKind {
     /// `[img:…]` grammar error (`data:` URI, unknown scheme, bare word).
     /// Surfaces as a system error; does not reach the LLM.
     InvalidAttachment(crate::attachments::AttachError),
-    /// `/pipeline [name|none|off]` — bind this conversation to a named team,
+    /// `/profile [name]` or `/agent [name]` — a per-conversation selection,
     /// not an LLM turn.
-    PipelineCommand(PipelineSubmission),
-    /// `/profile [name|none|off]` — run this conversation under a config
-    /// profile, not an LLM turn.
-    ProfileCommand(ProfileSubmission),
-}
-
-/// What a `/pipeline` invocation asked for. Bare = show the catalogue;
-/// `none`/`off` = clear the binding; anything else = that team's name
-/// verbatim (names are user-typed and case-sensitive).
-#[derive(Debug)]
-enum PipelineSubmission {
-    List,
-    Set(Option<String>),
-}
-
-/// What a `/profile` invocation asked for — same grammar as
-/// [`PipelineSubmission`].
-#[derive(Debug)]
-enum ProfileSubmission {
-    List,
-    Set(Option<String>),
-}
-
-/// The argument of a `/<verb> [arg]` selection command, trimmed (empty for
-/// the bare verb), or `None` when `trimmed` is not that verb. The whitespace
-/// filter keeps longer words (`/pipelines`, `/profilex`) out.
-fn selection_command_arg<'a>(trimmed: &'a str, verb: &str) -> Option<&'a str> {
-    trimmed
-        .strip_prefix(verb)
-        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
-        .map(str::trim)
-}
-
-/// A selection target: `none`/`off` (any case) clear it, anything else is a
-/// name taken verbatim.
-fn selection_target(arg: &str) -> Option<String> {
-    match arg.to_ascii_lowercase().as_str() {
-        "none" | "off" => None,
-        _ => Some(arg.to_string()),
-    }
+    Select(crate::selection::SelectSubmission),
 }
 
 fn classify_submission(msg: &str) -> SubmitKind {
@@ -245,21 +197,9 @@ fn classify_submission(msg: &str) -> SubmitKind {
     if trimmed == "/resume" {
         return SubmitKind::ResumeCommand;
     }
-    // `/pipeline` and `/profile` are per-conversation selections, not LLM
-    // turns.
-    if let Some(arg) = selection_command_arg(trimmed, "/pipeline") {
-        return SubmitKind::PipelineCommand(if arg.is_empty() {
-            PipelineSubmission::List
-        } else {
-            PipelineSubmission::Set(selection_target(arg))
-        });
-    }
-    if let Some(arg) = selection_command_arg(trimmed, "/profile") {
-        return SubmitKind::ProfileCommand(if arg.is_empty() {
-            ProfileSubmission::List
-        } else {
-            ProfileSubmission::Set(selection_target(arg))
-        });
+    // `/profile` and `/agent` are per-conversation selections, not LLM turns.
+    if let Some(sub) = crate::selection::classify_select(trimmed) {
+        return SubmitKind::Select(sub);
     }
     // Preserve whitespace on commands — leading whitespace in "/ quit"
     // should not be stripped before the command handler sees it.
@@ -300,229 +240,15 @@ fn stop_message(t: crate::state::StopTally) -> String {
     }
 }
 
-/// What a `/pipeline <target>` request resolves to against the live selection.
-/// The read-only half of the command — shared by the controller (which can only
-/// report) and `handle_select_pipeline` (which also rebuilds), so the lock,
-/// idempotency and unknown-name rules exist exactly once.
-enum PipelineChoice {
-    /// Already bound to this target — silent no-op, no rebuild storm.
-    Unchanged,
-    /// Refused, with the message to show the user.
-    Refused(String),
-    /// Apply this binding (needs the agent-loop rebuild).
-    Apply(Option<String>),
-}
-
-/// Resolve a `/pipeline` target. `available` is the configured team names —
-/// the controller reads them off `AppState`, the agent loop off the boot-built
-/// `PipelineSet`; the rule is the same either way.
-fn resolve_pipeline_choice(
-    sm: &StateManager,
-    target: Option<&str>,
-    available: &[String],
-) -> PipelineChoice {
-    if sm.selected_pipeline().as_deref() == target {
-        return PipelineChoice::Unchanged;
-    }
-    // Locked after the first turn — the tool list and the orchestrator's model
-    // are fixed once the model has seen them.
-    if sm.conversation_has_turns() {
-        return PipelineChoice::Refused(
-            "the pipeline is locked once the conversation has started — /new for a fresh one."
-                .to_string(),
-        );
-    }
-    if let Some(name) = target
-        && !available.iter().any(|a| a == name)
-    {
-        let listed = if available.is_empty() {
-            "(none configured — add a `pipelines:` block to config.yaml and restart)".to_string()
-        } else {
-            available.join(", ")
-        };
-        return PipelineChoice::Refused(format!(
-            "unknown pipeline '{name}'. Available pipelines: {listed}"
-        ));
-    }
-    PipelineChoice::Apply(target.map(str::to_string))
-}
-
-/// What a `/profile <target>` request resolves to — the read-only half of the
-/// command, kept separate from `handle_select_profile` so the rules are
-/// testable without an agent.
-enum ProfileChoice {
-    /// Already running under this target — silent no-op, no reload.
-    Unchanged,
-    /// Refused, with the message to show the user.
-    Refused(String),
-    /// Apply this selection (needs a config reload and an agent rebuild).
-    Apply(Option<String>),
-}
-
-/// Resolve a `/profile` target against the conversation's effective profile.
-/// "Unchanged" compares against the effective profile, so re-selecting the
-/// pin is a no-op while clearing it is refused.
-fn resolve_profile_choice(
-    sm: &StateManager,
-    target: Option<&str>,
-    pinned: Option<&str>,
-    available: &[String],
-) -> ProfileChoice {
-    let selected = sm.selected_profile();
-    if crate::config::effective_profile(pinned, selected.as_deref()) == target {
-        return ProfileChoice::Unchanged;
-    }
-    // Same lock as the pipeline: the tool list and prompt are fixed once the
-    // model has seen them.
-    if sm.conversation_has_turns() {
-        return ProfileChoice::Refused(
-            "the profile is locked once the conversation has started — /new for a fresh one."
-                .to_string(),
-        );
-    }
-    if let Some(pin) = pinned {
-        return ProfileChoice::Refused(format!(
-            "the profile is pinned by --profile {pin} — restart without --profile to switch."
-        ));
-    }
-    if let Some(name) = target
-        && !available.iter().any(|a| a == name)
-    {
-        let listed = if available.is_empty() {
-            "(none configured — add a `profiles:` block to the master config.yaml)".to_string()
-        } else {
-            available.join(", ")
-        };
-        return ProfileChoice::Refused(format!(
-            "unknown profile '{name}'. Available profiles: {listed}"
-        ));
-    }
-    ProfileChoice::Apply(target.map(str::to_string))
-}
-
-/// Resolve a conversation's saved profile on resume and `/load`: a profile no
-/// longer configured is dropped, and a boot pin overrides the saved one.
-/// Returns the selection to record (the pin, when pinned, so the conversation
-/// records what it actually runs under) plus the warnings to surface.
-pub(crate) fn resolve_conversation_profile(
-    config: &Config,
-    saved: Option<&str>,
-    pin: Option<&str>,
-) -> (Option<String>, Vec<String>) {
-    let (resolved, warning) = config.resolve_saved_profile(saved);
-    let mut warnings: Vec<String> = warning.into_iter().collect();
-    if let (Some(pin), Some(resolved)) = (pin, resolved)
-        && resolved != pin
-    {
-        warnings.push(format!(
-            "⚠ This conversation used profile '{resolved}', but --profile {pin} is pinned; \
-             continuing under '{pin}'."
-        ));
-    }
-    let selection = crate::config::effective_profile(pin, resolved).map(str::to_string);
-    (selection, warnings)
-}
-
-/// Render the bare `/profile` listing. `None` (the base config) is listed
-/// first so it can carry the `→` marker like any profile.
-fn render_profile_list(names: &[String], current: Option<&str>, pinned: Option<&str>) -> String {
-    if names.is_empty() {
-        return "👤 No profiles configured. Add a `profiles:` block to the master config.yaml."
-            .to_string();
-    }
-    let arrow = |on: bool| if on { "→ " } else { "  " };
-    let mut msg = String::from("Available profiles:\n");
-    msg.push_str(&format!(
-        "{}None  (base config)\n",
-        arrow(current.is_none())
-    ));
-    for name in names {
-        msg.push_str(&format!(
-            "{}{name}\n",
-            arrow(current == Some(name.as_str()))
-        ));
-    }
-    match pinned {
-        Some(pin) => msg.push_str(&format!(
-            "\nPinned by --profile {pin} — restart without --profile to switch."
-        )),
-        None => msg.push_str(
-            "\nUse /profile <name> to select one, /profile none for the base config \
-             (only before the first turn).",
-        ),
-    }
-    msg
-}
-
-/// Render the `/pipeline` listing from `AppState` — the catalogue stamped at
-/// session build, so the listing never re-reads config (and never disagrees
-/// with what the Agents panel shows).
-fn render_pipeline_list(state: &crate::ui::app_state::AppState) -> String {
-    if state.pipelines.is_empty() {
-        return "🧩 No pipelines configured. Add a `pipelines:` block to config.yaml (or this \
-                repo's .peakbot/config.yaml) — /new picks it up."
-            .to_string();
-    }
-    let mut msg = String::from("Available pipelines:\n");
-    for info in &state.pipelines {
-        let arrow = if state.selected_pipeline.as_deref() == Some(info.name.as_str()) {
-            "→ "
-        } else {
-            "  "
-        };
-        let members = info
-            .members
-            .iter()
-            .map(|(role, alias)| format!("{role} · {alias}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        msg.push_str(&format!(
-            "{arrow}{}  (orchestrator · {}) — {members}\n",
-            info.name, info.orchestrator_model
-        ));
-    }
-    msg.push_str(
-        "\nUse /pipeline <name> to select one, /pipeline none to clear \
-         (only before the first turn).",
-    );
-    msg
-}
-
-/// One line when the set of pipeline NAMES changed, else `None` (silence).
-/// Roster-only changes (same names, different members) update the
-/// catalogue silently — the Agents panel shows them via `set_pipelines`,
-/// but `names_joined()` is unchanged so the chat shouldn't get a
-/// redundant line. (Ticket §5.2/pipeline-catalogue-message.)
-fn pipeline_catalogue_message(before: &PipelineSet, after: &PipelineSet) -> Option<String> {
-    if before.names_joined() == after.names_joined() {
-        return None;
-    }
-    Some(if after.is_empty() {
-        "🧩 No pipelines configured here.".to_string()
-    } else {
-        format!(
-            "🧩 Pipelines available here: {} — /pipeline <name> to select.",
-            after.names_joined()
-        )
-    })
-}
-
-/// Drop a live selection that no longer resolves in the fresh `PipelineSet`.
-/// Returns the warning to emit, or `None` for a no-op (no selection, or
-/// the selection still resolves). Writes persisted truth via
-/// `set_selected_pipeline` (invariant I-3), so the caller is responsible
-/// for ensuring the current conversation has no turns — see the call
-/// sites in `handle_change_cwd`, `handle_switch_model`, and
-/// `refresh_agent_after_new`. Never auto-selects (ticket §5.5).
-fn reconcile_pipeline_selection(ctx: &RebuildContext, sm: &Arc<StateManager>) -> Option<String> {
-    let name = sm.selected_pipeline()?;
-    if ctx.pipelines.get(&name).is_some() {
-        return None;
-    }
-    sm.set_selected_pipeline(None);
-    Some(format!(
-        "⚠ Pipeline '{name}' is not configured here — continuing without a pipeline."
-    ))
+/// A selection request as it reaches the agent loop (the sole owner of the
+/// bound and the agent handle). Both shapes end in `handle_select`, so the
+/// lock / pin / unknown-name rules (`crate::selection`) exist exactly once.
+#[derive(Debug)]
+enum SelectRequest {
+    /// Typed `/profile [name]` or `/agent [name]` — bare forms list.
+    Command(crate::selection::SelectSubmission),
+    /// `UiAction::Select` from the Agents panel / `{"type":"select"}` frame.
+    Pair(crate::config::resolve::Selection),
 }
 
 /// Completion result sent from agent loop back to event loop
@@ -1321,36 +1047,19 @@ impl AgentRunner {
                             }
                             // Do not enqueue — the model is never called.
                         }
-                        SubmitKind::PipelineCommand(choice) => match choice {
-                            PipelineSubmission::List => {
-                                if let Some(ref sm) = state_manager {
-                                    let msg = render_pipeline_list(&sm.get_state());
-                                    sm.add_system_message(msg);
-                                }
+                        SubmitKind::Select(sub) => {
+                            // Forward to the agent loop: it owns the bound,
+                            // the catalog, the pin and the agent handle (a
+                            // selection rebuilds it; even the lists read the
+                            // live bound). Pending until it is handled.
+                            if let Some(ref sm) = state_manager {
+                                sm.increment_pending_input();
                             }
-                            PipelineSubmission::Set(name) => {
-                                // Forward to the agent loop (sole owner of the
-                                // agent handle — the selection rebuilds it).
-                                // It re-validates and reports refusals.
-                                if let Some(ref sm) = state_manager {
-                                    sm.increment_pending_input();
-                                }
-                                msg_tx.send(QueueMessage::SelectPipeline(name)).await.ok();
-                            }
-                        },
-                        SubmitKind::ProfileCommand(choice) => match choice {
-                            ProfileSubmission::List => {
-                                msg_tx.send(QueueMessage::ListProfiles).await.ok();
-                            }
-                            ProfileSubmission::Set(name) => {
-                                // Same shape as `/pipeline <name>`: the agent
-                                // loop owns the config and the agent handle.
-                                if let Some(ref sm) = state_manager {
-                                    sm.increment_pending_input();
-                                }
-                                msg_tx.send(QueueMessage::SelectProfile(name)).await.ok();
-                            }
-                        },
+                            msg_tx
+                                .send(QueueMessage::Select(SelectRequest::Command(sub)))
+                                .await
+                                .ok();
+                        }
                     }
                 }
 
@@ -1383,25 +1092,18 @@ impl AgentRunner {
                     msg_tx.send(QueueMessage::ChangeCwd(path)).await.ok();
                 }
 
-                UiAction::SelectPipeline(name) => {
-                    // Forward to the agent loop (sole owner of the agent
-                    // handle — the selection rebuilds it). Counts as pending
-                    // input so the status bar shows activity until the rebuild
-                    // completes.
+                UiAction::Select(selection) => {
+                    // Forward to the agent loop (sole owner of the bound and
+                    // the agent handle — the selection rebuilds it). Counts as
+                    // pending input so the status bar shows activity until the
+                    // rebuild completes.
                     if let Some(ref sm) = state_manager {
                         sm.increment_pending_input();
                     }
-                    msg_tx.send(QueueMessage::SelectPipeline(name)).await.ok();
-                }
-
-                UiAction::SelectProfile(name) => {
-                    // Same shape as SelectPipeline — the agent loop owns the
-                    // config and the agent handle, and the profile selection
-                    // reloads + rebuilds them.
-                    if let Some(ref sm) = state_manager {
-                        sm.increment_pending_input();
-                    }
-                    msg_tx.send(QueueMessage::SelectProfile(name)).await.ok();
+                    msg_tx
+                        .send(QueueMessage::Select(SelectRequest::Pair(selection)))
+                        .await
+                        .ok();
                 }
 
                 UiAction::PauseSubAgent => {
@@ -1571,9 +1273,7 @@ impl AgentRunner {
                     | QueueMessage::Command(_)
                     | QueueMessage::SwitchModel(_)
                     | QueueMessage::ChangeCwd(_)
-                    | QueueMessage::SelectPipeline(_)
-                    | QueueMessage::SelectProfile(_)
-                    | QueueMessage::ListProfiles
+                    | QueueMessage::Select(_)
                     | QueueMessage::BackgroundOutputReady => {
                         // Discarded — pending counter was already zeroed by
                         // the event loop's drain trigger. (SwitchModel is
@@ -1823,14 +1523,13 @@ impl AgentRunner {
                         completion_tx.send(CompletionResult::CommandDone).ok();
                     }
 
-                    QueueMessage::SelectPipeline(name) => {
+                    QueueMessage::Select(request) => {
                         if let Some(ref sm) = state_manager {
                             sm.set_running(true);
                         }
-                        let outcome = Self::handle_select_pipeline(
-                            name,
+                        Self::handle_select(
+                            request,
                             &mut agent,
-                            &mut config,
                             &state_manager,
                             &session_hook_cell,
                             &mut event_processor,
@@ -1840,49 +1539,6 @@ impl AgentRunner {
                         if let Some(ref sm) = state_manager {
                             sm.decrement_pending_input();
                             sm.set_running(false);
-                        }
-                        if let Err(msg) = outcome
-                            && let Some(ref sm) = state_manager
-                        {
-                            sm.add_system_message(format!("❌ /pipeline: {msg}"));
-                        }
-                        completion_tx.send(CompletionResult::CommandDone).ok();
-                    }
-
-                    QueueMessage::SelectProfile(name) => {
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(true);
-                        }
-                        let outcome = Self::handle_select_profile(
-                            name,
-                            &mut agent,
-                            &mut config,
-                            &state_manager,
-                            &session_hook_cell,
-                            &mut event_processor,
-                            rebuild_ctx.as_mut(),
-                        )
-                        .await;
-                        if let Some(ref sm) = state_manager {
-                            sm.decrement_pending_input();
-                            sm.set_running(false);
-                        }
-                        if let Err(msg) = outcome
-                            && let Some(ref sm) = state_manager
-                        {
-                            sm.add_system_message(format!("❌ /profile: {msg}"));
-                        }
-                        completion_tx.send(CompletionResult::CommandDone).ok();
-                    }
-
-                    QueueMessage::ListProfiles => {
-                        if let Some(ref sm) = state_manager {
-                            let pin = rebuild_ctx.as_ref().and_then(|c| c.profile_pin.as_deref());
-                            sm.add_system_message(render_profile_list(
-                                &config.profile_names(),
-                                config.active_profile.as_deref(),
-                                pin,
-                            ));
                         }
                         completion_tx.send(CompletionResult::CommandDone).ok();
                     }
@@ -2003,69 +1659,106 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// Bind the current conversation to a pipeline, or clear the binding.
+    /// `/profile`, `/agent` and the picker's `Select` (spec §6.5–§6.6).
     ///
-    /// The choice is locked once the conversation has real turns — swapping the
-    /// `delegate` roster (or the orchestrator's model) mid-conversation would
-    /// desync the tool list from the wire history, so we refuse and tell the
-    /// user. Before the first turn we record the choice (persisted onto the
-    /// conversation, mirrored into `AppState`) and rebuild the agent on that
-    /// team's orchestrator, so model, prompt and roster move together.
+    /// Bare forms render the live lists. A selection is decided by the pure
+    /// `crate::selection::resolve_selection_choice` (locked > pin > unknown >
+    /// apply); a picker pair is a profile step (when the profile changes)
+    /// followed by an agent step, so it obeys exactly the same rules.
     ///
-    /// No conversation reset — unlike `/model` and `/cd`. The conversation is
-    /// empty by construction (pre-first-turn) and minting a new id would break
-    /// the web UI's sticky `?convo=` binding; the wire id is re-stamped in place
-    /// instead.
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_select_pipeline(
-        name: Option<String>,
+    /// Applying swaps `ctx.bound`, rebuilds the agent on the bound agent's
+    /// configured model and only then persists the selection — a failed
+    /// rebuild leaves the previous agent running, so the bound rolls back
+    /// with it and `sm.selection()` was never touched.
+    ///
+    /// No conversation reset, unlike `/model` and `/cd`: selection is only
+    /// possible before the first turn, and minting a new id would break the
+    /// web UI's sticky `?convo=` binding; the wire id is re-stamped in place.
+    async fn handle_select(
+        request: SelectRequest,
         agent_slot: &mut Arc<DynAgent>,
-        config: &mut Config,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
         event_processor: &mut Option<tokio::task::JoinHandle<()>>,
         rebuild_ctx: Option<&mut RebuildContext>,
-    ) -> Result<(), String> {
+    ) {
+        use crate::selection::{
+            SelectChoice, SelectSubmission, render_agent_list, render_profile_list,
+            resolve_selection_choice,
+        };
+
+        let Some(sm) = state_manager.clone() else {
+            return;
+        };
         let Some(ctx) = rebuild_ctx else {
-            return Err("model registry not configured — restart with a `providers:` block".into());
+            sm.add_system_message(
+                "❌ selection is not available in this session (no agent loop attached)."
+                    .to_string(),
+            );
+            return;
         };
-        let sm = state_manager
-            .clone()
-            .ok_or_else(|| "state manager required".to_string())?;
+        let pin = ctx.profile_pin.clone();
 
-        // Lock / idempotency / unknown-name, resolved against the boot-built
-        // set (the authority — `AppState.pipelines` is only its projection).
-        let available: Vec<String> = ctx.pipelines.iter().map(|p| p.name.clone()).collect();
-        let target = match resolve_pipeline_choice(&sm, name.as_deref(), &available) {
-            PipelineChoice::Unchanged => return Ok(()),
-            PipelineChoice::Refused(msg) => return Err(msg),
-            PipelineChoice::Apply(target) => target,
+        let steps = match request {
+            SelectRequest::Command(SelectSubmission::ListProfiles) => {
+                sm.add_system_message(render_profile_list(
+                    &ctx.config.catalog,
+                    &ctx.bound,
+                    pin.as_deref(),
+                ));
+                return;
+            }
+            SelectRequest::Command(SelectSubmission::ListAgents) => {
+                sm.add_system_message(render_agent_list(&ctx.bound));
+                return;
+            }
+            SelectRequest::Command(step) => vec![step],
+            SelectRequest::Pair(selection) => {
+                // The picker re-sends the current pair on redraws; answering
+                // that with a rebuild (or a lock refusal) would be noise.
+                if selection == ctx.bound.selection() {
+                    return;
+                }
+                let mut steps = Vec::with_capacity(2);
+                if selection.profile != ctx.bound.profile.name {
+                    steps.push(SelectSubmission::Profile(selection.profile));
+                }
+                steps.push(SelectSubmission::Agent(selection.agent));
+                steps
+            }
         };
 
-        // The team owns the orchestrator's model; clearing the binding falls
-        // back to `default_model`.
-        let resolved = match &target {
-            Some(name) => ctx
-                .pipelines
-                .get(name)
-                .map(|p| p.orchestrator.clone())
-                .ok_or_else(|| format!("unknown pipeline '{name}'"))?,
-            None => ctx
-                .registry
-                .resolve(ctx.registry.default_alias())
-                .cloned()
-                .ok_or_else(|| "no default model configured".to_string())?,
-        };
+        let profile_changed = steps
+            .iter()
+            .any(|s| matches!(s, SelectSubmission::Profile(_)));
+        let has_turns = sm.conversation_has_turns();
+        let mut next = ctx.bound.clone();
+        for step in steps {
+            let command = match step {
+                SelectSubmission::Profile(_) => "/profile",
+                _ => "/agent",
+            };
+            match resolve_selection_choice(
+                &ctx.config.catalog,
+                &next,
+                step,
+                has_turns,
+                pin.as_deref(),
+            ) {
+                SelectChoice::Apply(bound) => next = bound,
+                SelectChoice::Refuse(msg) => {
+                    sm.add_system_message(format!("❌ {command}: {msg}"));
+                    return;
+                }
+            }
+        }
 
-        // Record before the rebuild — the seam derives the roster, the prompt
-        // and the model from `selected_pipeline()`.
-        let previous = sm.selected_pipeline();
-        sm.set_selected_pipeline(target.clone());
-
-        if let Err(e) = Self::rebuild_agent_for_resolved(
-            &resolved,
+        let command = if profile_changed { "/profile" } else { "/agent" };
+        let previous = std::mem::replace(&mut ctx.bound, next);
+        let model = ctx.bound.agent().main.model.clone();
+        if let Err(e) = Self::rebuild_agent(
+            &model,
             agent_slot,
-            config,
             &sm,
             session_hook_cell,
             event_processor,
@@ -2074,179 +1767,26 @@ impl AgentRunner {
         )
         .await
         {
-            // A failed rebuild leaves the previous agent running — the
-            // selection must follow it back, or state and agent disagree.
-            sm.set_selected_pipeline(previous);
-            return Err(e);
+            ctx.bound = previous;
+            sm.add_system_message(format!("❌ {command}: {e}"));
+            return;
         }
 
-        sm.set_model(resolved.model_name.clone());
-        sm.set_provider_name(resolved.provider_name.clone());
-        sm.set_model_alias(resolved.alias.clone());
-        // Keep the persisted re-activation key truthful: the conversation keeps
-        // its id but now runs on the orchestrator's model.
-        sm.set_conversation_wire_id(resolved.provider_name.clone(), resolved.model_name.clone());
+        sm.set_selection(ctx.bound.selection());
+        sm.set_model(model.model_name.clone());
+        sm.set_provider_name(model.provider_name.clone());
+        sm.set_model_alias(model.alias.clone());
+        // Keep the persisted re-activation key truthful: the conversation
+        // keeps its id but now runs on the agent's model.
+        sm.set_conversation_wire_id(model.provider_name.clone(), model.model_name.clone());
 
-        sm.add_system_message(match &target {
-            // Say where input goes at the moment a team is selected — that's
-            // when the "am I talking to a role now?" question appears.
-            Some(name) => format!(
-                "🧩 Pipeline '{name}' selected — orchestrator on {}. Your messages always go to \
-                 the orchestrator, which decides what to delegate.",
-                resolved.alias
-            ),
-            None => format!("🧩 Pipeline cleared — single agent on {}.", resolved.alias),
-        });
-
-        Ok(())
-    }
-
-    /// Run the current conversation under a config profile, or the base
-    /// config. Same lock rule as `/pipeline`; refused outright under a boot
-    /// `--profile` pin.
-    ///
-    /// The profile reshapes the config itself (tools, memory, prompt head,
-    /// pipelines gate), so this is a reload + rebuild on the current model.
-    /// No conversation reset, for the same reason as `/pipeline`: it is empty
-    /// by construction and the web UI's `?convo=` binding must survive.
-    /// Any failure restores the previous selection and config.
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_select_profile(
-        name: Option<String>,
-        agent_slot: &mut Arc<DynAgent>,
-        config: &mut Config,
-        state_manager: &Option<Arc<StateManager>>,
-        session_hook_cell: &SharedSessionHook,
-        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
-        rebuild_ctx: Option<&mut RebuildContext>,
-    ) -> Result<(), String> {
-        let Some(ctx) = rebuild_ctx else {
-            return Err("model registry not configured — restart with a `providers:` block".into());
-        };
-        let sm = state_manager
-            .clone()
-            .ok_or_else(|| "state manager required".to_string())?;
-
-        let target = match resolve_profile_choice(
-            &sm,
-            name.as_deref(),
-            ctx.profile_pin.as_deref(),
-            &config.profile_names(),
-        ) {
-            ProfileChoice::Unchanged => return Ok(()),
-            ProfileChoice::Refused(msg) => return Err(msg),
-            ProfileChoice::Apply(target) => target,
-        };
-
-        let previous_profile = sm.selected_profile();
-        let previous_pipeline = sm.selected_pipeline();
-        sm.set_selected_profile(target.clone());
-
-        let applied = Self::apply_selected_profile(
-            agent_slot,
-            config,
-            &sm,
-            session_hook_cell,
-            event_processor,
-            state_manager,
-            ctx,
-        )
-        .await;
-        let warnings = match applied {
-            Ok(warnings) => warnings,
-            Err(e) => {
-                // The agent was never swapped, so put the selection back and
-                // re-derive config + ctx for it; otherwise they would describe
-                // a profile the running agent doesn't have.
-                sm.set_selected_profile(previous_profile);
-                sm.set_selected_pipeline(previous_pipeline);
-                let profile = ctx.effective_profile(&sm);
-                for warning in Self::reload_session_config(
-                    config,
-                    ctx,
-                    &sm,
-                    &sm.session_cwd(),
-                    profile.as_deref(),
-                ) {
-                    sm.add_system_message(warning);
-                }
-                return Err(e);
-            }
-        };
-
-        sm.add_system_message(match &target {
-            Some(name) => format!("👤 Profile '{name}' selected."),
-            None => "👤 Profile cleared — base config.".to_string(),
-        });
-        for warning in warnings {
-            sm.add_system_message(warning);
-        }
-        Ok(())
-    }
-
-    /// Reload for the conversation's (already recorded) profile and rebuild
-    /// the agent on the current model. Returns the warnings to surface; `Err`
-    /// means the running agent is untouched and the caller must roll back.
-    #[allow(clippy::too_many_arguments)]
-    async fn apply_selected_profile(
-        agent_slot: &mut Arc<DynAgent>,
-        config: &mut Config,
-        sm: &Arc<StateManager>,
-        session_hook_cell: &SharedSessionHook,
-        event_processor: &mut Option<tokio::task::JoinHandle<()>>,
-        state_manager: &Option<Arc<StateManager>>,
-        ctx: &mut RebuildContext,
-    ) -> Result<Vec<String>, String> {
-        let profile = ctx.effective_profile(sm);
-        let mut warnings =
-            Self::reload_session_config(config, ctx, sm, &sm.session_cwd(), profile.as_deref());
-        if config.active_profile != profile {
-            // The reload kept the previous config — its warnings say why.
-            return Err(warnings.join(" "));
-        }
-        // The profile's pipelines gate may have removed the selected team.
-        // Zero turns (the lock), so the write targets this conversation.
-        if let Some(warning) = reconcile_pipeline_selection(ctx, sm) {
-            warnings.push(warning);
-        }
-
-        // Current model, like `/cd`; the rebuild seam still hands a selected
-        // team's orchestrator its own model.
-        let resolved = ctx
-            .registry
-            .resolve(&sm.get_model_alias())
-            .or_else(|| {
-                ctx.registry
-                    .find_by_wire_id(&sm.get_provider_name(), &sm.get_model())
-            })
-            .ok_or_else(|| "current model not found in registry".to_string())?
-            .clone();
-        Self::rebuild_agent_for_resolved(
-            &resolved,
-            agent_slot,
-            config,
-            sm,
-            session_hook_cell,
-            event_processor,
-            state_manager,
-            ctx,
-        )
-        .await?;
-
-        // A dropped team hands the orchestrator back to `resolved`; keep the
-        // display and the persisted re-activation key truthful either way.
-        let running = match sm
-            .selected_pipeline()
-            .and_then(|n| ctx.pipelines.get(&n).cloned())
-        {
-            Some(pipeline) => pipeline.orchestrator,
-            None => resolved,
-        };
-        sm.set_model(running.model_name.clone());
-        sm.set_provider_name(running.provider_name.clone());
-        sm.set_model_alias(running.alias.clone());
-        sm.set_conversation_wire_id(running.provider_name, running.model_name);
-        Ok(warnings)
+        let label = if profile_changed { "Profile" } else { "Agent" };
+        sm.add_system_message(format!(
+            "{label}: {} › {} — model {}.",
+            ctx.bound.profile.name,
+            ctx.bound.agent().main.name,
+            model.alias
+        ));
     }
 
     /// Change the working directory and rebuild on a fresh conversation.
@@ -3857,61 +3397,6 @@ impl AgentRunner {
                     sm.add_system_message(
                         "❌ /model: not available in this build. Configure a `providers:` \
                          block in config.yaml and restart. See `multi-model.md`."
-                            .to_string(),
-                    );
-                }
-            }
-            _ if cmd_lower.trim_end() == "/pipeline" => {
-                // Rendered from `AppState` — the catalogue stamped at session
-                // build, so the listing can't disagree with the Agents panel.
-                if let Some(sm) = state_manager {
-                    let msg = render_pipeline_list(&sm.get_state());
-                    sm.add_system_message(msg);
-                }
-            }
-            _ if cmd_lower.starts_with("/pipeline ") => {
-                // The event loop routes `/pipeline <name>` to the agent loop
-                // (which owns the agent handle and can rebuild). Reaching here
-                // means no agent loop is attached, so only the read-only half
-                // of the command can be answered — same shape as `/model
-                // <alias>` above.
-                if let Some(sm) = state_manager {
-                    // Case matters: pipeline names are user-typed, so read the
-                    // target off the original command, not the lowered copy.
-                    let target = cmd
-                        .trim()
-                        .strip_prefix("/pipeline ")
-                        .map(str::trim)
-                        .unwrap_or_default();
-                    let target = match target.to_ascii_lowercase().as_str() {
-                        "none" | "off" => None,
-                        _ => Some(target),
-                    };
-                    let available: Vec<String> = sm
-                        .get_state()
-                        .pipelines
-                        .iter()
-                        .map(|p| p.name.clone())
-                        .collect();
-                    match resolve_pipeline_choice(sm, target, &available) {
-                        PipelineChoice::Unchanged => {}
-                        PipelineChoice::Refused(msg) => {
-                            sm.add_system_message(format!("❌ /pipeline: {msg}"))
-                        }
-                        PipelineChoice::Apply(_) => sm.add_system_message(
-                            "❌ /pipeline: not available in this build (no agent loop attached)."
-                                .to_string(),
-                        ),
-                    }
-                }
-            }
-            // Tombstone: `/subagents` became `/pipeline` when pipelines went
-            // from one anonymous team to a named list.
-            _ if cmd_lower.trim_end() == "/subagents" || cmd_lower.starts_with("/subagents ") => {
-                if let Some(sm) = state_manager {
-                    sm.add_system_message(
-                        "🧩 /subagents is gone — use /pipeline to list the configured teams, \
-                         /pipeline <name> to select one, /pipeline none to clear."
                             .to_string(),
                     );
                 }
