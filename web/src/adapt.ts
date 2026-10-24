@@ -12,6 +12,7 @@ import type {
 import type {
   BashPanel,
   BgProcess,
+  CatalogAgent,
   CatalogProfile,
   ChatMessage,
   ContextUsage,
@@ -188,6 +189,20 @@ export function adaptSelection(s: AppState): Selection | null {
   return s.selection
     ? { profile: s.selection.profile, agent: s.selection.agent }
     : null;
+}
+
+/** Resolve a selection to its catalog agent (the roster the Agents panel and
+ * the Agents chip render), or null when nothing is bound / it isn't listed. */
+export function boundAgentOf(
+  catalog: CatalogProfile[] | undefined,
+  selection: Selection | null | undefined,
+): CatalogAgent | null {
+  if (!selection) return null;
+  return (
+    catalog
+      ?.find((p) => p.name === selection.profile)
+      ?.agents.find((a) => a.name === selection.agent) ?? null
+  );
 }
 
 // File tools whose `path` arg we surface in the Files tab. Writes (create /

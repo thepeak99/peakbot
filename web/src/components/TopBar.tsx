@@ -4,10 +4,13 @@ import type {
   InboundMessage,
   ModelInfo,
 } from "../state";
-import type { SubAgentRun } from "../types";
+import type { CatalogProfile, Selection, SubAgentRun } from "../types";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
+import { SelectionChip } from "./SelectionChip";
+import { AgentsChip } from "./AgentsChip";
+import { boundAgentOf } from "../adapt";
 import { NotifyToggle } from "./NotifyToggle";
 import { FocusToggle } from "./FocusToggle";
 import { ThemeToggle } from "./ThemeToggle";
@@ -38,6 +41,10 @@ export function TopBar({
   focusMode,
   onToggleFocus,
   onOpenSettings,
+  catalog,
+  selection,
+  profilePinned = false,
+  onToast,
 }: {
   isRunning: boolean;
   connected: boolean;
@@ -65,7 +72,17 @@ export function TopBar({
    * App passes it iff `settings_available` and the profile's `visible_tabs`
    * include `settings`. */
   onOpenSettings?: () => void;
+  // T32 chat chips (optional — absent ⇒ no chips, as on older servers):
+  // the profiles/agents catalog and this conversation's (profile, agent)
+  // selection. Both render null on their own when absent.
+  catalog?: CatalogProfile[];
+  selection?: Selection | null;
+  /** `AppState.profile_pinned` — a --profile pin freezes the profile. */
+  profilePinned?: boolean;
+  /** Toast sink for `Next conversation: …` (agent pick). */
+  onToast?(message: string): void;
 }) {
+  const boundAgent = boundAgentOf(catalog, selection);
   return (
 
     // `backdrop-blur` makes this header a stacking context, which traps the
@@ -80,6 +97,14 @@ export function TopBar({
       {/* Sessions trio — conversations + model + cwd. On mobile they move
           to the BottomBar to de-crowd the header, so hide them here below lg. */}
       <div className="hidden items-center gap-3 lg:flex">
+        <SelectionChip
+          catalog={catalog ?? []}
+          selection={selection ?? null}
+          locked={hasTranscript}
+          pinned={profilePinned}
+          send={send}
+          onToast={onToast}
+        />
         <ConversationsPicker
           conversations={conversations}
           error={conversationsError}
@@ -95,7 +120,11 @@ export function TopBar({
           hasTranscript={hasTranscript}
           onSwitch={onSwitchModel}
         />
- 
+        <AgentsChip
+          profile={selection?.profile ?? null}
+          agent={boundAgent}
+          activeModel={activeAlias}
+        />
 
         {cwd && (
           <CwdPicker

@@ -16,6 +16,8 @@
 import type { Document } from "yaml";
 import type { StructuredPatch, StructuredPatchHunk } from "diff";
 import type { Scope, Seg } from "./types";
+import type { CatalogAgent, CatalogProfile, Selection } from "../types";
+import type { InboundMessage } from "../state";
 
 /** The draft document: a `yaml` Document so comments/order survive edits. */
 export type Doc = Document;
@@ -727,3 +729,191 @@ export interface RawPaneProps {
 //     and may drop comments"; the spec text above is the contract.)
 // SaveBar gains: saveBlocked?: boolean — when true `savebar-save` has the
 // `disabled` attribute and onSave is never called.
+
+// ═════════════════════════════════════════════════════════════════════════
+// T32 (D11 chat selection) + T33 (D10/D12 first run)  — RED contracts
+// Tests: src/components/selectionChip.test.tsx, src/settings/firstRun.test.tsx
+// ═════════════════════════════════════════════════════════════════════════
+
+
+// ── ../components/SelectionChip (T32, spec §9.1) ────────────────────────
+// export function SelectionChip(props: SelectionChipProps)
+// Renders NOTHING (null) when `selection` is null or `catalog` is empty
+// (old server / no wire fields).
+export interface SelectionChipProps {
+  catalog: CatalogProfile[];
+  /** The (profile, agent) this conversation is bound to (adaptSelection). */
+  selection: Selection | null;
+  /** hasTranscript — after the first message the chip is locked (§6.5). */
+  locked: boolean;
+  /** AppState.profile_pinned — `--profile` pin: only the pinned profile is
+   *  listed (caption `pinned`); agent switching still works. */
+  pinned: boolean;
+  /** The only way the chip talks to the server: send(select(profile, agent)). */
+  send(msg: InboundMessage): void;
+  /** Called with `Next conversation: <p> › <a>` after an agent click. */
+  onToast?(message: string): void;
+  dropUp?: boolean;
+}
+// data-testids (the chip owns all of them):
+//   `selection-chip`      — the <button>. textContent = `[📁 ]<profile> › <agent> ▾`
+//                           (📁 only when the SELECTED profile is origin
+//                           "repo"). Locked: textContent starts `🔒`, no ▾,
+//                           `title` === "Locked after the first message",
+//                           `disabled`, click never opens the popover.
+//   `selection-popover`   — present only while open (never while locked).
+//   `selection-profile-<name>` — one row per profile, catalog order (repo
+//                           first). Repo rows show 📁; row 0 shows caption
+//                           `default`. Attribute data-browsed="true" on the
+//                           BROWSED row (initially the selected profile).
+//                           Click = BROWSE ONLY: right column switches,
+//                           nothing selected, nothing sent.
+//   `selection-agents-title` — `AGENTS · <PROFILE>` (browsed profile; compared
+//                           case-insensitively).
+//   `selection-agent-<name>` — rows of the BROWSED profile only. Caption
+//                           `N subagents` (+ ` · default` on the first agent)
+//                           or `single`. Click = send(select(browsedProfile,
+//                           agent)) + close popover + onToast(...).
+// Esc while open closes the popover AND calls event.preventDefault() (so the
+// Settings view's Esc handler, which skips defaultPrevented events, stays
+// open: Esc order modal → popover → Settings). Esc while closed does NOT
+// preventDefault. mousedown outside closes.
+// Pinned (`pinned`): only the row for selection.profile is rendered, with
+// caption `pinned`; no other `selection-profile-*`.
+
+// ── ../components/AgentsChip (T32, spec §9.1 "Agents chip popover") ─────
+// export function AgentsChip(props: AgentsChipProps)  — null when `agent` is null.
+export interface AgentsChipProps {
+  profile: string | null;
+  /** The bound catalog agent (App resolves selection → catalog). */
+  agent: CatalogAgent | null;
+  /** The model alias currently active (after /model it can differ from agent.model). */
+  activeModel: string;
+  dropUp?: boolean;
+}
+// data-testids:
+//   `agents-chip`          — textContent `Agents · N ▾`, N = 1 + subagents.
+//   `agents-popover`       — only while open (click toggles; Esc closes+preventDefault).
+//   `agents-roster-title`  — `Roster · <profile> › <agent>`.
+//   `agents-roster-main`   — contains agent.name, tag `main`, activeModel.
+//   `agents-roster-sub-<name>` — contains `↳ <name>` and the sub's model, or
+//                           `inherits <agent.model>` when sub.inherited.
+//   `agents-roster-empty`  — "Single agent — no delegate tool." (no subagents).
+
+// ── TopBar / BottomBar / Composer additions (T32) ───────────────────────
+// TopBar & BottomBar gain OPTIONAL props (all absent ⇒ no chips, as today):
+export interface ChatChipProps {
+  catalog?: CatalogProfile[];
+  selection?: Selection | null;
+  profilePinned?: boolean;
+  /** Toast sink for `Next conversation: …`. */
+  onToast?(message: string): void;
+}
+// They render <SelectionChip locked={hasTranscript} send={send} …/> then (after
+// the model chip) <AgentsChip …/>. TopBar: selection-chip precedes agents-chip.
+// BottomBar renders both too (dropUp).
+// Composer gains `settingsEnabled?: boolean` (default true): a hint element
+// `composer-settings-hint` with text `Ctrl+, settings`, placed AFTER the
+// `/ for commands` hint; not rendered when settingsEnabled === false.
+// ../tabs.ts gains the pure gate App/TopBar use for the gear (and Ctrl+,):
+//   settingsGearEnabled(settingsAvailable: boolean | undefined,
+//                       visibleTabs: string[] | undefined): boolean
+//   = (settingsAvailable ?? true) && (visibleTabs === undefined || visibleTabs.includes("settings"))
+
+// ── ./firstRun (T33, spec §9.13 / D10) ──────────────────────────────────
+export type FirstRunProviderType = "openrouter" | "openai" | "anthropic" | "llamacpp" | "ollama";
+export interface FirstRunModel {
+  name: string;
+  alias: string;
+  max_tokens: number;
+}
+export interface FirstRunAnswers {
+  provider: {
+    type: FirstRunProviderType;
+    name: string;
+    /** Omitted from the YAML for openrouter (fixed) and when empty. */
+    base_url?: string;
+    /** Omitted from the YAML when empty/undefined. */
+    api_key?: string;
+    models: FirstRunModel[];
+  };
+  agent: {
+    /** An alias from provider.models. */
+    model: string;
+    /** null = Built-in (Code Crusader) chip = OMIT `persona`. */
+    persona: string | null;
+    /** true ⇒ subagents.helper.prompt "Take focused sub-tasks and report back." */
+    subagents: boolean;
+  };
+  web: {
+    access: "local" | "lan";
+    /** Written as general.web.token only for access === "lan". */
+    token: string | null;
+  };
+}
+// buildFirstRunYaml(a: FirstRunAnswers): string   — PURE. Top-level key order
+//   providers, mcps (always `[]`), profiles, general. Profile `default`,
+//   agent `main` (MAPS, never `- name:` lists). general.web.bind =
+//   "127.0.0.1:7823" (local) | "0.0.0.0:7823" (+ token). Ends with "\n".
+// deriveSetupPhase(meta: {needs_setup:boolean; legacy_layout:boolean},
+//                  globalExists: boolean): "ready" | "guided" | "restart_pending"
+//   !needs_setup → "ready"; needs_setup && globalExists && !legacy_layout →
+//   "restart_pending"; otherwise "guided" (§6.9 — derived, never stored).
+export type SetupPhase = "ready" | "guided" | "restart_pending";
+//
+// <FirstRun meta={SettingsMeta} global={ConfigText} onClose?()/> (file
+// firstRun.tsx). Self-contained: uses ./api putConfig only. If
+// deriveSetupPhase(meta, global.exists) is "restart_pending" it renders the
+// restart screen straight away; otherwise the wizard.
+// Wizard testids — `fr-*` controls are either the element itself or a wrapper
+// holding a descendant [data-testid="input"] (tests accept both):
+//   `firstrun` root;  rail: `firstrun-rail-welcome|provider|agent|web|review`
+//   (buttons; DISABLED until the step has been visited);  step panes:
+//   `firstrun-step-welcome|provider|agent|web|review` (exactly one present).
+//   Footer: `firstrun-back`, `firstrun-skip` ("Skip to review"),
+//   `firstrun-next` (disabled while the step has errors), `firstrun-finish`
+//   (Review only).  `firstrun-step-errors` lists the step's error messages.
+//   Welcome: `firstrun-facts` (OS · Binary · Config · Data dir · Version),
+//     `firstrun-start-fresh` (the ONLY action; no Migrate button),
+//     `firstrun-banner-migrate` ONLY when meta.legacy_layout: contains
+//     "PeakBot couldn't migrate your old config", the verbatim
+//     meta.migrate_error, and "Your config.yaml was not changed.".
+//   Provider: `fr-provider-type` (select), `fr-provider-name`,
+//     `fr-provider-baseurl`, `fr-provider-apikey`, `fr-model-add` (button),
+//     per row k: `fr-model-name-k`, `fr-model-alias-k`, `fr-model-maxtokens-k`.
+//     Errors: `An API key is required for <type>.` (hosted types only:
+//     openrouter/openai/anthropic) and `Add at least one model.`
+//     Defaults: type openrouter, name "openrouter", zero model rows.
+//   Agent: `firstrun-agent-banner` ("Generated: profile default › agent main
+//     using model <alias>."), `fr-agent-model` (select of aliases),
+//     `fr-persona-builtin|neutral|terse` (chips; builtin default),
+//     `fr-agent-subagents` (toggle).
+//   Web: `fr-web-local`, `fr-web-lan` (radio inputs; local default),
+//     `fr-web-token`, `fr-web-token-generate`. LAN without token error:
+//     "A LAN bind requires a token — generate one, or switch back to local only."
+//   Review: `firstrun-yaml` (preview; secrets masked VISUALLY only),
+//     `firstrun-review-path` (contains meta.global_path),
+//     `firstrun-review-note` (desktop: "Finishing restarts PeakBot with this
+//     config." / browser: "After Finish, restart PeakBot to start chatting."),
+//     `firstrun-review-legacy-note` ONLY when legacy_layout ("old file kept
+//     as config.yaml.pre-0.24"), `firstrun-error` (a failed PUT's message).
+//   Finish → PUT /api/config {scope:"global", text: buildFirstRunYaml(answers),
+//     base_sha256: global.sha256}. Desktop (isDesktop()): location.href =
+//     "peakbot-desktop:restart", NO success screen. Browser: `firstrun-restart`
+//     (also shown for the derived restart_pending phase) containing
+//     "Config written", "Restart PeakBot to start chatting."; after Finish
+//     it also contains "PeakBot wrote your config. A backup was kept.", and
+//     `firstrun-restart-backup` ONLY when PutOk.backup !== null. No "Open chat".
+//
+// ── ../Boot (T33, spec §9.13 trigger + D12) ─────────────────────────────
+// export function Boot({ children }: { children: ReactNode })
+//   main.tsx wraps <App/> in it. On mount: getSettings(); when
+//   needs_setup also getConfig("global"). `children` (App → useAgent → /ws)
+//   is NOT mounted while needs_setup (the socket would 503); getSettings
+//   failure (404 old server, 403, network) ⇒ render children (never block
+//   the chat). `/setup` is an alias: with needs_setup it lands on the same
+//   guided FirstRun; with !needs_setup it renders children.
+//   testids: `boot-loading` (while fetching), `setup-strip` (after Esc closes
+//   FirstRun: "PeakBot isn't configured yet — no provider or model is set
+//   up." or, when legacy_layout, "PeakBot couldn't migrate your old config"),
+//   `setup-strip-finish` ("Finish setup" → reopens FirstRun).

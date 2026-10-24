@@ -17,9 +17,10 @@ import { Badge, FilterBlock, KvRows, ModelSelect, Toggle, type KvRow } from "./w
 import type { Seg } from "./types";
 
 // Persona presets — the mockup's texts (v2/index.html PERSONAS, lines 748–752).
-const NEUTRAL_PERSONA =
+// Shared with the first-run wizard (./firstRun): one source for the same chips.
+export const NEUTRAL_PERSONA =
   "You are a coding agent working in the user's local filesystem. State what you are about to do in one line, do it, then report what changed. Prefer the smallest correct change.";
-const TERSE_PERSONA =
+export const TERSE_PERSONA =
   "You are a senior engineer reviewing and writing code. Be direct and brief. No filler. Name the file and the line. If something is wrong, say so plainly.";
 
 const SELECT_CLS =

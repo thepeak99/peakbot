@@ -8,7 +8,7 @@
 // body is a 288px rail, below sm it spans 94vw. Replaces the old static aside
 // + separate mobile hamburger drawer.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Transcript, type TranscriptHandle } from "./components/Transcript";
 import { EmptyTranscript } from "./components/EmptyTranscript";
 import { BashPanel } from "./components/BashPanel";
@@ -34,7 +34,7 @@ import { useFavicon } from "./useFavicon";
 import { useFocusMode } from "./useFocusMode";
 import { focusView } from "./focus";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
-import { filterTabs, resolveActiveTab } from "./tabs";
+import { filterTabs, resolveActiveTab, settingsGearEnabled } from "./tabs";
 import type { ViewFilter } from "./types";
 import { type UploadLimits } from "./state";
 import {
@@ -46,6 +46,7 @@ import {
   adaptStats,
   adaptSubAgent,
   adaptWelcome,
+  boundAgentOf,
   deriveSubAgentRoster,
   filesFromMessages,
   filterMessagesByView,
@@ -120,12 +121,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // stats to one lane via the message `source`.
   const catalog = state ? adaptCatalog(state) : [];
   const selection = state ? adaptSelection(state) : null;
-  const boundAgent =
-    selection === null
-      ? null
-      : catalog
-          .find((p) => p.name === selection.profile)
-          ?.agents.find((a) => a.name === selection.agent) ?? null;
+  const boundAgent = boundAgentOf(catalog, selection);
   const [view, setView] = useState<ViewFilter>("global");
   // Called once here (not in TopBar) so App can filter with the same value
   // the button renders — two useState copies would desync (plan §6.1).
@@ -269,9 +265,25 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // bound profile's `visible_tabs` still lists `settings` (§9.12). Both
   // fields are absent on older servers / before the first state frame:
   // absent settings_available = available; absent visible_tabs = no rule.
-  const settingsEnabled =
-    (state?.settings_available ?? true) &&
-    (state?.visible_tabs === undefined || state.visible_tabs.includes("settings"));
+  // The rule itself lives in tabs.settingsGearEnabled (pure, unit-tested).
+  const settingsEnabled = settingsGearEnabled(
+    state?.settings_available,
+    state?.visible_tabs,
+  );
+
+  // One-shot toast (e.g. `Next conversation: …` from the selection chip).
+  // A minimal local sink — the app has no global toast system; the Settings
+  // view keeps its own.
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 4000);
+  }, []);
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+  }, []);
 
   // Keep an open drawer pointed at a tab the server still shows. When the
   // visible set changes (e.g. the bound profile's `tabs` drops a tab out
@@ -308,6 +320,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         focusMode={focusMode.focus}
         onToggleFocus={focusMode.toggle}
         onOpenSettings={settingsEnabled ? settingsView.toggle : undefined}
+        catalog={catalog}
+        selection={selection}
+        profilePinned={state?.profile_pinned ?? false}
+        onToast={showToast}
       />
       {convoTabs && (
         <ConvoTabBar
@@ -383,6 +399,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             pendingInput={pendingInput}
             attachments={attachments}
             supportsVision={state?.supports_vision ?? true}
+            settingsEnabled={settingsEnabled}
           />
         </DropOverlay>
       </div>
@@ -399,6 +416,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         send={send}
         onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={loadConversation}
+        catalog={catalog}
+        selection={selection}
+        profilePinned={state?.profile_pinned ?? false}
+        onToast={showToast}
       />
    
 
@@ -414,6 +435,12 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           activeProfile={selection?.profile ?? null}
           onClose={settingsView.close}
         />
+      )}
+
+      {toast && (
+        <div className="fixed bottom-16 left-1/2 z-40 -translate-x-1/2 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-200 shadow-xl">
+          {toast}
+        </div>
       )}
     </div>
   );
