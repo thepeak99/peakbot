@@ -317,16 +317,16 @@ pub struct Conversation {
     /// Todo list persisted with this conversation
     #[serde(default)]
     pub todos: crate::tools::todo::TodoList,
-    /// The pipeline (named team) this conversation is bound to, or `None` for
-    /// single-agent mode. The **one nullable fact** that drives the delegate
-    /// roster, the prompt recipe and the orchestrator's model on resume.
-    /// Absent for every pre-existing file; the legacy `subagents_enabled` key
-    /// such files carry is ignored on load (no auto-mapping — amendment 5).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pipeline: Option<String>,
-    /// The config profile this conversation runs under, or `None` for the
-    /// base config. Same lifecycle as `pipeline`: chosen before the first
-    /// turn, carried over by `/new`, re-applied by `/load`.
+    /// The agent (within `profile`) this conversation is bound to. Pre-0.24
+    /// files stored the pipeline name under `pipeline`; the alias loads it as
+    /// the agent name (migration names each pipeline's agent after it), and a
+    /// new save always writes `agent`. The legacy `subagents_enabled` key is
+    /// ignored on load.
+    #[serde(default, alias = "pipeline", skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The config profile this conversation runs under. Same lifecycle as
+    /// `agent`: chosen before the first turn, carried over by `/new`,
+    /// re-applied by `/load`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
 }
@@ -360,16 +360,9 @@ impl Conversation {
             cwd,
             metadata: ConversationMetadata::default(),
             todos: crate::tools::todo::TodoList::new(),
-            pipeline: None,
+            agent: None,
             profile: None,
         }
-    }
-
-    /// The pipeline this conversation is bound to. Reads the `pipeline` field
-    /// and nothing else — amendment 5 cancels the legacy `subagents_enabled`
-    /// mapping, so an old file resumes without a pipeline.
-    pub fn selected_pipeline(&self) -> Option<&str> {
-        self.pipeline.as_deref()
     }
 
     /// Add a user message to the conversation
@@ -884,7 +877,7 @@ mod tests {
         assert_eq!(parsed.cwd, "");
         assert!(parsed.provider_name.is_empty());
         assert!(parsed.todos.list().is_empty());
-        assert!(parsed.pipeline.is_none());
+        assert!(parsed.agent.is_none());
     }
 
     // === v5: conversation title ====================
@@ -1324,41 +1317,39 @@ mod tests {
             other => panic!("expected Assistant, got {other:?}"),
         }
     }
-    // ── Stage 1.2: per-conversation pipeline selection ───────────────────────
-    //
-    // The single nullable fact that replaces today's two-booleans state
-    // (`pipeline_available` + `subagents_enabled`). Persisted on the
-    // conversation so a resume / /load can re-activate the right team
-    // without re-asking the user. Amendment 5: legacy `subagents_enabled`
-    // is silently ignored on load — there is NO auto-mapping back to a
-    // `default` pipeline.
 
-    /// `pipeline` is `Option<String>`, defaults to `None`, and roundtrips
-    /// 1:1 through JSON (key = `"pipeline"` per plan §3).
+    // ── per-conversation agent selection ─────────────────────────────────────
+    //
+    // `agent` (with `profile`) is the persisted `(profile, agent)` the session
+    // re-binds to on resume / `/load`. Pre-0.24 files stored the pipeline name
+    // under `pipeline`; the serde alias loads it as `agent`.
+
+    /// `agent` defaults to `None`, round-trips under the key `agent`, and an
+    /// old `pipeline` key loads into it.
     #[test]
-    fn pipeline_field_round_trips_and_defaults_none() {
+    fn agent_field_round_trips_and_loads_legacy_pipeline_key() {
         let mut conv = Conversation::new(
             "Test".into(),
             "openrouter".into(),
             "anthropic/claude-3.7-sonnet".into(),
             String::new(),
         );
-        // Default = no pipeline (fresh session baseline, plan §4 "fresh
-        // session = None").
-        assert_eq!(conv.pipeline, None);
+        assert_eq!(conv.agent, None);
 
-        conv.pipeline = Some("web-team".into());
+        conv.agent = Some("web-team".into());
         let json = serde_json::to_string(&conv).expect("serializes");
-        // The field key is `pipeline`, per plan §3.
         assert!(
-            json.contains("\"pipeline\":\"web-team\""),
-            "JSON must contain the `pipeline` field; got: {json}"
+            json.contains("\"agent\":\"web-team\"") && !json.contains("\"pipeline\""),
+            "JSON must carry `agent`, never `pipeline`; got: {json}"
         );
-
         let parsed: Conversation = serde_json::from_str(&json).expect("parses back");
-        assert_eq!(parsed.pipeline.as_deref(), Some("web-team"));
+        assert_eq!(parsed.agent.as_deref(), Some("web-team"));
 
-        // Pre-existing files with no `pipeline` key default to None.
+        let legacy = json.replace("\"agent\"", "\"pipeline\"");
+        let parsed: Conversation = serde_json::from_str(&legacy).expect("legacy key loads");
+        assert_eq!(parsed.agent.as_deref(), Some("web-team"));
+
+        // Pre-existing files with neither key default to None.
         let legacy_no_pipeline = r#"{
             "id": "00000000-0000-0000-0000-000000000000",
             "name": "old",
@@ -1370,37 +1361,13 @@ mod tests {
             "metadata": {}
         }"#;
         let parsed: Conversation = serde_json::from_str(legacy_no_pipeline).unwrap();
-        assert_eq!(parsed.pipeline, None);
+        assert_eq!(parsed.agent, None);
     }
 
-    /// `selected_pipeline()` returns `self.pipeline.as_deref()` — single
-    /// source of truth, derived from the persisted field. It does NOT
-    /// consult any legacy field; amendment 5 cancels that adaptation.
+    /// A legacy `subagents_enabled: true` key is ignored on load — it never
+    /// auto-selects an agent.
     #[test]
-    fn selected_pipeline_returns_pipeline_field_only() {
-        let mut conv = Conversation::new(
-            "Test".into(),
-            "openrouter".into(),
-            "anthropic/claude-3.7-sonnet".into(),
-            String::new(),
-        );
-        assert_eq!(conv.selected_pipeline(), None);
-        conv.pipeline = Some("research-crew".into());
-        assert_eq!(conv.selected_pipeline(), Some("research-crew"));
-        conv.pipeline = None;
-        assert_eq!(conv.selected_pipeline(), None);
-    }
-
-    /// Amendment 5 pinned as a Conversation-level test (separate from
-    /// the StateManager mirror test): a JSON document that carries the
-    /// legacy `subagents_enabled: true` key but no `pipeline` key
-    /// deserializes to a conversation whose `selected_pipeline()` is
-    /// `None`. There is no auto-mapping back to a `default` pipeline —
-    /// the legacy key is either dropped as an unknown field or, if
-    /// the field is kept for back-compat, is simply not consulted by
-    /// `selected_pipeline()`.
-    #[test]
-    fn legacy_subagents_enabled_does_not_auto_select_default_pipeline() {
+    fn legacy_subagents_enabled_does_not_auto_select_an_agent() {
         let legacy = r#"{
             "id": "00000000-0000-0000-0000-000000000000",
             "name": "old",
@@ -1413,15 +1380,8 @@ mod tests {
             "subagents_enabled": true
         }"#;
         let conv: Conversation = serde_json::from_str(legacy)
-            .expect("legacy JSON must parse; subagents_enabled key is dropped or ignored");
-        assert_eq!(
-            conv.selected_pipeline(),
-            None,
-            "amendment 5: a legacy conversation's selected_pipeline is None; \
-             `subagents_enabled: true` does NOT auto-map to a 'default' pipeline"
-        );
-        // And the field is also None directly, since no `pipeline` key.
-        assert_eq!(conv.pipeline, None);
+            .expect("legacy JSON must parse; subagents_enabled key is ignored");
+        assert_eq!(conv.agent, None);
     }
 
     // ── per-conversation profile (Layer C, RED) ─────────────────────────────

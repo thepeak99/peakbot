@@ -186,7 +186,7 @@ impl WebUi {
         extra_sans: Vec<String>,
         needs_setup: bool,
     ) -> Self {
-        let web = deps.config.web.clone();
+        let web = deps.config.general.web.clone();
         // `SessionRegistry::new` consumes `deps`, so clone the store out
         // first (it is `Clone`-cheap: a PathBuf + a Copy config).
         let uploads = deps.uploads.clone();

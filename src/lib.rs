@@ -797,6 +797,67 @@ fn config_errors_summary(errors: &crate::config::ConfigErrors) -> String {
     out
 }
 
+/// What a provider build yields: the agent, its provider facts, the event
+/// stream (`None` for providers without hooks) and its session hook.
+pub(crate) type BuiltAgent = (
+    DynAgent,
+    ProviderInfo,
+    Option<mpsc::UnboundedReceiver<SourcedEvent>>,
+    Arc<SessionHook>,
+);
+
+/// The main agent built from `ctx.bound` on `model` — the one recipe for
+/// session boot and every rebuild verb. The prompt is built for the
+/// session's current cwd; the profile's [`ToolEnv`] is rebuilt from the
+/// long-lived MCP handles (no subprocess restarts; the vector store reuses
+/// the process-wide DB handle); `delegate` exists iff the agent has
+/// subagents.
+///
+/// [`ToolEnv`]: crate::tools::env::ToolEnv
+pub(crate) fn build_bound_agent(
+    model: &ResolvedModel,
+    ctx: &RebuildContext,
+    sm: &Arc<StateManager>,
+) -> Result<BuiltAgent, String> {
+    use crate::tools::env::{ToolEnv, delegate_enabled};
+
+    let system_prompt = rebuild_agent_for_resolved(
+        model,
+        &ctx.bound,
+        &ctx.skills,
+        ctx.shell_kind.clone(),
+        &sm.session_cwd(),
+    )?;
+    let tool_env = Arc::new(ToolEnv::for_profile(
+        &ctx.config,
+        &ctx.bound.profile,
+        &ctx.mcp_handles,
+    ));
+    let agent = ctx.bound.agent();
+    let delegate = delegate_enabled(agent).then(|| {
+        Arc::new(SubAgentDeps {
+            bound: ctx.bound.clone(),
+            tool_env: Arc::clone(&tool_env),
+            state_manager: Arc::clone(sm),
+            shell_kind: ctx.shell_kind.clone(),
+            skills: ctx.skills.clone(),
+            event_sink: None,
+            retry: ctx.config.general.retry.clone(),
+        })
+    });
+    crate::providers::create_provider(
+        model,
+        &system_prompt,
+        &tool_env,
+        &agent.main,
+        delegate,
+        ctx.todo_tool.clone(),
+        Arc::clone(sm),
+        ctx.shell_kind.as_ref(),
+    )
+    .map_err(|e| format!("failed to build agent for `{}`: {e}", model.alias))
+}
+
 /// Shared cell holding the *currently active* SessionHook. Replaced
 /// in-place by the agent loop on `/model` rebuild; the event loop's
 /// `/stop` path reads through the cell so it always cancels the
@@ -2163,8 +2224,6 @@ impl AgentRunner {
         state_manager: &Option<Arc<StateManager>>,
         ctx: &RebuildContext,
     ) -> Result<(), String> {
-        use crate::tools::env::{ToolEnv, delegate_enabled};
-
         let general = &ctx.config.general;
 
         // Validate the compaction model *before* mutating any state, so a
@@ -2178,45 +2237,8 @@ impl AgentRunner {
             )
         })?;
 
-        let system_prompt = rebuild_agent_for_resolved(
-            model,
-            &ctx.bound,
-            &ctx.skills,
-            ctx.shell_kind.clone(),
-            &sm_for_provider.session_cwd(),
-        )?;
-
-        // Rebuilt per call from the long-lived MCP handles (no subprocess
-        // restarts); the vector store reuses the process-wide DB handle.
-        let tool_env = Arc::new(ToolEnv::for_profile(
-            &ctx.config,
-            &ctx.bound.profile,
-            &ctx.mcp_handles,
-        ));
-        let agent = ctx.bound.agent();
-        let delegate = delegate_enabled(agent).then(|| {
-            Arc::new(SubAgentDeps {
-                bound: ctx.bound.clone(),
-                tool_env: Arc::clone(&tool_env),
-                state_manager: Arc::clone(sm_for_provider),
-                shell_kind: ctx.shell_kind.clone(),
-                skills: ctx.skills.clone(),
-                event_sink: None,
-                retry: general.retry.clone(),
-            })
-        });
-
-        let (new_agent, new_info, new_receiver, new_hook) = crate::providers::create_provider(
-            model,
-            &system_prompt,
-            &tool_env,
-            &agent.main,
-            delegate,
-            ctx.todo_tool.clone(),
-            Arc::clone(sm_for_provider),
-            ctx.shell_kind.as_ref(),
-        )
-        .map_err(|e| format!("failed to build agent for `{}`: {e}", model.alias))?;
+        let (new_agent, new_info, new_receiver, new_hook) =
+            build_bound_agent(model, ctx, sm_for_provider)?;
 
         // Thread the resolved reasoning gates into the shared StateManager
         // (single seam for every rebuild verb). The wire gate is
@@ -2325,10 +2347,9 @@ impl AgentRunner {
         let reload_cwd = restore_to.clone().unwrap_or_else(|| sm.session_cwd());
 
         // The conversation was already loaded, so warnings land in it.
-        // The `pipeline` field carries the agent name until T9a renames it.
         let rebind = Rebind::Saved {
             profile: conv.profile.as_deref(),
-            agent: conv.pipeline.as_deref(),
+            agent: conv.agent.as_deref(),
         };
         for warning in reload_config(ctx, sm, &reload_cwd, rebind) {
             sm.add_system_message(warning);
@@ -7665,7 +7686,7 @@ pipelines:
              both the live mirror and its persisted `pipeline`"
         );
         assert_eq!(
-            sm.get_current_conversation().unwrap().pipeline.as_deref(),
+            sm.get_current_conversation().unwrap().agent.as_deref(),
             Some("web-team"),
             "…and the new conversation's persisted `pipeline` agrees (I-3)"
         );
@@ -7782,7 +7803,7 @@ pipelines:
              conversation persists `pipeline: web-team`"
         );
         assert_eq!(
-            sm.get_current_conversation().unwrap().pipeline.as_deref(),
+            sm.get_current_conversation().unwrap().agent.as_deref(),
             Some("web-team"),
             "…and persisted truth agrees with the mirror (I-3)"
         );

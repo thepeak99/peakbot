@@ -5,12 +5,12 @@
 //! whichever View ran. The web UI makes **each tab its own agent**, so that
 //! "build one session" block is named here and called 1×N.
 //!
-//! [`SessionDeps`] holds the process-wide, immutable inputs (config,
-//! registry, MCP subprocess handles, vector store, skills, system prompt).
-//! It is built once and borrowed by every [`create_session`] call — the
-//! shared column of `webui.md` §10.2. Everything in the per-session column
-//! (a fresh `StateManager`, its `AgentRunner` + spawned `run_loop`, the
-//! `UiAction` channel, the `TodoTool`) is built anew each call.
+//! [`SessionDeps`] holds the process-wide inputs (boot config, MCP
+//! subprocess handles, skills, storage). It is built once and borrowed by
+//! every [`create_session`] call. Everything per-session (a fresh
+//! `StateManager`, its `AgentRunner` + spawned `run_loop`, the `UiAction`
+//! channel, the `TodoTool`, the session's one `Bound`) is built anew each
+//! call.
 //!
 //! ## Teardown (Option C, ephemeral session-per-connection)
 //!
@@ -21,58 +21,46 @@
 //! `Drop` impl or `AbortHandle` is needed — the channel-close cascade is
 //! the teardown (verified `lib.rs` run_loop end).
 
-use crate::config::{
-    Config, ModelRegistry, SearXngConfig, selectable_profiles, session_visible_tabs,
-};
-use crate::pipeline::PipelineSet;
+use crate::config::Config;
 use crate::tools::ShellKind;
 use crate::ui::app_state::WelcomeState;
 use crate::{
     AgentRunner, McpServerHandle, PEAKBOT_VERSION, RebuildContext, SkillRegistry, StateManager,
-    TodoTool, UiAction, build_system_prompt, create_provider, resolve_prompt_head,
+    TodoTool, UiAction, build_bound_agent, reload_session_config,
 };
 use anyhow::Result;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Process-wide inputs shared by every session. Built once in `main`,
-/// borrowed by each [`create_session`] call. The heavy handles
-/// (`mcp_handles`, `vector_store`, `pipelines`, `model_registry`)
-/// are `Arc`-backed, so the per-call clones are cheap.
+/// borrowed by each [`create_session`] call. Everything else a session
+/// needs (registry, profiles, search, vector store, tabs) is derived from
+/// `config` — or from the fresh config each session loads.
 pub struct SessionDeps {
-    /// Boot config with `provider` already mirrored to the active provider
-    /// (see `Config::resolve_and_mirror_boot_provider`). Cloned per session
-    /// so each `AgentRunner` reads a stable provider for its compaction model.
-    pub config: Config,
-    pub model_registry: Arc<ModelRegistry>,
+    /// The **boot** config: the one `boot_only_diff` compares a session's
+    /// fresh config against, and the fallback when that load fails.
+    pub config: Arc<Config>,
+    /// The boot skill scan; each session rescans for its own cwd.
     pub skills: SkillRegistry,
-    /// User-facing warnings from the boot skill scan (a skill that failed to
-    /// parse, an unreadable dir). Emitted as system messages on session
-    /// creation so both the TUI and web UI surface them.
-    pub skill_warnings: Vec<String>,
     /// One set of MCP subprocesses shared by all sessions; each session
     /// clones the *tools list*, not the processes.
     pub mcp_handles: Arc<Vec<McpServerHandle>>,
-    pub searxng_config: Option<SearXngConfig>,
-    /// The named teams this install declares, resolved once at boot. An empty
-    /// set is "no pipelines configured" — one fewer nullable than the old
-    /// `Option<SubAgentRegistry>`.
-    pub pipelines: Arc<PipelineSet>,
-    pub vector_store: Option<crate::vector::VectorStore>,
+    /// The boot migration notices (spec §7.5). The **first** session takes
+    /// them (`std::mem::take`) and shows them as system messages; later
+    /// sessions find the vec empty.
+    pub boot_notices: Mutex<Vec<String>>,
     pub shell_kind: Option<ShellKind>,
     /// Shared conversation storage (writes distinct files per conversation
     /// id), or `None` when persistence is disabled. Cloned into each
     /// session's `StateManager`.
     pub storage: Option<Arc<dyn crate::ConversationStorage>>,
-    pub mcp_tools_count: usize,
-    pub skills_count: usize,
-    /// The boot `--profile` pin. `config` was loaded under it; every session
-    /// runs under it and refuses runtime profile selection.
+    /// The boot `--profile` pin. Every session runs under it, refuses
+    /// runtime profile selection and ignores repo files.
     pub profile_pin: Option<String>,
-    /// The upload store, built once at boot from `config.uploads` (the
+    /// The upload store, built once at boot from `general.uploads` (the
     /// limits are boot-only). Cloned into each session's `StateManager`.
     pub uploads: crate::attachments::UploadStore,
 }
@@ -102,23 +90,17 @@ pub struct Session {
 /// conversation is initialised **synchronously** before the controller loop
 /// spawns, so [`Session::conversation_id`] is immediately valid.
 ///
-/// Mirrors the historical `main` boot block: fresh `StateManager`,
-/// per-session `TodoTool`, `create_provider`, `AgentRunner::new` +
-/// `with_rebuild_context`, welcome state, then `tokio::spawn(run_loop)`.
+/// Every session reads a **fresh** config for its cwd, exactly like `/new`
+/// (spec §6.7), so a new web tab sees edits saved since boot and a resumed
+/// conversation sees its own tree's repo profiles. A failed load keeps the
+/// boot config and says so.
 ///
 /// ## Per-session cwd
 ///
-/// This is the **single point** that resolves the per-session `session_cwd`
-/// and threads it into the system prompt, the persisted conversation, the
-/// welcome banner, and every path-aware tool. Resume adopts the saved
-/// cwd (it was persisted on the conversation at mint time); fresh
-/// sessions inherit the boot `current_dir()`. Order matters:
-/// 1. resolve `session_cwd`,
-/// 2. `state_manager.set_session_cwd(...)` *before* `create_provider` —
-///    `add_builtin_tools` snapshots it at agent-build time,
-/// 3. build the per-session system prompt from `session_cwd`,
-/// 4. pass that prompt into `create_provider` *and* into `RebuildContext`
-///    so a later `/model` switch keeps the cwd.
+/// This is the **single point** that resolves the per-session `session_cwd`.
+/// Resume adopts the saved cwd (persisted on the conversation at mint time);
+/// fresh sessions inherit the boot `current_dir()`. `set_session_cwd` runs
+/// *before* the agent build — the tools and the prompt snapshot it then.
 pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Session> {
     // Per-session Model. Storage (if any) is shared — it writes distinct
     // files per conversation id.
@@ -131,197 +113,97 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // cwd, gone directory) falls through to the boot cwd. A gone cwd is
     // best-effort: the user can `/cd` to a valid tree at runtime.
     let boot_cwd = std::env::current_dir().unwrap_or_default();
-    let saved_cwd: Option<PathBuf> = resume
+    let session_cwd = resume
         .and_then(|id| state_manager.peek_conversation_cwd(id).ok())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .filter(|p| p.is_dir());
-    let session_cwd = saved_cwd.clone().unwrap_or(boot_cwd);
-
-    // The conversation's profile: a fresh session runs under the pin (or the
-    // base config); a resumed one re-applies its saved profile.
-    let saved_profile = resume
-        .and_then(|id| state_manager.peek_conversation_profile(id).ok())
-        .flatten();
-    let (mut profile, mut profile_warnings) = crate::resolve_conversation_profile(
-        &deps.config,
-        saved_profile.as_deref(),
-        deps.profile_pin.as_deref(),
-    );
-
-    // A resumed session rebuilds from its own tree and profile, so a team in
-    // its `.peakbot/config.yaml` survives and its profile applies. A profile
-    // that can't be applied falls back to the boot config, and says so.
-    let (config, pipelines) =
-        match reload_for_resume(deps, &session_cwd, profile.as_deref(), saved_cwd.is_some()) {
-            Ok(resumed) => (
-                resumed.config.unwrap_or_else(|| deps.config.clone()),
-                resumed
-                    .pipelines
-                    .map(Arc::new)
-                    .unwrap_or_else(|| deps.pipelines.clone()),
-            ),
-            Err(reason) => {
-                profile_warnings.push(format!(
-                    "⚠ Couldn't apply profile '{}' ({reason}); loaded without it.",
-                    profile.as_deref().unwrap_or_default()
-                ));
-                profile = deps.profile_pin.clone();
-                (deps.config.clone(), deps.pipelines.clone())
-            }
-        };
-    state_manager.set_pipelines(pipelines.infos());
-
-    // The conversation's pipeline selection. A fresh session has none; a
-    // resumed one adopts its saved team, or drops it with a warning when that
-    // team is no longer configured. Resolved *before* the agent is built so
-    // the boot agent runs on the right orchestrator with the right roster.
-    let saved_pipeline = resume
-        .and_then(|id| state_manager.peek_conversation_pipeline(id).ok())
-        .flatten();
-    let (active, pipeline_warning) = pipelines.resolve_saved(saved_pipeline.as_deref());
-    state_manager.set_selected_pipeline(active.map(|p| p.name.clone()));
-
-    let todo_tool = TodoTool::new(state_manager.clone());
-
-    // Pick the model to boot on. The selected pipeline OWNS the orchestrator's
-    // model, so it beats the conversation's saved wire id (plan §8.6) — and a
-    // saved-but-dropped pipeline falls back to the registry default rather than
-    // that pipeline's fossilised wire id. Only a conversation that never had a
-    // pipeline boots on its saved model; a fresh session boots the registry
-    // default. The saved wire id is peeked without loading — the same preflight
-    // `/load` uses.
-    let saved_wire_id = resume.and_then(|id| state_manager.peek_conversation_wire_id(id).ok());
-    let boot = deps.model_registry.resolve_boot(
-        saved_wire_id
-            .as_ref()
-            .filter(|_| saved_pipeline.is_none())
-            .map(|(p, m)| (p.as_str(), m.as_str())),
-    );
-    // `resolve_boot` guarantees a model (a config-built registry always has a
-    // default), so there is no None case to handle.
-    let boot_model = match active {
-        Some(pipeline) => &pipeline.orchestrator,
-        None => boot.model,
-    };
-    let boot_provider_config = &boot_model.provider_config;
-    let boot_provider_name = boot_model.provider_name.clone();
-    let boot_alias = boot_model.alias.clone();
-    // Context size for the booted model, eagerly resolved at registry-build
-    // time (config override or auto-detected). Drives ContextManager
-    // compaction thresholds.
-    let context_size = boot_model.context_size;
-
-    // Each session clones the MCP tools list from the shared handles (not
-    // the subprocesses). `McpTool: Clone` makes this cheap. Grouped per
-    // server so the active profile's `mcp_servers:` gate can filter by
-    // server name at boot too (the rebuild seam does the same).
-    let mcp_tools = if deps.mcp_handles.is_empty() {
-        None
-    } else {
-        use rig_core::tool::ToolDyn;
-        let groups: Vec<(String, Vec<Box<dyn ToolDyn>>)> = deps
-            .mcp_handles
-            .iter()
-            .map(|handle| {
-                (
-                    handle.name().to_string(),
-                    handle
-                        .tools()
-                        .iter()
-                        .cloned()
-                        .map(|t| Box::new(t) as Box<dyn ToolDyn>)
-                        .collect(),
-                )
-            })
-            .collect();
-        Some(crate::mcp_tools_for_profile(
-            groups,
-            config.active_mcp_server_filter(),
-        ))
-    };
-
-    // Stamp the SM *before* create_provider so the tools snapshot the
-    // per-session value at agent-build time. A `set_session_cwd` after
-    // build would not reach the already-built tools.
+        .filter(|p| p.is_dir())
+        .unwrap_or(boot_cwd);
+    // Stamp the SM *before* the agent build so the tools and the prompt
+    // snapshot the per-session value.
     state_manager.set_session_cwd(session_cwd.clone());
 
-    // Build the per-session system prompt from `session_cwd` — the only
-    // place the cwd flows into the prompt. Skills + shell_kind are part
-    // of the env block too. With a pipeline selected this drops the
-    // crusader persona and appends the pipeline's orchestrator prompt. The
-    // head (config `system_prompt:`/`persona:` vs the pipeline's own
-    // `orchestrator.persona`) is resolved by the shared helper the rebuild
-    // seam also uses. `config_head` outlives this call: `RebuildContext`
-    // below stores the *unresolved* config head, because a later rebuild
-    // re-resolves it against whatever pipeline is selected then.
-    let config_head = config.prompt_head();
-    let session_head = resolve_prompt_head(
-        config_head.as_ref(),
-        active.and_then(|p| p.orchestrator_persona.as_deref()),
+    let todo_tool = TodoTool::new(state_manager.clone());
+    let start = deps
+        .config
+        .catalog
+        .start_bound(deps.profile_pin.as_deref())
+        .map_err(anyhow::Error::msg)?;
+    let mut ctx = RebuildContext {
+        config: Arc::clone(&deps.config),
+        bound: start,
+        mcp_handles: deps.mcp_handles.clone(),
+        shell_kind: deps.shell_kind.clone(),
+        skills: deps.skills.clone(),
+        todo_tool: Some(todo_tool),
+        profile_pin: deps.profile_pin.clone(),
+    };
+
+    // Fresh config + skills for the session cwd (repo-file migration, boot-
+    // only diff warnings and catalog publishing included). The messages are
+    // emitted after the conversation exists — a load would replace them.
+    let mut messages = reload_session_config(&mut ctx, &state_manager, &session_cwd);
+
+    // Bind: a fresh session starts on the default (or pinned) profile's
+    // first agent; a resumed one re-binds to its saved `(profile, agent)`.
+    let saved = resume
+        .and_then(|id| state_manager.peek_conversation_selection(id).ok())
+        .flatten();
+    let nonempty = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let saved_profile = saved.as_ref().and_then(|s| nonempty(&s.profile));
+    let saved_agent = saved.as_ref().and_then(|s| nonempty(&s.agent));
+    let (bound, warnings) = crate::selection::resolve_saved_selection(
+        &ctx.config.catalog,
+        saved_profile.as_deref(),
+        saved_agent.as_deref(),
+        deps.profile_pin.as_deref(),
     );
-    let session_prompt = build_system_prompt(
-        &deps.skills,
-        deps.shell_kind.as_ref(),
-        &session_cwd,
-        config.memory.enabled,
-        config.agents_md,
-        active.is_some(),
-        active.and_then(|p| p.orchestrator_prompt.as_deref()),
-        session_head.as_ref(),
+    ctx.bound = bound;
+    messages.extend(warnings);
+    state_manager.set_selection(ctx.bound.selection());
+    state_manager.set_visible_tabs(
+        ctx.bound
+            .profile
+            .tabs
+            .iter()
+            .map(|tab| tab.to_string())
+            .collect(),
     );
 
-    // The `delegate` tool (and thus sub-agents) is registered iff a pipeline is
-    // selected — and it exposes exactly that team's roster. A fresh session has
-    // no selection, so the boot agent has no delegate until the user selects a
-    // pipeline (which rebuilds the agent). `RebuildContext` keeps the whole set
-    // so that rebuild can hand over a different team's registry.
-    let boot_registry = active.map(|p| p.registry.as_ref());
+    // Boot model: a resumed conversation's saved wire id when it is still
+    // configured (the model is free, spec §6.5), else the bound agent's model.
+    let saved_wire_id = resume.and_then(|id| state_manager.peek_conversation_wire_id(id).ok());
+    let boot = ctx.config.registry.resolve_boot(
+        saved_wire_id
+            .as_ref()
+            .map(|(p, m)| (p.as_str(), m.as_str())),
+        &ctx.bound.agent().main.model,
+    );
+    let model = boot.model.clone();
+    let unavailable = boot.unavailable;
 
-    let (agent, provider_info, event_receiver, session_hook) = create_provider(
-        boot_provider_config,
-        mcp_tools,
-        &session_prompt,
-        deps.searxng_config.as_ref(),
-        config.agent_max_turns,
-        Some(todo_tool.clone()),
-        &config.bash,
-        &config.tools,
-        boot_registry,
-        state_manager.clone(),
-        deps.shell_kind.as_ref(),
-        deps.vector_store.as_ref(),
-        &deps.skills,
-        &config.retry,
-        &config.timeouts,
-        config.agents_md,
-        &config.fetch_url,
-    )?;
+    let (agent, provider_info, event_receiver, session_hook) =
+        build_bound_agent(&model, &ctx, &state_manager).map_err(anyhow::Error::msg)?;
 
-    // Thread the resolved reasoning gates into the shared StateManager.
-    // These are the same booleans that ride in `ProviderInfo`; setting them
-    // here (right after the agent is built) is the boot half of the pair —
-    // `AgentRunner::rebuild_agent_for_resolved` is the other, and between
-    // them every provider swap re-derives the gates from the provider that
-    // now owns the wire. See that site for the sub-agent semantics.
+    // Thread the resolved reasoning gates into the shared StateManager —
+    // the boot half of the pair; `AgentRunner::rebuild_agent` is the other.
     state_manager
         .set_wire_reasoning(provider_info.name == "anthropic" && provider_info.preserve_reasoning);
     state_manager.set_display_reasoning(provider_info.display_reasoning);
     state_manager.set_supports_vision(provider_info.supports_vision);
 
     // Stamp the wire identity `(provider_name, model)` and the display
-    // alias for the booted model (resumed model or registry default).
+    // alias for the booted model.
     state_manager.set_model(provider_info.model.clone());
-    state_manager.set_provider_name(boot_provider_name);
-    state_manager.set_model_alias(boot_alias.clone());
+    state_manager.set_provider_name(model.provider_name.clone());
+    state_manager.set_model_alias(model.alias.clone());
 
     // Initialise the conversation synchronously so `conversation_id` is valid
     // before the controller loop spawns. `resume` best-effort adopts a
     // persisted conversation; `ensure_boot_conversation` is idempotent, so it
     // mints a fresh one iff the resume didn't produce a current conversation
-    // (unknown id, disabled storage, or `None`). The result is total: a
-    // current conversation always exists afterwards. The fresh-mint path
-    // persists `session_cwd` so a later `/load` re-adopts the same tree.
+    // (unknown id, disabled storage, or `None`). The fresh-mint path
+    // persists `session_cwd` and the selection.
     if let Some(id) = resume {
         let _ = state_manager.load_conversation(id);
     }
@@ -329,108 +211,69 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     let conversation_id = state_manager
         .get_current_conversation_id()
         .expect("ensure_boot_conversation guarantees a current conversation");
+    // `load_conversation` restored the *saved* names; re-stamp the bound the
+    // session actually runs so a dropped name is not re-persisted.
+    state_manager.set_selection(ctx.bound.selection());
 
-    // `load_conversation` restored the *saved* selection; re-stamp the one the
-    // session actually booted on so an unconfigured name is dropped from the
-    // conversation too (and not re-persisted).
-    state_manager.set_selected_pipeline(active.map(|p| p.name.clone()));
-    state_manager.set_selected_profile(profile);
-
-    // Stamp the server-computed profile view (picker + tabs) from the
-    // per-session config — the client must not re-derive config rules.
-    // Under a pin the picker is empty, which is what hides the tab.
-    let selectable = selectable_profiles(&config, deps.profile_pin.as_deref());
-    state_manager.set_profile_view(
-        selectable.clone(),
-        session_visible_tabs(&config, &selectable),
+    // Boot migration notices reach the first session only.
+    let boot_notices = std::mem::take(
+        &mut *deps
+            .boot_notices
+            .lock()
+            .expect("boot_notices lock is never poisoned"),
     );
-
-    // A resumed conversation whose saved pipeline or profile is gone from
-    // config boots without it — say so rather than silently downgrade.
-    // Emitted after the load, which replaces the chat with the saved
-    // transcript.
-    for warning in pipeline_warning.into_iter().chain(profile_warnings) {
-        state_manager.add_system_message(warning);
+    for message in boot_notices.into_iter().chain(messages) {
+        state_manager.add_system_message(message);
     }
-
     // A resumed conversation whose saved model is gone from the registry
-    // boots on the default instead — tell the user rather than downgrade
-    // silently (the REPL `/load` rejects; a session boot must produce an
-    // agent, so it falls back and notes it).
-    if let Some((provider, model)) = boot.unavailable {
+    // boots on the bound agent's model — say so rather than downgrade
+    // silently.
+    if let Some((provider, model_name)) = unavailable {
         state_manager.add_system_message(format!(
-            "⚠ Model '{provider}/{model}' from this conversation is no longer available; \
-             loaded on '{boot_alias}' instead."
+            "⚠ Model '{provider}/{model_name}' from this conversation is no longer available; \
+             loaded on '{}' instead.",
+            model.alias
         ));
-    }
-
-    // Surface any skill-load failures from the boot scan so the user sees a
-    // broken skill instead of it silently going missing (TUI + web both
-    // render system messages).
-    for warning in &deps.skill_warnings {
-        state_manager.add_system_message(warning.clone());
     }
 
     let (action_sender, action_receiver) = mpsc::unbounded_channel::<UiAction>();
 
-    // `RebuildContext.system_prompt` is the per-session prompt (built from
-    // `session_cwd` above). A later `/model` rebuild will hand the same
-    // prompt to `create_provider`, so the cwd survives the model switch.
-    // A `/cd` rebuild overwrites this with a fresh prompt built from the
-    // new cwd.
-    let rebuild_ctx = RebuildContext {
-        registry: deps.model_registry.clone(),
-        system_prompt: session_prompt,
-        mcp_handles: deps.mcp_handles.clone(),
-        searxng_config: deps.searxng_config.clone(),
-        max_turns: config.agent_max_turns,
-        todo_tool: Some(todo_tool),
-        bash_config: config.bash.clone(),
-        pipelines: deps.pipelines.clone(),
-        shell_kind: deps.shell_kind.clone(),
-        skills: deps.skills.clone(),
-        vector_store: deps.vector_store.clone(),
-        memory_enabled: config.memory.enabled,
-        agents_md_enabled: config.agents_md,
-        tools_filter: config.tools.clone(),
-        prompt_head: config_head,
-        profile_pin: deps.profile_pin.clone(),
+    let general = &ctx.config.general;
+    let welcome = WelcomeState {
+        provider_name: provider_info.name.clone(),
+        model: provider_info.model.clone(),
+        max_tokens: model.provider_config.max_tokens() as usize,
+        // file_create, file_str_replace, file_insert, file_read, bash,
+        // list_directory, fetch_url, fetch_page, think, todo, search
+        builtin_tools_count: 11,
+        mcp_tools_count: deps.mcp_handles.len(),
+        skills_count: ctx.skills.len(),
+        searxng_enabled: general.search.is_some(),
+        searxng_url: general.search.as_ref().map(|s| s.base_url.clone()),
+        cost_tracking_enabled: crate::config::cost_tracking_enabled(general.cost_tracking, &model),
+        compaction_enabled: general.context.enabled,
+        compaction_threshold: general.context.threshold,
+        compaction_keep_recent: general.context.keep_recent,
+        conversation_persistence_enabled: deps.storage.is_some(),
+        cwd: session_cwd,
+        peakbot_version: PEAKBOT_VERSION.to_string(),
     };
 
     let mut runner = AgentRunner::new(
         agent,
-        config.clone(),
-        provider_info.clone(),
-        deps.skills.clone(),
+        Arc::clone(&ctx.config),
+        provider_info,
+        ctx.skills.clone(),
         event_receiver,
         Some(state_manager.clone()),
         session_hook,
-        context_size,
+        &model,
     )?
-    .with_rebuild_context(rebuild_ctx);
+    .with_rebuild_context(ctx);
 
     // Welcome banner's cwd reads from `session_cwd` (the single source of
-    // truth), not the live process cwd. Two web sessions in different trees
-    // each see their own cwd here, with no shared global touched.
-    state_manager.set_welcome(WelcomeState {
-        provider_name: provider_info.name.clone(),
-        model: provider_info.model.clone(),
-        max_tokens: config.max_tokens() as usize,
-        // file_create, file_str_replace, file_insert, file_read, bash,
-        // list_directory, fetch_url, fetch_page, think, todo, search
-        builtin_tools_count: 11,
-        mcp_tools_count: deps.mcp_tools_count,
-        skills_count: deps.skills_count,
-        searxng_enabled: config.searxng_enabled(),
-        searxng_url: config.searxng.as_ref().map(|s| s.base_url.clone()),
-        cost_tracking_enabled: config.supports_pricing() && config.cost_tracking,
-        compaction_enabled: config.context.enabled,
-        compaction_threshold: config.context.threshold,
-        compaction_keep_recent: config.context.keep_recent,
-        conversation_persistence_enabled: config.conversation_enabled(),
-        cwd: session_cwd,
-        peakbot_version: PEAKBOT_VERSION.to_string(),
-    });
+    // truth), not the live process cwd.
+    state_manager.set_welcome(welcome);
 
     let run_handle = tokio::spawn(async move {
         runner.run_loop(action_receiver).await;
@@ -439,68 +282,10 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     Ok(Session {
         state_manager,
         action_sender,
-        model_alias: boot_alias,
+        model_alias: model.alias,
         conversation_id,
         _run_handle: run_handle,
     })
-}
-
-/// What [`reload_for_resume`] rebuilt; `None` fields keep the boot value.
-struct Resumed {
-    /// Only when the profile differs from the boot one — a per-repo file
-    /// alone rebuilds just the pipeline set, as it always has.
-    config: Option<Config>,
-    pipelines: Option<PipelineSet>,
-}
-
-/// Rebuild config and pipeline set for a session that isn't running under
-/// the boot config: a resumed conversation whose tree has its own
-/// `.peakbot/config.yaml` (`check_per_repo`), or whose profile differs from
-/// the boot one. Without either, the boot values are authoritative — an empty
-/// set from `reload_for` would silently drop boot-declared teams.
-///
-/// A per-repo-only failure falls back silently, as before profiles; `Err` is
-/// reserved for a profile that couldn't be applied, which the caller reports.
-fn reload_for_resume(
-    deps: &SessionDeps,
-    cwd: &std::path::Path,
-    profile: Option<&str>,
-    check_per_repo: bool,
-) -> std::result::Result<Resumed, String> {
-    let profile_differs = profile != deps.config.active_profile.as_deref();
-    let per_repo = check_per_repo && cwd.join(".peakbot/config.yaml").is_file();
-    let keep_boot = Resumed {
-        config: None,
-        pipelines: None,
-    };
-    if !profile_differs && !per_repo {
-        return Ok(keep_boot);
-    }
-    match rebuild_config_and_pipelines(deps, cwd, profile) {
-        Ok((fresh, set)) => Ok(Resumed {
-            config: profile_differs.then(|| {
-                let mut config = deps.config.clone();
-                config.adopt_reloaded(fresh);
-                config
-            }),
-            pipelines: Some(set),
-        }),
-        Err(reason) if profile_differs => Err(reason),
-        Err(_) => Ok(keep_boot),
-    }
-}
-
-fn rebuild_config_and_pipelines(
-    deps: &SessionDeps,
-    cwd: &std::path::Path,
-    profile: Option<&str>,
-) -> std::result::Result<(Config, PipelineSet), String> {
-    let fresh = deps.config.reload_for(cwd, profile)?;
-    fresh.validate()?;
-    let registry = fresh.build_model_registry().map_err(|e| e.to_string())?;
-    let set = PipelineSet::build(&fresh, &registry, Some(&deps.skills.names()))
-        .map_err(|e| e.to_string())?;
-    Ok((fresh, set))
 }
 
 #[cfg(test)]

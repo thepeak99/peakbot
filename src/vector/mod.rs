@@ -561,10 +561,24 @@ pub enum IndexOutcome {
     Skipped,
 }
 
+/// Test helper: a `VectorSpec` from a `VectorDbConfig` literal with no
+/// profile origin — absolute → `Fixed`, relative → `SessionRelative`.
+#[cfg(test)]
+pub(crate) fn test_spec(config: &crate::config::VectorDbConfig) -> VectorSpec {
+    let db_path = if Path::new(&config.db_path).is_absolute() {
+        DbPathSpec::Fixed(PathBuf::from(config.db_path.as_str()))
+    } else {
+        DbPathSpec::SessionRelative(PathBuf::from(config.db_path.as_str()))
+    };
+    VectorSpec {
+        db_path,
+        embeddings: config.embeddings.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::resolve::VectorSpec;
     use crate::config::{EmbeddingsConfig, VectorDbConfig};
 
     #[test]
@@ -656,7 +670,7 @@ mod tests {
                 dimensions: 3,
             },
         };
-        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+        let store = VectorStore::open(&test_spec(&config)).unwrap();
         // Config path is absolute, so the session cwd is irrelevant here.
         let db_path = store.db_path_for(Path::new(""));
         // Materialize the DB so we can seed it directly.
@@ -729,7 +743,7 @@ mod tests {
     async fn reindex_orphans_absent_from_search() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
-        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+        let store = VectorStore::open(&test_spec(&config)).unwrap();
         // Config path is absolute, so the session cwd is irrelevant here.
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
@@ -785,7 +799,7 @@ mod tests {
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
 
         {
-            let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+            let store = VectorStore::open(&test_spec(&config)).unwrap();
             let db_path = store.db_path_for(Path::new(""));
             let db = store.db(&db_path).await.unwrap();
             db.insert_batch(&[
@@ -806,7 +820,7 @@ mod tests {
         }
 
         // Fresh store over the same path must see the same data.
-        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+        let store = VectorStore::open(&test_spec(&config)).unwrap();
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
 
@@ -827,7 +841,7 @@ mod tests {
     async fn delete_then_get_none_and_absent_from_search() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
-        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+        let store = VectorStore::open(&test_spec(&config)).unwrap();
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
 
@@ -869,7 +883,7 @@ mod tests {
     async fn reinsert_deleted_id_returns_new_vector() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
-        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+        let store = VectorStore::open(&test_spec(&config)).unwrap();
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
 
@@ -914,7 +928,7 @@ mod tests {
     async fn cosine_score_is_distance() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config_4d(dir.path().join("v.db").display().to_string());
-        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+        let store = VectorStore::open(&test_spec(&config)).unwrap();
         let db_path = store.db_path_for(Path::new(""));
         let db = store.db(&db_path).await.unwrap();
 
@@ -988,7 +1002,7 @@ mod tests {
             },
         };
 
-        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+        let store = VectorStore::open(&test_spec(&config)).unwrap();
         let resolved = store.db_path_for(Path::new(""));
         assert!(!db_path.exists(), "open() must not create the DB file");
 
@@ -1023,10 +1037,7 @@ mod tests {
     fn db_path_resolves_relative_against_session_cwd() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
-            "./.peakbot/vectors.db",
-        )))
-        .unwrap();
+        let store = VectorStore::open(&test_spec(&test_config("./.peakbot/vectors.db"))).unwrap();
         let first_base = first.path().canonicalize().unwrap();
         let second_base = second.path().canonicalize().unwrap();
 
@@ -1048,10 +1059,7 @@ mod tests {
         let db = tempfile::tempdir().unwrap().path().join("vectors.db");
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
-            db.display().to_string(),
-        )))
-        .unwrap();
+        let store = VectorStore::open(&test_spec(&test_config(db.display().to_string()))).unwrap();
 
         assert_eq!(
             store.db_path_for(first.path()),
@@ -1078,10 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn first_write_lands_under_session_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
-            "./.peakbot/vectors.db",
-        )))
-        .unwrap();
+        let store = VectorStore::open(&test_spec(&test_config("./.peakbot/vectors.db"))).unwrap();
         let path = store.db_path_for(dir.path());
         let _db = store.db(&path).await.unwrap();
 
@@ -1098,10 +1103,7 @@ mod tests {
         use ruvector_core::types::VectorEntry;
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
-            "./.peakbot/vectors.db",
-        )))
-        .unwrap();
+        let store = VectorStore::open(&test_spec(&test_config("./.peakbot/vectors.db"))).unwrap();
         let path_a = store.db_path_for(a.path());
         let path_b = store.db_path_for(b.path());
         let id = "synthetic-id";
@@ -1124,10 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn same_session_cwd_shares_one_handle() {
         let dir = tempfile::tempdir().unwrap();
-        let store = VectorStore::open(&VectorSpec::from_legacy(&test_config(
-            "./.peakbot/vectors.db",
-        )))
-        .unwrap();
+        let store = VectorStore::open(&test_spec(&test_config("./.peakbot/vectors.db"))).unwrap();
         let path = store.db_path_for(dir.path());
         let first = store.db(&path).await.unwrap();
         let second = store.db(&path).await.unwrap();
@@ -1139,11 +1138,11 @@ mod tests {
         let indexed = tempfile::tempdir().unwrap();
         let unindexed = tempfile::tempdir().unwrap();
         let config = test_config("./.peakbot/vectors.db");
-        let store = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+        let store = VectorStore::open(&test_spec(&config)).unwrap();
         let indexed_path = store.db_path_for(indexed.path());
         store.db(&indexed_path).await.unwrap();
 
-        let fresh = VectorStore::open(&VectorSpec::from_legacy(&config)).unwrap();
+        let fresh = VectorStore::open(&test_spec(&config)).unwrap();
         assert!(
             fresh
                 .db_if_exists(&fresh.db_path_for(indexed.path()))
@@ -1175,8 +1174,7 @@ mod tests {
 // LazyLock<Mutex<HashMap<DbPath, Arc<OnceCell<Arc<VectorDB>>>>>>`,
 // `VectorStore::open` takes a `&VectorSpec`, and `db_path_for` honours
 // `DbPathSpec::Fixed` (ignore cwd) vs `SessionRelative` (today's per-cwd
-// rule). Until the cutover, `main.rs` still gets a `VectorSpec` through the
-// temporary `VectorSpec::from_legacy(&VectorDbConfig)` shim (deleted in T9a).
+// rule).
 //
 // API the tests assume (exact signatures):
 //
@@ -1198,14 +1196,6 @@ mod tests {
 //         &self,
 //         session_cwd: &Path,
 //     ) -> Result<Arc<VectorDB>, VectorStoreError>;
-// }
-//
-// impl crate::config::resolve::VectorSpec {
-//     /// Temp shim for `main.rs` (deleted in T9a): the legacy 0.23
-//     /// `VectorDbConfig` has no origin, so a relative path is
-//     /// `SessionRelative` (today's behaviour) and an absolute one is
-//     /// `Fixed`.
-//     pub fn from_legacy(legacy: &crate::config::VectorDbConfig) -> Self;
 // }
 //
 // `VectorSpec` / `DbPathSpec` already exist in `crate::config::resolve`
@@ -1383,40 +1373,6 @@ mod t2_tests {
         assert!(
             Arc::ptr_eq(&ha, &store.handle_for_test(cwd_a.path()).await.unwrap()),
             "the same resolved path must keep returning the same handle"
-        );
-    }
-
-    /// The temp shim for `main.rs` (deleted in T9a) has no profile origin, so
-    /// it must keep today's behaviour: absolute → `Fixed`, relative →
-    /// `SessionRelative`. `~` stays as written (parse-time expansion is not
-    /// the shim's job).
-    #[test]
-    fn from_legacy_maps_absolute_to_fixed_relative_to_session_relative() {
-        let abs = tempfile::tempdir().unwrap().path().join("v.db");
-        let legacy_abs = crate::config::VectorDbConfig {
-            enabled: true,
-            db_path: abs.display().to_string(),
-            embeddings: EmbeddingsConfig {
-                base_url: "http://unused.invalid/v1".into(),
-                api_key: None,
-                model: "test".into(),
-                dimensions: 3,
-            },
-        };
-        let spec = VectorSpec::from_legacy(&legacy_abs);
-        assert_eq!(
-            spec.db_path,
-            DbPathSpec::Fixed(abs.clone()),
-            "absolute legacy db_path must become Fixed"
-        );
-
-        let mut legacy_rel = legacy_abs.clone();
-        legacy_rel.db_path = "./.peakbot/vectors.db".into();
-        let spec = VectorSpec::from_legacy(&legacy_rel);
-        assert_eq!(
-            spec.db_path,
-            DbPathSpec::SessionRelative(PathBuf::from("./.peakbot/vectors.db")),
-            "relative legacy db_path must stay session-relative (today's behaviour)"
         );
     }
 }

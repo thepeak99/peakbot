@@ -263,24 +263,6 @@ pub struct VectorSpec {
     pub embeddings: EmbeddingsConfig,
 }
 
-impl VectorSpec {
-    /// temporary shim, removed in the 0.24 cutover
-    pub fn from_legacy(legacy: &VectorDbConfig) -> Self {
-        // Relative (incl. `~`) stays `SessionRelative` — the shim must
-        // reproduce 0.23's per-cwd resolution byte-identically; `~` only
-        // becomes `Fixed` at `Config::parse`.
-        let db_path = if Path::new(&legacy.db_path).is_absolute() {
-            DbPathSpec::Fixed(PathBuf::from(legacy.db_path.as_str()))
-        } else {
-            DbPathSpec::SessionRelative(PathBuf::from(legacy.db_path.as_str()))
-        };
-        Self {
-            db_path,
-            embeddings: legacy.embeddings.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbPathSpec {
     /// Absolute, `~/…`, or repo-relative made absolute at parse time.

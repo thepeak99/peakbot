@@ -245,6 +245,19 @@ impl Default for ConversationConfig {
     }
 }
 
+impl ConversationConfig {
+    /// `storage_dir`, else `<data_local_dir>/peakbot/conversations` (the
+    /// 0.23 default, unchanged).
+    pub fn storage_dir_or_default(&self) -> PathBuf {
+        self.storage_dir.clone().unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("peakbot")
+                .join("conversations")
+        })
+    }
+}
+
 /// 0.24 per-profile `ui` block: `tabs` is a plain `NameFilter` (default =
 /// allow all) instead of the old `Option<NameFilter>`.
 #[derive(Debug, Deserialize, Clone, PartialEq, Default)]

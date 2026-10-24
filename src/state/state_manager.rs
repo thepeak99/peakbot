@@ -1397,9 +1397,7 @@ impl StateManager {
         // the bound).
         let selection = self.state.read().unwrap().selection.clone();
         let mut conv = Conversation::new(name, provider_name, model, cwd);
-        // The `pipeline` field carries the agent name until T9a renames it
-        // to `agent` (serde alias "pipeline" — old files keep reading).
-        conv.pipeline = (!selection.agent.is_empty()).then(|| selection.agent.clone());
+        conv.agent = (!selection.agent.is_empty()).then(|| selection.agent.clone());
         conv.profile = (!selection.profile.is_empty()).then(|| selection.profile.clone());
         *self.current_conversation.lock().unwrap() = Some(conv);
         self.mirror_conversation_to_state();
@@ -1447,9 +1445,7 @@ impl StateManager {
     /// `set_selection_and_persist_current_do_not_deadlock`).
     pub fn set_selection(&self, selection: crate::config::resolve::Selection) {
         if let Some(conv) = self.current_conversation.lock().unwrap().as_mut() {
-            // The `pipeline` field carries the agent name until T9a renames
-            // it to `agent` (serde alias "pipeline").
-            conv.pipeline = Some(selection.agent.clone());
+            conv.agent = Some(selection.agent.clone());
             conv.profile = Some(selection.profile.clone());
         }
         let mut state = self.state.write().unwrap();
@@ -1556,9 +1552,7 @@ impl StateManager {
                 .unwrap()
                 .as_ref()
                 .map(|c| crate::config::resolve::Selection {
-                    // The `pipeline` field carries the agent name (T9a
-                    // renames it to `agent`, serde alias "pipeline").
-                    agent: c.pipeline.clone().unwrap_or_default(),
+                    agent: c.agent.clone().unwrap_or_default(),
                     profile: c.profile.clone().unwrap_or_default(),
                 })
                 .unwrap_or_default();
@@ -1616,9 +1610,7 @@ impl StateManager {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("conversation storage is not configured"))?;
         let conv = storage.load(id)?;
-        // The `pipeline` field carries the agent name (T9a renames it to
-        // `agent`, serde alias "pipeline").
-        let (agent, profile) = (conv.pipeline, conv.profile);
+        let (agent, profile) = (conv.agent, conv.profile);
         match (agent, profile) {
             (None, None) => Ok(None),
             (agent, profile) => Ok(Some(crate::config::resolve::Selection {
@@ -3731,7 +3723,7 @@ mod tests {
 
         // Default session: no selection.
         sm.create_conversation("a".into(), "prov".into(), "model".into(), String::new());
-        assert!(sm.get_current_conversation().unwrap().pipeline.is_none());
+        assert!(sm.get_current_conversation().unwrap().agent.is_none());
         assert!(sm.get_current_conversation().unwrap().profile.is_none());
 
         // A session with a selection → the minted conversation carries it.
@@ -3741,7 +3733,7 @@ mod tests {
         });
         sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
         let conv = sm.get_current_conversation().unwrap();
-        assert_eq!(conv.pipeline.as_deref(), Some("team"));
+        assert_eq!(conv.agent.as_deref(), Some("team"));
         assert_eq!(conv.profile.as_deref(), Some("dev"));
     }
 
@@ -3769,7 +3761,7 @@ mod tests {
         sm.create_conversation("b".into(), "prov".into(), "model".into(), String::new());
 
         assert_eq!(
-            sm.get_current_conversation().unwrap().pipeline.as_deref(),
+            sm.get_current_conversation().unwrap().agent.as_deref(),
             Some("team"),
             "persisted truth: the minted conversation carries the selection"
         );
@@ -8042,8 +8034,7 @@ mod tests {
     // ── 0.24 cutover: selection state (catalog / selection / pin) ──────────
     //
     // These pin the cutover: the per-conversation selection state lives on
-    // `Conversation.{pipeline,profile}` (persisted; T9a renames `pipeline`
-    // to `agent`) and is mirrored into `AppState.selection` for the live UI.
+    // `Conversation.{agent,profile}` (persisted) and is mirrored into `AppState.selection` for the live UI.
     // The old nullable-string pair (`selected_pipeline` + `active_profile`)
     // is replaced by one concrete `Selection { profile, agent }` — a
     // selection is always a pair, never "cleared" to `None`.
@@ -8077,10 +8068,10 @@ mod tests {
         assert_eq!(
             sm.get_current_conversation()
                 .expect("current conversation")
-                .pipeline
+                .agent
                 .as_deref(),
             Some("team"),
-            "the conversation's persisted `pipeline` field must mirror the agent"
+            "the conversation's persisted `agent` field must mirror the selection"
         );
         assert_eq!(
             sm.get_current_conversation()
@@ -8101,7 +8092,7 @@ mod tests {
         assert_eq!(
             sm.get_current_conversation()
                 .expect("current conversation")
-                .pipeline
+                .agent
                 .as_deref(),
             Some("main")
         );
@@ -8147,13 +8138,9 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::default());
         let sm = StateManager::new_arc_with_storage(storage.clone());
 
-        let mut conv = Conversation::new(
-            "bound".into(),
-            "prov".into(),
-            "model".into(),
-            String::new(),
-        );
-        conv.pipeline = Some("team".into());
+        let mut conv =
+            Conversation::new("bound".into(), "prov".into(), "model".into(), String::new());
+        conv.agent = Some("team".into());
         conv.profile = Some("dev".into());
         let id = conv.id;
         storage.save(&conv).unwrap();
@@ -8197,7 +8184,7 @@ mod tests {
             "model".into(),
             String::new(),
         );
-        conv.pipeline = Some("team".into());
+        conv.agent = Some("team".into());
         conv.profile = Some("dev".into());
         let id = conv.id;
         storage.save(&conv).unwrap();
@@ -8228,8 +8215,8 @@ mod tests {
     /// `peek_conversation_selection` returns `None`.
     #[test]
     fn legacy_conversation_without_selection_fields_defaults() {
-        use crate::conversation::Conversation;
         use crate::config::resolve::Selection;
+        use crate::conversation::Conversation;
         use crate::storage::InMemoryStorage;
         let storage = Arc::new(InMemoryStorage::default());
         let sm = StateManager::new_arc_with_storage(storage.clone());
@@ -8310,7 +8297,11 @@ mod tests {
             let mut toggle = false;
             while !stop_a.load(Ordering::Relaxed) {
                 sm_a.set_selection(crate::config::resolve::Selection {
-                    profile: if toggle { "dev".into() } else { "default".into() },
+                    profile: if toggle {
+                        "dev".into()
+                    } else {
+                        "default".into()
+                    },
                     agent: if toggle { "team".into() } else { "main".into() },
                 });
                 toggle = !toggle;

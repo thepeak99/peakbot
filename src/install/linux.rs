@@ -30,12 +30,15 @@ const LINGER_DIR: &str = "/var/lib/systemd/linger";
 /// whitespace, so a home directory with a space would otherwise become two
 /// argv entries. Exactly one `Environment=` line — `PEAKBOT_NO_OPEN=1`
 /// (B2: a background service must never open a browser). It is
-/// secret-free; the token stays in the `web-token` file (§E.5), never in
-/// an artifact.
+/// secret-free; the service reads the token from `general.web.token`, never
+/// from an artifact.
 pub fn render_unit(plan: &ServicePlan) -> String {
     let argv = plan.argv();
-    let exe = &argv[0];
-    let args = argv[1..].join(" ");
+    // No trailing space when the plan carries no flags.
+    let exec_start = std::iter::once(format!("\"{}\"", argv[0]))
+        .chain(argv[1..].iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         "[Unit]\n\
          Description={display} agent (web UI)\n\
@@ -44,7 +47,7 @@ pub fn render_unit(plan: &ServicePlan) -> String {
          [Service]\n\
          Type=simple\n\
          Environment=PEAKBOT_NO_OPEN=1\n\
-         ExecStart=\"{exe}\" {args}\n\
+         ExecStart={exec_start}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -343,7 +346,7 @@ mod tests {
     fn unit_has_exactly_one_secret_free_environment_directive() {
         // B2: a background service must never open a browser — the unit
         // carries exactly one `Environment=` line, `PEAKBOT_NO_OPEN=1`
-        // (secret-free; the token stays in the web-token file).
+        // (secret-free; the token lives in config.yaml).
         let unit = render_unit(&plan("/home/you/.local/bin/peakbot"));
         let env_lines: Vec<&str> = unit
             .lines()

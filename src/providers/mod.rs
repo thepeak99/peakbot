@@ -1133,7 +1133,7 @@ pub fn create_mock_agent(
     let agent_builder = AgentBuilder::new(mock_model)
         .preamble(system_prompt)
         .max_tokens(1024)
-        .default_max_turns(tool_env.max_turns)
+        .default_max_turns(max_turns)
         .hook(hook.clone());
 
     // Add built-in tools (simplified for testing)

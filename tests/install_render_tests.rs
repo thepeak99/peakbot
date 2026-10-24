@@ -113,6 +113,28 @@ fn service_plan_lan_with_real_token_is_ok() {
     assert_eq!(argv[2], "0.0.0.0:7823");
 }
 
+/// §8.4: `service install` without `--bind` / `--tls` writes a unit that
+/// carries neither, so the service reads `general.web` at every start. The
+/// bind is still validated against the token.
+#[test]
+fn service_plan_without_explicit_bind_or_tls_omits_both_flags() {
+    let plan = plan_loopback("/usr/bin/peakbot").with_bind_in_argv(false);
+    assert_eq!(plan.argv(), vec!["/usr/bin/peakbot".to_string()]);
+    assert!(
+        render_unit(&plan).contains("ExecStart=\"/usr/bin/peakbot\"\n"),
+        "the unit's ExecStart must carry no web flags:\n{}",
+        render_unit(&plan)
+    );
+
+    let err = ServicePlan::new(PathBuf::from("/usr/bin/peakbot"), bind_lan(), None)
+        .map(|p| p.with_bind_in_argv(false))
+        .unwrap_err();
+    assert!(
+        matches!(err, PlanError::TokenRequired(_)),
+        "an implicit LAN bind (from general.web.bind) still needs a token"
+    );
+}
+
 // ===========================================================================
 // I1 — path_state over a synthetic PATH (plan §E.4).
 // ===========================================================================

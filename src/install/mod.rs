@@ -160,7 +160,13 @@ pub enum PlanError {
 #[derive(Debug, Clone)]
 pub struct ServicePlan {
     exe: PathBuf,
+    /// The effective bind the service will listen on — validated against
+    /// the token in [`ServicePlan::new`].
     bind: SocketAddr,
+    /// Whether `--bind` goes on the argv. Only an explicit `service install
+    /// --bind` pins it; without it the service reads `general.web.bind` at
+    /// every start, so a Settings edit plus a restart applies (§8.4).
+    bind_in_argv: bool,
     /// `None` is a meaningful state only for loopback binds. Whitespace-
     /// only values are rejected by [`ServicePlan::new`] so the inner
     /// `Option<String>` only ever holds `Some(real_token)` or `None`.
@@ -190,10 +196,20 @@ impl ServicePlan {
         Ok(Self {
             exe,
             bind,
+            bind_in_argv: true,
             token,
             tls: false,
             tls_names: Vec::new(),
         })
+    }
+
+    /// Keep `--bind` off the argv (`false`) so the service reads
+    /// `general.web.bind` at start. On by default.
+    pub fn with_bind_in_argv(self, bind_in_argv: bool) -> Self {
+        Self {
+            bind_in_argv,
+            ..self
+        }
     }
 
     /// Enable HTTPS on the service argv. TLS only changes the argv — the
@@ -209,16 +225,16 @@ impl ServicePlan {
     }
 
     /// The argv that every service artifact on every platform embeds:
-    /// `<exe> --bind <addr>`, then `--tls` and one `--tls-name <NAME>` pair
-    /// per name (in the given order) when TLS is on. Per §E.5 no secret
-    /// ever appears in any artifact — the token comes from the `web-token`
-    /// file (§E.5), not from this list.
+    /// `<exe>`, `--bind <addr>` unless [`Self::with_bind_in_argv`] turned it
+    /// off, then `--tls` and one `--tls-name <NAME>` pair per name (in the
+    /// given order) when TLS is on. No secret ever appears in any artifact —
+    /// the service reads the token from `general.web.token` at start.
     pub fn argv(&self) -> Vec<String> {
-        let mut argv = vec![
-            self.exe.display().to_string(),
-            "--bind".to_string(),
-            self.bind.to_string(),
-        ];
+        let mut argv = vec![self.exe.display().to_string()];
+        if self.bind_in_argv {
+            argv.push("--bind".to_string());
+            argv.push(self.bind.to_string());
+        }
         if self.tls {
             argv.push("--tls".to_string());
             for name in &self.tls_names {
@@ -520,17 +536,6 @@ pub fn install_binary() -> Result<InstallOutcome, InstallError> {
 /// Returns `None` only if the platform has no config dir at all.
 pub fn web_token_path() -> Option<PathBuf> {
     crate::config::get_config_dir().map(|d| d.join("web-token"))
-}
-
-/// Pure precedence: `--token > env > file > none`. Empty / whitespace-
-/// only values at every level are treated as absent, matching the
-/// §E.5 "this machine has a token" model. Used by `main`'s web bind.
-pub fn resolve_token(flag: Option<&str>, env: Option<&str>, file: Option<&str>) -> Option<String> {
-    [flag, env, file]
-        .into_iter()
-        .flatten()
-        .find(|t| !t.trim().is_empty())
-        .map(|t| t.trim().to_string())
 }
 
 /// Write the web token to `path` with `0600` perms on Unix. Trailing
@@ -1333,33 +1338,6 @@ mod tests {
     }
 
     // ── §E.5 token file ─────────────────────────────────────────────
-
-    #[test]
-    fn resolve_token_precedence_is_flag_then_env_then_file() {
-        assert_eq!(
-            resolve_token(Some("f"), Some("e"), Some("x")),
-            Some("f".to_string())
-        );
-        assert_eq!(
-            resolve_token(None, Some("e"), Some("x")),
-            Some("e".to_string())
-        );
-        assert_eq!(resolve_token(None, None, Some("x")), Some("x".to_string()));
-        assert_eq!(resolve_token(None, None, None), None);
-    }
-
-    #[test]
-    fn resolve_token_skips_empty_and_whitespace_at_every_level() {
-        assert_eq!(
-            resolve_token(Some(""), Some("e"), Some("x")),
-            Some("e".to_string())
-        );
-        assert_eq!(
-            resolve_token(Some("   "), Some("  "), Some("x")),
-            Some("x".to_string())
-        );
-        assert_eq!(resolve_token(Some(""), Some("   "), Some("\n")), None);
-    }
 
     #[test]
     fn write_then_read_web_token_round_trips() {
