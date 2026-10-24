@@ -43,6 +43,7 @@ export function TopBar({
   onOpenSettings,
   catalog,
   selection,
+  selectionLocked = false,
   profilePinned = false,
   onToast,
 }: {
@@ -77,6 +78,9 @@ export function TopBar({
   // selection. Both render null on their own when absent.
   catalog?: CatalogProfile[];
   selection?: Selection | null;
+  /** The conversation has a user/agent turn (`conversationHasTurns`) — the
+   * selection chip locks. Not `hasTranscript`: system notices don't lock. */
+  selectionLocked?: boolean;
   /** `AppState.profile_pinned` — a --profile pin freezes the profile. */
   profilePinned?: boolean;
   /** Toast sink for `Next conversation: …` (agent pick). */
@@ -100,7 +104,7 @@ export function TopBar({
         <SelectionChip
           catalog={catalog ?? []}
           selection={selection ?? null}
-          locked={hasTranscript}
+          locked={selectionLocked}
           pinned={profilePinned}
           send={send}
           onToast={onToast}

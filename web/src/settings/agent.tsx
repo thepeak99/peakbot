@@ -367,6 +367,11 @@ export function AgentPage({ profile, agent }: { profile: string; agent: string }
             const sp: Seg[] = [...subsPath, name];
             const sModel = asString(s.model);
             const sModelKnown = sModel === undefined || options.some((o) => o.alias === sModel);
+            // Same rule as the main model select: red + message when the alias
+            // is unknown locally or the server flagged this path (Fix lands here).
+            const sModelError =
+              errAt(errors, [...sp, "model"]) ??
+              (sModelKnown ? undefined : `Unknown model alias ${sModel}`);
             const sPrompt = asString(s.prompt);
             const promptMissing = sPrompt === undefined || sPrompt.trim() === "";
             return (
@@ -388,7 +393,8 @@ export function AgentPage({ profile, agent }: { profile: string; agent: string }
                       data-testid={`agent-sub-model-${i}`}
                       value={sModel ?? ""}
                       onChange={(e) => edit([...sp, "model"], e.target.value === "" ? undefined : e.target.value)}
-                      className={SELECT_CLS}
+                      aria-invalid={sModelError ? true : undefined}
+                      className={SELECT_CLS + (sModelError ? " border-red-600" : "")}
                     >
                       <option value="">{`inherits ${model ?? "the agent model"}`}</option>
                       {sModel !== undefined && !sModelKnown && (
@@ -400,6 +406,11 @@ export function AgentPage({ profile, agent }: { profile: string; agent: string }
                         </option>
                       ))}
                     </select>
+                    {sModelError && (
+                      <span data-testid="error" className="mt-1 block text-[11px] text-red-400">
+                        {sModelError}
+                      </span>
+                    )}
                   </div>
                 </div>
 

@@ -31,6 +31,7 @@ export function BottomBar({
   onLoadConversation,
   catalog,
   selection,
+  selectionLocked = false,
   profilePinned = false,
   onToast,
 }: {
@@ -48,6 +49,9 @@ export function BottomBar({
   // T32 chat chips (optional — absent ⇒ no chips, as on older servers).
   catalog?: CatalogProfile[];
   selection?: Selection | null;
+  /** The conversation has a user/agent turn (`conversationHasTurns`) — the
+   * selection chip locks. Not `hasTranscript`: system notices don't lock. */
+  selectionLocked?: boolean;
   /** `AppState.profile_pinned` — a --profile pin freezes the profile. */
   profilePinned?: boolean;
   /** Toast sink for `Next conversation: …` (agent pick). */
@@ -59,7 +63,7 @@ export function BottomBar({
       <SelectionChip
         catalog={catalog ?? []}
         selection={selection ?? null}
-        locked={hasTranscript}
+        locked={selectionLocked}
         pinned={profilePinned}
         send={send}
         onToast={onToast}

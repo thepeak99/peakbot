@@ -47,6 +47,7 @@ import {
   adaptSubAgent,
   adaptWelcome,
   boundAgentOf,
+  conversationHasTurns,
   deriveSubAgentRoster,
   filesFromMessages,
   filterMessagesByView,
@@ -96,6 +97,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
 
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
+  const selectionLocked = conversationHasTurns(state?.chat.messages ?? []);
   // Desktop conversation tabs (null in a browser). The title is only offered
   // once `state` describes the conversation the socket is bound to — right
   // after a switch it still describes the previous one.
@@ -322,6 +324,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         onOpenSettings={settingsEnabled ? settingsView.toggle : undefined}
         catalog={catalog}
         selection={selection}
+        selectionLocked={selectionLocked}
         profilePinned={state?.profile_pinned ?? false}
         onToast={showToast}
       />
@@ -418,6 +421,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         onLoadConversation={loadConversation}
         catalog={catalog}
         selection={selection}
+        selectionLocked={selectionLocked}
         profilePinned={state?.profile_pinned ?? false}
         onToast={showToast}
       />

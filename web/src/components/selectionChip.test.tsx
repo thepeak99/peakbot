@@ -259,6 +259,17 @@ describe("selection chip (T32, spec §9.1)", () => {
     expect(q("selection-profile-peakbot-dev").getAttribute("data-browsed")).toBe("true");
   });
 
+  // T34 regression (Playwright flow 8, §9.14): at 390 px the two-column
+  // popover ran off the right edge. jsdom has no layout, so pin the
+  // narrow-viewport classes that make it full-width and stacked.
+  it("popover_stacks_full_width_on_narrow_viewports", () => {
+    mountChip();
+    click(q("selection-chip"));
+    const cls = q("selection-popover").className;
+    expect(cls).toContain("max-[800px]:flex-col");
+    expect(cls).toContain("max-[800px]:w-[calc(100vw-1.5rem)]");
+  });
+
   it("chip_locked_after_turn", () => {
     const { send } = mountChip({ locked: true });
     const chip = q<HTMLButtonElement>("selection-chip");
@@ -462,11 +473,25 @@ describe("TopBar / BottomBar chips (T32)", () => {
     expect(sel.compareDocumentPosition(agents) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("topbar_chip_locks_once_the_chat_has_a_transcript", () => {
-    const props = { ...barBase(), ...chatChips, hasTranscript: true } as ComponentProps<typeof TopBar>;
+  it("topbar_chip_locks_once_the_conversation_has_turns", () => {
+    const props = { ...barBase(), ...chatChips, selectionLocked: true } as ComponentProps<typeof TopBar>;
     mount(<TopBar {...props} />);
     expect(text("selection-chip")).toContain("🔒");
     expect(q<HTMLButtonElement>("selection-chip").disabled).toBe(true);
+  });
+
+  // T34 regression: picking an agent posts a `Profile: …` system message, so
+  // the transcript is non-empty with zero turns — the chip must stay usable.
+  it("topbar_chip_stays_unlocked_with_only_system_messages", () => {
+    const props = {
+      ...barBase(),
+      ...chatChips,
+      hasTranscript: true,
+      selectionLocked: false,
+    } as ComponentProps<typeof TopBar>;
+    mount(<TopBar {...props} />);
+    expect(text("selection-chip")).not.toContain("🔒");
+    expect(q<HTMLButtonElement>("selection-chip").disabled).toBe(false);
   });
 
   it("topbar_agent_click_sends_select_through_send", () => {

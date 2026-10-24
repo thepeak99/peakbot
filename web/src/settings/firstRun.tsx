@@ -20,6 +20,7 @@ import { isDesktop } from "../desktop";
 import { putConfig } from "./api";
 import { generateToken } from "./general";
 import { NEUTRAL_PERSONA, TERSE_PERSONA } from "./agent";
+import { BASE_URL_PRESETS } from "./providerTypes";
 import type { FirstRunAnswers, FirstRunProviderType, SetupPhase } from "./contract";
 import type { ConfigText, PutOk, SettingsMeta } from "./types";
 
@@ -267,10 +268,23 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
             <p className="text-sm text-zinc-300">Restart PeakBot to start chatting.</p>
             <div className="space-y-1 font-mono text-[11px] text-zinc-500">
               <div>Config: {global.path}</div>
-              <div>Version: {meta.facts.version}</div>
               {finished && putOk.backup !== null && (
                 <div data-testid="firstrun-restart-backup">Backup: {putOk.backup}</div>
               )}
+              {/* §9.13 facts order: Config · Backup · Provider · Agent · Version.
+                  Provider/Agent come from this session's answers, so the
+                  derived restart_pending screen (after a reload) omits them. */}
+              {finished && (
+                <>
+                  <div data-testid="firstrun-restart-provider">
+                    Provider: {effective.provider.name} ({effective.provider.type})
+                  </div>
+                  <div data-testid="firstrun-restart-agent">
+                    Agent: default › main — {effective.agent.model}
+                  </div>
+                </>
+              )}
+              <div>Version: {meta.facts.version}</div>
             </div>
           </div>
         </div>
@@ -390,7 +404,18 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                       data-testid="input"
                       className={INPUT_CLS}
                       value={pType}
-                      onChange={(e) => setProvider({ type: e.target.value as FirstRunProviderType })}
+                      onChange={(e) => {
+                        const type = e.target.value as FirstRunProviderType;
+                        setProvider({
+                          type,
+                          // Same auto-fill as the Providers pane (§9.8);
+                          // OpenRouter's endpoint is fixed, so it has none.
+                          base_url: type === "openrouter" ? undefined : BASE_URL_PRESETS[type],
+                          // The name starts out as the type: keep it in step
+                          // until the user types their own.
+                          ...(answers.provider.name === pType ? { name: type } : {}),
+                        });
+                      }}
                     >
                       {PROVIDER_TYPES.map((t) => (
                         <option key={t.value} value={t.value}>

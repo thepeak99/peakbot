@@ -161,15 +161,7 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     ctx.bound = bound;
     messages.extend(warnings);
     state_manager.set_profile_pinned(deps.profile_pin.is_some());
-    state_manager.set_selection(ctx.bound.selection());
-    state_manager.set_visible_tabs(
-        ctx.bound
-            .profile
-            .tabs
-            .iter()
-            .map(|tab| tab.to_string())
-            .collect(),
-    );
+    crate::publish_bound(&state_manager, &ctx.bound);
 
     // Boot model: a resumed conversation's saved wire id when it is still
     // configured (the model is free, spec §6.5), else the bound agent's model.

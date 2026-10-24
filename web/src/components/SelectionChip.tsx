@@ -117,11 +117,13 @@ export function SelectionChip({
       {open && !locked && (
         <div
           data-testid="selection-popover"
-          className={`absolute left-0 z-20 flex w-[26rem] overflow-hidden rounded-md border border-zinc-800 bg-zinc-900 shadow-xl ${
+          // ≤ 800 px (§9.14): full-width and stacked — profiles above agents —
+          // instead of two columns running off the right edge of a phone.
+          className={`absolute left-0 z-20 flex w-[26rem] overflow-hidden rounded-md border border-zinc-800 bg-zinc-900 shadow-xl max-[800px]:w-[calc(100vw-1.5rem)] max-[800px]:flex-col ${
             dropUp ? "bottom-full mb-1" : "top-full mt-1"
           }`}
         >
-          <div className="w-44 shrink-0 border-r border-zinc-800 py-1">
+          <div className="w-44 shrink-0 border-r border-zinc-800 py-1 max-[800px]:w-full max-[800px]:border-r-0 max-[800px]:border-b">
             {profileList.map((p, i) => (
               <button
                 key={p.name}

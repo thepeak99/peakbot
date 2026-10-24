@@ -17,18 +17,7 @@ import { get } from "./yamlDoc";
 import { errAt } from "./paths";
 import { Badge, Field, SecretInput, Tri, type VisionTri } from "./widgets";
 import type { ConfigErr, Seg } from "./types";
-
-const TYPES = ["openrouter", "openai", "anthropic", "llamacpp", "ollama"] as const;
-type ProviderType = (typeof TYPES)[number];
-
-/** Preset base_url per provider type (spec §9.8). openrouter is fixed. */
-const BASE_URL_PRESETS: Record<ProviderType, string> = {
-  openrouter: "https://openrouter.ai/api/v1",
-  openai: "https://api.openai.com/v1",
-  anthropic: "https://api.anthropic.com",
-  ollama: "http://127.0.0.1:11434",
-  llamacpp: "http://127.0.0.1:8080",
-};
+import { BASE_URL_PRESETS, PROVIDER_TYPES as TYPES, type ProviderType } from "./providerTypes";
 
 /** `+ Add model` preset chips per type (mockup MODEL_PRESETS). */
 const MODEL_PRESETS: Record<ProviderType, [string, string, number][]> = {

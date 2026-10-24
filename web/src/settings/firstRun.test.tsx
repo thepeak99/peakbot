@@ -544,6 +544,28 @@ describe("FirstRun — step validation (spec §9.13 steps 2–4)", () => {
     expect(errs).toContain("Add at least one model.");
   });
 
+  // T34 regression: changing the type left base_url empty and the name on
+  // "openrouter", so an Ollama setup was written as `name: openrouter` with
+  // no base_url. Spec §9.13: base_url is auto-filled.
+  it("provider_type_change_autofills_base_url_and_default_name", () => {
+    stubApi();
+    mountFirstRun();
+    click(q("firstrun-start-fresh"));
+    choose(ctl<HTMLSelectElement>("fr-provider-type"), "ollama");
+    expect(ctl("fr-provider-baseurl").value).toBe("http://127.0.0.1:11434");
+    expect(ctl("fr-provider-name").value).toBe("ollama");
+
+    // A name the user typed is theirs: a later type change keeps it.
+    typeInto(ctl("fr-provider-name"), "my-box");
+    choose(ctl<HTMLSelectElement>("fr-provider-type"), "llamacpp");
+    expect(ctl("fr-provider-baseurl").value).toBe("http://127.0.0.1:8080");
+    expect(ctl("fr-provider-name").value).toBe("my-box");
+
+    // OpenRouter's endpoint is fixed: no base_url.
+    choose(ctl<HTMLSelectElement>("fr-provider-type"), "openrouter");
+    expect(ctl("fr-provider-baseurl").value).toBe("");
+  });
+
   it("agent_step_announces_generated_profile_agent_and_model", () => {
     stubApi();
     mountFirstRun();
@@ -702,6 +724,18 @@ describe("FirstRun — Review + Finish (spec §9.13 steps 5–6)", () => {
     expect(host.querySelectorAll("a[href]").length).toBe(0);
     expect(loc.href).toBe("http://localhost/"); // no navigation in a browser
     expect(has("firstrun-restart-backup")).toBe(false); // PutOk.backup === null
+  });
+
+  // T34 regression (spec §9.13): the success screen's facts include the
+  // Provider and the Agent — they were missing.
+  it("restart_screen_lists_provider_and_agent_facts", async () => {
+    stubApi();
+    mountFirstRun();
+    driveToReview();
+    click(q("firstrun-finish"));
+    await flush();
+    expect(text("firstrun-restart-provider")).toMatch(/^Provider: \S+ \(\w+\)$/);
+    expect(text("firstrun-restart-agent")).toMatch(/^Agent: default › main — \S+$/);
   });
 
   it("restart_screen_lists_backup_only_when_one_exists", async () => {

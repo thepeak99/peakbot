@@ -191,6 +191,14 @@ export function adaptSelection(s: AppState): Selection | null {
     : null;
 }
 
+/** True once the conversation has a user or agent message. Mirrors
+ * `StateManager::conversation_has_turns`, which is what the server uses to
+ * refuse `select`: system notices (welcome, restart warnings, the
+ * `Profile: …` confirmation itself) must not lock the selection chip. */
+export function conversationHasTurns(messages: WireChatMessage[]): boolean {
+  return messages.some((m) => m.role === "user" || m.role === "agent");
+}
+
 /** Resolve a selection to its catalog agent (the roster the Agents panel and
  * the Agents chip render), or null when nothing is bound / it isn't listed. */
 export function boundAgentOf(

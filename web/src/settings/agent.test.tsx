@@ -109,7 +109,7 @@ profiles:
 
 const AGENT: Seg[] = ["profiles", "dev", "agents", "lead"];
 
-function mountAgent(yaml: string): Edit[] {
+function mountAgent(yaml: string, errors: SettingsCtxValue["errors"] = []): Edit[] {
   const edits: Edit[] = [];
   const ctx: SettingsCtxValue = {
     scope: "global",
@@ -118,7 +118,7 @@ function mountAgent(yaml: string): Edit[] {
     edit: (path, value) => {
       edits.push({ path, value });
     },
-    errors: [],
+    errors,
   };
   mount(
     <ToastProvider>
@@ -240,6 +240,40 @@ describe("agent page (T28)", () => {
     const w = lastWrite(edits, model);
     expect(w, "subagent model written").toBeDefined();
     expect(w!.value, "inherit omits the model key").toBeUndefined();
+  });
+
+  // T34 regression (Playwright flow 1): Fix on a subagent-model error must
+  // land on a RED select — it only showed a `⚠` option before.
+  it("subagent_unknown_model_select_is_red", () => {
+    mountAgent(DOC.replace("model: qwen", "model: nope"));
+    const sel = q<HTMLSelectElement>("[data-testid='agent-sub-model-0']");
+    expect(sel.className).toContain("border-red-600");
+    expect(sel.getAttribute("aria-invalid")).toBe("true");
+    expect(host.querySelector("[data-testid='agent-sub-0'] [data-testid='error']")?.textContent).toBe(
+      "Unknown model alias nope",
+    );
+  });
+
+  it("subagent_model_server_error_marks_select", () => {
+    mountAgent(DOC, [
+      {
+        file: "global",
+        path: [...AGENT, "subagents", "tester", "model"],
+        message: "server says no",
+      },
+    ]);
+    const sel = q<HTMLSelectElement>("[data-testid='agent-sub-model-0']");
+    expect(sel.className).toContain("border-red-600");
+    expect(host.querySelector("[data-testid='agent-sub-0'] [data-testid='error']")?.textContent).toBe(
+      "server says no",
+    );
+  });
+
+  it("subagent_known_model_select_is_not_red", () => {
+    mountAgent(DOC);
+    const sel = q<HTMLSelectElement>("[data-testid='agent-sub-model-0']");
+    expect(sel.className).not.toContain("border-red-600");
+    expect(sel.hasAttribute("aria-invalid")).toBe(false);
   });
 
   // §9.4: while `persona` is absent, the textarea placeholder is the

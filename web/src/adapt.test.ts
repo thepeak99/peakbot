@@ -6,6 +6,7 @@ import {
   adaptStats,
   adaptSubAgent,
   assignDelegationCalls,
+  conversationHasTurns,
   deriveSubAgentRoster,
   filterMessagesByView,
   flatTree,
@@ -913,5 +914,26 @@ describe("adaptMessage — attachments (T9)", () => {
       attachments: [],
     });
     expect(adapted.attachments ?? []).toEqual([]);
+  });
+});
+
+// T34 regression: the selection chip locked as soon as a system notice (e.g.
+// the `Profile: …` confirmation of a pick) landed. Mirrors the server's
+// StateManager::conversation_has_turns.
+describe("conversationHasTurns", () => {
+  const m = (role: WireChatMessage["role"]): WireChatMessage => ({
+    role,
+    content: "x",
+    timestamp: "2026-01-01T00:00:00Z",
+  });
+
+  it("is false for an empty or system-only transcript", () => {
+    expect(conversationHasTurns([])).toBe(false);
+    expect(conversationHasTurns([m("system"), m("system")])).toBe(false);
+  });
+
+  it("is true once a user or agent message exists", () => {
+    expect(conversationHasTurns([m("system"), m("user")])).toBe(true);
+    expect(conversationHasTurns([m("agent")])).toBe(true);
   });
 });

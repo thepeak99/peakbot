@@ -696,17 +696,25 @@ fn reload_config(
     }
 
     // 7. Publish what the session is bound to.
-    sm.set_selection(ctx.bound.selection());
+    publish_bound(sm, &ctx.bound);
+
+    messages
+}
+
+/// Publish the session's `Bound` to the UI state. The selection and the
+/// visible tabs always travel together: the tabs (including `settings`, which
+/// gates the gear) belong to the bound profile, so every rebind must refresh
+/// both — a picker profile switch included.
+pub(crate) fn publish_bound(sm: &StateManager, bound: &Bound) {
+    sm.set_selection(bound.selection());
     sm.set_visible_tabs(
-        ctx.bound
+        bound
             .profile
             .tabs
             .iter()
             .map(|tab| tab.to_string())
             .collect(),
     );
-
-    messages
 }
 
 /// Step 3 of §6.7: `Config::load`, with a broken repo file degrading to the
@@ -2061,7 +2069,7 @@ impl AgentRunner {
             return;
         }
 
-        sm.set_selection(ctx.bound.selection());
+        publish_bound(&sm, &ctx.bound);
         sm.set_model(model.model_name.clone());
         sm.set_provider_name(model.provider_name.clone());
         sm.set_model_alias(model.alias.clone());
@@ -5188,6 +5196,82 @@ profiles:
         assert!(
             !json.contains("SIG-ANTHROPIC"),
             "an Anthropic signature must never reach a foreign provider's wire; got: {json}",
+        );
+    }
+
+    /// T34 regression: a picker profile switch must refresh the visible tabs
+    /// with the selection. Before, `handle_select` only set the selection, so
+    /// leaving a profile whose `ui.tabs` hide `settings` kept the gear hidden
+    /// (and entering one kept it shown) until the next reload.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn select_profile_republishes_visible_tabs() {
+        use crate::config::resolve::{ParseCtx, Selection, Source};
+
+        let config = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: r#"
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key: sk-ant-test
+    models:
+      - { name: claude-sonnet-4, alias: claude, context_size: 200000 }
+general:
+  context:
+    enabled: false
+profiles:
+  locked-down:
+    ui: { tabs: { disabled: [settings] } }
+    agents:
+      main: { model: claude }
+  open:
+    agents:
+      main: { model: claude }
+"#,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("two-profile config must parse");
+
+        let sm = StateManager::new_arc();
+        let mut ctx = rebuild_ctx_for(config);
+        publish_bound(&sm, &ctx.bound);
+        assert!(
+            !sm.get_state()
+                .visible_tabs
+                .contains(&"settings".to_string()),
+            "precondition: the first profile hides settings"
+        );
+
+        let (mock_agent, _info, _rx, mock_hook, _model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        let mut agent_slot: Arc<DynAgent> = Arc::new(mock_agent);
+        let hook_cell: SharedSessionHook = Arc::new(std::sync::RwLock::new(mock_hook));
+        let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
+
+        AgentRunner::handle_select(
+            SelectRequest::Pair(Selection {
+                profile: "open".to_string(),
+                agent: "main".to_string(),
+            }),
+            &mut agent_slot,
+            &Some(sm.clone()),
+            &hook_cell,
+            &mut event_processor,
+            Some(&mut ctx),
+        )
+        .await;
+
+        let state = sm.get_state();
+        assert_eq!(state.selection.profile, "open", "the selection applied");
+        assert!(
+            state.visible_tabs.contains(&"settings".to_string()),
+            "switching to a profile with all tabs must re-show settings; got {:?}",
+            state.visible_tabs
         );
     }
 
