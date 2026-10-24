@@ -332,6 +332,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         focusMode={focusMode.focus}
         onToggleFocus={focusMode.toggle}
         lockedReason={modelLockedReason}
+        stopPending={state?.stop_pending ?? false}
       />
       {convoTabs && (
         <ConvoTabBar
@@ -407,6 +408,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             pendingInput={pendingInput}
             attachments={attachments}
             supportsVision={state?.supports_vision ?? true}
+            stopPending={state?.stop_pending ?? false}
           />
         </DropOverlay>
       </div>

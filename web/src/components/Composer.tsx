@@ -70,6 +70,7 @@ export function Composer({
   pendingInput,
   attachments = NO_ATTACHMENTS,
   supportsVision = true,
+  stopPending = false,
 }: {
   isRunning: boolean;
   connected: boolean;
@@ -97,6 +98,10 @@ export function Composer({
   attachments?: Attachments;
   /** `AppState.supports_vision` — drives the ⚠ on image chips. */
   supportsVision?: boolean;
+  /** `AppState.stop_pending` — a graceful stop is already armed (first
+   * press). The Stop control takes the escalation label and a subtle
+   * pulse; a second press aborts immediately (the backend decides). */
+  stopPending?: boolean;
 }) {
   const [text, setText] = useState("");
   const [selected, setSelected] = useState(0);
@@ -223,9 +228,12 @@ export function Composer({
   // One label for the always-mounted dispatch button: mid-turn sends are
   // queued server-side, so while running it reads "Queue".
   const actionLabel = isRunning ? "Queue" : "Send";
-  // Stopping discards the queued sends, so the button says so when any exist.
-  const stopLabel =
-    pendingInput > 0
+  // Stopping discards the queued sends, so the button says so when any
+  // exist. A pending graceful stop outranks both: the label advertises the
+  // escalation (pressing again stops immediately).
+  const stopLabel = stopPending
+    ? "Stop now — stopping after the current tool call"
+    : pendingInput > 0
       ? `Stop and discard ${pendingInput} queued message${pendingInput === 1 ? "" : "s"}`
       : "Stop";
 
@@ -362,7 +370,11 @@ export function Composer({
                     onClick={onStop}
                     title={stopLabel}
                     aria-label={stopLabel}
-                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-950/70 hover:bg-red-900/70"
+                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-950/70 hover:bg-red-900/70 ${
+                      // A graceful stop is armed: a subtle pulse + ring on the
+                      // existing red surface says "press again to stop now".
+                      stopPending ? "animate-pulse ring-2 ring-red-500/60" : ""
+                    }`}
                   >
                     <span className="h-2.5 w-2.5 rounded-[2px] bg-red-400" />
                   </button>

@@ -98,6 +98,8 @@ interface ComposerProps {
   watchingRole?: string | null;
   onClearWatch?: () => void;
   pendingInput: number;
+  /** Two-stage stop: a graceful stop is pending (mirrors `AppState.stop_pending`). */
+  stopPending?: boolean;
 }
 
 const makeProps = (overrides: Partial<ComposerProps> = {}): ComposerProps => ({
@@ -1000,21 +1002,17 @@ describe("Composer — attachments (T12)", () => {
 
 // ─── Two-stage stop: Stop button label by `stopPending` ──────────────────
 //
-// Composer gains an optional `stopPending: boolean` prop (mirrors the wire
-// `AppState.stop_pending`). While a graceful stop is pending the Stop
-// control's label/aria-label reads
+// Composer's `stopPending` prop mirrors the wire `AppState.stop_pending`.
+// While a graceful stop is pending the Stop control's label/aria-label reads
 // "Stop now — stopping after the current tool call" (pressing again
 // escalates); normally it is the existing "Stop" / "Stop and discard …".
-//
-// RED today: the prop is not declared on Composer (and not read), so with
-// `stopPending: true` the label is still the plain "Stop" and the
-// escalation sentence is absent. The cast keeps the test running under
-// vitest (esbuild transform), exactly like the T12 block above.
+// Clicking while pending still sends a single {type:"stop"} — the backend
+// decides between finishing gracefully and aborting immediately.
 
 const PENDING_STOP_LABEL = "Stop now — stopping after the current tool call";
 
 function stopMount(props: ComposerProps, stopPending?: boolean): Promise<HTMLDivElement> {
-  return mount({ ...props, stopPending } as unknown as ComposerProps);
+  return mount({ ...props, stopPending });
 }
 
 describe("Composer — Stop label by stopPending (two-stage stop)", () => {
@@ -1051,7 +1049,9 @@ describe("Composer — Stop label by stopPending (two-stage stop)", () => {
       makeProps({ isRunning: true, onStop: () => sent.push({ type: "stop" }) }),
       true,
     );
-    const stop = el.querySelector(`[aria-label="${PENDING_STOP_LABEL}"]`);
+    const stop = el.querySelector(
+      `[aria-label="${PENDING_STOP_LABEL}"]`,
+    ) as HTMLButtonElement | null;
     expect(stop, "the pending Stop control must exist").not.toBeNull();
     await click(stop!);
     expect(sent).toEqual([{ type: "stop" }]);

@@ -38,6 +38,7 @@ export function TopBar({
   focusMode,
   onToggleFocus,
   lockedReason = null,
+  stopPending = false,
 }: {
   isRunning: boolean;
   connected: boolean;
@@ -62,6 +63,9 @@ export function TopBar({
   focusMode: boolean;
   onToggleFocus: () => void;
   lockedReason?: string | null;
+  /** Two-stage stop: a graceful stop is pending. While set, the working…
+   * chip shows the escalation sentence INSTEAD of the statusMessage. */
+  stopPending?: boolean;
 }) {
   return (
 
@@ -110,10 +114,21 @@ export function TopBar({
         <span className="flex items-center gap-1.5 text-xs text-amber-400">
           <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber-400 border-t-transparent shrink-0" />
           working…
-          {statusMessage && (
-            <span className="truncate max-w-[16rem]" title={statusMessage}>
-              · {statusMessage}
+          {stopPending ? (
+            // A pending graceful stop is the status the user needs: it
+            // outranks the tool/compaction statusMessage.
+            <span
+              className="truncate max-w-[16rem]"
+              title="Stopping after current tool call…"
+            >
+              · Stopping after current tool call…
             </span>
+          ) : (
+            statusMessage && (
+              <span className="truncate max-w-[16rem]" title={statusMessage}>
+                · {statusMessage}
+              </span>
+            )
           )}
         </span>
       )}

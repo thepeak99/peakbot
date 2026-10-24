@@ -2320,9 +2320,8 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         // this hook inline and `prompt_with_history` only returns afterwards, so
         // the main loop's `add_assistant_message` is guaranteed to see the
         // blocks. The spawned task had no such happens-before edge and lost
-        // text-turn thinking. The gate is the lane predicate — sub-agent hooks DO
-        // carry a StateManager (`build_sub_agent`), so "no manager" would prove
-        // nothing.
+        // text-turn thinking. The gate is the lane predicate — sub-agent hooks
+        // carry no StateManager, so the lane check is what excludes them.
         //
         // Note there is deliberately no `!thinking.is_empty()` condition: a
         // response that emitted no thinking still ends the previous response's
