@@ -46,6 +46,12 @@ import { AttachmentChip } from "./AttachmentChip";
 const MIN_H = 40; // one text row — roughly line-height + vertical padding
 const MAX_H = 192; // ~6 rows — beyond this the textarea scrolls internally
 
+// Pressing a button moves focus off the textarea, collapsing the soft keyboard;
+// the layout jump then cancels the tap. Cancel the focus change on both the
+// pointer event and the compat mousedown (Android Chrome focuses on the latter).
+const preventFocusSteal = (e: { preventDefault: () => void }) => e.preventDefault();
+const keepTextareaFocus = { onPointerDown: preventFocusSteal, onMouseDown: preventFocusSteal };
+
 // Inert default so the Composer works standalone (no upload plumbing).
 const NO_ATTACHMENTS: Attachments = {
   pending: [],
@@ -238,7 +244,7 @@ export function Composer({
       : "Stop";
 
   return (
-    <div className="border-t border-zinc-800 bg-zinc-950 p-3">
+    <div className="border-t border-zinc-800 bg-zinc-950 p-3 pr-12">
       <div className="mx-auto max-w-3xl">
         <div className="relative">
           {showPalette && (
@@ -352,6 +358,7 @@ export function Composer({
                       keeps it distinct from Stop's red (abort everything). */}
                   {subAgent?.pausable && (
                     <button
+                      {...keepTextareaFocus}
                       onClick={subAgent.pause === "running" ? onPause : onResume}
                       title={
                         subAgent.pause === "running"
@@ -367,6 +374,7 @@ export function Composer({
                     </button>
                   )}
                   <button
+                    {...keepTextareaFocus}
                     onClick={onStop}
                     title={stopLabel}
                     aria-label={stopLabel}
@@ -381,6 +389,7 @@ export function Composer({
                 </>
               ) : (
                 <button
+                  {...keepTextareaFocus}
                   onClick={submit}
                   disabled={!canSend}
                   title={sendBlockedReason}

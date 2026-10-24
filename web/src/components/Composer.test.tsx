@@ -1063,3 +1063,100 @@ describe("Composer — Stop label by stopPending (two-stage stop)", () => {
     expect(el.textContent).not.toContain("Stop now");
   });
 });
+
+// ─── Mobile: right-rail clearance + keep-focus buttons ───────────────────
+//
+// On phones the fixed right-hand TabbedDrawer rail (40px handles) overlaps
+// the composer. Contract (Tailwind classes ARE the layout contract — jsdom
+// has no layout engine):
+//   1. the Composer's outer container carries `pr-12` (rail clearance) so
+//      its controls never sit under the rail;
+//   2. Stop, Queue and Pause call preventDefault() on `pointerdown`, so the
+//      textarea keeps focus (tapping them must not collapse the soft
+//      keyboard, which would shift the layout and cancel the tap).
+
+/** Dispatch a cancelable, bubbling pointerdown and report whether a handler
+ *  prevented it. A plain Event is used on purpose: React's `onPointerDown`
+ *  listens for the native "pointerdown" type, and this works whether or not
+ *  the jsdom build ships a PointerEvent constructor. */
+const pointerDown = async (el: HTMLElement): Promise<boolean> => {
+  const ev = new Event("pointerdown", { bubbles: true, cancelable: true });
+  await act(async () => {
+    el.dispatchEvent(ev);
+  });
+  return ev.defaultPrevented;
+};
+
+describe("Composer — rail clearance (mobile)", () => {
+  it("outer container has the pr-12 right clearance class (idle)", async () => {
+    const el = await mount(makeProps());
+    const outer = el.firstElementChild as HTMLElement;
+    expect(outer.classList.contains("pr-12")).toBe(true);
+  });
+
+  it("outer container keeps pr-12 while a turn is running", async () => {
+    const el = await mount(makeProps({ isRunning: true }));
+    const outer = el.firstElementChild as HTMLElement;
+    expect(outer.classList.contains("pr-12")).toBe(true);
+  });
+});
+
+describe("Composer — buttons keep textarea focus on pointerdown (mobile)", () => {
+  it("Stop: pointerdown is default-prevented", async () => {
+    const el = await mount(makeProps({ isRunning: true }));
+    const stop = controlByName(el, "Stop")!;
+    expect(await pointerDown(stop)).toBe(true);
+  });
+
+  it("Pause: pointerdown is default-prevented", async () => {
+    const el = await mount(
+      makeProps({ isRunning: true, subAgent: subAgent("running") }),
+    );
+    const pause = controlByName(el, "Pause")!;
+    expect(pause).not.toBeNull();
+    expect(await pointerDown(pause)).toBe(true);
+  });
+
+  it("Queue: pointerdown is default-prevented", async () => {
+    const el = await mount(makeProps({ isRunning: true }));
+    await typeInto(el.querySelector("textarea")!, "queue me");
+    const queue = buttonWithText(el, "Queue")!;
+    expect(queue).not.toBeNull();
+    expect(await pointerDown(queue)).toBe(true);
+  });
+
+  it("Stop: textarea stays focused through pointerdown + click, and onStop still fires once", async () => {
+    const props = makeProps({ isRunning: true });
+    const el = await mount(props);
+    const textarea = el.querySelector("textarea")!;
+    const stop = controlByName(el, "Stop")!;
+
+    // jsdom does not move focus on pointer input, so emulate the browser
+    // default: unless the page cancelled pointerdown, focus goes to the
+    // pressed button. (Document-level bubble listener runs after React's
+    // root handler, so it sees the final `defaultPrevented`.)
+    const emulateBrowserFocus = (e: Event) => {
+      if (!e.defaultPrevented) (e.target as HTMLElement).focus();
+    };
+    document.addEventListener("pointerdown", emulateBrowserFocus);
+    try {
+      textarea.focus();
+      expect(document.activeElement).toBe(textarea);
+
+      await pointerDown(stop);
+      await click(stop);
+
+      expect(document.activeElement).toBe(textarea);
+      expect(props.onStop).toHaveBeenCalledTimes(1);
+    } finally {
+      document.removeEventListener("pointerdown", emulateBrowserFocus);
+    }
+  });
+
+  it("regression: clicking Stop still calls onStop exactly once", async () => {
+    const props = makeProps({ isRunning: true });
+    const el = await mount(props);
+    await click(controlByName(el, "Stop")!);
+    expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+});
