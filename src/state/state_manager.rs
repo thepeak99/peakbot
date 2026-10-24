@@ -44,9 +44,7 @@ pub struct StopTally {
     pub shell: bool,
 }
 
-/// What one press of Stop did (two-stage Stop). TDD STUB: the enum shape is
-/// the Architect's contract; `request_stop` below is `todo!()` until the
-/// implementation lands.
+/// What one press of Stop did — see [`StateManager::request_stop`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopStep {
     /// Idle, or the turn is already cancelled: nothing happened.
@@ -1004,6 +1002,8 @@ impl StateManager {
         {
             let mut state = self.state.write().unwrap();
             state.is_running = running;
+            // A graceful stop belongs to one turn; never carry it into the next.
+            state.stop_pending = false;
             state.run_started_at = if running {
                 Some(std::time::Instant::now())
             } else {
@@ -3125,15 +3125,42 @@ impl StateManager {
         StopTally { shell }
     }
 
-    /// Two-stage Stop entry point. TDD STUB — see `StopStep`.
+    /// One press of Stop. Idle or already-aborted → `Noop`; the first press
+    /// arms `stop_pending` (`Graceful`); a second press — or a first press no
+    /// hook would honour — aborts via [`Self::stop_turn_processes`]. The abort
+    /// runs after the state lock drops (it takes the lock itself), so callers
+    /// serialise presses — the controller's `pending_stop` cell does.
     pub fn request_stop(&self) -> StopStep {
-        todo!("two-stage stop")
+        {
+            let mut state = self.state.write().unwrap();
+            // Lock order state → turn_cancel; nothing nests them the other way.
+            if !state.is_running || self.turn_cancel.read().unwrap().is_cancelled() {
+                return StopStep::Noop;
+            }
+            let graceful = !state.stop_pending && Self::graceful_possible(&state);
+            state.stop_pending = graceful;
+            self.notify_update(&state);
+            if graceful {
+                return StopStep::Graceful;
+            }
+        }
+        StopStep::Immediate(self.stop_turn_processes())
     }
 
     /// Whether a graceful stop has been requested for the running turn.
-    /// TDD STUB.
     pub fn stop_pending(&self) -> bool {
-        todo!("two-stage stop")
+        self.state.read().unwrap().stop_pending
+    }
+
+    /// Whether a hook will see `stop_pending` at its next boundary. Ollama is
+    /// hookless (`DynAgent::Ollama` carries `()`), and a Pausing/Paused
+    /// sub-agent parks before the orchestrator hook runs again.
+    fn graceful_possible(state: &AppState) -> bool {
+        state.stats.provider_name != "ollama"
+            && state
+                .sub_agent
+                .as_ref()
+                .is_none_or(|r| r.pause == crate::ui::app_state::PauseState::Running)
     }
 
     /// Clear all per-process bg cooldowns so the next drain flushes every

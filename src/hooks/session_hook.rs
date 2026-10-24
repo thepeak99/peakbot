@@ -22,8 +22,10 @@ use crate::hooks::events::TokenUsage as EventTokenUsage;
 use crate::ui::app_state::MessageSource;
 
 /// `PromptCancelled` reason for a graceful (first-press) Stop.
-#[allow(dead_code)] // TDD stub: consumed by the implementation
 pub const STOP_REASON: &str = "stop";
+
+/// Tool result recorded for a call the model requested after a graceful Stop.
+const SKIPPED_BY_STOP: &str = "Skipped: stopped by user before this tool ran.";
 
 /// Pricing information for a model (cost per token)
 #[derive(Clone, Debug)]
@@ -2038,6 +2040,24 @@ impl SessionHook {
         self.wire = Some(crate::sniff::WireLabel { provider, model });
         self
     }
+
+    /// A graceful Stop is pending. Only the orchestrator hook holds a
+    /// `StateManager`, so sub-agent hooks never see it (`delegate` finishes).
+    fn stop_requested(&self) -> bool {
+        self.state_manager
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|sm| sm.stop_pending())
+    }
+
+    fn emit(&self, event: AgentEvent) {
+        if let Some(ref sender) = self.event_sender {
+            let _ = sender.send(SourcedEvent {
+                source: self.source.clone(),
+                event,
+            });
+        }
+    }
 }
 
 /// Provider-agnostic input token count. Under caching, `input_tokens` is
@@ -2181,6 +2201,11 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         // boundary without emitting the request event (park, then emit).
         if let Some(g) = &self.pause_gate {
             g.checkpoint().await;
+        }
+        // Graceful Stop: no further LLM call. Checked before the sniff and the
+        // CompletionRequest event, since no request is going out.
+        if self.stop_requested() {
+            return HookAction::terminate(STOP_REASON);
         }
         // Sniff first: the `req` line must be on disk before the call leaves,
         // so a hung or killed request still leaves its input behind.
@@ -2381,7 +2406,12 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         if let Some(g) = &self.pause_gate {
             g.checkpoint().await;
         }
-        if let Some(ref sender) = self.event_sender {
+        // rig 0.38.2 never hands hooks the provider's real tool_call.id
+        // (mod.rs builds the wire result from it two lines later) — this
+        // is PeakBot's own correlation handle, paired by equality with
+        // the ToolResult row in `sanitize_tool_pairs`.
+        let call_id = tool_call_id.or(Some(internal_call_id.to_string()));
+        if self.event_sender.is_some() {
             // Stamp the call with the response that requested it. The
             // transcript row is appended later by the event-processing task,
             // which cannot recover this after the fact — off the orchestrator
@@ -2394,21 +2424,26 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             } else {
                 None
             };
-            let event = AgentEvent::ToolCall {
+            self.emit(AgentEvent::ToolCall {
                 tool_name: tool_name.to_string(),
                 arguments: args.to_string(),
-                // rig 0.38.2 never hands hooks the provider's real tool_call.id
-                // (mod.rs builds the wire result from it two lines later) — this
-                // is PeakBot's own correlation handle, paired by equality with
-                // the ToolResult row in `sanitize_tool_pairs`.
-                call_id: tool_call_id.or(Some(internal_call_id.to_string())),
+                call_id: call_id.clone(),
                 response_id,
                 timestamp: Utc::now(),
-            };
-            let _ = sender.send(SourcedEvent {
-                source: self.source.clone(),
-                event,
             });
+        }
+        if self.stop_requested() {
+            // rig skips `on_tool_result` for a skipped call, so the pair's
+            // result row is emitted here.
+            self.emit(AgentEvent::ToolResult {
+                tool_name: tool_name.to_string(),
+                arguments: args.to_string(),
+                result: SKIPPED_BY_STOP.to_string(),
+                success: false,
+                call_id,
+                timestamp: Utc::now(),
+            });
+            return ToolCallHookAction::skip(SKIPPED_BY_STOP);
         }
         ToolCallHookAction::Continue
     }
