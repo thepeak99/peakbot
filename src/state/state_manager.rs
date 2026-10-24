@@ -324,7 +324,7 @@ impl StateManager {
 
     /// Get the current title/compaction model (if available). Used by
     /// `agent_loop` to fetch the live model after agent rebuilds (e.g. on
-    /// `/model` or `/pipeline` switch).
+    /// `/model` or a `/profile` / `/agent` switch).
     pub fn get_title_model(&self) -> Option<Arc<CompactionModel>> {
         self.title_model
             .read()

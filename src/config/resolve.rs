@@ -27,7 +27,8 @@ use super::{
 };
 use crate::vector::normalize_lexical;
 
-const L1_MESSAGE: &str = "config.yaml uses the pre-0.24 layout — restart PeakBot to migrate it automatically (the original is kept as config.yaml.pre-0.24)";
+/// L1 (§4.4). Public because reload quotes it for a legacy global.
+pub const L1_MESSAGE: &str = "config.yaml uses the pre-0.24 layout — restart PeakBot to migrate it automatically (the original is kept as config.yaml.pre-0.24)";
 const RP2_MESSAGE: &str = "this repo config uses the pre-0.24 layout — PeakBot migrates it automatically on the next start or /cd into this directory";
 const F1_MESSAGE: &str = "set either `disabled` (blocklist) or `only` (allowlist), not both";
 

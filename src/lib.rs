@@ -570,6 +570,233 @@ impl RebuildContext {
     }
 }
 
+/// How a reload re-binds the session's `Bound` (spec §6.7 step 6).
+enum Rebind<'a> {
+    /// A session verb (`/cd`, `/new`, `/model`): keep the bound while the
+    /// conversation has turns, re-resolve it while it has none.
+    Session,
+    /// `/load`: a new binding from the loaded conversation's saved names
+    /// (§6.6 `resolve_saved_selection`).
+    Saved {
+        profile: Option<&'a str>,
+        agent: Option<&'a str>,
+    },
+}
+
+/// Re-read the config + skills for a live session (spec §6.7 steps 1–7) so
+/// edits take effect on a session verb without a restart. `target_cwd` is
+/// the directory the session WILL be in after the verb — `/cd` passes its
+/// target, the other verbs the current session cwd.
+///
+/// Mutates `ctx` (`skills`, `config`, `bound`) and `sm` (catalog, selection,
+/// visible tabs). It does NOT rebuild the agent — the caller does (step 8).
+/// Returns the system messages to surface rather than emitting them, so a
+/// following `reset_conversation_state()` (as `/model` and `/cd` do) can't
+/// wipe them from the chat.
+pub fn reload_session_config(
+    ctx: &mut RebuildContext,
+    sm: &Arc<StateManager>,
+    target_cwd: &std::path::Path,
+) -> Vec<String> {
+    reload_config(ctx, sm, target_cwd, Rebind::Session)
+}
+
+fn reload_config(
+    ctx: &mut RebuildContext,
+    sm: &Arc<StateManager>,
+    target_cwd: &std::path::Path,
+    rebind: Rebind<'_>,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+
+    // 1. Skills for the target tree.
+    let (skills, skill_warnings) = load_default_skills(target_cwd);
+    ctx.skills = skills;
+    messages.extend(skill_warnings);
+
+    // 2. Repo-file migration (a pin means repo files are never read).
+    let mut repo_mode = ctx.repo_mode();
+    if repo_mode == RepoMode::Include
+        && let Some(config_dir) = crate::config::get_config_dir()
+    {
+        match crate::config::auto_migrate_repo(&config_dir, target_cwd) {
+            Ok(Some(migrated)) => messages.extend(migrated.notices()),
+            Ok(None) => {}
+            // Step 3 reports the global problem itself.
+            Err(e)
+                if matches!(
+                    e.reason,
+                    crate::config::migrate::AutoMigrateFailure::GlobalNotUsable(_)
+                ) => {}
+            Err(e) => {
+                messages.push(format!("⚠ {e} — ignoring this repo's profiles."));
+                repo_mode = RepoMode::Ignore;
+            }
+        }
+    }
+
+    // 3. Load; any global failure keeps the previous config.
+    let Some(fresh) = load_fresh_config(target_cwd, repo_mode, &ctx.skills, &mut messages) else {
+        return messages;
+    };
+    if let Some(pin) = ctx.profile_pin.as_deref()
+        && fresh.catalog.start_bound(Some(pin)).is_err()
+    {
+        messages.push(format!(
+            "⚠ --profile '{pin}' is no longer configured — keeping the previous config."
+        ));
+        return messages;
+    }
+
+    // 4. Boot-only blocks keep their boot value until a restart.
+    for key in crate::config::resolve::boot_only_diff(&ctx.config, &fresh) {
+        messages.push(format!("⚠ {key} change ignored — restart to apply."));
+    }
+
+    // 5. Adopt.
+    ctx.config = Arc::new(fresh);
+    sm.set_catalog(ctx.config.catalog.infos());
+
+    // 6. Rebind.
+    let catalog = &ctx.config.catalog;
+    let pin = ctx.profile_pin.as_deref();
+    match rebind {
+        Rebind::Saved { profile, agent } => {
+            let (bound, warnings) =
+                crate::selection::resolve_saved_selection(catalog, profile, agent, pin);
+            ctx.bound = bound;
+            messages.extend(warnings);
+        }
+        // In-flight conversations keep their definitions; only the
+        // cwd-derived prompt parts refresh in the caller's rebuild.
+        Rebind::Session if sm.conversation_has_turns() => {
+            let name = &ctx.bound.profile.name;
+            if catalog.profile(name).is_none() {
+                messages.push(format!(
+                    "⚠ Profile '{name}' is not configured in {}; this conversation keeps it until /new.",
+                    target_cwd.display()
+                ));
+            }
+        }
+        Rebind::Session => match catalog.resolve(&ctx.bound.selection()) {
+            Some(bound) => ctx.bound = bound,
+            None => {
+                // Under a pin the fallback stays inside the pinned profile.
+                let bound = catalog
+                    .start_bound(pin)
+                    .expect("the pin was checked against the fresh catalog above");
+                let sel = bound.selection();
+                messages.push(format!(
+                    "ℹ Using {} › {} (default here).",
+                    sel.profile, sel.agent
+                ));
+                ctx.bound = bound;
+            }
+        },
+    }
+
+    // 7. Publish what the session is bound to.
+    sm.set_selection(ctx.bound.selection());
+    sm.set_visible_tabs(
+        ctx.bound
+            .profile
+            .tabs
+            .iter()
+            .map(|tab| tab.to_string())
+            .collect(),
+    );
+
+    messages
+}
+
+/// Step 3 of §6.7: `Config::load`, with a broken repo file degrading to the
+/// global-only config. `None` means "keep the previous config" (the reason
+/// is already in `messages`).
+fn load_fresh_config(
+    target_cwd: &std::path::Path,
+    mut repo_mode: RepoMode,
+    skills: &SkillRegistry,
+    messages: &mut Vec<String>,
+) -> Option<Config> {
+    use crate::config::resolve::LoadError;
+
+    let known_skills = skills.names();
+    let parse_ctx = crate::config::resolve::ParseCtx {
+        known_skills: &known_skills,
+    };
+    let repo_path = target_cwd.join(".peakbot").join("config.yaml");
+    loop {
+        let repo_failure = match Config::load(target_cwd, repo_mode, &parse_ctx) {
+            Ok(fresh) => return Some(fresh),
+            Err(LoadError::Invalid(errors))
+                if repo_mode == RepoMode::Include
+                    && errors
+                        .0
+                        .iter()
+                        .all(|e| e.file == crate::config::ConfigFileKind::Repo) =>
+            {
+                config_errors_summary(&errors)
+            }
+            Err(LoadError::Io(path, e)) if repo_mode == RepoMode::Include && path == repo_path => {
+                format!("cannot read it: {e}")
+            }
+            Err(LoadError::Invalid(errors)) => {
+                messages.push(format!(
+                    "⚠ config reload failed: {} — keeping previous config.",
+                    config_errors_summary(&errors)
+                ));
+                return None;
+            }
+            // Never migrated here: the user may have restored the 0.23 file
+            // on purpose while PeakBot was running.
+            Err(LoadError::Legacy(path)) => {
+                messages.push(format!(
+                    "⚠ {}: {}; keeping the previous config.",
+                    path.display(),
+                    crate::config::resolve::L1_MESSAGE
+                ));
+                return None;
+            }
+            Err(LoadError::Missing(path)) => {
+                messages.push(format!(
+                    "⚠ config reload failed: {} does not exist — keeping previous config.",
+                    path.display()
+                ));
+                return None;
+            }
+            Err(LoadError::Io(path, e)) => {
+                messages.push(format!(
+                    "⚠ config reload failed: cannot read {}: {e} — keeping previous config.",
+                    path.display()
+                ));
+                return None;
+            }
+        };
+        messages.push(format!(
+            "⚠ {}: {repo_failure} — ignoring this repo's profiles.",
+            repo_path.display()
+        ));
+        repo_mode = RepoMode::Ignore;
+    }
+}
+
+/// `<first error> (+N more)` — one chat line for a whole error list.
+fn config_errors_summary(errors: &crate::config::ConfigErrors) -> String {
+    let Some(first) = errors.0.first() else {
+        return "invalid config".to_string();
+    };
+    let path = first.dotted_path();
+    let mut out = if path.is_empty() {
+        first.message.clone()
+    } else {
+        format!("{path}: {}", first.message)
+    };
+    if errors.0.len() > 1 {
+        out.push_str(&format!(" (+{} more)", errors.0.len() - 1));
+    }
+    out
+}
+
 /// Shared cell holding the *currently active* SessionHook. Replaced
 /// in-place by the agent loop on `/model` rebuild; the event loop's
 /// `/stop` path reads through the cell so it always cancels the
@@ -1403,22 +1630,19 @@ impl AgentRunner {
                         if let Some(ref sm) = state_manager {
                             sm.set_running(true);
                         }
-                        // The selection the *current* conversation is on. `/load`
-                        // swaps the conversation (and with it the selection), so the
-                        // rebuild below needs the before-value to spot the change.
-                        let selection_before = state_manager.as_ref().map(|sm| sm.selection());
+                        // The conversation *before* the command. `/load` swaps it;
+                        // an unchanged id after means there is nothing to re-bind.
+                        let conversation_before = state_manager
+                            .as_ref()
+                            .and_then(|sm| sm.get_current_conversation_id());
                         Self::process_command_internal(&cmd, &state_manager, &config).await;
 
                         // `/load <arg>` may have just swapped the active
-                        // conversation to one saved against a different
-                        // wire identity. Rebuild the agent if so — same
-                        // path `/model <alias>` uses. Falls through
-                        // (no-op) when the wire id matches the running
-                        // agent or `/load` failed validation.
+                        // conversation — re-bind and rebuild on it.
                         let lcmd = cmd.trim().to_ascii_lowercase();
                         if lcmd.starts_with("/load ") {
                             Self::maybe_rebuild_after_load(
-                                selection_before,
+                                conversation_before,
                                 &mut agent,
                                 &state_manager,
                                 &session_hook_cell,
@@ -1600,7 +1824,7 @@ impl AgentRunner {
         // surfaced *after* the conversation reset below so
         // `reset_conversation_state()` can't wipe them from the chat.
         let reload_warnings =
-            Self::reload_session_config(ctx, &sm_for_provider, &sm_for_provider.session_cwd());
+            reload_session_config(ctx, &sm_for_provider, &sm_for_provider.session_cwd());
 
         let Some(resolved) = ctx.config.registry.resolve(alias) else {
             let available = ctx.config.registry.aliases_sorted().join(", ");
@@ -1801,9 +2025,9 @@ impl AgentRunner {
     ///    path-aware tools' `session_cwd` flip here, **without** mutating
     ///    the process-global cwd. Two web sessions in different trees
     ///    stay correct because nothing they share is mutated.
-    /// 3. Rebuild the system prompt and store it back into
-    ///    `ctx.system_prompt`, so a later `/model` switch keeps the new
-    ///    cwd (the two axes are independent — ticket #124).
+    /// 3. Reload the config for the target tree (spec §6.7). The rebuild
+    ///    derives the prompt from `sm.session_cwd()`, so a later `/model`
+    ///    switch keeps the new cwd (the two axes are independent — #124).
     /// 4. Rebuild the agent on the *current* model, then reset the
     ///    conversation like `/new`. Tools snapshot the new
     ///    `session_cwd` at agent-build time, so the rebuild order is
@@ -1840,7 +2064,7 @@ impl AgentRunner {
         // because process cwd never moves (no `set_current_dir`), so the
         // per-repo config and the skill re-scan must read the NEW tree.
         // Warnings are surfaced after the conversation reset below.
-        let reload_warnings = Self::reload_session_config(ctx, &sm, target);
+        let reload_warnings = reload_session_config(ctx, &sm, target);
 
         let resolved = ctx
             .config
@@ -1909,186 +2133,6 @@ impl AgentRunner {
         }
 
         Ok(())
-    }
-
-    /// Re-read `config.yaml` and re-scan skills for a live session, so
-    /// YAML/skill edits take effect on a session verb (`/new`, `/model`,
-    /// `/cd`, `/load`) without a restart. Mutates `config` (ancillary
-    /// fields only — **never** `config.provider`, owned by the resolve
-    /// step) and `ctx` (registry, skills, system prompt, pipeline set,
-    /// and the trivial config-clone artifacts: searxng, max_turns,
-    /// bash).
-    ///
-    /// `session_cwd` is the directory the session WILL be in after this
-    /// verb completes — the base for both `.peakbot/config.yaml` and the
-    /// skill re-scan. `/cd` must pass its TARGET (the session cwd is
-    /// still the old dir when this runs); the other verbs pass the
-    /// current `session_cwd`. (Invariant I-5.)
-    ///
-    /// `profile` is the session's effective profile
-    /// ([`RebuildContext::effective_profile`]). On success
-    /// `config.active_profile` equals it; a failed reload leaves the previous
-    /// stamp, which is how `/profile` detects that its choice didn't land.
-    ///
-    /// Fallible edges are handled at the boundary: a malformed YAML or a
-    /// bad `default_model` (registry build error) warns and **keeps the
-    /// previous config** — the session survives. Both fallible steps run
-    /// before any mutation, so a failure leaves no partial state.
-    ///
-    /// Pipelines are rebuilt here (after the skill re-scan, before
-    /// `adopt_reloaded`) — see task 3 for the ordering rationale. A bad
-    /// `pipelines:` block warns and keeps the previous set; the rest of
-    /// the config is still adopted. The `ctx.pipelines` field and the
-    /// `AppState` catalogue are stamped together (invariant I-4) so the
-    /// Agents panel and the running agent can never disagree.
-    ///
-    /// `orchestrator_prompt`/`orchestrator_persona` are filed under
-    /// the per-pipeline `ResolvedPipeline` and surfaced by the rebuild
-    /// seam — never written into `ctx.system_prompt` here (that runs
-    /// after the registry/cwd flip on the calling verb).
-    ///
-    /// Boot-only config is diffed and, if changed, flagged with a
-    /// "restart to apply" warning: `mcp_servers` / `vector_db` (live
-    /// subprocesses / DB handle), `web.*` (read once by the reaper), and
-    /// `http` (baked into the HTTP client factory). The legacy `pipeline:`
-    /// key stays boot-only via `PipelineSet::build` (`LegacyBlock`).
-    ///
-    /// Returns the warnings to surface (reload failure, boot-only diffs,
-    /// skill-load failures, pipeline-rebuild failure) rather than
-    /// emitting them here — the caller owns *when* they land, so a
-    /// following `reset_conversation_state()` (as `/model` and `/cd` do)
-    /// can't wipe them from the chat.
-    fn reload_session_config(
-        ctx: &mut RebuildContext,
-        sm: &Arc<StateManager>,
-        session_cwd: &std::path::Path,
-    ) -> Vec<String> {
-        let mut warnings = Vec::new();
-        // Boundary parse — keep previous config on any failure.
-        let fresh = match config.reload_for(session_cwd, profile) {
-            Ok(c) => c,
-            Err(reason) => {
-                warnings.push(format!(
-                    "⚠ config reload failed: {reason} — keeping previous config."
-                ));
-                return warnings;
-            }
-        };
-        // Registry is the post-boot source of truth; a bad `default_model`
-        // here is recoverable — warn and keep the running registry.
-        let new_registry = match fresh.build_model_registry() {
-            Ok(r) => r,
-            Err(e) => {
-                warnings.push(format!(
-                    "⚠ config reload: model registry invalid ({e}) — keeping previous config."
-                ));
-                return warnings;
-            }
-        };
-
-        // Consolidated boundary parse (§1.6): tools filter + wall-clock
-        // budgets, over the effective (post-profile) config. Keeps the
-        // previous config on any failure.
-        if let Err(e) = fresh.validate() {
-            warnings.push(format!("⚠ config reload: {e} — keeping previous config."));
-            return warnings;
-        }
-
-        // Diff still-boot-only keys against the still-current config and warn.
-        // `pipelines` / `pipeline` are exempt: the running `PipelineSet` is
-        // rebuilt below from the fresh config, so a successful build supersedes
-        // the diff and a failed build surfaces its own warning (no need to
-        // also report "restart to apply" — that would mislead the user into
-        // restarting when the reload was already attempted).
-        for (label, changed) in [
-            ("mcp_servers", config.mcp_servers != fresh.mcp_servers),
-            ("vector_db", config.vector_db != fresh.vector_db),
-            ("web", config.web != fresh.web),
-            // `uploads` is boot-only like `web.*`: the running session's
-            // UploadStore keeps the boot limits until restart.
-            ("uploads", config.uploads != fresh.uploads),
-            // `http` is baked into the HTTP clients at boot; it was missing
-            // here, so edits were adopted into the config yet never applied.
-            ("http", config.http != fresh.http),
-        ] {
-            if changed {
-                warnings.push(format!("⚠ {label} change ignored — restart to apply."));
-            }
-        }
-
-        // Re-scan skills against the session cwd — using the new
-        // `session_cwd` argument, not the stale `sm.session_cwd()`, so
-        // `/cd` finally picks up the target repo's `.agents/skills`.
-        // (Same root-cause fix as the per-repo config read above.)
-        let (skills, skill_warnings) = load_default_skills(session_cwd);
-        ctx.skills = skills;
-        warnings.extend(skill_warnings);
-
-        // Build the fresh `PipelineSet` AFTER the skill re-scan (a role's
-        // `skills:` filter is validated against the fresh names here —
-        // `src/pipeline/set.rs:74`) and BEFORE `adopt_reloaded` (we still
-        // need `&fresh` and the new registry). A bad `pipelines:` block
-        // is local — `providers:`, `tools:`, skills and the prompt are
-        // all still valid, so we warn and keep the previous set; the rest
-        // of the config is adopted. The set and the catalogue are stamped
-        // together (invariant I-4).
-        let new_pipelines =
-            match PipelineSet::build(&fresh, &new_registry, Some(&ctx.skills.names())) {
-                Ok(set) => Some(set),
-                Err(e) => {
-                    warnings.push(format!(
-                        "⚠ config reload: pipelines invalid ({e}) — keeping the previous pipelines."
-                    ));
-                    None
-                }
-            };
-
-        // Commit. `config.provider` is preserved across the swap — the
-        // resolve step owns it, and this is the invariant the regression
-        // test pins (see `Config::adopt_reloaded`).
-        config.adopt_reloaded(fresh);
-
-        ctx.registry = Arc::new(new_registry);
-        ctx.memory_enabled = config.memory.enabled;
-        // The profile's `agents_md:` ceiling rides the reloaded config —
-        // the rebuild seam that follows reads it for the fresh prompt.
-        ctx.agents_md_enabled = config.agents_md;
-        ctx.tools_filter = config.tools.clone();
-        // `ctx.system_prompt` is recomputed by the rebuild seam that follows
-        // every reload (it derives persona/orchestrator framing from the live
-        // pipeline selection), so it is not rebuilt here.
-        ctx.searxng_config = config.searxng.clone();
-        ctx.max_turns = config.agent_max_turns;
-        ctx.bash_config = config.bash.clone();
-        // The prompt head is live-reloadable (no handles behind it). Mirroring
-        // it here is what makes `/new` after a config edit pick up new
-        // `persona:` / `system_prompt:` text.
-        ctx.prompt_head = config.prompt_head();
-
-        // Pipelines + catalogue — stamped together (I-4). The catalogue is
-        // always refreshed on a successful build, even when the names are
-        // unchanged: a roster-only change (e.g. a member's model flipped)
-        // must reach the Agents panel; it just doesn't deserve a chat line.
-        if let Some(set) = new_pipelines {
-            if let Some(msg) = pipeline_catalogue_message(&ctx.pipelines, &set) {
-                warnings.push(msg);
-            }
-            sm.set_pipelines(set.infos());
-            ctx.pipelines = Arc::new(set);
-        }
-
-        // Stamp the server-computed profile view (picker + tabs) from the
-        // reloaded config. Every session verb funnels through this seam, so
-        // the client's view can never drift from the effective profile —
-        // including `handle_select_profile` (via `apply_selected_profile`)
-        // and its rollback, which re-stamps the restored profile.
-        let selectable = crate::config::selectable_profiles(config, ctx.profile_pin.as_deref());
-        sm.set_profile_view(
-            selectable.clone(),
-            crate::config::session_visible_tabs(config, &selectable),
-        );
-
-        warnings
     }
 
     /// Rebuild the live `DynAgent` on `model` for the context's `Bound` —
@@ -2241,25 +2285,21 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// After `/load` has potentially swapped the active conversation
-    /// to one saved against a different wire identity, rebuild the
-    /// agent so the next prompt actually goes to the saved model.
-    /// No-op when:
-    /// - the running agent is already on the loaded conversation's
-    ///   wire id (alias may differ — that's fine), its cwd, and its pipeline,
-    /// - the registry isn't available,
-    /// - the loaded conversation's wire id isn't in the registry.
+    /// After `/load` swapped the active conversation, re-bind the session to
+    /// it and rebuild the agent so the next prompt runs on the loaded
+    /// conversation's `(profile, agent)`, model and cwd.
     ///
-    /// `selection_before` is the pipeline selected *before* the load: a
-    /// different one on the other side means a different tool list, so the
-    /// agent has to be rebuilt even when the wire id matches.
+    /// `/load` is a new binding (spec §6.7 step 6): the saved names go
+    /// through `resolve_saved_selection` against a fresh config, read for
+    /// the saved cwd — so the agent is always rebuilt when the load landed.
+    /// `conversation_before` is the conversation id before the command; an
+    /// unchanged id means `/load` failed (or re-loaded the current one) and
+    /// the running conversation keeps its bound untouched.
     ///
-    /// The error path doesn't emit a system message: `/load` itself
-    /// has already either rejected unavailability or accepted the load,
-    /// and a no-op rebuild is the silent normal case.
-    #[allow(clippy::too_many_arguments)]
+    /// The error paths don't emit a system message for the no-op cases:
+    /// `/load` itself has already reported a rejected load.
     async fn maybe_rebuild_after_load(
-        selection_before: Option<crate::config::Selection>,
+        conversation_before: Option<uuid::Uuid>,
         agent_slot: &mut Arc<DynAgent>,
         state_manager: &Option<Arc<StateManager>>,
         session_hook_cell: &SharedSessionHook,
@@ -2268,137 +2308,61 @@ impl AgentRunner {
     ) {
         let Some(sm) = state_manager else { return };
         let Some(ctx) = rebuild_ctx else { return };
-
-        // Hoist the conversation read ABOVE the reload so the per-repo
-        // config and the skill re-scan can target the right tree. The
-        // `/load` restore below applies `set_session_cwd` AFTER the reload,
-        // so passing `sm.session_cwd()` would re-read the *pre-load* tree
-        // and could then `resolve_saved`-drop a team that the target
-        // tree actually defines. Hoist also catches the impossible
-        // no-current-conversation `/load` early — don't half-apply a
-        // reload we won't rebuild for.
+        if sm.get_current_conversation_id() == conversation_before {
+            return;
+        }
         let Some(conv) = sm.get_current_conversation() else {
             return;
         };
+
+        // The reload must read the tree the conversation is restored INTO:
+        // `set_session_cwd` runs after it, so `sm.session_cwd()` would read
+        // the pre-load tree's repo profiles and skills. An empty (pre-cwd
+        // file) or vanished saved cwd falls back to the current tree.
         let saved_cwd = conv.cwd.clone();
         let saved_dir = (!saved_cwd.is_empty()).then(|| std::path::PathBuf::from(&saved_cwd));
         let restore_to = saved_dir.clone().filter(|p| p.is_dir());
-        // `Some` ⇒ we will flip to it; `None` and reload still runs on
-        // the current session cwd (so an empty / gone saved cwd doesn't
-        // strand the reload against the wrong tree).
         let reload_cwd = restore_to.clone().unwrap_or_else(|| sm.session_cwd());
 
-        // Re-read config + skills before resolving the saved wire id, so a
-        // config/skill edit lands on this /load. Refreshes the registry the
-        // find-by-wire-id below relies on, plus skills/system prompt (the
-        // prompt may be rebuilt again below if the saved cwd differs).
-        // The conversation was already loaded by the /load handler, so
-        // warnings are safe to surface immediately.
-        // The loaded conversation's profile decides what the reload applies:
-        // a vanished one is dropped, and a boot pin overrides it (stamped, so
-        // the conversation records what it actually runs under).
-        let (selection, profile_warnings) = resolve_conversation_profile(
-            config,
-            sm.selected_profile().as_deref(),
-            ctx.profile_pin.as_deref(),
-        );
-        for warning in profile_warnings {
+        // The conversation was already loaded, so warnings land in it.
+        // The `pipeline` field carries the agent name until T9a renames it.
+        let rebind = Rebind::Saved {
+            profile: conv.profile.as_deref(),
+            agent: conv.pipeline.as_deref(),
+        };
+        for warning in reload_config(ctx, sm, &reload_cwd, rebind) {
             sm.add_system_message(warning);
         }
-        sm.set_selected_profile(selection);
-        let profile = ctx.effective_profile(sm);
-        let profile_before = config.active_profile.clone();
 
-        let sm_arc = sm.clone();
-        for warning in
-            Self::reload_session_config(config, ctx, &sm_arc, &reload_cwd, profile.as_deref())
-        {
-            sm.add_system_message(warning);
-        }
-        // A different profile means a different tool list and prompt — a
-        // rebuild axis of its own. Compared on what the reload applied.
-        let profile_changed = config.active_profile != profile_before;
-
-        let saved_provider = conv.provider_name.clone();
-        let saved_model = conv.model.clone();
-
-        let wire_id_changed =
-            sm.get_provider_name() != saved_provider || sm.get_model() != saved_model;
-
-        // Re-resolve the loaded conversation's pipeline against the live set:
-        // a team that has since been removed from config is dropped (and the
-        // user told), same rule as the resume path.
-        let saved_selection = sm.selected_pipeline();
-        let (active, warning) = ctx.pipelines.resolve_saved(saved_selection.as_deref());
-        let active_orchestrator = active.map(|p| p.orchestrator.clone());
-        if let Some(warning) = warning {
-            sm.set_selected_pipeline(None);
-            sm.add_system_message(warning);
-        }
-        // A different team means a different tool list, so this is a rebuild
-        // axis in its own right — even when the wire id is unchanged.
-        let selection_changed = sm.selected_pipeline() != selection_before;
-
-        // Restore the saved cwd best-effort: only if it's non-empty (pre-cwd
-        // files default to ""), still exists, and actually differs from the
-        // current session cwd. The comparison is against `sm.session_cwd()`
-        // (the per-session source of truth), not the process-global cwd —
-        // every change is per-session. A gone path is warned about, not
-        // fatal — the load already succeeded. `saved_dir` / `restore_to`
-        // were derived above from the hoisted conversation read so the
-        // reload could target the right tree.
-        let current_session_cwd = sm.session_cwd();
-        let mut cwd_changed = false;
+        // Restore the saved cwd best-effort — per-session only, no
+        // `set_current_dir`, so concurrent web sessions in other trees stay
+        // race-free. A gone path is warned about, not fatal.
         if let Some(target) = restore_to {
-            if target != current_session_cwd {
-                // Kill bg processes rooted in the previous tree. The
-                // rebuild seam below recomputes the prompt for the restored
-                // cwd/agents.md (it reads `sm.session_cwd()`).
-                // Per-session only — no `set_current_dir`, so the
-                // process-global cwd is untouched and concurrent web
-                // sessions in other trees stay race-free.
+            if target != sm.session_cwd() {
+                // Kill bg processes rooted in the previous tree.
                 sm.clear_bg();
                 sm.set_session_cwd(target.clone());
                 sm.update_welcome_cwd(target);
-                cwd_changed = true;
             }
-            // else: already on the right tree — no work, no rebuild.
         } else if saved_dir.is_some() {
-            // `saved_dir` was `Some` (the saved cwd was non-empty) but
-            // `is_dir()` returned false → the path is gone. Warn but
-            // don't fatal — the load already succeeded.
             sm.add_system_message(format!(
                 "⚠ /load: saved working directory no longer exists: {saved_cwd}"
             ));
         }
-        // An empty `saved_cwd` (from a pre-cwd conversation file) keeps
-        // the SM's current session_cwd — it is the authoritative value
-        // for that conversation.
 
-        // Nothing to rebuild if no axis moved.
-        if !wire_id_changed && !cwd_changed && !selection_changed && !profile_changed {
-            return;
-        }
-        // The selected team owns the orchestrator; without one, the loaded
-        // conversation's saved wire id is the target.
-        let resolved = match active_orchestrator {
-            Some(orchestrator) => orchestrator,
-            None => match ctx
-                .config
-                .registry
-                .find_by_wire_id(&saved_provider, &saved_model)
-            {
-                Some(rm) => rm.clone(),
-                // /load already emitted the unavailability error — and yet
-                // somehow the slot got swapped. Defensive: do nothing.
-                None => return,
-            },
-        };
-        let sm_for_provider = sm.clone();
+        // The saved wire id is the target; `/load` already refused a
+        // conversation whose model is not configured. If it vanished in the
+        // reload above, the bound agent's own model keeps the session usable.
+        let resolved = ctx
+            .config
+            .registry
+            .find_by_wire_id(&conv.provider_name, &conv.model)
+            .unwrap_or(&ctx.bound.agent().main.model)
+            .clone();
         if let Err(e) = Self::rebuild_agent(
             &resolved,
             agent_slot,
-            &sm_for_provider,
+            sm,
             session_hook_cell,
             event_processor,
             state_manager,
@@ -2439,7 +2403,7 @@ impl AgentRunner {
         // reload/skill warnings are safe to surface immediately. The fresh
         // conversation is zero-turn, so the reload re-resolves the carried
         // `(profile, agent)` in the fresh catalog (spec §6.7 step 6).
-        let reload_warnings = Self::reload_session_config(ctx, &sm_arc, &sm.session_cwd());
+        let reload_warnings = reload_session_config(ctx, &sm_arc, &sm.session_cwd());
         for warning in reload_warnings {
             sm.add_system_message(warning);
         }
@@ -5107,10 +5071,10 @@ mod tests {
     /// stops replaying `Reasoning` content the moment Ollama owns the wire
     /// (an Anthropic signature on a foreign wire is a hard 400 at best).
     ///
-    /// Entry point is `rebuild_agent_for_resolved` — the shared seam that
-    /// `handle_switch_model` (and `/cd`, `/load`, `/new`, `/pipeline`)
+    /// Entry point is `rebuild_agent` — the shared seam that
+    /// `handle_switch_model` (and `/cd`, `/load`, `/new`, a selection)
     /// delegates to, and the site that sets the gate. Driving
-    /// `handle_switch_model` itself would first call `Config::reload_for(...)`,
+    /// `handle_switch_model` itself would first call `reload_session_config`,
     /// which reads the *machine's* real config directory and would swap this
     /// test's registry for whatever the developer has installed — an
     /// environment-dependent test, not a stronger one.
