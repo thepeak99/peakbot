@@ -433,10 +433,9 @@ mod tests {
 
     /// One registry with one attached, freshly minted session.
     fn registry_with_session() -> (SessionRegistry, Arc<RegisteredSession>) {
-        let registry = SessionRegistry::new(Arc::new(test_support::test_deps(
-            test_support::ollama_registry(),
-            Arc::new(InMemoryStorage::default()),
-        )));
+        let storage: Arc<dyn crate::storage::ConversationStorage> =
+            Arc::new(InMemoryStorage::default());
+        let registry = SessionRegistry::new(Arc::new(test_support::test_deps(Some(storage))));
         let registered = registry.attach(None).expect("attach mints a session");
         (registry, registered)
     }

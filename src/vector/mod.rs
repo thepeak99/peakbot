@@ -661,7 +661,6 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let config = VectorDbConfig {
-            enabled: true,
             db_path: dir.path().join("v.db").display().to_string(),
             embeddings: EmbeddingsConfig {
                 base_url: "http://unused.invalid".into(),
@@ -709,7 +708,6 @@ mod tests {
     /// needs).
     fn test_config_4d(db_path: impl Into<String>) -> VectorDbConfig {
         VectorDbConfig {
-            enabled: true,
             db_path: db_path.into(),
             embeddings: EmbeddingsConfig {
                 base_url: "http://unused.invalid".into(),
@@ -992,7 +990,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("sub").join("vectors.db");
         let config = VectorDbConfig {
-            enabled: true,
             db_path: db_path.display().to_string(),
             embeddings: EmbeddingsConfig {
                 base_url: "http://unused.invalid".into(),
@@ -1022,7 +1019,6 @@ mod tests {
 
     fn test_config(db_path: impl Into<String>) -> VectorDbConfig {
         VectorDbConfig {
-            enabled: true,
             db_path: db_path.into(),
             embeddings: EmbeddingsConfig {
                 base_url: "http://unused.invalid".into(),

@@ -154,11 +154,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             "List profiles, or pick one with /profile <name>",
             true,
         ),
-        SlashCommand::new(
-            "agent",
-            "List agents, or pick one with /agent <name>",
-            true,
-        ),
+        SlashCommand::new("agent", "List agents, or pick one with /agent <name>", true),
         SlashCommand::new(
             "cd",
             "Show the working directory, or change it with /cd <path>",

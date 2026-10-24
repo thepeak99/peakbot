@@ -769,14 +769,12 @@ fn dispatch_inbound(
         Ok(InboundMessage::SwitchCwd { path }) => {
             action_sender.send(UiAction::ChangeCwd(path)).is_ok()
         }
-        Ok(InboundMessage::Select { profile, agent }) => {
-            action_sender
-                .send(UiAction::Select(crate::config::resolve::Selection {
-                    profile,
-                    agent,
-                }))
-                .is_ok()
-        }
+        Ok(InboundMessage::Select { profile, agent }) => action_sender
+            .send(UiAction::Select(crate::config::resolve::Selection {
+                profile,
+                agent,
+            }))
+            .is_ok(),
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
             let items = build_conversations_snapshot(
@@ -907,31 +905,7 @@ mod tests {
         let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
         let (out_tx, _out_rx) = outbound_channel();
         let sm = StateManager::new_arc();
-        let config = crate::config::Config::default();
-        let model_registry = Arc::new(
-            config
-                .build_model_registry()
-                .expect("legacy registry builds"),
-        );
-        let deps = SessionDeps {
-            config,
-            model_registry,
-            skills: crate::skills::SkillRegistry::new(),
-            skill_warnings: Vec::new(),
-            mcp_handles: Arc::new(Vec::new()),
-            searxng_config: None,
-            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
-            vector_store: None,
-            shell_kind: None,
-            storage: None,
-            mcp_tools_count: 0,
-            skills_count: 0,
-            profile_pin: None,
-            uploads: crate::attachments::UploadStore::new(
-                crate::attachments::UploadStore::default_root(),
-                crate::config::UploadsConfig::default(),
-            ),
-        };
+        let deps = crate::session::test_support::test_deps(None);
         let registry = SessionRegistry::new(Arc::new(deps));
         (action_tx, action_rx, out_tx, sm, registry)
     }
@@ -1018,10 +992,9 @@ mod tests {
     ) {
         let (action_tx, _action_rx) = tokio::sync::mpsc::unbounded_channel();
         let (out_tx, out_rx) = outbound_channel();
-        let deps = crate::session::test_support::test_deps(
-            crate::session::test_support::ollama_registry(),
-            Arc::new(crate::storage::InMemoryStorage::default()),
-        );
+        let deps = crate::session::test_support::test_deps(Some(Arc::new(
+            crate::storage::InMemoryStorage::default(),
+        )));
         (
             action_tx,
             out_tx,

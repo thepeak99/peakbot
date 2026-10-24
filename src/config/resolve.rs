@@ -8,8 +8,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_path_to_error::Segment;
 use serde_yaml::Value;
 
@@ -185,7 +185,7 @@ pub enum Origin {
 }
 
 /// The wire projection of a profile for Settings and AppState (§8.7).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProfileInfo {
     pub name: String,
     /// `"repo"` or `"global"`. Owned (not `&'static str`) so `ProfileInfo`
@@ -197,7 +197,7 @@ pub struct ProfileInfo {
 }
 
 /// The wire projection of an agent (§8.7).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub name: String,
     /// The agent's model alias.
@@ -206,7 +206,7 @@ pub struct AgentInfo {
 }
 
 /// The wire projection of a subagent (§8.7).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubagentInfo {
     pub name: String,
     /// The subagent's model alias (the agent's when `inherited`).

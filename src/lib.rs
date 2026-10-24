@@ -2038,7 +2038,11 @@ impl AgentRunner {
             }
         }
 
-        let command = if profile_changed { "/profile" } else { "/agent" };
+        let command = if profile_changed {
+            "/profile"
+        } else {
+            "/agent"
+        };
         let previous = std::mem::replace(&mut ctx.bound, next);
         let model = ctx.bound.agent().main.model.clone();
         if let Err(e) = Self::rebuild_agent(
@@ -3842,6 +3846,111 @@ mod tests {
     use crate::ui::app_state::MessageSource;
     use std::collections::HashMap;
 
+    /// One openrouter model + one profile: the replacement for the deleted
+    /// `Config::default()`. Compaction is off so `AgentRunner::new` needs no
+    /// compaction provider.
+    const TEST_GLOBAL_YAML: &str = r#"
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-test
+    models:
+      - { name: anthropic/claude-3.7-sonnet, alias: sonnet }
+general:
+  context:
+    enabled: false
+profiles:
+  dev:
+    agents:
+      team:
+        model: sonnet
+"#;
+
+    fn test_config() -> Config {
+        use crate::config::resolve::{ParseCtx, Source};
+        Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: TEST_GLOBAL_YAML,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("fixture config must parse")
+    }
+
+    /// The wire identity the mock-agent tests boot on — no registry entry
+    /// needed, `AgentRunner::new` only reads its context size and provider.
+    #[cfg(feature = "mock")]
+    fn mock_resolved_model() -> ResolvedModel {
+        ResolvedModel {
+            alias: "mock".to_string(),
+            model_name: "mock-model".to_string(),
+            provider_name: "mock".to_string(),
+            provider_kind: crate::config::ProviderType::OpenRouter,
+            provider_config: crate::config::ProviderConfig::default(),
+            context_size: 100_000,
+        }
+    }
+
+    /// Prompt-shape fixture: memory on/off across profiles, `agents_md`
+    /// on/off across agents, one subagent-bearing agent (the old
+    /// "orchestrator recipe").
+    const PROMPT_GLOBAL_YAML: &str = r#"
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-test
+    models:
+      - { name: anthropic/claude-3.7-sonnet, alias: sonnet }
+profiles:
+  main:
+    agents:
+      solo:
+        model: sonnet
+      no-agents-md:
+        model: sonnet
+        agents_md: false
+      team:
+        model: sonnet
+        agents_md: true
+        subagents:
+          helper:
+            prompt: help
+      team-no-md:
+        model: sonnet
+        agents_md: false
+        subagents:
+          helper:
+            prompt: help
+  no-memory:
+    memory:
+      enabled: false
+    agents:
+      solo:
+        model: sonnet
+"#;
+
+    /// The `(profile, agent)` of the prompt fixture, for `build_agent_prompt`.
+    fn prompt_bound(profile: &str, agent: &str) -> Bound {
+        use crate::config::resolve::{ParseCtx, Selection, Source};
+        let cfg = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: PROMPT_GLOBAL_YAML,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("prompt fixture must parse");
+        cfg.catalog
+            .resolve(&Selection {
+                profile: profile.to_string(),
+                agent: agent.to_string(),
+            })
+            .expect("fixture bound resolves")
+    }
+
     // --- panic_text (shared catch_unwind payload renderer) -------------------
 
     /// `panic_text` must read the two payload shapes `std::panic::catch_unwind`
@@ -3872,7 +3981,7 @@ mod tests {
     #[tokio::test]
     async fn help_command_emits_system_message_listing_all_builtin_commands() {
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         AgentRunner::process_command_internal("/help", &Some(sm.clone()), &config).await;
 
@@ -3912,7 +4021,7 @@ mod tests {
 
     // --- system-prompt shell awareness (#82, PR3) ---------------------------------
     //
-    // PR3: the shell-specific guidance lives in a rendered `# Shell Tool
+    // The shell-specific guidance lives in a rendered `# Shell Tool
     // Usage` section (from `system_prompt_shell.txt` with {shell_tool} /
     // {bg_tool} / {output_dir} placeholders) that only exists when a shell
     // was detected. The core is shell-neutral, and on a PowerShell host the
@@ -3927,16 +4036,9 @@ mod tests {
         let ps = ShellKind::PowerShell {
             path: "pwsh.exe".to_string(),
         };
-        let prompt = build_system_prompt(
-            &skills,
-            Some(&ps),
-            cwd.path(),
-            true,
-            true,
-            false,
-            None,
-            None,
-        );
+        let bound = prompt_bound("main", "solo");
+        let prompt =
+            build_agent_prompt(bound.agent(), &bound.profile, &skills, Some(ps), cwd.path());
         // The env line + the shell section both name the shell tool…
         assert!(
             prompt.contains("**Shell**: powershell"),
@@ -3972,7 +4074,7 @@ mod tests {
             !prompt.contains("do not apply"),
             "the PR2 'bash examples elsewhere do not apply' phrasing must be gone"
         );
-        // …and the ENTIRE agentless prompt is bash-free on a PowerShell host.
+        // …and the ENTIRE single-agent prompt is bash-free on a PowerShell host.
         assert!(
             !prompt.to_lowercase().contains("bash"),
             "a PowerShell prompt must contain no 'bash' (case-insensitive) anywhere"
@@ -3981,63 +4083,58 @@ mod tests {
 
     #[test]
     fn system_prompt_powershell_orchestrator_recipe_same_contract() {
-        // The orchestrator recipe (no persona, subagents_active) must carry
-        // the same shell section and bash-free guarantee as the agentless one.
-        // Isolated cwd: the repo's own agents.md mentions bash/PowerShell and
-        // would be injected into the prompt under test.
+        // The subagent-bearing agent must carry the same shell section and
+        // bash-free guarantee as the single-agent one.
         let cwd = tempfile::tempdir().unwrap();
         let skills = SkillRegistry::new();
         let ps = ShellKind::PowerShell {
             path: "pwsh.exe".to_string(),
         };
+        let bound = prompt_bound("main", "team");
         let prompt =
-            build_system_prompt(&skills, Some(&ps), cwd.path(), true, true, true, None, None);
+            build_agent_prompt(bound.agent(), &bound.profile, &skills, Some(ps), cwd.path());
         assert!(
             prompt.contains("`powershell`"),
-            "orchestrator prompt must name the `powershell` tool"
+            "subagent-bearing prompt must name the `powershell` tool"
         );
         assert!(
             prompt.contains("`powershell_bg`"),
-            "orchestrator prompt must name the `powershell_bg` tool"
+            "subagent-bearing prompt must name the `powershell_bg` tool"
         );
         assert!(
             prompt.contains("# Shell Tool Usage"),
-            "orchestrator prompt must render the `# Shell Tool Usage` section"
+            "subagent-bearing prompt must render the `# Shell Tool Usage` section"
         );
         assert!(
             prompt.contains(&crate::tools::shell_output_dir().display().to_string()),
-            "orchestrator shell section must embed shell_output_dir()"
+            "subagent-bearing shell section must embed shell_output_dir()"
         );
         for placeholder in ["{shell_tool}", "{bg_tool}", "{output_dir}"] {
             assert!(
                 !prompt.contains(placeholder),
-                "unrendered placeholder {placeholder} leaked into the orchestrator prompt"
+                "unrendered placeholder {placeholder} leaked into the prompt"
             );
         }
         assert!(
             !prompt.to_lowercase().contains("bash"),
-            "a PowerShell orchestrator prompt must contain no 'bash' (case-insensitive)"
+            "a PowerShell subagent-bearing prompt must contain no 'bash' (case-insensitive)"
         );
     }
 
     #[test]
     fn system_prompt_bash_recipe_names_bash_tools_and_keeps_no_powershell() {
-        // Isolated cwd: the repo's own agents.md mentions bash/PowerShell and
-        // would be injected into the prompt under test.
         let cwd = tempfile::tempdir().unwrap();
         let skills = SkillRegistry::new();
         let bash = ShellKind::Bash {
             path: "/bin/sh".to_string(),
         };
-        let prompt = build_system_prompt(
+        let bound = prompt_bound("main", "solo");
+        let prompt = build_agent_prompt(
+            bound.agent(),
+            &bound.profile,
             &skills,
-            Some(&bash),
+            Some(bash),
             cwd.path(),
-            true,
-            true,
-            false,
-            None,
-            None,
         );
         assert!(
             prompt.contains("**Shell**: bash"),
@@ -4062,11 +4159,10 @@ mod tests {
         // No shell (Windows with nothing installed): the shell section does
         // not exist at all, the prompt carries no `_bg` tool name, and the
         // core is shell-neutral — so no "bash" reference survives anywhere.
-        // Isolated cwd: the repo's own agents.md mentions bash/PowerShell and
-        // would be injected into the prompt under test.
         let cwd = tempfile::tempdir().unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, cwd.path(), true, true, false, None, None);
+        let bound = prompt_bound("main", "solo");
+        let prompt = build_agent_prompt(bound.agent(), &bound.profile, &skills, None, cwd.path());
         assert!(
             !prompt.contains("# Shell Tool Usage"),
             "no shell ⇒ no `# Shell Tool Usage` section"
@@ -4096,7 +4192,8 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-CONTENT").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
+        let bound = prompt_bound("main", "solo");
+        let prompt = build_agent_prompt(bound.agent(), &bound.profile, &skills, None, &dir);
 
         assert!(
             prompt.contains(&dir.to_string_lossy().to_string()),
@@ -4112,8 +4209,8 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_memory_section_when_enabled() {
-        // Use a clean temp dir (no agents.md) so the assertion sees only the
-        // base prompt + memory section, not agents.md's own "# Memory.md".
+        // The `main` profile has memory on by default; a clean temp dir (no
+        // agents.md) keeps the assertion scoped to the memory section.
         let dir = std::env::temp_dir().join(format!(
             "peakbot-mem-on-{}-{}",
             std::process::id(),
@@ -4124,7 +4221,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
+        let bound = prompt_bound("main", "solo");
+        let prompt = build_agent_prompt(bound.agent(), &bound.profile, &skills, None, &dir);
         assert!(
             prompt.contains("# Memory.md"),
             "memory section must be present when memory is enabled"
@@ -4144,7 +4242,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, false, true, false, None, None);
+        let bound = prompt_bound("no-memory", "solo");
+        let prompt = build_agent_prompt(bound.agent(), &bound.profile, &skills, None, &dir);
         assert!(
             !prompt.contains("# Memory.md"),
             "memory section must be omitted when memory is disabled"
@@ -4152,80 +4251,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Agentless mode leads with the *built-in* crusader persona when nothing
-    /// is configured; orchestrator mode leads with the core guidance instead
-    /// (a configured persona does reach it — see
-    /// `tests/prompt_persona_tests.rs`).
-    #[test]
-    fn system_prompt_builtin_persona_only_in_agentless_mode() {
-        let skills = SkillRegistry::new();
-        let cwd = std::env::current_dir().unwrap();
-
-        let agentless = build_system_prompt(&skills, None, &cwd, false, true, false, None, None);
-        assert!(
-            agentless.contains("CODE CRUSADER"),
-            "agentless prompt must carry the persona"
-        );
-
-        let orchestrator = build_system_prompt(&skills, None, &cwd, false, true, true, None, None);
-        assert!(
-            !orchestrator.contains("CODE CRUSADER"),
-            "orchestrator prompt must drop the persona"
-        );
-        assert!(
-            orchestrator.contains("# Working Principles"),
-            "orchestrator prompt must keep the core tool guidance"
-        );
-    }
-
-    /// The orchestrator prompt is appended only in orchestrator mode, and is
-    /// ignored in agentless mode.
-    #[test]
-    fn orchestrator_prompt_appended_only_when_subagents_active() {
-        let skills = SkillRegistry::new();
-        let cwd = std::env::current_dir().unwrap();
-        let extra = Some("Lead the SENTINEL-TEAM well.");
-
-        let on = build_system_prompt(&skills, None, &cwd, false, true, true, extra, None);
-        assert!(
-            on.contains("SENTINEL-TEAM"),
-            "orchestrator prompt must be appended when sub-agents are active"
-        );
-
-        let off = build_system_prompt(&skills, None, &cwd, false, true, false, extra, None);
-        assert!(
-            !off.contains("SENTINEL-TEAM"),
-            "orchestrator prompt must be ignored in agentless mode"
-        );
-
-        // A blank orchestrator prompt adds no section.
-        let blank = build_system_prompt(&skills, None, &cwd, false, true, true, Some("   "), None);
-        assert!(
-            !blank.contains("# Orchestrator Instructions"),
-            "a blank orchestrator prompt must not emit a section header"
-        );
-    }
-
-    // =========================================================================
-    // CONTRACT B — `Profile.agents_md` at the prompt seam (RED).
-    //
-    // The flag reaches the builder as `agents_md_enabled: bool`, inserted
-    // after `memory_enabled` (the two dynamic-section gates sit together):
-    //
-    //     build_system_prompt(
-    //         skills, shell_kind, cwd,
-    //         memory_enabled,
-    //         agents_md_enabled,   // NEW — false ⇒ no agents.md section
-    //         subagents_active, orchestrator_prompt, head,
-    //     )
-    //
-    // Compile-RED until the parameter lands: every call below passes eight
-    // arguments to today's seven-argument function.
-    // =========================================================================
-
-    /// `agents_md_enabled: false` omits the agents.md content from the
-    /// main agent's system prompt (the profile's `agents_md: false`
-    /// ceiling). (RED — the parameter does not exist yet.)
+    /// `agents_md: false` omits the agents.md content from the main agent's
+    /// system prompt (the agent's `agents_md: false` ceiling).
     #[test]
     fn system_prompt_omits_agents_md_when_disabled() {
         let dir = std::env::temp_dir().join(format!(
@@ -4240,17 +4267,17 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-OFF").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, false, None, None);
+        let bound = prompt_bound("main", "no-agents-md");
+        let prompt = build_agent_prompt(bound.agent(), &bound.profile, &skills, None, &dir);
         assert!(
             !prompt.contains("SENTINEL-AGENTS-OFF"),
-            "agents_md_enabled: false must omit the agents.md content"
+            "agents_md: false must omit the agents.md content"
         );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `agents_md_enabled: true` keeps today's behaviour: the agents.md
-    /// content is injected. (RED — the parameter does not exist yet.)
+    /// `agents_md: true` (the default) keeps the agents.md content.
     #[test]
     fn system_prompt_includes_agents_md_when_enabled() {
         let dir = std::env::temp_dir().join(format!(
@@ -4265,20 +4292,20 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-ON").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, true, false, None, None);
+        let bound = prompt_bound("main", "solo");
+        let prompt = build_agent_prompt(bound.agent(), &bound.profile, &skills, None, &dir);
         assert!(
             prompt.contains("SENTINEL-AGENTS-ON"),
-            "agents_md_enabled: true must inject the agents.md content"
+            "agents_md: true must inject the agents.md content"
         );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The gate applies to the orchestrator recipe too, not just the
-    /// agentless one — one ceiling for the whole session's main agent.
-    /// (RED — the parameter does not exist yet.)
+    /// The gate applies to subagent-bearing agents too — one ceiling for the
+    /// whole session's main agent.
     #[test]
-    fn system_prompt_omits_agents_md_for_orchestrator_recipe_too() {
+    fn system_prompt_omits_agents_md_for_subagent_agent_too() {
         let dir = std::env::temp_dir().join(format!(
             "peakbot-agents-md-orch-{}-{}",
             std::process::id(),
@@ -4291,10 +4318,11 @@ mod tests {
         std::fs::write(dir.join("agents.md"), "SENTINEL-AGENTS-ORCH").unwrap();
 
         let skills = SkillRegistry::new();
-        let prompt = build_system_prompt(&skills, None, &dir, true, false, true, None, None);
+        let bound = prompt_bound("main", "team-no-md");
+        let prompt = build_agent_prompt(bound.agent(), &bound.profile, &skills, None, &dir);
         assert!(
             !prompt.contains("SENTINEL-AGENTS-ORCH"),
-            "the agents_md gate must hold for the orchestrator recipe as well"
+            "the agents_md gate must hold for a subagent-bearing agent as well"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -4303,7 +4331,7 @@ mod tests {
     #[tokio::test]
     async fn help_command_marks_arg_taking_commands_with_args_placeholder() {
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         AgentRunner::process_command_internal("/help", &Some(sm.clone()), &config).await;
 
@@ -4360,13 +4388,11 @@ mod tests {
 
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
         let mut out = Vec::new();
-        // Seed with the wire identity that matches the legacy
-        // synthesised registry: provider_name = "openrouter" (the
-        // ProviderType::OpenRouter display value used by the synth
-        // path) and model = the Config default. This way the post-v5
+        // Seed with the wire identity that matches the fixture registry:
+        // provider "openrouter" + the one configured model. This way the
         // `/load` wire-id check accepts these fixtures.
         let provider_name = "openrouter".to_string();
-        let model_wire_id = Config::default().model().to_string();
+        let model_wire_id = "anthropic/claude-3.7-sonnet".to_string();
         for (name, hours_ago) in specs {
             let mut conv = Conversation::new(
                 (*name).to_string(),
@@ -4397,7 +4423,7 @@ mod tests {
     #[tokio::test]
     async fn conversations_empty_list_emits_explicit_message() {
         let sm = sm_with_storage();
-        let config = Config::default();
+        let config = test_config();
         AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
         assert_eq!(last_system_msg(&sm), "No saved conversations.");
     }
@@ -4405,7 +4431,7 @@ mod tests {
     #[tokio::test]
     async fn conversations_no_storage_emits_distinct_message() {
         let sm = StateManager::new_arc(); // no storage
-        let config = Config::default();
+        let config = test_config();
         AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
         assert_eq!(
             last_system_msg(&sm),
@@ -4416,7 +4442,7 @@ mod tests {
     #[tokio::test]
     async fn conversations_lists_every_saved_name_with_index() {
         let (sm, seeded) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2), ("Gamma", 3)]);
-        let config = Config::default();
+        let config = test_config();
         AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
         let body = last_system_msg(&sm);
         for (name, _) in &seeded {
@@ -4437,7 +4463,7 @@ mod tests {
     async fn conversations_sorted_newest_first() {
         // Seeded in jumbled order: 3h ago, 1h ago, 2h ago.
         let (sm, _) = sm_with_seeded(&[("Older", 3), ("Newest", 1), ("Middle", 2)]);
-        let config = Config::default();
+        let config = test_config();
         AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
         let body = last_system_msg(&sm);
         let pos_newest = body.find("Newest").expect("Newest present");
@@ -4453,7 +4479,7 @@ mod tests {
     #[tokio::test]
     async fn conversations_marks_current() {
         let (sm, seeded) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2)]);
-        let config = Config::default();
+        let config = test_config();
         // Set Beta as current.
         sm.load_conversation(seeded[1].1).expect("load Beta");
         AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
@@ -4480,7 +4506,7 @@ mod tests {
     #[tokio::test]
     async fn conversations_hides_uuids() {
         let (sm, _) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2)]);
-        let config = Config::default();
+        let config = test_config();
         AgentRunner::process_command_internal("/conversations", &Some(sm.clone()), &config).await;
         let body = last_system_msg(&sm);
         // A UUID is 8-4-4-4-12 hex chars with hyphens. Robust check: no
@@ -4500,7 +4526,7 @@ mod tests {
     #[tokio::test]
     async fn load_by_index_resolves_to_correct_uuid() {
         let (sm, seeded) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2), ("Gamma", 3)]);
-        let config = Config::default();
+        let config = test_config();
         // Newest-first: Alpha=1h ago, Beta=2h, Gamma=3h. So index 2 → Beta.
         AgentRunner::process_command_internal("/load 2", &Some(sm.clone()), &config).await;
         let beta_id = seeded[1].1;
@@ -4514,7 +4540,7 @@ mod tests {
     #[tokio::test]
     async fn load_by_uuid_still_works() {
         let (sm, seeded) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2)]);
-        let config = Config::default();
+        let config = test_config();
         let alpha_id = seeded[0].1;
         let cmd = format!("/load {}", alpha_id);
         AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
@@ -4524,7 +4550,7 @@ mod tests {
     #[tokio::test]
     async fn load_index_zero_emits_helpful_error() {
         let (sm, _) = sm_with_seeded(&[("Alpha", 1)]);
-        let config = Config::default();
+        let config = test_config();
         AgentRunner::process_command_internal("/load 0", &Some(sm.clone()), &config).await;
         let body = last_system_msg(&sm);
         assert!(
@@ -4542,7 +4568,7 @@ mod tests {
     #[tokio::test]
     async fn load_index_out_of_range_emits_count() {
         let (sm, _) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2)]);
-        let config = Config::default();
+        let config = test_config();
         AgentRunner::process_command_internal("/load 99", &Some(sm.clone()), &config).await;
         let body = last_system_msg(&sm);
         assert!(
@@ -4556,7 +4582,7 @@ mod tests {
     #[tokio::test]
     async fn load_invalid_arg_emits_uniform_error() {
         let (sm, _) = sm_with_seeded(&[("Alpha", 1)]);
-        let config = Config::default();
+        let config = test_config();
         AgentRunner::process_command_internal(
             "/load not-a-uuid-or-int",
             &Some(sm.clone()),
@@ -4602,7 +4628,7 @@ mod tests {
         // Pre-state: no current conversation loaded.
         assert!(sm.get_current_conversation_id().is_none());
 
-        let config = Config::default();
+        let config = test_config();
         let cmd = format!("/load {saved_id}");
         AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
 
@@ -4650,7 +4676,7 @@ mod tests {
         storage.save(&conv).expect("seed save");
         let sm = StateManager::new_arc_with_storage(storage);
 
-        let config = Config::default();
+        let config = test_config();
         let cmd = format!("/load {id}");
         AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
 
@@ -4679,10 +4705,10 @@ mod tests {
         use crate::storage::{ConversationStorage, InMemoryStorage};
 
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
-        // Seed a conv on the legacy synth identity that will resolve
-        // (`openrouter` + Config default model) so the wire-id check
+        // Seed a conv on the fixture identity that will resolve
+        // (`openrouter` + the configured model) so the wire-id check
         // accepts it and `/load` reaches the success branch.
-        let model = Config::default().model().to_string();
+        let model = "anthropic/claude-3.7-sonnet".to_string();
         let mut conv = Conversation::new(
             "Saved".to_string(),
             "openrouter".to_string(),
@@ -4702,7 +4728,7 @@ mod tests {
         sm.set_model("boot-model".to_string());
         sm.set_model_alias("boot-alias".to_string());
 
-        let config = Config::default();
+        let config = test_config();
         let cmd = format!("/load {saved_id}");
         AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
 
@@ -4741,7 +4767,7 @@ mod tests {
         use crate::storage::{ConversationStorage, InMemoryStorage};
 
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
-        let model = Config::default().model().to_string();
+        let model = "anthropic/claude-3.7-sonnet".to_string();
         // Save under the legacy synth identity (provider "openrouter",
         // default model). The alias was "default" at save time —
         // but we don't even care, we never wrote it.
@@ -4759,7 +4785,7 @@ mod tests {
         // Use a fresh Config — the alias may have been rebuilt under
         // any name in config.yaml; doesn't matter, the wire-id
         // lookup is alias-blind.
-        let config = Config::default();
+        let config = test_config();
         let cmd = format!("/load {saved_id}");
         AgentRunner::process_command_internal(&cmd, &Some(sm.clone()), &config).await;
 
@@ -4775,7 +4801,7 @@ mod tests {
     #[tokio::test]
     async fn delete_by_index_works() {
         let (sm, _) = sm_with_seeded(&[("Alpha", 1), ("Beta", 2), ("Gamma", 3)]);
-        let config = Config::default();
+        let config = test_config();
         // /delete 1 → newest (Alpha). After: 2 conversations remain.
         AgentRunner::process_command_internal("/delete 1", &Some(sm.clone()), &config).await;
         let remaining = sm.list_conversations().expect("storage").len();
@@ -4785,7 +4811,7 @@ mod tests {
     #[tokio::test]
     async fn export_by_index_works() {
         let (sm, _) = sm_with_seeded(&[("OnlyOne", 1)]);
-        let config = Config::default();
+        let config = test_config();
         AgentRunner::process_command_internal("/export 1 markdown", &Some(sm.clone()), &config)
             .await;
         let body = last_system_msg(&sm);
@@ -4812,7 +4838,7 @@ mod tests {
     #[tokio::test]
     async fn new_command_clears_chat_messages() {
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         // Seed a conversation with some user/assistant turns
         sm.add_user_message("hello".to_string());
@@ -4841,7 +4867,7 @@ mod tests {
     #[tokio::test]
     async fn new_command_resets_session_stats() {
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         // Seed the stats as if a request had happened
         {
@@ -4871,7 +4897,7 @@ mod tests {
         // bug as carrying chat history: stale state leaking across a
         // user-initiated reset. See the docs above the /new handler.
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         // Seed the todo list with two tasks
         sm.add_todo("write the docs".to_string());
@@ -4897,7 +4923,7 @@ mod tests {
     #[tokio::test]
     async fn new_command_swaps_in_a_fresh_conversation() {
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         sm.create_conversation(
             "old one".to_string(),
@@ -4927,45 +4953,32 @@ mod tests {
     // See memory.md episodic entry 2026-05-07.
 
     fn config_with_two_aliases() -> Config {
-        use crate::config::{ModelEntry, ProviderEntry, ProviderType};
-        Config {
-            providers: vec![ProviderEntry {
-                name: "openrouter".into(),
-                kind: ProviderType::OpenRouter,
-                api_key: Some("sk-test".into()),
-                base_url: None,
-                preserve_reasoning: None,
-                display_reasoning: None,
-                models: vec![
-                    ModelEntry {
-                        name: "anthropic/claude-3.7-sonnet".into(),
-                        alias: Some("sonnet".into()),
-                        max_tokens: None,
-                        temperature: None,
-                        extra_params: None,
-                        prompt_caching: None,
-                        vision: None,
-                        context_size: None,
-                        preserve_reasoning: true,
-                        display_reasoning: false,
-                    },
-                    ModelEntry {
-                        name: "openai/gpt-4o".into(),
-                        alias: Some("gpt4o".into()),
-                        max_tokens: None,
-                        temperature: None,
-                        extra_params: None,
-                        prompt_caching: None,
-                        vision: None,
-                        context_size: None,
-                        preserve_reasoning: true,
-                        display_reasoning: false,
-                    },
-                ],
-            }],
-            default_model: Some("sonnet".into()),
-            ..Config::default()
-        }
+        use crate::config::resolve::{ParseCtx, Source};
+        Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: r#"
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-test
+    models:
+      - { name: anthropic/claude-3.7-sonnet, alias: sonnet }
+      - { name: openai/gpt-4o, alias: gpt4o }
+general:
+  context:
+    enabled: false
+profiles:
+  dev:
+    agents:
+      team:
+        model: sonnet
+"#,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("two-alias config must parse")
     }
 
     fn last_system_message(sm: &Arc<StateManager>) -> String {
@@ -5022,67 +5035,51 @@ mod tests {
 
     // --- /model switch: reasoning wire gate ---------------------------------
 
-    /// Two providers under one registry: an Anthropic model (thinking blocks
-    /// are its wire contract) and an Ollama model (they are poison there).
+    /// Two providers (Anthropic: thinking blocks are its wire contract;
+    /// Ollama: they are poison there) under one parsed config.
     #[cfg(feature = "mock")]
-    fn registry_with_anthropic_and_ollama() -> crate::config::ModelRegistry {
-        use crate::config::{ModelEntry, ProviderEntry, ProviderType};
-
-        let model = |name: &str, alias: &str| ModelEntry {
-            name: name.into(),
-            alias: Some(alias.into()),
-            max_tokens: None,
-            temperature: None,
-            extra_params: None,
-            prompt_caching: None,
-            vision: None,
-            context_size: Some(200_000),
-            preserve_reasoning: true,
-            display_reasoning: false,
-        };
-
-        let providers = vec![
-            ProviderEntry {
-                name: "anthropic".into(),
-                kind: ProviderType::Anthropic,
-                api_key: Some("sk-ant-test".into()),
-                base_url: None,
-                preserve_reasoning: None,
-                display_reasoning: None,
-                models: vec![model("claude-sonnet-4", "claude")],
+    fn config_with_anthropic_and_ollama() -> Config {
+        use crate::config::resolve::{ParseCtx, Source};
+        Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: r#"
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key: sk-ant-test
+    models:
+      - { name: claude-sonnet-4, alias: claude, context_size: 200000 }
+  - name: ollama
+    type: ollama
+    base_url: http://localhost:11434
+    models:
+      - { name: llama3, alias: local, context_size: 200000 }
+general:
+  context:
+    enabled: false
+profiles:
+  dev:
+    agents:
+      team:
+        model: claude
+"#,
             },
-            ProviderEntry {
-                name: "ollama".into(),
-                kind: ProviderType::Ollama,
-                api_key: None,
-                base_url: Some("http://localhost:11434".into()),
-                models: vec![model("llama3", "local")],
-                preserve_reasoning: None,
-                display_reasoning: None,
-            },
-        ];
-
-        crate::config::ModelRegistry::build(&providers, Some("claude")).expect("registry builds")
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("anthropic+ollama config must parse")
     }
 
     #[cfg(feature = "mock")]
-    fn rebuild_ctx_for(registry: crate::config::ModelRegistry) -> RebuildContext {
+    fn rebuild_ctx_for(config: Config) -> RebuildContext {
         RebuildContext {
-            registry: Arc::new(registry),
-            system_prompt: "test prompt".into(),
+            bound: config.catalog.default_bound(),
+            config: Arc::new(config),
             mcp_handles: Arc::new(Vec::new()),
-            searxng_config: None,
-            max_turns: 4,
-            todo_tool: None,
-            bash_config: crate::config::BashConfig::default(),
-            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
             shell_kind: None,
             skills: crate::skills::SkillRegistry::default(),
-            vector_store: None,
-            memory_enabled: false,
-            agents_md_enabled: true,
-            tools_filter: crate::config::NameFilter::default(),
-            prompt_head: None,
+            todo_tool: None,
             profile_pin: None,
         }
     }
@@ -5130,16 +5127,7 @@ mod tests {
             })
         };
 
-        let mut config = Config {
-            // Compaction off: the rebuild seam validates a compaction model
-            // when it's on, which is orthogonal to what this test pins.
-            context: crate::config::ContextConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            ..Config::default()
-        };
-        let mut ctx = rebuild_ctx_for(registry_with_anthropic_and_ollama());
+        let ctx = rebuild_ctx_for(config_with_anthropic_and_ollama());
         let (mock_agent, _mock_info, _rx, mock_hook, _mock_model) =
             crate::providers::create_mock_agent("test prompt", 4, sm.clone())
                 .expect("mock agent builds");
@@ -5150,19 +5138,19 @@ mod tests {
 
         // ── Switch to Anthropic: gate OPEN, blocks reach the wire ──────────
         let claude = ctx
+            .config
             .registry
             .resolve("claude")
             .expect("alias claude")
             .clone();
-        AgentRunner::rebuild_agent_for_resolved(
+        AgentRunner::rebuild_agent(
             &claude,
             &mut agent_slot,
-            &mut config,
             &sm,
             &hook_cell,
             &mut event_processor,
             &sm_opt,
-            &mut ctx,
+            &ctx,
         )
         .await
         .expect("rebuild onto anthropic");
@@ -5173,16 +5161,20 @@ mod tests {
         );
 
         // ── Switch to Ollama: gate CLOSED, no block survives the rebuild ───
-        let local = ctx.registry.resolve("local").expect("alias local").clone();
-        AgentRunner::rebuild_agent_for_resolved(
+        let local = ctx
+            .config
+            .registry
+            .resolve("local")
+            .expect("alias local")
+            .clone();
+        AgentRunner::rebuild_agent(
             &local,
             &mut agent_slot,
-            &mut config,
             &sm,
             &hook_cell,
             &mut event_processor,
             &sm_opt,
-            &mut ctx,
+            &ctx,
         )
         .await
         .expect("rebuild onto ollama");
@@ -5288,7 +5280,7 @@ mod tests {
     #[tokio::test]
     async fn reset_command_zeros_session_stats() {
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         // Seed the stats as if some requests had happened
         {
@@ -5319,7 +5311,7 @@ mod tests {
         // /new is the one that clears history. Keeping them orthogonal is the
         // whole reason they're two commands.
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         sm.add_user_message("keep me".to_string());
         sm.add_assistant_message("and me".to_string());
@@ -5344,7 +5336,7 @@ mod tests {
     #[tokio::test]
     async fn reset_command_emits_system_banner() {
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         AgentRunner::process_command_internal("/reset", &Some(sm.clone()), &config).await;
 
@@ -5378,7 +5370,7 @@ mod tests {
     #[tokio::test]
     async fn exit_command_sets_exit_requested_flag() {
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         assert!(
             !sm.exit_requested(),
@@ -5399,7 +5391,7 @@ mod tests {
         // reset, no chat clear. The REPL is about to tear down; extra
         // writes would just flash before the screen is cleared.
         let sm = StateManager::new_arc();
-        let config = Config::default();
+        let config = test_config();
 
         sm.add_user_message("keep me".to_string());
         sm.add_assistant_message("and me".to_string());
@@ -5549,51 +5541,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn classify_pipeline_bare_lists() {
-        assert!(matches!(
-            classify_submission("/pipeline"),
-            SubmitKind::PipelineCommand(PipelineSubmission::List)
-        ));
-    }
-
-    #[test]
-    fn classify_pipeline_single_word_selects() {
-        assert!(matches!(
-            classify_submission("/pipeline web-team"),
-            SubmitKind::PipelineCommand(PipelineSubmission::Set(Some(s))) if s == "web-team"
-        ));
-    }
-
-    #[test]
-    fn classify_pipeline_spaced_name_selects_rest_of_line() {
-        // Names may contain spaces; parsing must take everything after "/pipeline ".
-        assert!(matches!(
-            classify_submission("/pipeline Generic Dev Team"),
-            SubmitKind::PipelineCommand(PipelineSubmission::Set(Some(s))) if s == "Generic Dev Team"
-        ));
-    }
-
-    #[test]
-    fn classify_pipeline_none_clears() {
-        assert!(matches!(
-            classify_submission("/pipeline none"),
-            SubmitKind::PipelineCommand(PipelineSubmission::Set(None))
-        ));
-        assert!(matches!(
-            classify_submission("/pipeline off"),
-            SubmitKind::PipelineCommand(PipelineSubmission::Set(None))
-        ));
-    }
-
-    #[test]
-    fn classify_pipeline_trims_whitespace() {
-        assert!(matches!(
-            classify_submission("  /pipeline Generic Dev Team  "),
-            SubmitKind::PipelineCommand(PipelineSubmission::Set(Some(s))) if s == "Generic Dev Team"
-        ));
-    }
-
     // ── T7 — `[img:]` token grammar at classify time (design §3.2/§4.1, A1) ─
     //
     // `classify_submission` is grammar-only now: NO I/O, NO file resolution
@@ -5676,158 +5623,88 @@ mod tests {
     }
 
     // =========================================================================
-    // CONTRACT A — `Profile.mcp_servers` at the tool seam (RED).
+    // =========================================================================
+    // MCP tool filtering at the tool seam — `McpSource` (0.24).
     //
-    // MCP tools ARE tracked per server today (`McpServerHandle` owns a
-    // `name` + its `tools`), but both flattening sites (`create_session` in
-    // `src/session.rs`, `rebuild_agent_for_resolved` here) collapse the
-    // handles into one flat `Vec<Box<dyn ToolDyn>>` before the profile can
-    // see them. The locked seam is a pure filter over the per-server
-    // collection, so the gate is testable without a live MCP subprocess:
-    //
-    //     pub fn mcp_tools_for_profile(
-    //         servers: &[(String, Vec<Box<dyn ToolDyn>>)],
-    //         filter: Option<&NameFilter>,
-    //     ) -> Vec<Box<dyn ToolDyn>>
-    //
-    // Servers in input order, tools in per-server order; `None` = no gate
-    // (every server's tools — today's behaviour); `enabled: false` = none.
-    // Both flattening sites build the groups from `mcp_handles` (the new
-    // `McpServerHandle::name()` accessor) and pass
-    // `config.active_mcp_server_filter()` — boot AND rebuild, so a runtime
-    // `/profile` switch changes the rebuilt agent's MCP toolset.
-    //
-    // Compile-RED until the function lands.
+    // The profile's MCP `NameFilter` gates which servers' tools reach the
+    // agent. `McpSource::for_test` + `tool_names` exercise the same
+    // `NameFilter::allows` gate `tools()` applies over live handles.
     // =========================================================================
 
-    /// Two throwaway rig tools standing in for MCP tools — `Tool::NAME` is
-    /// per-type, hence two unit structs (the same trick as `InnerEcho` in
-    /// `src/providers/mod.rs::tests`).
-    struct AlphaTool;
-    impl rig_core::tool::Tool for AlphaTool {
-        const NAME: &'static str = "alpha_tool";
-        type Error = std::convert::Infallible;
-        type Args = serde_json::Value;
-        type Output = String;
-        async fn definition(&self, _p: String) -> rig_core::completion::ToolDefinition {
-            rig_core::completion::ToolDefinition {
-                name: Self::NAME.to_string(),
-                description: "alpha".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            }
-        }
-        async fn call(&self, _args: serde_json::Value) -> Result<String, Self::Error> {
-            Ok("alpha".to_string())
-        }
-    }
-
-    struct BetaTool;
-    impl rig_core::tool::Tool for BetaTool {
-        const NAME: &'static str = "beta_tool";
-        type Error = std::convert::Infallible;
-        type Args = serde_json::Value;
-        type Output = String;
-        async fn definition(&self, _p: String) -> rig_core::completion::ToolDefinition {
-            rig_core::completion::ToolDefinition {
-                name: Self::NAME.to_string(),
-                description: "beta".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            }
-        }
-        async fn call(&self, _args: serde_json::Value) -> Result<String, Self::Error> {
-            Ok("beta".to_string())
-        }
-    }
-
-    /// The fixture collection: server `alpha` with one tool, server `beta`
-    /// with one tool — the shape both flattening sites produce.
-    fn mcp_fixture_servers() -> Vec<(String, Vec<Box<dyn rig_core::tool::ToolDyn>>)> {
-        use rig_core::tool::ToolDyn;
+    /// The fixture groups: server `alpha` with one tool, server `beta` with
+    /// one tool — the shape `McpSource::tools()` derives from the handles.
+    fn mcp_fixture_groups() -> Vec<(String, Vec<String>)> {
         vec![
-            (
-                "alpha".to_string(),
-                vec![Box::new(AlphaTool) as Box<dyn ToolDyn>],
-            ),
-            (
-                "beta".to_string(),
-                vec![Box::new(BetaTool) as Box<dyn ToolDyn>],
-            ),
+            ("alpha".to_string(), vec!["alpha_tool".to_string()]),
+            ("beta".to_string(), vec!["beta_tool".to_string()]),
         ]
     }
 
-    fn tool_names(tools: &[Box<dyn rig_core::tool::ToolDyn>]) -> Vec<String> {
-        tools.iter().map(|t| t.name()).collect()
-    }
-
-    /// `None` = no gate: every server's tools, in server order.
-    /// (RED — the function does not exist yet.)
+    /// No gate (default filter): every server's tools, in server order.
     #[test]
-    fn mcp_tools_for_profile_none_keeps_every_server_in_order() {
-        let servers = mcp_fixture_servers();
-        let tools = mcp_tools_for_profile(servers, None);
+    fn mcp_source_default_filter_keeps_every_server_in_order() {
+        let groups = mcp_fixture_groups();
+        let source =
+            crate::tools::env::McpSource::for_test(&groups, crate::config::NameFilter::default());
         assert_eq!(
-            tool_names(&tools),
+            source.tool_names(),
             vec!["alpha_tool", "beta_tool"],
-            "no gate ⇒ every server's tools, in server order"
+            "an unfiltered source must keep every server in order"
         );
     }
 
-    /// `only: [alpha]` ⇒ only alpha's tools reach the agent.
-    /// (RED — the function does not exist yet.)
+    /// `only:` keeps exactly the named servers (in fixture order).
     #[test]
-    fn mcp_tools_for_profile_only_keeps_named_servers() {
-        let servers = mcp_fixture_servers();
+    fn mcp_source_only_keeps_named_servers() {
+        let groups = mcp_fixture_groups();
         let gate = crate::config::NameFilter {
-            only: vec!["alpha".into()],
+            only: vec!["beta".into()],
             ..Default::default()
         };
-        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        let source = crate::tools::env::McpSource::for_test(&groups, gate);
         assert_eq!(
-            tool_names(&tools),
-            vec!["alpha_tool"],
-            "only: [alpha] ⇒ only alpha's tools"
+            source.tool_names(),
+            vec!["beta_tool"],
+            "only: [beta] must keep exactly beta's tools"
         );
     }
 
-    /// `disabled: [alpha]` ⇒ everything but alpha's tools.
-    /// (RED — the function does not exist yet.)
+    /// `disabled:` drops the named servers.
     #[test]
-    fn mcp_tools_for_profile_disabled_drops_named_servers() {
-        let servers = mcp_fixture_servers();
+    fn mcp_source_disabled_drops_named_servers() {
+        let groups = mcp_fixture_groups();
         let gate = crate::config::NameFilter {
             disabled: vec!["alpha".into()],
             ..Default::default()
         };
-        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        let source = crate::tools::env::McpSource::for_test(&groups, gate);
         assert_eq!(
-            tool_names(&tools),
+            source.tool_names(),
             vec!["beta_tool"],
-            "disabled: [alpha] ⇒ all servers but alpha"
+            "disabled: [alpha] must drop alpha's tools"
         );
     }
 
     /// `enabled: false` ⇒ no MCP tools at all (the servers keep running).
-    /// (RED — the function does not exist yet.)
     #[test]
-    fn mcp_tools_for_profile_enabled_false_keeps_nothing() {
-        let servers = mcp_fixture_servers();
+    fn mcp_source_enabled_false_keeps_nothing() {
+        let groups = mcp_fixture_groups();
         let gate = crate::config::NameFilter {
             enabled: false,
             ..Default::default()
         };
-        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        let source = crate::tools::env::McpSource::for_test(&groups, gate);
         assert!(
-            tools.is_empty(),
+            source.tool_names().is_empty(),
             "enabled: false ⇒ no MCP tools, got: {:?}",
-            tool_names(&tools)
+            source.tool_names()
         );
     }
 
     /// Anti-astonishment (the `NameFilter` rule): EMPTY lists are a no-op —
-    /// `only: []` never means "none". (RED — the function does not exist
-    /// yet.)
+    /// `only: []` never means "none".
     #[test]
-    fn mcp_tools_for_profile_empty_lists_allow_all() {
+    fn mcp_source_empty_lists_allow_all() {
         for gate in [
             crate::config::NameFilter {
                 only: vec![],
@@ -5838,60 +5715,52 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            // Fresh fixture per iteration: `mcp_tools_for_profile` now
-            // consumes the groups by value (tools aren't `Clone`), so the
-            // same `servers` binding cannot be reused across loop passes.
-            let servers = mcp_fixture_servers();
-            let tools = mcp_tools_for_profile(servers, Some(&gate));
+            let groups = mcp_fixture_groups();
+            let source = crate::tools::env::McpSource::for_test(&groups, gate);
             assert_eq!(
-                tool_names(&tools),
+                source.tool_names(),
                 vec!["alpha_tool", "beta_tool"],
                 "an empty list must be a no-op, got: {:?}",
-                tool_names(&tools)
+                source.tool_names()
             );
         }
     }
 
     /// A name the config layer would have rejected still filters to
     /// nothing at the pure seam (validation is upstream; the filter must
-    /// not panic or leak tools on an unknown name). (RED — the function
-    /// does not exist yet.)
+    /// not panic or leak tools on an unknown name).
     #[test]
-    fn mcp_tools_for_profile_only_unknown_name_keeps_nothing() {
-        let servers = mcp_fixture_servers();
+    fn mcp_source_only_unknown_name_keeps_nothing() {
+        let groups = mcp_fixture_groups();
         let gate = crate::config::NameFilter {
             only: vec!["ghost".into()],
             ..Default::default()
         };
-        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        let source = crate::tools::env::McpSource::for_test(&groups, gate);
         assert!(
-            tools.is_empty(),
+            source.tool_names().is_empty(),
             "only: [ghost] matches no server ⇒ no tools, got: {:?}",
-            tool_names(&tools)
+            source.tool_names()
         );
     }
 
     /// Edge: a server with ZERO tools contributes nothing and must not
-    /// break the filter. (RED — the function does not exist yet.)
+    /// break the filter.
     #[test]
-    fn mcp_tools_for_profile_skips_server_with_no_tools() {
-        use rig_core::tool::ToolDyn;
-        let servers = vec![
-            ("alpha".to_string(), Vec::<Box<dyn ToolDyn>>::new()),
-            (
-                "beta".to_string(),
-                vec![Box::new(BetaTool) as Box<dyn ToolDyn>],
-            ),
+    fn mcp_source_skips_server_with_no_tools() {
+        let groups = vec![
+            ("alpha".to_string(), Vec::<String>::new()),
+            ("beta".to_string(), vec!["beta_tool".to_string()]),
         ];
         let gate = crate::config::NameFilter {
             only: vec!["alpha".into()],
             ..Default::default()
         };
-        let tools = mcp_tools_for_profile(servers, Some(&gate));
+        let source = crate::tools::env::McpSource::for_test(&groups, gate);
         assert!(
-            tools.is_empty(),
+            source.tool_names().is_empty(),
             "an allowed server with no tools yields no tools, got: {:?}",
-            tool_names(&tools)
+            source.tool_names()
         );
     }
 
@@ -6475,14 +6344,9 @@ headers:
         ));
         model.add_response(crate::mock::MockResponse::text("done"));
 
-        let config = Config {
-            retry: crate::config::RetryConfig {
-                max_retries: 1,
-                initial_delay_ms: 1,
-                ..Default::default()
-            },
-            ..Config::default()
-        };
+        let mut config = test_config();
+        config.general.retry.max_retries = 1;
+        config.general.retry.initial_delay_ms = 1;
 
         let current_turn = sm
             .build_current_turn_message()
@@ -6869,362 +6733,6 @@ headers:
         // ...but stats still moved.
         assert_eq!(sm.get_stats().total_api_calls, 1);
     }
-    // ── Stage 1.2: /pipeline command + /model refusal + pipeline selection ──
-    //
-    // The three pillars of §4 of the multi-pipeline plan:
-    // 1. `/pipeline [name|none|off]` routing (SubmitKind::PipelineCommand).
-    // 2. `/model <alias>` refusal when a pipeline is selected — the
-    //    orchestrator's model is owned by the pipeline.
-    // 3. Bare `/model` listing marks the fixed alias with
-    //    `[fixed by pipeline 'x']`.
-    //
-    // These are RED against the §7 contracts: `PipelineCommand`,
-    // `model_locked_message`, `handle_select_pipeline` do not exist
-    // yet. The build will fail until Stage 1.2 lands.
-
-    /// `/pipeline` (bare, no arg) classifies as the List variant — the
-    /// controller will then emit a listing of the configured pipelines.
-    /// `/pipeline <name>` classifies as `Set(Some(name))`. `/pipeline
-    /// none` and `/pipeline off` both classify as `Set(None)` — the two
-    /// reserved "clear" spellings the plan §7 promises.
-    #[test]
-    fn classify_pipeline_command_variants() {
-        // Bare — List. Printed by the controller from AppState.
-        assert!(matches!(
-            classify_submission("/pipeline"),
-            SubmitKind::PipelineCommand(PipelineSubmission::List)
-        ));
-        assert!(matches!(
-            classify_submission("  /pipeline  "),
-            SubmitKind::PipelineCommand(PipelineSubmission::List)
-        ));
-
-        // Name — Set(Some(name)). The exact name string survives, no
-        // case-folding (orchestrator already gets the validated alias,
-        // and case matters because pipeline names are user-typed).
-        assert!(matches!(
-            classify_submission("/pipeline web-team"),
-            SubmitKind::PipelineCommand(PipelineSubmission::Set(ref s)) if s.as_deref() == Some("web-team")
-        ));
-        assert!(matches!(
-            classify_submission("/pipeline research-crew"),
-            SubmitKind::PipelineCommand(PipelineSubmission::Set(ref s)) if s.as_deref() == Some("research-crew")
-        ));
-
-        // `none` and `off` — both clear the selection.
-        for clear in [
-            "/pipeline none",
-            "/pipeline off",
-            "/pipeline OFF",
-            "/pipeline None",
-        ] {
-            assert!(
-                matches!(
-                    classify_submission(clear),
-                    SubmitKind::PipelineCommand(PipelineSubmission::Set(None))
-                ),
-                "{clear:?} must clear the selection"
-            );
-        }
-
-        // Word-boundary guard: `/pipelines` (with an s) is NOT the
-        // pipeline command. The popup autocomplete completes to
-        // `/pipeline`, not `/pipelines`, but a user typing the plural
-        // by reflex used to slip into the with-args arm. Same prefix
-        // discipline as the existing `/subagents` test.
-        assert!(matches!(
-            classify_submission("/pipelines"),
-            SubmitKind::Command(_)
-        ));
-        // Prefix-only: `/pipelinex` isn't the pipeline command either.
-        assert!(matches!(
-            classify_submission("/pipelinex"),
-            SubmitKind::Command(_)
-        ));
-        // Mid-sentence slash stays chat content.
-        assert!(matches!(
-            classify_submission("TODO: /pipeline foo"),
-            SubmitKind::UserMessage { .. }
-        ));
-    }
-
-    /// `model_locked_message(pipeline)` is the ONE producer for the
-    /// `/model` refusal (plan §4). Every surface — REPL intercept,
-    /// stdio, web — funnels through it so the wording stays consistent.
-    /// The phrase `fixed by pipeline` is the user-visible signal; the
-    /// pipeline name must appear so the user can locate the source.
-    #[test]
-    fn model_locked_message_mentions_fixed_by_pipeline_and_name() {
-        let msg = model_locked_message("web-team");
-        assert!(
-            msg.contains("fixed by pipeline"),
-            "refusal must use the canonical 'fixed by pipeline' phrase; got: {msg:?}"
-        );
-        assert!(
-            msg.contains("web-team"),
-            "refusal must name the pipeline so the user can locate it; got: {msg:?}"
-        );
-    }
-
-    /// Bare `/model` listing must mark the orchestrator's alias with
-    /// `[fixed by pipeline 'x']` when a pipeline is selected (plan §4
-    /// "bare /model listing marks `[fixed by pipeline 'x']`"). The
-    /// marking tells the user the alias is fixed and *why*, without
-    /// the pop-up listing going silent on the choice. Goes through
-    /// `process_command_internal` (the controller-level seam), with a
-    /// `selected_pipeline` already stamped via `set_selected_pipeline`.
-    #[tokio::test]
-    async fn bare_model_command_marks_fixed_alias_when_pipeline_selected() {
-        let sm = StateManager::new_arc();
-        let config = config_with_two_aliases();
-        // Stage a pipeline selection. The marker MUST name the
-        // pipeline ("web-team") and mark the alias that's fixed by it.
-        sm.set_selected_pipeline(Some("web-team".into()));
-
-        AgentRunner::process_command_internal("/model", &Some(sm.clone()), &config).await;
-
-        let msg = last_system_message(&sm);
-        assert!(
-            msg.contains("Available models:"),
-            "bare /model must still show the listing, got: {msg}"
-        );
-        // The marker must mention the pipeline name AND the alias is
-        // fixed. The exact alias will depend on which pipeline was
-        // selected; here `web-team` is a placeholder so we only check
-        // for the "fixed by pipeline" tag and the pipeline name.
-        assert!(
-            msg.contains("fixed by pipeline") && msg.contains("web-team"),
-            "the fixed alias must be marked with `[fixed by pipeline 'x']`; got: {msg}"
-        );
-    }
-
-    /// Bare `/model` listing WITHOUT a pipeline selection must NOT
-    /// mark any alias — it stays the same listing the no-pipeline
-    /// world already shows (plan §4 only adds the marker under a
-    /// pipeline). Companion to the marker test above.
-    #[tokio::test]
-    async fn bare_model_command_unmarked_when_no_pipeline_selected() {
-        let sm = StateManager::new_arc();
-        let config = config_with_two_aliases();
-        // Default — no pipeline selected.
-
-        AgentRunner::process_command_internal("/model", &Some(sm.clone()), &config).await;
-
-        let msg = last_system_message(&sm);
-        assert!(msg.contains("Available models:"));
-        assert!(
-            !msg.contains("fixed by pipeline"),
-            "no pipeline selected → no `[fixed by pipeline]` marker; got: {msg}"
-        );
-    }
-
-    /// Refusal assertion: when a pipeline is selected, `/model <other-alias>`
-    /// returns an Err whose message contains `fixed by pipeline` AND
-    /// the original model is NOT swapped. Goes through the
-    /// authoritative `handle_switch_model` (covers stdio + web per §4).
-    ///
-    /// We can't construct a real `AgentRunner` here (it requires a
-    /// provider + session hook), so this test asserts through
-    /// `process_command_internal` — the controller path the agent loop
-    /// ultimately funnels into. The actual `handle_switch_model`
-    /// refusal path is pinned by the `model_locked_message` test above
-    /// + the orchestrator-owns-model contract enforced by the
-    /// rebuild seam.
-    #[tokio::test]
-    async fn model_alias_command_refused_when_pipeline_selected() {
-        let sm = StateManager::new_arc();
-        let config = config_with_two_aliases();
-        // Stamp the pipeline selection. The user's saved wire id is
-        // `sonnet` (the default). Switching to `gpt4o` under a
-        // pipeline must be refused.
-        sm.set_selected_pipeline(Some("web-team".into()));
-        let alias_before = sm.get_model_alias();
-
-        AgentRunner::process_command_internal("/model gpt4o", &Some(sm.clone()), &config).await;
-
-        let msg = last_system_message(&sm);
-        assert!(
-            msg.contains("fixed by pipeline") || msg.contains("pipeline"),
-            "/model <alias> under a pipeline must surface a refusal mentioning pipeline; got: {msg}"
-        );
-        // The model must NOT have changed. Plan §4: "the orchestrator's
-        // model is now derived from the selection rather than stored
-        // beside it, the top model selector goes read-only and /model
-        // refuses".
-        assert_eq!(
-            sm.get_model_alias(),
-            alias_before,
-            "the alias must not change when /model is refused"
-        );
-    }
-
-    /// `handle_select_pipeline` is the renamed `handle_set_subagents`
-    /// (§7 contracts). Lock check: once the conversation has a real
-    /// turn, the handler refuses with an error so the conversation
-    /// history and tool list don't desync mid-turn. This is the
-    /// same lock rule today — `subagents_enabled` is "mutable only
-    /// before the first turn, frozen after" — applied to the new
-    /// field.
-    ///
-    /// Tested through the existing `process_command_internal` /\u00a0controll\u00e8r
-    /// dispatch rather than calling `handle_select_pipeline`
-    /// directly (constructing an AgentRunner requires a live provider
-    /// + session hook). The lock rule is the same; this test pins
-    /// that it fires when a turn has happened.
-    #[tokio::test]
-    async fn pipeline_selection_locked_after_first_turn() {
-        let sm = StateManager::new_arc();
-        let config = config_with_two_aliases();
-        // Seed a real user turn — the conversation now has turns.
-        sm.add_user_message("hi".into());
-        assert!(sm.conversation_has_turns());
-
-        // Send a /pipeline web-team submission through the same
-        // controller path. The handler must refuse (locked).
-        // process_command_internal currently has no /pipeline arm; the
-        // builder must add one in Stage 1.2 that calls
-        // handle_select_pipeline, which returns Err after the first
-        // turn.
-        AgentRunner::process_command_internal("/pipeline web-team", &Some(sm.clone()), &config)
-            .await;
-
-        // The conversation did NOT adopt the new selection.
-        assert_eq!(
-            sm.selected_pipeline().as_deref(),
-            None,
-            "selection must NOT change once the conversation has turns"
-        );
-        // And the user sees an error in the system stream.
-        let last = last_system_message(&sm);
-        assert!(
-            last.to_lowercase().contains("lock")
-                || last.to_lowercase().contains("first turn")
-                || last.to_lowercase().contains("started"),
-            "user must see an error explaining the lock; got: {last}"
-        );
-    }
-
-    /// `handle_select_pipeline` must be idempotent for the
-    /// already-selected name: selecting the current pipeline is a
-    /// silent no-op, not a rebuild storm. This is the same property
-    /// today's `handle_set_subagents` has (line ~1520:
-    /// "No-op if already in the requested state (idempotent toggle).").
-    /// The test asserts that picking the active selection produces NO
-    /// system message (no announcement, no rebuild trace) and leaves
-    /// the alias unchanged.
-    #[tokio::test]
-    async fn pipeline_selection_idempotent_for_current_name() {
-        let sm = StateManager::new_arc();
-        let config = config_with_two_aliases();
-        // Pre-stamp a selection.
-        sm.set_selected_pipeline(Some("web-team".into()));
-        let alias_before = sm.get_model_alias();
-        let chat_len_before = sm.get_state().chat.messages.len();
-
-        AgentRunner::process_command_internal("/pipeline web-team", &Some(sm.clone()), &config)
-            .await;
-
-        // No-op — no announcement system message, no alias flip.
-        assert_eq!(sm.selected_pipeline().as_deref(), Some("web-team"));
-        assert_eq!(sm.get_model_alias(), alias_before);
-        assert_eq!(
-            sm.get_state().chat.messages.len(),
-            chat_len_before,
-            "idempotent re-selection must NOT add a system message (no rebuild storm)"
-        );
-    }
-
-    /// `handle_select_pipeline(unknown_name)` must reject with an
-    /// error that lists the available pipelines — same shape as
-    /// `handle_switch_model`'s unknown-alias error. Plan §4: the user
-    /// types a name after `/pipeline` and gets a list back when it's
-    /// wrong.
-    #[tokio::test]
-    async fn pipeline_selection_unknown_name_errors_listing_available() {
-        let sm = StateManager::new_arc();
-        let config = config_with_two_aliases();
-        // No selection yet.
-        assert_eq!(sm.selected_pipeline().as_deref(), None);
-
-        AgentRunner::process_command_internal(
-            "/pipeline nope-not-a-pipe",
-            &Some(sm.clone()),
-            &config,
-        )
-        .await;
-
-        // The selection is NOT applied.
-        assert_eq!(
-            sm.selected_pipeline().as_deref(),
-            None,
-            "an unknown pipeline name must NOT be silently applied"
-        );
-        let last = last_system_message(&sm);
-        assert!(
-            last.contains("nope-not-a-pipe"),
-            "error must name the bad name so the user can see the typo; got: {last}"
-        );
-        assert!(
-            last.contains("Available")
-                || last.contains("web-team")
-                || last.contains("Available pipelines"),
-            "error must list the available pipelines; got: {last}"
-        );
-    }
-
-    /// On failed selection, `handle_select_pipeline` MUST restore the
-    /// previous selection — the same fix the plan §4 calls out for the
-    /// existing toggle ("on failure: restore previous selection — fixes
-    /// a leak today's toggle has"). This test forces a failure by
-    /// selecting a pipeline name the registry doesn't know; without
-    /// the restore-before-set discipline the AppState would be left
-    /// holding an orphan name.
-    ///
-    /// Note: the full rebuild-failure path (the implementer's
-    /// `set_selected_pipeline(previous)` after a rebuild error) runs in
-    /// the agent loop and can't be triggered from `process_command_internal`
-    /// alone. This test pins the *observable* contract — an unknown
-    /// pipeline name MUST NOT mutate `selected_pipeline`, so the
-    /// previous selection survives. The deeper rebuild-restore
-    /// property is asserted by the StateManager mirror tests above
-    /// (which exercise `set_selected_pipeline` directly).
-    #[tokio::test]
-    async fn pipeline_selection_with_bad_name_does_not_mutate_previous() {
-        let sm = StateManager::new_arc();
-        let config = config_with_two_aliases();
-        // Pre-stamp a known-good selection so the test has a "previous"
-        // to fall back to.
-        sm.set_selected_pipeline(Some("web-team".into()));
-        let prior = sm.selected_pipeline();
-
-        AgentRunner::process_command_internal(
-            "/pipeline nope-not-a-pipe",
-            &Some(sm.clone()),
-            &config,
-        )
-        .await;
-
-        assert_eq!(
-            sm.selected_pipeline(),
-            prior,
-            "a failed selection must restore the previous selection (plan §4)"
-        );
-        assert_eq!(
-            sm.selected_pipeline().as_deref(),
-            Some("web-team"),
-            "the previous selection (web-team) must survive intact"
-        );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // #183 — T4: `stop_message_renders_tally` (design §8, T4).
-    //
-    // Pins the byte-exact rendered string for each of the two StopTally
-    // combinations the contract enumerates (see `stop_message` doc-table).
-    // Against the current code's stub, the `shell: true` case fails (the
-    // stub returns the bare sentence) and the `default()` case passes (the
-    // bare sentence is the expected output).
-    // ─────────────────────────────────────────────────────────────────────
 
     /// T4 — stop message rendering. Pure-function test, no fixtures.
     #[test]
@@ -7247,568 +6755,6 @@ headers:
     }
 
     // =========================================================================
-    // Reload-safe `pipelines:` (ticket pipelines-reload.md §8, tests 8–14 + 15).
-    //
-    // The two private helpers the design extracts — `pipeline_catalogue_message`
-    // and `reconcile_pipeline_selection` — are the testable seams. They are
-    // *module-private*, but the tests inside `mod tests { use super::*; }`
-    // reach them directly. RED-by-design: these fns do not exist yet — the
-    // compile errors are the "missing API" signal to the implementer.
-    //
-    // `tests/scenarios/pipeline_tests.rs::selected_pipeline_that_vanishes_…`
-    // pins the same contract at the delegate-tool seam (test 15 in the
-    // design's enumeration); the unit-test here pins the rebuild seam's
-    // lookup pattern at the same site (`src/lib.rs:1955-1957`).
-    // =========================================================================
-
-    /// A two-model registry mirroring the fixture in
-    /// `src/pipeline/set.rs::tests` — inlined here because that helper
-    /// is private to that module. Aliased `flash` (default) + `sonnet`.
-    fn two_model_registry() -> crate::config::ModelRegistry {
-        use crate::config::{ModelEntry, ProviderEntry, ProviderType};
-        let prov = ProviderEntry {
-            name: "openrouter".into(),
-            kind: ProviderType::OpenRouter,
-            api_key: Some("sk-or-test".into()),
-            base_url: None,
-            preserve_reasoning: None,
-            display_reasoning: None,
-            models: vec![
-                ModelEntry {
-                    name: "google/gemini-2.0-flash-001".into(),
-                    alias: Some("flash".into()),
-                    max_tokens: None,
-                    temperature: None,
-                    extra_params: None,
-                    prompt_caching: None,
-                    vision: None,
-                    context_size: None,
-                    preserve_reasoning: true,
-                    display_reasoning: false,
-                },
-                ModelEntry {
-                    name: "anthropic/claude-3.7-sonnet".into(),
-                    alias: Some("sonnet".into()),
-                    max_tokens: None,
-                    temperature: None,
-                    extra_params: None,
-                    prompt_caching: None,
-                    vision: None,
-                    context_size: None,
-                    preserve_reasoning: true,
-                    display_reasoning: false,
-                },
-            ],
-        };
-        crate::config::ModelRegistry::build(std::slice::from_ref(&prov), Some("flash"))
-            .expect("registry builds")
-    }
-
-    /// YAML preamble: a `providers:` list with two aliases and a
-    /// default. Same shape as the fixture in
-    /// `src/pipeline/set.rs::tests::PROVIDERS` and
-    /// `src/config/mod.rs::tests::STAGE11_PROVIDERS_YAML` so the YAML
-    /// fragments can be pasted in either place.
-    const PROVIDERS: &str = "\
-providers:
-  - name: openrouter
-    type: openrouter
-    api_key: sk-or-test
-    models:
-      - name: anthropic/claude-3.7-sonnet
-        alias: sonnet
-      - name: google/gemini-2.0-flash-001
-        alias: flash
-default_model: flash
-";
-
-    // ----- pipeline_catalogue_message ----------------------------------------
-
-    /// `pipeline_catalogue_message(before, after)` is the "is there
-    /// anything the user wants to know about the new roster?" decision.
-    /// It MUST be silent when the set of *names* didn't change — the
-    /// roster may have changed (e.g. one team's `reviewer` model flipped
-    /// from `flash` to `sonnet`) but `names_joined()` is identical, so
-    /// the chat doesn't get a redundant line for a panel-only update.
-    #[test]
-    fn pipeline_catalogue_message_is_silent_when_names_unchanged() {
-        use crate::pipeline::PipelineSet;
-        let a = PipelineSet::default();
-        let b = PipelineSet::default();
-        assert!(
-            super::pipeline_catalogue_message(&a, &b).is_none(),
-            "two empty sets must be silent — no team added or removed"
-        );
-
-        // Same names, different order? `names_joined` is order-independent,
-        // so it must also be silent. (Defends against a future impl that
-        // uses `iter()` for equality and would falsely flag a reorder.)
-        let yaml = format!(
-            "{PROVIDERS}\
-pipelines:
-  - name: web-team
-    orchestrator: {{}}
-    agents:
-      r:
-        prompt: p
-  - name: research-crew
-    orchestrator: {{}}
-    agents:
-      r2:
-        prompt: p
-"
-        );
-        let cfg: crate::config::Config =
-            serde_yaml::from_str(&yaml).expect("two-pipeline YAML parses");
-        let set = PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
-        assert!(
-            super::pipeline_catalogue_message(&set, &set).is_none(),
-            "the set compared with itself must be silent"
-        );
-    }
-
-    /// Empty → {a, b} yields a single `🧩` line containing every new
-    /// name AND pointing the user at `/pipeline <name>`. The exact
-    /// format string is the user-facing discoverability mechanism
-    /// (ticket §5.5: "The `🧩` line is the whole discoverability
-    /// mechanism").
-    #[test]
-    fn pipeline_catalogue_message_lists_new_names() {
-        use crate::pipeline::PipelineSet;
-        let before = PipelineSet::default();
-
-        let yaml = format!(
-            "{PROVIDERS}\
-pipelines:
-  - name: alpha
-    orchestrator: {{}}
-    agents:
-      r:
-        prompt: p
-  - name: beta
-    orchestrator: {{}}
-    agents:
-      r2:
-        prompt: p
-"
-        );
-        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
-        let after = PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
-
-        let msg = super::pipeline_catalogue_message(&before, &after)
-            .expect("empty → {alpha, beta} must produce one line");
-        assert!(
-            msg.contains("alpha") && msg.contains("beta"),
-            "the line must name every new pipeline; got: {msg}"
-        );
-        assert!(
-            msg.contains("/pipeline"),
-            "the line must point the user at `/pipeline <name>`; got: {msg}"
-        );
-    }
-
-    /// `{a}` → empty yields the "no pipelines configured" sentence
-    /// verbatim — distinct from the "🧩 Pipelines available here" line
-    /// so the two cases are visually different in the chat. The
-    /// verbatim text is what `render_pipeline_list` shows at boot, so a
-    /// single source of truth keeps them in sync.
-    #[test]
-    fn pipeline_catalogue_message_reports_emptied_set() {
-        use crate::pipeline::PipelineSet;
-        let yaml = format!(
-            "{PROVIDERS}\
-pipelines:
-  - name: alpha
-    orchestrator: {{}}
-    agents:
-      r:
-        prompt: p
-"
-        );
-        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
-        let before =
-            PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
-        let after = PipelineSet::default();
-        let msg = super::pipeline_catalogue_message(&before, &after)
-            .expect("non-empty → empty must produce the emptied-set line");
-        assert_eq!(
-            msg, "🧩 No pipelines configured here.",
-            "exact verbatim text — also rendered by `render_pipeline_list` for boot-time silence"
-        );
-    }
-
-    // ----- reconcile_pipeline_selection --------------------------------------
-
-    /// A selection that vanishes from the new set MUST be dropped
-    /// (cleared from `AppState` AND the conversation's persisted
-    /// `pipeline`), and the function returns the canonical
-    /// "⚠ Pipeline '{name}' is not configured here…" warning. Two
-    /// assertions in one test because they are two halves of the same
-    /// outcome — a clear-only-without-warning would still leave the UI
-    /// showing a phantom name, and a warning-without-clear would leave
-    /// the next rebuild rebuilding against a ghost.
-    #[test]
-    fn reconcile_drops_selection_missing_from_new_set() {
-        let sm = StateManager::new_arc();
-        // Pre-stage: conversation has zero turns, pipeline selected.
-        sm.set_selected_pipeline(Some("ghost".into()));
-        assert_eq!(sm.selected_pipeline().as_deref(), Some("ghost"));
-
-        let ctx = RebuildContext {
-            registry: Arc::new(two_model_registry()),
-            system_prompt: String::new(),
-            mcp_handles: Arc::new(Vec::new()),
-            searxng_config: None,
-            max_turns: 0,
-            todo_tool: None,
-            bash_config: crate::config::BashConfig::default(),
-            // Empty set — `ghost` is NOT here.
-            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
-            shell_kind: None,
-            skills: crate::skills::SkillRegistry::default(),
-            vector_store: None,
-            memory_enabled: false,
-            agents_md_enabled: true,
-            tools_filter: crate::config::NameFilter::default(),
-            prompt_head: None,
-            profile_pin: None,
-        };
-
-        let warning = super::reconcile_pipeline_selection(&ctx, &sm)
-            .expect("missing selection must emit the canonical warning");
-
-        assert!(
-            warning.contains("ghost"),
-            "the warning must name the dropped selection so the user can \
-             understand what vanished; got: {warning}"
-        );
-        assert!(
-            warning.contains("not configured") || warning.contains("continuing without a pipeline"),
-            "the warning must use the canonical 'not configured / continuing \
-             without a pipeline' wording from ticket §5.4; got: {warning}"
-        );
-        assert_eq!(
-            sm.selected_pipeline(),
-            None,
-            "the selection MUST be cleared — AppState mirrors it, so a \
-             future rebuild_agent_for_resolved would re-derive a phantom"
-        );
-    }
-
-    /// A selection that survives the rebuild is left alone — no
-    /// warning, no state write. The reconcile is a *drop*-only
-    /// operation; never auto-select (ticket §5.5).
-    #[test]
-    fn reconcile_keeps_selection_present_in_new_set() {
-        let sm = StateManager::new_arc();
-        sm.set_selected_pipeline(Some("web-team".into()));
-
-        // Build a set that DOES contain `web-team`.
-        let yaml = format!(
-            "{PROVIDERS}\
-pipelines:
-  - name: web-team
-    orchestrator: {{}}
-    agents:
-      r:
-        prompt: p
-"
-        );
-        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
-        let set = crate::pipeline::PipelineSet::build(&cfg, &two_model_registry(), Some(&[]))
-            .expect("set builds");
-        let ctx = RebuildContext {
-            registry: Arc::new(two_model_registry()),
-            system_prompt: String::new(),
-            mcp_handles: Arc::new(Vec::new()),
-            searxng_config: None,
-            max_turns: 0,
-            todo_tool: None,
-            bash_config: crate::config::BashConfig::default(),
-            pipelines: Arc::new(set),
-            shell_kind: None,
-            skills: crate::skills::SkillRegistry::default(),
-            vector_store: None,
-            memory_enabled: false,
-            agents_md_enabled: true,
-            tools_filter: crate::config::NameFilter::default(),
-            prompt_head: None,
-            profile_pin: None,
-        };
-
-        let chat_len_before = sm.get_state().chat.messages.len();
-        let result = super::reconcile_pipeline_selection(&ctx, &sm);
-        assert!(
-            result.is_none(),
-            "selection still resolves → no warning; got: {result:?}"
-        );
-        assert_eq!(
-            sm.selected_pipeline().as_deref(),
-            Some("web-team"),
-            "the live selection MUST NOT be touched when it still resolves"
-        );
-        assert_eq!(
-            sm.get_state().chat.messages.len(),
-            chat_len_before,
-            "no-op reconcile must NOT add a system message"
-        );
-    }
-
-    /// No selection at all → silent, no state write. The fresh-session
-    /// baseline (D2). Without this pin, a future impl that defaults to
-    /// `Some("default")` would invent a selection out of thin air.
-    #[test]
-    fn reconcile_is_silent_with_no_selection() {
-        let sm = StateManager::new_arc();
-        // No `set_selected_pipeline` — fresh baseline.
-        assert_eq!(sm.selected_pipeline(), None);
-
-        let ctx = RebuildContext {
-            registry: Arc::new(two_model_registry()),
-            system_prompt: String::new(),
-            mcp_handles: Arc::new(Vec::new()),
-            searxng_config: None,
-            max_turns: 0,
-            todo_tool: None,
-            bash_config: crate::config::BashConfig::default(),
-            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
-            shell_kind: None,
-            skills: crate::skills::SkillRegistry::default(),
-            vector_store: None,
-            memory_enabled: false,
-            agents_md_enabled: true,
-            tools_filter: crate::config::NameFilter::default(),
-            prompt_head: None,
-            profile_pin: None,
-        };
-
-        let chat_len_before = sm.get_state().chat.messages.len();
-        let result = super::reconcile_pipeline_selection(&ctx, &sm);
-        assert!(
-            result.is_none(),
-            "no selection → no warning; got: {result:?}"
-        );
-        assert_eq!(sm.selected_pipeline(), None);
-        assert_eq!(
-            sm.get_state().chat.messages.len(),
-            chat_len_before,
-            "no-op reconcile must NOT add a system message"
-        );
-    }
-
-    /// **Hazard #3** — the *contract* test for the reconciler's
-    /// precondition. The reconciler writes persisted truth via
-    /// `set_selected_pipeline` (I-3), so it must NEVER run on the
-    /// outgoing conversation. `/cd`/`/model`/`/new` all mint a fresh
-    /// conversation AFTER the reload, so the reconciler only ever sees
-    /// the *new* (zero-turn) conversation. The reverse — running the
-    /// reconciler on a conversation that already has turns — would
-    /// silently clobber the persisted `pipeline` of a conversation
-    /// the user is mid-way through.
-    ///
-    /// We don't have a direct knob to invoke the reconcile "on the
-    /// outgoing conversation" (that's the bug we're guarding against),
-    /// so the test pins the SAFE sequence instead: simulate the
-    /// outgoing conversation (turns + selection), mint a new
-    /// conversation, then assert the OUTGOING conversation's
-    /// persisted `pipeline` is unchanged (peeked, not loaded — a load
-    /// would itself mutate `current_conversation` and obscure the
-    /// invariant). A regression that "helpfully" calls the
-    /// reconciler before `create_conversation` would clear the
-    /// outgoing selection — the test catches it.
-    #[test]
-    fn reconcile_does_not_touch_a_conversation_with_turns() {
-        // `peek_conversation_pipeline` requires storage; the helper
-        // wires InMemoryStorage and is the same one the existing tests
-        // in this module use for /load / /save paths.
-        let sm = sm_with_storage();
-        // Outgoing conversation: at least one real turn + a selection.
-        sm.create_conversation(
-            "outgoing".into(),
-            "openrouter".into(),
-            "openai/gpt-4o-mini".into(),
-            String::new(),
-        );
-        sm.set_selected_pipeline(Some("web-team".into()));
-        sm.add_user_message("hi there".into());
-        assert!(sm.conversation_has_turns(), "fixture: outgoing has a turn");
-
-        // Snapshot the outgoing conversation's id and persisted
-        // pipeline BEFORE minting the new one.
-        let outgoing_id = sm
-            .get_current_conversation_id()
-            .expect("outgoing conversation");
-        let outgoing_pipeline = sm
-            .peek_conversation_pipeline(outgoing_id)
-            .expect("peek outgoing pipeline");
-        assert_eq!(
-            outgoing_pipeline.as_deref(),
-            Some("web-team"),
-            "fixture: outgoing conversation's persisted pipeline is 'web-team'"
-        );
-
-        // Mimic `/cd` step 7: create_conversation(...) on the *new* one.
-        sm.create_conversation(
-            "incoming".into(),
-            "openrouter".into(),
-            "openai/gpt-4o-mini".into(),
-            "/tmp/new-tree".into(),
-        );
-        // The current conversation is now `incoming`, which carried the
-        // selection onto its own `pipeline` (D2 — see the mirror assertion
-        // below). `mirror_conversation_to_state` does not touch
-        // `selected_pipeline`, so nothing about this mint can move the
-        // *outgoing* conversation's persisted value.
-
-        // Peek the OUTGOING conversation's persisted `pipeline` — it
-        // must still be the original selection, untouched by the
-        // new-conversation mint.
-        let outgoing_after = sm
-            .peek_conversation_pipeline(outgoing_id)
-            .expect("peek outgoing pipeline after mint");
-        assert_eq!(
-            outgoing_after.as_deref(),
-            Some("web-team"),
-            "outgoing conversation's persisted pipeline MUST survive the \
-             new-conversation mint — this is what stops the reconciler \
-             from clobbering a conversation the user is mid-way through"
-        );
-        // D2 / agents.md ("`/new` keeps the current selection"): the mint
-        // carries the selection, and the live mirror must agree with the new
-        // conversation's persisted `pipeline` (I-3) or the rebuild seam
-        // demotes the fresh conversation to single-agent mode. Dropping a
-        // now-invalid name is the reconciler's job, which runs *after* this
-        // mint — and can only do it because the mirror is still set here.
-        assert_eq!(
-            sm.selected_pipeline().as_deref(),
-            Some("web-team"),
-            "the mint carries the selection into the new conversation, in \
-             both the live mirror and its persisted `pipeline`"
-        );
-        assert_eq!(
-            sm.get_current_conversation().unwrap().agent.as_deref(),
-            Some("web-team"),
-            "…and the new conversation's persisted `pipeline` agrees (I-3)"
-        );
-    }
-
-    // ----- dangling-selection seam pin (test 15, in lib.rs rather than
-    // tests/scenarios/...). Driving the full `rebuild_agent_for_resolved`
-    // requires the mock agent harness; the cheapest end-to-end pin is the
-    // seam where the decision is made: `active = sm.selected_pipeline()
-    // .and_then(|name| ctx.pipelines.get(&name))`. A dangling selection
-    // resolves to `None` here, so `boot_registry` is `None`, so the
-    // `delegate` tool is NOT registered. This test makes that explicit
-    // — and would fail if the seam started using e.g. `pipelines.iter().find()`
-    // (which would silently re-find a *different* team named the same way).
-
-    #[cfg(feature = "mock")]
-    #[test]
-    fn dangling_selection_resolves_to_none_at_the_rebuild_seam() {
-        use crate::pipeline::PipelineSet;
-        let sm = StateManager::new_arc();
-        sm.set_selected_pipeline(Some("ghost".into()));
-
-        // Build a set that DOES NOT contain `ghost` — the bug case.
-        let yaml = format!(
-            "{PROVIDERS}\
-pipelines:
-  - name: web-team
-    orchestrator: {{}}
-    agents:
-      r:
-        prompt: p
-"
-        );
-        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
-        let set = PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
-        let ctx = RebuildContext {
-            registry: Arc::new(two_model_registry()),
-            system_prompt: String::new(),
-            mcp_handles: Arc::new(Vec::new()),
-            searxng_config: None,
-            max_turns: 0,
-            todo_tool: None,
-            bash_config: crate::config::BashConfig::default(),
-            pipelines: Arc::new(set),
-            shell_kind: None,
-            skills: crate::skills::SkillRegistry::default(),
-            vector_store: None,
-            memory_enabled: false,
-            agents_md_enabled: true,
-            tools_filter: crate::config::NameFilter::default(),
-            prompt_head: None,
-            profile_pin: None,
-        };
-
-        // This is the seam pin: the EXACT lookup the rebuild seam does
-        // at `src/lib.rs:1955-1957`. A dangling name MUST yield None —
-        // not a fallback to the first team, not a panic, not a "first
-        // team wins" silent misroute.
-        let active: Option<crate::pipeline::ResolvedPipeline> = sm
-            .selected_pipeline()
-            .and_then(|name| ctx.pipelines.get(&name).cloned());
-        assert!(
-            active.is_none(),
-            "a selection that vanished from the set must yield no active \
-             pipeline — the rebuild seam gates `delegate` on `active.is_some()` \
-             (src/lib.rs:2021), so anything other than None produces a phantom tool"
-        );
-    }
-
-    /// The other half of the seam pin, and the reason the mirror must survive
-    /// a mint: after `/new` (or `/cd`, or `/model`) the seam lookup must STILL
-    /// resolve a still-valid team, or the fresh conversation silently drops to
-    /// single-agent mode — no `delegate`, orchestrator model reverted to
-    /// `requested` — while its persisted `pipeline` still names the team.
-    /// Documented behaviour: agents.md — "`/new` keeps the current selection."
-    #[test]
-    fn selection_survives_a_new_conversation_mint_at_the_rebuild_seam() {
-        use crate::pipeline::PipelineSet;
-        let sm = StateManager::new_arc();
-        let yaml = format!(
-            "{PROVIDERS}\
-pipelines:
-  - name: web-team
-    orchestrator: {{}}
-    agents:
-      r:
-        prompt: p
-"
-        );
-        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).expect("parses");
-        let set = PipelineSet::build(&cfg, &two_model_registry(), Some(&[])).expect("set builds");
-
-        sm.set_selected_pipeline(Some("web-team".into()));
-        // The `/new` mint: `process_command_internal("/new")` does exactly this
-        // (reset + create_conversation) BEFORE `refresh_agent_after_new` reaches
-        // the rebuild seam, so whatever the mint leaves in the mirror is what
-        // the new conversation's agent is built from.
-        sm.reset_conversation_state();
-        sm.create_conversation(
-            "fresh".into(),
-            "openrouter".into(),
-            "flash".into(),
-            String::new(),
-        );
-
-        let active = sm
-            .selected_pipeline()
-            .and_then(|name| set.get(&name).cloned());
-        assert!(
-            active.is_some(),
-            "a still-valid selection MUST survive the mint and resolve at the \
-             rebuild seam — None here means `/new` silently demotes the session \
-             to single agent (no `delegate`) even though the freshly minted \
-             conversation persists `pipeline: web-team`"
-        );
-        assert_eq!(
-            sm.get_current_conversation().unwrap().agent.as_deref(),
-            Some("web-team"),
-            "…and persisted truth agrees with the mirror (I-3)"
-        );
-    }
-
     // ─── interrupted tool results (interrupted-tool-results design §5 b3/c) ───
 
     /// b3 — Stop mid-tool: the cancel arm must answer the in-flight
@@ -7855,7 +6801,7 @@ pipelines:
             .build_current_turn_message()
             .expect("the user turn was dispatched");
         let agent = Arc::new(agent);
-        let config = Config::default();
+        let config = test_config();
         let sm_opt = Some(sm.clone());
         let turn = tokio::spawn(async move {
             AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await
@@ -7968,13 +6914,8 @@ pipelines:
         ));
 
         // Compaction off: AgentRunner::new must not need a compaction provider.
-        let config = Config {
-            context: ContextConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            ..Config::default()
-        };
+        let config = Arc::new(test_config());
+        let model = mock_resolved_model();
 
         let mut runner = AgentRunner::new(
             agent,
@@ -7984,7 +6925,7 @@ pipelines:
             Some(events),
             Some(sm.clone()),
             hook,
-            100_000,
+            &model,
         )
         .expect("runner builds");
 
@@ -8106,7 +7047,6 @@ pipelines:
         let info = ProviderInfo {
             name: "mock".to_string(),
             model: "mock-model".to_string(),
-            supports_pricing: true,
             supports_vision,
             preserve_reasoning: true,
             display_reasoning: false,
@@ -8117,13 +7057,8 @@ pipelines:
         }
 
         // Compaction off: AgentRunner::new must not need a compaction provider.
-        let config = Config {
-            context: ContextConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            ..Config::default()
-        };
+        let config = Arc::new(test_config());
+        let model = mock_resolved_model();
 
         let mut runner = AgentRunner::new(
             DynAgent::Mock(agent),
@@ -8133,7 +7068,7 @@ pipelines:
             Some(events),
             Some(sm.clone()),
             Arc::new(hook),
-            100_000,
+            &model,
         )
         .expect("runner builds");
 
@@ -8703,1162 +7638,5 @@ pipelines:
             .await
             .expect("run_loop must finish within 10s of the action channel closing")
             .expect("the run_loop task must not panic");
-    }
-
-    // ── Layer B+C: /profile command + profile choice resolution (RED) ───────
-    //
-    // Mirrors the Stage 1.2 /pipeline tests one axis over:
-    // 1. `/profile [name|none|off]` routing (`SubmitKind::ProfileCommand`).
-    // 2. `resolve_profile_choice` — the read-only half of the command:
-    //    unchanged → locked-after-first-turn → pinned → unknown-name →
-    //    apply, in that order.
-    //
-    // Compile-RED until `ProfileSubmission`, `SubmitKind::ProfileCommand`,
-    // `ProfileChoice` and `resolve_profile_choice` exist.
-    // =========================================================================
-
-    /// `/profile` (bare, no arg) classifies as the List variant — the
-    /// controller will then emit a listing of the configured profiles.
-    /// `/profile <name>` classifies as `Set(Some(name))` (rest of the line,
-    /// spaces allowed, case-sensitive). `/profile none` and `/profile off`
-    /// both classify as `Set(None)`. Word-boundary discipline identical to
-    /// `/pipeline`.
-    #[test]
-    fn classify_profile_command_variants() {
-        // Bare — List. Printed by the controller from the config.
-        assert!(matches!(
-            classify_submission("/profile"),
-            SubmitKind::ProfileCommand(ProfileSubmission::List)
-        ));
-        assert!(matches!(
-            classify_submission("  /profile  "),
-            SubmitKind::ProfileCommand(ProfileSubmission::List)
-        ));
-
-        // Name — Set(Some(name)). The exact name string survives, no
-        // case-folding (profile names are user-typed).
-        assert!(matches!(
-            classify_submission("/profile web"),
-            SubmitKind::ProfileCommand(ProfileSubmission::Set(ref s)) if s.as_deref() == Some("web")
-        ));
-        assert!(matches!(
-            classify_submission("/profile admin"),
-            SubmitKind::ProfileCommand(ProfileSubmission::Set(ref s)) if s.as_deref() == Some("admin")
-        ));
-        // Names may contain spaces; parsing takes everything after "/profile ".
-        assert!(matches!(
-            classify_submission("/profile Generic Dev Team"),
-            SubmitKind::ProfileCommand(ProfileSubmission::Set(ref s)) if s.as_deref() == Some("Generic Dev Team")
-        ));
-
-        // `none` and `off` — both clear the selection.
-        for clear in [
-            "/profile none",
-            "/profile off",
-            "/profile OFF",
-            "/profile None",
-        ] {
-            assert!(
-                matches!(
-                    classify_submission(clear),
-                    SubmitKind::ProfileCommand(ProfileSubmission::Set(None))
-                ),
-                "{clear:?} must clear the selection"
-            );
-        }
-
-        // Word-boundary guard: `/profiles` (with an s) is NOT the profile
-        // command; `/profilex` isn't either.
-        assert!(matches!(
-            classify_submission("/profiles"),
-            SubmitKind::Command(_)
-        ));
-        assert!(matches!(
-            classify_submission("/profilex"),
-            SubmitKind::Command(_)
-        ));
-        // Mid-sentence slash stays chat content.
-        assert!(matches!(
-            classify_submission("TODO: /profile foo"),
-            SubmitKind::UserMessage { .. }
-        ));
-    }
-
-    // `resolve_profile_choice` mirrors `resolve_pipeline_choice`'s outcome
-    // type and rule order, plus the boot-pin rule. Signature under test
-    // (the implementer conforms to it):
-    //
-    // ```ignore
-    // enum ProfileChoice {
-    //     Unchanged,
-    //     Refused(String),
-    //     Apply(Option<String>),
-    // }
-    //
-    // fn resolve_profile_choice(
-    //     sm: &StateManager,
-    //     target: Option<&str>,
-    //     pinned: Option<&str>,
-    //     available: &[String],
-    // ) -> ProfileChoice
-    // ```
-    //
-    // Rule order: unchanged → locked-after-first-turn → pinned →
-    // unknown-name → apply. `target: None` is what the parse delivers for
-    // `none`/`off`.
-
-    /// Selecting the profile the conversation already has is a silent
-    /// no-op — no rebuild storm (mirrors `PipelineChoice::Unchanged`).
-    #[test]
-    fn resolve_profile_choice_same_target_is_unchanged() {
-        let sm = StateManager::new();
-        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
-        sm.set_selected_profile(Some("web".into()));
-
-        let available = vec!["web".to_string(), "admin".to_string()];
-        assert!(
-            matches!(
-                resolve_profile_choice(&sm, Some("web"), None, &available),
-                ProfileChoice::Unchanged
-            ),
-            "same target must be Unchanged"
-        );
-    }
-
-    /// Locked after the first real turn — the refusal reuses the pipeline's
-    /// wording pattern ("…locked once the conversation has started — /new
-    /// for a fresh one.").
-    #[test]
-    fn resolve_profile_choice_locked_after_first_turn() {
-        let sm = StateManager::new();
-        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
-        sm.add_user_message("hi".to_string());
-
-        let available = vec!["web".to_string()];
-        match resolve_profile_choice(&sm, Some("web"), None, &available) {
-            ProfileChoice::Refused(msg) => assert!(
-                msg.contains("locked once the conversation has started — /new for a fresh one"),
-                "the refusal must reuse the pipeline's lock wording; got: {msg}"
-            ),
-            _ => panic!("expected Refused after the first turn"),
-        }
-    }
-
-    /// Pinned at boot with `--profile web`: any change is refused, naming
-    /// the pin. A different name and clearing are both refused — the pin
-    /// keeps winning (`effective_profile = pin.or(selected)`).
-    #[test]
-    fn resolve_profile_choice_pinned_refuses_naming_the_pin() {
-        let sm = StateManager::new();
-        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
-
-        let available = vec!["web".to_string(), "admin".to_string()];
-
-        // A different name…
-        match resolve_profile_choice(&sm, Some("admin"), Some("web"), &available) {
-            ProfileChoice::Refused(msg) => assert!(
-                msg.contains("pinned by --profile web"),
-                "the refusal must name the pin; got: {msg}"
-            ),
-            _ => panic!("expected Refused for a different name under a pin"),
-        }
-        // …and clearing is refused too.
-        match resolve_profile_choice(&sm, None, Some("web"), &available) {
-            ProfileChoice::Refused(msg) => assert!(
-                msg.contains("pinned by --profile web"),
-                "clearing must be refused under a pin; got: {msg}"
-            ),
-            _ => panic!("expected Refused for clearing under a pin"),
-        }
-    }
-
-    /// The unchanged rule outranks the pin: selecting the pinned profile
-    /// that is already the current selection is a silent no-op.
-    #[test]
-    fn resolve_profile_choice_pinned_same_target_is_unchanged() {
-        let sm = StateManager::new();
-        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
-        sm.set_selected_profile(Some("web".into()));
-
-        let available = vec!["web".to_string()];
-        assert!(
-            matches!(
-                resolve_profile_choice(&sm, Some("web"), Some("web"), &available),
-                ProfileChoice::Unchanged
-            ),
-            "selecting the pinned profile that is already current must be a no-op"
-        );
-    }
-
-    /// Unknown name: refused, naming the unknown profile and listing the
-    /// available ones (mirrors the pipeline refusal shape).
-    #[test]
-    fn resolve_profile_choice_unknown_name_refused_lists_available() {
-        let sm = StateManager::new();
-        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
-
-        let available = vec!["web".to_string(), "admin".to_string()];
-        match resolve_profile_choice(&sm, Some("ghost"), None, &available) {
-            ProfileChoice::Refused(msg) => {
-                assert!(
-                    msg.contains("ghost"),
-                    "must name the unknown profile; got: {msg}"
-                );
-                assert!(msg.contains("web"), "must list available 'web'; got: {msg}");
-                assert!(
-                    msg.contains("admin"),
-                    "must list available 'admin'; got: {msg}"
-                );
-            }
-            _ => panic!("expected Refused for an unknown name"),
-        }
-    }
-
-    /// Unknown name with NO profiles configured: the refusal still names the
-    /// unknown profile and says none are configured (mirrors the pipeline's
-    /// empty-list message).
-    #[test]
-    fn resolve_profile_choice_unknown_name_with_no_profiles_says_none_configured() {
-        let sm = StateManager::new();
-        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
-
-        match resolve_profile_choice(&sm, Some("ghost"), None, &[]) {
-            ProfileChoice::Refused(msg) => {
-                assert!(
-                    msg.contains("ghost"),
-                    "must name the unknown profile; got: {msg}"
-                );
-                assert!(
-                    msg.contains("none configured"),
-                    "must say no profiles are configured; got: {msg}"
-                );
-            }
-            _ => panic!("expected Refused for an unknown name"),
-        }
-    }
-
-    /// `none`/`off` arrive here as `target: None` (the parse owns the
-    /// spellings) — a current selection is cleared.
-    #[test]
-    fn resolve_profile_choice_none_clears_selection() {
-        let sm = StateManager::new();
-        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
-        sm.set_selected_profile(Some("web".into()));
-
-        let available = vec!["web".to_string()];
-        assert!(
-            matches!(
-                resolve_profile_choice(&sm, None, None, &available),
-                ProfileChoice::Apply(None)
-            ),
-            "target None must clear the selection"
-        );
-    }
-
-    /// A valid, available name is applied.
-    #[test]
-    fn resolve_profile_choice_valid_name_applies() {
-        let sm = StateManager::new();
-        sm.create_conversation("p".into(), "prov".into(), "model".into(), String::new());
-
-        let available = vec!["web".to_string(), "admin".to_string()];
-        assert!(
-            matches!(
-                resolve_profile_choice(&sm, Some("web"), None, &available),
-                ProfileChoice::Apply(Some(target)) if target == "web"
-            ),
-            "a valid name must be applied"
-        );
-    }
-
-    // =========================================================================
-    // Layer C — `resolve_conversation_profile`: the shared /load + resume
-    // rule (GREEN — implemented, was untested).
-    //
-    // One rule for both entry points (session boot and `/load`): a saved
-    // profile that is no longer configured is dropped with a warning, and
-    // a boot `--profile` pin overrides the saved one. The returned
-    // selection is what the caller RECORDS (the pin, when pinned — the
-    // conversation must record what it actually runs under), plus the
-    // warnings to surface.
-    // =========================================================================
-
-    fn config_with_profiles(names: &[&str]) -> Config {
-        let mut cfg = Config::default();
-        for name in names {
-            cfg.profiles
-                .insert(name.to_string(), crate::config::Profile::default());
-        }
-        cfg
-    }
-
-    /// Pin + a different saved profile: the pin wins AND the user is told
-    /// which saved profile got overridden (both names must appear).
-    #[test]
-    fn resolve_conversation_profile_pin_beats_saved_with_warning() {
-        let cfg = config_with_profiles(&["web", "admin"]);
-        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("admin"), Some("web"));
-        assert_eq!(
-            selection.as_deref(),
-            Some("web"),
-            "the boot pin must beat the saved profile"
-        );
-        assert_eq!(warnings.len(), 1, "exactly one warning; got: {warnings:?}");
-        assert!(
-            warnings[0].contains("admin") && warnings[0].contains("web"),
-            "the warning must name BOTH the saved and the pinned profile; got: {}",
-            warnings[0]
-        );
-    }
-
-    /// Pin + the SAME saved profile: the pin still wins (trivially) but
-    /// there is nothing to warn about — a redundant "overridden by the
-    /// pin" line would be noise.
-    #[test]
-    fn resolve_conversation_profile_pin_equal_to_saved_is_silent() {
-        let cfg = config_with_profiles(&["web"]);
-        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("web"), Some("web"));
-        assert_eq!(selection.as_deref(), Some("web"));
-        assert!(
-            warnings.is_empty(),
-            "pin == saved ⇒ no warning; got: {warnings:?}"
-        );
-    }
-
-    /// Pin + no saved profile: the pin applies, silently. A fresh session
-    /// under a pin must not announce the pin on every boot.
-    #[test]
-    fn resolve_conversation_profile_pin_without_saved_applies_silently() {
-        let cfg = config_with_profiles(&["web"]);
-        let (selection, warnings) = resolve_conversation_profile(&cfg, None, Some("web"));
-        assert_eq!(selection.as_deref(), Some("web"));
-        assert!(warnings.is_empty(), "got: {warnings:?}");
-    }
-
-    /// No pin + a saved profile that still exists: it applies, silently —
-    /// the normal resume case.
-    #[test]
-    fn resolve_conversation_profile_saved_profile_without_pin_applies() {
-        let cfg = config_with_profiles(&["web", "admin"]);
-        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("admin"), None);
-        assert_eq!(selection.as_deref(), Some("admin"));
-        assert!(warnings.is_empty(), "got: {warnings:?}");
-    }
-
-    /// No pin + a saved profile that vanished from config: dropped to
-    /// `None` (base config) with a warning naming the vanished profile.
-    #[test]
-    fn resolve_conversation_profile_vanished_saved_profile_dropped_with_warning() {
-        let cfg = config_with_profiles(&["web"]);
-        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("ghost"), None);
-        assert_eq!(
-            selection, None,
-            "a vanished profile must resolve to the base config"
-        );
-        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
-        assert!(
-            warnings[0].contains("ghost"),
-            "the warning must name the vanished profile; got: {}",
-            warnings[0]
-        );
-    }
-
-    /// Pin + a vanished saved profile: the pin still applies (there is
-    /// nothing to override), and the vanished-profile warning is the only
-    /// one — no pin-override warning on top.
-    #[test]
-    fn resolve_conversation_profile_vanished_saved_with_pin_keeps_pin() {
-        let cfg = config_with_profiles(&["web"]);
-        let (selection, warnings) = resolve_conversation_profile(&cfg, Some("ghost"), Some("web"));
-        assert_eq!(
-            selection.as_deref(),
-            Some("web"),
-            "the pin survives a vanished saved profile"
-        );
-        assert_eq!(
-            warnings.len(),
-            1,
-            "only the vanished-profile warning; got: {warnings:?}"
-        );
-        assert!(warnings[0].contains("ghost"));
-    }
-
-    /// Nothing anywhere: base config, no warnings — the fresh-session
-    /// baseline.
-    #[test]
-    fn resolve_conversation_profile_nothing_anywhere_is_silent_base() {
-        let cfg = config_with_profiles(&["web"]);
-        let (selection, warnings) = resolve_conversation_profile(&cfg, None, None);
-        assert_eq!(selection, None);
-        assert!(warnings.is_empty());
-    }
-
-    // =========================================================================
-    // Layer C — `handle_select_profile`: apply / refuse / roll back (GREEN —
-    // implemented, was untested).
-    //
-    // The `/profile` verb's write half, driven end-to-end through the real
-    // handler with the RebuildContext pattern (the same harness shape as
-    // the `reconcile_pipeline_selection` tests): a live `Config`, a
-    // `RebuildContext` whose registry matches the master config on disk,
-    // and a mock agent in the slot. `reload_for` reads the master config
-    // from `XDG_CONFIG_HOME`, so each test points it at a tempdir under
-    // the shared `CONFIG_ENV_LOCK` (one test process, one env knob).
-    //
-    // Contract (mirrors `handle_select_pipeline` one axis over):
-    //   * happy path: the profile is applied — `Conversation.profile`,
-    //     `AppState.active_profile` and `Config.active_profile` all agree,
-    //     and the agent is rebuilt under it;
-    //   * refusals (locked / pinned / unknown name) leave every surface
-    //     untouched — no selection write, no config swap, no rebuild;
-    //   * a failed reload (the profile vanished from the master config
-    //     between selection and apply) rolls the profile AND the pipeline
-    //     selection back to the previous pair;
-    //   * a profile whose `pipelines:` gate filters out the selected team
-    //     drops the pipeline selection with the canonical warning.
-    // =========================================================================
-
-    /// Master config for the happy/refusal tests: one Ollama alias
-    /// (`local` — no credentials, no network at agent-build time, so the
-    /// rebuild seam runs to completion offline) and two profiles.
-    const PROFILE_HANDLER_MASTER: &str = "\
-providers:
-  - name: ollama
-    type: ollama
-    base_url: http://localhost:11434
-    models:
-      - name: llama3
-        alias: local
-default_model: local
-profiles:
-  research:
-    tools:
-      disabled: [bash]
-  web:
-    tools:
-      disabled: [view_image]
-";
-
-    /// The rollback test's master: `research` is GONE from disk — the
-    /// live config still lists it, which is exactly the "profile removed
-    /// between selection and apply" race the rollback must survive.
-    const PROFILE_HANDLER_MASTER_NO_RESEARCH: &str = "\
-providers:
-  - name: ollama
-    type: ollama
-    base_url: http://localhost:11434
-    models:
-      - name: llama3
-        alias: local
-default_model: local
-profiles:
-  web:
-    tools:
-      disabled: [view_image]
-";
-
-    /// The pipeline-gate test's master: two teams, and a profile whose
-    /// `pipelines:` allowlist keeps only `research-crew`.
-    const PROFILE_HANDLER_MASTER_GATED: &str = "\
-providers:
-  - name: ollama
-    type: ollama
-    base_url: http://localhost:11434
-    models:
-      - name: llama3
-        alias: local
-default_model: local
-pipelines:
-  - name: web-team
-    orchestrator: {}
-    agents:
-      r:
-        prompt: p
-  - name: research-crew
-    orchestrator: {}
-    agents:
-      r:
-        prompt: p
-profiles:
-  research:
-    pipelines:
-      only: [research-crew]
-";
-
-    /// The view-stamp test's master: a profile whose `ui.tabs` disables
-    /// `bash` — selecting it must remove "bash" from the client's
-    /// `AppState.visible_tabs`.
-    const PROFILE_HANDLER_MASTER_TABS: &str = "\
-providers:
-  - name: ollama
-    type: ollama
-    base_url: http://localhost:11434
-    models:
-      - name: llama3
-        alias: local
-default_model: local
-profiles:
-  research:
-    ui:
-      tabs:
-        disabled: [bash]
-";
-
-    /// The handler-test harness: a StateManager rooted at `repo_tmp`
-    /// (an empty tree — no per-repo config, no skills), a live `Config`
-    /// parsed from `live_yaml`, a `RebuildContext` whose registry matches
-    /// the master config on disk, and a mock agent in the slot.
-    #[cfg(feature = "mock")]
-    fn profile_handler_fixture(
-        repo_tmp: &std::path::Path,
-        live_yaml: &str,
-        profile_pin: Option<&str>,
-    ) -> (
-        Arc<StateManager>,
-        Config,
-        RebuildContext,
-        Arc<DynAgent>,
-        SharedSessionHook,
-    ) {
-        let sm = StateManager::new_arc();
-        sm.set_session_cwd(repo_tmp.to_path_buf());
-        sm.set_model_alias("local".to_string());
-        let config: Config = serde_yaml::from_str(live_yaml).expect("live config parses");
-        let registry = config.build_model_registry().expect("registry builds");
-        let pipelines = crate::pipeline::PipelineSet::build(&config, &registry, Some(&[]))
-            .expect("pipelines build");
-        let (mock_agent, _mock_info, _rx, mock_hook, _mock_model) =
-            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
-                .expect("mock agent builds");
-        let ctx = RebuildContext {
-            registry: Arc::new(registry),
-            system_prompt: "test prompt".into(),
-            mcp_handles: Arc::new(Vec::new()),
-            searxng_config: None,
-            max_turns: 4,
-            todo_tool: None,
-            bash_config: crate::config::BashConfig::default(),
-            pipelines: Arc::new(pipelines),
-            shell_kind: None,
-            skills: crate::skills::SkillRegistry::default(),
-            vector_store: None,
-            memory_enabled: false,
-            agents_md_enabled: true,
-            tools_filter: crate::config::NameFilter::default(),
-            prompt_head: None,
-            profile_pin: profile_pin.map(str::to_string),
-        };
-        (
-            sm,
-            config,
-            ctx,
-            Arc::new(mock_agent),
-            Arc::new(std::sync::RwLock::new(mock_hook)),
-        )
-    }
-
-    /// Point the master config at a tempdir holding `master_yaml` for the
-    /// duration of `body`, under the shared env lock, with an empty repo
-    /// tree as the session cwd. `body` returns everything the assertions
-    /// need so they run OUTSIDE the lock — a panic while holding it would
-    /// poison the lock for the whole test process (memory.md). The repo
-    /// path is OWNED (not a borrow of the tempdir) so the async body can
-    /// outlive the closure's parameter lifetime.
-    // The env lock is held across `body`'s await on purpose: the handler
-    // re-reads the master config from disk mid-await, so `XDG_CONFIG_HOME`
-    // must stay pointed at the tempdir for the whole body.
-    #[allow(clippy::await_holding_lock)]
-    async fn with_master_config<F, T>(
-        master_yaml: &str,
-        body: impl FnOnce(std::path::PathBuf) -> F,
-    ) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
-        let master_tmp = tempfile::tempdir().expect("master tmpdir");
-        let repo_tmp = tempfile::tempdir().expect("repo tmpdir");
-        let _env_guard = crate::config::CONFIG_ENV_LOCK.lock().unwrap();
-        let original = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", master_tmp.path()) };
-        let config_dir = crate::config::get_config_dir().expect("config dir under XDG_CONFIG_HOME");
-        std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
-        std::fs::write(config_dir.join("config.yaml"), master_yaml).expect("write master config");
-        let result = body(repo_tmp.path().to_path_buf()).await;
-        unsafe {
-            match original {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-        result
-    }
-
-    /// Any system message containing `needle` (order-independent — the
-    /// handler may emit warnings before or after the announcement).
-    fn any_system_message(sm: &Arc<StateManager>, needle: &str) -> bool {
-        sm.get_state().chat.messages.iter().any(|m| {
-            matches!(m.role, crate::ui::app_state::MessageRole::System)
-                && m.content.contains(needle)
-        })
-    }
-
-    /// Happy path: the profile is applied end to end — the selection is
-    /// recorded on the conversation and the live mirror, the config is
-    /// reloaded under the profile (its `tools:` filter in effect, its
-    /// `active_profile` stamped), and the agent is rebuilt (a new Arc in
-    /// the slot).
-    #[cfg(feature = "mock")]
-    #[tokio::test]
-    async fn handle_select_profile_applies_profile_and_rebuilds_agent() {
-        let (outcome, sm, config, agent_before, agent_after) =
-            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell) =
-                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
-                let agent_before = Arc::as_ptr(&agent_slot);
-                let mut config = config;
-                let mut ctx = ctx;
-                let mut agent_slot = agent_slot;
-                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-                let outcome = AgentRunner::handle_select_profile(
-                    Some("research".into()),
-                    &mut agent_slot,
-                    &mut config,
-                    &Some(sm.clone()),
-                    &hook_cell,
-                    &mut event_processor,
-                    Some(&mut ctx),
-                )
-                .await;
-                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
-            })
-            .await;
-
-        assert!(outcome.is_ok(), "happy path must succeed: {outcome:?}");
-        assert_eq!(
-            sm.selected_profile().as_deref(),
-            Some("research"),
-            "the selection must be recorded on the conversation"
-        );
-        assert_eq!(
-            sm.get_state().active_profile,
-            Some("research".into()),
-            "AppState.active_profile must mirror the selection"
-        );
-        assert_eq!(
-            config.active_profile.as_deref(),
-            Some("research"),
-            "the reloaded config must carry the active_profile stamp"
-        );
-        assert!(
-            !config.tools.allows("bash"),
-            "the profile's `tools:` filter must be in effect after the reload"
-        );
-        assert!(
-            config.tools.allows("view_image"),
-            "only the selected profile's filter applies — `web`'s must not leak in"
-        );
-        assert_ne!(
-            agent_before, agent_after,
-            "the agent must be rebuilt — a new Arc in the slot"
-        );
-        assert!(
-            any_system_message(&sm, "Profile 'research' selected"),
-            "the selection must be announced"
-        );
-    }
-
-    /// Refusal: once the conversation has a turn, the profile is locked —
-    /// the error names the lock, and NO surface moves: no selection
-    /// write, no config swap, no rebuild.
-    #[cfg(feature = "mock")]
-    #[tokio::test]
-    async fn handle_select_profile_refused_when_locked_leaves_state_untouched() {
-        let (outcome, sm, config, agent_before, agent_after) =
-            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell) =
-                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
-                // Seed a real turn — the conversation is now locked.
-                sm.add_user_message("hi".into());
-                assert!(sm.conversation_has_turns(), "fixture: locked");
-                let agent_before = Arc::as_ptr(&agent_slot);
-                let mut config = config;
-                let mut ctx = ctx;
-                let mut agent_slot = agent_slot;
-                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-                let outcome = AgentRunner::handle_select_profile(
-                    Some("research".into()),
-                    &mut agent_slot,
-                    &mut config,
-                    &Some(sm.clone()),
-                    &hook_cell,
-                    &mut event_processor,
-                    Some(&mut ctx),
-                )
-                .await;
-                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
-            })
-            .await;
-
-        let msg = outcome.expect_err("a locked conversation must refuse");
-        assert!(
-            msg.to_lowercase().contains("lock"),
-            "the refusal must name the lock; got: {msg}"
-        );
-        assert_eq!(
-            sm.selected_profile(),
-            None,
-            "a refused selection must NOT be recorded"
-        );
-        assert_eq!(
-            config.active_profile, None,
-            "a refused selection must NOT swap the config"
-        );
-        assert!(
-            config.tools.allows("bash"),
-            "a refused selection must NOT apply the profile's filter"
-        );
-        assert_eq!(
-            agent_before, agent_after,
-            "a refused selection must NOT rebuild the agent"
-        );
-        assert!(
-            !any_system_message(&sm, "Profile 'research' selected"),
-            "a refused selection must NOT announce success"
-        );
-    }
-
-    /// Refusal: under a boot `--profile` pin, naming a DIFFERENT profile
-    /// is refused (the pin is a restart-level decision); re-naming the pin
-    /// itself is a silent no-op.
-    #[cfg(feature = "mock")]
-    #[tokio::test]
-    async fn handle_select_profile_pinned_refuses_other_names() {
-        let (outcome, sm, config, agent_before, agent_after) =
-            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell) =
-                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, Some("web"));
-                let agent_before = Arc::as_ptr(&agent_slot);
-                let mut config = config;
-                let mut ctx = ctx;
-                let mut agent_slot = agent_slot;
-                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-                let outcome = AgentRunner::handle_select_profile(
-                    Some("research".into()),
-                    &mut agent_slot,
-                    &mut config,
-                    &Some(sm.clone()),
-                    &hook_cell,
-                    &mut event_processor,
-                    Some(&mut ctx),
-                )
-                .await;
-                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
-            })
-            .await;
-
-        let msg = outcome.expect_err("a pinned session must refuse other profiles");
-        assert!(
-            msg.contains("pinned") && msg.contains("web"),
-            "the refusal must name the pin; got: {msg}"
-        );
-        assert_eq!(sm.selected_profile(), None, "the pin is not a selection");
-        assert_eq!(config.active_profile, None, "no reload may have run");
-        assert_eq!(agent_before, agent_after, "no rebuild may have run");
-
-        // Re-naming the pin itself: Unchanged — Ok, silent, no rebuild.
-        let (outcome, sm, _config, agent_before, agent_after) =
-            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell) =
-                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, Some("web"));
-                let agent_before = Arc::as_ptr(&agent_slot);
-                let mut config = config;
-                let mut ctx = ctx;
-                let mut agent_slot = agent_slot;
-                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-                let outcome = AgentRunner::handle_select_profile(
-                    Some("web".into()),
-                    &mut agent_slot,
-                    &mut config,
-                    &Some(sm.clone()),
-                    &hook_cell,
-                    &mut event_processor,
-                    Some(&mut ctx),
-                )
-                .await;
-                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
-            })
-            .await;
-        assert!(
-            outcome.is_ok(),
-            "re-selecting the pin is a no-op, not an error: {outcome:?}"
-        );
-        assert_eq!(agent_before, agent_after, "the no-op must NOT rebuild");
-        assert!(
-            !any_system_message(&sm, "selected"),
-            "the no-op must be silent"
-        );
-    }
-
-    /// Refusal: an unknown name is refused with the available profiles
-    /// listed (sorted), and no surface moves.
-    #[cfg(feature = "mock")]
-    #[tokio::test]
-    async fn handle_select_profile_unknown_name_refused_lists_available() {
-        let (outcome, sm, config, agent_before, agent_after) =
-            with_master_config(PROFILE_HANDLER_MASTER, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell) =
-                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
-                let agent_before = Arc::as_ptr(&agent_slot);
-                let mut config = config;
-                let mut ctx = ctx;
-                let mut agent_slot = agent_slot;
-                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-                let outcome = AgentRunner::handle_select_profile(
-                    Some("ghost".into()),
-                    &mut agent_slot,
-                    &mut config,
-                    &Some(sm.clone()),
-                    &hook_cell,
-                    &mut event_processor,
-                    Some(&mut ctx),
-                )
-                .await;
-                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
-            })
-            .await;
-
-        let msg = outcome.expect_err("an unknown profile must be refused");
-        assert!(
-            msg.contains("ghost"),
-            "the refusal must name the bad name; got: {msg}"
-        );
-        assert!(
-            msg.contains("research") && msg.contains("web"),
-            "the refusal must list the available profiles (sorted); got: {msg}"
-        );
-        assert_eq!(sm.selected_profile(), None);
-        assert_eq!(config.active_profile, None);
-        assert_eq!(agent_before, agent_after, "no rebuild may have run");
-    }
-
-    /// Rollback: the profile vanished from the master config between
-    /// selection and apply (the live config still lists it, the disk
-    /// read no longer does). The reload fails, so the handler must put
-    /// BOTH the profile and the pipeline selection back to the previous
-    /// pair and re-derive the config for them — the running agent was
-    /// never swapped, so state must describe the profile it still has.
-    #[cfg(feature = "mock")]
-    #[tokio::test]
-    async fn handle_select_profile_rollback_when_reload_fails_restores_previous_pair() {
-        // Live config: both profiles (the user picked `research`).
-        // Disk master: only `web` (the profile was just removed).
-        let (outcome, sm, config, agent_before, agent_after) =
-            with_master_config(PROFILE_HANDLER_MASTER_NO_RESEARCH, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell) =
-                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER, None);
-                // Pre-stage the previous pair the rollback must restore.
-                sm.set_selected_profile(Some("web".into()));
-                sm.set_selected_pipeline(Some("web-team".into()));
-                let agent_before = Arc::as_ptr(&agent_slot);
-                let mut config = config;
-                let mut ctx = ctx;
-                let mut agent_slot = agent_slot;
-                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-                let outcome = AgentRunner::handle_select_profile(
-                    Some("research".into()),
-                    &mut agent_slot,
-                    &mut config,
-                    &Some(sm.clone()),
-                    &hook_cell,
-                    &mut event_processor,
-                    Some(&mut ctx),
-                )
-                .await;
-                (outcome, sm, config, agent_before, Arc::as_ptr(&agent_slot))
-            })
-            .await;
-
-        let msg = outcome.expect_err("a failed reload must surface as an error");
-        assert!(
-            msg.contains("research"),
-            "the error must name the profile that failed to apply; got: {msg}"
-        );
-        assert_eq!(
-            sm.selected_profile().as_deref(),
-            Some("web"),
-            "the previous profile selection must be restored"
-        );
-        assert_eq!(
-            sm.selected_pipeline().as_deref(),
-            Some("web-team"),
-            "the previous pipeline selection must be restored too"
-        );
-        assert_eq!(
-            config.active_profile.as_deref(),
-            Some("web"),
-            "the rollback must re-derive the config for the previous profile"
-        );
-        assert_eq!(
-            agent_before, agent_after,
-            "the agent was never swapped — the slot must be untouched"
-        );
-        assert!(
-            !any_system_message(&sm, "Profile 'research' selected"),
-            "a rolled-back selection must NOT announce success"
-        );
-    }
-
-    /// Pipeline reconciliation: selecting a profile whose `pipelines:`
-    /// gate filters out the currently selected team drops the pipeline
-    /// selection with the canonical warning — the same reconciler every
-    /// reload path runs, reached here through the profile axis.
-    #[cfg(feature = "mock")]
-    #[tokio::test]
-    async fn handle_select_profile_pipeline_gate_drops_filtered_selection_with_warning() {
-        let (outcome, sm, config, ctx_pipelines, agent_before, agent_after) =
-            with_master_config(PROFILE_HANDLER_MASTER_GATED, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell) =
-                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER_GATED, None);
-                // The user is currently on `web-team` — the profile's gate
-                // keeps only `research-crew`.
-                sm.set_selected_pipeline(Some("web-team".into()));
-                let agent_before = Arc::as_ptr(&agent_slot);
-                let mut config = config;
-                let mut ctx = ctx;
-                let mut agent_slot = agent_slot;
-                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-                let outcome = AgentRunner::handle_select_profile(
-                    Some("research".into()),
-                    &mut agent_slot,
-                    &mut config,
-                    &Some(sm.clone()),
-                    &hook_cell,
-                    &mut event_processor,
-                    Some(&mut ctx),
-                )
-                .await;
-                (
-                    outcome,
-                    sm,
-                    config,
-                    ctx.pipelines
-                        .iter()
-                        .map(|p| p.name.clone())
-                        .collect::<Vec<_>>(),
-                    agent_before,
-                    Arc::as_ptr(&agent_slot),
-                )
-            })
-            .await;
-
-        assert!(
-            outcome.is_ok(),
-            "the selection itself must succeed: {outcome:?}"
-        );
-        assert_eq!(
-            sm.selected_profile().as_deref(),
-            Some("research"),
-            "the profile must be applied"
-        );
-        assert_eq!(
-            config.active_profile.as_deref(),
-            Some("research"),
-            "the config must be reloaded under the profile"
-        );
-        assert_eq!(
-            ctx_pipelines,
-            vec!["research-crew".to_string()],
-            "the profile's pipelines gate must narrow the live set"
-        );
-        assert_eq!(
-            sm.selected_pipeline(),
-            None,
-            "the filtered-out team must be dropped from the selection"
-        );
-        assert!(
-            any_system_message(&sm, "Pipeline 'web-team'"),
-            "the drop must be announced by name"
-        );
-        assert!(
-            any_system_message(&sm, "not configured"),
-            "the canonical 'not configured / continuing without a pipeline' \
-             wording must be used"
-        );
-        assert_ne!(
-            agent_before, agent_after,
-            "a successful apply must rebuild the agent"
-        );
-    }
-
-    /// View stamp: selecting a profile whose `ui.tabs` disables a tab must
-    /// remove it from `AppState.visible_tabs` — the server-computed view the
-    /// client renders from — and the picker must keep the configured names.
-    #[cfg(feature = "mock")]
-    #[tokio::test]
-    async fn handle_select_profile_updates_visible_tabs() {
-        let (outcome, profiles_view, tabs_view) =
-            with_master_config(PROFILE_HANDLER_MASTER_TABS, |repo| async move {
-                let (sm, config, ctx, agent_slot, hook_cell) =
-                    profile_handler_fixture(&repo, PROFILE_HANDLER_MASTER_TABS, None);
-                let mut config = config;
-                let mut ctx = ctx;
-                let mut agent_slot = agent_slot;
-                let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-                let outcome = AgentRunner::handle_select_profile(
-                    Some("research".into()),
-                    &mut agent_slot,
-                    &mut config,
-                    &Some(sm.clone()),
-                    &hook_cell,
-                    &mut event_processor,
-                    Some(&mut ctx),
-                )
-                .await;
-                let state = sm.get_state();
-                (outcome, state.profiles, state.visible_tabs)
-            })
-            .await;
-
-        assert!(outcome.is_ok(), "happy path must succeed: {outcome:?}");
-        assert_eq!(
-            profiles_view,
-            vec!["research".to_string()],
-            "the picker must list the configured profile"
-        );
-        assert_eq!(
-            tabs_view,
-            vec![
-                "session".to_string(),
-                "todo".to_string(),
-                "files".to_string(),
-                "tasks".to_string(),
-                "agents".to_string(),
-                "profile".to_string(),
-            ],
-            "the profile's disabled tab must be gone from the client view"
-        );
-    }
-
-    // =========================================================================
-    // CONTRACT B — `Profile.agents_md` at the `handle_select_profile`
-    // harness (RED / guard).
-    //
-    // The repo tree carries a sentinel `agents.md`; the rebuild seam
-    // recomputes `ctx.system_prompt` from the session cwd, so the rebuilt
-    // prompt is observable without touching the agent. Selecting a profile
-    // with `agents_md: false` must rebuild on a prompt WITHOUT the
-    // sentinel; a profile without the key keeps today's behaviour (WITH it).
-    //
-    // The first test is RED today for the right reason: `agents_md:` is an
-    // unknown profile key, so the reload fails and the selection is refused
-    // (`outcome` is `Err` before any prompt assertion runs).
-    // =========================================================================
-
-    /// Selecting a profile with `agents_md: false` rebuilds the agent on a
-    /// system prompt WITHOUT the repo's agents.md content.
-    /// (RED — the profile key does not exist yet.)
-    #[cfg(feature = "mock")]
-    #[tokio::test]
-    async fn handle_select_profile_agents_md_false_omits_agents_md_from_rebuilt_prompt() {
-        const MASTER: &str = "\
-providers:
-  - name: ollama
-    type: ollama
-    base_url: http://localhost:11434
-    models:
-      - name: llama3
-        alias: local
-default_model: local
-profiles:
-  web:
-    agents_md: false
-";
-        let (outcome, sm, ctx) = with_master_config(MASTER, |repo| async move {
-            std::fs::write(repo.join("agents.md"), "SENTINEL-HARNESS-AGENTS")
-                .expect("write sentinel agents.md");
-            let (sm, config, ctx, agent_slot, hook_cell) =
-                profile_handler_fixture(&repo, MASTER, None);
-            let mut config = config;
-            let mut ctx = ctx;
-            let mut agent_slot = agent_slot;
-            let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-            let outcome = AgentRunner::handle_select_profile(
-                Some("web".into()),
-                &mut agent_slot,
-                &mut config,
-                &Some(sm.clone()),
-                &hook_cell,
-                &mut event_processor,
-                Some(&mut ctx),
-            )
-            .await;
-            (outcome, sm, ctx)
-        })
-        .await;
-
-        assert!(
-            outcome.is_ok(),
-            "selecting the agents_md profile must succeed: {outcome:?}"
-        );
-        assert!(
-            any_system_message(&sm, "Profile 'web' selected"),
-            "the selection must be announced"
-        );
-        assert!(
-            !ctx.system_prompt.contains("SENTINEL-HARNESS-AGENTS"),
-            "agents_md: false must keep agents.md out of the rebuilt prompt; prompt: {}",
-            ctx.system_prompt
-        );
-    }
-
-    /// Guard: a profile WITHOUT `agents_md:` keeps today's behaviour — the
-    /// rebuilt prompt still carries the repo's agents.md. (GREEN today;
-    /// must stay green: absent = unchanged.)
-    #[cfg(feature = "mock")]
-    #[tokio::test]
-    async fn handle_select_profile_without_agents_md_keeps_agents_md_in_rebuilt_prompt() {
-        const MASTER: &str = "\
-providers:
-  - name: ollama
-    type: ollama
-    base_url: http://localhost:11434
-    models:
-      - name: llama3
-        alias: local
-default_model: local
-profiles:
-  web:
-    tools:
-      disabled: [bash]
-";
-        let (outcome, _sm, ctx) = with_master_config(MASTER, |repo| async move {
-            std::fs::write(repo.join("agents.md"), "SENTINEL-HARNESS-AGENTS")
-                .expect("write sentinel agents.md");
-            let (sm, config, ctx, agent_slot, hook_cell) =
-                profile_handler_fixture(&repo, MASTER, None);
-            let mut config = config;
-            let mut ctx = ctx;
-            let mut agent_slot = agent_slot;
-            let mut event_processor: Option<tokio::task::JoinHandle<()>> = None;
-            let outcome = AgentRunner::handle_select_profile(
-                Some("web".into()),
-                &mut agent_slot,
-                &mut config,
-                &Some(sm.clone()),
-                &hook_cell,
-                &mut event_processor,
-                Some(&mut ctx),
-            )
-            .await;
-            (outcome, sm, ctx)
-        })
-        .await;
-
-        assert!(outcome.is_ok(), "happy path must succeed: {outcome:?}");
-        assert!(
-            ctx.system_prompt.contains("SENTINEL-HARNESS-AGENTS"),
-            "absent agents_md: must keep the repo's agents.md in the rebuilt prompt; prompt: {}",
-            ctx.system_prompt
-        );
     }
 }

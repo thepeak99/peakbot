@@ -214,7 +214,6 @@ mod tests {
         std::fs::write(session_dir.path().join("probe.unsupported"), "x").unwrap();
 
         let config = VectorDbConfig {
-            enabled: true,
             db_path: db_dir.path().join("v.db").display().to_string(),
             embeddings: EmbeddingsConfig {
                 base_url: "http://unused.invalid".into(),
@@ -257,7 +256,6 @@ mod tests {
         let probe = session_dir.path().join("probe.unsupported");
         std::fs::write(&probe, "x").unwrap();
         let config = VectorDbConfig {
-            enabled: true,
             db_path: "./.peakbot/vectors.db".into(),
             embeddings: EmbeddingsConfig {
                 base_url: "http://unused.invalid".into(),

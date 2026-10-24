@@ -4106,7 +4106,7 @@ mod model_popup_tests {
                 },
             ],
         };
-        Arc::new(ModelRegistry::build(&[prov], Some("sonnet")).expect("registry should build"))
+        Arc::new(ModelRegistry::build(&[prov]).expect("registry should build"))
     }
 
     fn harness_with_registry() -> (ReplUi, UnboundedReceiver<UiAction>) {
@@ -4345,8 +4345,8 @@ mod model_popup_tests {
     /// (0.24 cutover — replaces the old pipeline name).
     #[test]
     fn status_bar_shows_selection_as_profile_arrow_agent() {
-        use crate::ui::app_state::AppState;
         use crate::config::resolve::Selection;
+        use crate::ui::app_state::AppState;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 

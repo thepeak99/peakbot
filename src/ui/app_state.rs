@@ -11,8 +11,8 @@ use crate::tools::todo::TodoItem as CoreTodoItem;
 use crate::tools::view_image;
 use crate::ui::ui_trait::TodoItemAction;
 use chrono::{DateTime, Local};
-use serde::{Deserialize, Serialize};
 use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fmt;
 
@@ -230,10 +230,7 @@ impl Serialize for AppState {
         ser.serialize_field("pending_input_count", &self.pending_input_count)?;
         ser.serialize_field("bg", &self.bg)?;
         ser.serialize_field("bash_panel", &self.bash_panel)?;
-        ser.serialize_field(
-            "bash_panel_visibility",
-            &self.bash_panel_visibility,
-        )?;
+        ser.serialize_field("bash_panel_visibility", &self.bash_panel_visibility)?;
         ser.serialize_field("catalog", &self.catalog)?;
         ser.serialize_field("selection", &self.selection)?;
         ser.serialize_field("profile_pinned", &self.profile_pinned)?;
@@ -1748,6 +1745,7 @@ pub struct WelcomeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::resolve::{AgentInfo, SubagentInfo};
 
     // ── Phase 1: sub-agent lane plumbing ────────────────────────────────
 
@@ -1934,8 +1932,14 @@ mod tests {
         assert_eq!(v["catalog"][0]["overrides_global"], true);
         assert_eq!(v["catalog"][0]["agents"][0]["name"], "team");
         assert_eq!(v["catalog"][0]["agents"][0]["model"], "sonnet");
-        assert_eq!(v["catalog"][0]["agents"][0]["subagents"][0]["name"], "researcher");
-        assert_eq!(v["catalog"][0]["agents"][0]["subagents"][0]["inherited"], true);
+        assert_eq!(
+            v["catalog"][0]["agents"][0]["subagents"][0]["name"],
+            "researcher"
+        );
+        assert_eq!(
+            v["catalog"][0]["agents"][0]["subagents"][0]["inherited"],
+            true
+        );
         // The selection and the derived settings gate.
         assert_eq!(
             v["selection"],
@@ -1949,8 +1953,16 @@ mod tests {
         );
         assert_eq!(v["visible_tabs"], serde_json::json!(["session", "agents"]));
         // The old pipeline/profile fields are gone from the wire.
-        for gone in ["pipelines", "selected_pipeline", "active_profile", "profiles"] {
-            assert!(v.get(gone).is_none(), "`{gone}` must be off the wire: {json}");
+        for gone in [
+            "pipelines",
+            "selected_pipeline",
+            "active_profile",
+            "profiles",
+        ] {
+            assert!(
+                v.get(gone).is_none(),
+                "`{gone}` must be off the wire: {json}"
+            );
         }
 
         // The pin flips the derived field on the next serialization.

@@ -937,8 +937,8 @@ models:
 ";
         let prov: ProviderEntry =
             serde_yaml::from_str(yaml).expect("preserve_reasoning field parses");
-        assert_eq!(prov.models[0].preserve_reasoning, false);
-        assert_eq!(prov.models[1].preserve_reasoning, true); // default
+        assert!(!prov.models[0].preserve_reasoning);
+        assert!(prov.models[1].preserve_reasoning); // default
 
         let reg = ModelRegistry::build(std::slice::from_ref(&prov)).expect("registry builds");
         match &reg.resolve("qwen").unwrap().provider_config {
@@ -965,8 +965,8 @@ models:
 ";
         let prov: ProviderEntry =
             serde_yaml::from_str(yaml).expect("display_reasoning field parses");
-        assert_eq!(prov.models[0].display_reasoning, true);
-        assert_eq!(prov.models[1].display_reasoning, false);
+        assert!(prov.models[0].display_reasoning);
+        assert!(!prov.models[1].display_reasoning);
 
         let reg = ModelRegistry::build(std::slice::from_ref(&prov)).expect("registry builds");
         match &reg.resolve("show").unwrap().provider_config {
@@ -992,8 +992,8 @@ models:
         let prov: ProviderEntry =
             serde_yaml::from_str(yaml).expect("legacy config without new fields still parses");
         // Defaults: preserve=true, display=false.
-        assert_eq!(prov.models[0].preserve_reasoning, true);
-        assert_eq!(prov.models[0].display_reasoning, false);
+        assert!(prov.models[0].preserve_reasoning);
+        assert!(!prov.models[0].display_reasoning);
     }
 
     /// Provider-level `preserve_reasoning: false` outranks a per-model
