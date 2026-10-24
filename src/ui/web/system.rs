@@ -1,25 +1,18 @@
-//! `/api/setup` — the wizard's HTTP surface (plan §B, §C, track S tasks S2–S4).
+//! `/api/system/*` — install and service management (0.24 cutover).
 //!
-//! **The server is a validating file-writer, nothing more.** The wizard POSTs
-//! the exact reviewed YAML; the server parses it with the real
-//! `serde_yaml::from_str::<Config>` plus the real validators (`tools.validate`,
-//! `timeouts.validate`, `build_model_registry`), and only on success writes
-//! those bytes verbatim via [`save_config_at`]. Never rendered, merged, or
-//! defaulted server-side. *(principle of least astonishment)*
+//! The setup wizard is gone (`/api/setup*` → 404, see [`setup_removed`]).
+//! Its install/service surface moved here **verbatim** under
+//! `/api/system/*` (spec §8.2): `GET/POST/DELETE /api/system/service` and
+//! `POST /api/system/install`. The `install` and `service` ops stay
+//! fn-pointer seams (`InstallFn` / `ServiceFn`) so tests can inject fakes
+//! without copying a binary or shelling out to `systemctl`.
 //!
-//! The `SetupState` is built once at boot and injected into the router; the
-//! handler never re-derives paths. `install` and `service` are fn-pointer
-//! seams (plan §E.9) that track I later populates with the real platform
-//! dispatchers — see the `default_for_tests()` no-ops for the test path.
-//!
-//! The token layer is **not** wired here: tests attach it themselves so the
-//! auth contract is exercised independently. Production mounting
-//! (plan §E.9 + §B) merges the returned router into `WebUi::run` **before**
-//! the token layer, so every `/api/setup/*` route is gated by the same
+//! The token layer is **not** wired here: tests attach it themselves so
+//! the auth contract is exercised independently. Production mounting
+//! merges the returned router into `WebUi::run` **before** the token
+//! layer, so every `/api/system/*` route is gated by the same
 //! `require_token` as `/ws` and `/commands`.
 
-use crate::config::{BUILTIN_TOOL_NAMES, Config, save_config_at};
-use crate::pipeline::PipelineSet;
 use axum::{
     Router,
     body::Body,
@@ -30,48 +23,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 // ===========================================================================
-// SetupInfo — the GET /api/setup response (plan §B).
+// InstallPath — the wire form of the PATH verdict (spec §B tagged union).
 // ===========================================================================
-
-/// GET /api/setup response. Mirrors the plan §B TS type 1:1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetupInfo {
-    pub os: String,
-    pub arch: String,
-    pub exe_path: Option<String>,
-    pub config_path: String,
-    pub data_dir: Option<String>,
-    pub cache_dir: Option<String>,
-    pub skills_dir: Option<String>,
-    pub lan_bind_hint: String,
-    pub needs_setup: bool,
-    pub builtin_tools: Vec<String>,
-    pub install: InstallInfo,
-    pub existing: ExistingConfig,
-}
-
-/// Install target surface (plan §B). Track I now drives this from the real
-/// [`install_target`](crate::install::install_target) and
-/// [`path_state`](crate::install::path_state) over the process PATH — both
-/// pure, so the GET /api/setup install block never runs a subprocess.
-/// `state` is the canonicalised file comparison (`current` when
-/// `target == current_exe` on disk, `absent` when the file is missing,
-/// `other` when a *different* file is there). `path` is the PATH-lookup
-/// verdict the wizard renders verbatim — same shape §B pins for the
-/// install response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstallInfo {
-    pub target: String,
-    pub state: String, // "current" | "absent" | "other"
-    /// Same tagged union as §B: `{"status":"on_path"}` |
-    /// `{"status":"shadowed","by": <path>}` |
-    /// `{"status":"absent","hint": <hint>}`.
-    pub path: InstallPath,
-}
 
 /// Wire form of [`crate::install::PathState`]. Kept separate so the HTTP
 /// module owns its own JSON spelling and the install core can evolve
@@ -102,72 +58,12 @@ impl InstallPath {
     }
 }
 
-/// State of the existing `config.yaml` (plan §B tagged union).
-/// `Absent` for no file, `Ok` for a parsed file (transcoded JSON),
-/// `Error` for a malformed file (HTTP 200 regardless — a malformed
-/// config can never break the facts fetch).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status")]
-pub enum ExistingConfig {
-    Absent,
-    Ok { config: JsonValue },
-    Error { message: String },
-}
-
-// ===========================================================================
-// WriteOutcome — the POST /api/setup/config success response (plan §B).
-// ===========================================================================
-
-/// Returns the **exact** shape the wizard's "Restart" step reads. `restart_required`
-/// is locked to `true` (plan §A-Q4 ruling A — post-write story is "restart").
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteOutcome {
-    pub path: String,
-    pub backup: Option<String>,
-    pub restart_required: bool,
-}
-
-// ===========================================================================
-// FactsBase — platform facts surfaced once at GET /api/setup (plan §B).
-//
-// Resolved once at boot via [`FactsBase::current`] so the handler never
-// re-queries `current_exe()` or `dirs::*` on every request. The fields
-/// are nullable because not every platform has a data dir / cache dir.
-#[derive(Debug, Clone)]
-pub struct FactsBase {
-    pub os: String,
-    pub arch: String,
-    pub exe_path: Option<String>,
-    pub data_dir: Option<String>,
-    pub cache_dir: Option<String>,
-    pub skills_dir: Option<String>,
-}
-
-impl FactsBase {
-    /// Snapshot the running binary's platform facts. Path turns are
-    /// read via `dirs::data_dir()` / `cache_dir()` per the platform
-    /// conventions; omit the segment if the host has none.
-    pub fn current() -> Self {
-        Self {
-            os: std::env::consts::OS.to_string(),
-            arch: std::env::consts::ARCH.to_string(),
-            exe_path: std::env::current_exe()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned()),
-            data_dir: dirs::data_dir().map(|p| p.join("peakbot").to_string_lossy().into_owned()),
-            cache_dir: dirs::cache_dir().map(|p| p.join("peakbot").to_string_lossy().into_owned()),
-            skills_dir: dirs::config_dir()
-                .map(|p| p.join("peakbot/skills").to_string_lossy().into_owned()),
-        }
-    }
-}
-
 // ===========================================================================
 // InstallFn / ServiceFn — fn-pointer seams (plan §E.9).
 //
-// Track I replaces the defaults with the real `install::install_binary`
-// and `install::service_op` dispatchers. `default_for_tests()` returns a
-// no-op so the handler test never copies a binary into $HOME or shells
+// The production adapters (below) are the real `install::install_binary`
+// and `install::service_op` dispatchers; `default_for_tests()` returns a
+// no-op so a handler test never copies a binary into $HOME or shells
 // out to `systemctl` — the seam is exactly one indirection, no trait,
 // no plugin system.
 //
@@ -249,7 +145,7 @@ pub struct InstallFn(pub fn(JsonValue) -> Result<JsonValue, SetupOpError>);
 pub struct ServiceFn(pub fn(JsonValue) -> Result<JsonValue, SetupOpError>);
 
 impl InstallFn {
-    /// No-op install op. Track I replaces this with the real dispatcher.
+    /// No-op install op. The production adapter is the real dispatcher.
     pub fn default_for_tests() -> Self {
         fn noop(_req: JsonValue) -> Result<JsonValue, SetupOpError> {
             Ok(serde_json::json!({
@@ -262,7 +158,7 @@ impl InstallFn {
 }
 
 impl ServiceFn {
-    /// No-op service op. Track I replaces this with the real dispatcher.
+    /// No-op service op. The production adapter is the real dispatcher.
     pub fn default_for_tests() -> Self {
         fn noop(_req: JsonValue) -> Result<JsonValue, SetupOpError> {
             Ok(serde_json::json!({
@@ -299,11 +195,13 @@ pub fn install_op_adapter(_req: JsonValue) -> Result<JsonValue, SetupOpError> {
 
 /// Production service adapter. Dispatches on the request's `op` field
 /// (one of `{"op":"status"}` | `{"op":"uninstall"}` | `{"op":"install",
-/// "bind"?, "token"?}`); builds a `ServicePlan` for the install arm;
-/// threads the same §E.5 web-token write + uninstall note side-effects
-/// the CLI does so the two surfaces say exactly the same words.
+/// "bind"?, "token"?}`). The token, when given, rides the
+/// `ServicePlan` into the service argv-free world: the service reads
+/// `general.web.token` from config.yaml at start (spec §8.4), so this
+/// adapter never touches a token *file* — the `<config_dir>/web-token`
+/// file was retired with the 0.24 layout.
 pub fn service_op_adapter(req: JsonValue) -> Result<JsonValue, SetupOpError> {
-    use crate::install::{ServiceOp, ServicePlan, write_web_token};
+    use crate::install::{ServiceOp, ServicePlan};
     let op = req
         .get("op")
         .and_then(|v| v.as_str())
@@ -315,17 +213,8 @@ pub fn service_op_adapter(req: JsonValue) -> Result<JsonValue, SetupOpError> {
             Ok(service_report_to_wire(&report))
         }
         "uninstall" => {
-            let mut report = crate::install::service_op(ServiceOp::Uninstall)
+            let report = crate::install::service_op(ServiceOp::Uninstall)
                 .map_err(|e| SetupOpError::from_install_error(&e))?;
-            // §E.5: uninstall never deletes the token file. Surface the
-            // same note the CLI prints so the wizard renders it too.
-            if let Some(path) = crate::install::web_token_path() {
-                report.notes.push(format!(
-                    "the web-token file at {} was NOT deleted; \
-                     remove it by hand if you want to drop the secret.",
-                    path.display()
-                ));
-            }
             Ok(service_report_to_wire(&report))
         }
         "install" => {
@@ -341,22 +230,18 @@ pub fn service_op_adapter(req: JsonValue) -> Result<JsonValue, SetupOpError> {
                     .parse()
                     .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal")
             });
+            // The token, when the client sends one, travels in the
+            // `ServicePlan`; the service picks it up from
+            // `general.web.token` at start (spec §8.4).
             let token_str = req.get("token").and_then(|v| v.as_str());
             let token_trim = token_str.map(str::trim).filter(|t| !t.is_empty());
-            // Token precedence mirrors the CLI: explicit `token` first,
-            // then the existing `web-token` file. Plan §E.5.
-            let owned_token: Option<String> = match token_trim {
-                Some(t) => Some(t.to_string()),
-                None => crate::install::web_token_path()
-                    .as_deref()
-                    .and_then(|p| crate::install::read_web_token(p).ok().flatten()),
-            };
+            let owned_token: Option<String> = token_trim.map(str::to_string);
             // B3 (desktop design §7): when the install target does not
             // exist, run the binary install FIRST — the same copy the
             // `peakbot install` CLI verb performs — and point the service
-            // at the target. The wizard must never point a service at a
+            // at the target. The client must never point a service at a
             // path that does not exist (it matters for the desktop, where
-            // the wizard runs inside the window).
+            // the settings screen runs inside the window).
             let exe = match crate::install::install_target().as_ref() {
                 Some(t) if t.exists() => t.clone(),
                 _ => {
@@ -367,15 +252,6 @@ pub fn service_op_adapter(req: JsonValue) -> Result<JsonValue, SetupOpError> {
             };
             let plan = ServicePlan::new(exe, bind, owned_token)
                 .map_err(|e| SetupOpError::from_plan_error(&e))?;
-            // Mirror the CLI's web-token side effect: if the wizard
-            // sent a non-empty `token`, persist it to the file so a
-            // later `peakbot` boot finds it through the chain.
-            if let Some(t) = token_trim {
-                let path = crate::install::web_token_path().ok_or_else(|| {
-                    SetupOpError::internal("no config dir for web-token file", Vec::new())
-                })?;
-                write_web_token(&path, t).map_err(|e| SetupOpError::from_install_error(&e))?;
-            }
             let report = crate::install::service_op(ServiceOp::Install { plan })
                 .map_err(|e| SetupOpError::from_install_error(&e))?;
             Ok(service_report_to_wire(&report))
@@ -432,21 +308,13 @@ fn service_report_to_wire(r: &crate::install::ServiceReport) -> JsonValue {
 }
 
 // ===========================================================================
-// SetupState — built once at boot, cloned into the router (plan §D S2).
+// SystemState — built once at boot, cloned into the router.
 // ===========================================================================
 
 /// Per-handler state injected by [`router`]. The handler never re-derives
 /// paths or facts; everything is captured here at boot.
 #[derive(Clone)]
-pub struct SetupState {
-    /// Absolute path to the master config file the wizard is configuring.
-    /// Injected from production `WebUi::new` so the test path can point
-    /// at a tempdir without touching `$HOME`.
-    pub config_path: PathBuf,
-    /// Snapshot of platform facts at boot.
-    pub facts_base: FactsBase,
-    /// Whether this server was booted without an existing config file.
-    pub needs_setup: bool,
+pub struct SystemState {
     /// Install op (track I seam).
     pub install: InstallFn,
     /// Service op (track I seam).
@@ -473,16 +341,6 @@ impl ApiError {
             &Self {
                 error: message.into(),
                 problems: None,
-            },
-        )
-    }
-
-    fn validation(problems: Vec<String>) -> Response {
-        json_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            &Self {
-                error: "config is not valid".into(),
-                problems: Some(problems),
             },
         )
     }
@@ -562,241 +420,10 @@ async fn read_json_body(req: Request<Body>) -> Result<JsonValue, Box<Response>> 
 // Handlers
 // ===========================================================================
 
-/// GET /api/setup — platform facts + the existing config (plan §A-Q3).
-/// Always 200; a malformed file becomes `existing: {status: "error"}`.
-async fn get_setup(State(state): State<Arc<SetupState>>) -> Response {
-    let info = build_setup_info(&state);
-    json_response(StatusCode::OK, &info)
-}
-
-fn build_setup_info(state: &SetupState) -> SetupInfo {
-    let existing = read_existing(&state.config_path);
-    let install = build_install_info(&state.facts_base);
-    SetupInfo {
-        os: state.facts_base.os.clone(),
-        arch: state.facts_base.arch.clone(),
-        exe_path: state.facts_base.exe_path.clone(),
-        config_path: state.config_path.to_string_lossy().into_owned(),
-        data_dir: state.facts_base.data_dir.clone(),
-        cache_dir: state.facts_base.cache_dir.clone(),
-        skills_dir: state.facts_base.skills_dir.clone(),
-        // Plan §B fixed at the loopback-free bind address — the same
-        // value the `--bind 0.0.0.0` flag defaults to in the legacy
-        // surface. The wizard displays this verbatim in the launch line.
-        lan_bind_hint: "0.0.0.0:7823".to_string(),
-        // Computed once by the boot gate and threaded through WebUi.
-        needs_setup: state.needs_setup,
-        builtin_tools: crate::config::BUILTIN_TOOL_NAMES
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        install,
-        existing,
-    }
-}
-
-/// Build the `install` block of GET /api/setup from §E.4 pure functions
-/// only — `install_target()` + canonicalised `current_exe()` + `path_state`
-/// over the process PATH. No subprocess, no I/O beyond `current_exe()`
-/// resolution. Called once per GET, not per request, so even a chatty
-/// wizard costs nothing.
-fn build_install_info(facts_base: &FactsBase) -> InstallInfo {
-    let target = crate::install::install_target();
-    let target_display = target
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    // §B `state`: "current" when the running binary *is* the install
-    // target (the second-run case), "absent" when the file does not
-    // exist yet, "other" when a different file is in the target slot.
-    let install_state = match (&target, &facts_base.exe_path) {
-        (Some(_t), Some(exe)) if target.as_deref() == Some(std::path::Path::new(exe)) => {
-            // Cheap path: the wizard's `exe_path` already equals target.
-            // Means `current_exe()` IS the install target (the common
-            // case once the user has run `peakbot install`).
-            "current".to_string()
-        }
-        (Some(t), _) if t.exists() => {
-            // Compare canonical paths when the cheap path disagrees —
-            // avoids false "other" verdicts caused by symlinks or
-            // relative-path differences in `current_exe()`.
-            match (t.canonicalize(), std::fs::canonicalize(t)) {
-                (Ok(a), Ok(b)) if a == b => "current".to_string(),
-                _ => "other".to_string(),
-            }
-        }
-        (Some(_), _) => "absent".to_string(),
-        (None, _) => "absent".to_string(),
-    };
-    // PATH verdict: only meaningful when we have a target to look up.
-    // `path_state` is a pure walk over the var we hand it; the process
-    // PATH is the only env read on this path.
-    let path = match target.as_deref() {
-        Some(t) => {
-            let path_var: std::ffi::OsString = std::env::var_os("PATH").unwrap_or_default();
-            InstallPath::from_core(&crate::install::path_state(&path_var, t))
-        }
-        None => InstallPath::Absent {
-            hint: "no install target on this platform".to_string(),
-        },
-    };
-    InstallInfo {
-        target: target_display,
-        state: install_state,
-        path,
-    }
-}
-
-/// Read the existing config file and classify it into the tagged union.
-/// Parse failures stay at 200 with `status: "error"` — the facts fetch
-/// must never break because the user's YAML is malformed.
-fn read_existing(path: &std::path::Path) -> ExistingConfig {
-    if !path.exists() {
-        return ExistingConfig::Absent;
-    }
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            return ExistingConfig::Error {
-                message: format!("read {}: {e}", path.display()),
-            };
-        }
-    };
-    let yaml = match serde_yaml::from_str::<serde_yaml::Value>(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            return ExistingConfig::Error {
-                message: format!("parse {}: {e}", path.display()),
-            };
-        }
-    };
-    // Transcode to JSON for the wire. `serde_json::to_value` on a
-    // `serde_yaml::Value` walks the YAML node graph and emits a JSON
-    // representation — no defaults pollution (the user only sees the
-    // keys they actually wrote). This is the only reason we don't need
-    // `Serialize` on `Config`: the wizard gets the user's file, not the
-    // Rust struct.
-    let config = match serde_json::to_value(&yaml) {
-        Ok(v) => v,
-        Err(e) => {
-            return ExistingConfig::Error {
-                message: format!("transcode yaml→json: {e}"),
-            };
-        }
-    };
-    ExistingConfig::Ok { config }
-}
-
-/// POST /api/setup/config — validate the YAML, then write the verbatim bytes.
-/// Plan §A-Q4 pipeline: parse → tools validate → timeouts validate → registry
-/// build → pipelines build → write. Every failure becomes a 422 envelope; the
-/// file is never touched on failure.
-async fn post_config(State(state): State<Arc<SetupState>>, req: Request<Body>) -> Response {
-    if let Err(resp) = require_json_content_type(&req) {
-        return *resp;
-    }
-    let body = match read_json_body(req).await {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
-    let Some(yaml) = body.get("yaml").and_then(|v| v.as_str()) else {
-        return ApiError::simple(
-            StatusCode::BAD_REQUEST,
-            "expected JSON body with a `yaml` string field",
-        );
-    };
-
-    let mut problems: Vec<String> = Vec::new();
-
-    // Step 1 — parse the bytes as `Config`. `deny_unknown_fields` (and
-    // the per-struct tags) means anything that survives this is, by
-    // construction, a file the binary will boot from.
-    let cfg: Config = match serde_yaml::from_str::<Config>(yaml) {
-        Ok(c) => c,
-        Err(e) => {
-            problems.push(format!("yaml: {e}"));
-            return ApiError::validation(problems);
-        }
-    };
-
-    // Step 2 — tools filter XOR (blocklist vs allowlist) and the
-    // known-tool-name check.
-    if let Err(e) = cfg.tools.validate_shape("tools").and_then(|()| {
-        cfg.tools
-            .validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
-    }) {
-        problems.push(e);
-    }
-
-    // Step 3 — outbound timeouts (delegation / tool-call budgets).
-    if let Err(e) = cfg.timeouts.validate() {
-        problems.push(e);
-    }
-
-    // Step 4 — model registry build. Alias charset, reserved `unknown`,
-    // uniqueness, default_model resolution.
-    match cfg.build_model_registry() {
-        Ok(registry) => {
-            // Step 5 — pipelines. The same validator the binary runs at
-            // boot, so a team that cannot start never reaches disk (and the
-            // legacy `pipeline:` block is refused here with its migration
-            // recipe). `None` for `known_skills` skips the per-role
-            // skill-name check: the wizard does no skill discovery, and
-            // guessing would reject configs the binary accepts.
-            if let Err(e) = PipelineSet::build(&cfg, &registry, None) {
-                problems.push(e.to_string());
-            }
-        }
-        Err(e) => problems.push(e.to_string()),
-    }
-
-    if !problems.is_empty() {
-        return ApiError::validation(problems);
-    }
-
-    // Step 6 — write. This is the only mutating call. The CFG is fully
-    // validated at this point; the bytes written are the reviewed YAML
-    // verbatim (plan §A-Q4 ruling: "what you review is byte-for-byte
-    // what lands").
-    let outcome = match save_config_at(
-        state
-            .config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new(".")),
-        yaml,
-    ) {
-        Ok(o) => o,
-        Err(e) => {
-            return ApiError::simple(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to write config: {e}"),
-            );
-        }
-    };
-
-    let body = WriteOutcome {
-        path: outcome.path.to_string_lossy().into_owned(),
-        backup: outcome
-            .backup
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
-        // Post-write story is "restart" (plan §A-Q4 ruling A). The
-        // agent loop's `Arc<ModelRegistry>` and `WsState.models` are
-        // built once at boot and can't live-adopt a new config.
-        restart_required: true,
-    };
-
-    json_response(StatusCode::OK, &body)
-}
-
-// ===========================================================================
-// Router (plan §D S3).
-// ===========================================================================
-
-/// POST /api/setup/install — track I, plan §B. Body `{}` (ignored by
+/// POST /api/system/install — track I, plan §B. Body `{}` (ignored by
 /// the adapter). Success carries the §B `InstallResponse`; errors map
 /// per the §B error table (Unsupported→501, anything else→500).
-async fn post_install(State(state): State<Arc<SetupState>>, req: Request<Body>) -> Response {
+async fn post_install(State(state): State<Arc<SystemState>>, req: Request<Body>) -> Response {
     if let Err(resp) = require_json_content_type(&req) {
         return *resp;
     }
@@ -820,10 +447,10 @@ async fn post_install(State(state): State<Arc<SetupState>>, req: Request<Body>) 
     finish_op(result)
 }
 
-/// GET /api/setup/service — track I, plan §B. Body is empty (the
+/// GET /api/system/service — track I, plan §B. Body is empty (the
 /// handler synthesises `{"op":"status"}` so the adapter stays
 /// uniform across the three verbs).
-async fn get_service(State(state): State<Arc<SetupState>>) -> Response {
+async fn get_service(State(state): State<Arc<SystemState>>) -> Response {
     let service = state.service;
     let result =
         tokio::task::spawn_blocking(move || (service.0)(serde_json::json!({"op":"status"})))
@@ -837,10 +464,10 @@ async fn get_service(State(state): State<Arc<SetupState>>) -> Response {
     finish_op(result)
 }
 
-/// POST /api/setup/service — track I, plan §B. Body `{op:"install",
+/// POST /api/system/service — track I, plan §B. Body `{op:"install",
 /// bind?, token?}`. 422 on PlanError::TokenRequired; same mapping
 /// table for the rest.
-async fn post_service(State(state): State<Arc<SetupState>>, req: Request<Body>) -> Response {
+async fn post_service(State(state): State<Arc<SystemState>>, req: Request<Body>) -> Response {
     if let Err(resp) = require_json_content_type(&req) {
         return *resp;
     }
@@ -848,7 +475,7 @@ async fn post_service(State(state): State<Arc<SetupState>>, req: Request<Body>) 
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    // Validate `op` *before* dispatching — the wizard should never be
+    // Validate `op` *before* dispatching — the client should never be
     // able to trigger a 500 by sending an unknown verb. The §B
     // verb set is `install` (POST) / `status` (GET) / `uninstall`
     // (DELETE); POST also accepts a bare `{bind, token}` and we
@@ -878,9 +505,9 @@ async fn post_service(State(state): State<Arc<SetupState>>, req: Request<Body>) 
     finish_op(result)
 }
 
-/// DELETE /api/setup/service — track I, plan §B. Body is empty; the
+/// DELETE /api/system/service — track I, plan §B. Body is empty; the
 /// handler synthesises `{"op":"uninstall"}`.
-async fn delete_service(State(state): State<Arc<SetupState>>) -> Response {
+async fn delete_service(State(state): State<Arc<SystemState>>) -> Response {
     let service = state.service;
     let result =
         tokio::task::spawn_blocking(move || (service.0)(serde_json::json!({"op":"uninstall"})))
@@ -917,21 +544,44 @@ fn finish_op(result: Result<JsonValue, SetupOpError>) -> Response {
     }
 }
 
-/// Build the setup router. Mount this in `WebUi::run` **before** the token
-/// layer so every `/api/setup/*` route is gated by the same `require_token`
-/// as `/ws` and `/commands`. The returned router carries no auth — the
-/// caller adds it.
-pub fn router(state: SetupState) -> Router {
+// ===========================================================================
+// Router (spec §8.2).
+// ===========================================================================
+
+/// Build the system router. Mount this in `WebUi::run` **before** the
+/// token layer so every `/api/system/*` route is gated by the same
+/// `require_token` as `/ws` and `/commands`. The returned router
+/// carries no auth — the caller adds it.
+pub fn router(state: SystemState) -> Router {
     let state = Arc::new(state);
     Router::new()
-        .route("/api/setup", get(get_setup))
-        .route("/api/setup/config", post(post_config))
-        .route("/api/setup/install", post(post_install))
+        .route("/api/system/install", post(post_install))
         .route(
-            "/api/setup/service",
+            "/api/system/service",
             get(get_service).post(post_service).delete(delete_service),
         )
         .with_state(state)
+}
+
+/// The old `/api/setup*` surface, answered with 404 (spec B12). The SPA
+/// fallback would otherwise serve `index.html` (200) for these paths,
+/// which hides the removal. Only the routes that existed in 0.23 are
+/// tombstoned; unknown sub-paths keep the SPA fallback like any other
+/// unknown route.
+pub fn setup_removed() -> Router {
+    Router::new()
+        .route("/api/setup", get(gone))
+        .route("/api/setup/config", post(gone))
+        .route("/api/setup/install", post(gone))
+        .route("/api/setup/service", get(gone).post(gone).delete(gone))
+}
+
+/// 404 tombstone handler for the removed setup surface.
+async fn gone() -> Response {
+    ApiError::simple(
+        StatusCode::NOT_FOUND,
+        "the /api/setup routes were removed in 0.24 — use /api/settings and /api/system/*",
+    )
 }
 
 // ===========================================================================
@@ -978,13 +628,6 @@ mod tests {
     }
 
     #[test]
-    fn facts_base_current_populates_os_and_arch() {
-        let fb = FactsBase::current();
-        assert!(!fb.os.is_empty());
-        assert!(!fb.arch.is_empty());
-    }
-
-    #[test]
     fn install_fn_default_for_tests_is_a_no_op() {
         let f = InstallFn::default_for_tests();
         let v = (f.0)(serde_json::json!({})).unwrap();
@@ -996,40 +639,5 @@ mod tests {
         let f = ServiceFn::default_for_tests();
         let v = (f.0)(serde_json::json!({})).unwrap();
         assert_eq!(v["status"], "not_implemented");
-    }
-
-    #[test]
-    fn read_existing_returns_absent_when_no_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        assert!(matches!(read_existing(&path), ExistingConfig::Absent));
-    }
-
-    #[test]
-    fn read_existing_returns_ok_with_keys_for_valid_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        std::fs::write(
-            &path,
-            "provider:\n  type: openrouter\n  config:\n    model: x\n",
-        )
-        .unwrap();
-        match read_existing(&path) {
-            ExistingConfig::Ok { config } => {
-                assert!(config.get("provider").is_some());
-            }
-            other => panic!("expected Ok, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_existing_returns_error_with_message_for_garbage() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        std::fs::write(&path, "this: is: not: valid: yaml: at: all:\n").unwrap();
-        match read_existing(&path) {
-            ExistingConfig::Error { message } => assert!(!message.is_empty()),
-            other => panic!("expected Error, got {other:?}"),
-        }
     }
 }

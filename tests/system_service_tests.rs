@@ -1,13 +1,13 @@
-//! B3 — the setup wizard's service install must point the service at the
+//! B3 — the system service install must point the service at the
 //! install target, not at a path that does not exist (desktop DESIGN §7
 //! B3).
 //!
 //! **The seam.** The exe-selection logic lives inside
-//! `peakbot::ui::web::setup::service_op_adapter` — the production body
+//! `peakbot::ui::web::system::service_op_adapter` — the production body
 //! behind the `ServiceFn` fn-pointer seam. The HTTP seam sits *above*
-//! that logic (the fakes in `tests/setup_api_tests.rs` replace the whole
-//! adapter), so only a direct call to `service_op_adapter` exercises it.
-//! That is the smallest seam; no refactoring needed.
+//! that logic (the fakes in `tests/system_api_tests.rs` replace the
+//! whole adapter), so only a direct call to `service_op_adapter`
+//! exercises it. That is the smallest seam; no refactoring needed.
 //!
 //! **RED today:** with a fresh `$HOME`, `install_target()` does not
 //! exist, and the adapter takes the fallback (pointing the service at a
@@ -75,7 +75,7 @@ fn service_install_installs_the_binary_to_the_target_first_when_it_is_missing() 
         "precondition: fresh $HOME ⇒ no install target"
     );
 
-    let _ = peakbot::ui::web::setup::service_op_adapter(serde_json::json!({
+    let _ = peakbot::ui::web::system::service_op_adapter(serde_json::json!({
         "op": "install",
         "bind": "127.0.0.1:7823",
     }));

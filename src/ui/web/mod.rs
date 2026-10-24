@@ -85,7 +85,7 @@ use uuid::Uuid;
 
 mod images;
 mod registry;
-pub mod setup;
+pub mod system;
 pub mod tls;
 pub mod uploads;
 
@@ -170,12 +170,9 @@ pub struct WebUi {
     extra_sans: Vec<String>,
     /// How often the reaper scans for expired sessions.
     reaper_tick: Duration,
-    /// Redirect only the root document to the setup wizard on first run.
-    needs_setup: bool,
 }
 
 impl WebUi {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: SocketAddr,
         deps: Arc<SessionDeps>,
@@ -184,7 +181,6 @@ impl WebUi {
         token: Option<String>,
         tls: bool,
         extra_sans: Vec<String>,
-        needs_setup: bool,
     ) -> Self {
         let web = deps.config.general.web.clone();
         // `SessionRegistry::new` consumes `deps`, so clone the store out
@@ -203,7 +199,6 @@ impl WebUi {
             tls,
             extra_sans,
             reaper_tick: Duration::from_secs(web.reaper_tick_secs),
-            needs_setup,
         }
     }
 
@@ -252,29 +247,22 @@ impl Ui for WebUi {
             .with_state(self.ws_state.clone())
             .fallback(static_handler);
 
-        if self.needs_setup {
-            app = app.route("/", get(setup_redirect));
-        }
-
-        // Mount the setup wizard (plan §A-Q2, §B, §D S3). The router is
-        // merged BEFORE the token layer so every `/api/setup/*` route is
-        // gated by the same `require_token` as `/ws` and `/commands`.
-        // Constructed here (rather than in `WebUi::new`) so we read the
-        // config path fresh; the resolution is `dirs` + `ProjectDirs`
-        // and runs once at boot.
-        let config_path = crate::config::get_config_file_path()
-            .unwrap_or_else(|| std::path::PathBuf::from("config.yaml"));
-        let setup_state = setup::SetupState {
-            config_path,
-            facts_base: setup::FactsBase::current(),
-            needs_setup: self.needs_setup,
-            // Track I: the seams now point at the real install / service
-            // dispatchers. Tests still inject their own fakes via
-            // `SetupState`; production never sees `default_for_tests()`.
-            install: setup::InstallFn(setup::install_op_adapter),
-            service: setup::ServiceFn(setup::service_op_adapter),
+        // Mount the system routes (spec §8.2): the setup wizard's
+        // install/service surface, moved verbatim to `/api/system/*`. The
+        // router is merged BEFORE the token layer so every `/api/system/*`
+        // route is gated by the same `require_token` as `/ws` and
+        // `/commands`. The seams point at the real install / service
+        // dispatchers; tests inject their own fakes via `SystemState`,
+        // production never sees `default_for_tests()`.
+        let system_state = system::SystemState {
+            install: system::InstallFn(system::install_op_adapter),
+            service: system::ServiceFn(system::service_op_adapter),
         };
-        app = app.merge(setup::router(setup_state));
+        app = app.merge(system::router(system_state));
+
+        // The old `/api/setup*` surface is gone: tombstone 404s where the
+        // SPA fallback would otherwise serve index.html.
+        app = app.merge(system::setup_removed());
 
         // Upload routes (file-uploads design §5.2). Merged BEFORE the
         // token layer, so both `/api/uploads` routes are gated by the same
@@ -837,17 +825,6 @@ fn dispatch_inbound(
     }
 }
 
-/// Redirect only the first document request to the setup SPA route. This sits
-/// inside the existing token layer, so a token-bearing entry request receives
-/// its auth cookie on this 303 before the browser follows `/setup`.
-async fn setup_redirect() -> Response {
-    (
-        StatusCode::SEE_OTHER,
-        [(header::LOCATION, "/setup")],
-        Body::empty(),
-    )
-        .into_response()
-}
 /// Serve a single file from the embedded bundle. Unknown routes fall back
 /// to `index.html` (SPA client-side routing → 200, not 404), except paths
 /// containing `..` which are refused. When the bundle has no `index.html`
@@ -1203,26 +1180,6 @@ mod tests {
         assert_eq!(status, 200, "body: {body}");
         let ct_index = body.find("Shifu").unwrap_or(usize::MAX);
         assert!(ct_index < 1024, "root body did not contain Shifu: {body}");
-    }
-
-    #[tokio::test]
-    async fn first_run_root_redirects_to_setup() {
-        let app: Router = Router::new()
-            .route("/", get(setup_redirect))
-            .fallback(static_handler);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        assert_eq!(resp.headers()[header::LOCATION], "/setup");
     }
 
     #[tokio::test]

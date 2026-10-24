@@ -643,8 +643,8 @@ async fn main() -> Result<()> {
         }
 
         let tls = cli.tls || web.tls;
-        // `needs_setup` returns with the first-run Settings flow (C6); until
-        // then a missing config is refused above in every mode.
+        // The first-run `needs_setup` flow returns with C6 (spec §6.9);
+        // until then a missing config is refused above in every mode.
         let mut ui = WebUi::new(
             addr,
             session_deps.clone(),
@@ -653,7 +653,6 @@ async fn main() -> Result<()> {
             token,
             tls,
             cli.tls_name.clone(),
-            false,
         );
         ui.init().await?;
         ui.run().await?;

@@ -15,8 +15,8 @@
 //!
 //! **The token.** Artifacts never embed a secret; the artifact names an
 //! absolute binary path and `<binary> --bind <addr>`, and the token lives
-//! in `<config_dir>/web-token` with `0600` perms on Unix (the same
-//! precedent `save_config_at` uses). Rotation = edit one file + restart.
+//! in `general.web.token` in config.yaml (0.24 layout). Rotation = edit
+//! the config + restart.
 
 use std::ffi::OsStr;
 use std::io;
@@ -524,68 +524,6 @@ pub fn install_binary() -> Result<InstallOutcome, InstallError> {
     let dst = install_target()
         .ok_or_else(|| InstallError::Io(io::Error::other("no install target for this platform")))?;
     install_binary_to(&src, &dst)
-}
-
-// ===========================================================================
-// §E.5 — token file: `web-token`, written `0600` on Unix, read with
-// whitespace-trim, empty = absent. One file, one secret, one place to
-// rotate it.
-// ===========================================================================
-
-/// The token-file path: `<config_dir>/web-token`, next to `config.yaml`.
-/// Returns `None` only if the platform has no config dir at all.
-pub fn web_token_path() -> Option<PathBuf> {
-    crate::config::get_config_dir().map(|d| d.join("web-token"))
-}
-
-/// Write the web token to `path` with `0600` perms on Unix. Trailing
-/// whitespace/newlines are trimmed first so the on-disk file is
-/// *exactly* the secret — no surprise bytes.
-pub fn write_web_token(path: &Path, token: &str) -> Result<(), InstallError> {
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        return Err(InstallError::Io(io::Error::other(
-            "refusing to write a whitespace-only token",
-        )));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(InstallError::Io)?;
-    }
-    // Atomic write — temp + rename, same pattern as `save_config_at`.
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, trimmed.as_bytes()).map_err(InstallError::Io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&tmp, perms).map_err(InstallError::Io)?;
-    }
-    // If `path` exists, remove before rename (Windows rename refuses to
-    // overwrite; on Unix it atomically replaces). Same non-atomic
-    // window as `save_config_at` — only on Windows, only after the
-    // backup story.
-    if path.exists() {
-        std::fs::remove_file(path).map_err(InstallError::Io)?;
-    }
-    std::fs::rename(&tmp, path).map_err(InstallError::Io)?;
-    Ok(())
-}
-
-/// Read the web token from `path`. Returns `Ok(None)` for absent,
-/// whitespace-only, or unreadable-as-text; `Err` only for hard I/O
-/// failures. Mirrors the §E.5 "empty/whitespace reads as no token" rule.
-pub fn read_web_token(path: &Path) -> Result<Option<String>, InstallError> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(InstallError::Io(e)),
-    };
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed.to_string()))
-    }
 }
 
 // ===========================================================================
@@ -1335,59 +1273,6 @@ mod tests {
         install_binary_to(&src, &dst).unwrap();
         let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o755, "dst must be 0755 on unix; got {mode:o}");
-    }
-
-    // ── §E.5 token file ─────────────────────────────────────────────
-
-    #[test]
-    fn write_then_read_web_token_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-token");
-        write_web_token(&path, "s3cret\n").unwrap();
-        assert_eq!(read_web_token(&path).unwrap(), Some("s3cret".to_string()));
-    }
-
-    #[test]
-    fn read_web_token_returns_none_for_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-token");
-        assert_eq!(read_web_token(&path).unwrap(), None);
-    }
-
-    #[test]
-    fn read_web_token_treats_whitespace_only_as_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-token");
-        std::fs::write(&path, "  \n\t").unwrap();
-        assert_eq!(read_web_token(&path).unwrap(), None);
-    }
-
-    #[test]
-    fn write_web_token_rejects_whitespace_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-token");
-        assert!(write_web_token(&path, "   \n").is_err());
-        assert!(!path.exists(), "no file must be written on reject");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_web_token_sets_0600_on_unix() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-token");
-        write_web_token(&path, "s3cret").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o600, "web-token must be 0600 on unix; got {mode:o}");
-    }
-
-    #[test]
-    fn write_web_token_overwrites_existing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-token");
-        write_web_token(&path, "first").unwrap();
-        write_web_token(&path, "second").unwrap();
-        assert_eq!(read_web_token(&path).unwrap(), Some("second".to_string()));
     }
 
     // ── ServiceOp / service_op seam ─────────────────────────────────

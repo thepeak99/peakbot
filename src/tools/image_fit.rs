@@ -24,7 +24,7 @@ pub(crate) struct ResizeReport {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum FitError {
+pub enum FitError {
     #[error(
         "cannot resize {0}: only PNG and JPEG can be downscaled (an animated GIF would lose its animation)"
     )]

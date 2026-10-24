@@ -845,30 +845,6 @@ impl Default for NameFilter {
 }
 
 impl NameFilter {
-    /// Boundary parse: setting both lists is illegal.
-    pub fn validate_shape(&self, label: &str) -> Result<(), String> {
-        if !self.disabled.is_empty() && !self.only.is_empty() {
-            return Err(format!(
-                "{label}: set either `disabled` (blocklist) or `only` (allowlist), not both."
-            ));
-        }
-        Ok(())
-    }
-
-    /// Boundary parse: every name in `disabled`/`only` must be in `known`
-    /// (typo catch).
-    pub fn validate_names(&self, label: &str, noun: &str, known: &[&str]) -> Result<(), String> {
-        for name in self.disabled.iter().chain(self.only.iter()) {
-            if !known.contains(&name.as_str()) {
-                return Err(format!(
-                    "{label}: unknown {noun} '{name}'. Known {noun}s: {}.",
-                    known.join(", ")
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// Whether a name of this value survives the filter. `enabled: false`
     /// short-circuits to none; then allowlist wins, then blocklist. Both
     /// sides are trimmed, matching how config names are normalized.
@@ -942,8 +918,8 @@ fn default_backoff_factor() -> f64 {
 
 /// Get the platform-specific config directory.
 ///
-/// Public because `peakbot::install::web_token_path` (track I, plan §E.5) needs
-/// it to locate `<config_dir>/web-token` next to `config.yaml`.
+/// Public because `get_config_file_path` (and the auto-migration, which
+/// locates the legacy `web-token` file next to `config.yaml`) need it.
 pub fn get_config_dir() -> Option<std::path::PathBuf> {
     ProjectDirs::from("com", "peakbot", "peakbot").map(|dirs| dirs.config_dir().to_path_buf())
 }
@@ -1114,42 +1090,6 @@ mod tests {
         let t = NameFilter::default();
         assert!(t.allows("bash"));
         assert!(t.allows("web_search"));
-        assert!(t.validate_shape("tools").is_ok());
-        assert!(
-            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
-                .is_ok()
-        );
-    }
-
-    /// PR3: `powershell_bg` is a SEPARATE known tool name — `tools.disabled`
-    /// may name it without a typo error, exactly like `bash_bg` (which must
-    /// keep working for Bash hosts).
-    #[test]
-    fn tools_filter_validate_names_accepts_powershell_bg() {
-        let t = NameFilter {
-            disabled: vec!["powershell_bg".into()],
-            ..Default::default()
-        };
-        assert!(
-            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
-                .is_ok(),
-            "powershell_bg must be a known built-in tool name (typo catch must not fire)"
-        );
-    }
-
-    /// PR3 companion pin: adding `powershell_bg` must not have displaced
-    /// `bash_bg` from the known universe — Bash hosts still address it.
-    #[test]
-    fn tools_filter_validate_names_still_accepts_bash_bg() {
-        let t = NameFilter {
-            disabled: vec!["bash_bg".into()],
-            ..Default::default()
-        };
-        assert!(
-            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
-                .is_ok(),
-            "bash_bg must remain a known built-in tool name"
-        );
     }
 
     #[test]
@@ -1157,11 +1097,6 @@ mod tests {
         let f = NameFilter::default();
         assert!(f.allows("github"));
         assert!(f.allows("anything"));
-        assert!(f.validate_shape("profiles.p.agents.a.skills").is_ok());
-        assert!(
-            f.validate_names("profiles.p.agents.a.skills", "skill", &["github"])
-                .is_ok()
-        );
     }
 
     #[test]
@@ -1196,44 +1131,12 @@ mod tests {
     }
 
     #[test]
-    fn skill_filter_rejects_both_lists() {
-        let f = NameFilter {
-            enabled: true,
-            disabled: vec!["a".into()],
-            only: vec!["b".into()],
-        };
-        assert!(
-            f.validate_shape("profiles.p.agents.a.skills").is_err(),
-            "both lists is illegal"
-        );
-    }
-
-    #[test]
-    fn skill_filter_rejects_unknown_skill_name() {
-        let f = NameFilter {
-            enabled: true,
-            disabled: vec![],
-            only: vec!["ghost".into()],
-        };
-        assert!(
-            f.validate_names("profiles.p.agents.a.skills", "skill", &["github"])
-                .is_err(),
-            "an unknown skill name is a typo-catch error"
-        );
-    }
-
-    #[test]
     fn tools_filter_blocklist_removes_named_keeps_rest() {
         let t = NameFilter {
             disabled: vec!["bash_bg".into(), "web_search".into()],
             only: vec![],
             ..Default::default()
         };
-        assert!(t.validate_shape("tools").is_ok());
-        assert!(
-            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
-                .is_ok()
-        );
         assert!(!t.allows("bash_bg"));
         assert!(!t.allows("web_search"));
         assert!(t.allows("file_read"));
@@ -1246,81 +1149,10 @@ mod tests {
             only: vec!["file_read".into(), "bash".into()],
             ..Default::default()
         };
-        assert!(t.validate_shape("tools").is_ok());
-        assert!(
-            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
-                .is_ok()
-        );
         assert!(t.allows("file_read"));
         assert!(t.allows("bash"));
         assert!(!t.allows("web_search"));
         assert!(!t.allows("todo"));
-    }
-
-    #[test]
-    fn tools_filter_both_lists_is_error() {
-        let t = NameFilter {
-            disabled: vec!["bash".into()],
-            only: vec!["file_read".into()],
-            ..Default::default()
-        };
-        assert!(t.validate_shape("tools").is_err());
-    }
-
-    #[test]
-    fn tools_filter_unknown_tool_is_error() {
-        let t = NameFilter {
-            disabled: vec!["definitely_not_a_tool".into()],
-            only: vec![],
-            ..Default::default()
-        };
-        assert!(
-            t.validate_names("tools", "tool", BUILTIN_TOOL_NAMES)
-                .is_err()
-        );
-    }
-
-    /// Setting BOTH the blocklist and the allowlist is illegal (the same
-    /// rule for every filter). The error must name both keys.
-    #[test]
-    fn name_filter_rejects_disabled_and_only_together() {
-        let f = NameFilter {
-            disabled: vec!["a".into()],
-            only: vec!["b".into()],
-            ..Default::default()
-        };
-        let err = f
-            .validate_shape("mcps")
-            .expect_err("both lists must be rejected");
-        assert!(
-            err.contains("disabled"),
-            "error must name the `disabled` blocklist, got: {err}"
-        );
-        assert!(
-            err.contains("only"),
-            "error must name the `only` allowlist, got: {err}"
-        );
-    }
-
-    /// `validate_names` names the unknown entry and lists the known ones.
-    #[test]
-    fn name_filter_validate_names_flags_unknown_name_and_lists_known() {
-        let gate = NameFilter {
-            disabled: vec![],
-            only: vec!["ghost".into()],
-            ..Default::default()
-        };
-        let err = gate
-            .validate_names("profiles.web.mcps", "server", &["a"])
-            .expect_err("an unknown name must be rejected");
-        assert!(
-            err.contains("ghost"),
-            "the error must name the unknown entry, got: {err}"
-        );
-        assert!(
-            err.contains("Known servers: a"),
-            "the error must list the known names, got: {err}"
-        );
     }
 
     // ─── MCP OAuth — Slice 1 config-shape pins ──────────────────────────
