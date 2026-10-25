@@ -16,7 +16,7 @@
 # release-bump/release-tag run in throwaway local clones against a local
 # bare `origin` (cargo stubbed to a no-op).
 #
-# Run:  sh scripts/test-release.sh        (from the repo root, or anywhere)
+# Run:  sh tests/release.sh               (from the repo root, or anywhere)
 # Exit: 0 when every check passes (GREEN); 1 with a failing-check list
 #       otherwise (RED — each failure names the missing implementation piece).
 
@@ -413,6 +413,12 @@ fi
 
 F=$(mktemp -d); workdirs="$workdirs $F"
 git clone -q --bare "$root" "$F/origin.git" 2>/dev/null || { echo "❌ bare origin clone failed" >&2; exit 1; }
+# The fixture's master must be the code under test: point it at the worktree's
+# HEAD (the implementation branch), not at the pre-rework master.
+git -C "$F/origin.git" update-ref refs/heads/master "$(git -C "$root" rev-parse HEAD)"
+# Drop the repo's real release tag for $V from the fixture origin too, so
+# tag-state assertions are deterministic (T41/T42 create it via make).
+git -C "$F/origin.git" tag -d "$V" >/dev/null 2>&1 || true
 mkdir -p "$F/bin"
 printf '#!/bin/sh\nexit 0\n' > "$F/bin/cargo"
 chmod +x "$F/bin/cargo"
