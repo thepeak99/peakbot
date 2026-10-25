@@ -432,7 +432,7 @@ PeakBot ships as a single static binary for **Linux x86_64**, **Windows x86_64**
 | File | Builder | Notes |
 |------|---------|-------|
 | `Dockerfile.linux` | `rust:1.88-bookworm` | native; dummy-main caching trick |
-| `Dockerfile.windows` | `rust:1.88-bookworm` + mingw | cross via gcc-mingw |
+| `Dockerfile.windows` | `rust:1.91-bookworm` + clang/lld/llvm + cargo-xwin (MSVC SDK, static CRT) | cross to `x86_64-pc-windows-msvc` — the ONE Windows build: server asset AND the desktop sidecar are the same build (cache hit in the release pipeline) |
 | `Dockerfile.macos` | `cargo-zigbuild` | zig + macOS SDK; universal2 fat binary |
 | `Dockerfile.android` | `rust:1.91-bookworm` + NDK r27c | `cargo-ndk`; API level via `CARGO_NDK_PLATFORM` (24), **not** `-p` (collides with cargo `--package`); works clean because PeakBot is pure rustls/ring |
 
