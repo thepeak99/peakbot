@@ -55,11 +55,9 @@ desktop/
     ├── build-desktop.sh           single entry point used by Makefile AND CI
     ├── smoke-linux.sh             runs inside Dockerfile.desktop-linux
     ├── smoke-macos.sh             runs inside Dockerfile.desktop-macos
-    ├── check-version.sh           desktop version == root Cargo.toml version
-    └── attach-release.sh          CI: attach artifacts to the Gitea release for a tag
+    └── check-version.sh           desktop version == root Cargo.toml version
 Dockerfile.desktop-linux           (repo root, next to the existing Dockerfiles)
 Dockerfile.desktop-macos
-.gitea/workflows/desktop.yml
 ```
 
 | Component | Single responsibility | Why it exists |
@@ -73,7 +71,7 @@ Dockerfile.desktop-macos
 | `ui/` status page | Shows `StatusView` (polled), buttons → `act` | The only thing shown when the backend isn't up. Plain HTML/JS, embedded via `frontendDist`. |
 | `macos/assemble-app.sh` | Builds the `.app` layout Tauri CLI can't build on Linux | Researcher: Tauri CLI cannot bundle `.app` on Linux. |
 | Dockerfiles + `build-desktop.sh` | Reproducible builds, same path locally (podman) and in CI (docker) | Follows the existing `Dockerfile.*` + `--output type=local` pattern. |
-| Gitea workflow | Build both artifacts on `dind`, upload, attach on tag | Requirement 5. |
+| Gitea workflow | `.gitea/workflows/release.yml` (tag push → `make release TAG=<v>`): builds the desktop artifacts alongside the four server assets and publishes all 7 atomically | Requirement 5. |
 
 **Deliberately NOT added (and why):**
 - **No `tauri-plugin-shell`.** We spawn the sidecar with `std::process::Command` from Rust. `externalBin` is a *bundler* feature and works without the plugin. std gives us exact control over env, stdio, signals; the plugin would add a JS-facing capability surface we must then deny.
@@ -1048,18 +1046,18 @@ Lifecycle: `settings_get` on start, then polled every 1000 ms (refreshes `saved`
   (→ `output/peakbot-windows-amd64-msvc.exe`) and the portable exe with `Dockerfile.desktop-windows`;
   `all` = linux + macos + windows.
 - **Makefile:** `desktop-linux`, `desktop-macos`, `desktop-windows`, `desktop` (all three) → `sh desktop/scripts/build-desktop.sh …`; `desktop-dev`; `desktop-test` → `cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core`. Add to `.PHONY` and `## help` lines.
-- **`.gitea/workflows/desktop.yml`:** `on: workflow_dispatch` + `push: tags: ['*']`; one job `runs-on: dind`,
-  no `container:` (needs host docker), `timeout-minutes: 180` (three pipelines); steps: pure-git checkout (same as `ci.yml`) →
-  `PRUNE=1 CONTAINER_BUILDER=docker sh desktop/scripts/build-desktop.sh all` → `actions/upload-artifact@v3`
-  (`output/desktop/*`, Gitea doesn't support v4) → if `startsWith(github.ref, 'refs/tags/')`:
-  `docker run --rm -e GITEA_URL -e REPO -e TAG -e TOKEN -v "$PWD":/w -w /w alpine:3.20 sh -c 'apk add --no-cache curl jq >/dev/null && sh desktop/scripts/attach-release.sh'`
-  with `TOKEN: ${{ secrets.RELEASE_TOKEN }}`.
-- **`attach-release.sh`:** GET `/api/v1/repos/{owner}/{repo}/releases/tags/{tag}`; on 404 retry every 30 s up to 20 min
-  (`make release` creates the release after pushing the tag); delete existing assets with the same name (idempotent re-runs);
-  POST each file to `/releases/{id}/assets?name=…`.
-- **`ci.yml` (PR):** add step `Desktop core` → `cargo fmt --manifest-path desktop/Cargo.toml -p peakbot-desktop-core -- --check`,
-  `cargo clippy --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core --all-targets -- -D warnings`,
-  `cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core`. (Glue is compiled only in desktop.yml — needs webkit.)
+- **`.gitea/workflows/release.yml`:** the single release workflow (`on: push: tags: ['*']`); one job `runs-on: dind`,
+  no `container:` (drives the host docker daemon; the dind runner ships docker), `timeout-minutes: 180` (three
+  pipelines); steps: pure-git checkout (same as `ci.yml`) → tool check (make, curl, jq, docker, git, awk) →
+  `make release TAG=$GITHUB_REF_NAME PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=… REPO=…`
+  (secret `RELEASE_TOKEN` → env `GITEA_TOKEN`). There is no `upload-artifact` step here: desktop artifacts are
+  built and published by `make release` — per platform `release-build-<p>` + `desktop-<p>`, then
+  `release-publish` (draft release, all 7 assets asserted before any upload, publish, delete-draft on failure).
+- **`ci.yml` (PR):** job `ci` also runs the release contract tests (`sh tests/release.sh`, hermetic — Makefile
+  targets + `release.yml`) before the cargo gate. Job `desktop` runs the full desktop workspace
+  (`--manifest-path desktop/Cargo.toml --workspace`) with fmt/clippy/test after the webkit deps
+  (placeholder sidecar for `bundle.externalBin`), plus the Windows portable-exe static tests. (Glue is
+  compiled only there — needs webkit.)
 
 ### 5.8 README (manual removal section, locked content)
 Linux: `peakbot service uninstall` (or `systemctl --user disable --now peakbot.service; rm ~/.config/systemd/user/peakbot.service; systemctl --user daemon-reload`);
@@ -1142,7 +1140,7 @@ Order matters: T-tasks (tests) precede the C-tasks they cover (RED → GREEN).
 23. **[M] P4.1** `Dockerfile.desktop-linux` + `scripts/smoke-linux.sh`.
 24. **[S] P4.2** `Dockerfile.desktop-macos` + `macos/Info.plist.in` + `macos/assemble-app.sh` + `scripts/smoke-macos.sh` (zigbuild universal2 with Tauri, rcodesign, fallback recipe if needed).
 25. **[J] P4.3** `scripts/build-desktop.sh` + Makefile targets + help lines.
-26. **[S] P4.4** `.gitea/workflows/desktop.yml` + `scripts/attach-release.sh`; first verify on the `dind` runner (a throwaway dispatch) that the job has `docker`, `git`, `sh`, node (for upload-artifact) and ≥ 15 GB free; create the `RELEASE_TOKEN` secret (human).
+26. **[S] P4.4** `.gitea/workflows/release.yml` + the desktop-artifact build/publish inside `make release` via `release-publish` (release.yml itself has no `upload-artifact` step — `make release` builds and publishes all 7 assets atomically); first verify on the `dind` runner (Alpine host, host docker, 180-min timeout, ≥ 15 GB free) that the job has `docker`, `git`, `sh`, `make`, `jq`, `awk`; create the `RELEASE_TOKEN` secret (human — still a prerequisite).
 27. **[J] D1** `desktop/README.md` (install, Gatekeeper, background mode, logs locations, manual removal §5.8).
 28. **[S] M1 (human, on a Mac)** run §9.4 checklist; file issues.
 
