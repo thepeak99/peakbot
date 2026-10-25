@@ -295,7 +295,11 @@ grep -qF "POST $API/releases " "$D/log-happy" 2>/dev/null || fail27 "no create P
 grep -qF '"draft":true' "$D/log-happy" 2>/dev/null || fail27 "create body lacks draft:true"
 grep -qF "\"tag_name\":\"$V\"" "$D/log-happy" 2>/dev/null || fail27 "create body lacks tag_name=$V"
 grep -qF "\"name\":\"$V\"" "$D/log-happy" 2>/dev/null || fail27 "create body name is not exactly $V"
-grep -qF 'Windows web cwd picker fix' "$D/log-happy" 2>/dev/null || fail27 "create body lacks release-notes/$V.md content"
+# Sentinel: a long word from the real notes file — the assertion is "notes
+# content reached the create body", independent of which version is under test.
+notes_word=$(grep -m1 -oE '[A-Za-z]{8,}' "release-notes/$V.md" 2>/dev/null)
+[ -n "$notes_word" ] || fail27 "release-notes/$V.md has no content to verify"
+grep -qF "$notes_word" "$D/log-happy" 2>/dev/null || fail27 "create body lacks release-notes/$V.md content"
 grep -qF 'prerelease' "$D/log-happy" 2>/dev/null && fail27 "prerelease flag present"
 upl=$(grep -cF 'assets?name=' "$D/log-happy" 2>/dev/null || true)
 [ "$upl" = "7" ] || fail27 "$upl asset uploads, want 7"
@@ -490,6 +494,13 @@ fi
 # T38: happy bump VERSION=9.9.9 — branch release/9.9.9 from origin/master,
 # Cargo.toml + desktop/Cargo.toml bumped, notes promoted, committed, pushed,
 # no .release-version.
+# Seed the fixture origin's master with a draft entry so the promotion moves
+# real content and the commit touches current.md — independent of the
+# worktree's (possibly already-promoted) current.md.
+fresh_work
+printf -- '- T38 sentinel draft entry.\n' >> "$F/work/release-notes/current.md"
+git -C "$F/work" commit -qam "test: seed notes draft"
+git -C "$F/work" push -q origin master
 fresh_work
 awk '/^## /{f=1} f' "$F/work/release-notes/current.md" > "$F/expected_notes"
 awk '/^## /{exit} {print}' "$F/work/release-notes/current.md" > "$F/old_header"
@@ -523,6 +534,8 @@ if [ "$t38" -eq 1 ]; then
 else
     bad "T38 release-bump: happy path ($why)"
 fi
+# Restore the shared fixture origin (T39+ must see the unseeded master).
+git -C "$F/origin.git" update-ref refs/heads/master "$(git -C "$root" rev-parse HEAD)"
 
 # T39: release-tag with HEAD != origin/master → non-zero, names master.
 fresh_work

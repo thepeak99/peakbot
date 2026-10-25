@@ -54,6 +54,9 @@ const FIXED_CWD: &str = "/opt/peakbot-snapshot-cwd"; // non-existent → no agen
 const FIXED_SHELL_PATH: &str = "/bin/bash";
 const FIXED_TIME: &str = "2000-01-01 00:00:00 UTC";
 const FIXED_BIN_PATH: &str = "/usr/local/bin/peakbot";
+// The env block stamps the crate version at build time; the snapshots were
+// captured at 0.23.0, so fold it like the clock and binary path.
+const FIXED_VERSION: &str = "0.0.0";
 
 /// The built-in persona, byte-for-byte (its trailing `\n` is the boundary
 /// before the core guidance).
@@ -115,8 +118,9 @@ fn prompt_for(cfg: &Config, agent: &str) -> String {
     build_prompt(cfg, "p", agent, &SkillRegistry::new(), Path::new(FIXED_CWD))
 }
 
-/// `env_block` stamps a live clock and the test binary's exe path; fold both
-/// to fixed values (the same normalisation `old_behaviour_snapshots.rs` uses).
+/// `env_block` stamps a live clock, the test binary's exe path and the crate
+/// version; fold all three to fixed values (the same normalisation
+/// `old_behaviour_snapshots.rs` used for the clock and path).
 fn normalize(text: &str) -> String {
     let mut out = String::new();
     for line in text.lines() {
@@ -124,6 +128,8 @@ fn normalize(text: &str) -> String {
             out.push_str(&format!("- **Current Time**: {FIXED_TIME}"));
         } else if line.starts_with("- **PeakBot Binary Path**: ") {
             out.push_str(&format!("- **PeakBot Binary Path**: {FIXED_BIN_PATH}"));
+        } else if line.starts_with("- **PeakBot Version**: ") {
+            out.push_str(&format!("- **PeakBot Version**: {FIXED_VERSION}"));
         } else {
             out.push_str(line);
         }
@@ -523,7 +529,7 @@ fn a1_prompt_equivalence() {
                 .unwrap_or_else(|| panic!("{}: agent '{}'", pair.file, pair.old_pipeline))
         };
 
-        let expected_old = prompt_part(&pair.snapshot);
+        let expected_old = normalize(&prompt_part(&pair.snapshot));
 
         // Determinism: the same fixed inputs as the old capture — absent cwd
         // (no agents.md), fixed bash shell, empty skill registry; the live
