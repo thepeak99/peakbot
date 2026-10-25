@@ -136,7 +136,7 @@ Defaults are positional: the **first** profile is the default, and inside a prof
 
 ### Live reload on session verbs (`/new`, `/model`, `/cd`, `/load`)
 
-Editing `config.yaml` (global or the repo file) or skills does not require a restart: each session verb re-reads both config files (auto-migrating a legacy repo file first), re-scans skills, and re-resolves + rebuilds the agent on the session's bound `(profile, agent)` — per-session, never mutating the process-wide state. A parse error warns and keeps the previous config. A **legacy-layout** file is never migrated on reload (migration is boot-only) — the warning tells you to restart PeakBot to migrate it. `/new` rebuilds on the **currently-active** model (it does not bounce you to the agent's configured model). In-flight conversations keep their selection; a selection change (`/profile`, `/agent`) applies only to a conversation that has not started (locked after the first turn), and nothing is auto-selected — a repo file makes profiles *available*, never *active*.
+Editing `config.yaml` (global or the repo file) or skills does not require a restart: each session verb re-reads both config files (auto-migrating a legacy repo file first), re-scans skills, and re-resolves + rebuilds the agent on the session's bound `(profile, agent)` — except `/cd`, which re-binds for the target tree (see [Selection](#selection)) — per-session, never mutating the process-wide state. A parse error warns and keeps the previous config. A **legacy-layout** file is never migrated on reload (migration is boot-only) — the warning tells you to restart PeakBot to migrate it. `/new` rebuilds on the **currently-active** model (it does not bounce you to the agent's configured model). In-flight conversations keep their selection; a selection change (`/profile`, `/agent`) applies only to a conversation that has not started (locked after the first turn), and a repo's first profile is the default for conversations started in it — at session start and on `/cd`; `/new`, `/model`, `/load` never switch your selection.
 
 | Reload-safe (next session verb) | Boot-only (`⚠ <key> change ignored — restart to apply.`) |
 |---------------------------------|-----------------------------------------------------------|
@@ -255,7 +255,7 @@ OAuth notes: first connect opens the browser; tokens cached under `~/.cache/peak
 | `/model [alias]` | List / switch models (starts a new conversation) |
 | `/profile [name]` | List / select a profile (first turn only; web: selection chip — top bar, or bottom bar on phones) |
 | `/agent [name]` | List / select an agent within the active profile (first turn only) |
-| `/cd [path]` | Show / change session cwd |
+| `/cd [path]` | Show / change session cwd (re-binds to the target's default agent) |
 | `/new`, `/load`, `/conversations` | Conversation management |
 | `exit` | Quit |
 
@@ -548,6 +548,7 @@ Selection is per-conversation: `(profile, agent)`, persisted on the conversation
 - **`/profile <name>`** / **`/agent <name>`** — pick before the first turn; the name is the **rest of the line** (spaces work), case-sensitive.
 - **Web UI** — the selection chip in the top bar (bottom bar on phones) opens a Profile › Agent › Team › Model drill-down (repo profiles first) with per-member model override before the first message; it locks after the first message. The Agents tab shows the configured roster.
 - **`/new`** keeps the current selection; a fresh session starts at the first profile's first agent.
+- **`/cd <dir>`** starts a fresh conversation bound for the target tree. If the target has repo profiles you land on its first profile's first agent, unless you're already on one of them (kept, re-read). Without repo profiles your profile is kept, or you get the first profile if it isn't configured there. The model follows the new agent, subagent model overrides reset when the agent changes, and an `ℹ Switched to …` line says so.
 - **`--profile <name>`** pins a global profile: every conversation runs under it, `/profile` is refused, and repo files are ignored.
 - **Repo profiles** are listed first for that cwd; a repo profile with the same name as a global one **replaces** it entirely (no merge).
 

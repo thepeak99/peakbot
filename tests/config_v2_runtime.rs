@@ -54,8 +54,8 @@
 //!                                                        config + warning
 //!      `reload_broken_repo_falls_back_to_global_only`    global-only
 //!                                                        catalog + warning
-//!      `cd_with_turns_keeps_bound_and_old_persona`       with turns: the
-//!                                                        Bound (and its
+//!      `model_with_turns_keeps_bound_and_old_persona`    /model with turns:
+//!                                                        the Bound (and its
 //!                                                        persona) is kept
 //!                                                        exactly; only the
 //!                                                        cwd parts refresh
@@ -71,6 +71,38 @@
 //!      `reload_dropped_profile_without_turns_uses_default`
 //!                                                        `ℹ Using <p> › <a>
 //!                                                        (default here).`
+//!  - cd-rebind (`/cd` switches to the target dir's repo agent — the
+//!    0.24.0 bug kept the old (profile, agent) instead):
+//!      `cd_into_repo_switches_to_repo_default_even_with_turns`
+//!                                                        even WITH turns,
+//!                                                        the target repo's
+//!                                                        default wins + the
+//!                                                        `ℹ Switched to …`
+//!                                                        line, verbatim
+//!      `cd_out_of_repo_returns_to_global_default`        leaving the repo
+//!                                                        → the global
+//!                                                        default + line
+//!      `cd_keeps_chosen_global_profile_without_repo_profiles`
+//!                                                        a global choice is
+//!                                                        kept (fresh
+//!                                                        catalog's Arc), no
+//!                                                        Switched line
+//!      `cd_same_repo_with_turns_rereads_definition`      same pair: no
+//!                                                        Switched line, but
+//!                                                        the edited repo
+//!                                                        persona is picked
+//!                                                        up
+//!      `cd_under_pin_ignores_target_repo`                pin ⇒ repo file
+//!                                                        ignored ⇒ the pin
+//!                                                        is kept, catalog
+//!                                                        all Global
+//!      `cd_keeps_overrides_on_same_pair`                 same pair: the
+//!                                                        subagent model
+//!                                                        overrides survive,
+//!                                                        bound + mirror
+//!      `cd_into_repo_clears_overrides`                   switched pair:
+//!                                                        overrides empty in
+//!                                                        bound + mirror
 //!  - §11.3 item 5 (per-repo shadowing):
 //!      `repo_profile_replaces_global_in_tools_and_env`   the repo `dev`
 //!                                                        replaces the global
@@ -181,6 +213,15 @@
 //!     session_cwd: &Path) -> Result<Arc<VectorDB>, VectorStoreError>`
 //!     (T2's `pub(crate)` accessor, made `pub`) — the `Arc::ptr_eq`
 //!     accessor spec §11.3 item 8 asks for from an integration test.
+//! 11. `peakbot::reload_for_cd(ctx: &mut RebuildContext,
+//!     sm: &Arc<StateManager>, target_cwd: &Path) -> Vec<String>` — the
+//!     `/cd` reload seam (cd-rebind fix): mirrors `reload_session_config`,
+//!     rebind step 6 replaced by the locked `/cd` rule — the target
+//!     tree's repo profiles win, so the bound re-resolves in the target
+//!     catalog even WITH turns; a kept pair carries its subagent model
+//!     overrides (lenient). When the pair changes, the messages include
+//!     exactly `ℹ Switched to <p> › <a> for <target>.`; when the pair is
+//!     unchanged, no such line.
 //!
 //! Gaps (not testable from a lib integration test at M1):
 //!  - T8b's `handle_select(Selection)` runtime wiring (rollback on a
@@ -777,10 +818,10 @@ fn reload_broken_repo_falls_back_to_global_only() {
 }
 
 /// §11.3 item 13 (bound stability): with turns, a global edit to the bound
-/// agent's persona + `/cd` → the prompt keeps the OLD persona; only the
-/// cwd-derived parts refresh.
+/// agent's persona + `/model` (with turns) → the prompt keeps the OLD
+/// persona; only the cwd-derived parts refresh.
 #[test]
-fn cd_with_turns_keeps_bound_and_old_persona() {
+fn model_with_turns_keeps_bound_and_old_persona() {
     let home = TempHome::new();
     home.write_global(RELOAD_GLOBAL);
     let boot = Config::load(home.cwd(), RepoMode::Include, &ctx()).expect("boot");
@@ -824,7 +865,7 @@ fn cd_with_turns_keeps_bound_and_old_persona() {
     );
 }
 
-/// §11.3 item 4 + 13: with zero turns, a global persona edit + `/new`/`/cd`
+/// §11.3 item 4 + 13: with zero turns, a global persona edit + `/new`
 /// → the selection is re-resolved in the fresh catalog and the NEW persona
 /// is picked up; the selection is stamped back onto the `StateManager`.
 /// ASSUMED API: `StateManager::selection`/`set_selection` (see header, #7).
@@ -888,7 +929,7 @@ fn reload_without_turns_reresolves_selection() {
     );
 }
 
-/// §11.3 item 4: `/cd` into a config where the bound profile is gone, WITH
+/// §11.3 item 4: `/model` in a config where the bound profile is gone, WITH
 /// turns → the snapshot is kept + the exact warning.
 #[test]
 fn reload_dropped_profile_with_turns_warns_and_keeps() {
@@ -1424,6 +1465,289 @@ fn reload_with_turns_keeps_overrides() {
         rc.bound.selection().subagent_models,
         tester_opus(),
         "in-flight conversations keep their definitions"
+    );
+}
+
+// ── cd-rebind: `/cd` switches to the target dir's repo agent ───────────────
+//
+// The repo file lives in `cwd`, so "/cd into a repo" means: boot at `cwd2`
+// and call `peakbot::reload_for_cd(cwd)`. The target repo has exactly one
+// profile: `repo-dev › main`.
+// ASSUMED API: `peakbot::reload_for_cd` (see header, #11).
+
+/// The one-profile repo file the `/cd` tests target.
+const CD_REPO: &str = "profiles:\n  repo-dev:\n    agents:\n      main:\n        model: sonnet\n";
+
+/// cd-rebind: THE 0.24.0 bug — with turns, `/cd` kept the old
+/// (profile, agent). Now the target repo's default wins, and the messages
+/// contain exactly the Switched line.
+#[test]
+fn cd_into_repo_switches_to_repo_default_even_with_turns() {
+    let home = TempHome::new();
+    home.write_global(RELOAD_GLOBAL);
+    home.write_repo(CD_REPO);
+    let boot = Config::load(home.cwd2(), RepoMode::Include, &ctx()).expect("boot at cwd2");
+    let bound = boot
+        .catalog
+        .start_bound(None)
+        .expect("the default bound (dev/main)");
+    let mut rc = rebuild_ctx(boot, bound, None);
+    let sm = StateManager::new_arc();
+    sm.add_user_message("hi".to_string()); // the conversation has a turn
+
+    let messages = peakbot::reload_for_cd(&mut rc, &sm, home.cwd());
+
+    assert_eq!(
+        rc.bound.selection(),
+        Selection {
+            profile: "repo-dev".to_string(),
+            agent: "main".to_string(),
+            ..Default::default()
+        },
+        "even WITH turns, the target repo's default wins"
+    );
+    assert_eq!(sm.selection(), rc.bound.selection(), "the mirror follows");
+    let line = format!(
+        "ℹ Switched to repo-dev › main for {}.",
+        home.cwd().display()
+    );
+    assert_eq!(
+        messages,
+        vec![line],
+        "exactly the Switched line, nothing else"
+    );
+}
+
+/// cd-rebind: leaving the repo returns to the global default + the Switched
+/// line.
+#[test]
+fn cd_out_of_repo_returns_to_global_default() {
+    let home = TempHome::new();
+    home.write_global(RELOAD_GLOBAL);
+    home.write_repo(CD_REPO);
+    let boot = Config::load(home.cwd(), RepoMode::Include, &ctx()).expect("boot in the repo");
+    let bound = boot
+        .catalog
+        .start_bound(None)
+        .expect("the default bound (repo-dev/main)");
+    let mut rc = rebuild_ctx(boot, bound, None);
+    let sm = StateManager::new_arc();
+
+    let messages = peakbot::reload_for_cd(&mut rc, &sm, home.cwd2());
+
+    assert_eq!(
+        rc.bound.selection(),
+        Selection {
+            profile: "dev".to_string(),
+            agent: "main".to_string(),
+            ..Default::default()
+        },
+        "the global default (first global profile's first agent)"
+    );
+    assert_eq!(sm.selection(), rc.bound.selection(), "the mirror follows");
+    let line = format!("ℹ Switched to dev › main for {}.", home.cwd2().display());
+    assert_eq!(
+        messages,
+        vec![line],
+        "exactly the Switched line, nothing else"
+    );
+}
+
+/// cd-rebind: a chosen global profile in a target tree WITHOUT repo
+/// profiles is kept — re-resolved on the fresh catalog's profile Arc, no
+/// Switched line.
+#[test]
+fn cd_keeps_chosen_global_profile_without_repo_profiles() {
+    let home = TempHome::new();
+    home.write_global(GLOBAL_TEAM);
+    let boot = Config::load(home.cwd(), RepoMode::Include, &ctx()).expect("boot");
+    let bound = boot
+        .catalog
+        .resolve("research", "scholar")
+        .expect("research/scholar");
+    let mut rc = rebuild_ctx(boot, bound, None);
+    let sm = StateManager::new_arc();
+
+    let messages = peakbot::reload_for_cd(&mut rc, &sm, home.cwd2());
+
+    assert_eq!(
+        rc.bound.selection(),
+        Selection {
+            profile: "research".to_string(),
+            agent: "scholar".to_string(),
+            ..Default::default()
+        },
+        "the chosen global profile is kept"
+    );
+    assert!(
+        Arc::ptr_eq(
+            rc.config.catalog.profile("research").expect("research"),
+            &rc.bound.profile
+        ),
+        "the bound's profile is the FRESH catalog's Arc"
+    );
+    assert!(
+        messages.iter().all(|m| !m.contains("Switched")),
+        "no Switched line for an unchanged pair: {messages:?}"
+    );
+}
+
+/// cd-rebind: the SAME pair (a repo agent) is re-resolved against the EDITED
+/// repo file — no Switched line, but the new persona is picked up (the
+/// 0.24.0 with-turns keep froze the old definition).
+#[test]
+fn cd_same_repo_with_turns_rereads_definition() {
+    let home = TempHome::new();
+    home.write_global(RELOAD_GLOBAL);
+    home.write_repo("profiles:\n  repo-dev:\n    agents:\n      main:\n        model: sonnet\n        persona: Repo persona one.\n");
+    let boot = Config::load(home.cwd(), RepoMode::Include, &ctx()).expect("boot in the repo");
+    let bound = boot
+        .catalog
+        .start_bound(None)
+        .expect("the default bound (repo-dev/main)");
+    let mut rc = rebuild_ctx(boot, bound, None);
+    let sm = StateManager::new_arc();
+    sm.add_user_message("hi".to_string());
+
+    home.write_repo("profiles:\n  repo-dev:\n    agents:\n      main:\n        model: sonnet\n        persona: Repo persona two.\n");
+
+    let messages = peakbot::reload_for_cd(&mut rc, &sm, home.cwd());
+
+    assert_eq!(
+        rc.bound.selection(),
+        Selection {
+            profile: "repo-dev".to_string(),
+            agent: "main".to_string(),
+            ..Default::default()
+        },
+        "the same pair"
+    );
+    assert!(
+        messages.iter().all(|m| !m.contains("Switched")),
+        "no Switched line for an unchanged pair: {messages:?}"
+    );
+    let prompt = peakbot::build_agent_prompt(
+        rc.bound.agent(),
+        &rc.bound.profile,
+        &rc.skills,
+        None,
+        home.cwd(),
+    );
+    assert!(
+        prompt.contains("Repo persona two."),
+        "the edited repo persona is picked up"
+    );
+    assert!(
+        !prompt.contains("Repo persona one."),
+        "…the old one is gone"
+    );
+}
+
+/// cd-rebind: a `--profile` pin ignores the target tree's repo file — the
+/// pin is kept (no Switched line) and the fresh catalog is all Global.
+#[test]
+fn cd_under_pin_ignores_target_repo() {
+    let home = TempHome::new();
+    home.write_global(GLOBAL_TEAM);
+    home.write_repo(CD_REPO);
+    let boot = Config::load(home.cwd2(), RepoMode::Ignore, &ctx()).expect("boot at cwd2 (pin)");
+    let bound = boot
+        .catalog
+        .start_bound(Some("dev"))
+        .expect("the pinned bound (dev/team)");
+    let mut rc = rebuild_ctx(boot, bound, Some("dev".to_string()));
+    let sm = StateManager::new_arc();
+
+    let messages = peakbot::reload_for_cd(&mut rc, &sm, home.cwd());
+
+    assert_eq!(
+        rc.bound.selection(),
+        Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+            ..Default::default()
+        },
+        "the pin is kept (a pin ⇒ no repo profiles ⇒ the keep branch)"
+    );
+    assert!(
+        messages.iter().all(|m| !m.contains("Switched")),
+        "no Switched line for an unchanged pair: {messages:?}"
+    );
+    assert!(
+        rc.config
+            .catalog
+            .iter()
+            .all(|p| matches!(p.origin, Origin::Global)),
+        "the target repo's file is ignored under the pin"
+    );
+}
+
+/// cd-rebind: an UNCHANGED pair keeps its subagent model overrides — in the
+/// bound AND in the published selection.
+#[test]
+fn cd_keeps_overrides_on_same_pair() {
+    let home = TempHome::new();
+    let (mut rc, sm) = rebuild_ctx_with_tester_opus(&home);
+
+    let messages = peakbot::reload_for_cd(&mut rc, &sm, home.cwd2());
+
+    assert_eq!(
+        rc.bound.selection(),
+        Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+            subagent_models: tester_opus(),
+        },
+        "the same pair, with its override"
+    );
+    assert_eq!(
+        sm.selection().subagent_models,
+        tester_opus(),
+        "the published selection keeps it too"
+    );
+    assert!(
+        messages.iter().all(|m| !m.contains("Switched")),
+        "no Switched line for an unchanged pair: {messages:?}"
+    );
+}
+
+/// cd-rebind: a SWITCHED pair (into the repo's default) starts WITHOUT the
+/// old overrides — empty in the bound and the published selection — plus
+/// the Switched line.
+#[test]
+fn cd_into_repo_clears_overrides() {
+    let home = TempHome::new();
+    let (mut rc, sm) = rebuild_ctx_with_tester_opus(&home);
+    home.write_repo(CD_REPO);
+
+    let messages = peakbot::reload_for_cd(&mut rc, &sm, home.cwd());
+
+    assert_eq!(
+        rc.bound.selection(),
+        Selection {
+            profile: "repo-dev".to_string(),
+            agent: "main".to_string(),
+            ..Default::default()
+        },
+        "the target repo's default is the bound now (overrides empty)"
+    );
+    assert_eq!(
+        sm.selection(),
+        Selection {
+            profile: "repo-dev".to_string(),
+            agent: "main".to_string(),
+            ..Default::default()
+        },
+        "…and the published selection matches (overrides empty)"
+    );
+    let line = format!(
+        "ℹ Switched to repo-dev › main for {}.",
+        home.cwd().display()
+    );
+    assert_eq!(
+        messages,
+        vec![line],
+        "exactly the Switched line, nothing else"
     );
 }
 

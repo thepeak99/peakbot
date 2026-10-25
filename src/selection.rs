@@ -40,14 +40,14 @@ pub fn classify_select(line: &str) -> Option<SelectSubmission> {
             SelectSubmission::ListProfiles,
             SelectSubmission::Profile as fn(String) -> SelectSubmission,
         ),
-        None => match line.strip_prefix("/agent") {
-            Some(rest) => (
+        None => {
+            let rest = line.strip_prefix("/agent")?;
+            (
                 rest,
                 SelectSubmission::ListAgents,
                 SelectSubmission::Agent as fn(String) -> SelectSubmission,
-            ),
-            None => return None,
-        },
+            )
+        }
     };
     // A word boundary after the keyword: `/profiles` is not `/profile`, and
     // `strip_prefix` on the empty rest is `None`, so the bare form is the
@@ -127,6 +127,58 @@ pub fn resolve_saved_selection(
         bound = applied;
     }
     (bound, warnings)
+}
+
+/// The lenient override carry used by rebinds (cd-rebind): re-validate
+/// `prev`'s subagent model overrides against `next`'s roster — valid
+/// entries carry over, vanished ones drop with their ⚠ line. Shared by the
+/// zero-turn `Rebind::Session` rebind and the `/cd` rebind.
+pub fn carry_overrides(
+    next: Bound,
+    prev: &Bound,
+    registry: &ModelRegistry,
+) -> (Bound, Vec<String>) {
+    let wanted = prev.selection().subagent_models;
+    let (bound, rejected) = next.with_subagent_models(registry, &wanted);
+    let warnings = rejected
+        .iter()
+        .map(|rej| override_warning(rej, bound.agent()))
+        .collect();
+    (bound, warnings)
+}
+
+/// The locked `/cd` rebind rule (cd-rebind): the turn count does not
+/// matter — `/cd` always starts a fresh conversation.
+///
+/// | `cat.profile(bound.profile.name)` | kept target profile's origin        | result                                       |
+/// |-----------------------------------|-------------------------------------|----------------------------------------------|
+/// | `None`                            | —                                   | `cat.default_bound()` (no overrides)         |
+/// | `Some`                            | `Repo { .. }`                       | re-resolve the name (overrides carried)      |
+/// | `Some`                            | `Global`, catalog has Repo profiles | `cat.default_bound()` (no overrides)         |
+/// | `Some`                            | `Global`, no Repo profiles          | keep, re-resolved on the fresh catalog       |
+///
+/// A kept name re-resolves by `(profile, agent)`: the agent resolved →
+/// `carry_overrides`; it did not → the kept profile's first agent, no
+/// overrides. Under a `--profile` pin the repo file is ignored, so the
+/// catalog has no Repo profiles and the pinned name always resolves
+/// (`reload_config` bails out before this when the pin vanished) — no pin
+/// parameter is needed. The `Vec` holds override warnings only.
+pub fn rebind_for_cd(
+    cat: &Catalog,
+    registry: &ModelRegistry,
+    bound: &Bound,
+) -> (Bound, Vec<String>) {
+    let has_repo_profiles = cat.iter().any(|p| matches!(p.origin, Origin::Repo { .. }));
+    let kept = cat
+        .profile(&bound.profile.name)
+        .filter(|profile| matches!(profile.origin, Origin::Repo { .. }) || !has_repo_profiles);
+    let Some(kept) = kept else {
+        return (cat.default_bound(), Vec::new());
+    };
+    match cat.resolve(&kept.name, &bound.agent().main.name) {
+        Some(next) => carry_overrides(next, bound, registry),
+        None => (Bound::new(Arc::clone(kept), 0), Vec::new()),
+    }
 }
 
 /// The exact refusal line for a subagent override that a user frame asked
@@ -340,13 +392,13 @@ mod t5_tests {
     use std::path::Path;
 
     use crate::config::ModelRegistry;
-    use crate::config::resolve::{Bound, Catalog, Config, ParseCtx, Selection, Source};
+    use crate::config::resolve::{Bound, Catalog, Config, Origin, ParseCtx, Selection, Source};
     // NB: no short import of `render_agent_list` — the test fn below owns
     // that name in this module and calls the production fn by full path.
     use crate::config::resolve::OverrideRejection;
     use crate::selection::{
         SelectChoice, SelectSubmission, classify_select, override_refusal, override_warning,
-        render_profile_list, resolve_saved_selection, resolve_selection_choice,
+        rebind_for_cd, render_profile_list, resolve_saved_selection, resolve_selection_choice,
     };
 
     /// A valid 0.24 global config: two profiles, `dev` first; `dev` has two
@@ -1225,6 +1277,279 @@ profiles:
         assert!(
             bound.selection().subagent_models.is_empty(),
             "the fallback agent starts without the vanished agent's overrides"
+        );
+    }
+
+    // ── rebind_for_cd (cd-rebind: `/cd` switches to the target dir's repo agent) ──
+    //
+    // The locked rule (the turn count is irrelevant):
+    //   keep  = cat.profile(bound.profile.name) when (the bound's origin is
+    //           Repo OR the catalog has no Repo profiles — a pin ⇒ no repo
+    //           profiles, so a pin is kept by this branch)
+    //   no keep → cat.default_bound() (first profile's first agent, no
+    //             overrides)
+    //   keep    → cat.resolve(name, agent): Some → carry the overrides
+    //             (with_subagent_models + override_warning, lenient);
+    //             None → Bound::new(kept profile, 0) — the kept profile's
+    //             first agent, no overrides.
+    // The `Vec` returned holds override warnings only.
+
+    /// cd-rebind: a bound on a GLOBAL profile, targeting a catalog WITH repo
+    /// profiles → the repo's default (first profile's first agent), no
+    /// warnings.
+    #[test]
+    fn cd_global_bound_into_repo_takes_repo_default() {
+        let cat = catalog(Some(REPO_YAML));
+        let reg = registry(Some(REPO_YAML));
+        let prev = bound(None, "research", "scholar");
+        assert!(
+            matches!(prev.profile.origin, Origin::Global),
+            "fixture sanity: research is global-origin"
+        );
+
+        let (next, warnings) = rebind_for_cd(&cat, &reg, &prev);
+
+        assert_eq!(
+            next.selection(),
+            Selection {
+                profile: "peakbot-dev".into(),
+                agent: "team".into(),
+                ..Default::default()
+            },
+            "the target repo's default is the bound now"
+        );
+        assert!(
+            matches!(next.profile.origin, Origin::Repo { .. }),
+            "the new bound is repo-origin"
+        );
+        assert!(
+            warnings.is_empty(),
+            "a clean default carries no warnings: {warnings:?}"
+        );
+    }
+
+    /// cd-rebind: a shadowed name (`dev`) re-resolves to the REPO definition
+    /// in the fresh catalog — the same-named global is gone from the target
+    /// catalog (I7).
+    #[test]
+    fn cd_shadowed_name_reresolves_to_repo_definition() {
+        let cat = catalog(Some(REPO_YAML));
+        let prev = bound(None, "dev", "solo");
+
+        let (next, warnings) = rebind_for_cd(&cat, &registry(Some(REPO_YAML)), &prev);
+
+        assert_eq!(
+            next.selection(),
+            Selection {
+                profile: "dev".into(),
+                agent: "solo".into(),
+                ..Default::default()
+            },
+            "the kept name, re-resolved in the target catalog"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&next.profile, cat.profile("dev").expect("repo dev")),
+            "the bound's profile IS the fresh catalog's repo dev"
+        );
+        assert!(
+            matches!(
+                next.profile.origin,
+                Origin::Repo {
+                    overrides_global: true
+                }
+            ),
+            "…the repo definition shadowing the global"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no warnings for a clean re-resolution: {warnings:?}"
+        );
+    }
+
+    /// cd-rebind: the kept profile exists in the target catalog but the
+    /// agent no longer does → the kept profile's FIRST agent, no overrides,
+    /// no warnings.
+    #[test]
+    fn cd_shadowed_name_missing_agent_falls_to_profiles_first() {
+        let cat = catalog(Some(REPO_YAML));
+        // The global dev has `team`; the repo dev has only `solo`.
+        let prev = bound(None, "dev", "team");
+
+        let (next, warnings) = rebind_for_cd(&cat, &registry(Some(REPO_YAML)), &prev);
+
+        assert_eq!(
+            next.selection(),
+            Selection {
+                profile: "dev".into(),
+                agent: "solo".into(),
+                ..Default::default()
+            },
+            "the kept profile's first agent"
+        );
+        assert!(
+            next.selection().subagent_models.is_empty(),
+            "the fallback agent starts without overrides"
+        );
+        assert!(
+            warnings.is_empty(),
+            "the agent fallback is structural, not a warning: {warnings:?}"
+        );
+    }
+
+    /// cd-rebind: a bound on a REPO profile, targeting a catalog WITHOUT
+    /// repo profiles (cd'ing out of the repo) → the global default: the
+    /// first global profile's first agent (`dev/team` in GLOBAL_YAML).
+    #[test]
+    fn cd_repo_bound_out_of_repo_takes_global_default() {
+        let cat = catalog(None);
+        let prev = bound(Some(REPO_YAML), "peakbot-dev", "team");
+        assert!(
+            matches!(prev.profile.origin, Origin::Repo { .. }),
+            "fixture sanity: peakbot-dev is repo-origin"
+        );
+
+        let (next, warnings) = rebind_for_cd(&cat, &registry(None), &prev);
+
+        assert_eq!(
+            next.selection(),
+            Selection {
+                profile: "dev".into(),
+                agent: "team".into(),
+                ..Default::default()
+            },
+            "the global default (first global profile's first agent)"
+        );
+        assert!(
+            matches!(next.profile.origin, Origin::Global),
+            "the new bound is global-origin"
+        );
+        assert!(
+            warnings.is_empty(),
+            "a clean default carries no warnings: {warnings:?}"
+        );
+    }
+
+    /// cd-rebind: a bound on a global profile, targeting a catalog WITHOUT
+    /// repo profiles → the choice is kept, re-resolved on the FRESH
+    /// catalog's profile object.
+    #[test]
+    fn cd_keeps_global_choice_without_repo_profiles() {
+        let cat = catalog(None);
+        let prev = bound(None, "research", "scholar");
+
+        let (next, warnings) = rebind_for_cd(&cat, &registry(None), &prev);
+
+        assert_eq!(
+            next.selection(),
+            Selection {
+                profile: "research".into(),
+                agent: "scholar".into(),
+                ..Default::default()
+            },
+            "the kept choice"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&next.profile, cat.profile("research").expect("research")),
+            "the bound's profile is the FRESH catalog's Arc"
+        );
+        assert!(
+            warnings.is_empty(),
+            "keeping a configured choice is quiet: {warnings:?}"
+        );
+    }
+
+    /// cd-rebind: the SAME pair re-resolved in the target catalog carries
+    /// its subagent model overrides, with no warnings.
+    #[test]
+    fn cd_same_pair_carries_overrides() {
+        let cat = catalog(Some(REPO_YAML));
+        let reg = registry(Some(REPO_YAML));
+        let base = cat
+            .resolve("peakbot-dev", "team")
+            .expect("peakbot-dev/team");
+        let mut wanted = std::collections::BTreeMap::new();
+        wanted.insert("mid".to_string(), "opus".to_string());
+        let (prev, rejected) = base.with_subagent_models(&reg, &wanted);
+        assert!(
+            rejected.is_empty(),
+            "mid: opus is a valid override: {rejected:?}"
+        );
+
+        let (next, warnings) = rebind_for_cd(&cat, &reg, &prev);
+
+        assert_eq!(
+            next.selection(),
+            Selection {
+                profile: "peakbot-dev".into(),
+                agent: "team".into(),
+                subagent_models: wanted.clone(),
+            },
+            "the same pair, with its override carried over"
+        );
+        assert!(
+            warnings.is_empty(),
+            "a valid override carries quietly: {warnings:?}"
+        );
+    }
+
+    /// cd-rebind: a pair that SWITCHES (the kept profile's agent vanished
+    /// in the target catalog) starts on the new agent WITHOUT the old
+    /// overrides.
+    #[test]
+    fn cd_switch_clears_overrides() {
+        let cat = catalog(Some(REPO_YAML));
+        let reg = registry(Some(REPO_YAML));
+        let base = bound(None, "dev", "team");
+        let mut wanted = std::collections::BTreeMap::new();
+        wanted.insert("tester".to_string(), "opus".to_string());
+        let (prev, rejected) = base.with_subagent_models(&reg, &wanted);
+        assert!(
+            rejected.is_empty(),
+            "tester: opus is a valid override on the global dev/team: {rejected:?}"
+        );
+
+        let (next, warnings) = rebind_for_cd(&cat, &reg, &prev);
+
+        assert_eq!(
+            next.selection(),
+            Selection {
+                profile: "dev".into(),
+                agent: "solo".into(),
+                ..Default::default()
+            },
+            "the repo dev's only agent"
+        );
+        assert!(
+            next.selection().subagent_models.is_empty(),
+            "a switched pair starts without the old overrides"
+        );
+        assert!(warnings.is_empty(), "…and silently: {warnings:?}");
+    }
+
+    /// cd-rebind: a `--profile` pin needs no special case — a pin means the
+    /// repo file is ignored (RepoMode::Ignore), so the target catalog has
+    /// NO repo profiles and the pinned global profile is kept by the
+    /// "no repo profiles" branch.
+    #[test]
+    fn cd_pinned_profile_kept() {
+        // The pinned session's catalog is global-only (no repo file read).
+        let cat = catalog(None);
+        let prev = bound(None, "research", "scholar");
+
+        let (next, warnings) = rebind_for_cd(&cat, &registry(None), &prev);
+
+        assert_eq!(
+            next.selection(),
+            Selection {
+                profile: "research".into(),
+                agent: "scholar".into(),
+                ..Default::default()
+            },
+            "the pinned choice is kept"
+        );
+        assert!(
+            warnings.is_empty(),
+            "keeping the pin is quiet: {warnings:?}"
         );
     }
 }

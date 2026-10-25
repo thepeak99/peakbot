@@ -305,6 +305,12 @@ impl Bound {
         &self.profile.agents[self.agent_index]
     }
 
+    /// Whether two bounds name the same `(profile, agent)` pair — the
+    /// subagent model overrides are NOT part of the pair (cd-rebind).
+    pub fn same_pair(&self, other: &Bound) -> bool {
+        self.profile.name == other.profile.name && self.agent().main.name == other.agent().main.name
+    }
+
     /// The wire projection, with the override map as aliases.
     pub fn selection(&self) -> Selection {
         Selection {
@@ -1911,5 +1917,108 @@ profiles:
         let back: Selection =
             serde_json::from_str(r#"{"profile":"dev","agent":"team"}"#).expect("parses");
         assert!(back.subagent_models.is_empty(), "absent key = empty map");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cd-rebind RED tests: `Bound::same_pair` — the pair test the `/cd` rebind
+// uses to decide between keeping the session's active model (same pair) and
+// starting on the new agent's configured model (changed pair). Written
+// before the implementation exists; must fail on the `todo!` stub.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod cd_rebind_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// The plan's shared Rust fixture (§9): `dev/team` (with subagents), a
+    /// subagent-free `dev/solo`, and `research/main`.
+    const YAML: &str = r#"
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key: sk-ant-test
+    models:
+      - { name: claude-opus-5,   alias: opus,   context_size: 200000 }
+      - { name: claude-sonnet-5, alias: sonnet, context_size: 200000 }
+      - { name: claude-haiku-5,  alias: haiku,  context_size: 200000 }
+general: { context: { enabled: false } }
+profiles:
+  dev:
+    agents:
+      team:
+        model: sonnet
+        subagents:
+          reviewer: { prompt: "Review." }
+          tester:   { prompt: "Test.",  model: haiku }
+          twin:     { prompt: "Twin.",  model: sonnet }
+      solo: { model: opus }
+  research:
+    agents:
+      main: { model: haiku }
+"#;
+
+    fn config() -> Config {
+        Config::parse(
+            Source {
+                path: Path::new("/global/config.yaml"),
+                text: YAML,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("the shared team-models fixture parses")
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn bound(cfg: &Config, profile: &str, agent: &str) -> Bound {
+        cfg.catalog
+            .resolve(profile, agent)
+            .unwrap_or_else(|| panic!("fixture bound {profile}/{agent} must exist"))
+    }
+
+    /// cd-rebind: the SAME profile and agent with different subagent model
+    /// overrides is the same pair — the overrides are not part of the pair.
+    #[test]
+    fn same_pair_true_for_same_agent_with_different_overrides() {
+        let cfg = config();
+        let plain = bound(&cfg, "dev", "team");
+        let (overridden, rejected) = plain
+            .clone()
+            .with_subagent_models(&cfg.registry, &map(&[("tester", "opus")]));
+        assert!(rejected.is_empty(), "the override is valid: {rejected:?}");
+        assert!(
+            plain.selection().subagent_models.is_empty()
+                && !overridden.selection().subagent_models.is_empty(),
+            "fixture sanity: the two bounds really differ in overrides"
+        );
+        assert!(
+            plain.same_pair(&overridden),
+            "the subagent model overrides are not part of the pair"
+        );
+        assert!(
+            overridden.same_pair(&plain),
+            "…and the pair test is symmetric"
+        );
+    }
+
+    /// cd-rebind: a DIFFERENT agent (even in the same profile) is a
+    /// different pair.
+    #[test]
+    fn same_pair_false_for_different_agent() {
+        let cfg = config();
+        let team = bound(&cfg, "dev", "team");
+        let solo = bound(&cfg, "dev", "solo");
+        assert!(
+            !team.same_pair(&solo),
+            "a different agent is a different pair"
+        );
     }
 }
