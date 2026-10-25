@@ -54,10 +54,11 @@ export function BottomBar({
 }) {
   return (
     // flex-wrap (T34b): at ≤800 px the chips must not overflow the bar
-    // horizontally — they wrap to a second row instead.
+    // horizontally — they wrap to a second row instead. `pr-12` clears the
+    // fixed tab rail on the right (see TabbedDrawer).
     <footer
       data-testid="bottom-bar"
-      className="flex min-h-14 flex-wrap items-center gap-2 border-t border-zinc-800 bg-zinc-950/80 px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] backdrop-blur lg:hidden"
+      className="flex min-h-14 flex-wrap items-center gap-2 border-t border-zinc-800 bg-zinc-950/80 pl-3 pr-12 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] backdrop-blur lg:hidden"
     >
       <SelectionChip
         catalog={catalog ?? []}

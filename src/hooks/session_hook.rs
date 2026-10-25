@@ -21,6 +21,12 @@ use crate::hooks::events::SourcedEvent;
 use crate::hooks::events::TokenUsage as EventTokenUsage;
 use crate::ui::app_state::MessageSource;
 
+/// `PromptCancelled` reason for a graceful (first-press) Stop.
+pub const STOP_REASON: &str = "stop";
+
+/// Tool result recorded for a call the model requested after a graceful Stop.
+const SKIPPED_BY_STOP: &str = "Skipped: stopped by user before this tool ran.";
+
 /// Pricing information for a model (cost per token)
 #[derive(Clone, Debug)]
 pub struct ModelPricing {
@@ -1407,6 +1413,430 @@ mod tests {
             "every tool call must have its matching result in the snapshot; calls={calls:?} results={results:?}"
         );
     }
+
+    // ── Two-stage Stop (TDD: written before the implementation) ────────────
+    //
+    // The orchestrator's hook (the one holding a weak StateManager) honours a
+    // graceful-stop request at the two boundaries it controls:
+    //   * `on_completion_call` → terminate("stop") BEFORE anything else
+    //     (sniff, CompletionRequest event, compaction gate): no further LLM
+    //     call is made.
+    //   * `on_tool_call` → the call is SKIPPED, with a paired ToolCall +
+    //     ToolResult{SKIPPED, success:false} event so the transcript stays
+    //     well-formed.
+    // Sub-agent hooks hold no StateManager and are never affected: `delegate`
+    // is one orchestrator tool call and finishes on its own.
+
+    const SKIPPED_TEXT: &str = "Skipped: stopped by user before this tool ran.";
+
+    /// A running manager whose first Stop press has landed (graceful).
+    fn sm_with_pending_stop() -> Arc<crate::state::StateManager> {
+        let sm = crate::state::StateManager::new_arc();
+        sm.set_running(true);
+        assert_eq!(
+            sm.request_stop(),
+            crate::state::StopStep::Graceful,
+            "fixture: the first press must be graceful"
+        );
+        sm
+    }
+
+    #[test]
+    fn stop_reason_constant_is_stop() {
+        assert_eq!(STOP_REASON, "stop");
+    }
+
+    #[tokio::test]
+    async fn stop_pending_terminates_on_completion_call_with_stop_reason() {
+        let sm = sm_with_pending_stop();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &user_msg("next"),
+                &[],
+            )
+            .await;
+
+        assert_eq!(action, HookAction::terminate(STOP_REASON));
+    }
+
+    #[tokio::test]
+    async fn stop_terminate_emits_no_completion_request_event() {
+        // The stop check precedes the CompletionRequest event: no request is
+        // going out, so none may be announced to observers.
+        let sm = sm_with_pending_stop();
+        let (hook, mut rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+
+        let _ =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &user_msg("next"),
+                &[],
+            )
+            .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a stop-terminated completion call must not emit CompletionRequest"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_call_continues_when_no_stop_is_pending() {
+        let sm = crate::state::StateManager::new_arc();
+        sm.set_running(true);
+        let (hook, mut rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &user_msg("next"),
+                &[],
+            )
+            .await;
+
+        assert_eq!(action, HookAction::Continue);
+        assert!(
+            matches!(
+                rx.try_recv().map(|e| e.event),
+                Ok(AgentEvent::CompletionRequest { .. })
+            ),
+            "regression guard: the normal path still announces the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_call_continues_after_the_pending_flag_is_cleared() {
+        // set_running(false) at turn end clears the flag; the next turn's
+        // hook calls must not see a stale stop.
+        let sm = sm_with_pending_stop();
+        sm.set_running(false);
+        sm.set_running(true);
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &user_msg("next"),
+                &[],
+            )
+            .await;
+
+        assert_eq!(action, HookAction::Continue);
+    }
+
+    #[tokio::test]
+    async fn stop_check_precedes_compaction_gate() {
+        use crate::config::ContextConfig;
+        use crate::context_manager::ContextManager;
+
+        // 1_000-token window, 0.8 threshold → compaction fires above 800.
+        let sm = crate::state::StateManager::new_arc();
+        sm.init_context_manager(ContextManager::new(
+            ContextConfig {
+                threshold: 0.8,
+                keep_recent: 5,
+                enabled: true,
+                compaction_model: None,
+            },
+            1_000,
+            None,
+        ));
+        for i in 0..5 {
+            sm.add_user_message(format!("u{i}"));
+            sm.add_assistant_message(format!("a{i}"));
+        }
+        sm.add_request(&MessageSource::Human, 1_000, 100, 0.0);
+        assert!(sm.needs_compaction(), "fixture: compaction would fire");
+        sm.set_running(true);
+
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+
+        // Sanity: without a pending stop the compaction gate is what fires.
+        let before =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &user_msg("next"),
+                &[],
+            )
+            .await;
+        assert_eq!(before, HookAction::terminate("compact"));
+
+        // With a pending stop, "stop" wins: the user asked to end the turn,
+        // not to spend a compaction (an LLM call) first.
+        assert_eq!(sm.request_stop(), crate::state::StopStep::Graceful);
+        let after =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &user_msg("next"),
+                &[],
+            )
+            .await;
+        assert_eq!(after, HookAction::terminate(STOP_REASON));
+    }
+
+    #[tokio::test]
+    async fn stop_pending_skips_tool_call_and_emits_paired_events() {
+        let sm = sm_with_pending_stop();
+        let (hook, mut rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+        let args = r#"{"command":"rm -rf /tmp/never"}"#;
+
+        let action = rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_call(
+            &hook,
+            "bash",
+            None,
+            "internal-9",
+            args,
+        )
+        .await;
+
+        assert_eq!(action, ToolCallHookAction::skip(SKIPPED_TEXT));
+
+        let call = rx.try_recv().expect("a ToolCall event is emitted first");
+        let result = rx.try_recv().expect("then a ToolResult event");
+        assert!(rx.try_recv().is_err(), "exactly two events");
+
+        let call_id = match call.event {
+            AgentEvent::ToolCall {
+                tool_name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                assert_eq!(tool_name, "bash");
+                assert_eq!(arguments, args);
+                call_id
+            }
+            other => panic!("expected AgentEvent::ToolCall first, got {other:?}"),
+        };
+        match result.event {
+            AgentEvent::ToolResult {
+                tool_name,
+                arguments,
+                result,
+                success,
+                call_id: result_call_id,
+                ..
+            } => {
+                assert_eq!(tool_name, "bash");
+                assert_eq!(arguments, args);
+                assert_eq!(result, SKIPPED_TEXT);
+                assert!(!success, "a skipped call is not a success");
+                assert!(result_call_id.is_some());
+                assert_eq!(
+                    result_call_id, call_id,
+                    "ToolCall and ToolResult must share one call_id (sanitize_tool_pairs pairs on it)"
+                );
+            }
+            other => panic!("expected AgentEvent::ToolResult second, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_tool_pair_uses_the_providers_call_id_when_given() {
+        let sm = sm_with_pending_stop();
+        let (hook, mut rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+
+        let _ = rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_call(
+            &hook,
+            "file_read",
+            Some("toolu_abc".to_string()),
+            "internal-1",
+            "{}",
+        )
+        .await;
+
+        let ids: Vec<Option<String>> = [rx.try_recv().unwrap(), rx.try_recv().unwrap()]
+            .into_iter()
+            .map(|e| match e.event {
+                AgentEvent::ToolCall { call_id, .. } | AgentEvent::ToolResult { call_id, .. } => {
+                    call_id
+                }
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("toolu_abc".into()), Some("toolu_abc".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_continues_and_emits_only_the_call_when_no_stop_is_pending() {
+        let sm = crate::state::StateManager::new_arc();
+        sm.set_running(true);
+        let (hook, mut rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+
+        let action = rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_call(
+            &hook,
+            "bash",
+            None,
+            "internal-1",
+            "{}",
+        )
+        .await;
+
+        assert_eq!(action, ToolCallHookAction::Continue);
+        assert!(matches!(
+            rx.try_recv().map(|e| e.event),
+            Ok(AgentEvent::ToolCall { .. })
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "no synthetic ToolResult when the tool really runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_tool_result_still_records_the_real_result_while_stop_is_pending() {
+        // The in-flight tool finishes and records its REAL result: the
+        // result hook must not rewrite it to SKIPPED.
+        let sm = sm_with_pending_stop();
+        let (hook, mut rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_result(
+                &hook,
+                "bash",
+                None,
+                "internal-1",
+                "{}",
+                "REAL_OUTPUT",
+            )
+            .await;
+
+        assert_eq!(action, HookAction::Continue);
+        match rx.try_recv().expect("result event").event {
+            AgentEvent::ToolResult {
+                result, success, ..
+            } => {
+                assert_eq!(result, "REAL_OUTPUT");
+                assert!(success);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// A text-only answer arriving after the press completes normally: the
+    /// response hook has no business in the stop.
+    #[tokio::test]
+    async fn stop_pending_does_not_affect_on_completion_response() {
+        use rig_core::completion::CompletionResponse;
+
+        let sm = sm_with_pending_stop();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+
+        let response = CompletionResponse {
+            choice: OneOrMany::one(AssistantContent::Text(
+                rig_core::completion::message::Text::new("final answer"),
+            )),
+            usage: rig_core::completion::Usage::default(),
+            raw_response: crate::mock::completion_model::MockModelResponse {
+                content: "final answer".into(),
+                is_tool_call: false,
+            },
+            message_id: None,
+        };
+
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_response(
+                &hook,
+                &user_msg("next"),
+                &response,
+            )
+            .await;
+
+        assert_eq!(action, HookAction::Continue);
+        assert!(
+            sm.stop_pending(),
+            "the flag stays set until the next LLM boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_hook_ignores_stop_pending() {
+        // Sub-agent hooks are built without a StateManager: a pending
+        // orchestrator stop must never reach them (delegate = one tool call).
+        let sm = sm_with_pending_stop();
+        let (hook, mut rx) = SessionHook::with_channel();
+        let hook = hook
+            .with_source(MessageSource::SubAgent {
+                role: "reviewer".into(),
+            })
+            .with_sub_agent_gate(None);
+
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &user_msg("next"),
+                &[],
+            )
+            .await;
+        assert_eq!(action, HookAction::Continue);
+
+        let tool = rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_call(
+            &hook,
+            "bash",
+            None,
+            "internal-1",
+            "{}",
+        )
+        .await;
+        assert_eq!(tool, ToolCallHookAction::Continue);
+
+        // Events: CompletionRequest + ToolCall only — no synthetic result.
+        assert!(matches!(
+            rx.try_recv().map(|e| e.event),
+            Ok(AgentEvent::CompletionRequest { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv().map(|e| e.event),
+            Ok(AgentEvent::ToolCall { .. })
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(
+            sm.stop_pending(),
+            "sanity: the orchestrator stop stayed pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_whose_state_manager_was_dropped_ignores_stop() {
+        let sm = sm_with_pending_stop();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+        drop(sm);
+
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
+                &hook,
+                &user_msg("next"),
+                &[],
+            )
+            .await;
+        assert_eq!(action, HookAction::Continue);
+        let tool = rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_tool_call(
+            &hook,
+            "bash",
+            None,
+            "internal-1",
+            "{}",
+        )
+        .await;
+        assert_eq!(tool, ToolCallHookAction::Continue);
+    }
 }
 
 /// Sub-agent-only hook state. `SessionHook: Clone` shallow-copies Arc handles,
@@ -1610,6 +2040,24 @@ impl SessionHook {
         self.wire = Some(crate::sniff::WireLabel { provider, model });
         self
     }
+
+    /// A graceful Stop is pending. Only the orchestrator hook holds a
+    /// `StateManager`, so sub-agent hooks never see it (`delegate` finishes).
+    fn stop_requested(&self) -> bool {
+        self.state_manager
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|sm| sm.stop_pending())
+    }
+
+    fn emit(&self, event: AgentEvent) {
+        if let Some(ref sender) = self.event_sender {
+            let _ = sender.send(SourcedEvent {
+                source: self.source.clone(),
+                event,
+            });
+        }
+    }
 }
 
 /// Provider-agnostic input token count. Under caching, `input_tokens` is
@@ -1754,6 +2202,11 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         if let Some(g) = &self.pause_gate {
             g.checkpoint().await;
         }
+        // Graceful Stop: no further LLM call. Checked before the sniff and the
+        // CompletionRequest event, since no request is going out.
+        if self.stop_requested() {
+            return HookAction::terminate(STOP_REASON);
+        }
         // Sniff first: the `req` line must be on disk before the call leaves,
         // so a hung or killed request still leaves its input behind.
         if crate::sniff::enabled() {
@@ -1867,9 +2320,8 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         // this hook inline and `prompt_with_history` only returns afterwards, so
         // the main loop's `add_assistant_message` is guaranteed to see the
         // blocks. The spawned task had no such happens-before edge and lost
-        // text-turn thinking. The gate is the lane predicate — sub-agent hooks DO
-        // carry a StateManager (`build_sub_agent`), so "no manager" would prove
-        // nothing.
+        // text-turn thinking. The gate is the lane predicate — sub-agent hooks
+        // carry no StateManager, so the lane check is what excludes them.
         //
         // Note there is deliberately no `!thinking.is_empty()` condition: a
         // response that emitted no thinking still ends the previous response's
@@ -1953,7 +2405,12 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         if let Some(g) = &self.pause_gate {
             g.checkpoint().await;
         }
-        if let Some(ref sender) = self.event_sender {
+        // rig 0.38.2 never hands hooks the provider's real tool_call.id
+        // (mod.rs builds the wire result from it two lines later) — this
+        // is PeakBot's own correlation handle, paired by equality with
+        // the ToolResult row in `sanitize_tool_pairs`.
+        let call_id = tool_call_id.or(Some(internal_call_id.to_string()));
+        if self.event_sender.is_some() {
             // Stamp the call with the response that requested it. The
             // transcript row is appended later by the event-processing task,
             // which cannot recover this after the fact — off the orchestrator
@@ -1966,21 +2423,26 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             } else {
                 None
             };
-            let event = AgentEvent::ToolCall {
+            self.emit(AgentEvent::ToolCall {
                 tool_name: tool_name.to_string(),
                 arguments: args.to_string(),
-                // rig 0.38.2 never hands hooks the provider's real tool_call.id
-                // (mod.rs builds the wire result from it two lines later) — this
-                // is PeakBot's own correlation handle, paired by equality with
-                // the ToolResult row in `sanitize_tool_pairs`.
-                call_id: tool_call_id.or(Some(internal_call_id.to_string())),
+                call_id: call_id.clone(),
                 response_id,
                 timestamp: Utc::now(),
-            };
-            let _ = sender.send(SourcedEvent {
-                source: self.source.clone(),
-                event,
             });
+        }
+        if self.stop_requested() {
+            // rig skips `on_tool_result` for a skipped call, so the pair's
+            // result row is emitted here.
+            self.emit(AgentEvent::ToolResult {
+                tool_name: tool_name.to_string(),
+                arguments: args.to_string(),
+                result: SKIPPED_BY_STOP.to_string(),
+                success: false,
+                call_id,
+                timestamp: Utc::now(),
+            });
+            return ToolCallHookAction::skip(SKIPPED_BY_STOP);
         }
         ToolCallHookAction::Continue
     }

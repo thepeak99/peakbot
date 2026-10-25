@@ -111,13 +111,10 @@ enum QueueMessage {
         attachments: Vec<crate::attachments::Attachment>,
     },
     Command(String),
-    /// Signals that stop was requested. Carries the already-rendered system
-    /// message so the kill site (which knows *what* died) and the print site
-    /// (which knows *when* to say it) can never disagree (#183). The string
-    /// is `stop_message(tally)` computed by the event-loop's drain chokepoint.
-    StopMarker {
-        message: String,
-    },
+    /// Stop was requested. The message to post lives in the controller's
+    /// `pending_stop` cell, so an escalating second press can rewrite it
+    /// before the agent loop reaches this marker (#183: one message per stop).
+    StopMarker,
     /// Switch the active model and restart on a fresh conversation.
     /// Carries the validated alias (validation happens in the View
     /// before the action is sent). The agent loop dequeues this between
@@ -250,6 +247,14 @@ fn stop_message(t: crate::state::StopTally) -> String {
         "Agent stopped by user".to_string()
     }
 }
+
+/// System message for a graceful (first-press) Stop that was not escalated.
+const GRACEFUL_STOP_MESSAGE: &str = "Agent stopped by user (after the current tool call)";
+
+/// The stop handshake between the two loops. `Some(msg)` = a stop is in
+/// flight: the agent loop discards queued input until the `StopMarker`, then
+/// posts `msg`. Lock order: this cell, then the `StateManager` state.
+type PendingStop = Arc<std::sync::Mutex<Option<String>>>;
 
 /// A selection request as it reaches the agent loop (the sole owner of the
 /// bound and the agent handle). Both shapes end in `handle_select`, so the
@@ -1099,11 +1104,10 @@ impl AgentRunner {
             })
         };
 
-        // Drain flag — set by event loop on /stop, consumed by agent loop to
-        // discard any queued UserMessage/Command between the dropped turn and
-        // the matching StopMarker. See `make-flow-great-again.md`: /stop ==
-        // stop, queued follow-ups are discarded along with the in-flight turn.
-        let drain_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Set by the event loop on Stop, consumed by the agent loop at the
+        // matching StopMarker. See `make-flow-great-again.md`: /stop == stop,
+        // queued follow-ups are discarded along with the in-flight turn.
+        let pending_stop: PendingStop = Arc::default();
 
         // Completion notifications back to event loop
         let (completion_tx, _completion_rx) =
@@ -1137,7 +1141,7 @@ impl AgentRunner {
         let event_handle = tokio::spawn({
             let msg_tx = msg_tx.clone();
             let completion_tx = completion_tx.clone();
-            let drain_requested = drain_requested.clone();
+            let pending_stop = pending_stop.clone();
             let session_hook_cell = session_hook_cell.clone();
 
             async move {
@@ -1148,7 +1152,7 @@ impl AgentRunner {
                     state_manager,
                     session_hook_cell,
                     config_model,
-                    drain_requested,
+                    pending_stop,
                 )
                 .await;
             }
@@ -1157,7 +1161,7 @@ impl AgentRunner {
         let agent_handle = tokio::spawn({
             let msg_rx = tokio::sync::Mutex::new(msg_rx);
             let completion_tx = completion_tx.clone();
-            let drain_requested = drain_requested.clone();
+            let pending_stop = pending_stop.clone();
             let session_hook_cell = session_hook_cell.clone();
 
             async move {
@@ -1167,7 +1171,7 @@ impl AgentRunner {
                     state_manager_for_agent,
                     agent,
                     config_for_agent,
-                    drain_requested,
+                    pending_stop,
                     event_receiver,
                     session_hook_cell,
                     rebuild_ctx,
@@ -1209,7 +1213,7 @@ impl AgentRunner {
     ///
     /// Typing during a busy turn is therefore a queued **follow-up**, not an
     /// interrupt. The explicit interrupt is `/stop` (or `Esc` →
-    /// `UiAction::RequestStop`), which sets the drain flag, sends a
+    /// `UiAction::RequestStop`), which arms `pending_stop`, sends a
     /// `StopMarker`, and the agent loop discards every queued message until
     /// the marker is seen. /stop means stop.
     #[allow(clippy::too_many_arguments)] // event_loop coordinates many handles; refactoring loses clarity
@@ -1220,42 +1224,45 @@ impl AgentRunner {
         state_manager: Option<Arc<StateManager>>,
         _session_hook_cell: SharedSessionHook,
         config_model: String,
-        drain_requested: Arc<std::sync::atomic::AtomicBool>,
+        pending_stop: PendingStop,
     ) {
-        use std::sync::atomic::Ordering;
+        use crate::state::StopStep;
 
-        // Helper: trigger a full /stop. Sets the drain flag, cancels the
-        // running agent through the per-turn `CancellationToken` minted by
-        // `StateManager::set_running(true)` (read by `process_message_internal`'s
-        // `select!`), then sends `StopMarker` carrying the rendered tally.
-        // The drain arm in `agent_loop` just delivers the message — there is
-        // no second stop path. Background (`bash_bg`) processes are
-        // deliberately spared — they survive Stop.
-        let request_stop_and_drain =
-            |state_manager: &Option<Arc<StateManager>>,
-             msg_tx: &tokio::sync::mpsc::Sender<QueueMessage>,
-             drain_requested: &Arc<std::sync::atomic::AtomicBool>| {
-                let sm = state_manager.clone();
-                let msg_tx = msg_tx.clone();
-                let drain_requested = drain_requested.clone();
-                async move {
-                    // Idle guard (unchanged from pre-#183) — Stop while idle
-                    // is a no-op.
-                    let Some(sm_ref) = sm.as_ref().filter(|sm| sm.is_running()) else {
-                        return;
-                    };
-                    drain_requested.store(true, Ordering::Release);
-                    sm_ref.set_pending_input_count(0);
-                    sm_ref.set_status(Some("Stop requested...".to_string()));
-                    let tally = sm_ref.stop_turn_processes();
-                    msg_tx
-                        .send(QueueMessage::StopMarker {
-                            message: stop_message(tally),
-                        })
-                        .await
-                        .ok();
+        // Helper: one Stop press. The first press is graceful (the hook ends
+        // the turn at its next boundary); the second aborts through the
+        // per-turn `CancellationToken` (`StateManager::request_stop`). Either
+        // way the queue is drained and exactly one marker is sent per stop —
+        // escalation only rewrites the message in the cell. Background
+        // (`bash_bg`) processes are deliberately spared — they survive Stop.
+        let request_stop = |state_manager: &Option<Arc<StateManager>>,
+                            msg_tx: &tokio::sync::mpsc::Sender<QueueMessage>,
+                            pending_stop: &PendingStop| {
+            let sm = state_manager.clone();
+            let msg_tx = msg_tx.clone();
+            let pending_stop = pending_stop.clone();
+            async move {
+                let Some(sm) = sm else { return };
+                // Holding the cell across `request_stop` means the agent loop
+                // can never dequeue between the abort and the drain arming.
+                let first = {
+                    let mut cell = pending_stop.lock().unwrap();
+                    let first = cell.is_none();
+                    match sm.request_stop() {
+                        StopStep::Noop => return,
+                        StopStep::Graceful => *cell = Some(GRACEFUL_STOP_MESSAGE.to_string()),
+                        StopStep::Immediate(tally) => {
+                            *cell = Some(stop_message(tally));
+                            sm.set_status(Some("Stop requested...".to_string()));
+                        }
+                    }
+                    sm.set_pending_input_count(0);
+                    first
+                };
+                if first {
+                    msg_tx.send(QueueMessage::StopMarker).await.ok();
                 }
-            };
+            }
+        };
         // Ensure a boot conversation exists. Idempotent: `create_session`
         // already minted (fresh) or loaded (resume) one synchronously before
         // spawning this loop, so this only fires for callers that bypass the
@@ -1297,7 +1304,7 @@ impl AgentRunner {
                     }
                     match kind {
                         SubmitKind::StopCommand => {
-                            request_stop_and_drain(&state_manager, &msg_tx, &drain_requested).await;
+                            request_stop(&state_manager, &msg_tx, &pending_stop).await;
                         }
                         // `/pause` / `/resume` — immediate, like `/stop`: they
                         // must work mid-turn (that's the whole point of
@@ -1410,7 +1417,7 @@ impl AgentRunner {
 
                 UiAction::RequestStop => {
                     // Esc key — same shape as /stop. Stop means stop, queue is dropped.
-                    request_stop_and_drain(&state_manager, &msg_tx, &drain_requested).await;
+                    request_stop(&state_manager, &msg_tx, &pending_stop).await;
                 }
 
                 UiAction::SwitchModel(alias) => {
@@ -1541,10 +1548,9 @@ impl AgentRunner {
     /// user-typed text to wedge between an in-flight `ToolCall` and its
     /// `ToolResult`.
     ///
-    /// **Drain on /stop.** When `drain_requested` is set, all queued
-    /// `UserMessage`/`Command` items are discarded until the matching
-    /// `StopMarker` is consumed; the flag is then cleared. /stop = stop,
-    /// queued follow-ups are dropped along with the in-flight turn.
+    /// **Drain on /stop.** While `pending_stop` holds a message, all queued
+    /// items are discarded until the matching `StopMarker` takes and posts
+    /// it. /stop = stop, queued follow-ups are dropped along with the turn.
     ///
     /// A panic while handling a message aborts that turn like Stop and the
     /// loop keeps serving.
@@ -1555,13 +1561,11 @@ impl AgentRunner {
         state_manager: Option<Arc<StateManager>>,
         initial_agent: Arc<DynAgent>,
         mut config: Arc<Config>,
-        drain_requested: Arc<std::sync::atomic::AtomicBool>,
+        pending_stop: PendingStop,
         initial_event_receiver: Option<mpsc::UnboundedReceiver<SourcedEvent>>,
         session_hook_cell: SharedSessionHook,
         mut rebuild_ctx: Option<RebuildContext>,
     ) {
-        use std::sync::atomic::Ordering;
-
         // The agent reference is `mut` here — `/model` rebuilds it
         // in-place between turns. `session_hook_cell` is mirrored into the
         // live event_loop.
@@ -1602,44 +1606,13 @@ impl AgentRunner {
                 break;
             };
 
-            // Drain mode: discard everything that isn't the StopMarker. The
-            // event loop has already zeroed the pending counter and signalled
-            // the running prompt to cancel; our job is just to throw out the
-            // queue contents until the marker arrives.
-            if drain_requested.load(Ordering::Acquire) {
-                match msg {
-                    QueueMessage::StopMarker { message } => {
-                        drain_requested.store(false, Ordering::Release);
-                        if let Some(ref sm) = state_manager {
-                            sm.set_status(None);
-                            sm.add_system_message(message);
-                        }
-                        completion_tx.send(CompletionResult::Stopped).ok();
-                        continue;
-                    }
-                    QueueMessage::UserMessage { .. }
-                    | QueueMessage::Command(_)
-                    | QueueMessage::SwitchModel(_)
-                    | QueueMessage::ChangeCwd(_)
-                    | QueueMessage::Select(_)
-                    | QueueMessage::BackgroundOutputReady => {
-                        // Discarded — pending counter was already zeroed by
-                        // the event loop's drain trigger. (SwitchModel is
-                        // included for safety; in practice the View only
-                        // emits it between turns when nothing is running.)
-                        //
-                        // `BackgroundOutputReady` is discarded too: /stop ==
-                        // stop, *including* auto-injection. Buffers
-                        // themselves keep filling inside the registry (the
-                        // reader threads don't know about /stop); when a
-                        // new ping arrives after drain mode clears, the
-                        // accumulated lines flush in a single synthetic
-                        // turn. Per Q3: /stop suppresses synthetic turns,
-                        // unlimited-tier processes are functionally paused
-                        // (still running, just not flushed).
-                        continue;
-                    }
-                }
+            // Drain mode: while a stop is in flight, discard everything up to
+            // its StopMarker. The event loop has already zeroed the pending
+            // counter. `BackgroundOutputReady` is discarded too: /stop == stop,
+            // *including* auto-injection — buffers keep filling in the
+            // registry and flush in one synthetic turn on the next ping.
+            if !matches!(msg, QueueMessage::StopMarker) && pending_stop.lock().unwrap().is_some() {
+                continue;
             }
 
             let dispatch = async {
@@ -1792,15 +1765,14 @@ impl AgentRunner {
                         completion_tx.send(CompletionResult::CommandDone).ok();
                     }
 
-                    QueueMessage::StopMarker { message } => {
-                        // StopMarker outside drain mode — defensive: shouldn't
-                        // happen because the event loop always sets drain_requested
-                        // before sending. Treat as a benign acknowledgement.
-                        if let Some(ref sm) = state_manager {
-                            sm.set_status(None);
-                            sm.add_system_message(message);
+                    QueueMessage::StopMarker => {
+                        if let Some(message) = pending_stop.lock().unwrap().take() {
+                            if let Some(ref sm) = state_manager {
+                                sm.set_status(None);
+                                sm.add_system_message(message);
+                            }
+                            completion_tx.send(CompletionResult::Stopped).ok();
                         }
-                        completion_tx.send(CompletionResult::Stopped).ok();
                     }
 
                     QueueMessage::SwitchModel(alias) => {
@@ -2830,6 +2802,14 @@ impl AgentRunner {
                     // OR our explicit clear above did), so it does NOT
                     // re-terminate.
                     continue;
+                }
+
+                // Graceful Stop: every tool call already has its real or
+                // skipped result, so there is no in-flight call to close.
+                Err(PromptError::PromptCancelled { reason, .. })
+                    if reason == crate::hooks::session_hook::STOP_REASON =>
+                {
+                    return CompletionResult::Stopped;
                 }
 
                 Err(PromptError::PromptCancelled { .. }) => {
@@ -7833,6 +7813,536 @@ headers:
             .expect("run_loop must finish within 10s of the action channel closing")
             .expect("the run_loop task must not panic");
     }
+    #[cfg(feature = "mock")]
+    mod two_stage_stop {
+        use super::*;
+        use crate::ui::app_state::MessageRole;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        const GRACEFUL_MSG: &str = "Agent stopped by user (after the current tool call)";
+        const IMMEDIATE_MSG: &str = "Agent stopped by user";
+        const REAL: &str = "REAL_RESULT";
+
+        /// A tool that blocks until the test releases it, then returns
+        /// [`REAL`]. Makes "the tool is in flight" deterministic: `started`
+        /// fires on entry, `release` lets it finish.
+        struct GateTool {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+            ran: Arc<AtomicUsize>,
+        }
+
+        impl rig_core::tool::Tool for GateTool {
+            const NAME: &'static str = "gate_tool";
+            type Error = std::convert::Infallible;
+            type Args = serde_json::Value;
+            type Output = String;
+
+            async fn definition(&self, _p: String) -> rig_core::completion::ToolDefinition {
+                rig_core::completion::ToolDefinition {
+                    name: Self::NAME.to_string(),
+                    description: "blocks until the test releases it".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            async fn call(&self, _args: serde_json::Value) -> Result<String, Self::Error> {
+                self.ran.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(REAL.to_string())
+            }
+        }
+
+        struct Rig {
+            sm: Arc<StateManager>,
+            storage: Arc<dyn crate::storage::ConversationStorage>,
+            model: crate::mock::MockCompletionModel,
+            tx: mpsc::UnboundedSender<UiAction>,
+            h: tokio::task::JoinHandle<()>,
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+            ran: Arc<AtomicUsize>,
+        }
+
+        impl Rig {
+            fn send(&self, text: &str) {
+                self.tx
+                    .send(UiAction::SendMessage {
+                        text: text.to_string(),
+                        attachments: Vec::new(),
+                    })
+                    .expect("the action channel is open");
+            }
+
+            fn press(&self) {
+                self.tx
+                    .send(UiAction::RequestStop)
+                    .expect("the action channel is open");
+            }
+
+            async fn wait_tool_started(&self) {
+                tokio::time::timeout(std::time::Duration::from_secs(10), self.started.notified())
+                    .await
+                    .expect("the gate tool must start within 10s");
+            }
+
+            /// Wait (≤10s) for `cond` over the chat transcript.
+            async fn wait_for(
+                &self,
+                what: &str,
+                cond: impl Fn(&[crate::ui::app_state::ChatMessage]) -> bool,
+            ) {
+                let sm = self.sm.clone();
+                let ok = tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+                    loop {
+                        if cond(&sm.get_state().chat.messages) {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+                assert!(
+                    ok.is_ok(),
+                    "timed out waiting for: {what}; transcript={:?}",
+                    self.sm.get_state().chat.messages
+                );
+            }
+
+            async fn wait_stop_pending(&self) {
+                let sm = self.sm.clone();
+                let ok = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+                    while !sm.get_state().stop_pending {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                assert!(
+                    ok.is_ok(),
+                    "the first press must arm AppState.stop_pending (graceful stage)"
+                );
+            }
+
+            async fn wait_stop_message(&self) {
+                self.wait_for("a 'Agent stopped by user…' system message", |m| {
+                    m.iter().any(is_stop_msg)
+                })
+                .await;
+                // Settle: a buggy second message would land shortly after.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+
+            fn stop_messages(&self) -> Vec<String> {
+                self.sm
+                    .get_state()
+                    .chat
+                    .messages
+                    .iter()
+                    .filter(|m| is_stop_msg(m))
+                    .map(|m| m.content.clone())
+                    .collect()
+            }
+
+            async fn shutdown(self) {
+                self.h.abort();
+                let _ = self.h.await;
+            }
+        }
+
+        fn is_stop_msg(m: &crate::ui::app_state::ChatMessage) -> bool {
+            m.role == MessageRole::System && m.content.starts_with("Agent stopped by user")
+        }
+
+        /// Build a mock-backed runner around [`GateTool`].
+        fn spawn_rig(responses: Vec<crate::mock::MockResponse>) -> Rig {
+            let storage: Arc<dyn crate::storage::ConversationStorage> =
+                Arc::new(crate::storage::InMemoryStorage::new());
+            let sm = StateManager::new_arc_with_storage(storage.clone());
+
+            let model = crate::mock::MockCompletionModel::new();
+            for r in responses {
+                model.add_response(r);
+            }
+            let (ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+            let inner = SessionHook::with_context_tracking(Some(ev_tx), sm.stats_arc())
+                .with_state_manager(&sm)
+                .with_wire_label("mock".to_string(), "mock-model".to_string());
+
+            let (tx, rx) = mpsc::unbounded_channel::<UiAction>();
+
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let ran = Arc::new(AtomicUsize::new(0));
+            let gate = GateTool {
+                started: started.clone(),
+                release: release.clone(),
+                ran: ran.clone(),
+            };
+            let agent = rig_core::agent::AgentBuilder::new(model.clone())
+                .preamble("test prompt")
+                .max_tokens(1024)
+                .default_max_turns(4)
+                .hook(inner.clone())
+                .tools(vec![Box::new(gate) as Box<dyn ToolDyn>])
+                .build();
+
+            let info = ProviderInfo {
+                name: "mock".to_string(),
+                model: "mock-model".to_string(),
+                supports_vision: false,
+                preserve_reasoning: true,
+                display_reasoning: false,
+            };
+            // Compaction off: AgentRunner::new must not need a compaction provider.
+            let config = Arc::new(test_config());
+            let resolved = mock_resolved_model();
+            let mut runner = AgentRunner::new(
+                DynAgent::Mock(agent),
+                config,
+                info,
+                SkillRegistry::default(),
+                Some(events),
+                Some(sm.clone()),
+                Arc::new(inner),
+                &resolved,
+            )
+            .expect("runner builds");
+            let h = tokio::spawn(async move { runner.run_loop(rx).await });
+
+            Rig {
+                sm,
+                storage,
+                model,
+                tx,
+                h,
+                started,
+                release,
+                ran,
+            }
+        }
+
+        fn gate_call() -> crate::mock::MockResponse {
+            crate::mock::MockResponse::tool_call("gate_tool", serde_json::json!({}))
+        }
+
+        fn rows(
+            sm: &Arc<StateManager>,
+            role: MessageRole,
+        ) -> Vec<crate::ui::app_state::ChatMessage> {
+            sm.get_state()
+                .chat
+                .messages
+                .into_iter()
+                .filter(|m| m.role == role)
+                .collect()
+        }
+
+        fn mentions_interrupted(sm: &Arc<StateManager>) -> bool {
+            sm.get_state().chat.messages.iter().any(|m| {
+                m.content.contains("INTERRUPTED")
+                    || m.tool_result
+                        .as_deref()
+                        .is_some_and(|t| t.contains("INTERRUPTED"))
+            })
+        }
+
+        // ── graceful ────────────────────────────────────────────────────────
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn graceful_stop_records_real_tool_result_and_no_interrupted() {
+            let rig = spawn_rig(vec![
+                gate_call(),
+                crate::mock::MockResponse::text("SHOULD NOT BE SENT"),
+            ]);
+            rig.send("go");
+            rig.wait_tool_started().await;
+
+            rig.press();
+            rig.wait_stop_pending().await;
+            assert!(rig.sm.is_running(), "graceful leaves the turn running");
+            assert!(
+                rows(&rig.sm, MessageRole::ToolResult).is_empty(),
+                "the tool is still in flight — nothing may be recorded for it yet"
+            );
+
+            rig.release.notify_one(); // the in-flight tool now finishes
+            rig.wait_stop_message().await;
+
+            let results = rows(&rig.sm, MessageRole::ToolResult);
+            assert_eq!(
+                rig.ran.load(Ordering::SeqCst),
+                1,
+                "the tool ran exactly once"
+            );
+            assert_eq!(results.len(), 1, "exactly one tool result");
+            assert_eq!(results[0].tool_name.as_deref(), Some("gate_tool"));
+            assert_eq!(
+                results[0].tool_result.as_deref(),
+                Some(REAL),
+                "the in-flight call records its REAL result, not INTERRUPTED"
+            );
+            assert!(!mentions_interrupted(&rig.sm));
+            assert_eq!(
+                rig.model.request_count(),
+                1,
+                "the turn must end BEFORE the next LLM call"
+            );
+            assert_eq!(
+                rig.model.remaining(),
+                1,
+                "the 2nd canned reply was never fetched"
+            );
+            assert!(
+                rows(&rig.sm, MessageRole::Agent)
+                    .iter()
+                    .all(|m| !m.content.contains("SHOULD NOT BE SENT")),
+                "no assistant answer after the graceful stop"
+            );
+            assert_eq!(rig.stop_messages(), vec![GRACEFUL_MSG.to_string()]);
+            assert!(!rig.sm.is_running(), "the turn ended");
+            assert!(
+                !rig.sm.get_state().stop_pending,
+                "the flag is reset at turn end"
+            );
+
+            // The real result is persisted (survives reload).
+            let id = rig
+                .sm
+                .get_current_conversation_id()
+                .expect("boot conversation");
+            let conv = rig.storage.load(id).expect("conversation persists");
+            assert!(
+                conv.messages.iter().any(|m| matches!(
+                    m,
+                    crate::conversation::Message::ToolResult { result, .. } if result == REAL
+                )),
+                "the REAL result must be on disk"
+            );
+            rig.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn graceful_stop_then_next_turn_runs_normally() {
+            let rig = spawn_rig(vec![
+                gate_call(),
+                crate::mock::MockResponse::text("second answer"),
+            ]);
+            rig.send("go");
+            rig.wait_tool_started().await;
+            rig.press();
+            rig.wait_stop_pending().await;
+            rig.release.notify_one();
+            rig.wait_stop_message().await;
+            assert_eq!(rig.model.request_count(), 1);
+
+            // A stale drain flag would swallow this message; a stale
+            // stop_pending would stop it before its first LLM call.
+            rig.send("next");
+            rig.wait_for("the second turn's answer", |m| {
+                m.iter()
+                    .any(|x| x.role == MessageRole::Agent && x.content == "second answer")
+            })
+            .await;
+            assert_eq!(rig.model.request_count(), 2);
+            assert_eq!(
+                rig.stop_messages(),
+                vec![GRACEFUL_MSG.to_string()],
+                "no second stop notice for the second turn"
+            );
+            assert!(!rig.sm.get_state().stop_pending);
+            rig.shutdown().await;
+        }
+
+        // ── escalation ──────────────────────────────────────────────────────
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn double_press_is_immediate_and_persists_interrupted() {
+            let rig = spawn_rig(vec![
+                gate_call(),
+                crate::mock::MockResponse::text("SHOULD NOT BE SENT"),
+            ]);
+            rig.send("go");
+            rig.wait_tool_started().await;
+
+            rig.press();
+            rig.wait_stop_pending().await;
+            rig.press(); // escalate; the gate is deliberately never released
+            rig.wait_stop_message().await;
+
+            let results = rows(&rig.sm, MessageRole::ToolResult);
+            assert_eq!(results.len(), 1);
+            let text = results[0].tool_result.as_deref().unwrap_or_default();
+            assert!(
+                text.starts_with("INTERRUPTED: the turn was stopped before `gate_tool` returned."),
+                "the 2nd press is today's abort — got: {text}"
+            );
+            assert_ne!(text, REAL);
+            assert_eq!(rig.model.request_count(), 1);
+            assert_eq!(
+                rig.stop_messages(),
+                vec![IMMEDIATE_MSG.to_string()],
+                "an escalated stop posts the IMMEDIATE message once, not the graceful one"
+            );
+            assert!(!rig.sm.is_running());
+            assert!(!rig.sm.get_state().stop_pending);
+
+            let id = rig
+                .sm
+                .get_current_conversation_id()
+                .expect("boot conversation");
+            let conv = rig.storage.load(id).expect("conversation persists");
+            assert!(
+                conv.messages.iter().any(|m| matches!(
+                    m,
+                    crate::conversation::Message::ToolResult { result, .. }
+                        if result.starts_with("INTERRUPTED")
+                )),
+                "the INTERRUPTED result must be on disk"
+            );
+            rig.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn drain_posts_single_message_after_escalation() {
+            let rig = spawn_rig(vec![
+                gate_call(),
+                crate::mock::MockResponse::text("SHOULD NOT BE SENT"),
+            ]);
+            rig.send("go");
+            rig.wait_tool_started().await;
+            rig.send("queued follow-up"); // queued behind the running turn
+
+            rig.press();
+            rig.wait_stop_pending().await;
+            rig.press(); // escalate
+            rig.press(); // third press: no-op
+            rig.wait_stop_message().await;
+
+            assert_eq!(
+                rig.stop_messages(),
+                vec![IMMEDIATE_MSG.to_string()],
+                "press, press, press ⇒ exactly ONE system message == stop_message(tally)"
+            );
+            assert!(
+                rows(&rig.sm, MessageRole::User)
+                    .iter()
+                    .all(|m| !m.content.contains("queued follow-up")),
+                "the queued message must be discarded, never dequeued"
+            );
+            assert_eq!(
+                rig.model.request_count(),
+                1,
+                "the queued message never reached the model"
+            );
+            assert_eq!(rig.sm.get_state().pending_input_count, 0);
+            rig.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn drain_posts_graceful_message_and_discards_queue() {
+            let rig = spawn_rig(vec![
+                gate_call(),
+                crate::mock::MockResponse::text("SHOULD NOT BE SENT"),
+            ]);
+            rig.send("go");
+            rig.wait_tool_started().await;
+            rig.send("queued follow-up");
+
+            rig.press();
+            rig.wait_stop_pending().await;
+            rig.release.notify_one();
+            rig.wait_stop_message().await;
+
+            assert_eq!(rig.stop_messages(), vec![GRACEFUL_MSG.to_string()]);
+            assert!(
+                rows(&rig.sm, MessageRole::User)
+                    .iter()
+                    .all(|m| !m.content.contains("queued follow-up")),
+                "queued messages are discarded on a graceful stop too"
+            );
+            assert_eq!(rig.model.request_count(), 1);
+            assert_eq!(rig.sm.get_state().pending_input_count, 0);
+            assert!(!rig.sm.is_running());
+            rig.shutdown().await;
+        }
+
+        // ── no-ops ──────────────────────────────────────────────────────────
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn idle_press_is_a_noop_and_leaves_no_residue() {
+            let rig = spawn_rig(vec![crate::mock::MockResponse::text("hello")]);
+            rig.press();
+            rig.press();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            assert!(
+                rig.stop_messages().is_empty(),
+                "an idle press posts nothing"
+            );
+            assert!(!rig.sm.get_state().stop_pending);
+            assert!(!rig.sm.is_running());
+
+            // …and the next message is neither swallowed by a stale drain
+            // flag nor stopped by a stale stop_pending.
+            rig.send("hi");
+            rig.wait_for("the reply", |m| {
+                m.iter()
+                    .any(|x| x.role == MessageRole::Agent && x.content == "hello")
+            })
+            .await;
+            rig.shutdown().await;
+        }
+
+        // ── process_message_internal: the new `stop` arm ────────────────────
+
+        /// A graceful stop already pending when the turn begins: the hook
+        /// terminates with reason `stop` before any LLM request, and
+        /// `process_message_internal` maps that to `Stopped` — not `Error`,
+        /// and without fabricating an INTERRUPTED result.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stop_reason_maps_to_stopped_without_closing_a_tool_call() {
+            let sm = StateManager::new_arc();
+            sm.add_user_message("go".to_string());
+            let (agent, _info, _events, _hook, model) =
+                crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                    .expect("mock agent builds");
+            model.add_response(crate::mock::MockResponse::text("SHOULD NOT BE SENT"));
+
+            sm.set_running(true);
+            assert_eq!(sm.request_stop(), crate::state::StopStep::Graceful);
+
+            let current_turn = sm.build_current_turn_message().expect("the user turn");
+            let agent = Arc::new(agent);
+            let sm_opt = Some(sm.clone());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                AgentRunner::process_message_internal(
+                    current_turn,
+                    &sm_opt,
+                    &agent,
+                    &test_config(),
+                ),
+            )
+            .await
+            .expect("the stopped turn must finish promptly");
+
+            assert!(
+                matches!(result, CompletionResult::Stopped),
+                "PromptCancelled(\"stop\") must map to Stopped (was Error before two-stage stop)"
+            );
+            assert_eq!(model.request_count(), 0, "no LLM request after the press");
+            assert!(
+                sm.get_state()
+                    .chat
+                    .messages
+                    .iter()
+                    .all(|m| m.role != MessageRole::ToolResult),
+                "the graceful arm must not synthesise INTERRUPTED results"
+            );
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -8309,4 +8819,18 @@ profiles:
             "a longer keyword is not /model"
         );
     }
+
+    // ─── Two-stage Stop (TDD: written before the implementation) ────────────
+    //
+    // Contract under test (public behaviour only — no reliance on the
+    // internals of the controller's `pending_stop` cell):
+    //   * 1st `UiAction::RequestStop` while a turn runs → graceful: the
+    //     in-flight tool finishes and records its REAL result; the turn then
+    //     ends before the next LLM call; no INTERRUPTED row.
+    //   * Tool calls requested after the press are SKIPPED (recorded, not run).
+    //   * A text-only answer arriving after the press completes normally.
+    //   * 2nd press → today's immediate abort (INTERRUPTED persisted).
+    //   * Further / idle presses are no-ops.
+    //   * Queued messages are discarded on both stops; exactly ONE system
+    //     message is posted per stop; the next turn runs normally.
 }

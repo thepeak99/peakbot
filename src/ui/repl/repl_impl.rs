@@ -767,7 +767,9 @@ impl ReplUi {
     /// `" ⠹ Working · 00:07 · <status> · ⏳ N queued · esc to stop "` —
     /// the queued segment only appears when `pending_input > 0`. The hint
     /// sits in the working title (not the status bar) because that's where
-    /// the user's eye is during a busy turn.
+    /// the user's eye is during a busy turn. While `stop_pending`, the
+    /// trailing hint is the two-stage escalation:
+    /// `" · stopping after tool · esc again to stop now "`.
     ///
     /// Multiline behaviour: the buffer is split on `\n` into logical lines.
     /// The prompt marker (`> ` or the placeholder) only appears on line 0.
@@ -784,6 +786,7 @@ impl ReplUi {
         bg_running: usize,
         multiline: bool,
         sub_agent: Option<&SubAgentRun>,
+        stop_pending: bool,
     ) -> Paragraph<'a> {
         let (prompt_text, prompt_color) = if input.is_empty() {
             ("💬 Message...", Color::DarkGray)
@@ -878,8 +881,16 @@ impl ReplUi {
                 // Sub-agent segment (pause state + Ctrl+P hint) — see
                 // `sub_agent_title_segment`.
                 let sub_agent_seg = Self::sub_agent_title_segment(sub_agent);
+                // Trailing hint: a pending graceful stop (first press) turns
+                // the plain "esc to stop" into the escalation sentence —
+                // the second press aborts immediately.
+                let stop_hint = if stop_pending {
+                    " · stopping after tool · esc again to stop now "
+                } else {
+                    " · esc to stop "
+                };
                 format!(
-                    " {} Working · {} · {}{}{}{} · esc to stop ",
+                    " {} Working · {} · {}{}{}{}{stop_hint}",
                     spinner::frame_for(t),
                     spinner::fmt_elapsed(t),
                     phase,
@@ -1119,6 +1130,7 @@ impl ReplUi {
                     state.bg.running_count,
                     self.multiline_mode,
                     state.sub_agent.as_ref(),
+                    state.stop_pending,
                 );
 
                 // Check if todo panel should be shown (based on terminal size and visibility state)
@@ -2672,17 +2684,18 @@ mod multiline_input_tests {
     /// changes upstream, this test catches it.
     #[test]
     fn real_paragraph_line_count_includes_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false, None);
+        let empty =
+            ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false, None, false);
         // 1 content line (placeholder) + 2 border rows = 3.
         assert_eq!(empty.line_count(120), 3);
 
         let one_newline =
-            ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false, None);
+            ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false, None, false);
         // 2 content lines + 2 border rows = 4.
         assert_eq!(one_newline.line_count(120), 4);
 
         let two_newlines =
-            ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false, None);
+            ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false, None, false);
         // 3 content lines + 2 border rows = 5.
         assert_eq!(two_newlines.line_count(120), 5);
     }
@@ -2694,15 +2707,16 @@ mod multiline_input_tests {
     /// `Constraint::Length(input_height)` math in `ReplUi::render`.
     #[test]
     fn paragraph_content_rows_strips_block_borders() {
-        let empty = ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false, None);
+        let empty =
+            ReplUi::build_input_paragraph("", 0, false, None, None, 0, 0, false, None, false);
         assert_eq!(ReplUi::paragraph_content_rows(&empty, 120), 1);
 
         let one_newline =
-            ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false, None);
+            ReplUi::build_input_paragraph("\n", 1, false, None, None, 0, 0, false, None, false);
         assert_eq!(ReplUi::paragraph_content_rows(&one_newline, 120), 2);
 
         let two_newlines =
-            ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false, None);
+            ReplUi::build_input_paragraph("\n\n", 2, false, None, None, 0, 0, false, None, false);
         assert_eq!(ReplUi::paragraph_content_rows(&two_newlines, 120), 3);
     }
 
@@ -2775,6 +2789,7 @@ mod multiline_input_tests {
             0,
             false,
             None,
+            false,
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
         terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
@@ -2813,6 +2828,7 @@ mod multiline_input_tests {
             0,
             false,
             None,
+            false,
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
         terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
@@ -2827,6 +2843,68 @@ mod multiline_input_tests {
         assert!(
             !rendered.contains("queued"),
             "working title must not show queued hint when count == 0; rendered:\n{rendered}",
+        );
+    }
+
+    // ─── Two-stage Stop: working-title hint ───────────────────────────────
+    //
+    // While `stop_pending`, the working title's trailing hint changes from
+    // "· esc to stop" to "· stopping after tool · esc again to stop now"
+    // (the 2nd press escalates to the immediate abort).
+    //
+    // `stop_pending` is threaded through `build_input_paragraph` as the 10th
+    // argument (see `render_input` below). The not-pending test is a live
+    // regression guard on the default hint.
+    // (No insta snapshot: plain string assertions; the expected rendered title
+    // contains "Working · … · stopping after tool · esc again to stop now".)
+
+    fn render_input(input: &str, stop_pending: bool) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let started = std::time::Instant::now();
+        let para = ReplUi::build_input_paragraph(
+            input,
+            0,
+            true,
+            Some(started),
+            Some("thinking"),
+            0,
+            0,
+            false,
+            None,
+            stop_pending,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        terminal.draw(|f| f.render_widget(para, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area().height)
+            .flat_map(|y| {
+                (0..buffer.area().width)
+                    .map(move |x| buffer[(x, y)].symbol().to_string())
+                    .chain(std::iter::once("\n".to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn working_title_hints_normal_stop_when_not_pending() {
+        let rendered = render_input("", false);
+        assert!(
+            rendered.contains("esc to stop"),
+            "the default hint must remain 'esc to stop'; rendered:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("stopping after tool"),
+            "no pending hint without a pending stop; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn working_title_hints_escalation_when_stop_pending() {
+        let rendered = render_input("", true);
+        assert!(
+            rendered.contains("stopping after tool · esc again to stop now"),
+            "a pending graceful stop must change the hint to ' · stopping after tool              · esc again to stop now '; rendered:\n{rendered}"
         );
     }
 
@@ -4029,8 +4107,9 @@ mod multiline_mode_tests {
     fn build_input_paragraph_accepts_multiline_flag() {
         // Just a compile-time pin: the signature must accept the new
         // bool. The visual diff is owned by snapshot tests.
-        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, true, None);
-        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, false, None);
+        let _p = ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, true, None, false);
+        let _p =
+            ReplUi::build_input_paragraph("hi", 2, false, None, None, 0, 0, false, None, false);
     }
 }
 

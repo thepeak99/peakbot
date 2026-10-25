@@ -46,6 +46,12 @@ import { AttachmentChip } from "./AttachmentChip";
 const MIN_H = 40; // one text row — roughly line-height + vertical padding
 const MAX_H = 192; // ~6 rows — beyond this the textarea scrolls internally
 
+// Pressing a button moves focus off the textarea, collapsing the soft keyboard;
+// the layout jump then cancels the tap. Cancel the focus change on both the
+// pointer event and the compat mousedown (Android Chrome focuses on the latter).
+const preventFocusSteal = (e: { preventDefault: () => void }) => e.preventDefault();
+const keepTextareaFocus = { onPointerDown: preventFocusSteal, onMouseDown: preventFocusSteal };
+
 // Inert default so the Composer works standalone (no upload plumbing).
 const NO_ATTACHMENTS: Attachments = {
   pending: [],
@@ -71,6 +77,7 @@ export function Composer({
   attachments = NO_ATTACHMENTS,
   supportsVision = true,
   settingsEnabled = true,
+  stopPending = false,
 }: {
   isRunning: boolean;
   connected: boolean;
@@ -102,6 +109,10 @@ export function Composer({
    * makes sense when the Settings entry points exist; default true so a
    * standalone Composer (no wire fields yet) keeps showing it. */
   settingsEnabled?: boolean;
+  /** `AppState.stop_pending` — a graceful stop is already armed (first
+   * press). The Stop control takes the escalation label and a subtle
+   * pulse; a second press aborts immediately (the backend decides). */
+  stopPending?: boolean;
 }) {
   const [text, setText] = useState("");
   const [selected, setSelected] = useState(0);
@@ -228,14 +239,17 @@ export function Composer({
   // One label for the always-mounted dispatch button: mid-turn sends are
   // queued server-side, so while running it reads "Queue".
   const actionLabel = isRunning ? "Queue" : "Send";
-  // Stopping discards the queued sends, so the button says so when any exist.
-  const stopLabel =
-    pendingInput > 0
+  // Stopping discards the queued sends, so the button says so when any
+  // exist. A pending graceful stop outranks both: the label advertises the
+  // escalation (pressing again stops immediately).
+  const stopLabel = stopPending
+    ? "Stop now — stopping after the current tool call"
+    : pendingInput > 0
       ? `Stop and discard ${pendingInput} queued message${pendingInput === 1 ? "" : "s"}`
       : "Stop";
 
   return (
-    <div className="border-t border-zinc-800 bg-zinc-950 p-3">
+    <div className="border-t border-zinc-800 bg-zinc-950 p-3 pr-12">
       <div className="mx-auto max-w-3xl">
         <div className="relative">
           {showPalette && (
@@ -349,6 +363,7 @@ export function Composer({
                       keeps it distinct from Stop's red (abort everything). */}
                   {subAgent?.pausable && (
                     <button
+                      {...keepTextareaFocus}
                       onClick={subAgent.pause === "running" ? onPause : onResume}
                       title={
                         subAgent.pause === "running"
@@ -364,16 +379,22 @@ export function Composer({
                     </button>
                   )}
                   <button
+                    {...keepTextareaFocus}
                     onClick={onStop}
                     title={stopLabel}
                     aria-label={stopLabel}
-                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-950/70 hover:bg-red-900/70"
+                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-950/70 hover:bg-red-900/70 ${
+                      // A graceful stop is armed: a subtle pulse + ring on the
+                      // existing red surface says "press again to stop now".
+                      stopPending ? "animate-pulse ring-2 ring-red-500/60" : ""
+                    }`}
                   >
                     <span className="h-2.5 w-2.5 rounded-[2px] bg-red-400" />
                   </button>
                 </>
               ) : (
                 <button
+                  {...keepTextareaFocus}
                   onClick={submit}
                   disabled={!canSend}
                   title={sendBlockedReason}

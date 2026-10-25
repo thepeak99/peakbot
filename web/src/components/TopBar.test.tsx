@@ -90,6 +90,8 @@ interface TopBarFixtureProps {
   // (D7), mirroring what App.tsx will pass once the hook exists.
   focusMode: boolean;
   onToggleFocus: () => void;
+  /** Two-stage stop: a graceful stop is pending. */
+  stopPending?: boolean;
 }
 
 const baseProps: TopBarFixtureProps = {
@@ -110,6 +112,7 @@ const baseProps: TopBarFixtureProps = {
   onToggleNotify: () => {},
   focusMode: true,
   onToggleFocus: () => {},
+  stopPending: false,
 };
 
 // ─── mount helper ───────────────────────────────────────────────────────
@@ -316,5 +319,63 @@ describe("TopBar — focus mode toggle", () => {
     expect(
       focusBtn!.compareDocumentPosition(themeBtn!) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+});
+
+// ── Two-stage stop: pending sentence in the working… chip ─────────────────
+// While `stopPending`, the TopBar shows
+// "Stopping after current tool call…" INSTEAD of the statusMessage
+// (the graceful stage is the status the user needs to see). Gated on
+// isRunning like everything else in the chip.
+//
+// RED today: TopBar has no `stopPending` prop — the sentence never
+// renders and the statusMessage shows as it does today.
+
+describe("TopBar — two-stage stop pending sentence", () => {
+  it("stopPending=true: shows 'Stopping after current tool call…' and suppresses the statusMessage", async () => {
+    const el = await mount({
+      ...baseProps,
+      isRunning: true,
+      stopPending: true,
+      statusMessage: "bash",
+    });
+
+    expect(el.textContent).toContain("Stopping after current tool call…");
+    expect(el.textContent).not.toContain("· bash");
+    expect(el.textContent).toContain("working…");
+  });
+
+  it("stopPending=true with no statusMessage: the pending sentence is the status", async () => {
+    const el = await mount({
+      ...baseProps,
+      isRunning: true,
+      stopPending: true,
+      statusMessage: null,
+    });
+
+    expect(el.textContent).toContain("Stopping after current tool call…");
+    expect(el.textContent).not.toContain("· null");
+  });
+
+  it("stopPending=false: the statusMessage renders as today (no pending sentence)", async () => {
+    const el = await mount({
+      ...baseProps,
+      isRunning: true,
+      stopPending: false,
+      statusMessage: "bash",
+    });
+
+    expect(el.textContent).not.toContain("Stopping after current tool call…");
+    expect(el.textContent).toContain("· bash");
+  });
+
+  it("stopPending is gated on isRunning: a stale flag must not leak when idle", async () => {
+    const el = await mount({
+      ...baseProps,
+      isRunning: false,
+      stopPending: true,
+    });
+
+    expect(el.textContent).not.toContain("Stopping after current tool call…");
   });
 });

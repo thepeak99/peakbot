@@ -57,6 +57,11 @@ pub struct AppState {
     #[serde(default)]
     pub is_running: bool,
 
+    /// A graceful (first-press) Stop is pending: the in-flight tool call
+    /// finishes, then the turn ends. Cleared by `set_running`.
+    #[serde(default)]
+    pub stop_pending: bool,
+
     /// Whether the agent is currently loading (alias for is_running, kept for compatibility)
     #[serde(default)]
     #[doc(hidden)]
@@ -213,7 +218,7 @@ impl Serialize for AppState {
         // stored copy can never drift from the pin. `run_started_at` stays
         // off the wire (`Instant` is not `Serialize`). Keep this list in
         // sync with the struct above.
-        let mut ser = serializer.serialize_struct("AppState", 25)?;
+        let mut ser = serializer.serialize_struct("AppState", 26)?;
         ser.serialize_field("chat", &self.chat)?;
         ser.serialize_field("todo", &self.todo)?;
         ser.serialize_field("input", &self.input)?;
@@ -222,6 +227,7 @@ impl Serialize for AppState {
         ser.serialize_field("conversation", &self.conversation)?;
         ser.serialize_field("preferences", &self.preferences)?;
         ser.serialize_field("is_running", &self.is_running)?;
+        ser.serialize_field("stop_pending", &self.stop_pending)?;
         ser.serialize_field("is_loading", &self.is_loading)?;
         ser.serialize_field("welcome", &self.welcome)?;
         ser.serialize_field("is_final", &self.is_final)?;

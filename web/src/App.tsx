@@ -326,6 +326,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         selectionLocked={selectionLocked}
         profilePinned={state?.profile_pinned ?? false}
         onToast={showToast}
+        stopPending={state?.stop_pending ?? false}
       />
       {convoTabs && (
         <ConvoTabBar
@@ -402,6 +403,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             attachments={attachments}
             supportsVision={state?.supports_vision ?? true}
             settingsEnabled={settingsEnabled}
+            stopPending={state?.stop_pending ?? false}
           />
         </DropOverlay>
       </div>
