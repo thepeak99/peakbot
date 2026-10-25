@@ -171,7 +171,7 @@ Rules:
 - `alias` optional; without it a model is addressable only as `<provider_name>/<model_name>`. Aliases are globally unique, match `^[A-Za-z0-9_./:-]+$`; the literal `unknown` is reserved.
 - Per-model overrides: `max_tokens`, `temperature`, `context_size` (token window; the legacy field names `context_window_override` / `context_window` are read as aliases), `extra_params` (LlamaCpp), `prompt_caching` (Anthropic: `auto`/`auto_1h`/`manual`/`off`), `vision` (force image support on/off; omit for auto-detection), `preserve_reasoning` / `display_reasoning` (Anthropic thinking blocks).
 
-`/model` semantics: no arg lists aliases (active marked `→`); `/model <alias>` starts a **new conversation** on that model (confirm overlay if the chat has content); unknown alias / current alias are safe no-ops with a message. The active alias is bound to the conversation metadata — `/load` re-activates it and rejects the load if the alias no longer resolves. An agent's `model:` is its **starting** model only — there is no model lock, so `/model` works in every conversation, including one running an agent with subagents. MCP servers persist across switches.
+`/model` semantics: no arg lists aliases (active marked `→`); `/model <alias>` starts a **new conversation** on that model (confirm overlay if the chat has content; the web UI's typed `/model <alias>` needs no confirm and just starts a new conversation); unknown alias / current alias are safe no-ops with a message. The active alias is bound to the conversation metadata — `/load` re-activates it and rejects the load if the alias no longer resolves. An agent's `model:` is its **starting** model only — there is no model lock, so `/model` works in every conversation, including one running an agent with subagents; subagents that inherit their agent's model follow the switched model. MCP servers persist across switches.
 
 ### The `general:` block
 
@@ -253,7 +253,7 @@ OAuth notes: first connect opens the browser; tokens cached under `~/.cache/peak
 | `/pause` | Pause the running sub-agent at its next step (Ctrl+P in TUI) |
 | `/resume` | Resume a paused sub-agent (Ctrl+P in TUI) |
 | `/model [alias]` | List / switch models (starts a new conversation) |
-| `/profile [name]` | List / select a profile (first turn only; web: the 📁 chip) |
+| `/profile [name]` | List / select a profile (first turn only; web: selection chip — top bar, or bottom bar on phones) |
 | `/agent [name]` | List / select an agent within the active profile (first turn only) |
 | `/cd [path]` | Show / change session cwd |
 | `/new`, `/load`, `/conversations` | Conversation management |
@@ -536,14 +536,14 @@ profiles:
 Selection is per-conversation: `(profile, agent)`, persisted on the conversation, and **locked after the first turn** (flipping `delegate` or the profile mid-conversation desyncs the tool list from wire history).
 
 - **`/profile <name>`** / **`/agent <name>`** — pick before the first turn; the name is the **rest of the line** (spaces work), case-sensitive.
-- **Web UI** — the "📁 profile › agent" chip in the composer opens a two-column picker (repo profiles first) and locks after the first message; the Agents tab shows the roster.
+- **Web UI** — the selection chip in the top bar (bottom bar on phones) opens a Profile › Agent › Team › Model drill-down (repo profiles first) with per-member model override before the first message; it locks after the first message. The Agents tab shows the configured roster.
 - **`/new`** keeps the current selection; a fresh session starts at the first profile's first agent.
 - **`--profile <name>`** pins a global profile: every conversation runs under it, `/profile` is refused, and repo files are ignored.
 - **Repo profiles** are listed first for that cwd; a repo profile with the same name as a global one **replaces** it entirely (no merge).
 
 ### The model
 
-An agent's `model:` is its **starting** model — there is no lock. `/model <alias>` works in every conversation (including one running an agent with subagents) and starts a new conversation on that model.
+An agent's `model:` is its **starting** model — there is no lock. `/model <alias>` works in every conversation (including one running an agent with subagents) and starts a new conversation on that model. Before the first message the selection chip can also override the orchestrator's and each subagent's model; overrides travel with the conversation (/new keeps them, /load restores them, picking another agent clears them).
 
 ### The delegate tool
 
